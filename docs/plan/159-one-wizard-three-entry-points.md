@@ -103,6 +103,28 @@ picker 走完发 `/provider <id> <model> <effort>` 一条。**不要发 `/provid
 - `/model` 进 slash 补全菜单与 `/help`。
 - fmt / clippy `-D warnings` / `cargo test` / `--mock --headless` 全绿;README 的命令一节同步。
 
+## 四之二、✅ 2026-09-17 完成(提交 25e6c1c)
+
+验收全过,外加两处 plan 没写到的:
+
+- **`/provider` 在第一个 turn 之前是坏的**,而 picker 恰好把这条路变成最常走的入口。
+  `append_provider_route_changed` 拒绝空时间线,只有 `commands/effort.rs` 会先调
+  `ensure_initial_provider_route`;`/provider` 从来没调过,所以"开会话第一件事就换 provider"
+  一直报 `provider route persistence failed: history provider route timeline is missing`。
+  三个入口现在共用 `commands/provider.rs::apply`,那道 guard 在里面,并留了一条回归探针。
+- **"一条命令一条修订"逼着两条提交路径合并**。`SessionProviderState::commit_effort` 和
+  `switch_with` 原本是同一条时间线的两个写入口;effort 要跟着切换一起落,就得让
+  `switch_with` 收一个 `EffortRequest`,并把它的 "同路由 = NoOp" 早退改成
+  "同路由**且同 effort** = NoOp"。合并后 `commit_effort` 整个删掉,`/effort` 也走这条路。
+  continuity 由 commit 闭包按 `previous.same_route(next)` 二选一:同路由沿用、跨路由才投影。
+
+形状上与 plan 的两处出入:
+
+- `/provider`、`/model` 的列表改读 `state.catalog()` 而不是 `cfg.provider_catalog`——切换是在
+  session 的 catalog 上解析的,列表就该是同一份。
+- 多了一张整屏基线 `tui_pty__effort_picker_24x80.snap`(plan 149 的形状):effort 那一级是本
+  plan 唯一的新面板,七行 label+detail 叠在 composer 上是什么样子,只有整屏能看出来。
+
 ## 六、附录:2026-09-17 的实测数据(§3.2 的依据)
 
 对 `deepseek-v4-flash-0731`(走 gw-cn 的 responses 端点)实测。**这些是那一天、那个网关、

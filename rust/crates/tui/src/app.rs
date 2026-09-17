@@ -32,6 +32,7 @@ use kloop_protocol::ImageSource;
 use kloop_protocol::Injected;
 use kloop_protocol::Message;
 use kloop_protocol::Role;
+use kloop_protocol::RoutePickerStage;
 use tokio::sync::oneshot;
 
 use crate::composer::Composer;
@@ -267,10 +268,135 @@ pub struct ForkPicker {
     pub cursor: usize,
 }
 
+/// The open route picker (plan 159): one wizard, three stages, entered at
+/// whichever stage the command that opened it named. It carries the whole
+/// catalog payload because it walks providers and models the session is not on —
+/// none of that can be read off the active route.
 pub struct ProviderPicker {
-    pub providers: Vec<kloop_protocol::ProviderDescriptor>,
+    pub catalog: kloop_core::provider_route::RoutePicker,
+    /// The stage on screen. `catalog.stage` is the one it was entered at, and
+    /// Esc there closes rather than descending further.
+    pub stage: RoutePickerStage,
     pub provider_cursor: usize,
-    pub model_cursor: Option<usize>,
+    pub model_cursor: usize,
+    pub effort_cursor: usize,
+}
+
+impl ProviderPicker {
+    /// Open at `catalog.stage`, with every cursor already sitting on what the
+    /// session uses now: nobody opens this panel to be told where they are.
+    fn open(
+        catalog: kloop_core::provider_route::RoutePicker,
+        remembered_models: &HashMap<String, String>,
+    ) -> Self {
+        let provider_cursor = catalog
+            .providers
+            .iter()
+            .position(|provider| provider.id == catalog.active.provider_id)
+            .unwrap_or(0);
+        let mut picker = Self {
+            stage: catalog.stage,
+            catalog,
+            provider_cursor,
+            model_cursor: 0,
+            effort_cursor: 0,
+        };
+        // The Model and Effort entry points start inside the active route, so
+        // seed their cursors from it rather than from the provider's defaults.
+        picker.model_cursor = picker
+            .models()
+            .iter()
+            .position(|model| model == &picker.catalog.active.model)
+            .unwrap_or_else(|| picker.remembered_model_row(remembered_models));
+        picker.effort_cursor = picker.effort_row();
+        picker
+    }
+
+    pub fn provider(&self) -> &kloop_protocol::ProviderDescriptor {
+        &self.catalog.providers[self.provider_cursor]
+    }
+
+    pub fn models(&self) -> &[String] {
+        &self.provider().models
+    }
+
+    pub fn model(&self) -> &str {
+        &self.models()[self.model_cursor.min(self.models().len() - 1)]
+    }
+
+    /// `unset` plus whatever the selected model declared — the list the effort
+    /// stage shows and the command it sends is drawn from.
+    pub fn efforts(&self) -> Vec<Option<kloop_protocol::ReasoningEffort>> {
+        self.catalog.effort_choices(self.model())
+    }
+
+    fn rows(&self) -> usize {
+        match self.stage {
+            RoutePickerStage::Provider => self.catalog.providers.len(),
+            RoutePickerStage::Model => self.models().len(),
+            RoutePickerStage::Effort => self.efforts().len(),
+        }
+    }
+
+    fn cursor(&mut self) -> &mut usize {
+        match self.stage {
+            RoutePickerStage::Provider => &mut self.provider_cursor,
+            RoutePickerStage::Model => &mut self.model_cursor,
+            RoutePickerStage::Effort => &mut self.effort_cursor,
+        }
+    }
+
+    fn remembered_model_row(&self, remembered_models: &HashMap<String, String>) -> usize {
+        let provider = self.provider();
+        let model = remembered_models
+            .get(&provider.id)
+            .filter(|model| provider.models.contains(model))
+            .unwrap_or(&provider.default_model);
+        provider
+            .models
+            .iter()
+            .position(|candidate| candidate == model)
+            .unwrap_or(0)
+    }
+
+    /// Where the effort cursor opens: the session's current level, else the
+    /// selected provider's configured one, else `unset` — which is row 0 and is
+    /// on every list, because no declaration can gate "send no field".
+    fn effort_row(&self) -> usize {
+        let choices = self.efforts();
+        let row = |wanted: Option<kloop_protocol::ReasoningEffort>| {
+            choices.iter().position(|choice| *choice == wanted)
+        };
+        row(self.catalog.active.effort)
+            .or_else(|| row(self.provider().default_effort))
+            .unwrap_or(0)
+    }
+
+    fn advance(&mut self, remembered_models: &HashMap<String, String>) {
+        match self.stage {
+            RoutePickerStage::Provider => {
+                self.model_cursor = self.remembered_model_row(remembered_models);
+                self.stage = RoutePickerStage::Model;
+            }
+            RoutePickerStage::Model => {
+                self.effort_cursor = self.effort_row();
+                self.stage = RoutePickerStage::Effort;
+            }
+            RoutePickerStage::Effort => {}
+        }
+    }
+
+    /// One line for the whole walk. Two commands would put two revisions on the
+    /// route timeline for one decision, which reads later as a user who changed
+    /// their mind twice.
+    fn command(&self) -> String {
+        format!(
+            "/provider {} {} {}",
+            self.provider().id,
+            self.model(),
+            kloop_protocol::ReasoningEffort::choice_str(self.efforts()[self.effort_cursor]),
+        )
+    }
 }
 
 /// counterpart to the pure state change already applied.
@@ -551,16 +677,13 @@ impl App {
                     self.frozen_route = Some(route);
                 }
             }
-            AgentEvent::ProviderPicker(providers) => {
-                if providers.is_empty() {
+            AgentEvent::ProviderPicker(catalog) => {
+                if catalog.providers.is_empty() {
                     self.cells
                         .push(Cell::System("no configured providers".into()));
                 } else {
-                    self.provider_picker = Some(ProviderPicker {
-                        providers,
-                        provider_cursor: 0,
-                        model_cursor: None,
-                    });
+                    self.provider_picker =
+                        Some(ProviderPicker::open(catalog, &self.remembered_models));
                 }
             }
             AgentEvent::ClearTranscript => {
@@ -1648,67 +1771,47 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::None;
         }
-        let selecting_model = picker.model_cursor.is_some();
         // A row number acts as "move there, then Enter": the panel prints those
         // numbers, so they have to answer.
         let key = match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let row = c.to_digit(10).expect("ascii digit") as usize - 1;
-                let rows = if selecting_model {
-                    picker.providers[picker.provider_cursor].models.len()
-                } else {
-                    picker.providers.len()
-                };
-                if row >= rows {
+                if row >= picker.rows() {
                     return Command::None;
                 }
-                match picker.model_cursor.as_mut() {
-                    Some(cursor) => *cursor = row,
-                    None => picker.provider_cursor = row,
-                }
+                *picker.cursor() = row;
                 KeyEvent::new(KeyCode::Enter, key.modifiers)
             }
             _ => key,
         };
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(cursor) = picker.model_cursor.as_mut() {
-                    *cursor = cursor.saturating_sub(1);
-                } else {
-                    picker.provider_cursor = picker.provider_cursor.saturating_sub(1);
-                }
+                let cursor = picker.cursor();
+                *cursor = cursor.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(cursor) = picker.model_cursor.as_mut() {
-                    let models = &picker.providers[picker.provider_cursor].models;
-                    *cursor = (*cursor + 1).min(models.len() - 1);
-                } else {
-                    picker.provider_cursor =
-                        (picker.provider_cursor + 1).min(picker.providers.len() - 1);
-                }
+                let last = picker.rows() - 1;
+                let cursor = picker.cursor();
+                *cursor = (*cursor + 1).min(last);
             }
-            KeyCode::Enter if selecting_model => {
-                let provider = &picker.providers[picker.provider_cursor];
-                let model = &provider.models[picker.model_cursor.unwrap_or(0)];
-                let command = format!("/provider {} {}", provider.id, model);
+            KeyCode::Enter if picker.stage == RoutePickerStage::Effort => {
+                let command = picker.command();
                 self.provider_picker = None;
                 return Command::Slash(command);
             }
-            KeyCode::Enter => {
-                let provider = &picker.providers[picker.provider_cursor];
-                let model = remembered_models
-                    .get(&provider.id)
-                    .filter(|model| provider.models.contains(model))
-                    .unwrap_or(&provider.default_model);
-                let cursor = provider
-                    .models
-                    .iter()
-                    .position(|candidate| candidate == model)
-                    .unwrap_or(0);
-                picker.model_cursor = Some(cursor);
+            KeyCode::Enter => picker.advance(&remembered_models),
+            // Esc at the entry stage closes: `/effort` opened one list, and
+            // backing out of it into a model list nobody asked for would answer
+            // a different question than the one the command posed.
+            KeyCode::Esc if picker.stage == picker.catalog.stage => self.provider_picker = None,
+            KeyCode::Esc => {
+                picker.stage = match picker.stage {
+                    RoutePickerStage::Effort => RoutePickerStage::Model,
+                    RoutePickerStage::Model | RoutePickerStage::Provider => {
+                        RoutePickerStage::Provider
+                    }
+                };
             }
-            KeyCode::Esc if selecting_model => picker.model_cursor = None,
-            KeyCode::Esc => self.provider_picker = None,
             _ => {}
         }
         Command::None
@@ -2761,64 +2864,278 @@ mod tests {
         ));
     }
 
+    fn descriptor(
+        id: &str,
+        models: &[&str],
+        default_effort: Option<kloop_protocol::ReasoningEffort>,
+    ) -> kloop_protocol::ProviderDescriptor {
+        kloop_protocol::ProviderDescriptor {
+            id: id.into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            default_model: models[0].into(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+            default_effort,
+        }
+    }
+
+    fn active(provider_id: &str, model: &str) -> kloop_protocol::ActiveProviderRoute {
+        kloop_protocol::ActiveProviderRoute {
+            revision: 2,
+            provider_id: provider_id.into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: model.into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
+        }
+    }
+
+    fn open_picker(
+        stage: RoutePickerStage,
+        providers: Vec<kloop_protocol::ProviderDescriptor>,
+        active: kloop_protocol::ActiveProviderRoute,
+    ) -> AgentEvent {
+        AgentEvent::ProviderPicker(kloop_core::provider_route::RoutePicker {
+            stage,
+            providers,
+            declared_efforts: std::collections::BTreeMap::new(),
+            active,
+        })
+    }
+
+    /// The `/provider` entry point walks all three stages and leaves exactly one
+    /// command behind — two would put two revisions on the route timeline for
+    /// one decision.
     #[test]
-    fn provider_picker_selects_provider_then_model_and_updates_status() {
+    fn provider_picker_walks_provider_then_model_then_effort_into_one_command() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::ProviderPicker(vec![
-            kloop_protocol::ProviderDescriptor {
-                id: "a".into(),
-                api_family: kloop_protocol::ProviderApiFamily::Mock,
-                default_model: "a1".into(),
-                models: vec!["a1".into(), "a2".into()],
-                availability: kloop_protocol::ProviderAvailabilityCode::Ready,
-            },
-        ]));
+        app.apply(open_picker(
+            RoutePickerStage::Provider,
+            vec![descriptor("a", &["a1", "a2"], None)],
+            active("a", "a1"),
+        ));
         assert!(app.provider_picker.is_some());
         assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         assert_eq!(app.on_key(80, key(KeyCode::Down)), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         assert_eq!(
-            app.on_key(80, key(KeyCode::Enter)),
-            Command::Slash("/provider a a2".into())
+            app.provider_picker.as_ref().unwrap().stage,
+            RoutePickerStage::Effort
+        );
+        // Row 4 of `unset, none, low, medium, high, xhigh, max` is `medium`.
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Char('4'))),
+            Command::Slash("/provider a a2 medium".into())
         );
         assert!(app.provider_picker.is_none());
 
-        app.apply(AgentEvent::ProviderChanged(
-            kloop_protocol::ActiveProviderRoute {
-                revision: 2,
-                provider_id: "a".into(),
-                api_family: kloop_protocol::ProviderApiFamily::Mock,
-                model: "a2".into(),
-                continuity: kloop_protocol::ReasoningContinuity::Preserved,
-                effort: None,
-            },
-        ));
+        app.apply(AgentEvent::ProviderChanged(active("a", "a2")));
         assert_eq!(app.model, "a2");
     }
 
+    /// Esc walks back one stage at a time and closes at the stage the command
+    /// opened — never below it.
+    #[test]
+    fn provider_picker_esc_backs_out_one_stage_and_closes_at_the_entry_stage() {
+        let providers = vec![descriptor("a", &["a1", "a2"], None)];
+        let mut app = App::new("s".into());
+        app.apply(open_picker(
+            RoutePickerStage::Provider,
+            providers.clone(),
+            active("a", "a1"),
+        ));
+        app.on_key(80, key(KeyCode::Enter));
+        app.on_key(80, key(KeyCode::Enter));
+        assert_eq!(
+            app.provider_picker.as_ref().unwrap().stage,
+            RoutePickerStage::Effort
+        );
+        app.on_key(80, key(KeyCode::Esc));
+        assert_eq!(
+            app.provider_picker.as_ref().unwrap().stage,
+            RoutePickerStage::Model
+        );
+        app.on_key(80, key(KeyCode::Esc));
+        assert_eq!(
+            app.provider_picker.as_ref().unwrap().stage,
+            RoutePickerStage::Provider
+        );
+        app.on_key(80, key(KeyCode::Esc));
+        assert!(app.provider_picker.is_none());
+
+        // `/model` never offered a provider list, so Esc on its first screen
+        // closes instead of descending into one.
+        app.apply(open_picker(
+            RoutePickerStage::Model,
+            providers.clone(),
+            active("a", "a1"),
+        ));
+        assert_eq!(
+            app.provider_picker.as_ref().unwrap().stage,
+            RoutePickerStage::Model
+        );
+        app.on_key(80, key(KeyCode::Esc));
+        assert!(app.provider_picker.is_none());
+
+        // Same for `/effort`, one stage further in.
+        app.apply(open_picker(
+            RoutePickerStage::Effort,
+            providers,
+            active("a", "a2"),
+        ));
+        let picker = app.provider_picker.as_ref().unwrap();
+        assert_eq!(picker.stage, RoutePickerStage::Effort);
+        assert_eq!(picker.model(), "a2");
+        app.on_key(80, key(KeyCode::Esc));
+        assert!(app.provider_picker.is_none());
+    }
+
+    /// The effort stage lists `unset` plus exactly what the model declared, and
+    /// everything when it declared nothing. `none` gets no exemption from the
+    /// declaration — it is an ordinary wire value a model can refuse — while
+    /// `unset` is on every list, because it sends no field for a list to gate.
+    #[test]
+    fn effort_stage_lists_unset_plus_what_the_model_declared() {
+        use kloop_protocol::ReasoningEffort;
+
+        let list = |declared: Vec<(&str, Vec<ReasoningEffort>)>, model: &str| {
+            let mut app = App::new("s".into());
+            app.apply(AgentEvent::ProviderPicker(
+                kloop_core::provider_route::RoutePicker {
+                    stage: RoutePickerStage::Effort,
+                    providers: vec![descriptor("a", &["a1", "a2"], None)],
+                    declared_efforts: declared
+                        .into_iter()
+                        .map(|(model, levels)| (model.to_string(), levels))
+                        .collect(),
+                    active: active("a", model),
+                },
+            ));
+            app.provider_picker.as_ref().unwrap().efforts()
+        };
+
+        assert_eq!(
+            list(
+                vec![("a1", vec![ReasoningEffort::Low, ReasoningEffort::High])],
+                "a1"
+            ),
+            vec![
+                None,
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::High)
+            ]
+        );
+        // Declared without `none`: it is out, like any other unlisted level.
+        assert_eq!(
+            list(vec![("a1", vec![ReasoningEffort::Max])], "a1"),
+            vec![None, Some(ReasoningEffort::Max)]
+        );
+        // Declared nothing: no limit, so all six plus `unset`.
+        assert_eq!(
+            list(vec![("a1", vec![ReasoningEffort::Low])], "a2"),
+            vec![
+                None,
+                Some(ReasoningEffort::None),
+                Some(ReasoningEffort::Low),
+                Some(ReasoningEffort::Medium),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::XHigh),
+                Some(ReasoningEffort::Max),
+            ]
+        );
+    }
+
+    /// Every cursor opens on what the session uses now: the current effort, or
+    /// the provider's configured one when this model does not declare it, or
+    /// `unset` — which no declaration can exclude.
+    #[test]
+    fn effort_cursor_opens_on_the_current_level_then_the_providers_default() {
+        use kloop_protocol::ReasoningEffort;
+
+        let cursor = |current: Option<ReasoningEffort>, default_effort: Option<ReasoningEffort>| {
+            let mut app = App::new("s".into());
+            app.apply(AgentEvent::ProviderPicker(
+                kloop_core::provider_route::RoutePicker {
+                    stage: RoutePickerStage::Effort,
+                    providers: vec![descriptor("a", &["a1"], default_effort)],
+                    declared_efforts: std::collections::BTreeMap::from([(
+                        "a1".to_string(),
+                        vec![ReasoningEffort::Low, ReasoningEffort::High],
+                    )]),
+                    active: kloop_protocol::ActiveProviderRoute {
+                        effort: current,
+                        ..active("a", "a1")
+                    },
+                },
+            ));
+            app.provider_picker.as_ref().unwrap().effort_cursor
+        };
+
+        assert_eq!(cursor(Some(ReasoningEffort::High), None), 2);
+        assert_eq!(cursor(None, Some(ReasoningEffort::Low)), 0);
+        // `max` is not on this model's list, so the provider's own value stands.
+        assert_eq!(
+            cursor(Some(ReasoningEffort::Max), Some(ReasoningEffort::Low)),
+            1
+        );
+        // Neither is listed: `unset`, row 0.
+        assert_eq!(
+            cursor(Some(ReasoningEffort::Max), Some(ReasoningEffort::Max)),
+            0
+        );
+    }
+
+    /// j/k move like ↑↓, and a `/provider` walk that never touches the model
+    /// list lands on the model this session last used on that provider.
     #[test]
     fn provider_picker_remembers_successful_model_selection() {
         let mut app = App::new("s".into());
-        let provider = kloop_protocol::ProviderDescriptor {
-            id: "a".into(),
-            api_family: kloop_protocol::ProviderApiFamily::Mock,
-            default_model: "a1".into(),
-            models: vec!["a1".into(), "a2".into()],
-            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
-        };
-        app.apply(AgentEvent::ProviderChanged(
-            kloop_protocol::ActiveProviderRoute {
-                revision: 2,
-                provider_id: "a".into(),
-                api_family: kloop_protocol::ProviderApiFamily::Mock,
-                model: "a2".into(),
-                continuity: kloop_protocol::ReasoningContinuity::Preserved,
-                effort: None,
-            },
+        app.apply(AgentEvent::ProviderChanged(active("a", "a2")));
+        app.apply(open_picker(
+            RoutePickerStage::Provider,
+            vec![
+                descriptor("a", &["a1", "a2"], None),
+                descriptor("b", &["b1"], None),
+            ],
+            active("a", "a2"),
         ));
-        app.apply(AgentEvent::ProviderPicker(vec![provider]));
+
+        // The provider cursor opens on the active provider, and j/k move it.
+        assert_eq!(app.provider_picker.as_ref().unwrap().provider_cursor, 0);
+        assert_eq!(app.on_key(80, key(KeyCode::Char('j'))), Command::None);
+        assert_eq!(app.provider_picker.as_ref().unwrap().provider_cursor, 1);
+        assert_eq!(app.on_key(80, key(KeyCode::Char('k'))), Command::None);
+        assert_eq!(app.provider_picker.as_ref().unwrap().provider_cursor, 0);
 
         assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
-        assert_eq!(app.provider_picker.as_ref().unwrap().model_cursor, Some(1));
+        let picker = app.provider_picker.as_ref().unwrap();
+        assert_eq!(picker.stage, RoutePickerStage::Model);
+        assert_eq!(picker.model_cursor, 1);
+    }
+
+    /// A row number out of range is inert; one in range is "move there, then
+    /// Enter", which at the model stage means advancing to the effort list.
+    #[test]
+    fn provider_picker_row_numbers_pick_within_the_current_stage() {
+        let mut app = App::new("s".into());
+        app.apply(open_picker(
+            RoutePickerStage::Model,
+            vec![descriptor("a", &["a1", "a2"], None)],
+            active("a", "a1"),
+        ));
+        assert_eq!(app.on_key(80, key(KeyCode::Char('3'))), Command::None);
+        let picker = app.provider_picker.as_ref().unwrap();
+        assert_eq!(
+            picker.stage,
+            RoutePickerStage::Model,
+            "row 3 does not exist"
+        );
+        assert_eq!(picker.model_cursor, 0);
+
+        assert_eq!(app.on_key(80, key(KeyCode::Char('2'))), Command::None);
+        let picker = app.provider_picker.as_ref().unwrap();
+        assert_eq!(picker.stage, RoutePickerStage::Effort);
+        assert_eq!(picker.model(), "a2");
     }
 
     #[test]

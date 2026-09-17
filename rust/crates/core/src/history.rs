@@ -370,20 +370,35 @@ impl History {
         expected_revision: u64,
         provider_id: &str,
         model: Option<&str>,
+        effort: crate::provider_route::EffortRequest,
     ) -> Result<crate::provider_route::SwitchOutcome, ProviderSwitchError> {
         state
-            .switch_with(expected_revision, provider_id, model, |_previous, next| {
-                let continuity = self
-                    .projected_continuity(next, ProviderRouteSource::ExplicitSwitch)
-                    .map_err(ProviderSwitchCommitError::History)?;
-                self.append_provider_route_changed(
-                    next,
-                    ProviderRouteSource::ExplicitSwitch,
-                    continuity,
-                )
-                .map_err(ProviderSwitchCommitError::Persistence)?;
-                Ok(continuity)
-            })
+            .switch_with(
+                expected_revision,
+                provider_id,
+                model,
+                effort,
+                |previous, next| {
+                    // A revision that moves only the effort stays on the same
+                    // route, so nothing about reasoning replay changes and the
+                    // continuity this route already carries rides forward.
+                    // Projecting it would be asking whether a request view
+                    // nobody is rewriting still matches itself.
+                    let continuity = if previous.same_route(next) {
+                        previous.continuity()
+                    } else {
+                        self.projected_continuity(next, ProviderRouteSource::ExplicitSwitch)
+                            .map_err(ProviderSwitchCommitError::History)?
+                    };
+                    self.append_provider_route_changed(
+                        next,
+                        ProviderRouteSource::ExplicitSwitch,
+                        continuity,
+                    )
+                    .map_err(ProviderSwitchCommitError::Persistence)?;
+                    Ok(continuity)
+                },
+            )
             .map_err(|error| match error {
                 crate::provider_route::SwitchCommitError::Switch(error) => {
                     ProviderSwitchError::Route(error)
@@ -1308,6 +1323,7 @@ mod tests {
     fn explicit_switch_filters_request_view_and_switching_back_restores_reasoning() {
         use std::sync::Arc;
 
+        use crate::provider_route::EffortRequest;
         use crate::provider_route::ProviderCatalog;
         use crate::provider_route::ProviderCatalogEntry;
         use crate::provider_route::SessionProviderState;
@@ -1365,7 +1381,9 @@ mod tests {
         );
         let canonical = history.messages().to_vec();
 
-        let changed = history.switch_provider(&state, 1, "b", None).unwrap();
+        let changed = history
+            .switch_provider(&state, 1, "b", None, EffortRequest::Inherit)
+            .unwrap();
         assert!(matches!(
             changed,
             SwitchOutcome::Changed {
@@ -1393,7 +1411,9 @@ mod tests {
             ]
         );
         assert_eq!(history.messages(), canonical.as_slice());
-        history.switch_provider(&state, 2, "a", None).unwrap();
+        history
+            .switch_provider(&state, 2, "a", None, EffortRequest::Inherit)
+            .unwrap();
         let view_a = history
             .provider_request_view(&state.freeze().primary_attempt())
             .unwrap();
@@ -1404,6 +1424,7 @@ mod tests {
     fn chat_request_view_validates_source_then_removes_reasoning() {
         use std::sync::Arc;
 
+        use crate::provider_route::EffortRequest;
         use crate::provider_route::ProviderCatalog;
         use crate::provider_route::ProviderCatalogEntry;
         use crate::provider_route::SessionProviderState;
@@ -1462,7 +1483,9 @@ mod tests {
             &initial.primary_attempt(),
         );
 
-        history.switch_provider(&state, 1, "chat", None).unwrap();
+        history
+            .switch_provider(&state, 1, "chat", None, EffortRequest::Inherit)
+            .unwrap();
         let view = history
             .provider_request_view(&state.freeze().primary_attempt())
             .unwrap();
@@ -1479,6 +1502,7 @@ mod tests {
     fn route_append_failure_keeps_memory_state_and_remembered_model() {
         use std::sync::Arc;
 
+        use crate::provider_route::EffortRequest;
         use crate::provider_route::ProviderCatalog;
         use crate::provider_route::ProviderCatalogEntry;
         use crate::provider_route::SessionProviderState;
@@ -1507,7 +1531,9 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::write(&root, b"blocks parent directory creation").unwrap();
 
-        let error = history.switch_provider(&state, 1, "b", None).unwrap_err();
+        let error = history
+            .switch_provider(&state, 1, "b", None, EffortRequest::Inherit)
+            .unwrap_err();
         assert!(matches!(error, ProviderSwitchError::Persistence(_)));
         assert_eq!(state.active_route().revision, 1);
         assert_eq!(state.active_route().provider_id, "a");

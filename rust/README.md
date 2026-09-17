@@ -261,7 +261,10 @@ as an ordinary wire value (`"effort": "none"`) that a model can reject like any
 other, so exempting it would wave through the one value the list was written to
 exclude. A model that should be allowed to stop reasoning lists `none`.
 `/effort unset` is a different thing and no list gates it — it sends no effort
-field at all, so there is nothing for a model to accept or reject.
+field at all, so there is nothing for a model to accept or reject. The list has a
+second use: it is also what the route picker offers, so a level left out of the
+declaration stops being "one day `/effort xhigh` is mysteriously refused" and
+becomes a row visibly missing from a list.
 
 ## Session persistence (Phase 2, second slice)
 
@@ -990,7 +993,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detai
 for owner-scoped scheduler lifecycle (**no `turnId`**),
 `thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` runs on the ordinary command path but likewise re-freezes the session route, so its new `effort` reaches the next turn and the published route.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
 
 **Event recovery.** `thread/events/sync {threadId, eventCursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is
@@ -2323,12 +2326,17 @@ the model. The set is small and lives one-file-per-command under
   way to read what a same-named `SKILL.md` of your own would be replacing. This
   is the local REPL, not the `skills/list` read surface — that one withholds
   bodies on purpose, because it answers a client over the wire.
-- `/provider` — show the configured providers, or `/provider <provider>
-  [model]` to switch the session route (see **Provider catalog and session
-  route** above; the TUI opens a picker when called bare).
-- `/effort` — show the session reasoning effort, `/effort <level>` to set it
-  (`none`|`low`|`medium`|`high`|`xhigh`|`max`), `/effort unset` to send no
-  effort field at all (see **Reasoning effort** below).
+- `/provider`, `/model`, `/effort` — three entry points into **one** route
+  wizard, not three commands: `/provider <provider> [model] [effort]` from the
+  top, `/model <model> [effort]` inside the current provider, `/effort <level>`
+  on the current model (see **Provider catalog and session route** above and
+  **Reasoning effort** below). Called bare, each prints its own list and — in the
+  TUI — opens the picker at its own stage, walking down to the effort list from
+  there; Esc backs out one stage at a time and closes at the stage the command
+  opened, so `/effort` never drops into a model list nobody asked for. The walk
+  sends **one** command line, because provider, model and effort are one decision
+  and belong on one route revision. Arguments still work and skip the picker
+  entirely; `/effort unset` sends no effort field at all.
 - `/cost` — the current model and context-window estimate (`~used / window
   tokens (pct%)`, from the resettable usage anchor + char/4 tail estimate), plus
   durable provider-reported usage across all models in the current transcript:
@@ -2380,6 +2388,15 @@ spelled `off`, because `none` is a real level meaning "do no reasoning" and the
 two would read as synonyms. The initial value comes from `KLOOP_EFFORT` >
 the top-level `effort` key > the selected profile's own `effort`.
 
+The picker's effort stage lists `unset` first and then exactly what the model
+declared (everything, when it declared nothing). `unset` is always there and
+`none` never gets an exemption, which is the same rule the validation uses — and
+the two are not synonyms: measured on 2026-09-17 against one gateway's
+`deepseek-v4-flash-0731`, sending no field still produced 64 reasoning tokens
+while `effort: "none"` produced zero and no reasoning block at all. The same run
+found `low → high` reliably more than doubles the reasoning tokens spent, and
+`max` unpredictable — two runs of one question came back 665 and 5418.
+
 A change applies from the next turn: the effort rides the frozen provider route,
 so child agents and compaction sample at the same value, and it appears in the
 TUI footer and in `ActiveProviderRoute.effort`. It is deliberately **not** part
@@ -2388,7 +2405,9 @@ of the durable route timeline — route revision and receipts are route *identit
 reasoning replayable. A resumed session therefore re-seeds effort from
 configuration. A `/provider` switch carries an explicitly set effort along
 (including an explicit `unset`); a session that never ran `/effort` follows each
-provider's configured value. Changing effort mid-conversation invalidates the
+provider's configured value. A level named *in* the switch overrides both and
+lands in the same revision as the switch — splitting one decision into two
+revisions would read, months later, as a user who changed their mind twice. Changing effort mid-conversation invalidates the
 Anthropic prompt cache (the request prefix changes), so the next turn re-pays
 cache creation.
 

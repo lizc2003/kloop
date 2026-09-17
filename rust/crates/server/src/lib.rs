@@ -1702,6 +1702,7 @@ async fn thread_worker(
                         expected_revision,
                         &provider_id,
                         model.as_deref(),
+                        kloop_core::provider_route::EffortRequest::Inherit,
                     )
                     .map(|outcome| {
                         let (route, continuity) = match outcome {
@@ -1807,6 +1808,20 @@ fn provider_command_args(text: &str) -> Option<Vec<&str>> {
     Some(rest.split_whitespace().collect())
 }
 
+const PROVIDER_USAGE: &str = "usage: /provider <provider> [model] [effort]";
+
+/// `unset` is kloop's word for "send no effort field at all" and is not a wire
+/// value, so it is matched before the level vocabulary (see the command's own
+/// `parse_level`, which this mirrors for the server's idle-transaction path).
+fn parse_effort_level(
+    raw: &str,
+) -> Result<Option<kloop_protocol::ReasoningEffort>, kloop_protocol::UnknownReasoningEffort> {
+    if raw.eq_ignore_ascii_case("unset") {
+        return Ok(None);
+    }
+    raw.parse::<kloop_protocol::ReasoningEffort>().map(Some)
+}
+
 fn run_provider_command(
     args: &[&str],
     cfg: &mut Arc<Config>,
@@ -1822,12 +1837,25 @@ fn run_provider_command(
             route.provider_id, route.model, route.revision
         );
     };
-    if args.len() > 2 {
-        return "usage: /provider <provider> [model]".into();
+    if args.len() > 3 {
+        return PROVIDER_USAGE.into();
     }
     let model = args.get(1).copied();
+    let effort = match args.get(2).copied().map(parse_effort_level).transpose() {
+        Ok(level) => level.map_or(
+            kloop_core::provider_route::EffortRequest::Inherit,
+            kloop_core::provider_route::EffortRequest::Set,
+        ),
+        Err(error) => return format!("{error}\n{PROVIDER_USAGE}"),
+    };
     let expected_revision = provider_state.active_route().revision;
-    match history.switch_provider(provider_state, expected_revision, provider_id, model) {
+    match history.switch_provider(
+        provider_state,
+        expected_revision,
+        provider_id,
+        model,
+        effort,
+    ) {
         Ok(kloop_core::provider_route::SwitchOutcome::NoOp(route)) => format!(
             "provider unchanged: {} {} (revision {})",
             route.provider_id(),
@@ -1839,6 +1867,7 @@ fn run_provider_command(
             let provider_name = route.provider_id().to_string();
             let model_name = route.primary_model().to_string();
             let revision = route.revision();
+            let effort_label = kloop_protocol::ReasoningEffort::choice_str(route.effort());
             *cfg = Arc::new(cfg.clone_with_provider_route(route));
             *active_route.lock().unwrap() = public_route.clone();
             ui.projection.update_provider_route(public_route.clone());
@@ -1847,7 +1876,7 @@ fn run_provider_command(
                 json!({"route": public_route, "continuity": continuity}),
             );
             format!(
-                "provider switched: {provider_name} {model_name} (revision {revision}, reasoning continuity: {continuity:?})",
+                "provider switched: {provider_name} {model_name} (revision {revision}, reasoning continuity: {continuity:?}, effort: {effort_label})",
             )
         }
         Err(error) => format!("provider switch failed: {error}"),

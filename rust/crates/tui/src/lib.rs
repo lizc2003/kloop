@@ -433,10 +433,10 @@ async fn agent_worker(
                 if !send_command_result_events(&events, &result, history.estimated_tokens()) {
                     return;
                 }
-                if result.open_provider_picker
+                if let Some(stage) = result.open_picker
                     && events
                         .send(AgentEvent::ProviderPicker(
-                            cfg.provider_catalog.descriptors(),
+                            provider_state.route_picker(stage),
                         ))
                         .is_err()
                 {
@@ -1398,7 +1398,7 @@ mod tests {
             task_graph: Some(snapshot(7, 0)),
             quit: false,
             route_changed: false,
-            open_provider_picker: false,
+            open_picker: None,
         };
         assert!(send_command_result_events(&tx, &result, 40_000));
         assert!(matches!(

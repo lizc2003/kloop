@@ -37,7 +37,10 @@ pub enum AgentEvent {
     /// ProviderChanged may arrive while this operation is still settling; it
     /// updates the idle selection but must not rewrite this snapshot.
     RouteFrozen(kloop_protocol::ActiveProviderRoute),
-    ProviderPicker(Vec<kloop_protocol::ProviderDescriptor>),
+    /// Open the route picker on this payload. The stage inside it is the entry
+    /// point the command named (`/provider`, `/model`, `/effort`), and Esc there
+    /// closes the panel instead of descending a level that command never offered.
+    ProviderPicker(kloop_core::provider_route::RoutePicker),
     ClearTranscript,
     /// `/exit` ran on the worker; the UI loop quits (same clean teardown as a
     /// two-tap Ctrl+C).

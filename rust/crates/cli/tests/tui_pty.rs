@@ -507,6 +507,45 @@ async fn one_tool_call_and_its_result_fill_the_screen() -> Result<()> {
     Ok(())
 }
 
+/// The route picker's last stage, whole screen. Which levels it lists is unit
+/// tested; what seven rows of label-plus-detail actually look like stacked above
+/// the composer — and that `unset` and `none` read as the different things they
+/// are — only shows here. `tui-pty-model` declares no `efforts`, so this is the
+/// undeclared case: all six levels plus `unset`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_effort_picker_fills_the_screen() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("unused")]).await;
+    let mut harness = spawn(&fixture, 24, 80)?;
+    wait_for_boot(&mut harness)?;
+
+    // `/` opens the completion menu, which eats the first Enter; Tab completes
+    // the entry and closes it, and the summary line leaving the screen is how
+    // this test knows the next Enter will submit.
+    harness.write(b"/effort")?;
+    harness.wait_for("slash menu filtered", Duration::from_secs(3), |frame| {
+        frame.contains(SUMMARY)
+    })?;
+    harness.write(b"\t")?;
+    harness.wait_for("slash menu closed", Duration::from_secs(3), |frame| {
+        !frame.contains(SUMMARY)
+    })?;
+    harness.write(ENTER)?;
+
+    let settled =
+        harness.wait_for_quiescent("picker settles", Duration::from_secs(5), QUIET, |frame| {
+            frame.contains("How much reasoning?")
+        })?;
+    insta::assert_snapshot!("effort_picker_24x80", settled.stable_text());
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// The `/effort` row's summary in the slash menu, used above as "the menu is
+/// open" and then as "the menu is gone".
+const SUMMARY: &str = "show or set the session reasoning effort";
+
 /// A result longer than the preview cap. The transcript must show the first few
 /// lines and say how much it dropped, rather than letting a long file push the
 /// composer off the bottom — the "…more" hint is exactly the kind of detail a

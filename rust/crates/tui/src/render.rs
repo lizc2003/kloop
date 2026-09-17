@@ -20,6 +20,7 @@ use kloop_core::permissions::ConfirmRequest;
 use kloop_core::tools::TaskGraphSnapshot;
 use kloop_core::tools::TaskGraphTask;
 use kloop_core::tools::TaskStatus;
+use kloop_protocol::RoutePickerStage;
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -1234,31 +1235,22 @@ fn question_panel(question: &PendingQuestion, width: usize) -> choice::Panel {
 }
 
 fn provider_panel(app: &App, picker: &ProviderPicker) -> choice::Panel {
-    match picker.model_cursor {
-        Some(cursor) => {
-            let provider = &picker.providers[picker.provider_cursor];
-            choice::Panel {
-                header: format!("Model · {}", provider.id),
-                items: provider
-                    .models
-                    .iter()
-                    .map(|model| {
-                        if model == &provider.default_model {
-                            choice::Item::with_detail(model.clone(), "default")
-                        } else {
-                            choice::Item::new(model.clone())
-                        }
-                    })
-                    .collect(),
-                cursor,
-                prompt: Some("Which model?".to_string()),
-                hint: "Enter select · ↑↓ move · 1-9 pick · Esc back".to_string(),
-                ..choice::Panel::default()
-            }
+    // Esc at the entry stage closes the panel, so the hint has to say so: the
+    // same key is "back" two stages in and "cancel" at the one the command
+    // opened.
+    let hint = format!(
+        "Enter select · ↑↓ move · 1-9 pick · Esc {}",
+        if picker.stage == picker.catalog.stage {
+            "cancel"
+        } else {
+            "back"
         }
-        None => choice::Panel {
+    );
+    match picker.stage {
+        RoutePickerStage::Provider => choice::Panel {
             header: "Provider".to_string(),
             items: picker
+                .catalog
                 .providers
                 .iter()
                 .map(|provider| {
@@ -1274,9 +1266,63 @@ fn provider_panel(app: &App, picker: &ProviderPicker) -> choice::Panel {
                 .collect(),
             cursor: picker.provider_cursor,
             prompt: Some("Which provider?".to_string()),
-            hint: "Enter select · ↑↓ move · 1-9 pick · Esc cancel".to_string(),
+            hint,
             ..choice::Panel::default()
         },
+        RoutePickerStage::Model => choice::Panel {
+            header: format!("Model · {}", picker.provider().id),
+            items: picker
+                .models()
+                .iter()
+                .map(|model| {
+                    if model == &picker.provider().default_model {
+                        choice::Item::with_detail(model.clone(), "default")
+                    } else {
+                        choice::Item::new(model.clone())
+                    }
+                })
+                .collect(),
+            cursor: picker.model_cursor,
+            prompt: Some("Which model?".to_string()),
+            hint,
+            ..choice::Panel::default()
+        },
+        RoutePickerStage::Effort => choice::Panel {
+            header: format!("Effort · {}", picker.model()),
+            items: picker
+                .efforts()
+                .into_iter()
+                .map(|choice| {
+                    choice::Item::with_detail(
+                        kloop_protocol::ReasoningEffort::choice_str(choice).to_string(),
+                        effort_detail(choice),
+                    )
+                })
+                .collect(),
+            cursor: picker.effort_cursor,
+            prompt: Some("How much reasoning?".to_string()),
+            hint,
+            ..choice::Panel::default()
+        },
+    }
+}
+
+/// One line of plain language per level, kept to a single row so seven of them
+/// still fit above the composer. `unset` and `none` are the pair people read as
+/// synonyms and are not — measured 2026-09-17, a model asked with no field still
+/// reasoned where `none` zeroed it — so their two lines say which is which.
+/// `max` carries the warning its own measurement earned: two runs of one
+/// question came back eight times apart.
+fn effort_detail(choice: Option<kloop_protocol::ReasoningEffort>) -> &'static str {
+    use kloop_protocol::ReasoningEffort;
+    match choice {
+        None => "send no effort field — the provider's own default applies",
+        Some(ReasoningEffort::None) => "do no reasoning at all",
+        Some(ReasoningEffort::Low) => "think briefly",
+        Some(ReasoningEffort::Medium) => "think a moderate amount",
+        Some(ReasoningEffort::High) => "think hard",
+        Some(ReasoningEffort::XHigh) => "think harder",
+        Some(ReasoningEffort::Max) => "think longest — measured cost is unpredictable",
     }
 }
 

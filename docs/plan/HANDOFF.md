@@ -20,7 +20,7 @@ plan 文件里写够了开工所需的一切;**八条互相独立、可任意顺
 | ~~**155** 改大文件的一行,先付六次读~~ ✅ | `edit_file` 的资格从"读过全文"放宽到"读过一次" | 中 | 2026-09-16 完成。plan 49 那条裁决**推翻了**(用户同意;完整读买到的安全性比看起来少——"改到两个长得一样的地方里错的那个"是 `old_string` **唯一性**挡住的)。但**形状不是 plan 设计的那个**:用户一句「看参考项目」→ 五家里**没有一家实现区间资格**,cc/codewhale/dsh 都只要"读过一次"、grok 把 `skip_read_before_edit` 退成 "Deprecated runtime no-op"、codex 什么都不要求。于是 `ReadRequirement::{CompleteFile,CompleteNotebook,AnyRead}`,第六节四个坑里三个直接消失。实测 18 次读 / ~122k tok → 3 次读 / ~1.8k tok,教训 150 |
 | ~~**156** 三件小事,各值一次提交~~ ✅ | `bash` 补 `description`;沙箱 deny 配对加回归测试;edit 拒绝时报出该读哪一段 | 小 | 2026-09-16 完成,三次提交(三件都做了)。**第二件的前提说错了一半**:既有测试早就断言了那两条 deny,缺的是"普遍不变量"而不是"任何测试";**第三件 plan 给的提示词是错的**,照着读解不开锁,换成"第一行没读过的行"并加了一条"照提示读完 edit 真的成功"的测试,教训 148。第四件(图片按像素降采样)问了用户,**做了**——查官方 vision 文档时两个数推翻了原判断,见教训 149 |
 | ~~**158** 模型的事实,被当成了用户配置~~ ✅ | provider schema 重做:`[models.x]` 知识段、`providers`/`provider` 改名、`default_model`→`model`、删顶层 `model`/`effort` 与 `fallback_model`、切换后重算预算 | 大 | **2026-09-17 排定,用户已逐点拍板**,开工前没有待定项。破坏性变更、不做兼容。**2026-09-17 完成,两次提交**(改名与删除一次、知识段与预算一次)。plan 里"窗口 = min(模型, 网关, 200k 兜底)"的措辞是错的,兜底不能参与 min——参与的话声明真实 1M 也会在 200k 压缩,实现时纠正。`models` 可省略这条语法糖此前根本没实现(一直是 required),写验收测试才逼出来。第 6 项比估计轻:`clone_with_provider_route` 本来就是切换的重建点,只需给 Config 加一条"预算能否被重算"|
-| **159** 选 provider、选 model、选 effort,是同一条路的三个入口 | picker 补第三级 effort;新 `/model` 入口;三个命令按起始层级分工 | 中 | **2026-09-17 排定**,用户拍板「/effort 可以保留,表示在当前 model 上进行选择」。前两级(provider/model)plan 104 已经做完,本 plan 只补 effort 级 + 两个新起点。effort 列表接 plan 158 的 `[models.x].efforts` |
+| ~~**159** 选 provider、选 model、选 effort,是同一条路的三个入口~~ ✅ | picker 补第三级 effort;新 `/model` 入口;三个命令按起始层级分工 | 中 | **2026-09-17 排定并完成,一次提交**。验收全过。两件 plan 没写到的:① **`/provider` 在第一个 turn 之前本来就是坏的**(空时间线,`append_provider_route_changed` 拒收;只有 `/effort` 会先 `ensure_initial_provider_route`),而 picker 恰好把它变成最常走的入口——三个入口现在共用 `commands/provider.rs::apply`,guard 在里面,留了回归探针;② "一条命令一条修订"逼着 `commit_effort` 和 `switch_with` 合并成一条写入口(`EffortRequest`),教训 155。另外多了一张整屏基线 `effort_picker_24x80` |
 
 **同一轮调研里查过但不立 plan 的一条**:grok 记录了 macOS Seatbelt 的 `mv x y && cat y`
 绕过(deny 按路径,文件被移出被 deny 的路径就绕过了)。查下来 kloop **已经防住**——
@@ -1215,3 +1215,20 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    配套的一条:**兜底默认值绝不能参与 min。** 我在 plan 里写成了 "min(模型, 网关, 200k)",
    照那样实现的话,声明一个真实的 1M 窗口仍然会在 200k 压缩,声明就白写了。兜底是"两边都没
    声明时的地板",不是第三个候选值。
+
+155. **"一件事只留一条记录"这个要求,落到实现上往往是"两个写入口必须合并",不是"调用方少发一次"。**
+   plan 159 要求 picker 走完三级只产生一个 route revision。表面看是 UI 的事(别发两条命令),
+   但 `/provider a m high` 这一条命令本身就要同时改路由和 effort,而
+   `SessionProviderState` 当时有**两个**写同一条时间线的入口:`switch_with`(切换)和
+   `commit_effort`(档位)。只让 UI 少发一条,命令层还是得先切换再设 effort = 还是两条 receipt。
+   真正的解是让 `switch_with` 收一个 `EffortRequest`,`commit_effort` 整个删掉,`/effort` 也走
+   这条路——三个命令于是真的是一条路的三个入口,而不只是 UI 上看着像。
+   **合并时最容易漏的是那个"无事发生"的早退**:`switch_with` 原本"同路由就 NoOp",合并后必须
+   改成"同路由**且同 effort** 才 NoOp",否则 `/effort` 从这条路走会被静默吃掉。判据:给一个
+   已有的变更原语加一个新维度时,把它所有的 early-return 条件都重读一遍——它们是按旧维度写的,
+   每一条都可能因为少问一句而吞掉新维度的变更。
+   配套的一条:**把一个入口从"偶尔有人用"提升成"最常走的门"之前,把它邻居悄悄替它满足的前提
+   重查一遍。** 同一次改动里发现 `/provider` 在第一个 turn 之前一直是坏的——
+   `append_provider_route_changed` 拒绝空时间线,而只有 `commands/effort.rs` 会先调
+   `ensure_initial_provider_route`。这个洞能潜伏,正是因为 `/provider` 之前几乎只在会话跑起来
+   之后才被敲;picker 一做,"开会话第一件事就选 provider"变成主路径,它立刻是必经之路。

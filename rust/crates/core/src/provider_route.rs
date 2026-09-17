@@ -12,6 +12,7 @@ use kloop_protocol::ProviderDescriptor;
 use kloop_protocol::ProviderResponseProvenance;
 use kloop_protocol::ReasoningContinuity;
 use kloop_protocol::ReasoningEffort;
+use kloop_protocol::RoutePickerStage;
 use kloop_provider::Provider;
 
 pub type ProviderFactory =
@@ -102,6 +103,7 @@ impl ProviderCatalog {
                 default_model,
                 models,
                 availability: entry.availability,
+                default_effort: entry.default_effort,
             };
             if catalog
                 .insert(
@@ -179,6 +181,17 @@ impl ProviderCatalog {
 
     pub fn declared_efforts(&self, model: &str) -> Option<&[ReasoningEffort]> {
         self.model_knowledge.get(model)?.efforts.as_deref()
+    }
+
+    /// Every declared effort list, by model. Only models that declared one
+    /// appear — absence is what "no limit" looks like, so an empty entry would
+    /// read as the opposite. Handed to a front-end whole, because the picker
+    /// walks models the session has not switched to yet.
+    pub fn declared_effort_table(&self) -> BTreeMap<String, Vec<ReasoningEffort>> {
+        self.model_knowledge
+            .iter()
+            .filter_map(|(model, knowledge)| Some((model.clone(), knowledge.efforts.clone()?)))
+            .collect()
     }
 
     pub fn from_provider(
@@ -615,80 +628,63 @@ impl SessionProviderState {
         self.state.lock().unwrap().remembered_models.clone()
     }
 
-    pub fn preflight(&self, provider_id: &str, model: Option<&str>) -> Result<(), SwitchError> {
-        let target_model = {
-            let state = self.state.lock().unwrap();
-            let descriptor = self
-                .catalog
-                .descriptor(provider_id)
-                .ok_or_else(|| SwitchError::UnknownProvider(provider_id.to_string()))?;
+    /// Which model a switch to `provider_id` would land on: the one named, else
+    /// the one this session last used there, else the provider's default. None
+    /// when no such provider is configured. Callers that need the model *before*
+    /// committing — the effort check is one, since the target model's declared
+    /// list is the one that governs — ask here rather than re-deriving the rule.
+    pub fn target_model(&self, provider_id: &str, model: Option<&str>) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        let descriptor = self.catalog.descriptor(provider_id)?;
+        Some(
             model
                 .map(str::to_string)
                 .or_else(|| state.remembered_models.get(provider_id).cloned())
-                .unwrap_or(descriptor.default_model)
-        };
+                .unwrap_or(descriptor.default_model),
+        )
+    }
+
+    pub fn preflight(&self, provider_id: &str, model: Option<&str>) -> Result<(), SwitchError> {
+        let target_model = self
+            .target_model(provider_id, model)
+            .ok_or_else(|| SwitchError::UnknownProvider(provider_id.to_string()))?;
         self.catalog.resolve(provider_id, &target_model).map(|_| ())
     }
 
-    /// Change the session's reasoning effort as a route revision. `/effort` is a
-    /// user decision that changes what every later request looks like, so it
-    /// belongs on the same timeline as a provider switch rather than mutating
-    /// state invisibly — a transcript that recorded only the opening effort
-    /// would state it with confidence and be wrong. `commit` writes the receipt
-    /// and may refuse; nothing lands unless it succeeds. `Ok(None)` means the
-    /// value was already this.
-    pub fn commit_effort<E>(
-        &self,
-        effort: Option<ReasoningEffort>,
-        commit: impl FnOnce(&FrozenProviderRoute) -> Result<(), E>,
-    ) -> Result<Option<FrozenProviderRoute>, E> {
-        let mut state = self.state.lock().unwrap();
-        if state.effort == effort {
-            state.effort_pinned = true;
-            return Ok(None);
+    /// The picker payload for one entry stage: the catalog, what every model
+    /// declared, and where the session sits right now. Built in one shot because
+    /// the picker walks providers and models the session is not on.
+    pub fn route_picker(&self, stage: RoutePickerStage) -> RoutePicker {
+        RoutePicker {
+            stage,
+            providers: self.catalog.descriptors(),
+            declared_efforts: self.catalog.declared_effort_table(),
+            active: self.active_route(),
         }
-        let Some(next_revision) = state.revision.checked_add(1) else {
-            // Out of revisions is not a reason to lose the user's choice: apply
-            // it in memory, unrecorded, exactly as before this method existed.
-            state.effort = effort;
-            state.effort_pinned = true;
-            return Ok(None);
-        };
-        // Same provider, same model: nothing about reasoning replay changes, so
-        // the continuity this route already carries rides forward untouched.
-        let next = FrozenProviderRoute::with_continuity(
-            next_revision,
-            state.active.clone(),
-            state.continuity,
-            effort,
-        );
-        commit(&next)?;
-        state.revision = next_revision;
-        state.effort = effort;
-        state.effort_pinned = true;
-        Ok(Some(next))
     }
 
+    /// Move the session onto a route, with the reasoning effort decided in the
+    /// same step. One call and therefore **one revision**: `/provider a m high`
+    /// splits into a switch and an effort change only on a timeline, where it
+    /// would read months later as a user who changed their mind twice.
+    ///
+    /// `commit` writes the receipt and may refuse; nothing lands unless it
+    /// succeeds. It sees both routes, so it can tell an effort-only revision
+    /// (same route) from a real switch and pick the continuity accordingly.
     pub fn switch_with<E>(
         &self,
         expected_revision: u64,
         provider_id: &str,
         model: Option<&str>,
+        effort: EffortRequest,
         commit: impl FnOnce(
             &FrozenProviderRoute,
             &FrozenProviderRoute,
         ) -> Result<ReasoningContinuity, E>,
     ) -> Result<SwitchOutcome, SwitchCommitError<E>> {
-        let target_model = {
-            let state = self.state.lock().unwrap();
-            let descriptor = self.catalog.descriptor(provider_id).ok_or_else(|| {
-                SwitchCommitError::Switch(SwitchError::UnknownProvider(provider_id.to_string()))
-            })?;
-            model
-                .map(str::to_string)
-                .or_else(|| state.remembered_models.get(provider_id).cloned())
-                .unwrap_or(descriptor.default_model)
-        };
+        let target_model = self.target_model(provider_id, model).ok_or_else(|| {
+            SwitchCommitError::Switch(SwitchError::UnknownProvider(provider_id.to_string()))
+        })?;
         let target = self
             .catalog
             .resolve(provider_id, &target_model)
@@ -701,11 +697,24 @@ impl SessionProviderState {
                 actual: state.revision,
             }));
         }
-        if state.active.provider_id == target.provider_id
+        let same_route = state.active.provider_id == target.provider_id
             && state.active.primary_model == target.primary_model
             && state.active.api_family == target.api_family
-            && state.active.endpoint_fingerprint == target.endpoint_fingerprint
-        {
+            && state.active.endpoint_fingerprint == target.endpoint_fingerprint;
+        // A named level wins outright. Otherwise: staying on the same route
+        // changes nothing, and crossing to another provider keeps a pinned
+        // choice (once `/effort` has spoken it travels with the session) or
+        // follows the target's configured value. A model that refuses the level
+        // says so on the next turn — kloop does not second-guess it here (see
+        // `set_effort`).
+        let next_effort = match effort {
+            EffortRequest::Set(level) => level,
+            EffortRequest::Inherit if same_route || state.effort_pinned => state.effort,
+            EffortRequest::Inherit => self.catalog.default_effort(provider_id),
+        };
+        let pins = matches!(effort, EffortRequest::Set(_));
+        if same_route && next_effort == state.effort {
+            state.effort_pinned |= pins;
             return Ok(SwitchOutcome::NoOp(FrozenProviderRoute::with_continuity(
                 state.revision,
                 state.active.clone(),
@@ -713,25 +722,29 @@ impl SessionProviderState {
                 state.effort,
             )));
         }
-        let next_revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| SwitchCommitError::Switch(SwitchError::RevisionExhausted))?;
+        let Some(next_revision) = state.revision.checked_add(1) else {
+            // Out of revisions is not a reason to lose the user's choice when
+            // only the effort moves: apply it in memory, unrecorded. A real
+            // switch cannot do that — the route requests go to has to be the
+            // route the last receipt names.
+            if same_route {
+                state.effort = next_effort;
+                state.effort_pinned |= pins;
+                return Ok(SwitchOutcome::NoOp(FrozenProviderRoute::with_continuity(
+                    state.revision,
+                    state.active.clone(),
+                    state.continuity,
+                    state.effort,
+                )));
+            }
+            return Err(SwitchCommitError::Switch(SwitchError::RevisionExhausted));
+        };
         let previous = FrozenProviderRoute::with_continuity(
             state.revision,
             state.active.clone(),
             state.continuity,
             state.effort,
         );
-        // An unpinned session follows the target's configured effort; once
-        // `/effort` has spoken, the user's choice travels with the session. A
-        // model that refuses the level says so on the next turn — kloop does not
-        // second-guess it here (see `set_effort`).
-        let next_effort = if state.effort_pinned {
-            state.effort
-        } else {
-            self.catalog.default_effort(provider_id)
-        };
         let tentative = FrozenProviderRoute::new(next_revision, target.clone(), next_effort);
         let continuity = commit(&previous, &tentative).map_err(SwitchCommitError::Commit)?;
         let next = FrozenProviderRoute::with_continuity(
@@ -744,6 +757,7 @@ impl SessionProviderState {
         state.active = target;
         state.continuity = continuity;
         state.effort = next_effort;
+        state.effort_pinned |= pins;
         state
             .remembered_models
             .insert(provider_id.to_string(), target_model);
@@ -829,6 +843,17 @@ impl FrozenProviderRoute {
 
     pub fn effort(&self) -> Option<ReasoningEffort> {
         self.effort
+    }
+
+    /// Whether both sides name the same route — provider, model, rail and
+    /// endpoint. Revision and effort are not route identity, so a revision that
+    /// moves only the effort answers true here, which is how a commit tells an
+    /// effort change from a switch.
+    pub fn same_route(&self, other: &Self) -> bool {
+        self.route.provider_id == other.route.provider_id
+            && self.route.primary_model == other.route.primary_model
+            && self.route.api_family == other.route.api_family
+            && self.route.endpoint_fingerprint == other.route.endpoint_fingerprint
     }
 
     pub fn revision(&self) -> u64 {
@@ -1013,6 +1038,43 @@ impl FrozenProviderAttempt {
             endpoint_fingerprint: self.identity.endpoint_fingerprint.clone(),
             model: self.identity.model.clone(),
         }
+    }
+}
+
+/// What a route change does with the session's reasoning effort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffortRequest {
+    /// No level was named: the session keeps its own, or adopts the target
+    /// provider's configured value when `/effort` has never spoken.
+    Inherit,
+    /// A level — or `unset`, the `None` inside — named in the same command, so
+    /// it lands in the same revision as the route it came with.
+    Set(Option<ReasoningEffort>),
+}
+
+/// Everything the route picker needs to run all three of its stages without
+/// asking the session again. Built when a command opens the picker: the front-end
+/// walks providers and models the session is not on, so it cannot read the
+/// answers off the active route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutePicker {
+    /// Where this entry point starts — and, because Esc there closes the panel,
+    /// how far back it can go.
+    pub stage: RoutePickerStage,
+    pub providers: Vec<ProviderDescriptor>,
+    /// `[models."<id>"].efforts`, by model; absent means undeclared, which means
+    /// no limit (see [`ProviderCatalog::effort_supported`]).
+    pub declared_efforts: BTreeMap<String, Vec<ReasoningEffort>>,
+    /// Where the session sits now: the provider and model `/model` and `/effort`
+    /// start inside, and the effort the last stage's cursor opens on.
+    pub active: ActiveProviderRoute,
+}
+
+impl RoutePicker {
+    /// What the effort stage lists for one model: `unset`, then what the model
+    /// declared — everything when it declared nothing.
+    pub fn effort_choices(&self, model: &str) -> Vec<Option<ReasoningEffort>> {
+        ReasoningEffort::choices(self.declared_efforts.get(model).map(Vec::as_slice))
     }
 }
 
@@ -1412,11 +1474,17 @@ mod tests {
         );
         let state = SessionProviderState::new(catalog, "a", None).unwrap();
         let outcome = state
-            .switch_with(1, "b", Some("b2"), |previous, next| {
-                assert_eq!(previous.primary_model(), "a1");
-                assert_eq!(next.revision(), 2);
-                Ok::<_, ()>(ReasoningContinuity::Filtered)
-            })
+            .switch_with(
+                1,
+                "b",
+                Some("b2"),
+                EffortRequest::Inherit,
+                |previous, next| {
+                    assert_eq!(previous.primary_model(), "a1");
+                    assert_eq!(next.revision(), 2);
+                    Ok::<_, ()>(ReasoningContinuity::Filtered)
+                },
+            )
             .unwrap();
         assert!(matches!(outcome, SwitchOutcome::Changed { .. }));
         assert_eq!(state.active_route().model, "b2");
@@ -1433,7 +1501,7 @@ mod tests {
             .unwrap(),
         );
         let state = SessionProviderState::new(catalog, "a", None).unwrap();
-        let result = state.switch_with(1, "b", None, |_, _| {
+        let result = state.switch_with(1, "b", None, EffortRequest::Inherit, |_, _| {
             Err::<ReasoningContinuity, _>("persist")
         });
         assert!(matches!(result, Err(SwitchCommitError::Commit("persist"))));
@@ -1442,7 +1510,7 @@ mod tests {
 
         let mut called = false;
         let outcome = state
-            .switch_with(1, "a", None, |_, _| {
+            .switch_with(1, "a", None, EffortRequest::Inherit, |_, _| {
                 called = true;
                 Ok::<_, ()>(ReasoningContinuity::Preserved)
             })
@@ -1516,7 +1584,7 @@ mod tests {
         };
         let switch = |state: &SessionProviderState, to: &str, revision: u64| {
             state
-                .switch_with(revision, to, None, |_, _| {
+                .switch_with(revision, to, None, EffortRequest::Inherit, |_, _| {
                     Ok::<_, ()>(ReasoningContinuity::Filtered)
                 })
                 .unwrap()

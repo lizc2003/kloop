@@ -30,6 +30,7 @@ mod exit;
 mod help;
 #[path = "loop.rs"]
 mod loop_command;
+mod model;
 mod provider;
 mod skills;
 
@@ -52,7 +53,11 @@ pub struct SlashResult {
     /// model switch, or a new reasoning effort. The front-ends answer it by
     /// re-freezing `cfg` from the session provider state.
     pub route_changed: bool,
-    pub open_provider_picker: bool,
+    /// The front-end should open the route picker at this stage. `/provider`,
+    /// `/model` and `/effort` are three entry points into one wizard, and the
+    /// stage is what distinguishes them; a front-end without a picker ignores it
+    /// and shows `output`, which is why each of the three also prints its list.
+    pub open_picker: Option<kloop_protocol::RoutePickerStage>,
 }
 
 impl SlashResult {
@@ -67,7 +72,7 @@ impl SlashResult {
             task_graph: None,
             quit: false,
             route_changed: false,
-            open_provider_picker: false,
+            open_picker: None,
         }
     }
 
@@ -80,7 +85,7 @@ impl SlashResult {
             task_graph: Some(task_graph),
             quit: false,
             route_changed: false,
-            open_provider_picker: false,
+            open_picker: None,
         }
     }
 
@@ -93,11 +98,15 @@ impl SlashResult {
             task_graph: None,
             quit: false,
             route_changed: false,
-            open_provider_picker: false,
+            open_picker: None,
         }
     }
 
-    fn route(output: impl Into<String>, changed: bool, open_picker: bool) -> Self {
+    fn route(
+        output: impl Into<String>,
+        changed: bool,
+        open_picker: Option<kloop_protocol::RoutePickerStage>,
+    ) -> Self {
         Self {
             output: output.into(),
             cleared: false,
@@ -105,7 +114,7 @@ impl SlashResult {
             task_graph: None,
             quit: false,
             route_changed: changed,
-            open_provider_picker: open_picker,
+            open_picker,
         }
     }
 
@@ -118,7 +127,7 @@ impl SlashResult {
             task_graph: None,
             quit: true,
             route_changed: false,
-            open_provider_picker: false,
+            open_picker: None,
         }
     }
 }
@@ -139,6 +148,10 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "provider",
         summary: provider::SUMMARY,
+    },
+    Builtin {
+        name: "model",
+        summary: model::SUMMARY,
     },
     Builtin {
         name: "effort",
@@ -214,6 +227,7 @@ pub async fn run_with_provider_state(
     match name {
         "help" => help::run(cfg),
         "provider" => provider::run(args, history, cfg, provider_state),
+        "model" => model::run(args, history, cfg, provider_state),
         "effort" => effort::run(args, history, cfg, provider_state),
         "cost" => cost::run(history, cfg),
         "compact" => compact::run(history, cfg, ui, cancel).await,
@@ -691,7 +705,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /skills, /exit)"
+                "unknown command '/frobnicate' (available: /help, /provider, /model, /effort, /cost, /compact, /clear, /loop, /skills, /exit)"
             )
         );
     }
@@ -737,7 +751,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /greet)"
+                "unknown command '/nope' (available: /help, /provider, /model, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /greet)"
             )
         );
     }
@@ -897,7 +911,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /deploy)"
+                "unknown command '/nope' (available: /help, /provider, /model, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /deploy)"
             )
         );
     }
@@ -1189,6 +1203,253 @@ mod tests {
         );
     }
 
+    /// Regression probe kept because it is the bug the picker would have walked
+    /// into: `append_provider_route_changed` refuses an empty timeline, so a
+    /// route change before the first turn only works because the command opens
+    /// the timeline first. `/effort` always did; `/provider` never did.
+    #[tokio::test]
+    async fn a_route_change_before_the_first_turn_needs_the_timeline_opened() {
+        let state =
+            crate::provider_route::SessionProviderState::new(route_catalog(), "a", None).unwrap();
+        let mut history = History::new(route_cfg(&state).offload_dir.clone());
+        let error = history
+            .switch_provider(
+                &state,
+                1,
+                "b",
+                None,
+                crate::provider_route::EffortRequest::Inherit,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "provider route persistence failed: history provider route timeline is missing"
+        );
+    }
+
+    /// Two providers, `b2` declaring a narrow effort list, for the entry points
+    /// that have to cross between them.
+    fn route_catalog() -> Arc<crate::provider_route::ProviderCatalog> {
+        let entry = |id: &str, models: &[&str]| crate::provider_route::ProviderCatalogEntry {
+            id: id.into(),
+            api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
+            endpoint_fingerprint: format!("responses:{id}"),
+            default_model: models[0].into(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            context_window: None,
+            availability: kloop_protocol::ProviderAvailabilityCode::Ready,
+            default_effort: None,
+            factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
+        };
+        Arc::new(
+            crate::provider_route::ProviderCatalog::new(vec![
+                entry("a", &["a1", "a2"]),
+                entry("b", &["b1", "b2"]),
+            ])
+            .unwrap()
+            .with_model_knowledge(std::collections::BTreeMap::from([(
+                "b2".to_string(),
+                crate::provider_route::ModelKnowledge {
+                    context_window: None,
+                    efforts: Some(vec![
+                        kloop_protocol::ReasoningEffort::Low,
+                        kloop_protocol::ReasoningEffort::High,
+                    ]),
+                },
+            )])),
+        )
+    }
+
+    /// A cfg whose frozen route is the one this session actually opens on:
+    /// production hands both the same catalog, and the timeline's first receipt
+    /// comes off `cfg`.
+    fn route_cfg(state: &crate::provider_route::SessionProviderState) -> Arc<Config> {
+        let base = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        Arc::new(base.clone_with_provider_route(state.freeze()))
+    }
+
+    fn route_timeline(
+        history: &History,
+    ) -> Vec<(u64, String, String, Option<kloop_protocol::ReasoningEffort>)> {
+        history
+            .provider_routes()
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.revision,
+                    receipt.provider_id.clone(),
+                    receipt.primary_model.clone(),
+                    receipt.effort,
+                )
+            })
+            .collect()
+    }
+
+    /// The picker walks three stages and sends **one** line, so provider, model
+    /// and effort have to land as one revision. Splitting them would leave a
+    /// timeline that reads, months later, as a user who changed their mind
+    /// twice.
+    #[tokio::test]
+    async fn one_command_moves_provider_model_and_effort_in_a_single_revision() {
+        let state =
+            crate::provider_route::SessionProviderState::new(route_catalog(), "a", None).unwrap();
+        let cfg = route_cfg(&state);
+        let mut history = History::new(cfg.offload_dir.clone());
+        let cancel = CancellationToken::new();
+        let run = async |line: &str, history: &mut History| {
+            run_with_provider_state(line, history, &cfg, &state, &SilentUi, &cancel).await
+        };
+
+        // Before the first turn there is no timeline yet; choosing a route opens
+        // it, which is the normal way a session starts.
+        assert!(!history.has_provider_route());
+        let switched = run("/provider b b2 high", &mut history).await;
+        assert!(switched.route_changed);
+        assert_eq!(
+            switched.output,
+            "provider switched: b b2 (revision 2, reasoning continuity: Preserved, effort: high)"
+        );
+
+        // Same route, new level: still one revision, and the timeline says which
+        // stretch ran at which effort.
+        assert!(run("/provider b b2 low", &mut history).await.route_changed);
+        // Same route, same level: nothing to record.
+        assert!(!run("/provider b b2 low", &mut history).await.route_changed);
+        // `/model` and `/effort` are the same road from further in.
+        assert!(run("/model b1 unset", &mut history).await.route_changed);
+        assert!(run("/effort max", &mut history).await.route_changed);
+
+        assert_eq!(
+            route_timeline(&history),
+            vec![
+                (1, "a".into(), "a1".into(), None),
+                (
+                    2,
+                    "b".into(),
+                    "b2".into(),
+                    Some(kloop_protocol::ReasoningEffort::High)
+                ),
+                (
+                    3,
+                    "b".into(),
+                    "b2".into(),
+                    Some(kloop_protocol::ReasoningEffort::Low)
+                ),
+                (4, "b".into(), "b1".into(), None),
+                (
+                    5,
+                    "b".into(),
+                    "b1".into(),
+                    Some(kloop_protocol::ReasoningEffort::Max)
+                ),
+            ]
+        );
+    }
+
+    /// The declared list governs the model being switched *to*, not the one
+    /// being left: a switch can land on a narrower list than it started from,
+    /// and finding that out from a 400 mid-turn is the cost this check avoids.
+    #[tokio::test]
+    async fn a_named_effort_is_checked_against_the_model_the_command_lands_on() {
+        let state =
+            crate::provider_route::SessionProviderState::new(route_catalog(), "a", None).unwrap();
+        let cfg = route_cfg(&state);
+        let mut history = History::new(cfg.offload_dir.clone());
+        let cancel = CancellationToken::new();
+        let run = async |line: &str, history: &mut History| {
+            run_with_provider_state(line, history, &cfg, &state, &SilentUi, &cancel).await
+        };
+
+        // `a1` declares nothing, so `max` passes there.
+        assert!(run("/effort max", &mut history).await.route_changed);
+        let refused = run("/provider b b2 max", &mut history).await;
+        assert_eq!(
+            refused,
+            SlashResult::message(
+                "provider switch failed: 'max' is not among the efforts declared for model 'b2' \
+                 (low, high)"
+            )
+        );
+        assert_eq!(state.active_route().provider_id, "a");
+        let refused = run("/model b2 max", &mut history).await;
+        assert_eq!(
+            refused.output,
+            "model switch failed: 'max' is not among the efforts declared for model 'b2' (low, high)"
+        );
+        // The model's own list is the whole list — `/effort` says so too.
+        assert!(run("/provider b b2 high", &mut history).await.route_changed);
+        assert_eq!(
+            run("/effort", &mut history).await.output,
+            "effort: high (provider b)\n\
+             levels: unset, low, high — declared by model 'b2'\n\
+             usage: /effort <level> | /effort unset (send no effort field at all)"
+        );
+    }
+
+    /// Each of the three commands opens the wizard at its own stage, and each
+    /// prints its own list: a front-end without a picker ignores the stage, so
+    /// "pick one in the TUI" would leave it with nothing.
+    #[tokio::test]
+    async fn the_three_entry_points_each_open_a_stage_and_print_their_list() {
+        let state =
+            crate::provider_route::SessionProviderState::new(route_catalog(), "a", None).unwrap();
+        let cfg = route_cfg(&state);
+        let mut history = History::new(cfg.offload_dir.clone());
+        let cancel = CancellationToken::new();
+        let run = async |line: &str, history: &mut History| {
+            run_with_provider_state(line, history, &cfg, &state, &SilentUi, &cancel).await
+        };
+
+        let providers = run("/provider", &mut history).await;
+        assert_eq!(
+            providers,
+            SlashResult::route(
+                "active: a a1 (revision 1)\n\
+                 providers:\n  \
+                 a [responses] default=a1 models=a1,a2 availability=Ready\n  \
+                 b [responses] default=b1 models=b1,b2 availability=Ready\n\
+                 usage: /provider <provider> [model] [effort]",
+                /*changed*/ false,
+                Some(kloop_protocol::RoutePickerStage::Provider),
+            )
+        );
+
+        let models = run("/model", &mut history).await;
+        assert_eq!(
+            models,
+            SlashResult::route(
+                "active: a a1 (revision 1)\n\
+                 models on provider 'a':\n  \
+                 a1 (default)\n  \
+                 a2\n\
+                 usage: /model <model> [effort]",
+                /*changed*/ false,
+                Some(kloop_protocol::RoutePickerStage::Model),
+            )
+        );
+
+        let switched = run("/model a2", &mut history).await;
+        assert!(switched.route_changed);
+        assert_eq!(
+            switched.output,
+            "model switched: a2 (provider a, revision 2, reasoning continuity: Preserved, \
+             effort: unset)"
+        );
+        assert_eq!(
+            run("/model a2", &mut history).await.output,
+            "model unchanged: a2 (provider a, revision 2)"
+        );
+        assert_eq!(
+            run("/model nope", &mut history).await.output,
+            "model switch failed: unknown model 'nope' for provider 'a'"
+        );
+        assert_eq!(
+            run("/model a2 hgih", &mut history).await.output,
+            "unknown effort 'hgih' (known: none, low, medium, high, xhigh, max)\n\
+             usage: /model <model> [effort]"
+        );
+    }
+
     /// `/effort` reads and writes the session knob, enforcing only kloop's own
     /// spelling — which levels a model takes is the model's contract.
     #[tokio::test]
@@ -1218,15 +1479,19 @@ mod tests {
             run_with_provider_state(line, history, &cfg, &state, &SilentUi, &cancel).await
         };
 
+        // Bare: the status, the list this model would offer, the usage — and
+        // the picker stage for a front-end that has one.
         let shown = run("/effort", &mut history).await;
         assert_eq!(
             shown,
-            SlashResult::message(
+            SlashResult::route(
                 "effort: unset — no effort field is sent, the provider's own default applies \
                  (provider responses)\n\
-                 levels: none, low, medium, high, xhigh, max — a model accepts its own subset \
-                 and names it if you miss\n\
-                 usage: /effort <level> | /effort unset (send no effort field at all)"
+                 levels: unset, none, low, medium, high, xhigh, max — 'm1' declares none, so a \
+                 model accepts its own subset and names it if you miss\n\
+                 usage: /effort <level> | /effort unset (send no effort field at all)",
+                /*changed*/ false,
+                Some(kloop_protocol::RoutePickerStage::Effort),
             )
         );
 
@@ -1236,7 +1501,7 @@ mod tests {
             SlashResult::route(
                 "effort: medium (provider responses)",
                 /*changed*/ true,
-                /*open_picker*/ false,
+                /*open_picker*/ None,
             )
         );
         assert_eq!(

@@ -1,0 +1,29 @@
+---
+source: crates/cli/tests/tui_pty.rs
+expression: settled.stable_text()
+---
+[24x80 cursor=23,70]
+
+── Worked for <elapsed> ────────────────────────────────────────────────────────
+
+▌ Effort · tui-pty-model
+How much reasoning?
+> 1. unset
+     send no effort field — the provider's own default applies
+  2. none
+     do no reasoning at all
+  3. low
+     think briefly
+  4. medium
+     think a moderate amount
+  5. high
+     think hard
+  6. xhigh
+     think harder
+  7. max
+     think longest — measured cost is unpredictable
+Enter select · ↑↓ move · 1-9 pick · Esc cancel
+────────────────────────────────────────────────────────────────────────────────
+› Type a message…  (Shift+Enter for newline)
+────────────────────────────────────────────────────────────────────────────────
+[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit

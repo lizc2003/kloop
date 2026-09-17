@@ -482,6 +482,32 @@ impl ReasoningEffort {
         }
     }
 
+    /// The choices one model offers, `unset` first: `None` is "send no effort
+    /// field at all", which is not a level and no declaration can gate it — the
+    /// provider's own default applies, and that is measurably a third state
+    /// (a model asked with no field still reasoned where `none` zeroed it).
+    /// After it come the levels the model declared, in ladder order; a model
+    /// that declared nothing offers all six, the same "no declaration is no
+    /// limit" rule [`efforts`](crate::ReasoningEffort) validation uses. `none`
+    /// gets no exemption: on both OpenAI rails it is an ordinary wire value a
+    /// model can refuse, so it is listed only when the model listed it.
+    pub fn choices(declared: Option<&[ReasoningEffort]>) -> Vec<Option<ReasoningEffort>> {
+        std::iter::once(None)
+            .chain(
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .filter(|level| declared.is_none_or(|list| list.contains(level)))
+                    .map(Some),
+            )
+            .collect()
+    }
+
+    /// How a choice is spelled on a command line: `unset` for "no field".
+    pub fn choice_str(choice: Option<ReasoningEffort>) -> &'static str {
+        choice.map_or("unset", ReasoningEffort::as_str)
+    }
+
     /// Render a set for an error or help line: `none, low, medium, high, …`.
     pub fn join(levels: &[ReasoningEffort]) -> String {
         levels
@@ -542,6 +568,24 @@ pub struct ProviderDescriptor {
     pub default_model: String,
     pub models: Vec<String>,
     pub availability: ProviderAvailabilityCode,
+    /// The effort a session opens at on this provider. Carried here so the
+    /// route picker can fall back to it when the session's current level is not
+    /// on the selected model's list, without a second round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<ReasoningEffort>,
+}
+
+/// Which stage of the route picker a command opens at. The three commands are
+/// three entry points into one wizard — `/provider` at the top, `/model` inside
+/// the current provider, `/effort` on the current model — and Esc at the entry
+/// stage closes it rather than descending into a list that command never
+/// offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutePickerStage {
+    Provider,
+    Model,
+    Effort,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
