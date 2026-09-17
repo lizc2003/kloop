@@ -1014,6 +1014,34 @@ http_headers = { Authorization = "Bearer key" }
         assert!(error("[models.m]\ncontext_window = 0\n").contains("positive token count"));
     }
 
+    /// Real model ids contain dots (`gpt-5.6-sol`, `gpt-4.1`), so the table key
+    /// has to be quoted — bare `[models.gpt-5.6-sol]` is a nested table, not a
+    /// model named "gpt-5.6-sol". Quoted, it matches the model exactly; bare, it
+    /// fails closed rather than silently applying to nothing.
+    #[test]
+    fn dotted_model_ids_match_when_the_key_is_quoted() {
+        let with_id = |key: &str| {
+            format!(
+                "provider = \"g\"\n[providers.g]\nwire_api = \"responses\"\n\
+                 http_headers = {{ Authorization = \"Bearer k\" }}\n\
+                 model = \"gpt-5.6-sol\"\n[models.{key}]\ncontext_window = 400000\n"
+            )
+        };
+        assert_eq!(
+            resolve(Some(&with_id("\"gpt-5.6-sol\"")), &env(&[]))
+                .unwrap()
+                .initial_context_window(),
+            Some(400_000)
+        );
+        assert_eq!(
+            resolve(Some(&with_id("gpt-5.6-sol")), &env(&[]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "models.gpt-5 has unknown key '6-sol'"
+        );
+    }
+
     #[test]
     fn errors_never_echo_credentials() {
         for raw in [
