@@ -165,6 +165,68 @@ async fn accumulates_tool_calls_and_usage_across_chunks() {
     assert_eq!(ok.len(), 6);
 }
 
+/// A gateway may attach usage to BOTH the `finish_reason` frame and the
+/// trailing empty-choices frame (a GLM route sends two byte-identical copies).
+/// The stream survives that and reports the last one, which is the frame the
+/// `include_usage` contract calls final.
+#[tokio::test]
+async fn repeated_usage_keeps_the_last_report() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+                json!({
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 17,
+                        "completion_tokens": 120,
+                        "prompt_tokens_details": {"cached_tokens": 5},
+                        "cost": 4.617e-5,
+                        "total_tokens": 137
+                    }
+                }),
+                json!({
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 17,
+                        "completion_tokens": 126,
+                        "prompt_tokens_details": {"cached_tokens": 5},
+                        "cost": 4.617e-5,
+                        "total_tokens": 143
+                    }
+                }),
+            ],
+            true,
+        ),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(openai(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+
+    assert_eq!(
+        ok,
+        vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::BlockDone(AssistantBlock::Text { text: "hi".into() }),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::EndTurn,
+                usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 126,
+                    cache_read_input_tokens: 5,
+                    cache_creation_input_tokens: 0,
+                }),
+            },
+        ]
+    );
+}
+
 /// reasoning_content deltas (deepseek-style; plain `reasoning` also accepted)
 /// stream as ThinkingDelta and finalize into a signature-less Thinking block
 /// ahead of the text block.

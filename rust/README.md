@@ -115,7 +115,10 @@ quota, policy, invalid-request, request-too-large, billing); every other stream
 error — transient upstream, overload, and rate-limit conditions included —
 defaults to retryable, the inverse of the HTTP-status whitelist and gated by the
 same no-semantic-output rule. A named Chat `event: error` frame is recognized
-and read rather than rejected as an unknown event name. Core retains provider
+and read rather than rejected as an unknown event name. A Chat stream that
+reports `usage` more than once — a gateway attaching its own copy to the
+`finish_reason` frame on top of the trailing empty-choices frame
+`include_usage` promises — keeps the last report rather than failing. Core retains provider
 outcomes and failures inside typed turn errors;
 string rendering happens only at CLI/TUI/native protocol 2.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and

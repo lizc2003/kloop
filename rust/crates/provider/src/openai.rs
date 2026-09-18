@@ -443,12 +443,14 @@ pub(super) async fn stream(
             ));
         }
 
+        // `include_usage` puts the authoritative report in the trailing
+        // empty-choices frame, but a gateway may also attach a copy to the
+        // `finish_reason` frame (observed on a GLM route: both frames carried
+        // byte-identical usage). A later report therefore overwrites rather
+        // than failing the stream.
         if let Some(raw_usage) = value.get("usage")
             && !raw_usage.is_null()
         {
-            if usage.is_some() {
-                return Err(protocol("received duplicate usage"));
-            }
             usage = Some(parse_usage(raw_usage)?);
         }
 
