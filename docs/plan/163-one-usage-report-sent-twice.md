@@ -68,4 +68,4 @@
 
 ## ✅ 完成
 
-2026-09-18 完成,一次提交 `<sha>`。`cargo fmt` + `clippy -D warnings` + 全量 `cargo test` 全绿。
+2026-09-18 完成,一次提交 `73a2878`。`cargo fmt` + `clippy -D warnings` + 全量 `cargo test` 全绿。

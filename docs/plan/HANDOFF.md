@@ -25,6 +25,7 @@ plan 文件里写够了开工所需的一切;**八条互相独立、可任意顺
 | ~~**161** 跑着的这个二进制,是哪一份代码~~ ✅ | 横幅标题行补编译时的 git 戳 | 小 | **2026-09-17 用户一句「应该显示程序的版本号,比如编译时的 git」,当场做完,一次提交**。`crates/cli/build.rs` 戳 `--short=7` 的 HEAD,标题行右边 dim 显示 `v0.1.0 (2319ea3)`。**不做 `-dirty`**(准确的 dirty 要 build script 每次重跑;不重跑就是错的,而且它答不了「我刚改的代码在不在里面」)。build.rs 放叶子 crate 而不是公共 crate,rerun 只挂 HEAD/ref/packed-refs 并剔掉不存在的路径(Cargo 把 stat 不到的路径当永远脏)。顺带修掉一个真 bug:框宽 cap 只减了两条竖线、少算两列 padding,内容顶到 cap 时框比终端宽 2 列。**第二次提交是用户追加的 `-V`/`--version`**(与 `--help` 同为 local fast path,输出与横幅同一条串;不占 `-v`,留给将来的 verbose)。教训 157 |
 | ~~**162** 挑一个会话,不该先读一串 id~~ ✅ | `--resume` 的编号列表换成全屏 picker | 中 | **2026-09-18 用户贴了一张 cc 的 resume 截图说「体验更好一些」,问了一个点(做到哪一档)→ 核心档,当场做完,一次提交**。全屏卡片 + 输入即搜 + `↑↓`/Enter/Esc;底部那排(跨项目/分支/worktree/预览/重命名)**没做**,其中「按分支过滤」还压着前置:会话文件不记 git 分支。三件实现里才看清的事:① 旧路径**每条会话读两遍全文**(`resumable_sessions` 过滤空会话 + `session_line` 取标题,都是 `inspect_session`),picker 第一帧付不起这笔钱,于是有了 `session_digest`(读到第一句用户的话就停);② 副标题用**文件大小**而不是消息数,正因为消息数要整文件解析,cc 选大小是同一个理由;③ ratatui 的 inline viewport 在 `Terminal` drop 时把光标停在视口**底部**,所以「回到视口顶清屏」必须排在 drop 之后,否则界面消失后正文从第 24 行开始打。教训 158 |
 | ~~**163** 同一份用量,网关发了两遍~~ ✅ | chat 轨的重复 `usage` 从协议错误改成以最后一份为准 | 小 | **2026-09-18 用户改配置换轨后第一轮就报 `received duplicate usage`,当场查完做完,一次提交**。真机 curl 三次复现:`gw-cn` 的 glm 路由把**逐字节相同**的一份 usage 同时挂在 `finish_reason` 帧和尾部 `choices: []` 帧上。此前没撞上只因为 9/17 起的会话全走 responses 轨。修法是后到覆盖(尾帧是 `include_usage` 契约的权威帧),不做"相同才放行"(kloop 没有裁判依据)、不做累加(会让 token 翻倍污染 `/cost` 与压缩预算)。顺带查到 `deepseek-v4-flash-0731` 在 chat 轨上 403 `purpose_mismatch`,`models` 白名单里那条在 `wire_api = "chat"` 下是死的,**没改**。教训 159 |
+| ~~**164** 自己产的 reasoning,被自己判成不可能~~ ✅ | `validate_provenance` 的 `Plain` 形状不再禁止 chat 家族 | 小 | **2026-09-18 紧接 163 的第二轮报错,当场查完做完,一次提交**。`provider/src/openai.rs` 把 `reasoning_content` 转成 signature-less thinking(有测试锁死,glm/deepseek 都发),`core/src/provider_route.rs` 却断言 "Chat carries no reasoning at all"——那句注释把**不回放**写成了**不产生**。后果是 chat 轨上任何会开始 thinking 的模型**走不过第二轮**,且落盘校验共用同一个函数,**已写出的会话连 resume 都打不开**。只放宽 `Plain`(`Redacted` 仍然只有 Anthropic 有);strip 留在 `history.rs` 的投影里不动——它本来就写对了,只是被排在前面的校验挡得没机会跑。教训 160 |
 
 **同一轮调研里查过但不立 plan 的一条**:grok 记录了 macOS Seatbelt 的 `mv x y && cat y`
 绕过(deny 按路径,文件被移出被 deny 的路径就绕过了)。查下来 kloop **已经防住**——
@@ -1287,3 +1288,16 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    新功能的首次上线看**。② 排查 provider 层的形状分歧,**直接 curl 一次真网关比读任何文档都快**:
    三次复现就把"两帧各带一份、逐字节相同"钉死了,连带发现 `deepseek-v4-flash-0731` 在 chat 轨上
    403 `purpose_mismatch`(网关按 key 的 purpose 限路由,不是 kloop 的事)。
+
+160. 来自 Plan 164(chat 自己产的 reasoning,被自己判成不可能)。**一条 fail-closed 规则若断言
+   "这个组合不可能出现",先去仓库里找**谁在生产这个组合**——它很可能就在隔壁 crate,还带着测试。**
+   `provider/src/openai.rs` 把 `reasoning_content` 转成 signature-less thinking(测试锁死,注释
+   写着 deepseek-style),`core/src/provider_route.rs` 同时断言 "Chat carries no reasoning at all";
+   两边都有测试、都绿,因为没有一条测试同时踩到两边。真相是那句注释把**不回放**写成了**不产生**。
+   一般形态:**跨 crate 的"不可能"断言是对自己代码的断言,验法是搜一遍谁构造这个 variant**;
+   只要还有一个生产者,它就是一枚定时炸弹,引信是"哪天有人真的走那条路"——这次的引信是用户改了
+   一行 `wire_api`。代价还要乘上一个系数:同一个校验函数被**请求投影**和**落盘读取**共用,于是
+   坏的不只是下一轮,是**已经写出来的会话再也打不开**。
+   同批的一条小的:**校验排在处理前面时,先确认那段处理是不是已经把这件事处理掉了**——
+   `history.rs` 的投影本来就无条件剥掉 chat 目标的 reasoning,一直是对的,只是前面的校验先炸,
+   那段正确的代码从来没机会跑。删掉一条过严的校验,有时不需要补任何新逻辑。

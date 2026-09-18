@@ -130,7 +130,11 @@ Anthropic Messages and OpenAI Responses replay reasoning text plus
 signature/encrypted/redacted payloads only on an exact match; legacy reasoning
 without provenance, a provider/family switch, or a model switch fails closed
 before network I/O and cannot silently fall back. OpenAI Chat keeps its existing
-intentional boundary and strips reasoning instead of replaying it. Compaction
+intentional boundary and strips reasoning instead of replaying it — including
+the reasoning it produced itself, since a chat model that streams
+`reasoning_content` writes signature-less thinking into history under chat
+provenance; that shape is valid to store and read back, and only replay is
+withheld. Compaction
 keeps the recent tail verbatim, while resume and fork preserve this provenance
 with the complete message. Public `thread/read` and event snapshots remove the
 private provenance, signatures, encrypted content, and redacted blobs; only the

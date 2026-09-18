@@ -454,11 +454,14 @@ pub fn validate_provenance(
     {
         return Err(ProvenanceMismatch::IdentityMismatch);
     }
-    // Chat carries no reasoning at all; Responses carries it as an encrypted
-    // blob and never as a redacted block.
+    // Only Anthropic has redacted reasoning: Responses carries reasoning as an
+    // encrypted blob, and Chat as signature-less thinking of its own —
+    // DeepSeek- and GLM-shaped models stream `reasoning_content`, which the
+    // chat adapter keeps for the transcript and this projection strips before
+    // the request. Chat reasoning is therefore a real shape, not a corrupt one;
+    // what Chat must not do is replay it.
     let shape_agrees = match reasoning {
-        ReasoningShape::None => true,
-        ReasoningShape::Plain => source.api_family != ProviderApiFamily::OpenAiChatCompletions,
+        ReasoningShape::None | ReasoningShape::Plain => true,
         ReasoningShape::Redacted => !matches!(
             source.api_family,
             ProviderApiFamily::OpenAiChatCompletions | ProviderApiFamily::OpenAiResponses

@@ -2851,6 +2851,47 @@ mod tests {
         );
         cleanup(&path);
     }
+
+    /// And the same route with reasoning in it: a chat model that streams
+    /// `reasoning_content` writes signature-less thinking under chat
+    /// provenance, so refusing that shape on read would make the session it
+    /// wrote unopenable. Stripping reasoning is the request projection's job,
+    /// not the validator's.
+    #[test]
+    fn chat_reasoning_provenance_survives_read() {
+        let path = temp_file("chat-reasoning-provenance");
+        let provider = kloop_provider::Provider::OpenAiCompat {
+            key: "test-key".into(),
+            base: "https://chat.invalid".into(),
+        };
+        let (catalog, _) = crate::provider_route::ProviderCatalog::from_provider(
+            "chat",
+            provider,
+            "chat-model",
+            vec!["chat-model".into()],
+        )
+        .unwrap();
+        let route = catalog.initial_route("chat", Some("chat-model")).unwrap();
+        let mut rollout = Rollout::new_with_initial_route(path.clone(), &route).unwrap();
+        let assistant = Message::assistant_from_provider(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "streamed as reasoning_content".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "chat answer".into(),
+                },
+            ],
+            route.primary_attempt().provenance(2),
+        );
+        rollout.append_message(&assistant).unwrap();
+        assert_eq!(
+            load_session_snapshot(&path).unwrap().messages,
+            vec![assistant]
+        );
+        cleanup(&path);
+    }
     #[test]
     fn reasoning_provenance_and_typed_terminal_survive_resume_and_fork() {
         let path = temp_file("reasoning-continuity");

@@ -1498,6 +1498,55 @@ mod tests {
         assert_eq!(view[1].provider_provenance, None);
     }
 
+    /// The chat rail produces reasoning of its own — DeepSeek- and GLM-shaped
+    /// models stream `reasoning_content`, which the adapter keeps as
+    /// signature-less thinking. The next turn on that same route must strip it,
+    /// exactly as a switched-away block is stripped, instead of rejecting the
+    /// history as a shape the chat family could not have produced.
+    #[test]
+    fn chat_produced_reasoning_is_stripped_not_rejected() {
+        use crate::provider_route::ProviderCatalog;
+        use kloop_provider::Provider;
+
+        let (_catalog, route) = ProviderCatalog::from_provider(
+            "chat",
+            Provider::OpenAiCompat {
+                key: "unused".into(),
+                base: "https://chat.invalid".into(),
+            },
+            "chat-model",
+            vec!["chat-model".into()],
+        )
+        .unwrap();
+        let mut history = History::new(temp_dir("chat-self-reasoning"));
+        history.ensure_initial_provider_route(&route).unwrap();
+        history.record(Message::user_text("question"));
+        history.record_provider_assistant(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "streamed as reasoning_content".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            &route.primary_attempt(),
+        );
+
+        let view = history
+            .provider_request_view(&route.primary_attempt())
+            .unwrap();
+        assert_eq!(view.len(), 2);
+        assert_eq!(
+            view[1].content,
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+            }]
+        );
+        assert_eq!(view[1].provider_provenance, None);
+    }
+
     #[test]
     fn route_append_failure_keeps_memory_state_and_remembered_model() {
         use std::sync::Arc;
