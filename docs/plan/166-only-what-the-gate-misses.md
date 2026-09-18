@@ -50,14 +50,14 @@ finding",而 CI 的 clippy 是 `-D warnings`。两条叠起来的结论是:**任
 重试的退避/超时/上限/取消传播四件套要齐(plan 154 同源)、分类后放行的分类器必须是白名单
 (教训 8)。
 
-### 三、放 `.kloop/skills/`,不做 builtin
+### 三、放 `.kloop/skills/`,不做 builtin ⤴ 当天作废(见文末)
 
 用户指定。代价记在这里:发现是 **cwd 相对**的(`startup.rs::load_skills` 只看
 `cwd/.kloop/skills` 和 `~/.kloop/skills`,**不向上找项目根**),所以**在仓库根起的会话才看得到
 它**;习惯在 `rust/` 下起 kloop 的话这个技能不存在。要覆盖全目录只有两条路:做成 builtin
 (与 `code-review` 并列,编译进二进制),或者拷一份进 `~/.kloop/skills/`。
 
-### 四、`.gitignore` 要开一个洞,而且不能顺手改
+### 四、`.gitignore` 要开一个洞,而且不能顺手改 ⤴ 当天回滚(见文末)
 
 `.kloop/` 这条规则**内部不含斜杠,所以匹配任意层级**的同名目录——agent 在哪个 cwd 起就在
 哪里写一个,`rust/crates/core/src/.kloop/` 就是这么被盖住的。第一版为了开洞把它改成
@@ -74,7 +74,7 @@ finding",而 CI 的 clippy 是 `-D warnings`。两条叠起来的结论是:**任
 !/.kloop/skills/
 ```
 
-## 验收
+## 验收(首版;三、四两条已于当天回滚,见文末)
 
 - `git check-ignore`:`.kloop/env.local`、`.kloop/worktrees/x`、`rust/.kloop/a`、
   `rust/crates/core/src/.kloop/a`、`docs/.kloop/a` 全部仍被忽略;
@@ -83,6 +83,25 @@ finding",而 CI 的 clippy 是 `-D warnings`。两条叠起来的结论是:**任
   (`skills_from_roots`)加载仓库自带的 `.kloop/skills`,warnings 必须为空。
   **negative control 做过**:把 description 里插一个 `: `,测试报
   `invalid frontmatter: mapping values are not allowed in this context`。
+
+## ⤴ 当天移出仓库
+
+接着做了 `go-review`(上游 `rule_docs/go.md`,同一套筛法)。它把位置这件事戳穿了:
+**kloop 仓库里没有一行 Go 代码,而技能发现是 cwd 相对的**——放在 `.kloop/skills/` 的 Go 清单
+永远不会出现在有 Go 代码的地方。于是 go-review 直接放进 `~/.kloop/skills/`,用户随后要求
+rust-review 也搬过去。两份现在并排在那里,任何目录起的 kloop 都能用。
+
+内容层面的裁决(一、二)不受影响;另外三处全部回滚:
+
+- `.gitignore` 的四行洞回到原样的 `.kloop/`。那条教训仍然是真的(HANDOFF 教训 162),
+  只是这个仓库暂时用不上它。
+- `startup::tests::the_repositorys_own_skills_all_load` 删除。仓库里不再有自带技能,
+  它只会走 `!root.is_dir()` 那条静默 return,是一条永远空跑的测试。
+- **代价要认**:两份技能不在版本控制里,换机器丢失;编辑时写坏 frontmatter 也没有任何东西
+  会发现(一个裸 `: ` 就够,见教训 162)。搬迁前的验证办法是把技能拷进仓库 `.kloop/skills/`
+  跑一次那条测试——测试删掉之后,只剩"起一次 kloop 看有没有 skip 警告"。
+  要同时拿回版本控制和全目录可用,只有一条路:做成 builtin
+  (`core/src/skills/`,与 `code-review` 并列注册进 `BUILTIN_SKILLS`)。
 
 ## ✅ 完成
 

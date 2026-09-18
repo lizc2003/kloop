@@ -1,16 +1,8 @@
 # Rust build artifacts
 rust/target/
 
-# agent runtime offload output. `.kloop/` has no slash inside it, so it excludes
-# such a directory at *any* depth — the agent writes one next to whatever its cwd
-# happened to be. The three lines after it carve out the one skills directory we
-# version: git never descends into an excluded directory, so the root `.kloop`
-# has to be re-included as a directory first, its contents excluded again, and
-# only then can `skills/` be negated.
+# agent runtime offload output
 .kloop/
-!/.kloop/
-/.kloop/*
-!/.kloop/skills/
 rust/.kloop/
 
 # reference material (local copies of other repos, not ours to version) —

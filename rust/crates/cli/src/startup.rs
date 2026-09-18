@@ -1582,35 +1582,6 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The skills this repository ships in its own `.kloop/skills/` are data
-    /// files: nothing compiles them, and a malformed one is skipped at startup
-    /// with a warning that scrolls past. Load them through the real discovery
-    /// path so a bad edit fails here instead — a bare `: ` in a frontmatter
-    /// value is enough to lose the whole skill.
-    #[test]
-    fn the_repositorys_own_skills_all_load() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(3)
-            .expect("crates/cli sits three levels below the repo root")
-            .join(".kloop")
-            .join("skills");
-        // Absent outside a checkout of this repository (the crate vendored
-        // elsewhere); there is then nothing of ours to check.
-        if !root.is_dir() {
-            return;
-        }
-
-        let (skills, warnings) = skills_from_roots(&[root]);
-
-        assert!(
-            warnings.is_empty(),
-            "a shipped skill failed to load: {warnings:?}"
-        );
-        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"rust-review"), "{names:?}");
-    }
-
     /// Builtins (plan 119) join the registry behind whatever was discovered: a
     /// same-named skill on disk replaces the shipped one, and the rest still
     /// load. The replacement is silent, like project-over-global.
