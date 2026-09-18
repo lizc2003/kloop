@@ -27,6 +27,7 @@ plan 文件里写够了开工所需的一切;**八条互相独立、可任意顺
 | ~~**163** 同一份用量,网关发了两遍~~ ✅ | chat 轨的重复 `usage` 从协议错误改成以最后一份为准 | 小 | **2026-09-18 用户改配置换轨后第一轮就报 `received duplicate usage`,当场查完做完,一次提交**。真机 curl 三次复现:`gw-cn` 的 glm 路由把**逐字节相同**的一份 usage 同时挂在 `finish_reason` 帧和尾部 `choices: []` 帧上。此前没撞上只因为 9/17 起的会话全走 responses 轨。修法是后到覆盖(尾帧是 `include_usage` 契约的权威帧),不做"相同才放行"(kloop 没有裁判依据)、不做累加(会让 token 翻倍污染 `/cost` 与压缩预算)。顺带查到 `deepseek-v4-flash-0731` 在 chat 轨上 403 `purpose_mismatch`,`models` 白名单里那条在 `wire_api = "chat"` 下是死的,**没改**。教训 159 |
 | ~~**164** 自己产的 reasoning,被自己判成不可能~~ ✅ | `validate_provenance` 的 `Plain` 形状不再禁止 chat 家族 | 小 | **2026-09-18 紧接 163 的第二轮报错,当场查完做完,一次提交**。`provider/src/openai.rs` 把 `reasoning_content` 转成 signature-less thinking(有测试锁死,glm/deepseek 都发),`core/src/provider_route.rs` 却断言 "Chat carries no reasoning at all"——那句注释把**不回放**写成了**不产生**。后果是 chat 轨上任何会开始 thinking 的模型**走不过第二轮**,且落盘校验共用同一个函数,**已写出的会话连 resume 都打不开**。只放宽 `Plain`(`Redacted` 仍然只有 Anthropic 有);strip 留在 `history.rs` 的投影里不动——它本来就写对了,只是被排在前面的校验挡得没机会跑。教训 160 |
 | ~~**165** 模型自己写坏的 JSON,不是坏掉的协议~~ ✅ | tool arguments 先白名单修复,修不动的变成可回灌的失败调用 | 中 | **2026-09-18 换轨后的第三次报错,用户拍「先兼容,再可恢复」,当场做完,一次提交**。第一次报错只有 serde 的列号、原文没人留,于是先让错误带上原文(400 字节封顶),**下一次报错立刻定性**:`"description": 查看提交概要与文件列表` 少了引号,responses 轨同样复现——与轨无关,是模型通病(13 次采样全合法,偶发但一发就是一整轮)。新 `provider/src/tool_input.rs` 只修三种读法唯一的失误(裸值补引号、字符串里的裸控制字符、尾随逗号),**重写完仍交给 serde 判定**,歧义一律拒绝——参数会变成 shell 命令,靠猜的修复就是一条模型没写过的命令。修不动的走新 `AssistantBlock::InvalidToolUse`,**只活在 provider→core 这段流里**:落历史规范化成 `input: {}` 的普通 `tool_use`(于是 rollout / native / 回放一行不用改),原文和解析错误走 `is_error` 的 `tool_result` 回给模型,这一条不分发、同轮其它调用照常。三条轨统一,Anthropic 也不留例外。教训 161 |
+| ~~**166** 别人的审查清单,只留门禁抓不到的~~ ✅ | 上游 rust.md 摘成 `.kloop/skills/rust-review` | 小 | **2026-09-18 用户丢来 `alibaba/open-code-review` 问「对项目是否有帮助」,调研完的结论是工具不装、只摘它的 Rust 规则清单,用户拍「摘成 .kloop/skills 技能」,当场做完,一次提交**。筛选标准只有一条:**CI 的 clippy `-D warnings` 能抓的一律不收**——builtin `code-review` 本来就把 linter 能抓的排除在 finding 之外,收进来就是走不到审查那一步的噪音。于是「锁跨 await」整条改写(默认 lint `await_holding_lock` 已覆盖 std guard,只留 tokio guard 与跨用户代码那一面),`unwrap_used`/`redundant_clone`/`cast_possible_truncation` 这类**故意不开**的 lint 则保留并在条目里注明原因。另加一节上游没有的「与外部流的契约」,四条全部来自 plan 163/164/165 与教训 7/8。**发现是 cwd 相对的**,所以它只在仓库根起的会话里存在;要全目录可用得做成 builtin 或拷进 `~/.kloop/skills/`。教训 162 |
 
 **同一轮调研里查过但不立 plan 的一条**:grok 记录了 macOS Seatbelt 的 `mv x y && cat y`
 绕过(deny 按路径,文件被移出被 deny 的路径就绕过了)。查下来 kloop **已经防住**——
@@ -1319,3 +1320,16 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    落库前被规范化掉,它的影响面就只有那一段流**:`InvalidToolUse` 进历史时变成 `input: {}` 的
    普通 `tool_use`,于是 rollout、native 协议、回放、TUI 一行都不用改——**加类型时先问它能不能
    不进磁盘**。
+
+162. 来自 Plan 166(把上游的 Rust 审查清单摘成技能)。**仓库里由别的程序解释的数据文件,
+   要有一条走真实加载路径的测试——没有编译器替它把关,写坏的后果是静默消失。**
+   `.kloop/skills/*/SKILL.md` 坏掉时 kloop 的处理是 skip-with-warning(对用户技能这是对的,
+   一个坏技能不该阻断启动),于是仓库自带的那份写坏了也只会掉一条没人看的警告。这次第一版
+   description 里恰好有一个 `: `,YAML 当场判 `mapping values are not allowed`,整份技能
+   不存在——补完 negative control 才看见。测试就一条:用 `skills_from_roots` 加载仓库根的
+   `.kloop/skills`,warnings 必须为空,将来新增的技能自动纳入。
+   同批的一条与 Rust 无关但会反复踩的:**`.gitignore` 里不含内部斜杠的规则匹配任意层级,
+   为了开一个洞把它改成带斜杠的形式,等于把它锚定到仓库根、放走其它层级**。`.kloop/` 盖的是
+   任何 cwd 下的运行时目录(`rust/crates/core/src/.kloop/` 就是其一),改成 `.kloop/*` 的那一刻
+   它们全部冒了出来。开洞的正确形状是原规则不动、再补三行(`!/.kloop/`、`/.kloop/*`、
+   `!/.kloop/skills/`),因为 git 根本不会进入一个被排除的目录,negation 没有机会被读到。
