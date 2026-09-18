@@ -787,13 +787,8 @@ fn finish_function_call(
     }
     let call_id = final_call_id.to_string();
     let name = final_name.to_string();
-    let input = crate::parse_tool_input("openai-responses", &name, final_arguments)?;
     Ok((
-        vec![AssistantBlock::ToolUse {
-            id: call_id,
-            name,
-            input,
-        }],
+        vec![crate::tool_use_block(call_id, name, final_arguments)],
         completion,
     ))
 }
@@ -1040,7 +1035,13 @@ impl ResponseStream {
             finish_item(state, &value["item"], &mut self.output.has_refusal)?;
         self.output.truncated |= completion == ItemCompletion::Truncated;
         for block in &blocks {
-            self.output.has_tool |= matches!(block, AssistantBlock::ToolUse { .. });
+            // A call whose arguments could not be read is still a call: the
+            // response's outcome is what the model did, not whether we could
+            // parse what it wrote.
+            self.output.has_tool |= matches!(
+                block,
+                AssistantBlock::ToolUse { .. } | AssistantBlock::InvalidToolUse { .. }
+            );
         }
         for block in blocks.drain(..) {
             if block.has_semantic_payload() {

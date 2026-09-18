@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -791,12 +792,24 @@ impl Turn<'_> {
     }
 
     /// Run this round's tool calls and fold their results into history.
-    async fn dispatch_round(&mut self, blocks: &[ContentBlock], round: usize) -> RoundStep {
+    ///
+    /// `invalid` names the calls whose arguments the model did not write as
+    /// valid JSON. They are real `tool_use` blocks in `blocks` and each still
+    /// needs its `tool_result`, but running one would mean running a command
+    /// nobody wrote: they get the parser's complaint as a failed result and
+    /// the model rewrites them next round.
+    async fn dispatch_round(
+        &mut self,
+        blocks: &[ContentBlock],
+        invalid: &[(String, String)],
+        round: usize,
+    ) -> RoundStep {
         let tool_uses: Vec<(String, String, Value)> = blocks
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse { id, name, input } => {
-                    Some((id.clone(), name.clone(), input.clone()))
+                    (!invalid.iter().any(|(invalid_id, _)| invalid_id == id))
+                        .then(|| (id.clone(), name.clone(), input.clone()))
                 }
                 ContentBlock::Text { .. }
                 | ContentBlock::Thinking { .. }
@@ -824,6 +837,7 @@ impl Turn<'_> {
             Some(schema) => dispatch_structured_tools(tool_uses, &ctx, schema).await,
             None => (dispatch_tools(tool_uses, &ctx).await, None),
         };
+        let results = merge_invalid_results(blocks, invalid, results);
         // Record results BEFORE checking cancellation so every tool_use has a
         // paired tool_result and history stays legal for the next request.
         self.history.record(Message::tool_results(results));
@@ -953,6 +967,7 @@ async fn turn_rounds(
             blocks,
             usage,
             outcome,
+            invalid_tool_inputs,
         } = match turn.settle_sample(sampled, round).await {
             Ok(ok) => ok,
             Err(RoundStep::Retry) => continue,
@@ -963,7 +978,10 @@ async fn turn_rounds(
         }
         let step = match turn.classify_outcome(&outcome, &blocks, round) {
             Some(step) => step,
-            None => turn.dispatch_round(&blocks, round).await,
+            None => {
+                turn.dispatch_round(&blocks, &invalid_tool_inputs, round)
+                    .await
+            }
         };
         match step {
             RoundStep::Retry => continue,
@@ -982,6 +1000,45 @@ async fn turn_rounds(
         rounds: ending.rounds,
         structured_output: ending.structured,
     }
+}
+
+/// Put the failed results for unreadable calls back where their calls were.
+/// Pairing is by id, but order is what a person reads in the transcript, so a
+/// result sits next to the call it answers.
+fn merge_invalid_results(
+    blocks: &[ContentBlock],
+    invalid: &[(String, String)],
+    dispatched: Vec<ContentBlock>,
+) -> Vec<ContentBlock> {
+    if invalid.is_empty() {
+        return dispatched;
+    }
+    let mut dispatched = VecDeque::from(dispatched);
+    let mut merged = Vec::with_capacity(dispatched.len() + invalid.len());
+    for block in blocks {
+        let ContentBlock::ToolUse { id, .. } = block else {
+            continue;
+        };
+        match invalid.iter().find(|(invalid_id, _)| invalid_id == id) {
+            Some((id, message)) => merged.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: message.clone().into(),
+                is_error: true,
+            }),
+            // Ordinary calls come back in request order, so the front of the
+            // queue is this block's result.
+            None => {
+                if let Some(result) = dispatched.pop_front() {
+                    merged.push(result);
+                }
+            }
+        }
+    }
+    // A dispatcher that returned more results than there were calls (an
+    // envelope unwrapped into several, say) keeps all of them: dropping a
+    // result would orphan a call.
+    merged.extend(dispatched);
+    merged
 }
 
 async fn dispatch_structured_tools(

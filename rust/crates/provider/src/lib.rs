@@ -7,6 +7,7 @@ mod openai;
 mod responses;
 pub mod sse;
 mod stream;
+mod tool_input;
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -245,16 +246,28 @@ fn validate_assistant_blocks(
     let mut tool_ids = HashSet::new();
     let mut has_tool = false;
     for block in blocks {
-        if let AssistantBlock::ToolUse { id, name, input } = block {
+        // An unreadable call is still a call: it owns an id, it will be paired
+        // with a tool_result, and the identity rules below are about the wire,
+        // which the model's broken JSON says nothing about.
+        let identity = match block {
+            AssistantBlock::ToolUse { id, name, input } => {
+                if !input.is_object() {
+                    return Err(ProviderFailure::protocol(format!(
+                        "{rail} completed tool {name} with non-object input"
+                    )));
+                }
+                Some((id, name))
+            }
+            AssistantBlock::InvalidToolUse { id, name, .. } => Some((id, name)),
+            AssistantBlock::Text { .. }
+            | AssistantBlock::Thinking { .. }
+            | AssistantBlock::RedactedThinking { .. } => None,
+        };
+        if let Some((id, name)) = identity {
             has_tool = true;
             if id.is_empty() || name.is_empty() {
                 return Err(ProviderFailure::protocol(format!(
                     "{rail} completed a tool call with an empty identity"
-                )));
-            }
-            if !input.is_object() {
-                return Err(ProviderFailure::protocol(format!(
-                    "{rail} completed tool {name} with non-object input"
                 )));
             }
             if !tool_ids.insert(id) {
@@ -284,25 +297,62 @@ pub(crate) fn validate_assistant_output(
     }
 }
 
-pub(crate) fn parse_tool_input(
-    rail: &str,
-    tool_name: &str,
-    raw: &str,
-) -> Result<Value, ProviderFailure> {
+/// Bounded, char-boundary-safe view of what the model emitted. Long enough to
+/// show a whole ordinary tool call, short enough not to flood a terminal with
+/// a runaway one.
+fn tool_input_excerpt(raw: &str) -> String {
+    const MAX: usize = 400;
+    if raw.len() <= MAX {
+        return raw.to_string();
+    }
+    let cut = raw
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX)
+        .last()
+        .unwrap_or(0);
+    format!("{}… ({} bytes total)", &raw[..cut], raw.len())
+}
+
+/// The completed tool call for one rail, never failing on the model's own
+/// mistakes. Arguments arrive as a string the model generated: invalid JSON is
+/// its error to fix, not a broken wire, so an unreadable one becomes
+/// [`AssistantBlock::InvalidToolUse`] and the turn hands it back instead of
+/// dying. Empty arguments stay the ordinary "no parameters" call.
+pub(crate) fn tool_use_block(id: String, name: String, raw: &str) -> AssistantBlock {
+    const NOT_AN_OBJECT: &str = "tool arguments must be a JSON object";
     if raw.trim().is_empty() {
-        return Ok(json!({}));
+        return AssistantBlock::ToolUse {
+            id,
+            name,
+            input: json!({}),
+        };
     }
-    let input: Value = serde_json::from_str(raw).map_err(|error| {
-        ProviderFailure::protocol(format!(
-            "{rail} tool {tool_name} returned invalid JSON input: {error}"
-        ))
-    })?;
-    if !input.is_object() {
-        return Err(ProviderFailure::protocol(format!(
-            "{rail} tool {tool_name} returned non-object JSON input"
-        )));
+    let invalid = |error: String| AssistantBlock::InvalidToolUse {
+        id: id.clone(),
+        name: name.clone(),
+        raw: tool_input_excerpt(raw),
+        error,
+    };
+    let parsed = match serde_json::from_str::<Value>(raw) {
+        Ok(input) => input,
+        // Models get this string wrong at a low but real rate. `repair` reads
+        // the few unambiguous mistakes and refuses the rest; what it returns
+        // has still been through `serde_json`.
+        Err(error) => match crate::tool_input::repair(raw) {
+            Some(input) => input,
+            None => return invalid(error.to_string()),
+        },
+    };
+    if parsed.is_object() {
+        AssistantBlock::ToolUse {
+            id,
+            name,
+            input: parsed,
+        }
+    } else {
+        invalid(NOT_AN_OBJECT.into())
     }
-    Ok(input)
 }
 
 impl Provider {
@@ -617,10 +667,12 @@ impl Provider {
 }
 
 fn mock_outcome(blocks: &[AssistantBlock]) -> AssistantOutcome {
-    if blocks
-        .iter()
-        .any(|block| matches!(block, AssistantBlock::ToolUse { .. }))
-    {
+    if blocks.iter().any(|block| {
+        matches!(
+            block,
+            AssistantBlock::ToolUse { .. } | AssistantBlock::InvalidToolUse { .. }
+        )
+    }) {
         AssistantOutcome::ToolUse
     } else {
         AssistantOutcome::EndTurn
@@ -693,7 +745,9 @@ async fn emit_deltas(blocks: &[AssistantBlock], sink: &StreamSink) -> Result<(),
             AssistantBlock::Thinking { thinking, .. } => {
                 sink.thinking_delta(thinking.clone()).await?
             }
-            AssistantBlock::RedactedThinking { .. } | AssistantBlock::ToolUse { .. } => {}
+            AssistantBlock::RedactedThinking { .. }
+            | AssistantBlock::ToolUse { .. }
+            | AssistantBlock::InvalidToolUse { .. } => {}
         }
     }
     Ok(())
@@ -716,23 +770,60 @@ mod tests {
 
     #[test]
     fn tool_input_requires_complete_json_object() {
-        assert_eq!(parse_tool_input("test", "bash", "").unwrap(), json!({}));
-        assert_eq!(parse_tool_input("test", "bash", "  \n").unwrap(), json!({}));
+        let block = |raw: &str| tool_use_block("t1".into(), "bash".into(), raw);
+        let ok = |input: Value| AssistantBlock::ToolUse {
+            id: "t1".into(),
+            name: "bash".into(),
+            input,
+        };
+
+        assert_eq!(block(""), ok(json!({})));
+        assert_eq!(block("  \n"), ok(json!({})));
+        assert_eq!(block(r#"{"command":"pwd"}"#), ok(json!({"command": "pwd"})));
+
+        // A repairable mistake never becomes a failed call: one unquoted value
+        // is worth a rewrite, not a whole extra sampling round.
         assert_eq!(
-            parse_tool_input("test", "bash", r#"{"command":"pwd"}"#).unwrap(),
-            json!({"command": "pwd"})
+            block(r#"{"command": "ls", "description": 看一眼}"#),
+            ok(json!({"command": "ls", "description": "看一眼"}))
         );
 
+        // Valid JSON that is not an object is the model's mistake too, and
+        // takes the same road back to it.
         for raw in ["null", "[]", "true", "1", r#""text""#] {
-            let error = parse_tool_input("test", "bash", raw).unwrap_err();
-            assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
-            assert!(!error.is_retryable());
-            assert!(error.to_string().contains("non-object JSON input"));
+            assert_eq!(
+                block(raw),
+                AssistantBlock::InvalidToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    raw: raw.into(),
+                    error: "tool arguments must be a JSON object".into(),
+                }
+            );
         }
-        let error = parse_tool_input("test", "bash", "{oops").unwrap_err();
-        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
-        assert!(!error.is_retryable());
-        assert!(error.to_string().contains("invalid JSON input"));
+
+        // The text itself travels with the call: an offset alone cannot say
+        // whether the model wrote it wrong or we reassembled it wrong.
+        let (raw, error) = match block("{oops") {
+            AssistantBlock::InvalidToolUse { raw, error, .. } => (raw, error),
+            other => panic!("expected an invalid call, got {other:?}"),
+        };
+        assert_eq!(raw, "{oops");
+        assert!(error.contains("column"), "{error}");
+
+        let long = format!(r#"{{"command":"{}"#, "x".repeat(500));
+        let AssistantBlock::InvalidToolUse { raw, .. } = block(&long) else {
+            panic!("expected an invalid call");
+        };
+        assert!(raw.ends_with("(512 bytes total)"), "{raw}");
+        assert!(raw.len() < 460, "{}", raw.len());
+
+        // Cutting a multi-byte argument must not cut a character in half.
+        let wide = format!(r#"{{"command":"{}"#, "中".repeat(300));
+        let AssistantBlock::InvalidToolUse { raw, .. } = block(&wide) else {
+            panic!("expected an invalid call");
+        };
+        assert!(raw.ends_with("(912 bytes total)"), "{raw}");
     }
 
     #[test]

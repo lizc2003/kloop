@@ -650,8 +650,11 @@ async fn thinking_mode_field_shapes() {
     }
 }
 
+/// Even here, where the wire is Anthropic's own, the argument string is the
+/// model's. An unreadable one is handed back as a call the turn can answer,
+/// not as a dead stream.
 #[tokio::test]
-async fn malformed_tool_input_fails_closed() {
+async fn malformed_tool_input_comes_back_as_an_invalid_call() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -660,20 +663,39 @@ async fn malformed_tool_input_fails_closed() {
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "bash", "input": {}}}),
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{not json"}}),
             json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
             json!({"type": "message_stop"}),
         ]),
     )
     .await;
 
-    let events = collect(anthropic(&server)).await;
+    let events: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|event| event.unwrap())
+        .collect();
+    let [
+        StreamEvent::BlockDone(block),
+        StreamEvent::Terminal { outcome, .. },
+    ] = &events[..]
+    else {
+        panic!("expected one invalid call and a terminal, got {events:?}");
+    };
+    assert_eq!(outcome, &AssistantOutcome::ToolUse);
+    let AssistantBlock::InvalidToolUse {
+        id,
+        name,
+        raw,
+        error,
+    } = block
+    else {
+        panic!("expected an invalid call, got {block:?}");
+    };
     assert_eq!(
-        events.len(),
-        1,
-        "no ToolUse or Done may follow invalid JSON"
+        (id.as_str(), name.as_str(), raw.as_str()),
+        ("t1", "bash", "{not json")
     );
-    let error = events.into_iter().next().unwrap().unwrap_err();
-    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
-    assert!(error.to_string().contains("invalid JSON input"));
+    assert!(error.contains("column"), "{error}");
 }
 
 #[tokio::test]

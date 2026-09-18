@@ -1404,8 +1404,11 @@ async fn stream_dying_mid_flight_is_an_error() {
     assert!(error.to_string().contains("ended before completion"));
 }
 
+/// The arguments string is the model's, on this rail as on the others: an
+/// unreadable one completes as a call the turn can answer instead of killing
+/// the stream.
 #[tokio::test]
-async fn malformed_function_arguments_fail_closed() {
+async fn malformed_function_arguments_come_back_as_an_invalid_call() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -1428,16 +1431,33 @@ async fn malformed_function_arguments_fail_closed() {
     )
     .await;
 
-    let events = collect(responses(&server)).await;
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|event| event.unwrap())
+        .collect();
+    let [
+        StreamEvent::BlockDone(block),
+        StreamEvent::Terminal { outcome, .. },
+    ] = &events[..]
+    else {
+        panic!("expected one invalid call and a terminal, got {events:?}");
+    };
+    assert_eq!(outcome, &AssistantOutcome::ToolUse);
+    let AssistantBlock::InvalidToolUse {
+        id,
+        name,
+        raw,
+        error,
+    } = block
+    else {
+        panic!("expected an invalid call, got {block:?}");
+    };
     assert_eq!(
-        events.len(),
-        1,
-        "no ToolUse or Done may follow invalid JSON"
+        (id.as_str(), name.as_str(), raw.as_str()),
+        ("call_1", "bash", "{oops")
     );
-    let error = events.into_iter().next().unwrap().unwrap_err();
-    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
-    assert!(!error.is_retryable());
-    assert!(error.to_string().contains("invalid JSON input"));
+    assert!(error.contains("column"), "{error}");
 }
 
 /// The proxy may stream compact argument deltas but echo a pretty-printed

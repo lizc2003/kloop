@@ -55,4 +55,4 @@ reasoning 要进 transcript(显示、`--resume` 重放),chat 轨也不例外。"
 
 ## ✅ 完成
 
-2026-09-18 完成,一次提交 `<sha>`。`cargo fmt --check` + `clippy -D warnings` + 全量 `cargo test` 全绿。
+2026-09-18 完成,一次提交 `4bf1c86`。`cargo fmt --check` + `clippy -D warnings` + 全量 `cargo test` 全绿。

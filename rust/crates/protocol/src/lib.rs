@@ -914,6 +914,19 @@ pub enum AssistantBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// A tool call whose arguments the model did not write as valid JSON, and
+    /// which repair could not read either. It travels instead of failing the
+    /// stream so the turn can hand the model back its own text: the model is
+    /// the only one who can rewrite that string, and everything else it said
+    /// this round stays usable.
+    InvalidToolUse {
+        id: String,
+        name: String,
+        /// What the model sent, already bounded by the adapter.
+        raw: String,
+        /// Why it could not be read, in the JSON parser's words.
+        error: String,
+    },
 }
 
 impl AssistantBlock {
@@ -928,7 +941,7 @@ impl AssistantBlock {
                 signature,
             } => !thinking.is_empty() || !signature.is_empty(),
             Self::RedactedThinking { data } => !data.is_empty(),
-            Self::ToolUse { .. } => true,
+            Self::ToolUse { .. } | Self::InvalidToolUse { .. } => true,
         }
     }
 
@@ -946,6 +959,37 @@ impl AssistantBlock {
             },
             Self::RedactedThinking { data } => ContentBlock::RedactedThinking { data },
             Self::ToolUse { id, name, input } => ContentBlock::ToolUse { id, name, input },
+            // History keeps a legal tool call — every rail requires an object
+            // here, and a `tool_use` still needs its `tool_result` partner.
+            // The text the model actually sent travels in that result instead,
+            // which is where the model has to read it anyway. A caller that
+            // drops the paired error would be telling the model its call
+            // simply did nothing, so conversion alone is never the whole job:
+            // see `invalid_tool_use`.
+            Self::InvalidToolUse { id, name, .. } => ContentBlock::ToolUse {
+                id,
+                name,
+                input: serde_json::Value::Object(serde_json::Map::new()),
+            },
+        }
+    }
+
+    /// The call that could not be read, as (id, name, raw, error). The
+    /// conversion above deliberately cannot express it, so a caller that turns
+    /// blocks into history has to pick this up and pair it with a failed
+    /// `tool_result`.
+    pub fn invalid_tool_use(&self) -> Option<(&str, &str, &str, &str)> {
+        match self {
+            Self::InvalidToolUse {
+                id,
+                name,
+                raw,
+                error,
+            } => Some((id, name, raw, error)),
+            Self::Text { .. }
+            | Self::Thinking { .. }
+            | Self::RedactedThinking { .. }
+            | Self::ToolUse { .. } => None,
         }
     }
 }

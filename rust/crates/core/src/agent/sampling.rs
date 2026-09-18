@@ -35,6 +35,11 @@ pub(super) struct SampleOk {
     pub(super) blocks: Vec<ContentBlock>,
     pub(super) usage: Option<Usage>,
     pub(super) outcome: AssistantOutcome,
+    /// Tool calls whose arguments the model did not write as valid JSON, as
+    /// (id, what to tell the model). They are ordinary `tool_use` blocks in
+    /// `blocks` — the wire has no other legal shape — so the round has to be
+    /// told separately not to run them.
+    pub(super) invalid_tool_inputs: Vec<(String, String)>,
 }
 
 pub(super) enum Sampled {
@@ -315,14 +320,16 @@ async fn sample_once(
                             }
                             AssistantBlock::Thinking { .. }
                             | AssistantBlock::RedactedThinking { .. }
-                            | AssistantBlock::ToolUse { .. } => {}
+                            | AssistantBlock::ToolUse { .. }
+                            | AssistantBlock::InvalidToolUse { .. } => {}
                         }
                     }
                     match &block {
                         AssistantBlock::Text { .. } => text_accum.clear(),
                         AssistantBlock::Thinking { .. } => think_accum.clear(),
                         AssistantBlock::RedactedThinking { .. }
-                        | AssistantBlock::ToolUse { .. } => {}
+                        | AssistantBlock::ToolUse { .. }
+                        | AssistantBlock::InvalidToolUse { .. } => {}
                     }
                     blocks.push(block);
                 }
@@ -348,18 +355,37 @@ async fn sample_once(
                             partial: replayable_partial(blocks, &text_accum),
                         });
                     }
+                    let mut invalid_tool_inputs = Vec::new();
+                    let blocks = blocks
+                        .into_iter()
+                        .map(|block| {
+                            if let Some((id, name, raw, error)) = block.invalid_tool_use() {
+                                invalid_tool_inputs
+                                    .push((id.to_string(), invalid_input_message(name, raw, error)));
+                            }
+                            block.into_content_block()
+                        })
+                        .collect();
                     return Ok(SampleOk {
-                        blocks: blocks
-                            .into_iter()
-                            .map(AssistantBlock::into_content_block)
-                            .collect(),
+                        blocks,
                         usage,
                         outcome,
+                        invalid_tool_inputs,
                     });
                 }
             }
         }
     }
+}
+
+/// What the model is told when its own tool arguments could not be read. It
+/// gets the parser's complaint and its own text back: without the text it has
+/// nothing to compare against and tends to resend the same string.
+fn invalid_input_message(name: &str, raw: &str, error: &str) -> String {
+    format!(
+        "{name} was not run: its arguments were not valid JSON ({error}). \
+         You sent: {raw}\nCall {name} again with valid JSON arguments."
+    )
 }
 
 fn replayable_partial(blocks: Vec<AssistantBlock>, open_text: &str) -> Vec<ContentBlock> {
@@ -377,7 +403,9 @@ fn replayable_partial(blocks: Vec<AssistantBlock>, open_text: &str) -> Vec<Conte
                 thinking,
                 signature,
             }),
-            AssistantBlock::Thinking { .. } | AssistantBlock::ToolUse { .. } => None,
+            AssistantBlock::Thinking { .. }
+            | AssistantBlock::ToolUse { .. }
+            | AssistantBlock::InvalidToolUse { .. } => None,
         })
         .collect();
     if !open_text.is_empty() {

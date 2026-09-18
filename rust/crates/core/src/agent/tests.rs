@@ -1561,6 +1561,82 @@ async fn core_rejects_outcome_tool_mismatch_and_invalid_tool_shape_before_dispat
     }
 }
 
+/// Unreadable arguments are the model's own mistake, not a broken wire. The
+/// round runs the calls it could read, hands that one its text back as a
+/// failed result, and the turn goes on — the alternative costs a whole turn to
+/// recover something the model said correctly everywhere else.
+#[tokio::test]
+async fn unreadable_tool_arguments_become_a_failed_result_and_the_turn_goes_on() {
+    let provider = Provider::mock(vec![
+        vec![
+            tool_use("good", "echo ran"),
+            AssistantBlock::InvalidToolUse {
+                id: "bad".into(),
+                name: "bash".into(),
+                raw: r#"{"command": "ls", "description": 看一眼}"#.into(),
+                error: "expected value at line 1 column 34".into(),
+            },
+        ],
+        vec![AssistantBlock::Text {
+            text: "recovered".into(),
+        }],
+    ]);
+    let cfg = crate::tools::testutil::TestConfig::new("invalid-tool-input")
+        .provider(provider)
+        .max_rounds(Some(10))
+        .build();
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("run it"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "recovered");
+
+    let messages = history.messages();
+    // The call that could not be read is still a call, with the only input the
+    // wire can carry, and it keeps its place among the round's calls.
+    assert_eq!(
+        messages[1].content[1],
+        ContentBlock::ToolUse {
+            id: "bad".into(),
+            name: "bash".into(),
+            input: json!({}),
+        }
+    );
+    let [ran, failed] = &messages[2].content[..] else {
+        panic!(
+            "expected one result per call, got {:?}",
+            messages[2].content
+        );
+    };
+    assert!(matches!(
+        ran,
+        ContentBlock::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "good"
+    ));
+    let ContentBlock::ToolResult {
+        tool_use_id,
+        content,
+        is_error,
+    } = failed
+    else {
+        panic!("expected a tool result, got {failed:?}");
+    };
+    assert_eq!(tool_use_id, "bad");
+    assert!(is_error);
+    let kloop_protocol::ToolResultContent::Text(text) = content else {
+        panic!("expected text, got {content:?}");
+    };
+    // The model gets the parser's complaint and its own text back: without the
+    // text it has nothing to compare against and resends the same string.
+    assert_eq!(
+        text,
+        "bash was not run: its arguments were not valid JSON (expected value at line 1 column 34). \
+         You sent: {\"command\": \"ls\", \"description\": 看一眼}\nCall bash again with valid JSON arguments."
+    );
+}
+
 #[tokio::test]
 async fn completed_block_without_delta_still_has_one_item_lifecycle() {
     struct EventUi(std::sync::Mutex<Vec<Event>>);

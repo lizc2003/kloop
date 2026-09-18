@@ -90,7 +90,15 @@ validate five architectural bets before committing to a larger agent design.
    other unknown SSE event still fails closed, naming the event. Responses function-call
    arguments are reconciled by JSON value (the proxy may stream compact deltas
    but echo a pretty-printed `.done`), while text and reasoning stay byte-exact;
-   genuinely divergent or non-JSON arguments still fail closed. Responses
+   genuinely divergent arguments still fail closed. Tool arguments are a string
+   the model wrote, so all three rails treat a broken one as the model's
+   mistake rather than a broken wire: a whitelist repairs the few unambiguous
+   slips (an unquoted value, a raw newline inside a string, a trailing comma)
+   and `serde_json` still rules on the result, while anything else becomes an
+   invalid call — recorded as an ordinary `tool_use` with empty input, never
+   dispatched, and answered with a failed `tool_result` carrying the parser's
+   complaint and the model's own text, so the turn keeps its other calls and
+   the model rewrites that one next round. Responses
    requests also carry `prompt_cache_key` — the session id, shared by this
    session's sampling and compaction — so the growing prefix keeps landing on a
    backend that already holds it; a sub-agent sends its own `{parent}-{agent-N}`

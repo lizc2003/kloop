@@ -202,20 +202,22 @@ fn finish_block(acc: BlockAcc) -> Result<AssistantBlock, ProviderFailure> {
             initial_input,
             json,
         } => {
-            let input = if json.trim().is_empty() {
-                initial_input
-            } else {
-                if initial_input
-                    .as_object()
-                    .is_some_and(|object| !object.is_empty())
-                {
-                    return Err(protocol(
-                        "tool input appeared in both start and delta events",
-                    ));
-                }
-                crate::parse_tool_input("anthropic", &name, &json)?
-            };
-            Ok(AssistantBlock::ToolUse { id, name, input })
+            if json.trim().is_empty() {
+                return Ok(AssistantBlock::ToolUse {
+                    id,
+                    name,
+                    input: initial_input,
+                });
+            }
+            if initial_input
+                .as_object()
+                .is_some_and(|object| !object.is_empty())
+            {
+                return Err(protocol(
+                    "tool input appeared in both start and delta events",
+                ));
+            }
+            Ok(crate::tool_use_block(id, name, &json))
         }
         BlockAcc::Thinking {
             thinking,

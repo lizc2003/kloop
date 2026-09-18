@@ -546,13 +546,15 @@ pub(super) async fn stream(
         let name = acc
             .name
             .ok_or_else(|| protocol("tool call completed without a name"))?;
-        let input = crate::parse_tool_input("openai-compat", &name, &acc.args)?;
-        blocks.push(AssistantBlock::ToolUse { id, name, input });
+        blocks.push(crate::tool_use_block(id, name, &acc.args));
     }
     if refusal_seen
-        && blocks
-            .iter()
-            .any(|block| matches!(block, AssistantBlock::ToolUse { .. }))
+        && blocks.iter().any(|block| {
+            matches!(
+                block,
+                AssistantBlock::ToolUse { .. } | AssistantBlock::InvalidToolUse { .. }
+            )
+        })
     {
         return Err(protocol("response combined refusal with tool calls"));
     }

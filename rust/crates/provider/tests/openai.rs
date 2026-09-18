@@ -394,8 +394,12 @@ async fn empty_tool_identity_must_eventually_fill_and_nonempty_values_cannot_cha
     }
 }
 
+/// Arguments are a string the model wrote; an unreadable one is its mistake to
+/// fix, so the stream completes with a call the turn can answer instead of
+/// dying on it. Repair handles the shapes it can read unambiguously — this one
+/// it cannot.
 #[tokio::test]
-async fn malformed_arguments_fail_closed() {
+async fn malformed_arguments_come_back_as_an_invalid_call() {
     let server = MockServer::start().await;
     mount_sse(
         &server,
@@ -411,11 +415,65 @@ async fn malformed_arguments_fail_closed() {
     )
     .await;
 
-    let events = collect(openai(&server)).await;
-    assert_eq!(events.len(), 1);
-    let error = events.into_iter().next().unwrap().unwrap_err();
-    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
-    assert!(error.to_string().contains("invalid JSON input"));
+    let events: Vec<StreamEvent> = collect(openai(&server))
+        .await
+        .into_iter()
+        .map(|event| event.unwrap())
+        .collect();
+    let [
+        StreamEvent::BlockDone(block),
+        StreamEvent::Terminal { outcome, .. },
+    ] = &events[..]
+    else {
+        panic!("expected one invalid call and a terminal, got {events:?}");
+    };
+    assert_eq!(outcome, &AssistantOutcome::ToolUse);
+    let AssistantBlock::InvalidToolUse {
+        id,
+        name,
+        raw,
+        error,
+    } = block
+    else {
+        panic!("expected an invalid call, got {block:?}");
+    };
+    assert_eq!(
+        (id.as_str(), name.as_str(), raw.as_str()),
+        ("c1", "bash", "{oops")
+    );
+    assert!(error.contains("column"), "{error}");
+}
+
+/// The mistake models actually make, and the one that cost a whole turn before:
+/// a value left unquoted. It is repaired into the call the model meant.
+#[tokio::test]
+async fn repairable_arguments_still_reach_the_tool() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "c1", "function": {"name": "bash", "arguments": "{\"command\": \"ls\", \"description\": 看一眼}"}}
+                ]}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            ],
+            true,
+        ),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(openai(&server))
+        .await
+        .into_iter()
+        .map(|event| event.unwrap())
+        .collect();
+    assert!(matches!(
+        &events[0],
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
+            if id == "c1" && name == "bash"
+                && input == &json!({"command": "ls", "description": "看一眼"})
+    ));
 }
 
 #[tokio::test]
