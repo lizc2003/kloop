@@ -87,5 +87,5 @@ JSON,解析不了就 `ProviderFailure::protocol` —— 整个流失败、整轮
 
 ## ✅ 完成
 
-2026-09-18 完成,一次提交 `<sha>`。`cargo fmt --check` + `clippy -D warnings` +
+2026-09-18 完成,一次提交 `5334208`。`cargo fmt --check` + `clippy -D warnings` +
 全量 `cargo test`(1588)全绿。
