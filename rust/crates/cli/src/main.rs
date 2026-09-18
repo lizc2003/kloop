@@ -170,12 +170,14 @@ struct SessionState {
 }
 
 impl SessionState {
+    /// `Ok(None)`: the resume picker was cancelled, so there is no session to
+    /// open and nothing to run.
     fn open(
         args: &CliArgs,
         cwd: &std::path::Path,
         process: &ProcessState,
         session_store: &SessionStore,
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
         let project = if args.mock {
             context::mock(cwd)
         } else {
@@ -205,12 +207,17 @@ impl SessionState {
             }
             skills
         });
-        let (mut history, session_id) = open_history(
+        let Some((mut history, session_id)) = open_history(
             session_store,
             &session_dirs,
             &args.session,
             &process.provider.initial_route(),
-        )?;
+        )?
+        else {
+            // The resume picker was cancelled: nothing was chosen, so there is
+            // nothing to run.
+            return Ok(None);
+        };
         // Every session — fresh, resumed or forked — opens on the route a new
         // session would open on: `model_provider`/`model` (and their env overrides)
         // as they read right now. A `/provider` switch belongs to the conversation
@@ -232,7 +239,7 @@ impl SessionState {
         } else {
             image::load_images(&args.images)?
         };
-        Ok(Self {
+        Ok(Some(Self {
             project,
             sandbox,
             skills,
@@ -241,7 +248,7 @@ impl SessionState {
             session_route,
             session_dirs,
             pending_images,
-        })
+        }))
     }
 }
 
@@ -309,7 +316,9 @@ async fn run_front_end(
     if args.serve {
         return run_serve(args, process, session_store).await;
     }
-    let session = SessionState::open(&args, &cwd, &process, &session_store)?;
+    let Some(session) = SessionState::open(&args, &cwd, &process, &session_store)? else {
+        return Ok(ExitCode::SUCCESS);
+    };
     // Headless (`--headless`) takes precedence over the interactive
     // front-ends — including --mock, so `--mock --headless` is a hermetic
     // end-to-end run for CI. One turn, print the result, exit by outcome.

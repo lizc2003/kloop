@@ -30,3 +30,8 @@ tokio-util = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 synoptic = "2.2.9"
+
+[dev-dependencies]
+# Whole-screen baselines for the resume picker (plan 162), the same tool the
+# PTY baselines use.
+insta = { workspace = true }

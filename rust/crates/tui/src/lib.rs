@@ -18,6 +18,7 @@ mod events;
 mod markdown;
 mod menu;
 mod render;
+mod session_picker;
 mod terminal;
 mod text_layout;
 mod toolrow;
@@ -58,11 +59,14 @@ use kloop_core::inbox::InboxItem;
 use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::rollout::fork_points;
+
 use kloop_core::rollout::fork_session;
 use kloop_core::rollout::inspect_session;
 use kloop_core::rollout::session_id_of;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+pub use session_picker::SessionEntry;
+pub use session_picker::pick_session;
 
 use crate::app::App;
 use crate::app::Cell;

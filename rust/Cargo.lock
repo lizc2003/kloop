@@ -1698,6 +1698,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "crossterm",
+ "insta",
  "kloop-core",
  "kloop-process-spawn",
  "kloop-protocol",

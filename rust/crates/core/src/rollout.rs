@@ -1385,7 +1385,7 @@ pub fn fork_origin(path: &Path) -> Option<String> {
 /// How a session file relates to another, read from its first line: forked
 /// from a cut point of another session, or spawned as a sub-agent of a parent
 /// turn. None for a session started fresh at the top level.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionOrigin {
     /// A fork's cross-file `parent` (`{src stem}#{cut}`).
     Fork(String),
@@ -1398,10 +1398,13 @@ pub enum SessionOrigin {
 /// two are mutually exclusive in practice, but the precedence keeps the label
 /// unambiguous. Reads only the first line.
 pub fn session_origin(path: &Path) -> Option<SessionOrigin> {
-    let meta = read_first_meta(path)?;
-    match (meta.subagent_of, meta.parent) {
-        (Some(sa), _) => Some(SessionOrigin::SubAgent(sa)),
-        (None, Some(parent)) => Some(SessionOrigin::Fork(parent)),
+    origin_of(&read_first_meta(path)?)
+}
+
+fn origin_of(meta: &LineMeta) -> Option<SessionOrigin> {
+    match (&meta.subagent_of, &meta.parent) {
+        (Some(sa), _) => Some(SessionOrigin::SubAgent(sa.clone())),
+        (None, Some(parent)) => Some(SessionOrigin::Fork(parent.clone())),
         (None, None) => None,
     }
 }
@@ -1420,6 +1423,74 @@ fn read_first_meta(path: &Path) -> Option<LineMeta> {
     std::io::BufReader::new(file).read_line(&mut first).ok()?;
     let line: RolloutLine = serde_json::from_str(first.trim()).ok()?;
     Some(line.into_meta())
+}
+
+/// Everything a session list shows for one file, read without replaying it.
+/// `inspect_session` reads and JSON-parses every byte; a picker facing dozens
+/// of megabyte-sized transcripts would pay that for all of them before drawing
+/// its first frame, so this stops at the first user text instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionDigest {
+    pub id: String,
+    /// First user text, truncated. Empty when the session has none yet.
+    pub title: String,
+    pub origin: Option<SessionOrigin>,
+    /// Last write = when the session was last active, the order a list wants.
+    pub modified: SystemTime,
+    pub bytes: u64,
+    /// The file holds a conversation, not just the opening preamble.
+    pub has_content: bool,
+}
+
+pub fn session_digest(path: &Path) -> io::Result<SessionDigest> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let mut digest = SessionDigest {
+        id: session_id_of(path),
+        title: String::new(),
+        origin: None,
+        modified: metadata.modified()?,
+        bytes: metadata.len(),
+        has_content: false,
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw = String::new();
+    let mut at_first_line = true;
+    loop {
+        raw.clear();
+        if reader.read_line(&mut raw)? == 0 {
+            break;
+        }
+        // Lineage rides the first line only, and an unparseable line is skipped
+        // rather than fatal — `parse_session` tolerates a torn tail the same
+        // way, and a damaged session must still be listable.
+        let first = std::mem::take(&mut at_first_line);
+        let Ok(line) = serde_json::from_str::<RolloutLine>(raw.trim()) else {
+            continue;
+        };
+        if first {
+            digest.origin = origin_of(line.meta());
+        }
+        match &line {
+            RolloutLine::Message { message, .. } => {
+                digest.has_content = true;
+                if digest.title.is_empty() {
+                    // Wide enough for any terminal the picker will draw in; it
+                    // truncates to the real width itself.
+                    digest.title = user_snippet(std::slice::from_ref(message), 200);
+                }
+            }
+            RolloutLine::Compacted { .. } | RolloutLine::Repaired { .. } => {
+                digest.has_content = true;
+            }
+            _ => {}
+        }
+        if digest.has_content && !digest.title.is_empty() {
+            break;
+        }
+    }
+    Ok(digest)
 }
 
 /// Make the replayed history legal to send. Both directions, mirroring what
@@ -1703,6 +1774,13 @@ pub fn session_id_of(path: &Path) -> String {
 /// First user text in a session, truncated — the human-readable label for
 /// session lists.
 pub fn first_user_snippet(messages: &[Message]) -> String {
+    user_snippet(messages, 60)
+}
+
+/// The cap is the caller's: a one-line stdout listing wants a short label,
+/// while the picker truncates to the terminal's width and would rather have
+/// the room.
+fn user_snippet(messages: &[Message], max_chars: usize) -> String {
     for message in messages {
         if message.role != Role::User {
             continue;
@@ -1711,10 +1789,10 @@ pub fn first_user_snippet(messages: &[Message]) -> String {
             if let ContentBlock::Text { text } = block {
                 let mut snippet: String = text
                     .chars()
-                    .take(60)
+                    .take(max_chars)
                     .map(|c| if c == '\n' { ' ' } else { c })
                     .collect();
-                if text.chars().count() > 60 {
+                if text.chars().count() > max_chars {
                     snippet.push('…');
                 }
                 return snippet;
@@ -2521,6 +2599,75 @@ mod tests {
         // Lineage metadata is inert on replay: the history is just the two messages.
         assert_eq!(load_session(&path).unwrap().len(), 2);
         cleanup(&path);
+    }
+
+    /// The digest is what a session list reads instead of replaying the file:
+    /// the first user line, and nothing after it. A torn tail past that point
+    /// must not change the answer — the picker has to list a damaged session,
+    /// not fail on it.
+    #[test]
+    fn session_digest_stops_at_the_first_user_line() {
+        use std::io::Write as _;
+
+        let path = temp_file("digest");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::user_text("review the picker"))
+            .unwrap();
+        rollout
+            .append_message(&Message::assistant(vec![ContentBlock::Text {
+                text: "on it".into(),
+            }]))
+            .unwrap();
+        rollout
+            .append_message(&Message::user_text("a later prompt"))
+            .unwrap();
+        drop(rollout);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"type\": \"mess").unwrap();
+        drop(file);
+
+        let digest = session_digest(&path).unwrap();
+        assert_eq!(digest.id, "session");
+        assert_eq!(digest.title, "review the picker");
+        assert_eq!(digest.origin, None);
+        assert!(digest.has_content);
+        assert_eq!(digest.bytes, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A file holding only its preamble replays as an empty conversation, and
+    /// the digest says so without a title to show for it.
+    #[test]
+    fn session_digest_marks_a_preamble_only_file_as_empty() {
+        let path = temp_file("digest-shell");
+        // A writer that never gets past the preamble removes the file on drop;
+        // a hard kill does not, and that is the file this covers.
+        std::mem::forget(Rollout::new(path.clone()));
+
+        let digest = session_digest(&path).unwrap();
+        assert!(!digest.has_content);
+        assert_eq!(digest.title, "");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Lineage rides the first line, so the digest reads it for free — that is
+    /// what keeps sub-agent transcripts out of the picker without a second pass
+    /// over every file.
+    #[test]
+    fn session_digest_carries_lineage() {
+        let path = temp_file("digest-fork");
+        let dir = path.parent().unwrap().to_path_buf();
+        seed_forkable(&path);
+        let fork = fork_session(&path, Some(5), &dir).unwrap();
+
+        let digest = session_digest(&fork).unwrap();
+        assert!(matches!(digest.origin, Some(SessionOrigin::Fork(_))));
+        assert_eq!(digest.title, "one");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

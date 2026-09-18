@@ -1,0 +1,28 @@
+---
+source: crates/tui/src/session_picker.rs
+expression: "screen(&picker, 80, 24)"
+---
+Resume session (1 of 3)
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ⌕ Search…                                                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  kloop
+
+❯ review the picker
+  16 seconds ago · 1MB
+
+  fix the banner width
+  19 hours ago · 1.2MB
+
+  审查 243484df
+  1 day ago · 574.1KB
+
+
+
+
+
+
+
+↑↓ to select · Enter to resume · Type to search · Esc to cancel

@@ -388,7 +388,19 @@ operation, so a timestamp collision cannot truncate an existing transcript.
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency); `--resume` picks the most recently modified session, `--resume
 <id>` a specific one, `--list-sessions` shows this project's sessions and
-`--list-sessions --all` every project's. Native-protocol
+`--list-sessions --all` every project's.
+
+`--resume` with no id opens the full-screen picker (plan 162): one card per
+session — the first user prompt, then how long ago it was last written and how
+big it is — with `↑↓` to move, typing to filter (case-insensitive substring over
+the prompt and the id), Enter to resume and Esc to cancel, which exits without
+starting anything. It asks for a viewport as tall as the list needs rather than
+the whole screen, and hands the terminal back cleared, so the session banner
+prints where the picker began. Off a terminal (a pipe, a harness, a terminal
+that refuses raw mode) it falls back to the numbered stdout list it used to be.
+Rows are built from `session_digest`, which reads each file only up to its first
+user line: replaying dozens of megabyte-sized transcripts just to label them is
+what a list of 74 sessions cannot afford. Native-protocol
 sessions additionally restore the exact canonical cwd and resolved model that
 were pinned at `thread/start`; a legacy rollout without this metadata remains
 readable but requires its original `cwd` once on `thread/resume` before it is

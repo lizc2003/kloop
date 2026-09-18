@@ -16,15 +16,16 @@ use kloop_core::history::History;
 use kloop_core::permissions::Mode;
 use kloop_core::provider_route::FrozenProviderRoute;
 use kloop_core::rollout::Rollout;
+use kloop_core::rollout::SessionDigest;
 use kloop_core::rollout::SessionOrigin;
 use kloop_core::rollout::checked_session_path;
 use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
-use kloop_core::rollout::is_subagent_session;
 use kloop_core::rollout::load_session;
 use kloop_core::rollout::new_session_id;
 use kloop_core::rollout::resume_session;
+use kloop_core::rollout::session_digest;
 use kloop_core::rollout::session_id_of;
 use kloop_core::rollout::session_origin;
 use kloop_core::rollout::session_path;
@@ -408,41 +409,126 @@ fn session_in_this_project(store: &SessionStore, dirs: &SessionDirs, id: &str) -
     }
 }
 
+/// One offered session: its file plus the digest a list row is built from.
+/// `error` is set when the file could not be read at all — it stays on the
+/// list, saying why, because hiding it would hide the problem.
+struct Resumable {
+    path: PathBuf,
+    digest: SessionDigest,
+    error: Option<String>,
+}
+
 /// Top-level sessions the resume picker offers, most recent first: every
 /// session except sub-agent transcripts, which are reachable only by explicit
 /// id (they still show in `--list-sessions`). Mirrors cc hiding sidechains and
 /// codex filtering by source.
-fn resumable_sessions(sessions_dir: &Path) -> Vec<PathBuf> {
+///
+/// Read through [`session_digest`], not `load_session`: the picker draws every
+/// one of these rows before the first keystroke, and replaying dozens of
+/// megabyte-sized transcripts to learn their first line is the cost that made
+/// the old numbered list feel instant only because it was short.
+fn resumable_sessions(sessions_dir: &Path) -> Vec<Resumable> {
     sessions_by_recency(sessions_dir)
         .into_iter()
-        .filter(|path| !is_subagent_session(path))
+        .map(|path| match session_digest(&path) {
+            Ok(digest) => Resumable {
+                path,
+                digest,
+                error: None,
+            },
+            Err(error) => Resumable {
+                digest: SessionDigest {
+                    id: session_id_of(&path),
+                    title: String::new(),
+                    origin: None,
+                    modified: SystemTime::UNIX_EPOCH,
+                    bytes: 0,
+                    has_content: true,
+                },
+                path,
+                error: Some(error.to_string()),
+            },
+        })
+        .filter(|session| !matches!(session.digest.origin, Some(SessionOrigin::SubAgent(_))))
         // A session holding nothing but its opening preamble replays as an empty
         // conversation — there is nothing to continue into. A writer no longer
         // leaves one behind, but the ones already on disk (and any left by a
-        // hard kill) would still win `--continue` on recency alone. An unreadable
-        // file stays listed: `session_line` reports why, and hiding it would hide
-        // the problem.
-        .filter(|path| !matches!(load_session(path), Ok(messages) if messages.is_empty()))
+        // hard kill) would still win `--continue` on recency alone.
+        .filter(|session| session.digest.has_content)
         .collect()
 }
 
-/// `--resume` with no id: numbered list on stdout, one line of stdin picks.
+/// The row text for one session, shared by the picker and the stdio fallback.
+fn session_title(session: &Resumable) -> String {
+    match (&session.error, session.digest.title.as_str()) {
+        (Some(error), _) => format!("(unreadable: {error})"),
+        (None, "") => "(no prompt yet)".to_string(),
+        (None, title) => title.to_string(),
+    }
+}
+
+fn session_badge(session: &Resumable) -> Option<String> {
+    match &session.digest.origin {
+        Some(SessionOrigin::Fork(origin)) => Some(format!("forked from {origin}")),
+        Some(SessionOrigin::SubAgent(origin)) => Some(format!("sub-agent of {origin}")),
+        None => None,
+    }
+}
+
+/// `--resume` with no id. On a terminal this is the full-screen picker
+/// (plan 162); anywhere else — a pipe, a test harness, a terminal that refuses
+/// raw mode — it falls back to the numbered list this used to be.
 /// Runs before any UI starts, so plain blocking stdio is fine.
-fn pick_session(sessions_dir: &Path) -> Result<PathBuf> {
+fn pick_session(sessions_dir: &Path) -> Result<Option<PathBuf>> {
+    use std::io::IsTerminal as _;
+
     let sessions = resumable_sessions(sessions_dir);
     if sessions.is_empty() {
         bail!("no saved sessions to resume");
     }
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let now = SystemTime::now();
+        let entries = sessions
+            .iter()
+            .map(|session| kloop_tui::SessionEntry {
+                id: session.digest.id.clone(),
+                title: session_title(session),
+                age: now
+                    .duration_since(session.digest.modified)
+                    .unwrap_or_default(),
+                bytes: session.digest.bytes,
+                badge: session_badge(session),
+            })
+            .collect();
+        let project = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| {
+                cwd.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        return Ok(
+            kloop_tui::pick_session(entries, &project)?.map(|index| sessions[index].path.clone())
+        );
+    }
     println!("saved sessions (most recent first):");
-    for (i, path) in sessions.iter().enumerate() {
-        println!("{:>3}. {}", i + 1, session_line(path));
+    for (i, session) in sessions.iter().enumerate() {
+        println!(
+            "{:>3}. {}  {}{}",
+            i + 1,
+            session.digest.id,
+            session_title(session),
+            session_badge(session)
+                .map(|badge| format!("  [{badge}]"))
+                .unwrap_or_default()
+        );
     }
     print!("resume which? [1-{}, empty = 1] > ", sessions.len());
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let index = pick_index(&line, sessions.len())?;
-    Ok(sessions[index].clone())
+    Ok(Some(sessions[index].path.clone()))
 }
 
 /// 1-based selection, empty input = the first (most recent) entry.
@@ -458,13 +544,15 @@ fn pick_index(input: &str, len: usize) -> Result<usize> {
 }
 
 /// Build the History for this run: a fresh persisted session by default, or
-/// one replayed from disk for `--resume`.
+/// one replayed from disk for `--resume`. `Ok(None)` means the picker was
+/// cancelled — the user asked for nothing, so kloop exits quietly instead of
+/// starting a session they did not choose.
 pub(crate) fn open_history(
     store: &SessionStore,
     dirs: &SessionDirs,
     choice: &SessionChoice,
     initial_route: &FrozenProviderRoute,
-) -> Result<(History, String)> {
+) -> Result<Option<(History, String)>> {
     let sessions_dir = dirs.sessions.as_path();
     let offload_dir = dirs.offload.clone();
     let resume_path = match choice {
@@ -475,14 +563,20 @@ pub(crate) fn open_history(
                 session_path(sessions_dir, &id),
                 initial_route,
             )?);
-            return Ok((history, id));
+            return Ok(Some((history, id)));
         }
         SessionChoice::Resume(id) => session_in_this_project(store, dirs, id)?,
-        SessionChoice::Continue => resumable_sessions(sessions_dir)
-            .into_iter()
-            .next()
-            .context("no saved sessions to continue")?,
-        SessionChoice::Pick => pick_session(sessions_dir)?,
+        SessionChoice::Continue => {
+            resumable_sessions(sessions_dir)
+                .into_iter()
+                .next()
+                .context("no saved sessions to continue")?
+                .path
+        }
+        SessionChoice::Pick => match pick_session(sessions_dir)? {
+            Some(path) => path,
+            None => return Ok(None),
+        },
         SessionChoice::Fork { id, cut } => {
             let src = session_in_this_project(store, dirs, id)?;
             let path = fork_session(&src, *cut, sessions_dir)
@@ -505,7 +599,7 @@ pub(crate) fn open_history(
         resumed.messages.len()
     );
     let history = History::resume(offload_dir, resumed);
-    Ok((history, id))
+    Ok(Some((history, id)))
 }
 #[cfg(test)]
 mod tests {
@@ -900,7 +994,11 @@ mod tests {
             "the shell is on disk, and it is the newer file"
         );
 
-        assert_eq!(resumable_sessions(&dir), vec![real]);
+        let offered: Vec<PathBuf> = resumable_sessions(&dir)
+            .into_iter()
+            .map(|session| session.path)
+            .collect();
+        assert_eq!(offered, vec![real]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
