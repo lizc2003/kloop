@@ -12,6 +12,7 @@ use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
+use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailureKind;
 use kloop_provider::StreamResult;
@@ -62,7 +63,7 @@ async fn mount_bytes(server: &MockServer, body: Vec<u8>) {
 
 fn responses(server: &MockServer) -> Provider {
     Provider::OpenAiResponses {
-        key: "test-key".into(),
+        cred: Credential::bearer("test-key"),
         base: server.uri(),
     }
 }
@@ -263,7 +264,7 @@ async fn effort_maps_to_reasoning_field() {
         )
         .await;
         let provider = Arc::new(Provider::OpenAiResponses {
-            key: "test-key".into(),
+            cred: Credential::bearer("test-key"),
             base: server.uri(),
         });
         let attempt = provider.attempt_identity("responses", 1, "test-model");

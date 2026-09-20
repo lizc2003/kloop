@@ -1278,7 +1278,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
 model = "secret-model"
 [model_providers.secret]
 wire_api = "responses"
-http_headers = { Authorization = "Bearer SENTINEL-PROVIDER" }
+auth_header = { Authorization = "Bearer SENTINEL-PROVIDER" }
 [permissions]
 deny = ["bash(secret *)"]
 [[hooks]]

@@ -122,9 +122,63 @@ pub enum ThinkingMode {
     Budget(u64),
 }
 
+/// How a provider presents its credential on the wire. Both wires have a
+/// conventional spelling — Messages sends `x-api-key`, the OpenAI rails send
+/// `Authorization: Bearer` — but a gateway in the middle picks its own, so the
+/// spelling is configuration rather than a property of the rail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `x-api-key: <secret>`
+    ApiKey,
+    /// `Authorization: Bearer <secret>`
+    Bearer,
+}
+
+/// A secret and the header that carries it, kept together because they are only
+/// correct together: the scheme decides what goes on the wire, and the bare
+/// secret — never the header value around it — is what `redact_secret` has to
+/// match in provider-authored text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credential {
+    scheme: AuthScheme,
+    secret: String,
+}
+
+impl Credential {
+    pub fn new(scheme: AuthScheme, secret: impl Into<String>) -> Self {
+        Self {
+            scheme,
+            secret: secret.into(),
+        }
+    }
+
+    pub fn api_key(secret: impl Into<String>) -> Self {
+        Self::new(AuthScheme::ApiKey, secret)
+    }
+
+    pub fn bearer(secret: impl Into<String>) -> Self {
+        Self::new(AuthScheme::Bearer, secret)
+    }
+
+    pub fn scheme(&self) -> AuthScheme {
+        self.scheme
+    }
+
+    pub(crate) fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    pub(crate) fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.scheme {
+            AuthScheme::ApiKey => req.header("x-api-key", &self.secret),
+            AuthScheme::Bearer => req.bearer_auth(&self.secret),
+        }
+    }
+}
+
 pub enum Provider {
     Anthropic {
-        key: String,
+        cred: Credential,
         base: String,
         /// Prompt caching: mark cache_control breakpoints on the last tool,
         /// the system block, and the last message block.
@@ -132,14 +186,14 @@ pub enum Provider {
         thinking: ThinkingMode,
     },
     OpenAiCompat {
-        key: String,
+        cred: Credential,
         base: String,
     },
     /// OpenAI Responses API (`/responses`), stateless: `store: false`, with
     /// reasoning carried across requests via encrypted_content blobs riding
     /// in `Thinking.signature`.
     OpenAiResponses {
-        key: String,
+        cred: Credential,
         base: String,
     },
     /// Scripted turns for keyless end-to-end runs; each `stream()` call pops one turn.
@@ -544,13 +598,13 @@ impl Provider {
                 spawn_stream(move |sink| async move { run_mock_turn(turn, &sink).await })
             }
             Provider::Anthropic {
-                key,
+                cred,
                 base,
                 cache,
                 thinking,
             } => {
                 let url = format!("{base}/v1/messages");
-                let key = key.clone();
+                let cred = cred.clone();
                 let mut body = json!({
                     "model": model,
                     "max_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
@@ -584,12 +638,12 @@ impl Provider {
                 }
                 let session = cache_key.map(str::to_string);
                 spawn_stream(move |sink| async move {
-                    anthropic::stream(&url, &key, session.as_deref(), &body, &sink).await
+                    anthropic::stream(&url, &cred, session.as_deref(), &body, &sink).await
                 })
             }
-            Provider::OpenAiResponses { key, base } => {
+            Provider::OpenAiResponses { cred, base } => {
                 let url = format!("{base}/responses");
-                let key = key.clone();
+                let cred = cred.clone();
                 let mut body = json!({
                     "model": model,
                     "instructions": system,
@@ -615,12 +669,12 @@ impl Provider {
                     body["prompt_cache_key"] = json!(cache_key);
                 }
                 spawn_stream(move |sink| async move {
-                    responses::stream(&url, &key, &body, &sink).await
+                    responses::stream(&url, &cred, &body, &sink).await
                 })
             }
-            Provider::OpenAiCompat { key, base } => {
+            Provider::OpenAiCompat { cred, base } => {
                 let url = format!("{base}/chat/completions");
-                let key = key.clone();
+                let cred = cred.clone();
                 let messages = match openai::to_openai_messages(system, messages) {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -659,7 +713,7 @@ impl Provider {
                     body["prompt_cache_key"] = json!(cache_key);
                 }
                 spawn_stream(
-                    move |sink| async move { openai::stream(&url, &key, &body, &sink).await },
+                    move |sink| async move { openai::stream(&url, &cred, &body, &sink).await },
                 )
             }
         }
@@ -890,7 +944,7 @@ mod tests {
         assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
 
         let chat = Provider::OpenAiCompat {
-            key: "unused".into(),
+            cred: Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
         };
         let chat_attempt = chat.attempt_identity("chat", 1, "chat-model");
@@ -911,7 +965,7 @@ mod tests {
     #[test]
     fn chat_replay_still_requires_validated_source() {
         let chat = Provider::OpenAiCompat {
-            key: "unused".into(),
+            cred: Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
         };
         let foreign = Message::assistant_from_provider(

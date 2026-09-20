@@ -21,6 +21,8 @@ use kloop_core::provider_route::ProviderCatalogEntry;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAvailabilityCode;
 use kloop_protocol::ReasoningEffort;
+use kloop_provider::AuthScheme;
+use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ThinkingMode;
 
@@ -44,6 +46,17 @@ impl Rail {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
             Self::OpenAiChat | Self::OpenAiResponses => "https://api.openai.com/v1",
+        }
+    }
+
+    /// What each wire's own vendor sends, used when a profile declares no
+    /// `auth_header` and the credential arrives from the environment instead.
+    /// A profile that does declare one outranks this: the spelling belongs to
+    /// the endpoint, not to the rail and not to where the secret came from.
+    fn default_auth(self) -> AuthScheme {
+        match self {
+            Self::Anthropic => AuthScheme::ApiKey,
+            Self::OpenAiChat | Self::OpenAiResponses => AuthScheme::Bearer,
         }
     }
 }
@@ -102,7 +115,10 @@ impl ResolvedProviderSettings {
 struct Profile {
     wire: Rail,
     base_url: String,
-    headers: BTreeMap<String, String>,
+    /// The one credential this profile declared, with the header spelling that
+    /// carries it. `None` is a profile whose secret can only come from the
+    /// environment — it stays visible but bounded-unavailable until it does.
+    auth: Option<Credential>,
     model: String,
     models: Vec<String>,
     cache: bool,
@@ -187,22 +203,22 @@ fn resolve_table(
         let thinking = profile.thinking;
         let default_effort = selected_effort(&profile, selected, env)?;
         let factory = Arc::new(move || {
-            let key = credential
+            let cred = credential
                 .clone()
                 .ok_or(ProviderAvailabilityCode::MissingCredential)?;
             Ok(match wire {
                 Rail::Anthropic => Provider::Anthropic {
-                    key,
+                    cred,
                     base: base.clone(),
                     cache,
                     thinking,
                 },
                 Rail::OpenAiChat => Provider::OpenAiCompat {
-                    key,
+                    cred,
                     base: base.clone(),
                 },
                 Rail::OpenAiResponses => Provider::OpenAiResponses {
-                    key,
+                    cred,
                     base: base.clone(),
                 },
             })
@@ -288,19 +304,10 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
     }
     .unwrap_or_else(|| wire.default_base().into());
     let base_url = validate_base_url(&base, "provider base URL")?;
-    let mut headers = BTreeMap::new();
-    match wire {
-        Rail::Anthropic => {
-            headers.insert("x-api-key".into(), key);
-        }
-        Rail::OpenAiChat | Rail::OpenAiResponses => {
-            headers.insert("authorization".into(), format!("Bearer {key}"));
-        }
-    }
     let profile = Profile {
         wire,
         base_url,
-        headers,
+        auth: Some(Credential::new(wire.default_auth(), key)),
         model: model.clone(),
         models: vec![model],
         cache: wire == Rail::Anthropic,
@@ -360,11 +367,15 @@ fn parse_effort_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<Reaso
         .transpose()
 }
 
+/// The env var replaces the secret, never the presentation: which header a
+/// gateway wants is a property of the gateway, so a profile that declared
+/// `auth_header` keeps its spelling even when the secret arrives from the
+/// environment. Only a profile that declared nothing falls back to the rail's.
 fn selected_credential(
     profile: &Profile,
     selected: bool,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<String>> {
+) -> Result<Option<Credential>> {
     let from_env = if selected {
         match profile.wire {
             Rail::Anthropic => nonempty_env(env, "ANTHROPIC_API_KEY")?,
@@ -373,10 +384,14 @@ fn selected_credential(
     } else {
         None
     };
-    Ok(from_env.or_else(|| match profile.wire {
-        Rail::Anthropic => profile.headers.get("x-api-key").cloned(),
-        Rail::OpenAiChat | Rail::OpenAiResponses => bearer_key(&profile.headers),
-    }))
+    let scheme = profile
+        .auth
+        .as_ref()
+        .map_or_else(|| profile.wire.default_auth(), Credential::scheme);
+    Ok(match from_env {
+        Some(secret) => Some(Credential::new(scheme, secret)),
+        None => profile.auth.clone(),
+    })
 }
 
 fn parse_global_file(table: &toml::Table) -> Result<GlobalFile> {
@@ -477,7 +492,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
             "name"
                 | "wire_api"
                 | "base_url"
-                | "http_headers"
+                | "auth_header"
                 | "model"
                 | "models"
                 | "cache"
@@ -532,11 +547,11 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         "context_window",
         &format!("providers.{id}.context_window"),
     )?;
-    let headers = parse_headers(id, spec.get("http_headers"), wire)?;
+    let auth = parse_auth_header(id, spec.get("auth_header"))?;
     Ok(Profile {
         wire,
         base_url,
-        headers,
+        auth,
         model,
         models,
         cache,
@@ -571,38 +586,48 @@ fn required_string_array(table: &toml::Table, key: &str, field: &str) -> Result<
     Ok(models)
 }
 
-fn parse_headers(id: &str, value: Option<&Value>, wire: Rail) -> Result<BTreeMap<String, String>> {
-    let mut headers = BTreeMap::new();
+/// `auth_header` is one credential written the way the endpoint wants it, not a
+/// bag of request headers: kloop sends exactly the spelling declared here, and
+/// nothing else. The set stays closed at the two spellings the wires actually
+/// use, because everything downstream depends on there being exactly one known
+/// secret — `redact_secret` strips it out of provider-authored text, and
+/// availability is "did this profile get a credential at all". Which spelling
+/// belongs to which rail is the gateway's business, not ours, so both are legal
+/// on all three.
+///
+/// Widening this later means adding a spelling *and* the rule for finding the
+/// bare secret inside its value, the way Bearer's prefix is stripped here.
+fn parse_auth_header(id: &str, value: Option<&Value>) -> Result<Option<Credential>> {
     let Some(value) = value else {
-        return Ok(headers);
+        return Ok(None);
     };
+    let field = format!("providers.{id}.auth_header");
     let table = value
         .as_table()
-        .with_context(|| format!("providers.{id}.http_headers must be a table"))?;
-    for (header, value) in table {
-        let folded = header.to_ascii_lowercase();
-        let allowed = match wire {
-            Rail::Anthropic => folded == "x-api-key",
-            Rail::OpenAiChat | Rail::OpenAiResponses => folded == "authorization",
-        };
-        if !allowed {
-            bail!("providers.{id}.http_headers contains unsupported header '{header}'");
-        }
-        let value = value
-            .as_str()
-            .with_context(|| format!("providers.{id}.http_headers.{header} must be a string"))?;
-        let value = nonempty(value, &format!("providers.{id}.http_headers.{header}"))?;
-        if headers.insert(folded, value).is_some() {
-            bail!("providers.{id}.http_headers contains a duplicate header");
-        }
+        .with_context(|| format!("{field} must be a table"))?;
+    let mut entries = table.iter();
+    let (header, value) = entries
+        .next()
+        .with_context(|| format!("{field} must name one header"))?;
+    if entries.next().is_some() {
+        bail!("{field} holds exactly one header");
     }
-    if wire != Rail::Anthropic
-        && let Some(value) = headers.get("authorization")
-        && bearer_from_header(value).is_none()
-    {
-        bail!("providers.{id}.http_headers.Authorization must use Bearer authentication");
+    let raw = value
+        .as_str()
+        .with_context(|| format!("{field}.{header} must be a string"))?;
+    let raw = nonempty(raw, &format!("{field}.{header}"))?;
+    match header.to_ascii_lowercase().as_str() {
+        "x-api-key" => Ok(Some(Credential::api_key(raw))),
+        "authorization" => {
+            // The stored secret is the bare token: the "Bearer " around it is
+            // wire framing, and a redaction sentinel that carried the prefix
+            // would miss the token echoed on its own.
+            let token = bearer_from_header(&raw)
+                .with_context(|| format!("{field}.{header} must use Bearer authentication"))?;
+            Ok(Some(Credential::bearer(token)))
+        }
+        _ => bail!("{field} contains unsupported header '{header}' (x-api-key | Authorization)"),
     }
-    Ok(headers)
 }
 
 fn parse_wire(raw: &str, id: &str) -> Result<Rail> {
@@ -706,12 +731,6 @@ fn parse_thinking_string(raw: &str, field: &str) -> Result<ThinkingMode> {
     }
 }
 
-fn bearer_key(headers: &BTreeMap<String, String>) -> Option<String> {
-    headers
-        .get("authorization")
-        .and_then(|value| bearer_from_header(value))
-}
-
 fn bearer_from_header(value: &str) -> Option<String> {
     let (scheme, key) = value.split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !key.trim().is_empty()).then(|| key.trim().into())
@@ -735,7 +754,7 @@ provider = "anthropic-a"
 [providers.anthropic-a]
 wire_api = "messages"
 base_url = "https://anthropic-a.example"
-http_headers = { x-api-key = "a-key" }
+auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a", "claude-b", "claude-a"]
 cache = false
@@ -744,7 +763,7 @@ thinking = "adaptive"
 [providers.responses-b]
 wire_api = "responses"
 base_url = "https://responses-b.example/v1"
-http_headers = { Authorization = "Bearer b-key" }
+auth_header = { Authorization = "Bearer b-key" }
 model = "gpt-a"
 models = ["gpt-a", "gpt-b"]
 effort = "high"
@@ -767,7 +786,7 @@ provider = "responses-b"
 [providers.anthropic-a]
 wire_api = "messages"
 base_url = "https://anthropic-a.example"
-http_headers = { x-api-key = "a-key" }
+auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a"]
 context_window = 111000
@@ -775,7 +794,7 @@ context_window = 111000
 [providers.responses-b]
 wire_api = "responses"
 base_url = "https://responses-b.example/v1"
-http_headers = { Authorization = "Bearer b-key" }
+auth_header = { Authorization = "Bearer b-key" }
 model = "gpt-a"
 models = ["gpt-a"]
 context_window = 258400
@@ -817,7 +836,7 @@ provider = "responses-b"
 [providers.responses-b]
 wire_api = "responses"
 base_url = "https://responses-b.example/v1"
-http_headers = {{ Authorization = "Bearer b-key" }}
+auth_header = {{ Authorization = "Bearer b-key" }}
 model = "gpt-a"
 models = ["gpt-a"]
 {raw}
@@ -869,7 +888,7 @@ models = ["gpt-a"]
 
     #[test]
     fn selected_environment_credentials_do_not_make_other_profiles_ready() {
-        let raw = CATALOG.replace("http_headers = { Authorization = \"Bearer b-key\" }", "");
+        let raw = CATALOG.replace("auth_header = { Authorization = \"Bearer b-key\" }", "");
         let settings = resolve(
             Some(&raw),
             &env(&[
@@ -893,7 +912,7 @@ provider = "x"
 [providers.x]
 wire_api = "responses"
 default_model = "old"
-http_headers = { Authorization = "Bearer key" }
+auth_header = { Authorization = "Bearer key" }
 "#;
         assert!(
             resolve(Some(retired), &env(&[]))
@@ -904,9 +923,138 @@ http_headers = { Authorization = "Bearer key" }
         );
 
         let outside_allowlist = "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\n\
-             http_headers = { Authorization = \"Bearer key\" }\n\
+             auth_header = { Authorization = \"Bearer key\" }\n\
              model = \"missing\"\nmodels = [\"a\"]\n";
         assert!(resolve(Some(outside_allowlist), &env(&[])).is_err());
+    }
+
+    fn auth_of(raw: &str) -> Result<Option<Credential>> {
+        let table: toml::Table = raw.parse().unwrap();
+        parse_auth_header("x", table.get("auth_header"))
+    }
+
+    /// One credential, written the way the endpoint reads it. Both spellings are
+    /// legal on every rail: which header a gateway wants is the gateway's
+    /// business, and the Messages wire alone has both in the wild. The stored
+    /// secret is always bare — `Bearer` is framing, and a redaction sentinel
+    /// carrying the prefix would miss the token echoed on its own.
+    #[test]
+    fn auth_header_takes_either_spelling_on_any_rail() {
+        assert_eq!(
+            auth_of(r#"auth_header = { Authorization = "Bearer b-key" }"#).unwrap(),
+            Some(Credential::bearer("b-key"))
+        );
+        assert_eq!(
+            auth_of(r#"auth_header = { x-api-key = "a-key" }"#).unwrap(),
+            Some(Credential::api_key("a-key"))
+        );
+        // Spelling is case-insensitive the way headers are.
+        assert_eq!(
+            auth_of(r#"auth_header = { X-Api-Key = "a-key" }"#).unwrap(),
+            Some(Credential::api_key("a-key"))
+        );
+        // Declaring none is a profile whose secret can only come from the env.
+        assert_eq!(auth_of("model = \"m\"").unwrap(), None);
+
+        // The rail does not get a veto: the user's own gateway speaks Messages
+        // and authenticates with Bearer.
+        let gateway = "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
+             auth_header = { Authorization = \"Bearer k\" }\nmodel = \"m\"\n";
+        let resolved = resolve(Some(gateway), &env(&[])).unwrap();
+        assert_eq!(
+            resolved.catalog().descriptors()[0].availability,
+            ProviderAvailabilityCode::Ready
+        );
+    }
+
+    /// Everything downstream assumes exactly one known secret — `redact_secret`
+    /// has to match it in provider-authored text, and availability is "did this
+    /// profile get a credential at all" — so the set stays closed and anything
+    /// outside it fails closed rather than being sent unredacted.
+    #[test]
+    fn auth_header_is_exactly_one_known_spelling() {
+        let refused = |raw: &str| auth_of(raw).map(|_| ()).unwrap_err().to_string();
+
+        assert_eq!(
+            refused(r#"auth_header = { X-Tenant = "acme" }"#),
+            "providers.x.auth_header contains unsupported header 'X-Tenant' \
+             (x-api-key | Authorization)"
+        );
+        assert_eq!(
+            refused(r#"auth_header = { x-api-key = "a", Authorization = "Bearer b" }"#),
+            "providers.x.auth_header holds exactly one header"
+        );
+        assert_eq!(
+            refused(r#"auth_header = { Authorization = "a-key" }"#),
+            "providers.x.auth_header.Authorization must use Bearer authentication"
+        );
+        assert_eq!(
+            refused(r#"auth_header = { x-api-key = "" }"#),
+            "providers.x.auth_header.x-api-key must not be empty"
+        );
+        assert_eq!(
+            refused("auth_header = \"Bearer k\""),
+            "providers.x.auth_header must be a table"
+        );
+        assert_eq!(
+            refused("auth_header = {}"),
+            "providers.x.auth_header must name one header"
+        );
+
+        // The old name is gone outright; no alias, just the closed key table.
+        let retired = "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
+             http_headers = { x-api-key = \"k\" }\nmodel = \"m\"\n";
+        assert_eq!(
+            resolve(Some(retired), &env(&[]))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "providers.x has unknown key 'http_headers'"
+        );
+    }
+
+    /// An environment credential replaces the secret, never the presentation:
+    /// the header a gateway reads is a property of the gateway, not of where the
+    /// secret came from. A profile that declared nothing falls back to what the
+    /// wire's own vendor sends.
+    #[test]
+    fn environment_credentials_replace_the_secret_not_the_spelling() {
+        let profile = |wire: Rail, auth: Option<Credential>| Profile {
+            wire,
+            base_url: "https://gateway.test".into(),
+            auth,
+            model: "m".into(),
+            models: vec!["m".into()],
+            cache: false,
+            thinking: ThinkingMode::Unset,
+            effort: None,
+            context_window: None,
+        };
+        let from_env = |profile: &Profile, selected: bool, var: &str| {
+            selected_credential(profile, selected, &env(&[(var, "env-key")])).unwrap()
+        };
+
+        let declared = profile(Rail::Anthropic, Some(Credential::bearer("file-key")));
+        assert_eq!(
+            from_env(&declared, /*selected=*/ true, "ANTHROPIC_API_KEY"),
+            Some(Credential::bearer("env-key"))
+        );
+        // Unselected profiles are never retargeted by the environment.
+        assert_eq!(
+            from_env(&declared, /*selected=*/ false, "ANTHROPIC_API_KEY"),
+            Some(Credential::bearer("file-key"))
+        );
+
+        let undeclared = profile(Rail::Anthropic, None);
+        assert_eq!(
+            from_env(&undeclared, /*selected=*/ true, "ANTHROPIC_API_KEY"),
+            Some(Credential::api_key("env-key"))
+        );
+        let chat = profile(Rail::OpenAiChat, None);
+        assert_eq!(
+            from_env(&chat, /*selected=*/ true, "OPENAI_API_KEY"),
+            Some(Credential::bearer("env-key"))
+        );
     }
 
     /// `wire_api` names the endpoint, not the vendor — the axis
@@ -917,7 +1065,7 @@ http_headers = { Authorization = "Bearer key" }
         let profile = |wire: &str| {
             format!(
                 "provider = \"x\"\n[providers.x]\nwire_api = \"{wire}\"\n\
-                 http_headers = {{ x-api-key = \"k\" }}\nmodel = \"m\"\nmodels = [\"m\"]\n"
+                 auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\nmodels = [\"m\"]\n"
             )
         };
         assert_eq!(
@@ -937,7 +1085,7 @@ http_headers = { Authorization = "Bearer key" }
     fn with_knowledge(gateway: &str, models: &str) -> String {
         format!(
             "provider = \"g\"\n[providers.g]\nwire_api = \"responses\"\n\
-             http_headers = {{ Authorization = \"Bearer k\" }}\n\
+             auth_header = {{ Authorization = \"Bearer k\" }}\n\
              model = \"m\"\n{gateway}\n{models}"
         )
     }
@@ -971,7 +1119,7 @@ http_headers = { Authorization = "Bearer key" }
         let with_effort = |effort: &str, models: &str| {
             let raw = format!(
                 "provider = \"g\"\n[providers.g]\nwire_api = \"responses\"\n\
-                 http_headers = {{ Authorization = \"Bearer k\" }}\n\
+                 auth_header = {{ Authorization = \"Bearer k\" }}\n\
                  model = \"m\"\neffort = \"{effort}\"\n{models}"
             );
             resolve(Some(&raw), &env(&[])).map(|_| ())
@@ -1027,7 +1175,7 @@ http_headers = { Authorization = "Bearer key" }
         let with_id = |key: &str| {
             format!(
                 "provider = \"g\"\n[providers.g]\nwire_api = \"responses\"\n\
-                 http_headers = {{ Authorization = \"Bearer k\" }}\n\
+                 auth_header = {{ Authorization = \"Bearer k\" }}\n\
                  model = \"gpt-5.6-sol\"\n[models.{key}]\ncontext_window = 400000\n"
             )
         };
@@ -1050,8 +1198,8 @@ http_headers = { Authorization = "Bearer key" }
     fn errors_never_echo_credentials() {
         for raw in [
             "secret = \"SENTINEL\"\n",
-            "provider = \"x\"\n[providers.x]\nwire_api = \"bad\"\nhttp_headers = { Authorization = \"Bearer SENTINEL\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
-            "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nhttp_headers = { Authorization = \"Bearer key\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
+            "provider = \"x\"\n[providers.x]\nwire_api = \"bad\"\nauth_header = { Authorization = \"Bearer SENTINEL\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
+            "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nauth_header = { Authorization = \"Bearer key\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
         ] {
             let error = resolve(Some(raw), &env(&[])).err().unwrap().to_string();
             assert!(!error.contains("SENTINEL"), "secret reflected: {error}");
@@ -1069,14 +1217,14 @@ provider = "anthropic-a"
 
 [providers.anthropic-a]
 wire_api = "messages"
-http_headers = { x-api-key = "a-key" }
+auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a"]
 effort = "low"
 
 [providers.responses-b]
 wire_api = "responses"
-http_headers = { Authorization = "Bearer b-key" }
+auth_header = { Authorization = "Bearer b-key" }
 model = "gpt-a"
 models = ["gpt-a"]
 effort = "none"
@@ -1117,7 +1265,7 @@ provider = "responses-b"
 
 [providers.responses-b]
 wire_api = "responses"
-http_headers = { Authorization = "Bearer b-key" }
+auth_header = { Authorization = "Bearer b-key" }
 model = "gpt-a"
 models = ["gpt-a"]
 effort = "xhigh"
@@ -1135,7 +1283,7 @@ provider = "anthropic-a"
 
 [providers.anthropic-a]
 wire_api = "messages"
-http_headers = { x-api-key = "a-key" }
+auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a"]
 effort = "sky-high"

@@ -1337,3 +1337,20 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    任何 cwd 下的运行时目录(`rust/crates/core/src/.kloop/` 就是其一),改成 `.kloop/*` 的那一刻
    它们全部冒了出来。开洞的正确形状是原规则不动、再补三行(`!/.kloop/`、`/.kloop/*`、
    `!/.kloop/skills/`),因为 git 根本不会进入一个被排除的目录,negation 没有机会被读到。
+
+163. 来自 Plan 167(`http_headers` → `auth_header`,Messages rail 补 Bearer)。两条:
+
+   **① 字段名撒谎时,它的报错会把人引向错误的诊断。** `http_headers` 听起来是"任意请求头",
+   实际收的是**唯一凭证槽**(脱敏只认一个 secret、可用性判定读它、协议自有的头不许被顶掉)。
+   名字这么起之后,"messages rail 不收 Authorization"看上去像一条安全策略,于是没人去问它
+   为什么——真相是那条 rail 只写了一半(Anthropic 官方 SDK 两种凭证形态都发,Claude Code 的
+   `ANTHROPIC_AUTH_TOKEN` 走的正是 Bearer 那条)。**限制本身可能是对的,限制的位置不一定**:
+   看到一条"拒绝"时先分清它挡的是威胁,还是我们没实现的东西。
+
+   **② fail-closed 该用在失败是静默的地方。** 未知配置键会悄悄丢掉一个 server、凭证形态错会
+   悄悄不发认证——这些必须启动就拒。而 base_url 拼错是**响亮**的失败:网关自己会喊 404。
+   我当时提议"拒绝 messages rail 以 `/v1` 结尾的 base_url",用户否掉("这种限制太大,业务场景
+   千变万化")——对,用一条猜出来的规则去拒绝一份本来能跑的配置,代价比让它 404 大。
+   响亮的失败要做的不是拦截,是**让它说清楚**:endpoint 是"配置的 base + rail 选的后缀"拼出来的,
+   而 404 的 body 不会告诉你路径,所以 URL 必须进错误消息(`send_checked` 的 http/timeout/
+   transport 三条)。

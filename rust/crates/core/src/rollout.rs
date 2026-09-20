@@ -2826,7 +2826,7 @@ mod tests {
     fn chat_text_provenance_survives_read_without_reasoning() {
         let path = temp_file("chat-text-provenance");
         let provider = kloop_provider::Provider::OpenAiCompat {
-            key: "test-key".into(),
+            cred: kloop_provider::Credential::bearer("test-key"),
             base: "https://chat.invalid".into(),
         };
         let (catalog, _) = crate::provider_route::ProviderCatalog::from_provider(
@@ -2861,7 +2861,7 @@ mod tests {
     fn chat_reasoning_provenance_survives_read() {
         let path = temp_file("chat-reasoning-provenance");
         let provider = kloop_provider::Provider::OpenAiCompat {
-            key: "test-key".into(),
+            cred: kloop_provider::Credential::bearer("test-key"),
             base: "https://chat.invalid".into(),
         };
         let (catalog, _) = crate::provider_route::ProviderCatalog::from_provider(

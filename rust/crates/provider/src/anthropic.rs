@@ -242,14 +242,13 @@ const SESSION_HEADER: &str = "x-claude-code-session-id";
 
 pub(super) async fn stream(
     url: &str,
-    key: &str,
+    cred: &crate::Credential,
     session: Option<&str>,
     body: &Value,
     sink: &StreamSink,
 ) -> Result<StreamCompletion, ProviderFailure> {
-    let mut req = crate::http_client()
-        .post(url)
-        .header("x-api-key", key)
+    let mut req = cred
+        .apply(crate::http_client().post(url))
         .header("anthropic-version", "2023-06-01");
     // A session id only has to be a safe filename, so it can hold bytes that do
     // not belong in a header: `HeaderValue` would accept a non-ASCII id as
@@ -265,7 +264,7 @@ pub(super) async fn stream(
         req = req.header(SESSION_HEADER, value);
     }
     let req = req.json(body);
-    let resp = crate::send_checked(req, "anthropic", key).await?;
+    let resp = crate::send_checked(req, "anthropic", url, cred.secret()).await?;
 
     let mut frames = SseFrames::new(resp.bytes_stream());
     let mut started = false;
@@ -454,7 +453,7 @@ pub(super) async fn stream(
                 return Err(crate::stream_error(
                     "anthropic",
                     crate::error_label(&value["error"]),
-                    crate::error_detail(&value["error"], key),
+                    crate::error_detail(&value["error"], cred.secret()),
                 ));
             }
             _ => return Err(protocol("returned an unknown semantic event")),

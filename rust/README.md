@@ -3309,7 +3309,7 @@ cargo run -- --mock
 #   [providers.gw_router]
 #   wire_api = "responses"             # responses | chat | messages
 #   base_url = "https://example/v1"
-#   http_headers = { Authorization = "Bearer ..." }
+#   auth_header = { Authorization = "Bearer ..." }   # or { x-api-key = "..." }
 #   model = "gpt-5.6-sol"               # this provider's default model
 #   models = ["gpt-5.6-sol", "gpt-5.6-mini"]   # optional; omitted = just `model`
 #   context_window = 258400             # optional; what this gateway caps at
@@ -3317,6 +3317,15 @@ cargo run -- --mock
 #   [models."gpt-5.6-sol"]              # facts about the model, not settings
 #   context_window = 400000
 #   efforts = ["low", "high", "xhigh", "max"]
+#
+# auth_header is one credential written the way the endpoint reads it, not a bag
+# of request headers: kloop sends exactly that spelling and nothing else. The two
+# legal spellings are `x-api-key` and `Authorization: Bearer`, and both are valid
+# on every wire_api — which header a gateway wants is the gateway's business, and
+# the Messages wire has both in the wild. Writing two is an error. The set stays
+# closed because everything downstream assumes one known secret: it is stripped
+# out of provider-authored error text, and availability is whether a profile got
+# a credential at all.
 #
 # Every configured profile declares a stable id, API family, default model, and
 # ordered model allowlist. Unselected profiles may be unavailable because their
@@ -3336,7 +3345,9 @@ cargo run -- --mock
 #
 # ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL select Messages;
 # OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
-# selected profile. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
+# selected profile. A key from the environment replaces the secret, never the
+# spelling: a profile that declared auth_header keeps its header, and one that
+# declared none falls back to what the wire's own vendor sends. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
 # settings. KLOOP_EFFORT (or the selected profile's own effort key — the env var
 # wins, and both are valid on every wire_api)
 # seeds the session reasoning effort that /effort then owns. Only the spelling is checked: which

@@ -1322,12 +1322,12 @@ fn reasoning_index(value: &Value, summary: bool) -> Result<u64, ProviderFailure>
 
 pub(super) async fn stream(
     url: &str,
-    key: &str,
+    cred: &crate::Credential,
     body: &Value,
     sink: &StreamSink,
 ) -> Result<StreamCompletion, ProviderFailure> {
-    let req = crate::http_client().post(url).bearer_auth(key).json(body);
-    let resp = crate::send_checked(req, "openai-responses", key).await?;
+    let req = cred.apply(crate::http_client().post(url)).json(body);
+    let resp = crate::send_checked(req, "openai-responses", url, cred.secret()).await?;
 
     let mut frames = SseFrames::new(resp.bytes_stream());
     let mut state = ResponseStream::default();
@@ -1367,7 +1367,9 @@ pub(super) async fn stream(
             "response.function_call_arguments.done" => state.on_arguments_done(&value)?,
             "response.output_item.done" => state.on_item_done(&value, sink).await?,
             "response.completed" | "response.incomplete" => state.on_terminal(event, &value)?,
-            "response.failed" | "error" => return Err(stream_failure(event, &value, key)),
+            "response.failed" | "error" => {
+                return Err(stream_failure(event, &value, cred.secret()));
+            }
             _ if is_out_of_band(event) => {}
             // Name the offender: without it a new vendor event costs an SSE
             // capture to identify (how `keepalive` was found).

@@ -1434,7 +1434,7 @@ mod tests {
         let source_provider = Provider::mock(Vec::new());
         let source_fingerprint = source_provider.endpoint_fingerprint();
         let chat_provider = || Provider::OpenAiCompat {
-            key: "unused".into(),
+            cred: kloop_provider::Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
         };
         let chat_fingerprint = chat_provider().endpoint_fingerprint();
@@ -1511,7 +1511,7 @@ mod tests {
         let (_catalog, route) = ProviderCatalog::from_provider(
             "chat",
             Provider::OpenAiCompat {
-                key: "unused".into(),
+                cred: kloop_provider::Credential::bearer("unused"),
                 base: "https://chat.invalid".into(),
             },
             "chat-model",

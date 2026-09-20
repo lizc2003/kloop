@@ -310,23 +310,29 @@ impl<S> SseFrames<S> {
     }
 }
 
+/// `url` rides along in every failure message. A gateway answers a wrong path
+/// with a 404 whose body says nothing about which path it was, and the endpoint
+/// is assembled from a configured base plus a rail-chosen suffix — so without it
+/// the reader cannot tell a wrong base from a dead gateway. It carries no
+/// secret: `validate_base_url` rejects userinfo and query strings.
 pub(crate) async fn send_checked(
     req: reqwest::RequestBuilder,
     label: &str,
+    url: &str,
     secret: &str,
 ) -> Result<reqwest::Response, ProviderFailure> {
     let resp = match wait_for_open(req.send(), STREAM_OPEN_TIMEOUT).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             return Err(ProviderFailure::transport(format!(
-                "{label} request failed: {error}"
+                "{label} request to {url} failed: {error}"
             )));
         }
         Err(()) => {
             return Err(ProviderFailure::timeout(
                 TimeoutStage::Open,
                 format!(
-                    "{label} response headers did not arrive within {}s",
+                    "{label} response headers from {url} did not arrive within {}s",
                     STREAM_OPEN_TIMEOUT.as_secs()
                 ),
             ));
@@ -358,7 +364,7 @@ pub(crate) async fn send_checked(
     let text = sanitized_http_error(&text, secret);
     Err(ProviderFailure::http(
         status,
-        format!("{label} http {status}: {text}"),
+        format!("{label} http {status} from {url}: {text}"),
         retry_after,
     ))
 }

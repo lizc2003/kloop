@@ -13,6 +13,7 @@ use kloop_protocol::OutputLimitKind;
 use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
+use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailureKind;
 use kloop_provider::StreamResult;
@@ -21,6 +22,7 @@ use serde_json::json;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -73,7 +75,7 @@ async fn collect(provider: Provider) -> Vec<StreamResult> {
 
 fn anthropic(server: &MockServer) -> Provider {
     Provider::Anthropic {
-        key: "test-key".into(),
+        cred: Credential::api_key("test-key"),
         base: server.uri(),
         cache: true,
         thinking: ThinkingMode::Unset,
@@ -277,7 +279,7 @@ async fn cache_off_sends_plain_request() {
     let server = MockServer::start().await;
     mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
     let provider = Arc::new(Provider::Anthropic {
-        key: "test-key".into(),
+        cred: Credential::api_key("test-key"),
         base: server.uri(),
         cache: false,
         thinking: ThinkingMode::Unset,
@@ -579,7 +581,7 @@ async fn thinking_replay_and_request_modes() {
     let server = MockServer::start().await;
     mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
     let provider = Arc::new(Provider::Anthropic {
-        key: "test-key".into(),
+        cred: Credential::api_key("test-key"),
         base: server.uri(),
         cache: true,
         thinking: ThinkingMode::Budget(2048),
@@ -636,7 +638,7 @@ async fn thinking_mode_field_shapes() {
         server.reset().await;
         mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
         let provider = Arc::new(Provider::Anthropic {
-            key: "test-key".into(),
+            cred: Credential::api_key("test-key"),
             base: server.uri(),
             cache: true,
             thinking: mode,
@@ -870,7 +872,7 @@ async fn effort_none_overrides_a_configured_thinking_mode() {
     let server = MockServer::start().await;
     mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
     let provider = Arc::new(Provider::Anthropic {
-        key: "test-key".into(),
+        cred: Credential::api_key("test-key"),
         base: server.uri(),
         cache: false,
         thinking: ThinkingMode::Adaptive,
@@ -889,4 +891,63 @@ async fn effort_none_overrides_a_configured_thinking_mode() {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["thinking"], json!({"type": "disabled"}));
     assert!(body.get("output_config").is_none());
+}
+
+/// The Messages wire has two credential spellings in the wild — Anthropic's own
+/// SDK sends `x-api-key` or `Authorization: Bearer`, and gateways in front of it
+/// pick one — so the credential decides, not the rail. The mock only answers a
+/// Bearer request: anything else falls through to a 404 and the stream fails.
+#[tokio::test]
+async fn the_credential_spelling_travels_with_the_credential() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("connection", "close")
+                .set_body_raw(
+                    sse_body(&[
+                        json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
+                        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "ok"}}),
+                        json!({"type": "content_block_stop", "index": 0}),
+                        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+                        json!({"type": "message_stop"}),
+                    ]),
+                    "text/event-stream",
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    let events = collect(Provider::Anthropic {
+        cred: Credential::bearer("test-key"),
+        base: server.uri(),
+        cache: true,
+        thinking: ThinkingMode::Unset,
+    })
+    .await;
+    assert!(matches!(
+        events.last().unwrap().as_ref().unwrap(),
+        StreamEvent::Terminal { .. }
+    ));
+}
+
+/// A wrong base URL and a dead gateway both answer 404, and the body says
+/// nothing about which path was asked for — the endpoint is a configured base
+/// plus a rail-chosen suffix, so the failure has to name the whole thing.
+#[tokio::test]
+async fn http_failures_name_the_endpoint_they_were_sent_to() {
+    let server = MockServer::start().await;
+    let events = collect(anthropic(&server)).await;
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Http { status: 404 });
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{}/v1/messages", server.uri())),
+        "{error}"
+    );
 }

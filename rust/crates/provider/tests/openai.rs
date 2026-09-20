@@ -9,6 +9,7 @@ use kloop_protocol::Message;
 use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
+use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailureKind;
 use kloop_provider::StreamResult;
@@ -70,7 +71,7 @@ async fn collect(provider: Provider) -> Vec<StreamResult> {
 
 fn openai(server: &MockServer) -> Provider {
     Provider::OpenAiCompat {
-        key: "test-key".into(),
+        cred: Credential::bearer("test-key"),
         base: server.uri(),
     }
 }

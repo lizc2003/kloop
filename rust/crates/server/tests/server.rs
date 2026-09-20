@@ -28,6 +28,7 @@ use kloop_core::session_store::SessionStore;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
+use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_server::ConfigFactory;
 use kloop_server::ConfigSnapshot;
@@ -1330,7 +1331,7 @@ async fn real_three_rail_route_switch_contract() {
                 default_effort: None,
                 factory: Arc::new(move || {
                     Ok(Provider::Anthropic {
-                        key: anthropic_factory_key.clone(),
+                        cred: Credential::api_key(anthropic_factory_key.clone()),
                         base: anthropic_factory_base.clone(),
                         cache: true,
                         thinking: kloop_provider::ThinkingMode::Unset,
@@ -1351,7 +1352,7 @@ async fn real_three_rail_route_switch_contract() {
                 default_effort: None,
                 factory: Arc::new(move || {
                     Ok(Provider::OpenAiCompat {
-                        key: chat_factory_key.clone(),
+                        cred: Credential::bearer(chat_factory_key.clone()),
                         base: chat_factory_base.clone(),
                     })
                 }),
@@ -1370,7 +1371,7 @@ async fn real_three_rail_route_switch_contract() {
                 default_effort: Some(responses_effort),
                 factory: Arc::new(move || {
                     Ok(Provider::OpenAiResponses {
-                        key: responses_factory_key.clone(),
+                        cred: Credential::bearer(responses_factory_key.clone()),
                         base: responses_factory_base.clone(),
                     })
                 }),
@@ -3657,17 +3658,23 @@ async fn real_effort_sweep_contract() {
                     Ok(match api_family {
                         kloop_protocol::ProviderApiFamily::AnthropicMessages => {
                             Provider::Anthropic {
-                                key,
+                                cred: Credential::api_key(key),
                                 base,
                                 cache: true,
                                 thinking: kloop_provider::ThinkingMode::Unset,
                             }
                         }
                         kloop_protocol::ProviderApiFamily::OpenAiChatCompletions => {
-                            Provider::OpenAiCompat { key, base }
+                            Provider::OpenAiCompat {
+                                cred: Credential::bearer(key),
+                                base,
+                            }
                         }
                         kloop_protocol::ProviderApiFamily::OpenAiResponses => {
-                            Provider::OpenAiResponses { key, base }
+                            Provider::OpenAiResponses {
+                                cred: Credential::bearer(key),
+                                base,
+                            }
                         }
                         kloop_protocol::ProviderApiFamily::Mock => {
                             unreachable!("a real rail is selected above")

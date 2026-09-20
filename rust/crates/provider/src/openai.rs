@@ -398,12 +398,12 @@ async fn apply_choice_payload(
 
 pub(super) async fn stream(
     url: &str,
-    key: &str,
+    cred: &crate::Credential,
     body: &Value,
     sink: &StreamSink,
 ) -> Result<StreamCompletion, ProviderFailure> {
-    let req = crate::http_client().post(url).bearer_auth(key).json(body);
-    let resp = crate::send_checked(req, "openai-compat", key).await?;
+    let req = cred.apply(crate::http_client().post(url)).json(body);
+    let resp = crate::send_checked(req, "openai-compat", url, cred.secret()).await?;
 
     let mut frames = SseFrames::new(resp.bytes_stream());
     let mut text = String::new();
@@ -439,7 +439,7 @@ pub(super) async fn stream(
             return Err(crate::stream_error(
                 "openai-compat",
                 crate::error_label(&value["error"]),
-                crate::error_detail(&value["error"], key),
+                crate::error_detail(&value["error"], cred.secret()),
             ));
         }
 

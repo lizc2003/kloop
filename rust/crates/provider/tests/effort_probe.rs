@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use kloop_protocol::Message;
 use kloop_protocol::ProviderApiFamily;
+use kloop_provider::Credential;
 use kloop_provider::Provider;
 
 fn label(level: Option<kloop_protocol::ReasoningEffort>) -> &'static str {
@@ -56,17 +57,17 @@ async fn probe_effort_levels() {
         tokio::time::sleep(std::time::Duration::from_secs(45)).await;
         let provider = Arc::new(match family {
             ProviderApiFamily::AnthropicMessages => Provider::Anthropic {
-                key: key.clone(),
+                cred: Credential::api_key(key.clone()),
                 base: base.clone(),
                 cache: false,
                 thinking: kloop_provider::ThinkingMode::Unset,
             },
             ProviderApiFamily::OpenAiChatCompletions => Provider::OpenAiCompat {
-                key: key.clone(),
+                cred: Credential::bearer(key.clone()),
                 base: base.clone(),
             },
             _ => Provider::OpenAiResponses {
-                key: key.clone(),
+                cred: Credential::bearer(key.clone()),
                 base: base.clone(),
             },
         });
