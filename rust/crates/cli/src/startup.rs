@@ -87,6 +87,11 @@ impl RuntimeSettings {
         let config_path = config.path().to_path_buf();
         let (shell_programs, shell_warnings) =
             kloop_core::shell_programs::resolve_shell_programs(load_shell_overrides(table)?)?;
+        // `[env]` was applied in `main`, before this runtime existed. It is
+        // parsed again here for one reason: the pre-runtime read swallows every
+        // error so `--list-sessions` survives a broken file, which would
+        // otherwise let a malformed [env] be skipped in silence.
+        crate::user_config::load_env_overrides(table)?;
         let permission_rules = parse_permission_rules(table)?;
         let global_permissions = Arc::new(GlobalPermissionPolicy::new(
             &permission_rules.deny,

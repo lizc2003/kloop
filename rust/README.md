@@ -3362,7 +3362,17 @@ cargo run -- --mock
 # provider, a model, a base URL, a key or an effort — one file answers "what
 # will this run talk to", so the answer cannot change with the shell that
 # started it. A missing or empty ~/.kloop/config.toml is a startup error, not
-# a fallback to ANTHROPIC_API_KEY. There is no scope above the profile for
+# a fallback to ANTHROPIC_API_KEY.
+#
+# One thing crosses that line, in the other direction: `[env]` in the same file
+# sets variables for this process and for every command it runs — a proxy, a CA
+# bundle, things that describe the machine rather than kloop. It is not a
+# configuration source (nothing is read from it back into kloop's settings),
+# and anything the shell already set wins, so `HTTPS_PROXY=… kloop` still
+# overrides the file for one run. `HOME` cannot be set there: the file was just
+# read from it.
+#
+# There is no scope above the profile for
 # either model or effort: both belong to the provider that has to send them,
 # and the profile's own `effort` seeds the session effort that /effort then
 # owns. Only the spelling is checked at load: which levels a model takes is

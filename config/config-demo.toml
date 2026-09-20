@@ -1,7 +1,7 @@
 # kloop provider config — one profile per wire protocol. Copy to
 # ~/.kloop/config.toml; kloop requires 0700 on the directory and 0600 on the
-# file. Full reference, and the other sections (mcp, hooks, sandbox, agents,
-# program, permissions), in rust/README.md.
+# file. Full reference, and the other sections (mcp, hooks, sandbox, shells,
+# agents, program, permissions), in rust/README.md.
 #
 #   mkdir -p ~/.kloop && chmod 700 ~/.kloop
 #   cp config/config-demo.toml ~/.kloop/config.toml && chmod 600 ~/.kloop/config.toml
@@ -69,3 +69,15 @@ efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 [web]
 search_provider = "tavily"                              # or "brave"
 # api_key       = "tvly-..."                            # tavily free tier: no card
+
+
+# [env] — variables kloop sets for itself and for every command it runs, and
+# the one place it still deals in the environment. This is the machine's own
+# setup (a proxy, a CA bundle), not kloop's configuration, so anything the
+# shell already set wins: `HTTPS_PROXY=… kloop` still overrides it for one run.
+
+# [env]
+# HTTPS_PROXY = "http://127.0.0.1:7897"                 # only used if the shell
+# HTTP_PROXY  = "http://127.0.0.1:7897"                 # did not set it
+# ALL_PROXY   = "socks5h://127.0.0.1:7897"
+# NO_PROXY    = "localhost,127.0.0.1"

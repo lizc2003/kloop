@@ -252,8 +252,33 @@ impl SessionState {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<ExitCode> {
+/// `[env]` is applied here and nowhere else, because here is the only place
+/// it can be: `set_var` is sound while the process is single-threaded, and the
+/// runtime built on the next line is what ends that. What the shell already
+/// set is left alone — see `pending_env`.
+fn main() -> Result<ExitCode> {
+    // A conservative scan rather than the real parser, which needs the
+    // subcommand normalization that lives inside `run`. Erring towards "this
+    // is --mock" only means declining to read the config, which --mock never
+    // does anyway.
+    if !std::env::args().any(|arg| arg == "--mock") {
+        let pending = user_config::pending_env(user_config::config_env(), &|name| {
+            std::env::var_os(name).is_some()
+        });
+        for (name, value) in pending {
+            // SAFETY: no second thread exists yet — the runtime below has not
+            // been built, and nothing above this point spawns one.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?
+        .block_on(run())
+}
+
+async fn run() -> Result<ExitCode> {
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
     // `kloop mcp …` is the one subcommand (OAuth login); everything else is
     // flag-shaped and goes through the flag parser.
