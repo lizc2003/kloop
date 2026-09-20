@@ -47,3 +47,15 @@ README「Running」段(cargo run 的例子)、AGENTS.md 的完成标准(fmt + cl
 `make check` 全绿(fmt 干净、clippy `-D warnings` 无输出、**1602 passed / 0 failed**),`make parity` 通过。
 
 README「Running」段开头补了这一节(Makefile 是仓库根新的入口,而 README 在 `rust/` 下)。
+
+### 追加 — `--help` 里一句过期的话(同日)
+
+写仓库根 README 时要写"没有任何环境变量能决定这次运行接哪个网关",顺手核了一遍
+`--help`,末行还写着 `(KLOOP_* / provider env may override)`。**plan 172 把环境从
+provider 配置里删干净是三个 plan 之前的事,这句话活过了它**——全仓再没有一处生产代码读
+`KLOOP_*` 做配置(只剩真 key 测试的 harness 变量和 build stamp / sandbox 提示)。
+
+`cli/src/args.rs` 那一行改成 "No environment variable overrides it.",并在既有的
+help 用例里加一条**否定断言**:`!help.contains("KLOOP_")`。正面列表(每个模式、每个
+顶层 flag 都得出现)挡不住这类错——**过期的承诺不是缺了一个词,是多了一句话**,只有
+否定断言看得见。

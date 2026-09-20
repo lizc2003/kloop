@@ -281,7 +281,7 @@ pub(crate) fn help_text() -> &'static str {
      \x20   -h, --help            show this help and exit\n\
      \x20   -V, --version         show the version and build commit, then exit\n\
      \n\
-     All persistent runtime/provider configuration: ~/.kloop/config.toml (KLOOP_* / provider env may override).\n\
+     All persistent runtime/provider configuration: ~/.kloop/config.toml. No environment variable overrides it.\n\
      Cwd selects the workspace; it is never an automatic config source.\n"
 }
 
@@ -914,6 +914,13 @@ mod tests {
         ] {
             assert!(help.contains(needle), "help missing {needle}");
         }
+        // Plan 172 took the environment out of provider configuration. The help
+        // text outlived it by three plans, still telling people a `KLOOP_*` name
+        // could override the file; nothing in the product reads one any more.
+        assert!(
+            !help.contains("KLOOP_"),
+            "help still offers environment overrides"
+        );
     }
 
     /// Two partitions under one root, each holding one transcript.
