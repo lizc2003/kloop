@@ -136,4 +136,4 @@ endpoint URL(plan 167 加的),到那天再把键加回来是 15 行的事。**�
   **教训 164 订正**(它把 168 的矛盾写成了已修)。
 - 验证:fmt、clippy `-D warnings`、`cargo test --workspace`(1596 passed)全绿;demo 配置拷进
   隔离 HOME 重跑三条 rail;并验 `effort = "none"` 现在走得通(停在占位主机 DNS,不再被拒)。
-- 提交:本次(plan 169,见 git log)。
+- 提交:`f7dd296`(第一版)+ `f5012c9`(删掉 `thinking_param`)。
