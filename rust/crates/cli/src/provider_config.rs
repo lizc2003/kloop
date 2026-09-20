@@ -122,10 +122,6 @@ struct Profile {
     model: String,
     models: Vec<String>,
     prompt_cache: bool,
-    /// Whether this endpoint takes the `thinking` request field. A statement
-    /// about the gateway, not about reasoning — `effort` is the only knob for
-    /// that — and the sibling of `prompt_cache`.
-    thinking_param: bool,
     effort: Option<ReasoningEffort>,
     /// The model's real context window, when the provider knows it. Only the
     /// provider can: the global default has to be conservative enough for the
@@ -203,7 +199,6 @@ fn resolve_table(
         let endpoint_fingerprint = Provider::endpoint_fingerprint_for(api_family, &base);
         let wire = profile.wire;
         let prompt_cache = profile.prompt_cache;
-        let sends_thinking = profile.thinking_param;
         let default_effort = selected_effort(&profile, selected, env)?;
         let factory = Arc::new(move || {
             let cred = credential
@@ -234,7 +229,6 @@ fn resolve_table(
             context_window: profile.context_window,
             availability,
             default_effort,
-            sends_thinking,
             factory,
         });
     }
@@ -246,14 +240,6 @@ fn resolve_table(
     // A declared effort set is a claim the user made after testing; contradicting
     // it is a config mistake, and finding it at startup beats finding it in a 400
     // halfway through the first turn.
-    if catalog.default_effort(&initial_provider) == Some(ReasoningEffort::None)
-        && !catalog.sends_thinking(&initial_provider)
-    {
-        bail!(
-            "provider '{initial_provider}' omits the thinking request field \
-             (thinking_param = false), so effort = 'none' cannot be expressed there"
-        );
-    }
     if let Some(effort) = catalog.default_effort(&initial_provider)
         && !catalog.effort_supported(&initial_model, effort)
     {
@@ -322,7 +308,6 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         model: model.clone(),
         models: vec![model],
         prompt_cache: wire == Rail::Anthropic,
-        thinking_param: true,
         // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
         // provider — which, here, is the only one.
         effort: None,
@@ -568,7 +553,6 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "model"
                 | "models"
                 | "prompt_cache"
-                | "thinking_param"
                 | "effort"
                 | "context_window"
         ) {
@@ -605,16 +589,8 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 .map_err(|e| anyhow!("providers.{id}.effort: {e}"))
         })
         .transpose()?;
-    let thinking_param = optional_bool(
-        spec,
-        "thinking_param",
-        &format!("providers.{id}.thinking_param"),
-    )?
-    .unwrap_or(true);
-    if wire != Rail::Anthropic
-        && (spec.contains_key("prompt_cache") || spec.contains_key("thinking_param"))
-    {
-        bail!("providers.{id}: prompt_cache/thinking_param are only valid for messages wire_api");
+    if wire != Rail::Anthropic && spec.contains_key("prompt_cache") {
+        bail!("providers.{id}.prompt_cache is only valid for messages wire_api");
     }
     let context_window = optional_integer(
         spec,
@@ -629,7 +605,6 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         model,
         models,
         prompt_cache,
-        thinking_param,
         effort,
         context_window,
     })
@@ -819,7 +794,6 @@ auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a", "claude-b", "claude-a"]
 prompt_cache = false
-thinking_param = false
 
 [providers.responses-b]
 wire_api = "responses"
@@ -1087,7 +1061,6 @@ auth_header = { Authorization = "Bearer key" }
             model: "m".into(),
             models: vec!["m".into()],
             prompt_cache: false,
-            thinking_param: true,
             effort: None,
             context_window: None,
         };
@@ -1177,86 +1150,34 @@ auth_header = { Authorization = "Bearer key" }
         assert!(refused(&model("thinking_budget = { hgih = 2048 }")).contains("thinking_budget"));
     }
 
-    /// Thinking is on by default on this rail. Omitting the field is not neutral
-    /// — Opus 4.8/4.7/4.6 and Sonnet 4.6 read a missing `thinking` as "do not
-    /// think", so a silent default would run them with no reasoning while still
-    /// paying for a configured effort. `thinking_param = false` is the way out
-    /// for a gateway that cannot take the field; it is a statement about the
-    /// gateway, not a second reasoning dial, and the old `thinking` enum that
-    /// overlapped `effort` is gone.
+    /// Nothing in a provider profile speaks about thinking any more. The field is
+    /// derived entirely from the rail, the model and the session effort, so
+    /// `effort` is the only reasoning knob the config file has — not the main one
+    /// among several. Both retired spellings fail closed as unknown keys.
     #[test]
-    fn the_messages_rail_thinks_unless_told_otherwise() {
+    fn a_profile_has_no_say_over_thinking() {
         let profile = |line: &str| {
             let raw = format!(
                 "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
                  auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
             );
-            raw.parse::<toml::Table>()
-                .unwrap()
-                .get("providers")
-                .and_then(Value::as_table)
-                .and_then(|providers| providers.get("x"))
-                .and_then(Value::as_table)
-                .map(|spec| parse_profile("x", spec))
-                .unwrap()
+            resolve(Some(&raw), &env(&[])).map(|_| ())
         };
 
-        assert!(profile("").unwrap().thinking_param);
-        assert!(!profile("thinking_param = false").unwrap().thinking_param);
-        // The retired enum overlapped `effort`: "off" was `effort = "none"` by
-        // another name, "adaptive" was the default spelled out, and the pair
-        // could be configured into a request that disabled thinking and asked
-        // for xhigh at once.
-        assert_eq!(
-            profile("thinking = \"adaptive\"")
-                .map(|_| ())
-                .unwrap_err()
-                .to_string(),
-            "providers.x has unknown key 'thinking'"
-        );
-        // The other rails have no such field, and no default to pick either.
-        let chat = "provider = \"x\"\n[providers.x]\nwire_api = \"chat\"\n\
-             auth_header = { Authorization = \"Bearer k\" }\nmodel = \"m\"\n";
-        let resolved = resolve(Some(chat), &env(&[])).unwrap();
-        assert_eq!(
-            resolved.catalog().descriptors()[0].api_family,
-            ProviderApiFamily::OpenAiChatCompletions
-        );
-    }
-
-    /// "Do no reasoning" is spelled with the very field this gateway cannot
-    /// take, so the two cannot both be true. Refused at startup rather than
-    /// rendered into a request that quietly asks for nothing.
-    #[test]
-    fn none_is_refused_where_the_thinking_field_cannot_be_sent() {
-        let raw = |line: &str| {
-            format!(
-                "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
-                 auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
-            )
-        };
-        assert_eq!(
-            resolve(
-                Some(&raw("thinking_param = false\neffort = \"none\"")),
-                &env(&[])
-            )
-            .map(|_| ())
-            .unwrap_err()
-            .to_string(),
-            "provider 'x' omits the thinking request field (thinking_param = false), \
-             so effort = 'none' cannot be expressed there"
-        );
-        // Any other level is fine: it rides output_config, which this gateway
-        // does take.
-        assert!(
-            resolve(
-                Some(&raw("thinking_param = false\neffort = \"high\"")),
-                &env(&[])
-            )
-            .is_ok()
-        );
-        // And `none` is fine on a gateway that does take the field.
-        assert!(resolve(Some(&raw("effort = \"none\"")), &env(&[])).is_ok());
+        assert!(profile("").is_ok());
+        // `thinking` was a second depth dial that overlapped `effort`;
+        // `thinking_param` was an escape hatch for a gateway nobody has met, and
+        // it made `effort = "none"` inexpressible. Both are gone outright.
+        for retired in ["thinking = \"adaptive\"", "thinking_param = false"] {
+            let key = retired.split_whitespace().next().unwrap();
+            assert_eq!(
+                profile(retired).unwrap_err().to_string(),
+                format!("providers.x has unknown key '{key}'")
+            );
+        }
+        // `none` is expressible everywhere again: it is the disabled thinking
+        // field on this rail, and no profile can take that field away.
+        assert!(profile("effort = \"none\"").is_ok());
     }
 
     /// `wire_api` names the endpoint, not the vendor — the axis

@@ -35,11 +35,6 @@ pub struct ProviderCatalogEntry {
     /// [`SessionProviderState`]; `/effort` then owns the value for the rest of
     /// the session (the provider itself bakes in nothing).
     pub default_effort: Option<ReasoningEffort>,
-    /// Whether this endpoint can take the `thinking` request field at all. Not a
-    /// reasoning setting — `effort` is the only one of those — but a statement
-    /// about the gateway, the sibling of `prompt_cache`. False omits the field
-    /// entirely, which also makes "do no reasoning" inexpressible here.
-    pub sends_thinking: bool,
     pub factory: ProviderFactory,
 }
 
@@ -48,7 +43,6 @@ struct CatalogEntry {
     endpoint_fingerprint: String,
     context_window: Option<u64>,
     default_effort: Option<ReasoningEffort>,
-    sends_thinking: bool,
     factory: ProviderFactory,
     provider: OnceLock<Result<Arc<Provider>, ProviderAvailabilityCode>>,
 }
@@ -129,7 +123,6 @@ impl ProviderCatalog {
                         endpoint_fingerprint,
                         context_window: entry.context_window,
                         default_effort: entry.default_effort,
-                        sends_thinking: entry.sends_thinking,
                         factory: entry.factory,
                         provider: OnceLock::new(),
                     },
@@ -196,16 +189,6 @@ impl ProviderCatalog {
         }
     }
 
-    /// Whether this provider sends the `thinking` request field. A gateway that
-    /// cannot take it also cannot be told to stop reasoning, since that is what
-    /// the field says — so the effort gates consult this before accepting
-    /// `none`. Unknown ids answer true: they fail later, by name.
-    pub fn sends_thinking(&self, provider_id: &str) -> bool {
-        self.entries
-            .get(provider_id)
-            .is_none_or(|entry| entry.sends_thinking)
-    }
-
     pub fn declared_efforts(&self, model: &str) -> Option<&[ReasoningEffort]> {
         self.model_knowledge.get(model)?.efforts.as_deref()
     }
@@ -241,7 +224,6 @@ impl ProviderCatalog {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
-            sends_thinking: true,
             factory: Arc::new(move || {
                 provider
                     .lock()
@@ -351,7 +333,10 @@ impl ProviderCatalog {
             allowed_models: entry.descriptor.models.clone(),
             provider,
             thinking: ThinkingRouting {
-                send_param: entry.sends_thinking,
+                rail_has_field: matches!(
+                    entry.descriptor.api_family,
+                    ProviderApiFamily::AnthropicMessages | ProviderApiFamily::Mock
+                ),
                 budgets: entry
                     .descriptor
                     .models
@@ -556,12 +541,14 @@ struct ResolvedRoute {
 }
 
 /// The `thinking` half of the reasoning knob, carried by a resolved route.
+/// Entirely derived from the model and the session effort — no provider profile
+/// key feeds into it, which is what makes `effort` the only reasoning knob there
+/// is rather than merely the main one.
 #[derive(Clone)]
 struct ThinkingRouting {
-    /// Whether the endpoint takes the field at all (`thinking_param`). False is
-    /// a gateway's limitation, not a choice about reasoning, and it silences
-    /// every mode below.
-    send_param: bool,
+    /// Only the Messages rail has a `thinking` field; the OpenAI rails carry the
+    /// whole of the reasoning setting on their own effort field.
+    rail_has_field: bool,
     /// Per-model effort -> token budget, for the models that read no effort
     /// field. Only the route's allowed models appear.
     budgets: BTreeMap<String, BTreeMap<ReasoningEffort, u64>>,
@@ -572,10 +559,7 @@ impl ThinkingRouting {
     /// wire for one model. `none` means "do not reason" on every model and so
     /// outranks both the budget table and the profile default.
     fn resolve(&self, model: &str, effort: Option<ReasoningEffort>) -> ThinkingMode {
-        // A gateway that cannot take the field gets none of these. `none` never
-        // reaches here on such a provider: both the startup check and `/effort`
-        // refuse it, because "do no reasoning" is spelled with this very field.
-        if !self.send_param {
+        if !self.rail_has_field {
             return ThinkingMode::Unset;
         }
         if effort == Some(ReasoningEffort::None) {
@@ -1302,7 +1286,6 @@ mod tests {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
-            sends_thinking: true,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         }
     }
@@ -1359,34 +1342,42 @@ mod tests {
         }
     }
 
-    /// A gateway that cannot take the `thinking` field gets none of it — not the
-    /// default, not a model's budget. That is a limitation of the endpoint, not
-    /// a reasoning choice, which is why `effort` is untouched and only the field
-    /// disappears.
+    /// Only the Messages rail has a `thinking` field; the OpenAI rails carry the
+    /// whole reasoning setting on their own effort field. Nothing in a provider
+    /// profile can change that — which is what leaves `effort` the only reasoning
+    /// knob there is, rather than the main one among several.
     #[test]
-    fn a_gateway_that_omits_the_thinking_field_sends_no_mode_at_all() {
-        let mut entry = mock_entry("p", "budget-model", &["budget-model", "effort-model"]);
-        entry.sends_thinking = false;
-        let catalog = Arc::new(
-            ProviderCatalog::new(vec![entry])
-                .unwrap()
-                .with_model_knowledge(BTreeMap::from([(
-                    "budget-model".to_string(),
-                    ModelKnowledge {
-                        context_window: None,
-                        efforts: Some(vec![ReasoningEffort::High]),
-                        thinking_budgets: Some(BTreeMap::from([(ReasoningEffort::High, 16384)])),
-                    },
-                )])),
-        );
-        assert!(!catalog.sends_thinking("p"));
-        for model in ["budget-model", "effort-model"] {
-            let route = catalog.initial_route("p", Some(model)).unwrap();
-            let state = SessionProviderState::from_route(Arc::clone(&catalog), route);
+    fn the_openai_rails_carry_no_thinking_field() {
+        for family in [
+            ProviderApiFamily::OpenAiResponses,
+            ProviderApiFamily::OpenAiChatCompletions,
+        ] {
+            let catalog = Arc::new(
+                ProviderCatalog::new(vec![rail_entry("p", family, None)])
+                    .unwrap()
+                    .with_model_knowledge(BTreeMap::from([(
+                        "m1".to_string(),
+                        ModelKnowledge {
+                            context_window: None,
+                            efforts: None,
+                            // Even a budget table cannot conjure a field the rail
+                            // does not have.
+                            thinking_budgets: Some(BTreeMap::from([(
+                                ReasoningEffort::High,
+                                16384,
+                            )])),
+                        },
+                    )])),
+            );
+            let state = SessionProviderState::new(Arc::clone(&catalog), "p", None).unwrap();
             state.set_effort(Some(ReasoningEffort::High));
             let attempt = state.freeze().primary_attempt();
-            assert_eq!(attempt.reasoning().thinking, ThinkingMode::Unset, "{model}");
-            assert_eq!(attempt.effort(), Some(ReasoningEffort::High), "{model}");
+            assert_eq!(
+                attempt.reasoning().thinking,
+                ThinkingMode::Unset,
+                "{family:?}"
+            );
+            assert_eq!(attempt.effort(), Some(ReasoningEffort::High), "{family:?}");
         }
     }
 

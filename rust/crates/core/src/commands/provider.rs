@@ -120,15 +120,6 @@ pub(super) fn apply(
         let target = state
             .target_model(provider_id, model)
             .ok_or_else(|| format!("unknown provider '{provider_id}'"))?;
-        // "Do no reasoning" is the `thinking` field on this rail, so a gateway
-        // that cannot take that field cannot be told it either. Refusing beats
-        // accepting a level that would quietly render to nothing.
-        if level == ReasoningEffort::None && !state.catalog().sends_thinking(provider_id) {
-            return Err(format!(
-                "provider '{provider_id}' omits the thinking request field \
-                 (thinking_param = false), so 'none' cannot be expressed there"
-            ));
-        }
         if !state.catalog().effort_supported(&target, level) {
             return Err(format!(
                 "'{}' is not among the efforts declared for model '{target}' ({})",

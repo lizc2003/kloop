@@ -17,7 +17,14 @@ profile 的 `thinking` 剩三个值,逐个看它买到了什么:
 
 ## 裁决
 
-枚举整个拿掉,只留逃生口,并**用它真正的身份命名**——那不是推理设置,是一条**网关能力声明**,
+枚举整个拿掉。
+
+> **⤴ 当天二次修订(见文末「一次加了又删」)**:第一版只留了个逃生口
+> `thinking_param = false`(网关收不了这个字段)。用户看完当场追问"这个是不是说明这个参数名
+> 错了,让它能兼容这种情况"——顺着查下去,结论是**这个键本来就不该存在**,最终版把它也删了。
+> 下面这段保留原样,因为它是那一步的推理过程。
+
+只留逃生口,并**用它真正的身份命名**——那不是推理设置,是一条**网关能力声明**,
 和 `prompt_cache = false` 完全同类:
 
 ```toml
@@ -83,3 +90,50 @@ Messages 的"不要推理"就是 `thinking: {"type":"disabled"}`。网关既然�
   `Error: provider 'k-claude' omits the thinking request field (thinking_param = false),
   so effort = 'none' cannot be expressed there`。
 - 提交:`f7dd296`。
+
+## 一次加了又删:`thinking_param`
+
+用户追问"`thinking_param = false` 之后 `effort = "none"` 无处可落,两处都拒不静默——这个是不是
+说明这个参数名错了,让它能兼容这种情况"。查下来:
+
+**名字没错,矛盾是真的。** 这个键的字面意思就是"网关收不了 `thinking` 字段";这句话若为真,
+`{"type":"disabled"}` 也发不出去,而 Messages 的 `output_config.effort` 只有 low..max、
+**没有 none 这一档**,所以"不要推理"确实无处可落。改叫什么都一样。
+
+**但同一类约束在模型层已经有更好的解法。** Fable 5.1 直接拒 `disabled`、Opus 5 在
+effort > high 时拒——这些就是"这里说不了 none",而它们只要在 `[models.x].efforts` 里不列
+`none`,现成的门就拦下了,一个新键都不用加。
+
+**那 `thinking_param` 剩下的唯一用途是"网关整个不认这个字段",而这个情况是我编的。**
+没有任何一个这样的网关的证据。为一个没见过的故障加了一个键、两道门、一条要写进文档的矛盾。
+用户拍板:删掉。
+
+删干净之后的形态比第一版更好:
+
+- `ProviderCatalogEntry.sends_thinking`、`ThinkingRouting.send_param`、两道 `none` 门全消失
+- `ThinkingRouting` 只剩「这条 rail 有没有这个字段」+ budget 表,**profile 一点发言权都没有**
+- `resolve` 三行:非 Messages rail → `Unset`;`none` → `Off`;有 budget 表 → `Budget/Unset`;
+  否则 → `Adaptive`
+- 顺带修掉一个第一版带进来的脏点:chat/responses 的 attempt 原本也会带上 `Adaptive`(惰性无害
+  但读着不对),现在由 rail 决定,Mock 跟 Messages 同组(与 `ANTHROPIC_MAX_OUTPUT_TOKENS` 的
+  既有分组一致)
+- `effort = "none"` 在所有 provider 上重新可用
+
+代价认下来:真撞上那种网关时没有退路,只能吃一个 400——但那是**响亮**的失败,错误信息里有
+endpoint URL(plan 167 加的),到那天再把键加回来是 15 行的事。**带着证据加,才是加它的时机。**
+
+## 完成记录 ✅(2026-09-20)
+
+- **cli**:profile 键 `thinking` 删除(不留别名,落既有 unknown key);`thinking_param` 加了又删,
+  最终 profile 里**没有任何键谈论 thinking**;`prompt_cache` 的 rail 校验独立成一条错误信息。
+- **core**:`ThinkingRouting{rail_has_field, budgets}`,`ProviderCatalogEntry` 不再带任何
+  thinking 相关字段;`resolve` 完全由 (rail, 模型, effort) 决定。
+- **测试**:`a_profile_has_no_say_over_thinking`(cli,两个退役键都落 unknown key,
+  `effort = "none"` 重新可用)、`the_openai_rails_carry_no_thinking_field`(core,连 budget 表
+  也变不出一个 rail 没有的字段)、`effort_renders_into_whichever_reasoning_field_the_model_reads`
+  (plan 168 的,现在不再依赖 profile 默认值)。
+- **文档**:`config/config-demo.toml` 明写"这里故意没有 thinking 的键";README 同步;
+  **教训 164 订正**(它把 168 的矛盾写成了已修)。
+- 验证:fmt、clippy `-D warnings`、`cargo test --workspace`(1596 passed)全绿;demo 配置拷进
+  隔离 HOME 重跑三条 rail;并验 `effort = "none"` 现在走得通(停在占位主机 DNS,不再被拒)。
+- 提交:本次(plan 169,见 git log)。

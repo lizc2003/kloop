@@ -377,7 +377,6 @@ fn switch_factory(
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(move || {
                     provider
                         .lock()
@@ -426,7 +425,6 @@ fn renaming_factory(offload: PathBuf, configured: Arc<Mutex<Vec<String>>>) -> Co
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(|| Ok(Provider::mock(vec![vec![text("answer")]]))),
             })
             .collect();
@@ -1182,7 +1180,6 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
             },
             kloop_core::provider_route::ProviderCatalogEntry {
@@ -1194,7 +1191,6 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
             },
         ])
@@ -1333,7 +1329,6 @@ async fn real_three_rail_route_switch_contract() {
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(move || {
                     Ok(Provider::Anthropic {
                         cred: Credential::api_key(anthropic_factory_key.clone()),
@@ -1354,7 +1349,6 @@ async fn real_three_rail_route_switch_contract() {
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(move || {
                     Ok(Provider::OpenAiCompat {
                         cred: Credential::bearer(chat_factory_key.clone()),
@@ -1374,7 +1368,6 @@ async fn real_three_rail_route_switch_contract() {
                 context_window: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: Some(responses_effort),
-                sends_thinking: true,
                 factory: Arc::new(move || {
                     Ok(Provider::OpenAiResponses {
                         cred: Credential::bearer(responses_factory_key.clone()),
@@ -3658,7 +3651,6 @@ async fn real_effort_sweep_contract() {
                 // The sweep sets every level explicitly; starting from "no field
                 // sent" keeps the first turn a clean control.
                 default_effort: None,
-                sends_thinking: true,
                 factory: Arc::new(move || {
                     let key = factory_key.clone();
                     let base = factory_base.clone();

@@ -49,24 +49,20 @@ context_window = 1000000
 # rails — only the wire field differs (see the table at the bottom).
 effort = "xhigh"
 
-# Two statements about what this gateway can take — NOT reasoning settings.
-# `effort` above is the only knob for how hard to think; these only say which
-# fields the endpoint chokes on. Both default to true, are Messages-only (writing
-# either on another rail is a startup error, even `false`, because that rail has
-# no such field), and can simply be omitted.
+# prompt_cache is Messages-only (writing it on another rail is a startup error,
+# even `false`, because that rail has no such field) and defaults to true, so it
+# can simply be omitted. It is not a reasoning setting — `effort` above is the
+# only knob for that.
 #
-#   prompt_cache   = true   # send cache_control breakpoints: on the last tool,
+#   prompt_cache = true     # send cache_control breakpoints: on the last tool,
 #                           # the system block, and the last message block. Set
 #                           # false for a gateway that rejects the field; usage
 #                           # reports cache_read/cache_creation, so a real hit is
 #                           # visible.
-#   thinking_param = true   # send the `thinking` field at all. Set false only
-#                           # for a gateway that rejects it — note the model may
-#                           # still think, this is about the request, not the
-#                           # behaviour. With it false, effort = "none" is
-#                           # refused at startup and /effort none is refused too:
-#                           # "do no reasoning" IS this field, so there is
-#                           # nowhere for it to land.
+#
+# There is deliberately no key here for the `thinking` field. It is derived from
+# the rail, the model and `effort` alone — see [models.*] below — so nothing in a
+# profile can contradict the effort you asked for.
 
 
 # ─────────────────────────────────────────────────────────────────────────────

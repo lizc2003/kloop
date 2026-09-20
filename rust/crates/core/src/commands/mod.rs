@@ -1037,64 +1037,6 @@ mod tests {
     /// worse than recording none: it states an answer with confidence and is
     /// wrong the moment `/effort` is used.
     /// A model that declares its levels is taken at its word: `/effort` refuses
-    /// `/effort none` asks for the `thinking` field, so a gateway that cannot
-    /// take that field cannot be told it either. Refused by name rather than
-    /// accepted into a request that would quietly ask for nothing.
-    #[tokio::test]
-    async fn effort_none_is_refused_where_the_thinking_field_cannot_be_sent() {
-        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
-        let mut history = History::new(cfg.offload_dir.clone());
-        let catalog = Arc::new(
-            crate::provider_route::ProviderCatalog::new(vec![
-                crate::provider_route::ProviderCatalogEntry {
-                    id: "messages".into(),
-                    api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
-                    endpoint_fingerprint: "messages:test".into(),
-                    default_model: "m1".into(),
-                    models: vec!["m1".into()],
-                    context_window: None,
-                    availability: kloop_protocol::ProviderAvailabilityCode::Ready,
-                    default_effort: None,
-                    sends_thinking: false,
-                    factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
-                },
-            ])
-            .unwrap(),
-        );
-        let state =
-            crate::provider_route::SessionProviderState::new(catalog, "messages", None).unwrap();
-        let cancel = CancellationToken::new();
-        let refused = run_with_provider_state(
-            "/effort none",
-            &mut history,
-            &cfg,
-            &state,
-            &SilentUi,
-            &cancel,
-        )
-        .await;
-        assert!(!refused.route_changed);
-        assert_eq!(
-            refused.output,
-            "effort not changed: provider 'messages' omits the thinking request field \
-             (thinking_param = false), so 'none' cannot be expressed there"
-        );
-        assert_eq!(state.effort(), None);
-
-        // Every other level rides output_config, which this gateway does take.
-        let accepted = run_with_provider_state(
-            "/effort high",
-            &mut history,
-            &cfg,
-            &state,
-            &SilentUi,
-            &cancel,
-        )
-        .await;
-        assert!(accepted.route_changed);
-        assert_eq!(state.effort(), Some(kloop_protocol::ReasoningEffort::High));
-    }
-
     /// an undeclared level on the spot instead of letting the turn find out from
     /// a 400. `none` is in the list or it is not — it gets no exemption, while
     /// `unset` never reaches the check at all because it sends no field.
@@ -1113,7 +1055,6 @@ mod tests {
                     context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
-                    sends_thinking: true,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
                 },
             ])
@@ -1199,7 +1140,6 @@ mod tests {
                     context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
-                    sends_thinking: true,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
                 },
             ])
@@ -1300,7 +1240,6 @@ mod tests {
             context_window: None,
             availability: kloop_protocol::ProviderAvailabilityCode::Ready,
             default_effort: None,
-            sends_thinking: true,
             factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
         };
         Arc::new(
@@ -1530,7 +1469,6 @@ mod tests {
                     context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
-                    sends_thinking: true,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
                 },
             ])
