@@ -176,6 +176,26 @@ max_agents = 3
         assert!(table.contains_key("mcp"));
     }
 
+    /// `config/config-demo.toml` is what a new user copies into place, and
+    /// nothing else checks that kloop still accepts what it says. The provider
+    /// profiles resolve against the environment and stay out; the top-level
+    /// schema and the `[web]` section are verified here.
+    #[test]
+    fn the_shipped_demo_config_is_one_kloop_accepts() {
+        let raw = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../config/config-demo.toml"),
+        )
+        .expect("config/config-demo.toml");
+        let table = parse_root(&raw).expect("demo config parses");
+        assert_eq!(
+            crate::web::load_web_config(&table).unwrap(),
+            crate::web::WebConfig {
+                search_provider: "tavily".into(),
+                api_key: Some("tvly-REPLACE-ME".into()),
+            }
+        );
+    }
+
     #[test]
     fn root_rejects_unknown_keys_without_echoing_values() {
         let error = parse_root("mystery = \"sentinel-secret\"")
