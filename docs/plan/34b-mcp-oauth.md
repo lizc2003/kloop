@@ -17,7 +17,7 @@
 - **cc**:自实现 `OAuthClientProvider` 回调 + keychain 存储 + 本地回调 server +
   发现缓存 + 刷新锁;PKCE/DCR/授权 URL/code 换 token 全由 SDK `auth()` 做
   (`cc/services/mcp/auth.ts:847 performMCPOAuthFlow`、`:1376 ClaudeAuthProvider`)。
-- **codex**:自实现登录编排(`sky/perform_oauth_login.rs`)+ token 持久化
+- **codex**:自实现登录编排(`rmcp-client/src/perform_oauth_login.rs`)+ token 持久化
   (`sky/oauth.rs`)+ HTTP 适配 + 传输挂钩(`sky/rmcp_client.rs`);PKCE/discovery/
   DCR/交换/refresh 全在 `rmcp`(`RMCP` 全文),`rmcp` 又建在 `oauth2` v5 上。
 

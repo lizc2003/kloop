@@ -62,7 +62,7 @@
 
 ## 回源待办(开工必做,教训 11 + 14)
 
-- **codex code-mode**:`code-mode/src/runtime/globals.rs`(`build_all_tools_value`/`ALL_TOOLS`、
+- **codex code-mode**:`code-mode-runtime/src/runtime/globals.rs`(`build_all_tools_value`/`ALL_TOOLS`、
   enabled tool 挂载)、`code-mode-protocol/src/description.rs`(`normalize_code_mode_identifier`、
   `render_json_schema_to_typescript`、`CallToolResult<T>`、`MCP_TYPESCRIPT_PREAMBLE`、
   `DEFERRED_NESTED_TOOLS_GUIDANCE`)——**重点:deferred 工具在 code-mode 里怎么暴露**(全量 TS 声明
@@ -106,7 +106,7 @@ README、HANDOFF、plan 24 挂账(②)与本 plan 更新;未选切片记挂账�
 ### 回源结论(三家真读,教训 11+14)
 
 - **codex(唯一有真 Rust code-mode 实现,决定性)**——两个面**解耦**:
-  - 运行期 `tools` 对象(`code-mode/src/runtime/globals.rs` `build_tools_object`)= 从
+  - 运行期 `tools` 对象(`code-mode-runtime/src/runtime/globals.rs` `build_tools_object`)= 从
     `enabled_tools` 建,**所有启用工具(含 MCP)永远可调**;另有 `ALL_TOOLS` 全局 =
     `{name, description}[]` 紧凑清单,也永远在。
   - `exec` 工具的 **description**(`code-mode-protocol/src/description.rs`

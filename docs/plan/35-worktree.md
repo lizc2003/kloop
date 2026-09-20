@@ -6,9 +6,10 @@
 
 ## 回源结论(2026-07-15,两家真读,file:line)
 
-- **codex**(`ext/worktree/` 整 crate):三类 owner `ManualTool/Subagent/Cli`
-  (`service.rs:42-54`);目录 `.codex/worktrees/<name>` + 分支
-  `codex/worktree/<name>`(`service.rs:28-31/1118-1132`),创建 = `git worktree add
+- **codex fork**(`ext/worktree/` 整 crate;上游 codex 的 `worktree` crate 没有这一层,
+  树也不放仓内):三类 owner `ManualTool/Subagent/Cli`
+  (`service.rs:42-54`);目录 `.<fork>/worktrees/<name>` + 分支
+  `<fork>/worktree/<name>`(`service.rs:28-31/1118-1132`),创建 = `git worktree add
   --no-track -B <branch> <path> <base>`(:191-200),managed 目录注入
   `.git/info/exclude`(:934-957)。入口两个:模型工具 `enter_worktree`/`exit_worktree`
   (`tool.rs:39-40`,一 thread 一棵)+ 多 agent `spawn_agent` 的
@@ -187,7 +188,7 @@ server 会话 `enter_worktree→write_file→exit_worktree`,客户端收到两�
 ## 修正（2026-08-29 → 2026-08-31，plan 105 会话中 dogfood 发现）
 
 `WORKTREES_DIR` 原本是 `.claude/worktrees` —— 用户看到后一句「这个不合理」。确实:
-本文件上面写的收敛点是「**仓内专用目录**」,codex 用 `.codex/worktrees`、cc 用
+本文件上面写的收敛点是「**仓内专用目录**」,codex fork 用 `.<fork>/worktrees`、cc 用
 `.claude/worktrees`,两家都用**自己的**命名空间;kloop 照抄了 cc 的**字面目录名**,
 等于把自己的工作树写进另一个产品的目录里(README 里甚至有一句「kloop scans only its
 own `.kloop/`, not cc's `.claude/`」,自相矛盾)。同一仓库里同时用 cc 和 kloop 时,
