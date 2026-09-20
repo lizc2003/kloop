@@ -4,7 +4,26 @@ Copyright 2026 lizc2003@gmail.com
 Licensed under the Apache License, Version 2.0. See LICENSE.
 
 --------------------------------------------------------------------
-Third-party material in this repository, NOT covered by that license:
+This product includes code derived from OpenAI Codex
+(https://github.com/openai/codex), licensed under the Apache License,
+Version 2.0. Per section 4 of that license, its own notice follows:
+
+  OpenAI Codex
+  Copyright 2025 OpenAI
+
+What is derived from it:
+
+  rust/crates/core/src/shell.rs
+      The word-only bash parse-tree walk and the read-only / dangerous
+      command classifiers, ported from the `codex-shell-command` crate.
+
+  rust/crates/core/src/sandbox/seatbelt_base.sbpl
+  rust/crates/core/src/sandbox/seatbelt_network.sbpl
+      Copied verbatim from `codex-rs/sandboxing/src/`. The base policy
+      is itself derived from Chrome's sandbox policy.
+
+--------------------------------------------------------------------
+Third-party material in this repository, NOT covered by kloop's license:
 
   refs/claude-code-2.1.220/
       A pinned parity corpus generated against Anthropic's Claude Code

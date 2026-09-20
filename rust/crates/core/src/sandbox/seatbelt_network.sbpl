@@ -1,4 +1,4 @@
-; verbatim from codex codex-rs sandboxing/src/seatbelt_network_policy.sbpl:
+; verbatim from codex `codex-rs/sandboxing/src/seatbelt_network_policy.sbpl` (Apache-2.0):
 ; appended after the base policy when [sandbox] allow_network is on.
 ; when network access is enabled, these policies are added after those in seatbelt_base_policy.sbpl
 ; proxy-specific allow rules are injected by codex-core based on environment.

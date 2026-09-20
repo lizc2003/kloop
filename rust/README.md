@@ -1116,51 +1116,6 @@ turn is interrupted.
 ← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","eventGeneration":"g","seq":"8","turn":{"id":1,"status":"completed"}}}
 ```
 
-### Codex Desktop adapter (plan 39 slices 2–4)
-
-The `桌面前端仓库` repository's dedicated `kloop` branch launches this
-server through `ENGINE_BIN` and consumes native protocol 2.0 directly (it
-does not emulate the old Codex app-server wire). Its initialize request declares
-the mandatory event recovery shape and hard-rejects a server missing any of
-`events.sequence`, `events.sync`, or `events.snapshot`. The Tauri reader also
-rejects and terminates the native child on any malformed public sequence instead
-of forwarding an unsequenced event. A per-thread TypeScript coordinator owns
-initial attach, replay/gap repair, duplicate suppression, generation replacement,
-and generation-scoped UI item identities; snapshots use a dedicated full-replace
-normalizer rather than synthetic live events. The adapter also requires the structured
-approval capability, validates each `approvalScopes` payload, offers only the
-advertised Once / Workspace session / Project actions, sends
-`acceptForProject`, and rejects a mismatched handshake or malformed/unknown approval:
-
-```sh
-cargo build -p kloop
-cd /path/to/桌面前端仓库/app
-ENGINE_BIN=/path/to/kloop-repo/rust/target/debug/kloop bun run app
-```
-
-That branch gets provider credentials from the process-global
-`~/.kloop/config.toml` (environment variables are optional overrides), so it
-deliberately skips Codex SSO/LoginDialog/AccessGuard. The same immutable
-startup snapshot supplies permissions, MCP, web, hooks, sandbox, agents, and
-codemode; thread cwd only anchors workspace-specific context, skills,
-permissions, and sandbox paths. Live text/image turns, Stop,
-generic tool cards, all four approval decisions, and native
-`thread/list|read|resume|fork` history are connected.
-Slice 4 also enables the local model picker, project-scoped skill catalog and
-native `/skill ` invocation, the safe config read adapter, and an immutable MCP
-status panel. The model picker is locked after a thread starts because its model
-is pinned; reasoning controls stay hidden. Connector add/edit/toggle/delete,
-skill/plugin lifecycle operations, generic config writes, personalization
-settings/reset, and all other mutation methods remain fail-closed at both the
-TypeScript and Tauri command boundaries. Personalization controls also disable
-when their legacy settings cannot load, so the safe config projection is never
-presented as editable legacy state. The adapter never receives raw config,
-skill bodies, MCP commands/env/headers, or connection error chains.
-
-Search, name/archive/rollback/compact/goal, plan/review, dynamic tools,
-automation/artifacts, and account-only panels remain capability-gated and never
-issue legacy RPCs.
-
 ## MCP client (Phase 2, sixth slice)
 
 kloop connects to external MCP tool servers over one of two transports: a
@@ -2098,8 +2053,7 @@ types, and unknown fields are rejected. Names are at most 64 characters and
 may use `/`-separated ASCII letter/digit/dot/underscore/dash segments; `/` is
 encoded as `+`. Managed trees live at `.kloop/worktrees/<encoded-name>` on
 `kloop-worktree-<encoded-name>` — kloop's own namespace, not another agent's
-(cc uses `.claude/worktrees` + `worktree-<slug>`, codex `.codex/worktrees` +
-`codex/worktree/<name>`). An existing `path` must canonicalize to a registered
+(cc uses `.claude/worktrees` + `worktree-<slug>`). An existing `path` must canonicalize to a registered
 worktree with the same Git common directory. Entering by path grants
 **External** custody only.
 
@@ -3194,7 +3148,7 @@ read and shrunk. Raising it is Plan 61's decision, not this one's.
   role **cannot** hold an image, so the image is **relocated** to a trailing
   `user` message (`[tool output contains image data attached in the following
   message]` placeholder + a `Tool output for call_id …:` user message with the
-  data URL) — codex's proven shape, so no information is lost on that rail.
+  data URL) — a proven shape, so no information is lost on that rail.
 - **MCP tools return images too**: an MCP tool whose result carries an image
   content block (`{type:"image", data, mimeType}`) is lifted into the same
   canonical image block (when the mime is one the models accept — png/jpeg/gif/

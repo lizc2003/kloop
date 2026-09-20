@@ -109,7 +109,7 @@ Pi 不成为依赖或架构上游；未复制源码、第三方资产、extensio
   NTFS 硬链接可从另一路径暴露同一文件）——补 Windows 沙箱前该先读这份边界。
 - **原生协议**。codex `app-server` 全家约 23.6 万行（server 17.5 万 + protocol 3.45 万 +
   transport 1.8 万 + daemon 6668），kloop 的 `protocol` 1611 行 + `server` 7798 行。
-  让 kloop 引擎替换 旧引擎二进制 二进制、让 Tauri 前端接原生协议，这是最直接的底本。
+  kloop 的原生协议要再长,这是最直接的底本。
 - **hooks**。kloop 776 行 6 事件；codex 1.57 万行 9 类（session_start/end、user_prompt_submit、
   pre/post_tool_use、permission_request、compact、interrupt、stop），特色是 hook 可以是一个
   MCP tool，并有 `output_spill` 处理 hook 输出溢出；grok 1.25 万行 16 事件，用 macro 表驱动，

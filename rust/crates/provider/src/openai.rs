@@ -22,7 +22,7 @@ use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
 
 /// Left in the `tool` message when its image is relocated to a trailing user
-/// message (the `tool` role cannot carry images). codex uses this exact text.
+/// message (the `tool` role cannot carry images).
 const IMAGE_RELOCATED_PLACEHOLDER: &str =
     "[tool output contains image data attached in the following message]";
 

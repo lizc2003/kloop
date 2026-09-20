@@ -1440,7 +1440,7 @@ mod tests {
         // One under the line.
         assert!(!predicted_overflow(100_000 - growth - 1, growth, 100_000));
         // A window at or below the growth reserve never predicts overflow —
-        // the lesson from the codex dry run: a negative threshold means
+        // the lesson from the compaction dry run: a negative threshold means
         // "always compact", which is wrong.
         assert!(!predicted_overflow(u64::MAX / 2, growth, growth));
         assert!(!predicted_overflow(1_900, growth, 2_000));

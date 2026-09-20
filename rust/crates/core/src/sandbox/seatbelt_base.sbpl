@@ -1,4 +1,4 @@
-; verbatim from codex codex-rs sandboxing/src/seatbelt_base_policy.sbpl (itself derived
+; verbatim from codex `codex-rs/sandboxing/src/seatbelt_base_policy.sbpl` (Apache-2.0; itself derived
 ; from Chrome sandbox policy) — a security allow-list; do not trim entries casually.
 (version 1)
 

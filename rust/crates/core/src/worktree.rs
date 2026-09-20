@@ -38,7 +38,7 @@ use crate::permissions::Permissions;
 use crate::sandbox::SandboxPolicy;
 
 /// Managed worktrees live in kloop's own repository namespace, not in another
-/// agent's directory (cc's `.claude/worktrees`, codex's `.codex/worktrees`).
+/// agent's directory (cc's `.claude/worktrees`).
 ///
 /// Nesting under `.kloop/` costs an exemption: `.kloop` is otherwise a sensitive
 /// path component — kloop's own state, where a write is privilege escalation and

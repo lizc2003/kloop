@@ -1,7 +1,6 @@
 //! `enter_worktree` / `exit_worktree` (plan 35 slice 2): let the SESSION move
 //! into an isolated git worktree at runtime and back out again — cc's
-//! EnterWorktree/ExitWorktree and codex's enter_worktree/exit_worktree, "one
-//! tree per session". Distinct from `run_agent {isolation:worktree}` (slice 1),
+//! EnterWorktree/ExitWorktree, "one tree per session". Distinct from `run_agent {isolation:worktree}` (slice 1),
 //! which isolates a throwaway sub-agent. The switch flips the session's active
 //! worktree slot; the `effective_*` accessors make it take effect immediately.
 

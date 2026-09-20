@@ -1,5 +1,5 @@
 //! shell — bash command analysis on a real parse tree (tree-sitter-bash),
-//! ported from codex's `codex-shell-command` crate.
+//! ported from codex's `codex-shell-command` crate (Apache-2.0).
 //!
 //! One analysis feeds three verdicts: concurrency safety (tools.rs), the
 //! read-only/allowlist layers, and the dangerous-command safety check
