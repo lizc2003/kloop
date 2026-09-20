@@ -1,73 +1,27 @@
-# kloop provider configuration — a worked example of all three wire protocols.
+# kloop provider config — one profile per wire protocol. Copy to
+# ~/.kloop/config.toml; kloop requires 0700 on the directory and 0600 on the
+# file. Full reference, and the other sections (mcp, web, hooks, sandbox,
+# agents, codemode, permissions), in rust/README.md.
 #
-# Copy to ~/.kloop/config.toml and replace the hosts, models and credentials.
-# kloop requires the directory to be 0700 and the file 0600 (it holds plaintext
-# credentials, and the model's read_file/grep/bash are refused on this path):
-#
-#     mkdir -p ~/.kloop && chmod 700 ~/.kloop
-#     cp config/config-demo.toml ~/.kloop/config.toml && chmod 600 ~/.kloop/config.toml
-#
-# Nothing below is a real endpoint or a real key.
+#   mkdir -p ~/.kloop && chmod 700 ~/.kloop
+#   cp config/config-demo.toml ~/.kloop/config.toml && chmod 600 ~/.kloop/config.toml
+
+provider = "k-claude"                                   # which one this session starts on
 
 
-# The only top-level selector: which provider this session starts on.
-# KLOOP_PROVIDER overrides it; /provider switches mid-session.
-provider = "k-claude"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# wire_api = "messages"  —  Anthropic Messages.  POST {base_url}/v1/messages
-#
-# Note the base URL carries NO /v1: kloop appends the whole endpoint path, the
-# same convention ANTHROPIC_BASE_URL has everywhere else. The two OpenAI rails
-# below are the other way round — that asymmetry is inherited from the two
-# vendors' own SDKs, not invented here.
-# ─────────────────────────────────────────────────────────────────────────────
+# messages → POST {base_url}/v1/messages    ← base_url carries NO /v1 on this rail
 [providers.k-claude]
-wire_api = "messages"
-base_url = "https://gateway.example.com"
+wire_api    = "messages"
+base_url    = "https://gateway.example.com"
+auth_header = { Authorization = "Bearer REPLACE-ME" }   # or { x-api-key = "sk-ant-..." }
+model       = "claude-opus-4-8"
+models      = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
+context_window = 1000000                                # what this gateway caps at
+effort      = "xhigh"
+# prompt_cache = true                                   # messages-only; false for a
+                                                        # gateway rejecting cache_control
 
-# One credential, written the way the endpoint reads it. Exactly two spellings
-# are legal and both work on every wire_api, because which header a gateway
-# wants is the gateway's business:
-#
-#     auth_header = { x-api-key = "sk-ant-..." }        # Anthropic's own spelling
-#     auth_header = { Authorization = "Bearer ..." }    # most gateways in front of it
-#
-# Writing two is an error. This is not a general header bag — kloop sends this
-# and nothing else.
-auth_header = { Authorization = "Bearer REPLACE-ME" }
-
-model  = "claude-opus-4-8"
-models = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
-
-# What this gateway caps context at, when it caps lower than the model itself.
-# The effective budget is min(this, the model's own, kloop's fallback).
-context_window = 1000000
-
-# Where this provider starts; /effort owns it afterwards. Valid on all three
-# rails — only the wire field differs (see the table at the bottom).
-effort = "xhigh"
-
-# prompt_cache is Messages-only (writing it on another rail is a startup error,
-# even `false`, because that rail has no such field) and defaults to true, so it
-# can simply be omitted. It is not a reasoning setting — `effort` above is the
-# only knob for that.
-#
-#   prompt_cache = true     # send cache_control breakpoints: on the last tool,
-#                           # the system block, and the last message block. Set
-#                           # false for a gateway that rejects the field; usage
-#                           # reports cache_read/cache_creation, so a real hit is
-#                           # visible.
-#
-# There is deliberately no key here for the `thinking` field. It is derived from
-# the rail, the model and `effort` alone — see [models.*] below — so nothing in a
-# profile can contradict the effort you asked for.
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# wire_api = "responses"  —  OpenAI Responses.  POST {base_url}/responses
-# ─────────────────────────────────────────────────────────────────────────────
+# responses → POST {base_url}/responses
 [providers.k-gpt]
 wire_api    = "responses"
 base_url    = "https://gateway.example.com/v1"
@@ -77,68 +31,28 @@ models      = ["gpt-5.6-sol", "gpt-5.6-terra"]
 context_window = 258400
 effort      = "xhigh"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# wire_api = "chat"  —  OpenAI Chat Completions.  POST {base_url}/chat/completions
-# ─────────────────────────────────────────────────────────────────────────────
+# chat → POST {base_url}/chat/completions
 [providers.k-chat]
 wire_api    = "chat"
 base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
-# Omitting `models` means the allowlist is just `model`.
-model       = "glm-5.3-flash"
+model       = "glm-5.3-flash"                           # no `models` = just this one
 effort      = "max"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# [models."<id>"] — facts about a model, not choices about a session. Looked up
-# once and then left alone, and shared by every provider that routes to it.
-# Everything here is optional; an undeclared model simply has no limits applied.
-# ─────────────────────────────────────────────────────────────────────────────
+# [models."<id>"] — facts about a model, shared by every provider. All optional.
 
-# `efforts` is the levels this model accepts. Declaring it makes a wrong one a
-# startup error instead of a 400 halfway through the first turn. Absent means
-# "not declared", which is not the same as "accepts nothing".
 [models."claude-opus-4-8"]
 efforts = ["low", "medium", "high", "xhigh", "max"]
 
 [models."claude-sonnet-4-6"]
-efforts = ["low", "medium", "high", "max"]        # this one has no xhigh
+efforts = ["low", "medium", "high", "max"]              # no xhigh
 
-# Older models read a token budget instead of an effort field — sending them an
-# effort is an error. Declare one budget per level and `/effort` keeps working:
-# kloop renders the chosen level into whichever field the model actually reads.
-# The table's keys are also this model's accepted levels, so `efforts` must not
-# be declared alongside it, and a level left out of the table is refused.
-# Minimum 1024 tokens.
+# Models that read a token budget instead of an effort field. The keys are this
+# model's accepted levels too, so do not also declare `efforts`.
 [models."claude-haiku-4-5"]
 thinking_budget = { low = 2048, medium = 8192, high = 16384 }
 
 [models."gpt-5.6-sol"]
 context_window = 400000
 efforts = ["low", "medium", "high", "xhigh", "max"]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reasoning is one knob — `effort` — and each rail spells it differently:
-#
-#   messages    output_config: {"effort": ...}   + thinking: {"type": "adaptive"}
-#   responses   reasoning: {"effort": ..., "summary": "auto"}
-#   chat        reasoning_effort: ...
-#
-# `effort = "none"` means "do no reasoning" on all three; on Messages that is a
-# disabled thinking field rather than an effort value.
-#
-# Environment overrides apply to the SELECTED provider only and can never
-# introduce a provider or model that is not declared here:
-#
-#   KLOOP_PROVIDER    which profile to start on
-#   KLOOP_MODEL       which model (must be in that profile's models allowlist)
-#   KLOOP_EFFORT      starting effort
-#   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL     Messages profiles
-#   OPENAI_API_KEY    / OPENAI_BASE_URL        Responses and Chat profiles
-#
-# A key from the environment replaces the secret, never the header spelling.
-#
-# Other sections (mcp, web, hooks, sandbox, agents, codemode, permissions) also
-# live in this file; see rust/README.md for those.
