@@ -3366,11 +3366,12 @@ cargo run -- --mock
 #
 # One thing crosses that line, in the other direction: `[env]` in the same file
 # sets variables for this process and for every command it runs — a proxy, a CA
-# bundle, things that describe the machine rather than kloop. It is not a
-# configuration source (nothing is read from it back into kloop's settings),
-# and anything the shell already set wins, so `HTTPS_PROXY=… kloop` still
-# overrides the file for one run. `HOME` cannot be set there: the file was just
-# read from it.
+# bundle, whatever the machine needs. It is not a configuration source (nothing
+# is read from it back into kloop's settings), and **a name written there wins
+# over the same name in the environment**: one file decides what this run's
+# environment is, for the same reason it decides everything else about the run.
+# Names it leaves out are inherited untouched. `HOME` cannot be set there: the
+# file was just read from it.
 #
 # There is no scope above the profile for
 # either model or effort: both belong to the provider that has to send them,

@@ -15,17 +15,19 @@ plan 172 刚把**所有**"从环境读 kloop 的配置"删干净。`[env]` 看�
 
 一句话:kloop 的设置只有一个来源(文件);机器的环境仍然是环境,而文件可以**供给**它。
 
-## 二、shell 赢,文件兜底
+## 二、文件赢(同会话第二轮拍板)
 
-`[env]` **只填 shell 没设的变量**。理由三条,都指向同一侧:
+第一版做成了兜底(只填 shell 没设的),我给的理由是惯例("离进程越近越赢")和可诊断性
+(`echo $HTTPS_PROXY` 当场可见)。用户否掉:**「我觉得是 config 的赢,更合适。」**
 
-1. 用户的原话就是兜底——「我在 shell 里没设,也不会出问题」。
-2. 环境变量的通行惯例是**离进程越近越赢**:`HTTPS_PROXY=… kloop` 临时换个代理调试,必须压得过
-   配置文件,否则那条命令行就是骗人的。
-3. **可诊断性**:shell 里有什么,`echo $HTTPS_PROXY` 当场可见;文件里有什么要去翻。让当场可见的
-   那个赢,"为什么是这个值"才有最短的答案。
+这个取舍更彻底,而且和 plan 172 是同一句话:**一个文件决定这次运行是什么样**。兜底语义下,
+同一份 config 在两台机器上仍可能走不同的代理——那正是 plan 172 花一整轮删掉的那种不确定性,
+只是换了个位置回来。让文件赢,"为什么用了那个代理"就只有一个地方可查。
 
-设成空串**算设过**(好几个工具把空串读作"禁用",那是决定,不是缺席)。
+代价写明:`HTTPS_PROXY=… kloop` 对**已在 `[env]` 里写明的**变量不再有效(没写明的照常继承)。
+想临时换,改那一行。
+
+`[env]` 没提到的变量原样继承——文件决定的是它说了的那些,不是整个环境。
 
 ## 三、只能在 main 的第一行附近做
 
@@ -60,15 +62,15 @@ plan 172 刚把**所有**"从环境读 kloop 的配置"删干净。`[env]` 看�
 `user_config.rs`(`load_env_overrides` / `pending_env` / `config_env` + 顶层白名单加 `env`)、
 `main.rs`(拆 `#[tokio::main]`、一处 `unsafe set_var`)、`startup.rs`(一行再校验)。
 
-测试两个,都不碰真环境:
-`env_section_parses_pairs_and_refuses_what_would_contradict_itself`(整对象断言三个 pair 含空值;
-`env = 3` / `X = 3` / `HOME` / `USERPROFILE` 四种拒绝的整串断言)与
-`a_variable_the_shell_already_set_is_left_alone`(注入 `present` 闭包,三种覆盖情形)。
+测试 `env_section_parses_pairs_and_refuses_what_would_contradict_itself`,不碰真环境:整对象断言
+三个 pair(含空值),外加 `env = 3` / `X = 3` / `HOME` / `USERPROFILE` 四种拒绝的整串断言。
+第一版还有一个 `a_variable_the_shell_already_set_is_left_alone` 与纯函数 `pending_env`,
+随兜底语义一起删除——文件全赢之后没有可判定的分支了。
 
 README 在"文件就是全部"那段后面补了反方向的这一条;`config-demo.toml` 带一段**注释掉的**
 `[env]` 代理示例(照抄 demo 的人不该被塞一个他没有的代理——和 `api_key` 同一个判断)。
 
 `cargo fmt --check` 干净,`clippy --all-targets -- -D warnings` 全绿,`cargo test`
-**1603 passed / 0 failed**。
+**1602 passed / 0 failed**(兜底那个测试随语义一起删掉)。
 
 教训 170。

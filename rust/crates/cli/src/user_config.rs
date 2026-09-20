@@ -56,12 +56,15 @@ impl UserConfig {
     }
 }
 
-/// `[env]`: variables the config file supplies for this process, and so for
-/// every child it spawns. This is the one place kloop still deals in the
-/// environment, and it is not a configuration source — it is the opposite
-/// direction. A proxy or a CA bundle describes *the machine*, not how kloop
-/// works, so it belongs in the environment; `[env]` only means a user who has
-/// not put it in their shell does not go without.
+/// `[env]`: variables the config file sets for this process, and so for every
+/// child it spawns. It is not a configuration source — it runs the other way,
+/// and nothing here is ever read back into kloop's own settings.
+///
+/// **A name written here wins over the same name in the environment.** One
+/// file decides what this run's environment looks like, for the same reason
+/// one file decides everything else about it (plan 172): otherwise the answer
+/// to "why did it use that proxy" depends on which shell happened to start
+/// kloop. A variable the file does not mention is left exactly as inherited.
 pub(crate) fn load_env_overrides(root: &toml::Table) -> Result<Vec<(String, String)>> {
     let Some(section) = root.get("env") else {
         return Ok(Vec::new());
@@ -89,22 +92,6 @@ pub(crate) fn load_env_overrides(root: &toml::Table) -> Result<Vec<(String, Stri
         out.push((name.clone(), value.to_string()));
     }
     Ok(out)
-}
-
-/// The pairs that actually get set. **A variable the environment already
-/// carries wins**: the shell that started this run is the more specific
-/// statement of intent, it is what `echo $HTTPS_PROXY` shows, and
-/// `HTTPS_PROXY=… kloop` has to be able to override the file for one run. A
-/// variable set to the empty string counts as set — several tools read empty
-/// as "disabled", which is a decision, not an absence.
-pub(crate) fn pending_env(
-    configured: Vec<(String, String)>,
-    present: &dyn Fn(&str) -> bool,
-) -> Vec<(String, String)> {
-    configured
-        .into_iter()
-        .filter(|(name, _)| !present(name))
-        .collect()
 }
 
 /// The `[env]` pairs read straight from disk, for the single-threaded moment
@@ -248,9 +235,9 @@ max_agents = 3
 
     /// The one section whose effect is a side effect on the process, so what
     /// it accepts is worth pinning exactly. Nothing here calls `set_var`:
-    /// parsing and the shell-wins decision are pure functions, and that is the
-    /// half worth testing — applying them is one line in `main`, sound only
-    /// because it runs before the runtime exists.
+    /// parsing is a pure function and that is the half worth testing —
+    /// applying it is one line in `main`, sound only because it runs before
+    /// the runtime exists.
     #[test]
     fn env_section_parses_pairs_and_refuses_what_would_contradict_itself() {
         assert_eq!(load_env_overrides(&toml::Table::new()).unwrap(), vec![]);
@@ -294,21 +281,6 @@ max_agents = 3
             refused("[env]\nUSERPROFILE = \"C:/other\"").contains("cannot be set"),
             "USERPROFILE is HOME on the other platform"
         );
-    }
-
-    /// The file supplies what the shell did not; it never overrules it.
-    #[test]
-    fn a_variable_the_shell_already_set_is_left_alone() {
-        let configured = vec![
-            ("HTTPS_PROXY".to_string(), "http://from-file:1".to_string()),
-            ("NO_PROXY".to_string(), "localhost".to_string()),
-        ];
-        assert_eq!(
-            pending_env(configured.clone(), &|name| name == "HTTPS_PROXY"),
-            vec![("NO_PROXY".to_string(), "localhost".to_string())]
-        );
-        assert_eq!(pending_env(configured.clone(), &|_| false), configured);
-        assert_eq!(pending_env(configured, &|_| true), vec![]);
     }
 
     /// `config/config-demo.toml` is what a new user copies into place, and

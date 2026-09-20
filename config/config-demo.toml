@@ -71,13 +71,13 @@ search_provider = "tavily"                              # or "brave"
 # api_key       = "tvly-..."                            # tavily free tier: no card
 
 
-# [env] — variables kloop sets for itself and for every command it runs, and
-# the one place it still deals in the environment. This is the machine's own
-# setup (a proxy, a CA bundle), not kloop's configuration, so anything the
-# shell already set wins: `HTTPS_PROXY=… kloop` still overrides it for one run.
+# [env] — variables kloop sets for itself and for every command it runs. A
+# name written here wins over the same name in your shell: one file decides
+# what this run's environment looks like, so it does not change with whichever
+# shell started kloop. Names left out are inherited untouched.
 
 # [env]
-# HTTPS_PROXY = "http://127.0.0.1:7897"                 # only used if the shell
-# HTTP_PROXY  = "http://127.0.0.1:7897"                 # did not set it
+# HTTPS_PROXY = "http://127.0.0.1:7897"                 # wins over the shell's
+# HTTP_PROXY  = "http://127.0.0.1:7897"
 # ALL_PROXY   = "socks5h://127.0.0.1:7897"
 # NO_PROXY    = "localhost,127.0.0.1"
