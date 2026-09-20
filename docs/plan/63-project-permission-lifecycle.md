@@ -4,7 +4,7 @@
 >
 > 依赖：Plan 8、35、37、39、46、49、51
 >
-> 施工关系：Plan 61、62 已在开工前完成并固定安全 seam；Plan 63 以 `13d0772` 为唯一实现基线，在同一 kloop main 工作树完成。Desktop companion 只在 `~/work/桌面前端仓库/.claude/worktrees/kloop-plan63` 的独立 `kloop` worktree 修改。
+> 施工关系：Plan 61、62 已在开工前完成并固定安全 seam；Plan 63 以 `13d0772` 为唯一实现基线，在同一 kloop main 工作树完成。Desktop companion 只在 `~/work/桌面前端仓库.claude/worktrees/kloop-plan63` 的独立 `kloop` worktree 修改。
 >
 > 实际开工基线：kloop `13d0772`；Desktop local `kloop` 基线 `934e325d`。两仓库保持两个提交，不 push。
 
@@ -319,7 +319,7 @@ pub enum Decision {
 - 删除 `acceptAlways`；旧值、unknown、missing、cancel、EOF全部 deny。
 - 不实现旧approval token兼容、版本双栈或token alias；protocol `2.0`握手作为mismatch拒绝。
 
-同步更新 `~/work/桌面前端仓库/app` 的 kloop专用分支：native protocol 1.0 scoped approval capability、`approvalScopes`、`acceptForProject`和对应前端文案。kloop main最终一次 Plan 63 commit；app仓库按其分支纪律做独立 companion commit。
+同步更新 `桌面前端仓库` 的 kloop专用分支：native protocol 1.0 scoped approval capability、`approvalScopes`、`acceptForProject`和对应前端文案。kloop main最终一次 Plan 63 commit；app仓库按其分支纪律做独立 companion commit。
 
 ## 6. Server、resume、sub-agent 与 worktree
 
@@ -518,7 +518,7 @@ pub enum Decision {
 - `rust/crates/tui/src/{app.rs,render.rs,lib.rs}`
 - `rust/crates/server/src/{lib.rs,wire.rs}` 与 server tests
 - 受 Config literal/clone影响的统一 test builders与模块测试
-- `~/work/桌面前端仓库/app` 的 kloop专用分支 adapter（实施阶段）
+- `桌面前端仓库` 的 kloop专用分支 adapter（实施阶段）
 
 文档：
 

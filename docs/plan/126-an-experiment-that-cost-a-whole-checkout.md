@@ -75,7 +75,7 @@ SKILL.md 第 95 行（plan123 起就在，不是 plan125 加的）：
 两家都照做了，形状完全不同。
 
 **codex**：6 个一次性 `main` 程序，文件写到 `/tmp`，**以仓库为 workdir 跑 `go run`**，
-直接 `import "codex/gateway/infra/config"`。每个 5–10 行，一次循环验 2–3 个
+直接 `import "内部 Go 包"`。每个 5–10 行，一次循环验 2–3 个
 输入。仓库一个字节没动。
 
 **kloop**：写 `review_probe_test.go` + `go test -run TestReviewProbe`。测试文件必须

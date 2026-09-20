@@ -1,13 +1,13 @@
 # Plan 39 — kloop 原生 agent 协议 + core 事件模型重构(替换 codex 引擎)
 
-> 大工程,分切片。开工前读 HANDOFF.md。背景与目标见记忆 [[kloop-replace-codex-engine]]。
-> 这不是"兼容 codex wire",而是 **kloop 定义一套最合理的原生协议,app 在 `桌面前端仓库` 开专门分支改造适配,kloop 引擎替换 旧引擎二进制 二进制**。codex 的 app-server 协议只作参考 + 反面教材。
+> 大工程,分切片。开工前读 HANDOFF.md。背景与目标见记忆 [[kloop-native-protocol]]。
+> 这不是"兼容 codex wire",而是 **kloop 定义一套最合理的原生协议,app 在 `桌面前端仓库` 开专门分支改造适配,kloop 引擎替换旧引擎二进制**。codex 的 app-server 协议只作参考 + 反面教材。
 
 ## 〇、背景:为什么推翻 plan 12 的自创协议
 
-- app(Tauri 前端)现在起的是 `旧引擎二进制 app-server [--config …]` 二进制,走 stdio 类 JSON-RPC。目标是让 kloop 引擎顶替它。
+- app(Tauri 前端)现在起的是 `旧引擎 app-server [--config …]` 二进制,走 stdio 类 JSON-RPC。目标是让 kloop 引擎顶替它。
 - 用户拍板:**不逐字节兼容 codex,做纯粹合理的协议,愿意改 app**。所以 wire 由 kloop 定义,app 跟着改。
-- codex 协议调研结论(两轮 Explore,权威):合理的留、历史债甩掉。详见 [[kloop-replace-codex-engine]]。
+- codex 协议调研结论(两轮 Explore,权威):合理的留、历史债甩掉。详见 [[kloop-native-protocol]]。
 - 现有 `crates/server`(plan 12)的自创 `thread/turn` 协议 + 事件形态(`text/delta`/`tool/started`)是这套的**起点但要重写 wire 层**。
 
 ## 一、大方向(已拍板,2026-07-20)
@@ -210,7 +210,7 @@ core 事件模型重构落地,纯重构无 wire 变化,行为逐字节不变。
 
 ### 切片 2 ✅(2026-07-22,app 功能提交 `f660aca1` + kloop 本提交；2026-07-23 app 合并 main 后 head `80a4cd1e`)
 
-真实 Codex Desktop 已改为 kloop v1 客户端,主链不再经过旧 Codex wire；延期能力在 UI、TypeScript API 和 Rust 启动热路径三层 fail-closed,不伪装兼容。
+真实桌面前端已改为 kloop v1 客户端,主链不再经过旧 Codex wire；延期能力在 UI、TypeScript API 和 Rust 启动热路径三层 fail-closed,不伪装兼容。
 
 - **kloop 每线程配置**:`thread/start` 新增 `ThreadStartOptions{cwd,model}`；cwd 缺省 server 启动目录,显式相对路径按该目录解析后 canonicalize,空/坏类型/不存在/非目录均 `INVALID_PARAMS`；CLI 不改进程 cwd,而是按 thread cwd 重建 project instructions、skills、permissions、sandbox、hooks/agent types/program limits,provider 与已连接 MCP `tool_sources` 仍进程共享；model 在默认 provider/env 配好后作 thread 级 override。`resume/fork` 本切片仍用默认 options。
 - **Tauri transport**(`桌面前端仓库` 专用 `kloop` 分支):子进程只起 `<ENGINE_BIN> app-server`；所有 request/reverse-response 都是标准 JSON-RPC 2.0；initialize 硬校验 name/version/protocol/capabilities；首轮只发 `thread/start{cwd}` + native `turn/start{threadId,input}`，第二轮不再 `thread/read`；Rust 保留数字 turn id,仅 TS store 边界转字符串；图片 data URL 转 canonical base64 image block；reader 只 surface `approval/request`,未知 reverse request 自动 `{}` 回包；四档 decision 全接通,旧 `cancel` 只在 Rust 边界映 `decline`。

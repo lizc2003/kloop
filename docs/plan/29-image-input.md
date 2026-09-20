@@ -16,13 +16,13 @@ image/base64/multimodal 零命中,唯一 `is_image_path` 只是 @-引用的扩�
   `{type:"image", source:{type:"base64", media_type, data}}`——**data 与 media_type 分
   离**;`media_type ∈ 'image/png'|'image/jpeg'|'image/gif'|'image/webp'`
   (`imageResizer.ts:22`)。也支持 `source.type:"url"` 透传。
-- **OpenAI Chat**(cc `@ant/openaiConvertMessages.ts:247-255`;codex `chat 轨实现:834-854`):
+- **OpenAI Chat**(cc `@ant/openaiConvertMessages.ts:247-255`;codex fork 的 chat 轨):
   `{type:"image_url", image_url:{url:"data:${mime};base64,${data}", detail}}`——**data
   URL 整串**,不拆。
 - **OpenAI Responses**(codex `models.rs:842-857` `InputImage`;cc `responsesAdapter.ts:51-55`):
   `{type:"input_image", image_url:"data:...", detail}`。
 - **detail 分歧**:Anthropic **无** detail;OpenAI 有 `auto/low/high`(codex 默认
-  `High`,把 `Original/low` 归一到 `high`,`chat 轨实现:856-862`)。→ kloop 内部块带
+  `High`,把 `Original/low` 归一到 `high`,同一处)。→ kloop 内部块带
   **可选 detail**,anthropic 轨忽略、openai/responses 轨缺省填 `auto`(或 high)。
 
 ### B. 图片来源(两类)
@@ -55,7 +55,7 @@ base64。
 - OpenAI **Responses** 轨:塞进 `function_call_output.output` 的 `content_items` 数组
   (codex,Responses 独有能力,Chat 没有)。
 - OpenAI **Chat** 轨(tool 角色消息**不能带图**)两条先例:
-  - **搬运**(codex `chat 轨实现:869-940`,**推荐**):tool 消息只留文本 +
+  - **搬运**(codex fork 的 chat 轨,**推荐**):tool 消息只留文本 +
     `"[tool output contains image data attached in the following message]"` 占位,图另建
     一条**紧随的 `role:"user"`** 合成消息(`"Tool output for call_id …:"` + image_url),
     信息不丢。
@@ -213,7 +213,7 @@ openai-chat 搬运降级)。至此 plan 29 主体完成。
    <mt>]` 标签,给 offload/hook/codemode/降级占位等纯文本面)。
 3. **openai-chat 轨降级 = 搬运**(codex 式,非 cc 的丢弃)。**破例不随 cc**:cc 的 Chat
    是边缘轨(cc 主轨 Anthropic),丢弃可接受;但 openai-chat 对 kloop 是正经副轨,丢弃 =
-   该轨读图直接废。搬运保信息(回源真读 codex `chat 轨实现:869-940` +
+   该轨读图直接废。搬运保信息(回源真读 codex fork 的 chat 轨 +
    `pending_multimodal_tool_outputs` 排序 `:401,537`):tool 消息留占位
    `[tool output contains image data attached in the following message]`,图另建**紧随的**
    `user` 消息(`Tool output for call_id X:` + `image_url` data URL)。用户追问"大模型支持

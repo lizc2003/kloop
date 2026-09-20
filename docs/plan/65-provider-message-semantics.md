@@ -560,7 +560,7 @@ response remained truncated after <N> continuation attempts
 - `rust/crates/core/src/rollout.rs` tests
 - `rust/crates/server/tests/server.rs`
 - plain/TUI受item terminal status影响的render tests
-- 如受影响，`~/work/桌面前端仓库/app` kloop专用分支的adapter/contract tests
+- 如受影响，`桌面前端仓库` kloop专用分支的adapter/contract tests
 
 文档：
 
