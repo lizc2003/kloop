@@ -6,7 +6,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 
 | 参考 | 位置 | 看什么 |
 |---|---|---|
-| **codex** | `refs/codex`(上游 openai/codex,固定 `02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`) | 分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`core/src/tools/parallel.rs`;压缩全家桶:`core/src/compact*.rs`;Responses 线路:`codex-api/src/common.rs`(请求体)+ `codex-api/src/sse/responses.rs`(事件);集成测试:`core/tests/suite`(mock SSE + wiremock 范式)。**系统面(2026-09-15 补:此前一直只当"循环与压缩的参考",用窄了)**:沙箱三平台 `linux-sandbox`(landlock + seccompiler + bwrap,1.03 万行)/`windows-sandbox-rs`(CreateRestrictedToken + 私有 desktop + JobObject + ConPTY,2.43 万行原生)/`core/src/sandboxing`(seatbelt);原生协议 `app-server*`(server 17.5 万 + protocol 3.45 万 + transport 1.8 万 + daemon 6668 行);`hooks`(1.57 万行,9 类事件 + hook 可以是 MCP tool + `output_spill`);工具执行策略 `execpolicy` + `shell-escalation`。**fork 特有的东西不在上游**:`fork_*.rs`、`models-manager/models.json`、`core/src/rollout/`、`ext/worktree` 要回 `refs/codex` 看 |
+| **codex** | `refs/codex`(上游 openai/codex,固定 `02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`) | 分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`core/src/tools/parallel.rs`;压缩全家桶:`core/src/compact*.rs`;Responses 线路:`codex-api/src/common.rs`(请求体)+ `codex-api/src/sse/responses.rs`(事件);集成测试:`core/tests/suite`(mock SSE + wiremock 范式)。**系统面(2026-09-15 补:此前一直只当"循环与压缩的参考",用窄了)**:沙箱三平台 `linux-sandbox`(landlock + seccompiler + bwrap,1.03 万行)/`windows-sandbox-rs`(CreateRestrictedToken + 私有 desktop + JobObject + ConPTY,2.43 万行原生)/`core/src/sandboxing`(seatbelt);原生协议 `app-server*`(server 17.5 万 + protocol 3.45 万 + transport 1.8 万 + daemon 6668 行);`hooks`(1.57 万行,9 类事件 + hook 可以是 MCP tool + `output_spill`);工具执行策略 `execpolicy` + `shell-escalation` |
 | **claude-code(逆向 TS 版)** | `refs/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
 | **claw-code（已退休）** | 历史快照 `claw-code@b71afddae100ced324457337925a694686b8fef2`（本地 clone 已移除） | **不可作底座**。只保留四项局部结论：① mock/request-capture 与 CLI output-contract 测试纪律；② OpenAI-compatible tool_calls 流式 reducer 的兼容边界；③ compact 不切开 tool_use/tool_result pair 的边界回归；④ typed lifecycle/degraded error 的阅读材料。kloop 已按自身协议和安全边界重实现，不复制 claw runtime。
 | **CodeWhale** | `refs/codewhale`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
@@ -218,11 +218,9 @@ WebFetch `<redacted>`;Agent `<redacted>`;Bash `<redacted>`;Notebook/Edit stale-r
 `<redacted>`。这些只是静态入口,没有走完 schema→parser→executor→permission/concurrency→
 output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
 
-本轮也重新固定了三个架构参考的快照:
+本轮也重新固定了两个架构参考的快照:
 
 - `refs/claude-code`（当时在 `~/work/claude-code`）commit `<redacted>`;
-- `refs/codex` commit
-  `bb21ed4b8d8f74567cd6fecb3c7d4fba795bc6e3`;
 - archived snapshot: `claw-code@4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d` (the local clone was later verified at `b71afddae100ced324457337925a694686b8fef2` before retirement).
 
 回源交叉核对的收敛点:工具计划/条件注册与执行分发分层;编辑前保存并校验文件读取状态;
@@ -562,7 +560,7 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 
 ## 调研结论(三轮调研的浓缩)
 
-1. **codex**:地基最硬——分层循环(任务→主循环→provider 故障转移→请求重试→流消费,各一层)、append-only 历史硬规则、多模型工具画像(model_info 按模型切工具形态)、unified exec 持久 shell 会话。弱在:上下文耐力(门控全部基于已测量用量,无 predictive;此缺口 2026-07 已在其 fork 上试补过一轮,见下"预演记录")、恢复语义少、工具默认不并行、shell 万能导致权限粒度粗。
+1. **codex**:地基最硬——分层循环(任务→主循环→provider 故障转移→请求重试→流消费,各一层)、append-only 历史硬规则、多模型工具画像(model_info 按模型切工具形态)、unified exec 持久 shell 会话。弱在:上下文耐力(门控全部基于已测量用量,无 predictive)、恢复语义少、工具默认不并行、shell 万能导致权限粒度粗。
 2. **claude-code**:赢在生存层——七层上下文防线(含 predictive/reactive 压缩)、丰富恢复语义(输出截断升级重试、fallback 模型、孤儿 tool_result 修补、Terminal 原因枚举)、专用工具(Read/Edit/Grep/Glob)+ `isConcurrencySafe(input)` 按入参动态并发(只读批并发上限 10)、子 agent 递归复用同一 query() 循环。
 3. **claw-code**(agent 自治维护的 Rust 克隆,精读过 11.6 万行):约 60% 真实 / 25% 孤儿 / 15% 表演;压缩是假的(不调模型,关键词模板套 `<summary>` 戏服,触发数学错误)、工具严格串行、Worker/Cron 是内存模拟。
 4. **两边独立收敛的"必然解"**(直接照抄不必发明):tool_use 有无判续跑(别信 stop_reason)、deferred 工具 + tool_search、超长输出落盘 + 回读工具、MCP `server__tool` 命名。
@@ -628,7 +626,7 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
 
 背景:kloop 已有后台 bash(run_in_background + bash_output/kill_bash + 进程组 + monitor task)与同步 task 子 agent,评估 codex 还有什么可借。细节可再查:unified_exec 在 `codex-rs/core/src/unified_exec/`(process_manager.rs 编排、head_tail_buffer.rs 截断)+ 工具面 `core/src/tools/handlers/unified_exec/`;多 agent 在 `core/src/tools/handlers/multi_agents_v2/`;并行锁 `core/src/tools/parallel.rs`。
 
-- **unified_exec 的本质差异是交互**(codex 上游机制,codex 只加审批/沙箱面):`exec_command`(cmd/tty/yield_time_ms 默认 10s/max_output_tokens)先等一会,等不完就存进程返回 `session_id`;`write_stdin(session_id, chars)` 续写,**空 chars = 纯轮询**(默认 5s,上限 300s)。可持续写 stdin(REPL/ssh/交互确认)是 kloop 后台 bash 没有的能力;PTY 可选。生命周期:上限 64 个,LRU 淘汰(保护最近 8、优先淘汰已退出),turn 结束全清,无空闲超时。输出 HeadTailBuffer:1MiB,头尾各 50%,中间截断。
+- **unified_exec 的本质差异是交互**(codex 上游机制):`exec_command`(cmd/tty/yield_time_ms 默认 10s/max_output_tokens)先等一会,等不完就存进程返回 `session_id`;`write_stdin(session_id, chars)` 续写,**空 chars = 纯轮询**(默认 5s,上限 300s)。可持续写 stdin(REPL/ssh/交互确认)是 kloop 后台 bash 没有的能力;PTY 可选。生命周期:上限 64 个,LRU 淘汰(保护最近 8、优先淘汰已退出),turn 结束全清,无空闲超时。输出 HeadTailBuffer:1MiB,头尾各 50%,中间截断。
 - **codex 没有"完成主动通知模型"的通道**:后台进程靠模型轮询;`notify` 配置是通知用户的外部命令(fire-and-forget,输出丢弃)。三个参考里只有 cc 做了 task-notification 回灌模型。
 - **多 agent 是异步体系**:`spawn` 立即返回 agent_id → `wait`(mailbox 更新摘要,新用户输入可提前打断)→ `send_message`;**子 agent 终态时投递父 agent mailbox(turn 中途回灌,`session/mod.rs` forward_child_completion_to_parent)——"通知通道"的现成先例,且只对子 agent 做、无需全局任务框架**。role 化(config 分层覆盖 model/effort/系统提示)、complexity 分级、CSV 批量 fan-out 均体量巨大,明确不抄。
 - **工具并行 codex 比 kloop 粗**(反向借鉴,保持 kloop 现状):全局单把 RwLock + 每工具静态 supports_parallel 布尔,读锁共享写锁独占;无路径粒度、无 kloop 的"连续只读成批、遇写切断"顺序性。
@@ -689,7 +687,3 @@ src/turn_diff.rs`(`similar`);claw `claw-code@b71afddae100ced324457337925a694686b
 - **教训**:plan 21 初版按 plan 备忘"edit 直接成 diff"跳过回源(教训 11 复发),漏了行号 +
   读文件这对收敛点;用户追问后回源补齐。收敛信号(教训 14)在这里很干净:cc 与 codex 用
   完全不同的库(structuredPatch vs diffy/similar)得出同一"读文件+整文件 diff+行号"取舍。
-
-## 预演记录(codex fork,2026-07-09)
-
-kloop 的压缩设计曾先在 codex fork 上完整实现过一轮(分支 `codex/worktree/predictive_reactive_compaction`,提交 57c746ef7,Buildbot 绿,未合入 main):predictive 插在 `run_pre_sampling_compact`、reactive 插在采样错误分支、Feature 双旗标、compact_fork_tests.rs 四个集成测试。价值:验证了设计、抓出小窗口负阈值盲点。教训:kloop 才是项目,参考库不用于开发。
