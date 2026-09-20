@@ -161,4 +161,4 @@ URL 里没有秘密,进错误信息是安全的。`send_checked` 已有 url 在�
 - 验证:`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo test --workspace` 全绿;`cargo run -p kloop -- --mock --headless` 跑通。
   **真实网关未验**——gw-claude 的实跑要花用户的 key/额度,单独确认。
-- 提交:本次(plan 167,见 git log)。
+- 提交:`263db3b`。
