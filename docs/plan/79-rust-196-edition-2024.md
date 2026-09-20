@@ -153,3 +153,26 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 - 已知兼容点：`rust/crates/cli/src/mcp.rs`、`rust/crates/cli/src/provider_config.rs`、`rust/crates/core/src/tools/fs/windows.rs`
 - 生命周期路径：实际 lint 命中的 `rust/crates/{mcp,provider,core,server}/src/**` 与现有 tests
 - 文档：本文件、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`rust/README.md`
+
+## 后续 — 最后一处 `set_var` 清掉(2026-09-20)
+
+本 plan 立过的规矩是「删除测试中的 `set_var`/`remove_var`,避免全局 env 竞态」,但
+`startup.rs` 里漏了一处,直到今天在 plan 168/169 的验收里偶发失败才暴露:
+
+```
+---- startup::tests::every_read_deny_is_covered_by_a_write_deny ----
+KLOOP_ALLOW is no longer supported; remove it and approve rules separately in each project
+```
+
+`nonempty_legacy_allow_environment_is_rejected_without_echoing_it` 用
+`unsafe { set_var("KLOOP_ALLOW", …) }` 造场景,并且**只有写方**拿了 `ENV_LOCK`;读方
+(`every_read_deny_is_covered_by_a_write_deny` → `RuntimeSettings::load` →
+`load_permission_rules`)根本不知道有这把锁,于是并行跑到那个窗口里就读到了别人的变量。
+
+**判据:给共享可变状态加锁,只锁写方等于没锁。** 而这里真正的修法不是让读方也拿锁——是让它
+不再有共享状态可读:`load_permission_rules(root, env)` 按本 plan 给 `mcp::http_headers_for`
+定的同一形状注入闭包,生产传 `std::env::var(name).ok()`,测试传内存闭包。`ENV_LOCK` 随之删除,
+全仓 `set_var`/`remove_var` 归零。
+
+验证:连跑 5 次 `cargo test -p kloop --bin kloop` 全绿;`cargo test --workspace` 1597 passed。
+提交见 git log。

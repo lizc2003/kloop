@@ -95,7 +95,7 @@ impl RuntimeSettings {
         let config_path = config.path().to_path_buf();
         let (shell_programs, shell_warnings) =
             kloop_core::shell_programs::resolve_shell_programs(load_shell_overrides(table)?)?;
-        let permission_rules = load_permission_rules(table)?;
+        let permission_rules = load_permission_rules(table, &|name| std::env::var(name).ok())?;
         let global_permissions = Arc::new(GlobalPermissionPolicy::new(
             &permission_rules.deny,
             &permission_rules.ask,
@@ -280,18 +280,22 @@ fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
     Ok(rules)
 }
 
-fn load_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
+/// `env` is injected rather than read from the process: the environment is
+/// global mutable state, so a test that sets a variable to exercise one branch
+/// races every other test reading the same variable in the same process (this
+/// one did, intermittently). Same shape as `mcp::http_headers_for`.
+fn load_permission_rules(
+    root: &toml::Table,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<PermissionRules> {
     let mut rules = parse_permission_rules(root)?;
-    if std::env::var("KLOOP_ALLOW")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
+    if env("KLOOP_ALLOW").is_some_and(|value| !value.trim().is_empty()) {
         bail!(
             "KLOOP_ALLOW is no longer supported; remove it and approve rules separately in each project"
         );
     }
     let append_env = |name: &str, out: &mut Vec<String>| {
-        if let Ok(raw) = std::env::var(name) {
+        if let Some(raw) = env(name) {
             out.extend(
                 raw.split(',')
                     .map(str::trim)
@@ -1119,8 +1123,6 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
 mod tests {
     use super::*;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn config(raw: &str) -> toml::Table {
         raw.parse().unwrap()
     }
@@ -1810,10 +1812,10 @@ http_headers = { Authorization = "SENTINEL-MCP" }
 
     #[test]
     fn nonempty_legacy_allow_environment_is_rejected_without_echoing_it() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("KLOOP_ALLOW", "bash(secret-command *)") };
-        let error = load_permission_rules(&toml::Table::new()).expect_err("accepted KLOOP_ALLOW");
-        unsafe { std::env::remove_var("KLOOP_ALLOW") };
+        let error = load_permission_rules(&toml::Table::new(), &|name| {
+            (name == "KLOOP_ALLOW").then(|| "bash(secret-command *)".to_string())
+        })
+        .expect_err("accepted KLOOP_ALLOW");
         assert!(
             error
                 .to_string()
