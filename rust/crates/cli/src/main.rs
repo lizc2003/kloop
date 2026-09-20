@@ -117,7 +117,7 @@ impl ProcessState {
         }
         // MCP servers connect once per process (before any UI owns the terminal)
         // and are shared into every Config — including all server-mode threads.
-        // --mock stays hermetic: no child processes or web-key reads.
+        // --mock stays hermetic: no child processes, no network-backed tools.
         let (tool_sources, mcp_statuses, mcp_lifecycle) = if args.mock {
             (Vec::new(), Vec::new(), mcp::McpLifecycleOwner::default())
         } else {

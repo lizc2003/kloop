@@ -2,9 +2,9 @@
 //! `kloop-web`. Core's `tools::web` module owns the agent-facing contracts;
 //! this layer selects network backends and binds execution without adding a
 //! network dependency to core. web_fetch is always on (except --mock);
-//! web_search needs the selected backend's key and degrades to a warning
-//! without one.
+//! web_search needs `[web].api_key` and degrades to a warning without it.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,17 +25,37 @@ use kloop_web::SearchBackend;
 use kloop_web::Tavily;
 use kloop_web::WebTools;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WebConfig {
     /// Which SearchBackend to construct: "tavily" (default; free tier needs
     /// no card) or "brave".
     pub search_provider: String,
+    /// The selected backend's key, and `[web].api_key` in the global config
+    /// is the only place it can come from. No environment variable: every
+    /// other credential kloop uses is written in that one 0600 file, and a
+    /// key that only an exported variable can carry works for whoever already
+    /// knows the variable's name and silently degrades to fetch-only for
+    /// everyone else — including the user who configured the provider right
+    /// there in the file.
+    pub api_key: Option<String>,
+}
+
+/// Renders the key as `<redacted>`: this struct holds a credential, and both
+/// assertions and any future logging reach for `{:?}`.
+impl fmt::Debug for WebConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebConfig")
+            .field("search_provider", &self.search_provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         WebConfig {
             search_provider: "tavily".into(),
+            api_key: None,
         }
     }
 }
@@ -56,7 +76,14 @@ pub fn load_web_config(root: &toml::Table) -> Result<WebConfig> {
                     .context("[web].search_provider must be a string")?
                     .to_string();
             }
-            other => bail!("[web] has unknown key '{other}' (search_provider)"),
+            "api_key" => {
+                let key = val.as_str().context("[web].api_key must be a string")?;
+                if key.is_empty() {
+                    bail!("[web].api_key must not be empty");
+                }
+                cfg.api_key = Some(key.to_string());
+            }
+            other => bail!("[web] has unknown key '{other}' (search_provider, api_key)"),
         }
     }
     Ok(cfg)
@@ -66,40 +93,43 @@ pub fn load_web_config(root: &toml::Table) -> Result<WebConfig> {
 /// fetch-only with a warning (missing key, unknown provider) — web tools
 /// never block startup.
 pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn ToolSource>> {
-    let backend = |key: String| -> Option<Box<dyn SearchBackend>> {
-        match cfg.search_provider.as_str() {
-            "tavily" => Some(Box::new(Tavily::new(key))),
-            "brave" => Some(Box::new(Brave::new(key))),
-            _ => None,
-        }
-    };
-    let key_env = match cfg.search_provider.as_str() {
-        "tavily" => Some("TAVILY_API_KEY"),
-        "brave" => Some("BRAVE_API_KEY"),
-        _ => None,
-    };
-    let search: Option<Box<dyn SearchBackend>> = match key_env {
-        None => {
+    // An unknown provider is reported ahead of a missing key: the name is the
+    // more basic mistake, and naming the key to add would send the user off to
+    // buy one for a backend kloop cannot build.
+    let search: Option<Box<dyn SearchBackend>> = match cfg.search_provider.as_str() {
+        "tavily" => keyed(cfg, warn, |key| Box::new(Tavily::new(key))),
+        "brave" => keyed(cfg, warn, |key| Box::new(Brave::new(key))),
+        other => {
             warn(&format!(
-                "web_search disabled: unknown [web].search_provider '{}' (supported: tavily, brave)",
-                cfg.search_provider
+                "web_search disabled: unknown [web].search_provider '{other}' \
+                 (supported: tavily, brave)"
             ));
             None
         }
-        Some(env) => match std::env::var(env) {
-            Ok(key) if !key.is_empty() => backend(key),
-            _ => {
-                warn(&format!(
-                    "web_search disabled: {env} not set (web_fetch still available)"
-                ));
-                None
-            }
-        },
     };
     match WebTools::new(search) {
         Ok(tools) => Some(web_source(tools)),
         Err(e) => {
             warn(&format!("web tools unavailable, skipped: {e:#}"));
+            None
+        }
+    }
+}
+
+/// A known provider still needs its key, and `[web].api_key` is the one place
+/// that carries it.
+fn keyed(
+    cfg: &WebConfig,
+    warn: &dyn Fn(&str),
+    build: impl FnOnce(String) -> Box<dyn SearchBackend>,
+) -> Option<Box<dyn SearchBackend>> {
+    match &cfg.api_key {
+        Some(key) => Some(build(key.clone())),
+        None => {
+            warn(
+                "web_search disabled: no [web].api_key in ~/.kloop/config.toml \
+                 (web_fetch still available)",
+            );
             None
         }
     }
@@ -161,12 +191,40 @@ mod tests {
         let root = config("[permissions]\nallow = []\n");
         assert_eq!(load_web_config(&root).unwrap(), WebConfig::default());
 
-        let root = config("[web]\nsearch_provider = \"brave\"\n");
+        let root = config("[web]\nsearch_provider = \"brave\"\napi_key = \"bsk\"\n");
         assert_eq!(
             load_web_config(&root).unwrap(),
             WebConfig {
-                search_provider: "brave".into()
+                search_provider: "brave".into(),
+                api_key: Some("bsk".into()),
             }
+        );
+
+        // The key alone is a complete config: the provider keeps its default.
+        let root = config("[web]\napi_key = \"tvly-x\"\n");
+        assert_eq!(
+            load_web_config(&root).unwrap(),
+            WebConfig {
+                search_provider: "tavily".into(),
+                api_key: Some("tvly-x".into()),
+            }
+        );
+    }
+
+    /// The struct carries a credential, so the derived Debug had to go.
+    #[test]
+    fn debug_never_prints_the_key() {
+        let cfg = WebConfig {
+            search_provider: "tavily".into(),
+            api_key: Some("tvly-secret".into()),
+        };
+        assert_eq!(
+            format!("{cfg:?}"),
+            "WebConfig { search_provider: \"tavily\", api_key: Some(\"<redacted>\") }"
+        );
+        assert_eq!(
+            format!("{:?}", WebConfig::default()),
+            "WebConfig { search_provider: \"tavily\", api_key: None }"
         );
     }
 
@@ -175,30 +233,74 @@ mod tests {
         for (tag, bad) in [
             ("unknown", "[web]\nprovider = \"brave\"\n"),
             ("badtype", "[web]\nsearch_provider = 3\n"),
+            ("keytype", "[web]\napi_key = 3\n"),
+            // Written-but-empty is a typo, not a request for fetch-only —
+            // same call as providers.x.auth_header makes.
+            ("keyempty", "[web]\napi_key = \"\"\n"),
             ("section", "web = 3\n"),
         ] {
             let root = config(bad);
             assert!(load_web_config(&root).is_err(), "{tag} should fail");
         }
+
+        // A key misspelled into an unknown one must not echo the secret.
+        let root = config("[web]\napi_keys = \"tvly-sentinel\"\n");
+        let error = load_web_config(&root).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "[web] has unknown key 'api_keys' (search_provider, api_key)"
+        );
     }
 
+    /// Registration is a pure function of the config now that no environment
+    /// variable takes part, so all three outcomes are assertable here.
     #[test]
-    fn build_web_source_degrades_search_by_provider() {
-        // Unknown provider: fetch-only source plus a warning.
-        let warnings = std::sync::Mutex::new(Vec::<String>::new());
-        let warn = |s: &str| warnings.lock().unwrap().push(s.to_string());
-        let cfg = WebConfig {
-            search_provider: "duckduckgo".into(),
+    fn build_web_source_registers_search_only_with_a_known_provider_and_a_key() {
+        let build = |cfg: WebConfig| {
+            let warnings = std::sync::Mutex::new(Vec::<String>::new());
+            let names = {
+                let warn = |s: &str| warnings.lock().unwrap().push(s.to_string());
+                let source = build_web_source(&cfg, &warn).expect("web source");
+                assert!(source.is_readonly("web_fetch"));
+                source
+                    .defs()
+                    .iter()
+                    .map(|def| def.name.clone())
+                    .collect::<Vec<String>>()
+            };
+            (names, warnings.into_inner().unwrap())
         };
-        let source = build_web_source(&cfg, &warn).expect("fetch-only source");
-        let names: Vec<String> = source.defs().iter().map(|def| def.name.clone()).collect();
-        assert_eq!(names, vec!["web_fetch".to_string()]);
-        assert!(source.is_readonly("web_fetch"));
-        let warnings = warnings.into_inner().unwrap();
-        assert_eq!(warnings.len(), 1);
-        assert!(
-            warnings[0].contains("unknown [web].search_provider"),
-            "{warnings:?}"
+
+        let (names, warnings) = build(WebConfig {
+            search_provider: "tavily".into(),
+            api_key: Some("tvly-k".into()),
+        });
+        assert_eq!(names, ["web_fetch", "web_search"]);
+        assert_eq!(warnings, [] as [String; 0]);
+
+        let (names, warnings) = build(WebConfig::default());
+        assert_eq!(names, ["web_fetch"]);
+        assert_eq!(
+            warnings,
+            [
+                "web_search disabled: no [web].api_key in ~/.kloop/config.toml \
+              (web_fetch still available)"
+            ]
+        );
+
+        // The provider name is the more basic mistake: it is reported even
+        // when the key is missing too.
+        let (names, warnings) = build(WebConfig {
+            search_provider: "duckduckgo".into(),
+            api_key: None,
+        });
+        assert_eq!(names, ["web_fetch"]);
+        assert_eq!(
+            warnings,
+            [
+                "web_search disabled: unknown [web].search_provider 'duckduckgo' \
+              (supported: tavily, brave)"
+            ]
         );
     }
 

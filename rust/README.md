@@ -1971,13 +1971,17 @@ network-free, reqwest lives only in provider and web):
   same 2.1 MB on every retry.
 - **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
   at least two characters; allow/block lists are mutually exclusive) —
-  pluggable `SearchBackend` trait with Tavily (default, `TAVILY_API_KEY`) and
-  Brave (`BRAVE_API_KEY`). The backend result count is an internal fixed bound,
-  result URLs must be HTTP(S), domain matching uses exact-host/subdomain
-  boundaries, provider JSON responses are capped at 5 MiB, and formatted model
-  output is capped at 50k characters. Without the selected backend's key the
-  tool is not registered and startup warns. `[web] search_provider` in global
-  `~/.kloop/config.toml` selects the backend.
+  pluggable `SearchBackend` trait with Tavily (default) and Brave. The backend
+  result count is an internal fixed bound, result URLs must be HTTP(S), domain
+  matching uses exact-host/subdomain boundaries, provider JSON responses are
+  capped at 5 MiB, and formatted model output is capped at 50k characters.
+  `[web]` in the global `~/.kloop/config.toml` holds both halves —
+  `search_provider` selects the backend, `api_key` carries its key — and is the
+  only source: no environment variable is read, because every other credential
+  kloop uses is already written in that one 0600 file, and a key that only an
+  exported variable can carry works for whoever knows the variable's name and
+  silently degrades for everyone else. Without a usable key the tool is not
+  registered and startup warns, leaving web_fetch available.
 
 Both are read-only for concurrency; the permission gate treats them like any
 external tool (ask by default, with ordinary durable grants scoped to the
