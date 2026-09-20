@@ -151,3 +151,26 @@ README 里 `KLOOP_CACHE` / `KLOOP_THINKING` 那半句是过时的——`provider
   `cargo test --workspace`(1595 passed)全绿;`cargo run -p kloop -- --mock --headless` 跑通。
   **真实网关未验**——opus-4-8 由"不思考"变成 adaptive 的实际差异要花用户额度,单独确认。
 - 提交:`0e5de72`。
+
+### 追加 — `config/config-demo.toml`(同日)
+
+> 用户:"写一个三种 wire_api 的示例配置吧" → "放到项目的 config 目录下,名字叫
+> config-demo.toml,不要写敏感信息,用来给其他人参考的"。
+
+仓库新增 `config/` 目录与 `config-demo.toml`:三条 rail 各一个 profile
+(`k-claude`/`k-gpt`/`k-chat`)+ 四个 `[models.x]`,把本 plan 与 plan 167 定下的 schema 写成
+可抄的形状。**主机名一律 `gateway.example.com`、凭证一律 `REPLACE-ME`**,不含任何真实端点或
+密钥(用户明确要求)。
+
+验收方式值得记:不是读一遍,是**把它当真配置跑**——拷进一个隔离的临时 HOME(0700/0600),
+三条 rail 各起一次 headless。三次都走完解析、路由、拼 URL,最后停在占位主机的 DNS 失败:
+
+```
+anthropic       request to https://gateway.example.com/v1/messages failed
+openai-responses request to https://gateway.example.com/v1/responses failed
+openai-compat   request to https://gateway.example.com/v1/chat/completions failed
+```
+
+三条 URL 同时印证了注释里写的拼接规则(messages 的 base 不带 `/v1`,另两条带)。
+注释里"`prompt_cache`/`thinking` 只在 messages 合法,写 `false` 也报错"这句也单独验了一次
+——示例文档里的断言和代码一样会过期,能跑的验收才算数。
