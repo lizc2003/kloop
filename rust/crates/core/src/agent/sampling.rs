@@ -178,7 +178,7 @@ async fn sample_once(
     let system = &workspace.system;
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
-        provider_attempt.effort(),
+        provider_attempt.reasoning(),
         cfg.cache_key(),
         system,
         messages,

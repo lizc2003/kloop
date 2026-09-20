@@ -16,6 +16,7 @@ use kloop_protocol::Usage;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailureKind;
+use kloop_provider::Reasoning;
 use kloop_provider::StreamResult;
 use kloop_provider::ThinkingMode;
 use serde_json::json;
@@ -77,8 +78,7 @@ fn anthropic(server: &MockServer) -> Provider {
     Provider::Anthropic {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
-        cache: true,
-        thinking: ThinkingMode::Unset,
+        prompt_cache: true,
     }
 }
 
@@ -247,7 +247,7 @@ async fn session_id_rides_the_gateway_header_without_touching_the_body() {
         let attempt = provider.attempt_identity("test", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
-            None,
+            Reasoning::new(None, ThinkingMode::Unset),
             session,
             "be brief",
             &[Message::user_text("hi")],
@@ -281,8 +281,7 @@ async fn cache_off_sends_plain_request() {
     let provider = Arc::new(Provider::Anthropic {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
-        cache: false,
-        thinking: ThinkingMode::Unset,
+        prompt_cache: false,
     });
     let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
     while rx.recv().await.is_some() {}
@@ -583,8 +582,7 @@ async fn thinking_replay_and_request_modes() {
     let provider = Arc::new(Provider::Anthropic {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
-        cache: true,
-        thinking: ThinkingMode::Budget(2048),
+        prompt_cache: true,
     });
     // Contrived: a trailing assistant message ending in thinking, to pin the
     // breakpoint-skips-thinking rule.
@@ -602,7 +600,15 @@ async fn thinking_replay_and_request_modes() {
             provider.response_provenance("test-model"),
         ),
     ];
-    let mut rx = provider.stream("test-model", "s", &messages, &[]);
+    let attempt = provider.attempt_identity("test", 1, "test-model");
+    let mut rx = provider.stream_attempt(
+        &attempt,
+        Reasoning::new(Some(ReasoningEffort::High), ThinkingMode::Budget(2048)),
+        /*cache_key*/ None,
+        "s",
+        &messages,
+        &[],
+    );
     while rx.recv().await.is_some() {}
 
     let requests = server.received_requests().await.unwrap();
@@ -610,6 +616,11 @@ async fn thinking_replay_and_request_modes() {
     assert_eq!(
         body["thinking"],
         json!({"type": "enabled", "budget_tokens": 2048})
+    );
+    assert_eq!(
+        body.get("output_config"),
+        None,
+        "a budget-dialect model reads no effort field; sending one is an error there"
     );
     assert_eq!(body["max_tokens"], json!(8192 + 2048));
     assert_eq!(
@@ -640,10 +651,17 @@ async fn thinking_mode_field_shapes() {
         let provider = Arc::new(Provider::Anthropic {
             cred: Credential::api_key("test-key"),
             base: server.uri(),
-            cache: true,
-            thinking: mode,
+            prompt_cache: true,
         });
-        let mut rx = provider.stream("test-model", "s", &[Message::user_text("hi")], &[]);
+        let attempt = provider.attempt_identity("test", 1, "test-model");
+        let mut rx = provider.stream_attempt(
+            &attempt,
+            Reasoning::new(None, mode),
+            /*cache_key*/ None,
+            "s",
+            &[Message::user_text("hi")],
+            &[],
+        );
         while rx.recv().await.is_some() {}
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -820,25 +838,37 @@ async fn message_stop_does_not_close_an_unfinished_block() {
 }
 
 /// The session effort renders into `output_config` on this rail (its own
-/// spelling — `reasoning`/`reasoning_effort` belong to the OpenAI rails), and
-/// no effort sends no field, leaving the provider's own default in force.
+/// spelling — `reasoning`/`reasoning_effort` belong to the OpenAI rails).
 ///
-/// `none` is the exception: "do no reasoning" is this rail's `thinking`
-/// parameter, not an effort value, so it disables thinking and sends no
-/// `output_config` at all.
+/// Two levels never reach that field. `none` is not an effort value here at
+/// all — "do no reasoning" is the `thinking` parameter, so the route resolves
+/// it to a disabled mode and no `output_config` goes out. And a budget-dialect
+/// model has already taken the whole of the effort as a token count, so sending
+/// one would be an error on exactly the models that read budgets.
+///
+/// The mode itself arrives resolved: picking it from the model and the session
+/// effort is the route's job (`ThinkingRouting`), not the renderer's.
 #[tokio::test]
-async fn effort_maps_to_output_config_except_none_which_disables_thinking() {
-    for (effort, output_config, thinking) in [
-        (None, None, None),
+async fn effort_and_thinking_render_as_one_knob() {
+    for (effort, mode, output_config, thinking) in [
+        (None, ThinkingMode::Unset, None, None),
         (
             Some(ReasoningEffort::XHigh),
+            ThinkingMode::Adaptive,
             Some(json!({"effort": "xhigh"})),
-            None,
+            Some(json!({"type": "adaptive"})),
         ),
         (
             Some(ReasoningEffort::None),
+            ThinkingMode::Off,
             None,
             Some(json!({"type": "disabled"})),
+        ),
+        (
+            Some(ReasoningEffort::Medium),
+            ThinkingMode::Budget(8192),
+            None,
+            Some(json!({"type": "enabled", "budget_tokens": 8192})),
         ),
     ] {
         let server = MockServer::start().await;
@@ -847,8 +877,8 @@ async fn effort_maps_to_output_config_except_none_which_disables_thinking() {
         let attempt = provider.attempt_identity("anthropic", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
-            effort,
-            None,
+            Reasoning::new(effort, mode),
+            /*cache_key*/ None,
             "s",
             &[Message::user_text("hi")],
             &[],
@@ -865,22 +895,22 @@ async fn effort_maps_to_output_config_except_none_which_disables_thinking() {
     }
 }
 
-/// `/effort none` outranks a profile's own `thinking` setting — it is the later,
-/// session-level instruction, and the two would otherwise contradict.
+/// A disabled mode sends the disabled field and nothing else — no `output_config`
+/// rides along to contradict it. (Which efforts resolve to this mode is the
+/// route's business; see `ThinkingRouting` in core.)
 #[tokio::test]
-async fn effort_none_overrides_a_configured_thinking_mode() {
+async fn a_disabled_mode_sends_no_effort_alongside_it() {
     let server = MockServer::start().await;
     mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
     let provider = Arc::new(Provider::Anthropic {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
-        cache: false,
-        thinking: ThinkingMode::Adaptive,
+        prompt_cache: false,
     });
     let attempt = provider.attempt_identity("anthropic", 1, "test-model");
     let mut rx = provider.stream_attempt(
         &attempt,
-        Some(ReasoningEffort::None),
+        Reasoning::new(Some(ReasoningEffort::None), ThinkingMode::Off),
         /*cache_key*/ None,
         "s",
         &[Message::user_text("hi")],
@@ -925,8 +955,7 @@ async fn the_credential_spelling_travels_with_the_credential() {
     let events = collect(Provider::Anthropic {
         cred: Credential::bearer("test-key"),
         base: server.uri(),
-        cache: true,
-        thinking: ThinkingMode::Unset,
+        prompt_cache: true,
     })
     .await;
     assert!(matches!(

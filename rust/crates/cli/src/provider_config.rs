@@ -18,6 +18,7 @@ use kloop_core::provider_route::FrozenProviderRoute;
 use kloop_core::provider_route::ModelKnowledge;
 use kloop_core::provider_route::ProviderCatalog;
 use kloop_core::provider_route::ProviderCatalogEntry;
+use kloop_protocol::ANTHROPIC_MIN_THINKING_BUDGET;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAvailabilityCode;
 use kloop_protocol::ReasoningEffort;
@@ -121,7 +122,11 @@ struct Profile {
     auth: Option<Credential>,
     model: String,
     models: Vec<String>,
-    cache: bool,
+    prompt_cache: bool,
+    /// The profile's own `thinking`, used only for models with no budget
+    /// dialect of their own. Not a second reasoning knob: `effort` decides how
+    /// hard to think, and this only says how "on" is spelled for a gateway that
+    /// needs something other than the default.
     thinking: ThinkingMode,
     effort: Option<ReasoningEffort>,
     /// The model's real context window, when the provider knows it. Only the
@@ -199,8 +204,8 @@ fn resolve_table(
         let api_family = profile.wire.api_family();
         let endpoint_fingerprint = Provider::endpoint_fingerprint_for(api_family, &base);
         let wire = profile.wire;
-        let cache = profile.cache;
-        let thinking = profile.thinking;
+        let prompt_cache = profile.prompt_cache;
+        let default_thinking = profile.thinking;
         let default_effort = selected_effort(&profile, selected, env)?;
         let factory = Arc::new(move || {
             let cred = credential
@@ -210,8 +215,7 @@ fn resolve_table(
                 Rail::Anthropic => Provider::Anthropic {
                     cred,
                     base: base.clone(),
-                    cache,
-                    thinking,
+                    prompt_cache,
                 },
                 Rail::OpenAiChat => Provider::OpenAiCompat {
                     cred,
@@ -232,6 +236,7 @@ fn resolve_table(
             context_window: profile.context_window,
             availability,
             default_effort,
+            default_thinking,
             factory,
         });
     }
@@ -310,8 +315,8 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         auth: Some(Credential::new(wire.default_auth(), key)),
         model: model.clone(),
         models: vec![model],
-        cache: wire == Rail::Anthropic,
-        thinking: ThinkingMode::Unset,
+        prompt_cache: wire == Rail::Anthropic,
+        thinking: default_thinking(wire),
         // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
         // provider — which, here, is the only one.
         effort: None,
@@ -434,7 +439,10 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
             .as_table()
             .with_context(|| format!("models.{id} must be a table"))?;
         for key in spec.keys() {
-            if !matches!(key.as_str(), "context_window" | "efforts") {
+            if !matches!(
+                key.as_str(),
+                "context_window" | "efforts" | "thinking_budget"
+            ) {
                 bail!("models.{id} has unknown key '{key}'");
             }
         }
@@ -443,15 +451,73 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
             "context_window",
             &format!("models.{id}.context_window"),
         )?;
+        let thinking_budgets = parse_thinking_budget(spec, &id)?;
+        if thinking_budgets.is_some() && spec.contains_key("efforts") {
+            bail!(
+                "models.{id} declares both efforts and thinking_budget; \
+                 the budget table's keys are the accepted efforts"
+            );
+        }
+        // The keys of a budget table are that model's accepted levels, so the
+        // existing effort gate needs no second source to consult — and a model
+        // that takes no effort field at all finally has a way to say so.
+        let efforts = match &thinking_budgets {
+            Some(budgets) => Some(budgets.keys().copied().collect()),
+            None => parse_efforts(spec, &id)?,
+        };
         knowledge.insert(
             id.clone(),
             ModelKnowledge {
                 context_window,
-                efforts: parse_efforts(spec, &id)?,
+                efforts,
+                thinking_budgets,
             },
         );
     }
     Ok(knowledge)
+}
+
+/// The budget dialect: models whose only reasoning dial is `budget_tokens`
+/// (Haiku 4.5 and older — `output_config.effort` is an error on exactly those).
+/// One budget per effort level keeps `/effort` the single knob; kloop renders it
+/// into whichever field the model actually reads.
+///
+/// The API floor is 1024, and the ceiling takes care of itself: a budget raises
+/// `max_tokens` by its own size, so it can never exceed it.
+fn parse_thinking_budget(
+    spec: &toml::Table,
+    id: &str,
+) -> Result<Option<BTreeMap<ReasoningEffort, u64>>> {
+    let Some(value) = spec.get("thinking_budget") else {
+        return Ok(None);
+    };
+    let field = format!("models.{id}.thinking_budget");
+    let table = value
+        .as_table()
+        .with_context(|| format!("{field} must be a table of effort = token budget"))?;
+    let mut budgets = BTreeMap::new();
+    for (level, budget) in table {
+        let effort = level
+            .parse::<ReasoningEffort>()
+            .map_err(|e| anyhow!("{field}: {e}"))?;
+        // `none` is "do no reasoning", which is a disabled thinking field on
+        // every model — a budget for it would be a contradiction.
+        if effort == ReasoningEffort::None {
+            bail!("{field} must not give 'none' a budget (it means no reasoning at all)");
+        }
+        let budget = budget
+            .as_integer()
+            .and_then(|raw| u64::try_from(raw).ok())
+            .with_context(|| format!("{field}.{level} must be a token count"))?;
+        if budget < ANTHROPIC_MIN_THINKING_BUDGET {
+            bail!("{field}.{level} must be at least {ANTHROPIC_MIN_THINKING_BUDGET} tokens");
+        }
+        budgets.insert(effort, budget);
+    }
+    if budgets.is_empty() {
+        bail!("{field} must name at least one effort level");
+    }
+    Ok(Some(budgets))
 }
 
 /// `None` is "not declared" and means every level is allowed. An empty array is
@@ -495,7 +561,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "auth_header"
                 | "model"
                 | "models"
-                | "cache"
+                | "prompt_cache"
                 | "thinking"
                 | "effort"
                 | "context_window"
@@ -521,8 +587,12 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     let base_url = optional_string(spec, "base_url", &format!("providers.{id}.base_url"))?
         .unwrap_or_else(|| wire.default_base().to_string());
     let base_url = validate_base_url(&base_url, &format!("providers.{id}.base_url"))?;
-    let cache = optional_bool(spec, "cache", &format!("providers.{id}.cache"))?
-        .unwrap_or(wire == Rail::Anthropic);
+    let prompt_cache = optional_bool(
+        spec,
+        "prompt_cache",
+        &format!("providers.{id}.prompt_cache"),
+    )?
+    .unwrap_or(wire == Rail::Anthropic);
     let effort = optional_string(spec, "effort", &format!("providers.{id}.effort"))?
         .map(|raw| {
             raw.parse::<ReasoningEffort>()
@@ -530,17 +600,18 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         })
         .transpose()?;
     let thinking = match spec.get("thinking") {
-        None => ThinkingMode::Unset,
+        None => default_thinking(wire),
         Some(Value::String(raw)) => {
             parse_thinking_string(raw, &format!("providers.{id}.thinking"))?
         }
-        Some(Value::Integer(raw)) if *raw > 0 => ThinkingMode::Budget(*raw as u64),
         Some(_) => {
-            bail!("providers.{id}.thinking must be 'off', 'adaptive', or a positive integer")
+            bail!("providers.{id}.thinking must be 'unset', 'off', or 'adaptive'")
         }
     };
-    if wire != Rail::Anthropic && (spec.contains_key("cache") || spec.contains_key("thinking")) {
-        bail!("providers.{id}: cache/thinking are only valid for messages wire_api");
+    if wire != Rail::Anthropic
+        && (spec.contains_key("prompt_cache") || spec.contains_key("thinking"))
+    {
+        bail!("providers.{id}: prompt_cache/thinking are only valid for messages wire_api");
     }
     let context_window = optional_integer(
         spec,
@@ -554,7 +625,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         auth,
         model,
         models,
-        cache,
+        prompt_cache,
         thinking,
         effort,
         context_window,
@@ -718,16 +789,29 @@ fn nonempty_env(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<Opti
     env(name).map(|value| nonempty(&value, name)).transpose()
 }
 
+/// Reasoning depth is `effort`'s job, so this is not a second dial — it only
+/// says how "think" is spelled for a gateway that needs something other than
+/// the Messages default. A token budget is no longer a value here: it belongs
+/// to the model that reads budgets rather than efforts, in
+/// `[models."<id>"].thinking_budget`.
 fn parse_thinking_string(raw: &str, field: &str) -> Result<ThinkingMode> {
     match raw {
+        "unset" => Ok(ThinkingMode::Unset),
         "off" => Ok(ThinkingMode::Off),
         "adaptive" => Ok(ThinkingMode::Adaptive),
-        value => value
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .map(ThinkingMode::Budget)
-            .with_context(|| format!("{field} must be off | adaptive | a positive token budget")),
+        _ => bail!("{field} must be unset | off | adaptive"),
+    }
+}
+
+/// Thinking is on by default on the Messages rail. Omitting the field is not
+/// the same as leaving the model's own default in place: Opus 4.8/4.7/4.6 and
+/// Sonnet 4.6 read a missing `thinking` as "do not think at all", so a profile
+/// that says nothing would silently run them without reasoning while still
+/// paying for a configured effort. The other rails have no such field.
+fn default_thinking(wire: Rail) -> ThinkingMode {
+    match wire {
+        Rail::Anthropic => ThinkingMode::Adaptive,
+        Rail::OpenAiChat | Rail::OpenAiResponses => ThinkingMode::Unset,
     }
 }
 
@@ -757,7 +841,7 @@ base_url = "https://anthropic-a.example"
 auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a", "claude-b", "claude-a"]
-cache = false
+prompt_cache = false
 thinking = "adaptive"
 
 [providers.responses-b]
@@ -1025,7 +1109,7 @@ auth_header = { Authorization = "Bearer key" }
             auth,
             model: "m".into(),
             models: vec!["m".into()],
-            cache: false,
+            prompt_cache: false,
             thinking: ThinkingMode::Unset,
             effort: None,
             context_window: None,
@@ -1054,6 +1138,114 @@ auth_header = { Authorization = "Bearer key" }
         assert_eq!(
             from_env(&chat, /*selected=*/ true, "OPENAI_API_KEY"),
             Some(Credential::bearer("env-key"))
+        );
+    }
+
+    fn knowledge(raw: &str) -> Result<BTreeMap<String, ModelKnowledge>> {
+        parse_model_knowledge(&raw.parse::<toml::Table>().unwrap())
+    }
+
+    /// Effort is the only reasoning knob the user turns. Models whose sole dial
+    /// is a token budget declare one per level, and those keys *are* the levels
+    /// they accept — which is how "this model reads no effort field at all"
+    /// finally becomes expressible (an empty `efforts` array is refused).
+    #[test]
+    fn a_budget_table_declares_both_the_budgets_and_the_accepted_efforts() {
+        let parsed = knowledge(
+            "[models.\"claude-haiku-4-5\"]\n\
+             thinking_budget = { low = 2048, high = 16384 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            BTreeMap::from([(
+                "claude-haiku-4-5".to_string(),
+                ModelKnowledge {
+                    context_window: None,
+                    efforts: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
+                    thinking_budgets: Some(BTreeMap::from([
+                        (ReasoningEffort::Low, 2048),
+                        (ReasoningEffort::High, 16384),
+                    ])),
+                },
+            )])
+        );
+    }
+
+    #[test]
+    fn a_budget_table_fails_closed_on_contradictions_and_unusable_budgets() {
+        let refused = |raw: &str| knowledge(raw).map(|_| ()).unwrap_err().to_string();
+        let model = |body: &str| format!("[models.\"m\"]\n{body}\n");
+
+        assert_eq!(
+            refused(&model(
+                "thinking_budget = { low = 2048 }\nefforts = [\"low\"]"
+            )),
+            "models.m declares both efforts and thinking_budget; \
+             the budget table's keys are the accepted efforts"
+        );
+        assert_eq!(
+            refused(&model("thinking_budget = { low = 512 }")),
+            "models.m.thinking_budget.low must be at least 1024 tokens"
+        );
+        assert_eq!(
+            refused(&model("thinking_budget = { none = 2048 }")),
+            "models.m.thinking_budget must not give 'none' a budget \
+             (it means no reasoning at all)"
+        );
+        assert_eq!(
+            refused(&model("thinking_budget = {}")),
+            "models.m.thinking_budget must name at least one effort level"
+        );
+        assert!(refused(&model("thinking_budget = { hgih = 2048 }")).contains("thinking_budget"));
+    }
+
+    /// Thinking is on by default on this rail. Omitting the field is not neutral
+    /// — Opus 4.8/4.7/4.6 and Sonnet 4.6 read a missing `thinking` as "do not
+    /// think", so a silent default would run them with no reasoning while still
+    /// paying for a configured effort. `unset` is the way back out for a gateway
+    /// that cannot take the field, and a token budget is no longer spellable
+    /// here: it belongs to the model that reads budgets instead of efforts.
+    #[test]
+    fn the_messages_rail_thinks_unless_told_otherwise() {
+        let profile = |line: &str| {
+            let raw = format!(
+                "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
+                 auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
+            );
+            raw.parse::<toml::Table>()
+                .unwrap()
+                .get("providers")
+                .and_then(Value::as_table)
+                .and_then(|providers| providers.get("x"))
+                .and_then(Value::as_table)
+                .map(|spec| parse_profile("x", spec))
+                .unwrap()
+        };
+
+        assert_eq!(profile("").unwrap().thinking, ThinkingMode::Adaptive);
+        assert_eq!(
+            profile("thinking = \"unset\"").unwrap().thinking,
+            ThinkingMode::Unset
+        );
+        assert_eq!(
+            profile("thinking = \"off\"").unwrap().thinking,
+            ThinkingMode::Off
+        );
+        assert_eq!(
+            profile("thinking = 2048")
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "providers.x.thinking must be 'unset', 'off', or 'adaptive'"
+        );
+        // The other rails have no such field, and no default to pick either.
+        let chat = "provider = \"x\"\n[providers.x]\nwire_api = \"chat\"\n\
+             auth_header = { Authorization = \"Bearer k\" }\nmodel = \"m\"\n";
+        let resolved = resolve(Some(chat), &env(&[])).unwrap();
+        assert_eq!(
+            resolved.catalog().descriptors()[0].api_family,
+            ProviderApiFamily::OpenAiChatCompletions
         );
     }
 

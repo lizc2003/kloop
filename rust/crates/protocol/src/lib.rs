@@ -447,7 +447,10 @@ impl ProviderApiFamily {
 /// Absent (`None` at the call site) means kloop sends no field at all and the
 /// provider's default stands — a different thing from [`ReasoningEffort::None`],
 /// which explicitly asks the model for no reasoning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Declaration order is the semantic order (least to most reasoning) and the
+/// derived `Ord` depends on it — keep new levels in their right place rather
+/// than appending them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     /// `effort: "none"` — the model does no reasoning. Distinct from sending no
@@ -852,6 +855,11 @@ impl Message {
 /// top of it rather than taken out of it (see the Anthropic request body), so
 /// reasoning can never consume the room the answer needs.
 pub const ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 8_192;
+
+/// The smallest thinking budget the Messages API accepts. Below it the request
+/// is refused, so a configured budget is checked at startup rather than on the
+/// first turn.
+pub const ANTHROPIC_MIN_THINKING_BUDGET: u64 = 1_024;
 
 /// Output cap for one Responses or Chat Completions call. Deliberately four
 /// times the Anthropic one: on these rails reasoning tokens come out of the

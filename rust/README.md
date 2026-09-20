@@ -3318,6 +3318,9 @@ cargo run -- --mock
 #   context_window = 400000
 #   efforts = ["low", "high", "xhigh", "max"]
 #
+#   [models."claude-haiku-4-5"]         # a model whose only dial is a budget
+#   thinking_budget = { low = 2048, high = 16384 }
+#
 # auth_header is one credential written the way the endpoint reads it, not a bag
 # of request headers: kloop sends exactly that spelling and nothing else. The two
 # legal spellings are `x-api-key` and `Authorization: Bearer`, and both are valid
@@ -3347,12 +3350,37 @@ cargo run -- --mock
 # OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
 # selected profile. A key from the environment replaces the secret, never the
 # spelling: a profile that declared auth_header keeps its header, and one that
-# declared none falls back to what the wire's own vendor sends. KLOOP_CACHE and KLOOP_THINKING remain provider-local request
-# settings. KLOOP_EFFORT (or the selected profile's own effort key — the env var
+# declared none falls back to what the wire's own vendor sends.
+# KLOOP_EFFORT (or the selected profile's own effort key — the env var
 # wins, and both are valid on every wire_api)
 # seeds the session reasoning effort that /effort then owns. Only the spelling is checked: which
 # levels a model takes is the model's own contract, stated in its own error.
 # Provider/search keys are stripped from model-controlled shell environments.
+#
+# Reasoning is one knob: `effort` (profile key, KLOOP_EFFORT, or /effort). How it
+# reaches the wire is the model's business, not the user's. Most models take the
+# level on `output_config.effort` and think adaptively; a model that reads a token
+# budget instead declares `thinking_budget` in its `[models."<id>"]` table, one
+# budget per level, and kloop renders the chosen level into that field and sends
+# no effort field at all (those models reject one). A budget table's keys are also
+# that model's accepted levels, so declaring both it and `efforts` is an error, and
+# a model that takes no effort field at all is expressible for the first time.
+# `effort = "none"` means "do no reasoning" everywhere, which on Messages is a
+# disabled thinking field.
+#
+# On the Messages rail kloop sends `thinking: {"type": "adaptive"}` by default.
+# Omitting the field is not neutral: several models read a missing `thinking` as
+# "do not think at all", so a silent default would run them without reasoning
+# while still paying for a configured effort. The profile key `thinking` is the
+# way out for a gateway that cannot take the field — `unset` sends nothing, `off`
+# disables, `adaptive` is the default. It is not a second depth dial, and a token
+# budget is not spellable there: budgets belong to the model that reads them.
+#
+# prompt_cache (Messages only, on by default) marks cache_control breakpoints on
+# the last tool, the system block, and the last message block — tools and system
+# render before messages, so the breakpoints cache the whole stable prefix and the
+# last one moves forward each round. Turn it off only for a gateway that rejects
+# the field; usage reports cache_read/cache_creation so a real hit is visible.
 #
 # Output caps are rail-local and not user config, because the rails disagree
 # about whose budget reasoning comes out of. Anthropic Messages asks for 8,192

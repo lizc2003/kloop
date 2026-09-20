@@ -1354,3 +1354,20 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    响亮的失败要做的不是拦截,是**让它说清楚**:endpoint 是"配置的 base + rail 选的后缀"拼出来的,
    而 404 的 body 不会告诉你路径,所以 URL 必须进错误消息(`send_checked` 的 http/timeout/
    transport 三条)。
+
+164. 来自 Plan 168(reasoning 统一归 effort;`cache` → `prompt_cache`)。**两个用户可见的旋钮
+   管同一件事时,真正的成本不是冗余,是它们必须互相认识——而那条互相认识的规则会悄悄失真。**
+   `thinking` 与 `effort` 的重叠只有一处(`off` ≡ `none`),但为了维持它,`lib.rs` 里长出了
+   "`/effort none` 压过 profile 的 thinking"这条跨旋钮规则;其余档位不管 thinking,于是
+   `thinking = "off"` + `effort = "xhigh"` 这种自相矛盾的组合**配得出来、也发得出去**
+   (在 Opus 5 上是确定的 400),没有任何地方拦。
+   更贵的是另一半:两个旋钮各自看起来都有合理默认,合起来却是错的——profile 不写 `thinking`
+   时 kloop 不发这个字段,而 Opus 4.8/4.7/4.6、Sonnet 4.6 把"没有 thinking 字段"读成
+   **完全不思考**。于是用户的主力模型一直在不思考的状态下跑,同时照付着 `effort = "xhigh"`。
+   **一个静默的默认值,乘以另一个静默的默认值,等于一个没人会去查的错误。**
+   解法是承认它们本就是一个意图的两种线协议表达:`effort` 是唯一的旋钮,`thinking` 降级成
+   渲染结果,由模型的方言决定(`[models.x].thinking_budget`)。同时 `Reasoning` 把两半绑成
+   一个值传递——clippy 的 `too_many_arguments` 这次是对的,参数多出来正是因为设计还没收敛。
+   附带一条查证纪律:**别凭记忆断言第三方 API 的语义。** 这一轮所有模型行为都过了
+   `claude-api` 技能核对,而我第一轮的两处猜测(`adaptive` 是 no-op、`budget` 只给老模型)
+   全错——`adaptive` 对 4.x 是唯一的开关,`budget` 是 Haiku 4.5 今天唯一能用的形态。

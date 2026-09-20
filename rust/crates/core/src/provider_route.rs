@@ -14,6 +14,8 @@ use kloop_protocol::ReasoningContinuity;
 use kloop_protocol::ReasoningEffort;
 use kloop_protocol::RoutePickerStage;
 use kloop_provider::Provider;
+use kloop_provider::Reasoning;
+use kloop_provider::ThinkingMode;
 
 pub type ProviderFactory =
     Arc<dyn Fn() -> Result<Provider, ProviderAvailabilityCode> + Send + Sync + 'static>;
@@ -33,6 +35,10 @@ pub struct ProviderCatalogEntry {
     /// [`SessionProviderState`]; `/effort` then owns the value for the rest of
     /// the session (the provider itself bakes in nothing).
     pub default_effort: Option<ReasoningEffort>,
+    /// What this provider's `thinking` field defaults to when the model has no
+    /// budget dialect of its own. Only the Messages rail reads it; the others
+    /// have no such field.
+    pub default_thinking: ThinkingMode,
     pub factory: ProviderFactory,
 }
 
@@ -41,6 +47,7 @@ struct CatalogEntry {
     endpoint_fingerprint: String,
     context_window: Option<u64>,
     default_effort: Option<ReasoningEffort>,
+    default_thinking: ThinkingMode,
     factory: ProviderFactory,
     provider: OnceLock<Result<Arc<Provider>, ProviderAvailabilityCode>>,
 }
@@ -55,6 +62,14 @@ pub struct ModelKnowledge {
     /// Absent means "not declared", which is not the same as "supports nothing":
     /// an undeclared model accepts every level and lets the provider refuse.
     pub efforts: Option<Vec<ReasoningEffort>>,
+    /// Models whose only reasoning dial is a token budget (Haiku 4.5 and older:
+    /// `output_config.effort` is an error there, and thinking happens only with
+    /// an explicit `budget_tokens`). One budget per effort level, so `/effort`
+    /// stays the single knob and renders into whichever field the model reads.
+    /// Declaring it also declares the accepted levels — its keys are the answer
+    /// [`ProviderCatalog::declared_efforts`] gives, which is how a model that
+    /// takes no effort field at all becomes expressible.
+    pub thinking_budgets: Option<BTreeMap<ReasoningEffort, u64>>,
 }
 
 pub struct ProviderCatalog {
@@ -113,6 +128,7 @@ impl ProviderCatalog {
                         endpoint_fingerprint,
                         context_window: entry.context_window,
                         default_effort: entry.default_effort,
+                        default_thinking: entry.default_thinking,
                         factory: entry.factory,
                         provider: OnceLock::new(),
                     },
@@ -214,6 +230,7 @@ impl ProviderCatalog {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
+            default_thinking: ThinkingMode::default(),
             factory: Arc::new(move || {
                 provider
                     .lock()
@@ -322,6 +339,18 @@ impl ProviderCatalog {
             primary_model: model.to_string(),
             allowed_models: entry.descriptor.models.clone(),
             provider,
+            thinking: ThinkingRouting {
+                default_mode: entry.default_thinking,
+                budgets: entry
+                    .descriptor
+                    .models
+                    .iter()
+                    .filter_map(|model| {
+                        let budgets = self.model_knowledge.get(model)?.thinking_budgets.clone()?;
+                        Some((model.clone(), budgets))
+                    })
+                    .collect(),
+            },
         })
     }
 
@@ -509,6 +538,40 @@ struct ResolvedRoute {
     primary_model: String,
     allowed_models: Vec<String>,
     provider: Arc<Provider>,
+    /// Everything needed to turn (model, effort) into a `thinking` field without
+    /// the catalog in hand: a frozen route outlives the lookup that made it, and
+    /// `child_route` can mint an attempt for any allowed model.
+    thinking: ThinkingRouting,
+}
+
+/// The `thinking` half of the reasoning knob, carried by a resolved route.
+#[derive(Clone, Default)]
+struct ThinkingRouting {
+    /// The provider profile's own setting, for models with no budget dialect.
+    default_mode: ThinkingMode,
+    /// Per-model effort -> token budget, for the models that read no effort
+    /// field. Only the route's allowed models appear.
+    budgets: BTreeMap<String, BTreeMap<ReasoningEffort, u64>>,
+}
+
+impl ThinkingRouting {
+    /// Effort is the only knob the user turns; this is where it lands on the
+    /// wire for one model. `none` means "do not reason" on every model and so
+    /// outranks both the budget table and the profile default.
+    fn resolve(&self, model: &str, effort: Option<ReasoningEffort>) -> ThinkingMode {
+        if effort == Some(ReasoningEffort::None) {
+            return ThinkingMode::Off;
+        }
+        let Some(budgets) = self.budgets.get(model) else {
+            return self.default_mode;
+        };
+        // A budget-dialect model with no effort selected gets no thinking field,
+        // which is exactly that model's own API default.
+        match effort.and_then(|effort| budgets.get(&effort)) {
+            Some(budget) => ThinkingMode::Budget(*budget),
+            None => ThinkingMode::Unset,
+        }
+    }
 }
 
 struct SessionState {
@@ -911,6 +974,7 @@ impl FrozenProviderRoute {
     }
 
     fn attempt(&self, model: String) -> FrozenProviderAttempt {
+        let model_for_thinking = model.clone();
         FrozenProviderAttempt {
             identity: ProviderAttemptIdentity {
                 route_revision: self.revision,
@@ -919,7 +983,12 @@ impl FrozenProviderRoute {
                 endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
                 model,
             },
-            effort: self.effort,
+            reasoning: Reasoning::new(
+                self.effort,
+                self.route
+                    .thinking
+                    .resolve(&model_for_thinking, self.effort),
+            ),
             provider: Arc::clone(&self.route.provider),
         }
     }
@@ -999,7 +1068,11 @@ impl FrozenProviderRoute {
 #[derive(Clone)]
 pub struct FrozenProviderAttempt {
     identity: ProviderAttemptIdentity,
-    effort: Option<ReasoningEffort>,
+    /// The session effort together with what it rendered to for this attempt's
+    /// model. Resolved here rather than inside the provider because only the
+    /// route knows the model's dialect, and only the route is still holding the
+    /// session effort.
+    reasoning: Reasoning,
     provider: Arc<Provider>,
 }
 
@@ -1029,7 +1102,13 @@ impl FrozenProviderAttempt {
     /// [`ProviderAttemptIdentity`]: identity drives provenance and reasoning
     /// replay matching, and a response stays replayable when the effort changes.
     pub fn effort(&self) -> Option<ReasoningEffort> {
-        self.effort
+        self.reasoning.effort
+    }
+
+    /// The whole reasoning setting for this attempt: the chosen effort and the
+    /// `thinking` field it rendered to for this model.
+    pub fn reasoning(&self) -> Reasoning {
+        self.reasoning
     }
 
     pub fn provenance(&self, origin_boundary: u64) -> ProviderResponseProvenance {
@@ -1204,7 +1283,60 @@ mod tests {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
+            default_thinking: kloop_provider::ThinkingMode::Unset,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+        }
+    }
+
+    /// Effort is the only knob the user turns; which field it lands in is the
+    /// model's business. A budget-dialect model turns a level into a token
+    /// count, every other model leaves the level on `output_config` and takes
+    /// the profile's own thinking mode, and `none` means "do not reason" on all
+    /// of them — so it outranks both.
+    #[test]
+    fn effort_renders_into_whichever_reasoning_field_the_model_reads() {
+        let mut entry = mock_entry("p", "budget-model", &["budget-model", "effort-model"]);
+        entry.default_thinking = ThinkingMode::Adaptive;
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![entry])
+                .unwrap()
+                .with_model_knowledge(BTreeMap::from([(
+                    "budget-model".to_string(),
+                    ModelKnowledge {
+                        context_window: None,
+                        efforts: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
+                        thinking_budgets: Some(BTreeMap::from([
+                            (ReasoningEffort::Low, 2048),
+                            (ReasoningEffort::High, 16384),
+                        ])),
+                    },
+                )])),
+        );
+        let thinking = |model: &str, effort: Option<ReasoningEffort>| {
+            let route = catalog.initial_route("p", Some(model)).unwrap();
+            let state = SessionProviderState::from_route(Arc::clone(&catalog), route);
+            state.set_effort(effort);
+            state.freeze().primary_attempt().reasoning().thinking
+        };
+
+        assert_eq!(
+            thinking("budget-model", Some(ReasoningEffort::High)),
+            ThinkingMode::Budget(16384)
+        );
+        // No level selected on a budget model sends no field, which is that
+        // model's own API default — not the profile's adaptive.
+        assert_eq!(thinking("budget-model", None), ThinkingMode::Unset);
+        assert_eq!(
+            thinking("effort-model", Some(ReasoningEffort::High)),
+            ThinkingMode::Adaptive
+        );
+        assert_eq!(thinking("effort-model", None), ThinkingMode::Adaptive);
+        for model in ["budget-model", "effort-model"] {
+            assert_eq!(
+                thinking(model, Some(ReasoningEffort::None)),
+                ThinkingMode::Off,
+                "{model}"
+            );
         }
     }
 

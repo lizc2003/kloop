@@ -176,14 +176,32 @@ impl Credential {
     }
 }
 
+/// One knob, rendered. `effort` is what the user chose; `thinking` is what that
+/// choice became for the model it is being sent to. They travel together because
+/// they are two halves of one setting — a model reads its reasoning depth from
+/// one field or the other, never both — and resolving which is the route's job,
+/// not the renderer's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reasoning {
+    pub effort: Option<ReasoningEffort>,
+    pub thinking: ThinkingMode,
+}
+
+impl Reasoning {
+    pub fn new(effort: Option<ReasoningEffort>, thinking: ThinkingMode) -> Self {
+        Self { effort, thinking }
+    }
+}
+
 pub enum Provider {
     Anthropic {
         cred: Credential,
         base: String,
         /// Prompt caching: mark cache_control breakpoints on the last tool,
-        /// the system block, and the last message block.
-        cache: bool,
-        thinking: ThinkingMode,
+        /// the system block, and the last message block. The `thinking` field
+        /// is deliberately absent — it is resolved per request from the model
+        /// and the session effort, the way `effort` itself already is.
+        prompt_cache: bool,
     },
     OpenAiCompat {
         cred: Credential,
@@ -539,7 +557,12 @@ impl Provider {
     ) -> ProviderStream {
         let attempt = self.attempt_identity("test", 1, model);
         self.stream_attempt(
-            &attempt, None, /*cache_key*/ None, system, messages, tools,
+            &attempt,
+            Reasoning::default(),
+            /*cache_key*/ None,
+            system,
+            messages,
+            tools,
         )
     }
 
@@ -570,7 +593,7 @@ impl Provider {
     pub fn stream_attempt(
         self: &Arc<Self>,
         attempt: &ProviderAttemptIdentity,
-        effort: Option<ReasoningEffort>,
+        reasoning: Reasoning,
         cache_key: Option<&str>,
         system: &str,
         messages: &[Message],
@@ -580,6 +603,7 @@ impl Provider {
             return spawn_stream(move |_sink| async move { Err(error) });
         }
         let model = attempt.model.as_str();
+        let Reasoning { effort, thinking } = reasoning;
         match self.as_ref() {
             Provider::Mock { turns, seen } => {
                 seen.lock().unwrap().push(MockRequest {
@@ -600,31 +624,31 @@ impl Provider {
             Provider::Anthropic {
                 cred,
                 base,
-                cache,
-                thinking,
+                prompt_cache,
             } => {
                 let url = format!("{base}/v1/messages");
                 let cred = cred.clone();
+                let cache = *prompt_cache;
                 let mut body = json!({
                     "model": model,
                     "max_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
-                    "system": anthropic::system_value(system, *cache),
-                    "messages": anthropic::messages_value(messages, *cache),
-                    "tools": anthropic::tools_value(tools, *cache),
+                    "system": anthropic::system_value(system, cache),
+                    "messages": anthropic::messages_value(messages, cache),
+                    "tools": anthropic::tools_value(tools, cache),
                     "stream": true,
                 });
-                // "Do no reasoning" is not an effort value on this rail — it is
-                // the thinking parameter. So `none` disables thinking and sends
-                // no effort field, while every other level rides output_config
-                // and leaves the configured thinking mode alone. An explicit
-                // `/effort none` outranks a profile's `thinking` setting: it is
-                // the later, session-level instruction.
-                let mut thinking = *thinking;
-                match effort {
-                    None => {}
-                    Some(ReasoningEffort::None) => thinking = ThinkingMode::Off,
-                    Some(effort) => {
-                        body["output_config"] = json!({"effort": effort.as_str()});
+                // Effort is the only reasoning knob; `thinking` is what it
+                // rendered to for this model (resolved by the catalog, which is
+                // the only place that knows the model's dialect). A budget-
+                // dialect model takes the whole of it there, so no effort field
+                // goes on the wire — sending one is an error on exactly those
+                // models.
+                match thinking {
+                    ThinkingMode::Budget(_) => {}
+                    _ => {
+                        if let Some(effort) = effort.filter(|e| *e != ReasoningEffort::None) {
+                            body["output_config"] = json!({"effort": effort.as_str()});
+                        }
                     }
                 }
                 match thinking {

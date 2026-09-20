@@ -551,7 +551,7 @@ async fn sample_summary(
 ) -> Result<(String, Option<Usage>)> {
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
-        provider_attempt.effort(),
+        provider_attempt.reasoning(),
         cache_key,
         COMPACT_SYSTEM,
         request,

@@ -6,6 +6,7 @@ use kloop_protocol::Message;
 use kloop_protocol::ProviderApiFamily;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
+use kloop_provider::Reasoning;
 
 fn label(level: Option<kloop_protocol::ReasoningEffort>) -> &'static str {
     level.map_or("(nofield)", kloop_protocol::ReasoningEffort::as_str)
@@ -59,8 +60,7 @@ async fn probe_effort_levels() {
             ProviderApiFamily::AnthropicMessages => Provider::Anthropic {
                 cred: Credential::api_key(key.clone()),
                 base: base.clone(),
-                cache: false,
-                thinking: kloop_provider::ThinkingMode::Unset,
+                prompt_cache: false,
             },
             ProviderApiFamily::OpenAiChatCompletions => Provider::OpenAiCompat {
                 cred: Credential::bearer(key.clone()),
@@ -74,7 +74,7 @@ async fn probe_effort_levels() {
         let attempt = provider.attempt_identity("probe", 1, &model);
         let mut rx = provider.stream_attempt(
             &attempt,
-            level,
+            Reasoning::new(level, kloop_provider::ThinkingMode::Unset),
             /*cache_key*/ None,
             "Reply with OK.",
             &[Message::user_text("hi")],

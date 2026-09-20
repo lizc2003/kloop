@@ -1055,6 +1055,7 @@ mod tests {
                     context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
+                    default_thinking: kloop_provider::ThinkingMode::Unset,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
                 },
             ])
@@ -1067,6 +1068,7 @@ mod tests {
                         kloop_protocol::ReasoningEffort::Low,
                         kloop_protocol::ReasoningEffort::High,
                     ]),
+                    thinking_budgets: None,
                 },
             )])),
         );
@@ -1139,6 +1141,7 @@ mod tests {
                     context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
+                    default_thinking: kloop_provider::ThinkingMode::Unset,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
                 },
             ])
@@ -1239,6 +1242,7 @@ mod tests {
             context_window: None,
             availability: kloop_protocol::ProviderAvailabilityCode::Ready,
             default_effort: None,
+            default_thinking: kloop_provider::ThinkingMode::Unset,
             factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
         };
         Arc::new(
@@ -1255,6 +1259,7 @@ mod tests {
                         kloop_protocol::ReasoningEffort::Low,
                         kloop_protocol::ReasoningEffort::High,
                     ]),
+                    thinking_budgets: None,
                 },
             )])),
         )
@@ -1467,6 +1472,7 @@ mod tests {
                     context_window: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
+                    default_thinking: kloop_provider::ThinkingMode::Unset,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
                 },
             ])

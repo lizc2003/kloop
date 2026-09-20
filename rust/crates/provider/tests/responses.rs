@@ -15,6 +15,7 @@ use kloop_protocol::Usage;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailureKind;
+use kloop_provider::Reasoning;
 use kloop_provider::StreamResult;
 use serde_json::Value;
 use serde_json::json;
@@ -172,7 +173,7 @@ async fn prompt_cache_key_is_sent_when_bound_and_omitted_otherwise() {
         let attempt = provider.attempt_identity("test", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
-            None,
+            Reasoning::new(None, kloop_provider::ThinkingMode::Unset),
             cache_key,
             "s",
             &[Message::user_text("hi")],
@@ -270,7 +271,7 @@ async fn effort_maps_to_reasoning_field() {
         let attempt = provider.attempt_identity("responses", 1, "test-model");
         let mut rx = provider.stream_attempt(
             &attempt,
-            effort,
+            Reasoning::new(effort, kloop_provider::ThinkingMode::Unset),
             None,
             "s",
             &[Message::user_text("hi")],

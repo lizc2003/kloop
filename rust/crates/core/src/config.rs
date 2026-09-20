@@ -868,6 +868,7 @@ mod context_budget_tests {
             context_window: gateway,
             availability: kloop_protocol::ProviderAvailabilityCode::Ready,
             default_effort: None,
+            default_thinking: kloop_provider::ThinkingMode::Unset,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         };
         Arc::new(
@@ -882,6 +883,7 @@ mod context_budget_tests {
                 ModelKnowledge {
                     context_window: Some(400_000),
                     efforts: None,
+                    thinking_budgets: None,
                 },
             )])),
         )
