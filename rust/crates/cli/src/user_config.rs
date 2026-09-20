@@ -179,7 +179,9 @@ max_agents = 3
     /// `config/config-demo.toml` is what a new user copies into place, and
     /// nothing else checks that kloop still accepts what it says. The provider
     /// profiles resolve against the environment and stay out; the top-level
-    /// schema and the `[web]` section are verified here.
+    /// schema and the `[web]` section are verified here — including that the
+    /// demo ships *without* a search key, so copying it as-is degrades to
+    /// fetch-only rather than sending a placeholder at Tavily for a 401.
     #[test]
     fn the_shipped_demo_config_is_one_kloop_accepts() {
         let raw = std::fs::read_to_string(
@@ -191,7 +193,7 @@ max_agents = 3
             crate::web::load_web_config(&table).unwrap(),
             crate::web::WebConfig {
                 search_provider: "tavily".into(),
-                api_key: Some("tvly-REPLACE-ME".into()),
+                api_key: None,
             }
         );
     }

@@ -62,9 +62,10 @@ efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 
 # [web] — which search backend web_search calls, and its key. Both halves live
-# here; no environment variable is read. Leave `api_key` out and web_search is
-# simply not registered (startup says so) — web_fetch needs no key either way.
+# here; no environment variable is read. web_search is registered only once
+# api_key is filled in — until then it stays off (startup says so) and
+# web_fetch, which needs no key, carries on.
 
 [web]
 search_provider = "tavily"                              # or "brave"
-api_key         = "tvly-REPLACE-ME"                     # tavily free tier: no card
+# api_key       = "tvly-..."                            # tavily free tier: no card

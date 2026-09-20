@@ -93,9 +93,15 @@ env 覆盖链看着"兼容",实际效果是把"我的 key 明明写了怎么没�
 用户要求 `config/config-demo.toml` 也带上 `[web]` 段——配置自洽的另一半是**新用户照抄的那份
 文件里能看见它**。加段的同时把文件头"其他段见 README"的清单里的 `web` 去掉。
 
+示例里的 `api_key` **是注释掉的**:填占位符的话,照抄 demo 的人会得到一个注册成功、但每次搜索
+回 401 的 `web_search`——比缺 key 时的静默降级更吵,也更难看出是 key 没换。注释掉则退回
+fetch-only,启动 warning 正好告诉他该填哪一行。(provider 段的 `Bearer REPLACE-ME` 不同:那是
+必填项,不换就根本跑不起来,占位符在那里是提示不是陷阱。)
+
 顺手补了 `user_config.rs::the_shipped_demo_config_is_one_kloop_accepts`:demo 文件是新用户的
 第一接触点,而在此之前**没有任何东西验证 kloop 自己还认得它**(上一个提交刚精简过它)。测试让
-真的 `parse_root` 读真的 demo 文件,再用 `load_web_config` 整对象断言出示例里那两行。provider
+真的 `parse_root` 读真的 demo 文件,再用 `load_web_config` 整对象断言出示例的形状——**包括 key 为 `None`**,这一条就是
+上面那个取舍的锁。provider
 段要靠环境解析,不进这个测试。
 
 ### 使用者须知
