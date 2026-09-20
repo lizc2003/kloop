@@ -1366,7 +1366,14 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    **完全不思考**。于是用户的主力模型一直在不思考的状态下跑,同时照付着 `effort = "xhigh"`。
    **一个静默的默认值,乘以另一个静默的默认值,等于一个没人会去查的错误。**
    解法是承认它们本就是一个意图的两种线协议表达:`effort` 是唯一的旋钮,`thinking` 降级成
-   渲染结果,由模型的方言决定(`[models.x].thinking_budget`)。同时 `Reasoning` 把两半绑成
+   渲染结果,由模型的方言决定(`[models.x].thinking_budget`)。
+   **⤴ 订正(plan 169,当天):168 只做到一半。** profile 的 `thinking` 留下了
+   `unset|off|adaptive` 三个值,而 `off` 仍然等于 `effort = "none"`,于是那个自相矛盾的组合
+   **原封不动地活着**——`ThinkingRouting::resolve` 在 effort 不是 `none` 时直接返回
+   `default_mode`(= `Off`),渲染层照常发 `output_config`。判据:**"把旧旋钮降级成兜底"不等于
+   消除重叠——只要那个兜底还能被用户点名,重叠就还在。** 169 把枚举整个删掉,只留一个布尔
+   `thinking_param`(网关能不能收这个字段,`prompt_cache` 的同类),`effort` 才真正成为配置
+   文件里可证的唯一推理旋钮。同时 `Reasoning` 把两半绑成
    一个值传递——clippy 的 `too_many_arguments` 这次是对的,参数多出来正是因为设计还没收敛。
    附带一条查证纪律:**别凭记忆断言第三方 API 的语义。** 这一轮所有模型行为都过了
    `claude-api` 技能核对,而我第一轮的两处猜测(`adaptive` 是 no-op、`budget` 只给老模型)

@@ -3371,10 +3371,14 @@ cargo run -- --mock
 # On the Messages rail kloop sends `thinking: {"type": "adaptive"}` by default.
 # Omitting the field is not neutral: several models read a missing `thinking` as
 # "do not think at all", so a silent default would run them without reasoning
-# while still paying for a configured effort. The profile key `thinking` is the
-# way out for a gateway that cannot take the field — `unset` sends nothing, `off`
-# disables, `adaptive` is the default. It is not a second depth dial, and a token
-# budget is not spellable there: budgets belong to the model that reads them.
+# while still paying for a configured effort.
+#
+# thinking_param (Messages only, on by default) is the way out for a gateway that
+# cannot take that field: false omits it entirely. It is a statement about the
+# endpoint rather than about reasoning — the sibling of prompt_cache, not a second
+# depth dial — and with it false, `effort = "none"` is refused at startup and
+# `/effort none` is refused too, because "do no reasoning" is spelled with exactly
+# the field the gateway will not take.
 #
 # prompt_cache (Messages only, on by default) marks cache_control breakpoints on
 # the last tool, the system block, and the last message block — tools and system

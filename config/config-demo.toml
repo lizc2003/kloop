@@ -49,20 +49,24 @@ context_window = 1000000
 # rails — only the wire field differs (see the table at the bottom).
 effort = "xhigh"
 
-# Both of these are Messages-only; writing either on another rail is a startup
-# error (even writing `false`, because that rail has no such knob at all).
-# Both are shown at their defaults and can simply be omitted.
+# Two statements about what this gateway can take — NOT reasoning settings.
+# `effort` above is the only knob for how hard to think; these only say which
+# fields the endpoint chokes on. Both default to true, are Messages-only (writing
+# either on another rail is a startup error, even `false`, because that rail has
+# no such field), and can simply be omitted.
 #
-#   prompt_cache = true     # cache_control breakpoints on the last tool, the
-#                           # system block, and the last message block. Turn it
-#                           # off only for a gateway that rejects the field;
-#                           # usage reports cache_read/cache_creation, so a real
-#                           # hit is visible.
-#   thinking = "adaptive"   # unset | off | adaptive. NOT a depth dial — effort
-#                           # is. This only says how "think" is spelled, for a
-#                           # gateway that chokes on the field ("unset" sends
-#                           # nothing). A token budget is not spellable here; it
-#                           # belongs to the model, see [models.*] below.
+#   prompt_cache   = true   # send cache_control breakpoints: on the last tool,
+#                           # the system block, and the last message block. Set
+#                           # false for a gateway that rejects the field; usage
+#                           # reports cache_read/cache_creation, so a real hit is
+#                           # visible.
+#   thinking_param = true   # send the `thinking` field at all. Set false only
+#                           # for a gateway that rejects it — note the model may
+#                           # still think, this is about the request, not the
+#                           # behaviour. With it false, effort = "none" is
+#                           # refused at startup and /effort none is refused too:
+#                           # "do no reasoning" IS this field, so there is
+#                           # nowhere for it to land.
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -25,7 +25,6 @@ use kloop_protocol::ReasoningEffort;
 use kloop_provider::AuthScheme;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
-use kloop_provider::ThinkingMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rail {
@@ -123,11 +122,10 @@ struct Profile {
     model: String,
     models: Vec<String>,
     prompt_cache: bool,
-    /// The profile's own `thinking`, used only for models with no budget
-    /// dialect of their own. Not a second reasoning knob: `effort` decides how
-    /// hard to think, and this only says how "on" is spelled for a gateway that
-    /// needs something other than the default.
-    thinking: ThinkingMode,
+    /// Whether this endpoint takes the `thinking` request field. A statement
+    /// about the gateway, not about reasoning — `effort` is the only knob for
+    /// that — and the sibling of `prompt_cache`.
+    thinking_param: bool,
     effort: Option<ReasoningEffort>,
     /// The model's real context window, when the provider knows it. Only the
     /// provider can: the global default has to be conservative enough for the
@@ -205,7 +203,7 @@ fn resolve_table(
         let endpoint_fingerprint = Provider::endpoint_fingerprint_for(api_family, &base);
         let wire = profile.wire;
         let prompt_cache = profile.prompt_cache;
-        let default_thinking = profile.thinking;
+        let sends_thinking = profile.thinking_param;
         let default_effort = selected_effort(&profile, selected, env)?;
         let factory = Arc::new(move || {
             let cred = credential
@@ -236,7 +234,7 @@ fn resolve_table(
             context_window: profile.context_window,
             availability,
             default_effort,
-            default_thinking,
+            sends_thinking,
             factory,
         });
     }
@@ -248,6 +246,14 @@ fn resolve_table(
     // A declared effort set is a claim the user made after testing; contradicting
     // it is a config mistake, and finding it at startup beats finding it in a 400
     // halfway through the first turn.
+    if catalog.default_effort(&initial_provider) == Some(ReasoningEffort::None)
+        && !catalog.sends_thinking(&initial_provider)
+    {
+        bail!(
+            "provider '{initial_provider}' omits the thinking request field \
+             (thinking_param = false), so effort = 'none' cannot be expressed there"
+        );
+    }
     if let Some(effort) = catalog.default_effort(&initial_provider)
         && !catalog.effort_supported(&initial_model, effort)
     {
@@ -316,7 +322,7 @@ fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
         model: model.clone(),
         models: vec![model],
         prompt_cache: wire == Rail::Anthropic,
-        thinking: default_thinking(wire),
+        thinking_param: true,
         // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
         // provider — which, here, is the only one.
         effort: None,
@@ -562,7 +568,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "model"
                 | "models"
                 | "prompt_cache"
-                | "thinking"
+                | "thinking_param"
                 | "effort"
                 | "context_window"
         ) {
@@ -599,19 +605,16 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 .map_err(|e| anyhow!("providers.{id}.effort: {e}"))
         })
         .transpose()?;
-    let thinking = match spec.get("thinking") {
-        None => default_thinking(wire),
-        Some(Value::String(raw)) => {
-            parse_thinking_string(raw, &format!("providers.{id}.thinking"))?
-        }
-        Some(_) => {
-            bail!("providers.{id}.thinking must be 'unset', 'off', or 'adaptive'")
-        }
-    };
+    let thinking_param = optional_bool(
+        spec,
+        "thinking_param",
+        &format!("providers.{id}.thinking_param"),
+    )?
+    .unwrap_or(true);
     if wire != Rail::Anthropic
-        && (spec.contains_key("prompt_cache") || spec.contains_key("thinking"))
+        && (spec.contains_key("prompt_cache") || spec.contains_key("thinking_param"))
     {
-        bail!("providers.{id}: prompt_cache/thinking are only valid for messages wire_api");
+        bail!("providers.{id}: prompt_cache/thinking_param are only valid for messages wire_api");
     }
     let context_window = optional_integer(
         spec,
@@ -626,7 +629,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         model,
         models,
         prompt_cache,
-        thinking,
+        thinking_param,
         effort,
         context_window,
     })
@@ -789,32 +792,6 @@ fn nonempty_env(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<Opti
     env(name).map(|value| nonempty(&value, name)).transpose()
 }
 
-/// Reasoning depth is `effort`'s job, so this is not a second dial — it only
-/// says how "think" is spelled for a gateway that needs something other than
-/// the Messages default. A token budget is no longer a value here: it belongs
-/// to the model that reads budgets rather than efforts, in
-/// `[models."<id>"].thinking_budget`.
-fn parse_thinking_string(raw: &str, field: &str) -> Result<ThinkingMode> {
-    match raw {
-        "unset" => Ok(ThinkingMode::Unset),
-        "off" => Ok(ThinkingMode::Off),
-        "adaptive" => Ok(ThinkingMode::Adaptive),
-        _ => bail!("{field} must be unset | off | adaptive"),
-    }
-}
-
-/// Thinking is on by default on the Messages rail. Omitting the field is not
-/// the same as leaving the model's own default in place: Opus 4.8/4.7/4.6 and
-/// Sonnet 4.6 read a missing `thinking` as "do not think at all", so a profile
-/// that says nothing would silently run them without reasoning while still
-/// paying for a configured effort. The other rails have no such field.
-fn default_thinking(wire: Rail) -> ThinkingMode {
-    match wire {
-        Rail::Anthropic => ThinkingMode::Adaptive,
-        Rail::OpenAiChat | Rail::OpenAiResponses => ThinkingMode::Unset,
-    }
-}
-
 fn bearer_from_header(value: &str) -> Option<String> {
     let (scheme, key) = value.split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !key.trim().is_empty()).then(|| key.trim().into())
@@ -842,7 +819,7 @@ auth_header = { x-api-key = "a-key" }
 model = "claude-a"
 models = ["claude-a", "claude-b", "claude-a"]
 prompt_cache = false
-thinking = "adaptive"
+thinking_param = false
 
 [providers.responses-b]
 wire_api = "responses"
@@ -1110,7 +1087,7 @@ auth_header = { Authorization = "Bearer key" }
             model: "m".into(),
             models: vec!["m".into()],
             prompt_cache: false,
-            thinking: ThinkingMode::Unset,
+            thinking_param: true,
             effort: None,
             context_window: None,
         };
@@ -1203,9 +1180,10 @@ auth_header = { Authorization = "Bearer key" }
     /// Thinking is on by default on this rail. Omitting the field is not neutral
     /// — Opus 4.8/4.7/4.6 and Sonnet 4.6 read a missing `thinking` as "do not
     /// think", so a silent default would run them with no reasoning while still
-    /// paying for a configured effort. `unset` is the way back out for a gateway
-    /// that cannot take the field, and a token budget is no longer spellable
-    /// here: it belongs to the model that reads budgets instead of efforts.
+    /// paying for a configured effort. `thinking_param = false` is the way out
+    /// for a gateway that cannot take the field; it is a statement about the
+    /// gateway, not a second reasoning dial, and the old `thinking` enum that
+    /// overlapped `effort` is gone.
     #[test]
     fn the_messages_rail_thinks_unless_told_otherwise() {
         let profile = |line: &str| {
@@ -1223,21 +1201,18 @@ auth_header = { Authorization = "Bearer key" }
                 .unwrap()
         };
 
-        assert_eq!(profile("").unwrap().thinking, ThinkingMode::Adaptive);
+        assert!(profile("").unwrap().thinking_param);
+        assert!(!profile("thinking_param = false").unwrap().thinking_param);
+        // The retired enum overlapped `effort`: "off" was `effort = "none"` by
+        // another name, "adaptive" was the default spelled out, and the pair
+        // could be configured into a request that disabled thinking and asked
+        // for xhigh at once.
         assert_eq!(
-            profile("thinking = \"unset\"").unwrap().thinking,
-            ThinkingMode::Unset
-        );
-        assert_eq!(
-            profile("thinking = \"off\"").unwrap().thinking,
-            ThinkingMode::Off
-        );
-        assert_eq!(
-            profile("thinking = 2048")
+            profile("thinking = \"adaptive\"")
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
-            "providers.x.thinking must be 'unset', 'off', or 'adaptive'"
+            "providers.x has unknown key 'thinking'"
         );
         // The other rails have no such field, and no default to pick either.
         let chat = "provider = \"x\"\n[providers.x]\nwire_api = \"chat\"\n\
@@ -1247,6 +1222,41 @@ auth_header = { Authorization = "Bearer key" }
             resolved.catalog().descriptors()[0].api_family,
             ProviderApiFamily::OpenAiChatCompletions
         );
+    }
+
+    /// "Do no reasoning" is spelled with the very field this gateway cannot
+    /// take, so the two cannot both be true. Refused at startup rather than
+    /// rendered into a request that quietly asks for nothing.
+    #[test]
+    fn none_is_refused_where_the_thinking_field_cannot_be_sent() {
+        let raw = |line: &str| {
+            format!(
+                "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
+                 auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
+            )
+        };
+        assert_eq!(
+            resolve(
+                Some(&raw("thinking_param = false\neffort = \"none\"")),
+                &env(&[])
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string(),
+            "provider 'x' omits the thinking request field (thinking_param = false), \
+             so effort = 'none' cannot be expressed there"
+        );
+        // Any other level is fine: it rides output_config, which this gateway
+        // does take.
+        assert!(
+            resolve(
+                Some(&raw("thinking_param = false\neffort = \"high\"")),
+                &env(&[])
+            )
+            .is_ok()
+        );
+        // And `none` is fine on a gateway that does take the field.
+        assert!(resolve(Some(&raw("effort = \"none\"")), &env(&[])).is_ok());
     }
 
     /// `wire_api` names the endpoint, not the vendor — the axis

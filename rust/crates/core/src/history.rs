@@ -1344,7 +1344,7 @@ mod tests {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
-            default_thinking: kloop_provider::ThinkingMode::Unset,
+            sends_thinking: true,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         };
         let catalog = Arc::new(
@@ -1450,7 +1450,7 @@ mod tests {
                     context_window: None,
                     availability: ProviderAvailabilityCode::Ready,
                     default_effort: None,
-                    default_thinking: kloop_provider::ThinkingMode::Unset,
+                    sends_thinking: true,
                     factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
                 },
                 ProviderCatalogEntry {
@@ -1462,7 +1462,7 @@ mod tests {
                     context_window: None,
                     availability: ProviderAvailabilityCode::Ready,
                     default_effort: None,
-                    default_thinking: kloop_provider::ThinkingMode::Unset,
+                    sends_thinking: true,
                     factory: Arc::new(move || Ok(chat_provider())),
                 },
             ])
@@ -1571,7 +1571,7 @@ mod tests {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
-            default_thinking: kloop_provider::ThinkingMode::Unset,
+            sends_thinking: true,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         };
         let catalog = Arc::new(ProviderCatalog::new(vec![entry("a"), entry("b")]).unwrap());
@@ -1623,7 +1623,7 @@ mod tests {
             context_window: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
-            default_thinking: kloop_provider::ThinkingMode::Unset,
+            sends_thinking: true,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
         };
 
