@@ -82,4 +82,4 @@ Messages 的"不要推理"就是 `thinking: {"type":"disabled"}`。网关既然�
   隔离 HOME 重跑三条 rail,URL 一如既往;新增负例真跑一次:
   `Error: provider 'k-claude' omits the thinking request field (thinking_param = false),
   so effort = 'none' cannot be expressed there`。
-- 提交:本次(plan 169,见 git log)。
+- 提交:`f7dd296`。
