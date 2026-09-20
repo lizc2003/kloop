@@ -25,10 +25,8 @@ impl TestRoot {
             .env("HOME", self.root.join("home"))
             .env("PATH", "/usr/bin:/bin")
             .env("KLOOP_PROVIDER", "invalid-provider")
-            .env("KLOOP_CACHE", "not-a-boolean")
             .env("ANTHROPIC_API_KEY", "")
-            .env("OPENAI_API_KEY", "")
-            .env("KLOOP_ALLOW", "not a valid rule (");
+            .env("OPENAI_API_KEY", "");
         command
     }
 }

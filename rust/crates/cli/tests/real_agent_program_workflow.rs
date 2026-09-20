@@ -72,6 +72,78 @@ impl TestRoot {
     fn workspace(&self) -> PathBuf {
         self.0.join("workspace")
     }
+
+    /// kloop takes its provider from `~/.kloop/config.toml` and nowhere else
+    /// (plan 172). The environment is still how an operator hands a real key
+    /// to an ignored test, so the harness turns it into that file.
+    fn write_provider_config(&self) {
+        let provider = std::env::var("KLOOP_PROVIDER").expect("set KLOOP_PROVIDER");
+        let (wire, key_var, base_var, model_var, default_base, default_model, header) =
+            match provider.as_str() {
+                "anthropic" => (
+                    "messages",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_MODEL",
+                    "https://api.anthropic.com",
+                    "claude-sonnet-5",
+                    "x-api-key",
+                ),
+                "openai" => (
+                    "chat",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "OPENAI_MODEL",
+                    "https://api.openai.com/v1",
+                    "gpt-5.6-sol",
+                    "Authorization",
+                ),
+                "openai-responses" => (
+                    "responses",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "OPENAI_MODEL",
+                    "https://api.openai.com/v1",
+                    "gpt-5.6-sol",
+                    "Authorization",
+                ),
+                other => panic!("unsupported KLOOP_PROVIDER '{other}'"),
+            };
+        let nonempty = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let key = nonempty(key_var).unwrap_or_else(|| panic!("set {key_var}"));
+        let base = nonempty(base_var).unwrap_or_else(|| default_base.to_string());
+        let model = nonempty(model_var).unwrap_or_else(|| {
+            nonempty("KLOOP_MODEL").unwrap_or_else(|| default_model.to_string())
+        });
+        let auth = if header == "x-api-key" {
+            format!("{{ x-api-key = \"{key}\" }}")
+        } else {
+            format!("{{ Authorization = \"Bearer {key}\" }}")
+        };
+        let effort = match nonempty("KLOOP_EFFORT") {
+            Some(effort) => format!("effort = \"{effort}\"\n"),
+            None => String::new(),
+        };
+        let config = self.0.join("home/.kloop/config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "provider = \"{provider}\"\n\n[providers.{provider}]\n\
+                 wire_api = \"{wire}\"\nbase_url = \"{base}\"\n\
+                 auth_header = {auth}\nmodel = \"{model}\"\n{effort}"
+            ),
+        )
+        .expect("write real-key config.toml");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 }
 
 impl Drop for TestRoot {
@@ -118,6 +190,7 @@ impl NativeClient {
     }
 
     fn spawn_with_permission_mode(root: &TestRoot, permission_mode: &str) -> Self {
+        root.write_provider_config();
         let mut command = Command::new(env!("CARGO_BIN_EXE_kloop"));
         command
             .args(["app-server", "--permission-mode", permission_mode])
@@ -131,16 +204,9 @@ impl NativeClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Only the transport environment crosses over; everything about the
+        // provider itself is in the config file the harness just wrote.
         for name in [
-            "KLOOP_PROVIDER",
-            "KLOOP_MODEL",
-            "KLOOP_EFFORT",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_MODEL",
-            "OPENAI_API_KEY",
-            "OPENAI_BASE_URL",
-            "OPENAI_MODEL",
             "HTTP_PROXY",
             "HTTPS_PROXY",
             "ALL_PROXY",

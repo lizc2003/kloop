@@ -447,6 +447,32 @@ impl PtyHarness {
             }
             std::fs::write(&file, contents).with_context(|| format!("seed {}", file.display()))?;
         }
+        // The provider comes from the config file and nothing else (plan 172),
+        // so the harness writes one instead of exporting OPENAI_* — same
+        // profile the environment used to build.
+        let kloop_home = home.join(".kloop");
+        std::fs::create_dir_all(&kloop_home).context("create PTY ~/.kloop")?;
+        let config = kloop_home.join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "provider = \"openai-compat\"\n\n\
+                 [providers.openai-compat]\n\
+                 wire_api = \"chat\"\n\
+                 base_url = \"{base_url}\"\n\
+                 auth_header = {{ Authorization = \"Bearer synthetic-tui-pty-key\" }}\n\
+                 model = \"tui-pty-model\"\n"
+            ),
+        )
+        .context("write PTY config.toml")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&kloop_home, std::fs::Permissions::from_mode(0o700))
+                .context("chmod PTY ~/.kloop")?;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
+                .context("chmod PTY config.toml")?;
+        }
         let redactions = Arc::new(redaction_table(base_url, sandbox.path(), &root));
 
         let pair = native_pty_system()
@@ -471,10 +497,6 @@ impl PtyHarness {
         // The banner carries the build stamp (plan 161), which moves with every
         // commit — pin it so the checked-in frames stay a fact about layout.
         command.env("KLOOP_VERSION", "v0.0.0 (0000000)");
-        command.env("KLOOP_PROVIDER", "openai-compat");
-        command.env("OPENAI_API_KEY", "synthetic-tui-pty-key");
-        command.env("OPENAI_MODEL", "tui-pty-model");
-        command.env("OPENAI_BASE_URL", base_url);
         command.env("NO_PROXY", "127.0.0.1,localhost,::1");
         command.env("USER", "kloop-test");
 

@@ -254,12 +254,11 @@ context_window = 258400        # what this gateway caps at
 context_window = 400000        # what the model itself takes
 ```
 
-`KLOOP_CONTEXT_WINDOW` (a token count, or `off` to disable compaction) overrides
-both, and a number the environment names is pinned: a `/provider` switch leaves
-it alone. Otherwise the budget is re-derived for the new (provider, model) pair
-on every switch — carrying the old number across would mean a smaller window is
-only discovered by being rejected. When neither side declares anything, 200000
-applies. **That default is a floor for the undeclared case, never a third term in
+The provider's number wins over the model's, and the budget is re-derived for
+the new (provider, model) pair on every `/provider` switch — carrying the old
+number across would mean a smaller window is only discovered by being rejected.
+(`/context` pins a number for the session; configuration never does.) When
+neither side declares anything, 200000 applies. **That default is a floor for the undeclared case, never a third term in
 the `min`** — if it took part, declaring a real 1M window would still compact at
 200000. A window set too low is invisible (it just compacts earlier than it had
 to); a window set too high costs one rejected request before the measured ceiling
@@ -578,9 +577,8 @@ redirect onto a device (`… > /dev/sda`) needs no entry either — a redirect o
 file makes the whole script opaque, and an opaque script never gets an automatic
 verdict.
 
-**Rules** are split by lifetime. Global `~/.kloop/config.toml` and the
-comma-separated `KLOOP_DENY` / `KLOOP_ASK` env vars provide only process-wide
-constraints:
+**Rules** are split by lifetime. Global `~/.kloop/config.toml` provides only
+process-wide constraints:
 
 ```toml
 [permissions]
@@ -590,10 +588,9 @@ ask = ["bash(cargo publish *)"]   # always confirm, even if project-approved
 
 Durable allow rules live instead in the user-private, per-project
 `~/.kloop/projects/v1/<ProjectId>/permissions.json` store. Legacy
-`[permissions].allow` and non-empty `KLOOP_ALLOW` fail startup with a
-secret-safe migration error: kloop neither applies, silently ignores, rewrites,
-nor automatically migrates them. Remove the legacy entry and approve again in
-each project.
+`[permissions].allow` fails startup with a secret-safe migration error: kloop
+neither applies, silently ignores, rewrites, nor automatically migrates it.
+Remove the legacy entry and approve again in each project.
 
 `tool_name` covers the whole tool; `bash(<tokens>)` matches one command's
 leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
@@ -1176,13 +1173,13 @@ selects stdio, `url` selects HTTP (exactly one, or it's a config error):
 [mcp.servers.fs]                                   # stdio: local child process
 command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "sandbox"]
 env = { }                                          # merged onto the process env
-readonly = ["read_text_file", "list_directory"]    # eligible for concurrent dispatch
+readonly_tools = ["read_text_file", "list_directory"]   # concurrent-dispatch eligible
 
 [mcp.servers.remote]                               # streamable HTTP: static bearer
 url = "https://mcp.example.com/mcp"
-bearer_token_env_var = "EXAMPLE_MCP_TOKEN"         # env var NAME, never the token itself
+bearer_token = "sk-..."                            # the token itself; this file is 0600
 http_headers = { X-Tenant = "acme" }               # static extra request headers
-readonly = ["search"]
+readonly_tools = ["search"]
 
 [mcp.servers.github]                               # streamable HTTP: OAuth (plan 34b)
 url = "https://api.githubcopilot.com/mcp/"
@@ -1190,10 +1187,10 @@ url = "https://api.githubcopilot.com/mcp/"
 # oauth_scopes = ["repo", "read:user"]             # optional: override discovered scopes
 ```
 
-MCP bearer secrets never live inline in the config: `bearer_token_env_var` names an
-variable that kloop reads at connect time into `Authorization: Bearer <token>`
-(an inline `bearer_token` is refused; a referenced-but-unset var is an error).
-Over HTTP, one POST carries each request, the reply comes back as
+`bearer_token` is spelled into `Authorization: Bearer <token>` at connect
+time. It is written in the config like every other credential kloop uses — no
+environment variable is read for it (plan 172) — and written-but-empty is
+refused. Over HTTP, one POST carries each request, the reply comes back as
 `application/json` or a short-lived `text/event-stream`, and the server's
 `Mcp-Session-Id` header rides every subsequent request; a `404` for a
 session-bearing request re-runs the handshake once but does **not** transparently
@@ -1202,7 +1199,7 @@ tool catalog under its lifecycle gate; only a later freshly discovered call may
 retry. 408/429/5xx and transient network errors retry (250ms, 1s, then a final
 try), while 401/403 are terminal.
 
-**OAuth (plan 34b).** A remote server with no `bearer_token_env_var` takes the
+**OAuth (plan 34b).** A remote server with no `bearer_token` takes the
 OAuth 2.1 authorization-code path — the way the hosted MCP servers (GitHub,
 Linear, Notion) authenticate a user. Log in once:
 
@@ -1325,7 +1322,7 @@ subscription remain outside this slice.
 
 ### Deferred tools + tool_search
 
-Past 30 total tools (`KLOOP_DEFER_THRESHOLD` overrides; built-ins never
+Past 30 total tools (`[mcp].defer_threshold` overrides; built-ins never
 defer), external source definitions stop being sent to the model. A source may
 also force selected helpers to defer below that threshold (the MCP resource
 helpers do this). The request carries the built-ins plus two extra tools, and
@@ -2187,14 +2184,14 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   HTTP client takes by default, and in a denied sandbox the variables have no
   other use. A command that spells the proxy out itself (`curl -x …`) still
   reaches it; deliberate evasion is not what this boundary is for.
-- **Sandboxed = fewer questions** (`auto_allow`, default on): a bash call
+- **Sandboxed = fewer questions** (`trust_sandboxed`, default on): a bash call
   the sandbox will contain skips the asking layers of the permission gate —
   opaque scripts (substitutions, subshells) included, since OS containment
   replaces parse-level vetting. Deny rules, safety checks (a visible
   `rm -rf` still confirms) and explicit ask rules stay in force above it.
   The accepted trade-off: a contained command can still modify the workspace
   without a prompt — protected `.git` internals aside, git history is the
-  recovery path. `auto_allow = false` reverts to pure containment (approve
+  recovery path. `trust_sandboxed = false` reverts to pure containment (approve
   first, then run sandboxed). `--permission-mode bypass` bypasses approvals but
   not the sandbox — and not a call that removes the sandbox itself: a bash call
   carrying `disable_sandbox` still reaches you under bypass, because what the
@@ -2261,17 +2258,18 @@ containment.
 enabled = true            # default; false turns the sandbox off
 allow_network = false     # default; true appends the network allow rules
 writable_roots = []       # extra writable directories
-auto_allow = true         # default; false = ask first, then run sandboxed
+trust_sandboxed = true    # default; false = ask first, then run sandboxed
 escalate = true           # default; false = model-driven disable_sandbox instead
 ```
 
-`KLOOP_SANDBOX=off` is the env escape hatch. Linux currently has no OS
-filesystem/network sandbox and runs Bash without that containment, while the
-permission gate and Unix process-group ownership remain active. Native Windows
-also has no restricted-token/AppContainer filesystem/network sandbox, but every
-model-controlled Bash or PowerShell process is still assigned to a mandatory
-Job Object before user code runs; `[sandbox]`, `KLOOP_SANDBOX=off`, and
-`disable_sandbox` never disable process-tree ownership. A missing
+`enabled = false` is the whole off switch; no environment variable overrides
+it. Linux currently has no OS filesystem/network sandbox and runs Bash without
+that containment, while the permission gate and Unix process-group ownership
+remain active. Native Windows also has no restricted-token/AppContainer
+filesystem/network sandbox, but every model-controlled Bash or PowerShell
+process is still assigned to a mandatory Job Object before user code runs;
+neither `[sandbox]` nor `disable_sandbox` ever disables process-tree
+ownership. A missing
 `sandbox-run_program` on macOS warns and falls back to the permission gate plus
 process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
@@ -2461,8 +2459,8 @@ per-rail table was measured wrong in both directions before it was deleted.
 force; that is also the startup state, so the chat rail's field (which only
 reasoning models accept) never appears unless asked for. It is deliberately not
 spelled `off`, because `none` is a real level meaning "do no reasoning" and the
-two would read as synonyms. The initial value comes from `KLOOP_EFFORT` >
-the top-level `effort` key > the selected profile's own `effort`.
+two would read as synonyms. The initial value is the selected profile's own
+`effort`.
 
 The picker's effort stage lists `unset` first and then exactly what the model
 declared (everything, when it declared nothing). `unset` is always there and
@@ -2607,10 +2605,10 @@ await-suspended time) or a user Ctrl+C. Orchestration limits are:
 - `max_items` — hard cap on one `parallel()`/`pipeline()` input (default 4096);
   over-limit calls throw and never silently truncate.
 
-All six knobs override via `[codemode]` in global `~/.kloop/config.toml`
+All six knobs override via `[program]` in global `~/.kloop/config.toml`
 (`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_concurrency`,
-`max_items`) or matching `KLOOP_PROGRAM_*` environment variables (environment
-wins). Detached Agent/Program/Workflow executions retain their separate,
+`max_items`) — the section is named after the `run_program` tool it bounds.
+Detached Agent/Program/Workflow executions retain their separate,
 session-wide cap of 8.
 
 A running program is observable, not a black box: each `tools.<name>(...)` and
@@ -3261,8 +3259,7 @@ kloop --mock --headless --json
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
   deny"). Existing project grants, `--permission-mode accept-edits`/`bypass`,
-  and sandbox auto-allow still act before the approver. Non-empty `KLOOP_ALLOW`
-  is a startup error, not a headless override.
+  and sandbox trust still act before the approver.
 - **Interactive control surfaces are absent.** Headless installs neither a
   `Questioner` nor detached Workflow lifecycle, so `ask_user_question`,
   `enter_plan_mode`, and `workflow` are not advertised. It never reads stdin
@@ -3359,28 +3356,18 @@ cargo run -- --mock
 # are checked only when selected. No model discovery or credential editing occurs
 # at runtime. kloop appends /v1/messages, /chat/completions, or /responses.
 
-# Environment variables only select a new session's initial catalog route; they
-# cannot inject an undeclared provider or model. Provider selection:
-# KLOOP_PROVIDER > provider. Model order:
-# ANTHROPIC_MODEL/OPENAI_MODEL > KLOOP_MODEL > the profile's own model, but every
-# result must occur in that profile's models allowlist. There is no scope above
-# the profile for either model or effort: both belong to the provider that has
-# to send them. Credentials and
-# base URL env overrides apply to the selected profile only; unselected profiles
-# remain bounded-unavailable when their configured credential is absent.
-#
-# ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL select Messages;
-# OPENAI_API_KEY / OPENAI_BASE_URL select Chat or Responses according to the
-# selected profile. A key from the environment replaces the secret, never the
-# spelling: a profile that declared auth_header keeps its header, and one that
-# declared none falls back to what the wire's own vendor sends.
-# KLOOP_EFFORT (or the selected profile's own effort key — the env var
-# wins, and both are valid on every wire_api)
-# seeds the session reasoning effort that /effort then owns. Only the spelling is checked: which
-# levels a model takes is the model's own contract, stated in its own error.
+# The file is the whole of it (plan 172). No environment variable names a
+# provider, a model, a base URL, a key or an effort — one file answers "what
+# will this run talk to", so the answer cannot change with the shell that
+# started it. A missing or empty ~/.kloop/config.toml is a startup error, not
+# a fallback to ANTHROPIC_API_KEY. There is no scope above the profile for
+# either model or effort: both belong to the provider that has to send them,
+# and the profile's own `effort` seeds the session effort that /effort then
+# owns. Only the spelling is checked at load: which levels a model takes is
+# the model's own contract, stated in its own error.
 # Provider/search keys are stripped from model-controlled shell environments.
 #
-# Reasoning is one knob: `effort` (profile key, KLOOP_EFFORT, or /effort). How it
+# Reasoning is one knob: `effort` (profile key or /effort). How it
 # reaches the wire is the model's business, not the user's. Most models take the
 # level on `output_config.effort` and think adaptively; a model that reads a token
 # budget instead declares `thinking_budget` in its `[models."<id>"]` table, one
@@ -3476,8 +3463,10 @@ cargo run -- --mock
 # Responses must be selected explicitly and needs KLOOP_EFFORT so it actually
 # produces and validates reasoning items. Its real-test watchdog defaults to 900s
 # (300s on other rails) and can be overridden with
-# KLOOP_REAL_EVALUATOR_TIMEOUT_SECS=60..3600. Provide private OPENAI_* compatibility
-# env without printing or committing it:
+# KLOOP_REAL_EVALUATOR_TIMEOUT_SECS=60..3600. These variables are the TEST's
+# input, not kloop's: the harness turns them into the ~/.kloop/config.toml it
+# hands the child. Provide private OPENAI_* compatibility env without printing
+# or committing it:
 # KLOOP_PROVIDER=openai-responses KLOOP_EFFORT=high \
 #   cargo test -p kloop --test real_agent_program_workflow \
 #   real_agent_program_workflow_contract -- --exact --ignored --nocapture
@@ -3508,20 +3497,17 @@ cargo run -- --fork <id>#<seq> # branch off a session at line #<seq> (rewind)
 cargo run -- --fork <id>       # branch off a session at its end
 
 # MCP servers come from global ~/.kloop/config.toml — see MCP client above
-# KLOOP_DEFER_THRESHOLD=<n> tunes when MCP tool defs defer behind tool_search
+# [mcp].defer_threshold = <n> tunes when MCP tool defs defer behind tool_search
 # (default 30 total tools; lower it to exercise deferral with a small server,
 # raise it to effectively disable)
 
-# permissions: global constraints come from TOML/KLOOP_DENY/KLOOP_ASK;
+# permissions: global constraints come from [permissions] in that same file;
 # project approvals persist in ~/.kloop/projects/v1/<ProjectId>/permissions.json
-KLOOP_DENY='bash(git push *)' cargo run            # hard-block rules
-KLOOP_ASK='bash(cargo publish *)' cargo run        # force confirmation
 cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
 cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
 
-# OS sandbox (macOS Seatbelt; see OS sandbox above). This never disables Unix
-# process groups or Windows Job Objects.
-KLOOP_SANDBOX=off cargo run                        # remove OS fs/network sandbox only
+# OS sandbox (macOS Seatbelt; see OS sandbox above): [sandbox] enabled = false
+# turns it off. This never disables Unix process groups or Windows Job Objects.
 ```
 
 Interrupting a running turn patches history so it stays legal either way. In
@@ -3566,7 +3552,7 @@ Every session is saved and resumable — see Session persistence above.
   safety checks, sensitive paths never cached, ask-rules-over-allow,
   acceptEdits cwd boundary, glob rules, WorkspaceId-partitioned session cache,
   ProjectId identity and durable ProjectStore publication/RMW, legacy
-  `[permissions].allow`/`KLOOP_ALLOW` rejection, opaque scripts cacheable for the
+  `[permissions].allow` rejection, opaque scripts cacheable for the
   session but never durable, `ConfirmRequest.preview` carrying an
   edit/write diff while other calls carry none); Windows shell contracts
   (Git for Windows layout discovery, conditional catalog, CreateProcessW

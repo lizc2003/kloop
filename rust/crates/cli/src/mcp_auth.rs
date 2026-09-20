@@ -169,14 +169,14 @@ pub async fn run_login(server_name: &str) -> Result<()> {
     let (url, client_id, scopes) = match &server.transport {
         McpTransport::Http {
             url,
-            bearer_token_env_var,
+            bearer_token,
             oauth_client_id,
             oauth_scopes,
             ..
         } => {
-            if bearer_token_env_var.is_some() {
+            if bearer_token.is_some() {
                 bail!(
-                    "server '{server_name}' uses a static bearer_token_env_var, not OAuth; \
+                    "server '{server_name}' uses a static bearer_token, not OAuth; \
                      no login needed"
                 );
             }

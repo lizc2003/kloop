@@ -101,7 +101,7 @@ fn validate_root(table: &toml::Table) -> Result<()> {
                 | "sandbox"
                 | "shells"
                 | "agents"
-                | "codemode"
+                | "program"
         ) {
             bail!("~/.kloop/config.toml has unknown top-level key '{key}'");
         }
@@ -166,7 +166,7 @@ enabled = true
 bash = "/trusted/bash.exe"
 [agents.reviewer]
 description = "review"
-[codemode]
+[program]
 max_agents = 3
 "#,
         )

@@ -58,14 +58,8 @@ pub(crate) struct RuntimeSettings {
     project_store: Option<Arc<ProjectStore>>,
     hooks: Arc<Hooks>,
     sandbox: SandboxSettings,
-    sandbox_disabled_by_env: bool,
     agent_types: Arc<Vec<AgentType>>,
     program_limits: kloop_core::ProgramLimits,
-    /// `KLOOP_CONTEXT_WINDOW` as given: `None` means the user said nothing, so a
-    /// provider's declared window applies. Collapsing that into the resolved
-    /// value would make "unset" and "explicitly 200_000" indistinguishable, and
-    /// the provider's window would never get a chance to win.
-    context_window_env: Option<Option<u64>>,
     defer_threshold: usize,
     shell_programs: Arc<ShellPrograms>,
     shell_warnings: Vec<String>,
@@ -82,10 +76,8 @@ impl RuntimeSettings {
                 project_store: None,
                 hooks: Arc::new(Hooks::none()),
                 sandbox: SandboxSettings::default(),
-                sandbox_disabled_by_env: false,
                 agent_types: Arc::new(Vec::new()),
                 program_limits: kloop_core::ProgramLimits::default(),
-                context_window_env: Some(Some(DEFAULT_CONTEXT_WINDOW)),
                 defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
                 shell_programs: Arc::new(shell_programs),
                 shell_warnings,
@@ -95,7 +87,7 @@ impl RuntimeSettings {
         let config_path = config.path().to_path_buf();
         let (shell_programs, shell_warnings) =
             kloop_core::shell_programs::resolve_shell_programs(load_shell_overrides(table)?)?;
-        let permission_rules = load_permission_rules(table, &|name| std::env::var(name).ok())?;
+        let permission_rules = parse_permission_rules(table)?;
         let global_permissions = Arc::new(GlobalPermissionPolicy::new(
             &permission_rules.deny,
             &permission_rules.ask,
@@ -112,11 +104,9 @@ impl RuntimeSettings {
                 defs: load_hooks(table)?,
             }),
             sandbox: load_sandbox_settings(table)?,
-            sandbox_disabled_by_env: sandbox_disabled_from_env(),
             agent_types: Arc::new(load_agent_types(table)?),
             program_limits: load_program_limits(table)?,
-            context_window_env: context_window_from_env()?,
-            defer_threshold: defer_threshold_from_env()?,
+            defer_threshold: crate::mcp::load_defer_threshold(table)?,
             shell_programs: Arc::new(shell_programs),
             shell_warnings,
         })
@@ -280,35 +270,6 @@ fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
     Ok(rules)
 }
 
-/// `env` is injected rather than read from the process: the environment is
-/// global mutable state, so a test that sets a variable to exercise one branch
-/// races every other test reading the same variable in the same process (this
-/// one did, intermittently). Same shape as `mcp::http_headers_for`.
-fn load_permission_rules(
-    root: &toml::Table,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<PermissionRules> {
-    let mut rules = parse_permission_rules(root)?;
-    if env("KLOOP_ALLOW").is_some_and(|value| !value.trim().is_empty()) {
-        bail!(
-            "KLOOP_ALLOW is no longer supported; remove it and approve rules separately in each project"
-        );
-    }
-    let append_env = |name: &str, out: &mut Vec<String>| {
-        if let Some(raw) = env(name) {
-            out.extend(
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(str::to_string),
-            );
-        }
-    };
-    append_env("KLOOP_DENY", &mut rules.deny);
-    append_env("KLOOP_ASK", &mut rules.ask);
-    Ok(rules)
-}
-
 fn load_project_permission_policy(
     store: &Arc<ProjectStore>,
     registry: &Arc<ProjectPolicyRegistry>,
@@ -384,14 +345,17 @@ fn build_permissions(
 
 /// `[sandbox]` in the global user config: `enabled` (default true),
 /// `allow_network` (default false), `writable_roots` (extra writable
-/// directories, default none), `auto_allow` (default true: sandboxed bash
+/// directories, default none), `trust_sandboxed` (default true: sandboxed bash
 /// skips the asking layers of the permission gate), `escalate` (default
 /// true: a sandbox-denied command is offered for an unsandboxed re-run).
 struct SandboxSettings {
     enabled: bool,
     allow_network: bool,
     writable_roots: Vec<PathBuf>,
-    auto_allow: bool,
+    /// The config spelling of core's `SandboxPolicy::auto_allow`. The engine
+    /// keeps its own word for the mechanism; what the user writes says what it
+    /// means — a command that already ran inside the sandbox is trusted.
+    trust_sandboxed: bool,
     escalate: bool,
 }
 
@@ -401,7 +365,7 @@ impl Default for SandboxSettings {
             enabled: true,
             allow_network: false,
             writable_roots: Vec::new(),
-            auto_allow: true,
+            trust_sandboxed: true,
             escalate: true,
         }
     }
@@ -688,10 +652,10 @@ fn load_sandbox_settings(root: &toml::Table) -> Result<SandboxSettings> {
                     ));
                 }
             }
-            "auto_allow" => {
-                settings.auto_allow = value
+            "trust_sandboxed" => {
+                settings.trust_sandboxed = value
                     .as_bool()
-                    .context("sandbox.auto_allow must be a boolean")?;
+                    .context("sandbox.trust_sandboxed must be a boolean")?;
             }
             "escalate" => {
                 settings.escalate = value
@@ -699,29 +663,27 @@ fn load_sandbox_settings(root: &toml::Table) -> Result<SandboxSettings> {
                     .context("sandbox.escalate must be a boolean")?;
             }
             other => bail!(
-                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots | auto_allow | escalate)"
+                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots | trust_sandboxed | escalate)"
             ),
         }
     }
     Ok(settings)
 }
 
-/// `[codemode]` in the global user config (all optional; defaults in
+/// `[program]` in the global user config (all optional; defaults in
 /// `Limits::default`): `memory_mb`, `stack_kb`, `cpu_secs` (engine resource
 /// limits) and `max_agents`, `max_concurrency`, `max_items` (orchestration
-/// ceilings). Each
-/// is also overridable via `KLOOP_PROGRAM_<KEY>` env, which wins over the config
-/// value. Bounds one `run_program` (code-mode) run.
+/// ceilings). Bounds one `run_program` (code-mode) run.
 fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> {
     let mut limits = kloop_core::ProgramLimits::default();
-    if let Some(section) = root.get("codemode") {
-        let section = section.as_table().context("[codemode] must be a table")?;
+    if let Some(section) = root.get("program") {
+        let section = section.as_table().context("[program] must be a table")?;
         for (key, value) in section {
             let need = || {
                 value
                     .as_integer()
                     .filter(|&number| number > 0)
-                    .with_context(|| format!("codemode.{key} must be a positive integer"))
+                    .with_context(|| format!("program.{key} must be a positive integer"))
             };
             match key.as_str() {
                 "memory_mb" => limits.memory_bytes = need()? as usize * 1024 * 1024,
@@ -731,51 +693,12 @@ fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> 
                 "max_concurrency" => limits.max_concurrency = need()? as usize,
                 "max_items" => limits.max_items_per_call = need()? as usize,
                 other => bail!(
-                    "[codemode] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_concurrency | max_items)"
+                    "[program] has unknown key '{other}' (memory_mb | stack_kb | cpu_secs | max_agents | max_concurrency | max_items)"
                 ),
             }
         }
     }
-    let env_uint = |name: &str| -> Result<Option<u64>> {
-        match std::env::var(name) {
-            Ok(s) => {
-                let value = s
-                    .parse::<u64>()
-                    .with_context(|| format!("{name} must be a positive integer"))?;
-                if value == 0 {
-                    bail!("{name} must be a positive integer");
-                }
-                Ok(Some(value))
-            }
-            Err(_) => Ok(None),
-        }
-    };
-    if let Some(n) = env_uint("KLOOP_PROGRAM_MEMORY_MB")? {
-        limits.memory_bytes = n as usize * 1024 * 1024;
-    }
-    if let Some(n) = env_uint("KLOOP_PROGRAM_STACK_KB")? {
-        limits.max_stack_bytes = n as usize * 1024;
-    }
-    if let Some(n) = env_uint("KLOOP_PROGRAM_CPU_SECS")? {
-        limits.cpu_burst = Duration::from_secs(n);
-    }
-    if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_AGENTS")? {
-        limits.max_agents = n;
-    }
-    if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_CONCURRENCY")? {
-        limits.max_concurrency = n as usize;
-    }
-    if let Some(n) = env_uint("KLOOP_PROGRAM_MAX_ITEMS")? {
-        limits.max_items_per_call = n as usize;
-    }
     Ok(limits)
-}
-
-fn sandbox_disabled_from_env() -> bool {
-    matches!(
-        std::env::var("KLOOP_SANDBOX").ok().as_deref(),
-        Some("off") | Some("0") | Some("false")
-    )
 }
 
 /// The session sandbox policy, or None with a warning when unavailable —
@@ -789,7 +712,7 @@ pub(crate) fn build_sandbox(
     warn: impl Fn(&str),
 ) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
     // --mock stays hermetic; the env escape hatch was captured at startup.
-    if args.mock || runtime.sandbox_disabled_by_env {
+    if args.mock {
         return Ok(None);
     }
     let settings = &runtime.sandbox;
@@ -813,7 +736,7 @@ pub(crate) fn build_sandbox(
             // output, which it was handed a preview of and a path to. Writes there
             // remain denied.
             .with_allowed_read_path(offload_dir);
-            policy.auto_allow = settings.auto_allow;
+            policy.auto_allow = settings.trust_sandboxed;
             policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
         }
@@ -826,34 +749,11 @@ pub(crate) fn build_sandbox(
     }
 }
 
-/// KLOOP_DEFER_THRESHOLD: total tool count above which MCP tool definitions
-/// are deferred behind tool_search. Lower it to exercise deferral with a
-/// small server; raise it to effectively disable deferral.
-fn defer_threshold_from_env() -> Result<usize> {
-    match std::env::var("KLOOP_DEFER_THRESHOLD").ok() {
-        Some(raw) => raw
-            .parse::<usize>()
-            .context("KLOOP_DEFER_THRESHOLD must be a tool count"),
-        None => Ok(kloop_core::tools::TOOL_DEFER_THRESHOLD),
-    }
-}
-
-/// The default when neither the env var nor the provider declares a window.
-/// Deliberately conservative: it has to be safe for the smallest model anyone
-/// routes to, which is why a provider that knows better should say so.
+/// The default when the provider declares no window. Deliberately
+/// conservative: it has to be safe for the smallest model anyone routes to,
+/// which is why a provider that knows better should say so in
+/// `providers.<id>.context_window` or `models."<id>".context_window`.
 const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
-
-/// `Ok(None)` = the user said nothing. `Ok(Some(None))` = explicitly off.
-fn context_window_from_env() -> Result<Option<Option<u64>>> {
-    match std::env::var("KLOOP_CONTEXT_WINDOW").ok().as_deref() {
-        Some("off") | Some("0") => Ok(Some(None)),
-        Some(raw) => Ok(Some(Some(
-            raw.parse::<u64>()
-                .context("KLOOP_CONTEXT_WINDOW must be a token count or 'off'")?,
-        ))),
-        None => Ok(None),
-    }
-}
 
 /// Safe effective-config allowlist for native `config/read`. The source table
 /// may contain secrets, but only these non-sensitive values cross the protocol.
@@ -864,10 +764,8 @@ pub(crate) fn server_config_snapshot(
     runtime: &RuntimeSettings,
 ) -> Result<ConfigSnapshot> {
     let settings = &runtime.sandbox;
-    let sandbox_enabled = !args.mock
-        && settings.enabled
-        && !runtime.sandbox_disabled_by_env
-        && kloop_core::sandbox::availability().is_ok();
+    let sandbox_enabled =
+        !args.mock && settings.enabled && kloop_core::sandbox::availability().is_ok();
     Ok(ConfigSnapshot {
         cwd: cwd.to_string_lossy().to_string(),
         route: Some(provider.initial_route().public_route()),
@@ -876,19 +774,14 @@ pub(crate) fn server_config_snapshot(
         } else {
             args.permission_mode.label().into()
         },
-        // Env override, then the provider's declared window, then the default.
-        // The env var wins so a wrong or missing provider value can be corrected
-        // without editing the provider block.
-        context_window: runtime.context_window_env.unwrap_or_else(|| {
-            provider
-                .initial_context_window()
-                .or(Some(DEFAULT_CONTEXT_WINDOW))
-        }),
+        context_window: provider
+            .initial_context_window()
+            .or(Some(DEFAULT_CONTEXT_WINDOW)),
         defer_threshold: runtime.defer_threshold,
         sandbox: SandboxConfigInfo {
             enabled: sandbox_enabled,
             allow_network: !args.mock && settings.allow_network,
-            auto_allow: !args.mock && settings.auto_allow,
+            auto_allow: !args.mock && settings.trust_sandboxed,
             escalate: !args.mock && settings.escalate,
         },
         worktree_enabled: !args.mock,
@@ -992,23 +885,14 @@ pub(crate) fn config_from_settings(
         cwd,
         offload_dir: session_dirs.offload.clone(),
         sessions_dir: session_dirs.sessions.clone(),
-        // Env override, then the provider's declared window, then the default.
-        // The env var wins so a wrong or missing provider value can be corrected
-        // without editing the provider block.
-        context_window: runtime.context_window_env.unwrap_or_else(|| {
-            provider
-                .initial_context_window()
-                .or(Some(DEFAULT_CONTEXT_WINDOW))
-        }),
-        // A number the env named is the user's, and a `/provider` switch must not
-        // move it; anything else is derived per (provider, model) and re-derived
-        // on every switch.
-        context_budget: if runtime.context_window_env.is_some() {
-            kloop_core::config::ContextBudgetSource::Pinned
-        } else {
-            kloop_core::config::ContextBudgetSource::Catalog {
-                fallback: Some(DEFAULT_CONTEXT_WINDOW),
-            }
+        context_window: provider
+            .initial_context_window()
+            .or(Some(DEFAULT_CONTEXT_WINDOW)),
+        // Always derived per (provider, model) and re-derived on every
+        // `/provider` switch. `Pinned` is what `/context` sets at runtime;
+        // configuration no longer produces it.
+        context_budget: kloop_core::config::ContextBudgetSource::Catalog {
+            fallback: Some(DEFAULT_CONTEXT_WINDOW),
         },
         permissions,
         questioner,
@@ -1272,7 +1156,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         std::fs::write(cwd_a.join(".kloop/config.toml"), "not valid toml = [").unwrap();
         std::fs::write(
             cwd_b.join(".kloop/config.toml"),
-            "[sandbox]\nallow_network = false\nauto_allow = true\n",
+            "[sandbox]\nallow_network = false\ntrust_sandboxed = true\n",
         )
         .unwrap();
         let root = config(
@@ -1288,7 +1172,7 @@ event = "pre_turn"
 command = ["SENTINEL-HOOK"]
 [sandbox]
 allow_network = true
-auto_allow = false
+trust_sandboxed = false
 escalate = false
 [mcp.servers.remote]
 url = "https://mcp.example.test"
@@ -1703,7 +1587,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         assert!(settings.enabled);
         assert!(!settings.allow_network);
         assert!(settings.writable_roots.is_empty());
-        assert!(settings.auto_allow);
+        assert!(settings.trust_sandboxed);
         assert!(settings.escalate);
         assert!(
             load_sandbox_settings(&config("[permissions]\nallow = []\n"))
@@ -1725,9 +1609,9 @@ http_headers = { Authorization = "SENTINEL-MCP" }
                 .enabled
         );
         assert!(
-            !load_sandbox_settings(&config("[sandbox]\nauto_allow = false\n"))
+            !load_sandbox_settings(&config("[sandbox]\ntrust_sandboxed = false\n"))
                 .unwrap()
-                .auto_allow
+                .trust_sandboxed
         );
         assert!(
             !load_sandbox_settings(&config("[sandbox]\nescalate = false\n"))
@@ -1740,7 +1624,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             "[sandbox]\nallow_network = 1\n",
             "[sandbox]\nwritable_roots = \"/opt\"\n",
             "[sandbox]\nwritable_roots = [1]\n",
-            "[sandbox]\nauto_allow = \"on\"\n",
+            "[sandbox]\ntrust_sandboxed = \"on\"\n",
             "[sandbox]\nescalate = 1\n",
             "[sandbox]\nnetwork = true\n",
             "sandbox = true\n",
@@ -1753,13 +1637,13 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     }
 
     #[test]
-    fn codemode_config_rejects_unknown_and_nonpositive_limits() {
+    fn program_config_rejects_unknown_and_nonpositive_limits() {
         for bad in [
-            "codemode = false\n",
-            "[codemode]\nmax_agents = 0\n",
-            "[codemode]\nmax_concurrency = 0\n",
-            "[codemode]\nmemory_mb = \"large\"\n",
-            "[codemode]\nunknown = 1\n",
+            "program = false\n",
+            "[program]\nmax_agents = 0\n",
+            "[program]\nmax_concurrency = 0\n",
+            "[program]\nmemory_mb = \"large\"\n",
+            "[program]\nunknown = 1\n",
         ] {
             assert!(
                 load_program_limits(&config(bad)).is_err(),
@@ -1769,9 +1653,9 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     }
 
     #[test]
-    fn codemode_config_loads_agent_concurrency_limit() {
+    fn program_config_loads_agent_concurrency_limit() {
         let limits = load_program_limits(&config(
-            "[codemode]\nmax_agents = 20\nmax_concurrency = 3\nmax_items = 40\n",
+            "[program]\nmax_agents = 20\nmax_concurrency = 3\nmax_items = 40\n",
         ))
         .unwrap();
         assert_eq!(limits.max_agents, 20);
@@ -1808,20 +1692,6 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             let error = parse_permission_rules(&config(bad)).expect_err("accepted legacy config");
             assert!(!error.to_string().contains("do-not-echo-this"));
         }
-    }
-
-    #[test]
-    fn nonempty_legacy_allow_environment_is_rejected_without_echoing_it() {
-        let error = load_permission_rules(&toml::Table::new(), &|name| {
-            (name == "KLOOP_ALLOW").then(|| "bash(secret-command *)".to_string())
-        })
-        .expect_err("accepted KLOOP_ALLOW");
-        assert!(
-            error
-                .to_string()
-                .contains("KLOOP_ALLOW is no longer supported")
-        );
-        assert!(!error.to_string().contains("secret-command"));
     }
 
     #[test]

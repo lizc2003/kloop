@@ -22,7 +22,6 @@ use kloop_protocol::ANTHROPIC_MIN_THINKING_BUDGET;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAvailabilityCode;
 use kloop_protocol::ReasoningEffort;
-use kloop_provider::AuthScheme;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
 
@@ -46,17 +45,6 @@ impl Rail {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
             Self::OpenAiChat | Self::OpenAiResponses => "https://api.openai.com/v1",
-        }
-    }
-
-    /// What each wire's own vendor sends, used when a profile declares no
-    /// `auth_header` and the credential arrives from the environment instead.
-    /// A profile that does declare one outranks this: the spelling belongs to
-    /// the endpoint, not to the rail and not to where the secret came from.
-    fn default_auth(self) -> AuthScheme {
-        match self {
-            Self::Anthropic => AuthScheme::ApiKey,
-            Self::OpenAiChat | Self::OpenAiResponses => AuthScheme::Bearer,
         }
     }
 }
@@ -143,53 +131,43 @@ pub(crate) fn load(mock: bool, table: &toml::Table) -> Result<ResolvedProviderSe
     if mock {
         return Ok(ResolvedProviderSettings::mock());
     }
-    resolve_table(Some(table), &|name| std::env::var(name).ok())
+    resolve_table(Some(table))
 }
 
 #[cfg(test)]
-fn resolve(
-    raw: Option<&str>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<ResolvedProviderSettings> {
+fn resolve(raw: Option<&str>) -> Result<ResolvedProviderSettings> {
     let table = raw
         .map(|raw| {
             raw.parse::<toml::Table>()
                 .map_err(|_| anyhow!("cannot parse ~/.kloop/config.toml (TOML syntax error)"))
         })
         .transpose()?;
-    resolve_table(table.as_ref(), env)
+    resolve_table(table.as_ref())
 }
 
-fn resolve_table(
-    table: Option<&toml::Table>,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<ResolvedProviderSettings> {
+/// `~/.kloop/config.toml` is the whole of it. No environment variable names a
+/// provider, a model, a base URL, a key or an effort: one file answers "what
+/// will this run talk to", so the answer cannot depend on which shell started
+/// it (plan 172).
+fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings> {
     let file = match table {
         Some(table) if !table.is_empty() => parse_global_file(table)?,
-        _ => env_only_file(env)?,
+        _ => bail!(
+            "no provider configured: ~/.kloop/config.toml is missing or empty — \
+             it needs `provider` and a matching [providers.<id>] section"
+        ),
     };
-    let initial_provider =
-        nonempty_env(env, "KLOOP_PROVIDER")?.unwrap_or_else(|| file.initial_provider.clone());
+    let initial_provider = file.initial_provider.clone();
     let profile = file.profiles.get(&initial_provider).with_context(|| {
         format!("provider profile '{initial_provider}' is not defined in ~/.kloop/config.toml")
     })?;
-    let rail_model = match profile.wire {
-        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_MODEL")?,
-        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_MODEL")?,
-    };
-    let initial_model = rail_model
-        .or(nonempty_env(env, "KLOOP_MODEL")?)
-        .unwrap_or_else(|| profile.model.clone());
-    if !profile.models.iter().any(|model| model == &initial_model) {
-        bail!(
-            "initial model '{initial_model}' is not in provider '{initial_provider}' models allowlist"
-        );
-    }
+    // `parse_profile` already refused a `model` outside `models`, and the
+    // initial model is now exactly that field — nothing left to re-check.
+    let initial_model = profile.model.clone();
     let mut entries = Vec::with_capacity(file.profiles.len());
     for (id, profile) in file.profiles {
-        let selected = id == initial_provider;
-        let base = selected_base(&profile, selected, env)?;
-        let credential = selected_credential(&profile, selected, env)?;
+        let base = profile.base_url.clone();
+        let credential = profile.auth.clone();
         let availability = if credential.is_some() {
             ProviderAvailabilityCode::Ready
         } else {
@@ -199,7 +177,7 @@ fn resolve_table(
         let endpoint_fingerprint = Provider::endpoint_fingerprint_for(api_family, &base);
         let wire = profile.wire;
         let prompt_cache = profile.prompt_cache;
-        let default_effort = selected_effort(&profile, selected, env)?;
+        let default_effort = profile.effort;
         let factory = Arc::new(move || {
             let cred = credential
                 .clone()
@@ -265,128 +243,6 @@ fn resolve_table(
         initial_provider,
         initial_route,
         initial_context_window,
-    })
-}
-
-fn env_only_file(env: &dyn Fn(&str) -> Option<String>) -> Result<GlobalFile> {
-    let id = nonempty_env(env, "KLOOP_PROVIDER")?.context(
-        "no provider configured: set KLOOP_PROVIDER or declare provider in ~/.kloop/config.toml",
-    )?;
-    let wire = match id.as_str() {
-        "anthropic" => Rail::Anthropic,
-        "openai" | "openai-compat" => Rail::OpenAiChat,
-        "openai-responses" => Rail::OpenAiResponses,
-        _ => bail!("provider '{id}' requires a declared providers profile"),
-    };
-    let model = match wire {
-        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_MODEL")?,
-        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_MODEL")?,
-    }
-    .or(nonempty_env(env, "KLOOP_MODEL")?)
-    .unwrap_or_else(|| {
-        if wire == Rail::Anthropic {
-            "claude-sonnet-5".into()
-        } else {
-            "gpt-5.6-sol".into()
-        }
-    });
-    let key = match wire {
-        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_API_KEY")?,
-        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_API_KEY")?,
-    }
-    .context("provider credentials missing; set the provider API key environment variable")?;
-    let base = match wire {
-        Rail::Anthropic => nonempty_env(env, "ANTHROPIC_BASE_URL")?,
-        Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_BASE_URL")?,
-    }
-    .unwrap_or_else(|| wire.default_base().into());
-    let base_url = validate_base_url(&base, "provider base URL")?;
-    let profile = Profile {
-        wire,
-        base_url,
-        auth: Some(Credential::new(wire.default_auth(), key)),
-        model: model.clone(),
-        models: vec![model],
-        prompt_cache: wire == Rail::Anthropic,
-        // `KLOOP_EFFORT` is applied by `selected_effort` for the selected
-        // provider — which, here, is the only one.
-        effort: None,
-        // No config file to declare it in; the global default applies.
-        context_window: None,
-    };
-    Ok(GlobalFile {
-        initial_provider: id.clone(),
-        profiles: BTreeMap::from([(id, profile)]),
-        model_knowledge: BTreeMap::new(),
-    })
-}
-
-fn selected_base(
-    profile: &Profile,
-    selected: bool,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<String> {
-    let override_name = match profile.wire {
-        Rail::Anthropic => "ANTHROPIC_BASE_URL",
-        Rail::OpenAiChat | Rail::OpenAiResponses => "OPENAI_BASE_URL",
-    };
-    if selected && let Some(base) = nonempty_env(env, override_name)? {
-        return validate_base_url(&base, override_name);
-    }
-    Ok(profile.base_url.clone())
-}
-
-/// The effort this provider starts a session at: `KLOOP_EFFORT` beats the
-/// profile's own `effort`. Like the base URL and credential overrides, the env
-/// source applies to the selected provider only — it must not silently retarget
-/// the others. Only the spelling is checked (at parse time): which levels are
-/// legal belongs to the model, not the wire, and the provider names its own
-/// supported set on refusal.
-fn selected_effort(
-    profile: &Profile,
-    selected: bool,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<ReasoningEffort>> {
-    Ok(if selected {
-        parse_effort_env(env)?.or(profile.effort)
-    } else {
-        profile.effort
-    })
-}
-
-fn parse_effort_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Option<ReasoningEffort>> {
-    nonempty_env(env, "KLOOP_EFFORT")?
-        .map(|raw| {
-            raw.parse::<ReasoningEffort>()
-                .map_err(|e| anyhow!("KLOOP_EFFORT: {e}"))
-        })
-        .transpose()
-}
-
-/// The env var replaces the secret, never the presentation: which header a
-/// gateway wants is a property of the gateway, so a profile that declared
-/// `auth_header` keeps its spelling even when the secret arrives from the
-/// environment. Only a profile that declared nothing falls back to the rail's.
-fn selected_credential(
-    profile: &Profile,
-    selected: bool,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<Credential>> {
-    let from_env = if selected {
-        match profile.wire {
-            Rail::Anthropic => nonempty_env(env, "ANTHROPIC_API_KEY")?,
-            Rail::OpenAiChat | Rail::OpenAiResponses => nonempty_env(env, "OPENAI_API_KEY")?,
-        }
-    } else {
-        None
-    };
-    let scheme = profile
-        .auth
-        .as_ref()
-        .map_or_else(|| profile.wire.default_auth(), Credential::scheme);
-    Ok(match from_env {
-        Some(secret) => Some(Credential::new(scheme, secret)),
-        None => profile.auth.clone(),
     })
 }
 
@@ -555,8 +411,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     for key in spec.keys() {
         if !matches!(
             key.as_str(),
-            "name"
-                | "wire_api"
+            "wire_api"
                 | "base_url"
                 | "auth_header"
                 | "model"
@@ -568,7 +423,6 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
             bail!("providers.{id} has unknown key '{key}'");
         }
     }
-    let _display_name = optional_string(spec, "name", &format!("providers.{id}.name"))?;
     let wire = parse_wire(
         &required_string(spec, "wire_api", &format!("providers.{id}.wire_api"))?,
         id,
@@ -772,10 +626,6 @@ fn nonempty(raw: &str, field: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn nonempty_env(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<Option<String>> {
-    env(name).map(|value| nonempty(&value, name)).transpose()
-}
-
 fn bearer_from_header(value: &str) -> Option<String> {
     let (scheme, key) = value.split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !key.trim().is_empty()).then(|| key.trim().into())
@@ -784,14 +634,6 @@ fn bearer_from_header(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn env<'a>(entries: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |name| {
-            entries
-                .iter()
-                .find_map(|(key, value)| (*key == name).then(|| (*value).to_string()))
-        }
-    }
 
     const CATALOG: &str = r#"
 provider = "anthropic-a"
@@ -845,20 +687,19 @@ context_window = 258400
 "#
         .parse()
         .unwrap();
-        let selected = resolve_table(Some(&table), &env(&[])).unwrap();
+        let selected = resolve_table(Some(&table)).unwrap();
         assert_eq!(selected.initial_context_window(), Some(258_400));
 
         // The other provider's 111000 must not leak in when it is selected away
         // from; and a profile without the key declares nothing.
-        let other =
-            resolve_table(Some(&table), &env(&[("KLOOP_PROVIDER", "anthropic-a")])).unwrap();
+        let mut other_table = table.clone();
+        other_table.insert("provider".into(), "anthropic-a".into());
+        let other = resolve_table(Some(&other_table)).unwrap();
         assert_eq!(other.initial_context_window(), Some(111_000));
 
         let bare: toml::Table = CATALOG.parse().unwrap();
         assert_eq!(
-            resolve_table(Some(&bare), &env(&[]))
-                .unwrap()
-                .initial_context_window(),
+            resolve_table(Some(&bare)).unwrap().initial_context_window(),
             None
         );
     }
@@ -888,7 +729,7 @@ models = ["gpt-a"]
             )
             .parse()
             .unwrap();
-            let error = resolve_table(Some(&table), &env(&[]))
+            let error = resolve_table(Some(&table))
                 .err()
                 .expect("invalid context_window must be rejected")
                 .to_string();
@@ -898,7 +739,7 @@ models = ["gpt-a"]
 
     #[test]
     fn canonical_catalog_preserves_ordered_allowlists_and_availability() {
-        let settings = resolve(Some(CATALOG), &env(&[])).unwrap();
+        let settings = resolve(Some(CATALOG)).unwrap();
         assert_eq!(settings.initial_provider(), "anthropic-a");
         assert_eq!(settings.model(), "claude-a");
         let descriptors = settings.catalog().descriptors();
@@ -910,43 +751,25 @@ models = ["gpt-a"]
         );
     }
 
+    /// The file names the initial route, and a model outside the profile's own
+    /// allowlist is refused where it is written.
     #[test]
-    fn environment_selects_only_declared_initial_routes() {
-        let settings = resolve(
-            Some(CATALOG),
-            &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_MODEL", "gpt-b")]),
-        )
+    fn the_file_selects_the_initial_route() {
+        let settings = resolve(Some(
+            &CATALOG.replace("provider = \"anthropic-a\"", "provider = \"responses-b\""),
+        ))
         .unwrap();
         assert_eq!(settings.initial_provider(), "responses-b");
-        assert_eq!(settings.model(), "gpt-b");
+        assert_eq!(settings.model(), "gpt-a");
 
-        let error = resolve(
-            Some(CATALOG),
-            &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_MODEL", "raw")]),
-        )
+        let error = resolve(Some(&CATALOG.replace(
+            "model = \"gpt-a\"\nmodels = [\"gpt-a\", \"gpt-b\"]",
+            "model = \"raw\"\nmodels = [\"gpt-a\", \"gpt-b\"]",
+        )))
         .err()
         .unwrap()
         .to_string();
-        assert!(error.contains("allowlist"));
-    }
-
-    #[test]
-    fn selected_environment_credentials_do_not_make_other_profiles_ready() {
-        let raw = CATALOG.replace("auth_header = { Authorization = \"Bearer b-key\" }", "");
-        let settings = resolve(
-            Some(&raw),
-            &env(&[
-                ("KLOOP_PROVIDER", "responses-b"),
-                ("OPENAI_API_KEY", "selected-key"),
-            ]),
-        )
-        .unwrap();
-        let descriptors = settings.catalog().descriptors();
-        assert_eq!(descriptors[2].availability, ProviderAvailabilityCode::Ready);
-        assert_eq!(
-            descriptors[1].availability,
-            ProviderAvailabilityCode::MissingCredential
-        );
+        assert!(error.contains("allowlist"), "{error}");
     }
 
     #[test]
@@ -959,7 +782,7 @@ default_model = "old"
 auth_header = { Authorization = "Bearer key" }
 "#;
         assert!(
-            resolve(Some(retired), &env(&[]))
+            resolve(Some(retired))
                 .err()
                 .unwrap()
                 .to_string()
@@ -969,7 +792,7 @@ auth_header = { Authorization = "Bearer key" }
         let outside_allowlist = "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\n\
              auth_header = { Authorization = \"Bearer key\" }\n\
              model = \"missing\"\nmodels = [\"a\"]\n";
-        assert!(resolve(Some(outside_allowlist), &env(&[])).is_err());
+        assert!(resolve(Some(outside_allowlist)).is_err());
     }
 
     fn auth_of(raw: &str) -> Result<Option<Credential>> {
@@ -1004,7 +827,7 @@ auth_header = { Authorization = "Bearer key" }
         // and authenticates with Bearer.
         let gateway = "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
              auth_header = { Authorization = \"Bearer k\" }\nmodel = \"m\"\n";
-        let resolved = resolve(Some(gateway), &env(&[])).unwrap();
+        let resolved = resolve(Some(gateway)).unwrap();
         assert_eq!(
             resolved.catalog().descriptors()[0].availability,
             ProviderAvailabilityCode::Ready
@@ -1049,54 +872,8 @@ auth_header = { Authorization = "Bearer key" }
         let retired = "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
              http_headers = { x-api-key = \"k\" }\nmodel = \"m\"\n";
         assert_eq!(
-            resolve(Some(retired), &env(&[]))
-                .map(|_| ())
-                .unwrap_err()
-                .to_string(),
+            resolve(Some(retired)).map(|_| ()).unwrap_err().to_string(),
             "providers.x has unknown key 'http_headers'"
-        );
-    }
-
-    /// An environment credential replaces the secret, never the presentation:
-    /// the header a gateway reads is a property of the gateway, not of where the
-    /// secret came from. A profile that declared nothing falls back to what the
-    /// wire's own vendor sends.
-    #[test]
-    fn environment_credentials_replace_the_secret_not_the_spelling() {
-        let profile = |wire: Rail, auth: Option<Credential>| Profile {
-            wire,
-            base_url: "https://gateway.test".into(),
-            auth,
-            model: "m".into(),
-            models: vec!["m".into()],
-            prompt_cache: false,
-            effort: None,
-            context_window: None,
-        };
-        let from_env = |profile: &Profile, selected: bool, var: &str| {
-            selected_credential(profile, selected, &env(&[(var, "env-key")])).unwrap()
-        };
-
-        let declared = profile(Rail::Anthropic, Some(Credential::bearer("file-key")));
-        assert_eq!(
-            from_env(&declared, /*selected=*/ true, "ANTHROPIC_API_KEY"),
-            Some(Credential::bearer("env-key"))
-        );
-        // Unselected profiles are never retargeted by the environment.
-        assert_eq!(
-            from_env(&declared, /*selected=*/ false, "ANTHROPIC_API_KEY"),
-            Some(Credential::bearer("file-key"))
-        );
-
-        let undeclared = profile(Rail::Anthropic, None);
-        assert_eq!(
-            from_env(&undeclared, /*selected=*/ true, "ANTHROPIC_API_KEY"),
-            Some(Credential::api_key("env-key"))
-        );
-        let chat = profile(Rail::OpenAiChat, None);
-        assert_eq!(
-            from_env(&chat, /*selected=*/ true, "OPENAI_API_KEY"),
-            Some(Credential::bearer("env-key"))
         );
     }
 
@@ -1198,7 +975,7 @@ auth_header = { Authorization = "Bearer key" }
                 "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\n\
                  auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
             );
-            resolve(Some(&raw), &env(&[])).map(|_| ())
+            resolve(Some(&raw)).map(|_| ())
         };
 
         assert!(profile("").is_ok());
@@ -1229,13 +1006,13 @@ auth_header = { Authorization = "Bearer key" }
             )
         };
         assert_eq!(
-            resolve(Some(&profile("vendor")), &env(&[]))
+            resolve(Some(&profile("vendor")))
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
             "providers.x.wire_api must be messages | chat | responses"
         );
-        let resolved = resolve(Some(&profile("messages")), &env(&[])).unwrap();
+        let resolved = resolve(Some(&profile("messages"))).unwrap();
         assert_eq!(
             resolved.catalog().descriptors()[0].api_family,
             ProviderApiFamily::AnthropicMessages
@@ -1257,7 +1034,7 @@ auth_header = { Authorization = "Bearer key" }
     #[test]
     fn the_effective_window_is_the_smaller_of_the_model_and_the_gateway() {
         let window = |gateway: &str, models: &str| {
-            resolve(Some(&with_knowledge(gateway, models)), &env(&[]))
+            resolve(Some(&with_knowledge(gateway, models)))
                 .unwrap()
                 .initial_context_window()
         };
@@ -1282,7 +1059,7 @@ auth_header = { Authorization = "Bearer key" }
                  auth_header = {{ Authorization = \"Bearer k\" }}\n\
                  model = \"m\"\neffort = \"{effort}\"\n{models}"
             );
-            resolve(Some(&raw), &env(&[])).map(|_| ())
+            resolve(Some(&raw)).map(|_| ())
         };
         let narrow = "[models.m]\nefforts = [\"low\", \"high\"]\n";
 
@@ -1304,7 +1081,7 @@ auth_header = { Authorization = "Bearer key" }
     #[test]
     fn model_knowledge_fails_closed_on_empty_and_malformed_declarations() {
         let error = |models: &str| {
-            resolve(Some(&with_knowledge("", models)), &env(&[]))
+            resolve(Some(&with_knowledge("", models)))
                 .map(|_| ())
                 .unwrap_err()
                 .to_string()
@@ -1340,13 +1117,13 @@ auth_header = { Authorization = "Bearer key" }
             )
         };
         assert_eq!(
-            resolve(Some(&with_id("\"gpt-5.6-sol\"")), &env(&[]))
+            resolve(Some(&with_id("\"gpt-5.6-sol\"")))
                 .unwrap()
                 .initial_context_window(),
             Some(400_000)
         );
         assert_eq!(
-            resolve(Some(&with_id("gpt-5.6-sol")), &env(&[]))
+            resolve(Some(&with_id("gpt-5.6-sol")))
                 .map(|_| ())
                 .unwrap_err()
                 .to_string(),
@@ -1361,7 +1138,7 @@ auth_header = { Authorization = "Bearer key" }
             "provider = \"x\"\n[providers.x]\nwire_api = \"bad\"\nauth_header = { Authorization = \"Bearer SENTINEL\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
             "provider = \"x\"\n[providers.x]\nwire_api = \"responses\"\nbase_url = \"https://SENTINEL@example.test/v1\"\nauth_header = { Authorization = \"Bearer key\" }\nmodel = \"m\"\nmodels = [\"m\"]\n",
         ] {
-            let error = resolve(Some(raw), &env(&[])).err().unwrap().to_string();
+            let error = resolve(Some(raw)).err().unwrap().to_string();
             assert!(!error.contains("SENTINEL"), "secret reflected: {error}");
         }
     }
@@ -1390,7 +1167,7 @@ models = ["gpt-a"]
 effort = "none"
 "#;
         // Every profile keeps its own; nothing above it can retarget them.
-        let configured = resolve(Some(WITH_EFFORT), &env(&[])).unwrap();
+        let configured = resolve(Some(WITH_EFFORT)).unwrap();
         assert_eq!(
             configured.catalog().default_effort("anthropic-a"),
             Some(ReasoningEffort::Low)
@@ -1398,21 +1175,6 @@ effort = "none"
         assert_eq!(
             configured.catalog().default_effort("responses-b"),
             Some(ReasoningEffort::None)
-        );
-
-        // The environment beats the selected profile, and follows the selection.
-        let from_env = resolve(
-            Some(WITH_EFFORT),
-            &env(&[("KLOOP_PROVIDER", "responses-b"), ("KLOOP_EFFORT", "high")]),
-        )
-        .unwrap();
-        assert_eq!(
-            from_env.catalog().default_effort("responses-b"),
-            Some(ReasoningEffort::High)
-        );
-        assert_eq!(
-            from_env.catalog().default_effort("anthropic-a"),
-            Some(ReasoningEffort::Low)
         );
     }
 
@@ -1431,7 +1193,7 @@ models = ["gpt-a"]
 effort = "xhigh"
 "#;
         assert_eq!(
-            resolve(Some(XHIGH_ON_RESPONSES), &env(&[]))
+            resolve(Some(XHIGH_ON_RESPONSES))
                 .unwrap()
                 .catalog()
                 .default_effort("responses-b"),
@@ -1449,19 +1211,8 @@ models = ["claude-a"]
 effort = "sky-high"
 "#;
         assert_eq!(
-            resolve(Some(TYPO), &env(&[]))
-                .map(|_| ())
-                .unwrap_err()
-                .to_string(),
+            resolve(Some(TYPO)).map(|_| ()).unwrap_err().to_string(),
             "providers.anthropic-a.effort: unknown effort 'sky-high' \
-             (known: none, low, medium, high, xhigh, max)"
-        );
-        assert_eq!(
-            resolve(Some(XHIGH_ON_RESPONSES), &env(&[("KLOOP_EFFORT", "hgih")]))
-                .map(|_| ())
-                .unwrap_err()
-                .to_string(),
-            "KLOOP_EFFORT: unknown effort 'hgih' \
              (known: none, low, medium, high, xhigh, max)"
         );
     }
