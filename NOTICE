@@ -1,0 +1,14 @@
+kloop
+Copyright 2026 lizc2003@gmail.com
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+--------------------------------------------------------------------
+Third-party material in this repository, NOT covered by that license:
+
+  refs/claude-code-2.1.220/
+      A pinned parity corpus generated against Anthropic's Claude Code
+      2.1.220 CLI: captured outputs of that program plus byte-anchored
+      excerpts of its bundle. It is kept as the evidence behind the
+      behavioural comparisons in docs/, not as kloop's own work. No
+      license to it is granted here; rights remain with Anthropic.

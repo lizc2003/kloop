@@ -73,3 +73,10 @@ effort      = "high"
 | `config/` | 配置样例 |
 
 `make help` 列出全部构建目标(`make check` = fmt + clippy + test,与 CI 同令)。
+
+## 许可
+
+[Apache-2.0](LICENSE),Copyright 2026 lizc2003@gmail.com。
+
+一个例外:`refs/claude-code-2.1.220/` 是对着 Claude Code 2.1.220 跑出来的 parity 语料,
+含第三方产物,不在本许可之内 —— 见 [`NOTICE`](NOTICE)。
