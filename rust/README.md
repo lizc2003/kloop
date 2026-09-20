@@ -2177,13 +2177,15 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   host being `localhost`: the port it appears to match is never consulted, and
   on the *local* address it does not discriminate at all — so a sandboxed
   process can listen on **every interface**, not only loopback, and no rule can
-  tell a test server's random port from a proxy's. Since a loopback proxy would
-  therefore turn the denied network straight back into an open one, denying the
-  network also **strips `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`FTP_PROXY`**
-  (both spellings) from the command's environment — that is the route every
-  HTTP client takes by default, and in a denied sandbox the variables have no
-  other use. A command that spells the proxy out itself (`curl -x …`) still
-  reaches it; deliberate evasion is not what this boundary is for.
+  tell a test server's random port from a proxy's. So **what a denied network
+  actually denies is the direct route off the machine**: on a host running a
+  loopback proxy, a client that reads `HTTPS_PROXY` still gets out. kloop does
+  not close that by editing the command's environment (plan 170 stripped the
+  proxy variables; plan 173 stopped): a command has to behave the same run by
+  hand as run here, and a boundary maintained by quietly removing the user's
+  own configuration reads as a guarantee it cannot keep. Credentials are the
+  one exception — see below — because those belong to this process, not to the
+  command.
 - **Sandboxed = fewer questions** (`trust_sandboxed`, default on): a bash call
   the sandbox will contain skips the asking layers of the permission gate —
   opaque scripts (substitutions, subshells) included, since OS containment

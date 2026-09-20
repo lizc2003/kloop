@@ -144,37 +144,6 @@ pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
     }
 }
 
-/// Both spellings of each: Go reads the uppercase form, curl prefers the
-/// lowercase one, and a shell that keeps either keeps the route.
-const MODEL_SHELL_PROXY_ENV: &[&str] = &[
-    "ALL_PROXY",
-    "all_proxy",
-    "FTP_PROXY",
-    "ftp_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-];
-
-/// The sandbox lets a command reach loopback, because that is where its own
-/// test servers listen — and a proxy on a loopback port is therefore reachable
-/// too, which turns a denied network back into an open one for every client
-/// that reads these variables, which is all of them. Seatbelt cannot separate
-/// the two: its network filter only matches on the host being `localhost`, and
-/// the port it appears to also match is not actually consulted (measured, plan
-/// 170 — `deny … "localhost:7897"` lets the proxy through, `"localhost:*"`
-/// blocks the test server as well). So the split is made here instead: with the
-/// network denied, the shell is simply not told where the proxy is. A command
-/// that spells the proxy out itself (`curl -x …`) still reaches it; that is the
-/// accepted edge, not an oversight — deliberate evasion has other routes out of
-/// a sandbox whose reads are full-disk.
-pub(super) fn scrub_model_shell_proxy_env(spec: &mut ProcessSpec) {
-    for name in MODEL_SHELL_PROXY_ENV {
-        spec.env_remove(*name);
-    }
-}
-
 /// The process spec for the frozen Bash-family executable's `-lc <command>`,
 /// wrapped in the OS sandbox when a policy applies. The env vars are hints only;
 /// enforcement is the profile.
@@ -197,7 +166,6 @@ fn shell_spec(
         spec.env("KLOOP_SANDBOX", "seatbelt");
         if !policy.allow_network {
             spec.env("KLOOP_SANDBOX_NETWORK_DISABLED", "1");
-            scrub_model_shell_proxy_env(&mut spec);
         }
     }
     // Provider/search credentials belong to the parent process, never to a
@@ -1522,13 +1490,13 @@ Wait-Process -Id $grandchild.Id
         assert!(text.contains("KEEP_ME=visible"), "{text}");
     }
 
-    /// Denying the network has to take the proxy route with it: loopback is
-    /// inside the sandbox's reach (that is where test servers listen), so a
-    /// proxy listening there is reachable too, and leaving these variables set
-    /// hands every HTTP client a way off the machine. With the network allowed
-    /// they are ordinary configuration and stay.
+    /// The shell's environment is the user's, minus this process's own
+    /// credentials — and nothing else, whether or not the network is denied.
+    /// kloop used to also strip the proxy variables under a denied network
+    /// (plan 170); it no longer does (plan 173), because a command has to
+    /// behave the same run by hand as run here.
     #[test]
-    fn a_denied_network_scrubs_the_proxy_route_an_allowed_one_keeps_it() {
+    fn only_this_process_credentials_leave_the_shell_environment() {
         let shell = crate::shell_programs::ShellPrograms::test_fixture()
             .bash
             .expect("test shell is available");
@@ -1556,20 +1524,7 @@ Wait-Process -Id $grandchild.Id
             "TAVILY_API_KEY",
             "BRAVE_API_KEY",
         ];
-        let proxies = [
-            "ALL_PROXY",
-            "all_proxy",
-            "FTP_PROXY",
-            "ftp_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-        ];
-        assert_eq!(
-            scrubbed(/*allow_network*/ false),
-            sorted(&[secrets.as_slice(), proxies.as_slice()].concat())
-        );
+        assert_eq!(scrubbed(/*allow_network*/ false), sorted(&secrets));
         assert_eq!(scrubbed(/*allow_network*/ true), sorted(&secrets));
     }
 

@@ -173,3 +173,13 @@ README 的 OS sandbox 段落重写了 network 那一条(回环例外 + 两条实
 `cargo fmt` 干净,`clippy --all-targets -- -D warnings` 全绿,`cargo test` **1600 passed / 0 failed**。
 
 教训 166(两条:filter 的语法粒度 ≠ 判定粒度;放宽一道门先问它顺手放开了哪条既有的路)。
+
+## ⚠️ 后半段已被 plan 173 推翻(2026-09-20 同日)
+
+(b) 那一刀——禁网时 `env_remove` 掉代理变量——**撤掉了**。处境的判断没错(seatbelt 确实表达
+不了"放行回环但不放行回环上的代理"),错的是补救的形态:**它靠篡改用户的环境来维持一道边界,
+而运行时没有任何线索告诉用户这件事发生了**。同一份代码里,反方向的 `disable_sandbox` 尚且有
+`[no sandbox]` 通告。
+
+于是 `allow_network = false` 的承诺缩到它真做得到的那句:封的是直连;一台跑着回环代理的机器
+上,读 `HTTPS_PROXY` 的客户端仍然出得去。详见 plan 173。
