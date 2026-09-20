@@ -3297,6 +3297,19 @@ snapshot is not a runtime dependency.
 
 ## Running
 
+From the repository root a `Makefile` wraps the commands below: `make` (release
+build), `make debug`, `make test`, `make check` (fmt + clippy + test — the same
+three CI runs), `make mock`, `make parity`, `make help` for the rest. It shells
+into `rust/`, which is where the workspace lives.
+
+`make install` puts the release binary in `$BINDIR` (default `~/.local/bin`;
+override `PREFIX` or `BINDIR`) and, **only when `~/.kloop/config.toml` does not
+exist**, copies `config/config-demo.toml` there — creating `~/.kloop` as 0700 and
+the file as 0600, the modes kloop requires — then tells you to edit it before the
+first run. An existing config is never read, rewritten or backed up: it holds this
+machine's gateway and credential, so the install has nothing to say about it.
+`make uninstall` removes the binary and leaves `~/.kloop` alone.
+
 Building the workspace requires Rust 1.96 or newer and uses Rust edition
 2024. The repository's `rust/rust-toolchain.toml` pins local development to
 Rust 1.96.1 with rustfmt and clippy; CI's stable matrix explicitly invokes
