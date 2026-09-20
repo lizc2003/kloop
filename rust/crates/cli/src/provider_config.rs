@@ -451,9 +451,18 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
         }
         // The keys of a budget table are that model's accepted levels, so the
         // existing effort gate needs no second source to consult — and a model
-        // that takes no effort field at all finally has a way to say so.
+        // that takes no effort field at all finally has a way to say so. `none`
+        // joins them: a budget for "do no reasoning" would be a contradiction
+        // (and is refused above), but the level itself is still expressible —
+        // it renders to a disabled thinking field, which every model on this
+        // rail takes. Leaving it out would let the gate refuse a level the
+        // renderer handles.
         let efforts = match &thinking_budgets {
-            Some(budgets) => Some(budgets.keys().copied().collect()),
+            Some(budgets) => Some(
+                std::iter::once(ReasoningEffort::None)
+                    .chain(budgets.keys().copied())
+                    .collect(),
+            ),
             None => parse_efforts(spec, &id)?,
         };
         knowledge.insert(
@@ -1112,13 +1121,41 @@ auth_header = { Authorization = "Bearer key" }
                 "claude-haiku-4-5".to_string(),
                 ModelKnowledge {
                     context_window: None,
-                    efforts: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
+                    // `none` rides along: it is not a budget, it is the
+                    // disabled thinking field, and the renderer takes it on
+                    // every model.
+                    efforts: Some(vec![
+                        ReasoningEffort::None,
+                        ReasoningEffort::Low,
+                        ReasoningEffort::High,
+                    ]),
                     thinking_budgets: Some(BTreeMap::from([
                         (ReasoningEffort::Low, 2048),
                         (ReasoningEffort::High, 16384),
                     ])),
                 },
             )])
+        );
+    }
+
+    /// A budget for "do no reasoning" is a contradiction, so the table refuses
+    /// one — but the level itself still has to work, because it renders to a
+    /// disabled thinking field rather than to a budget. Leaving `none` out of
+    /// the derived list would let the gate refuse what the renderer handles.
+    #[test]
+    fn none_survives_a_budget_table_without_being_given_a_budget() {
+        let parsed = knowledge(
+            "[models.\"claude-haiku-4-5\"]\n\
+             thinking_budget = { low = 2048 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["claude-haiku-4-5"].efforts,
+            Some(vec![ReasoningEffort::None, ReasoningEffort::Low])
+        );
+        assert_eq!(
+            parsed["claude-haiku-4-5"].thinking_budgets,
+            Some(BTreeMap::from([(ReasoningEffort::Low, 2048)]))
         );
     }
 

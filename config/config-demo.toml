@@ -41,18 +41,21 @@ effort      = "max"
 
 
 # [models."<id>"] — facts about a model, shared by every provider. All optional.
+# A declared `efforts` list is the WHOLE list: leave "none" out and /effort none
+# is refused on that model, so list it unless the model really rejects it.
 
 [models."claude-opus-4-8"]
-efforts = ["low", "medium", "high", "xhigh", "max"]
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 [models."claude-sonnet-4-6"]
-efforts = ["low", "medium", "high", "max"]              # no xhigh
+efforts = ["none", "low", "medium", "high", "max"]      # no xhigh
 
 # Models that read a token budget instead of an effort field. The keys are this
-# model's accepted levels too, so do not also declare `efforts`.
+# model's accepted levels too (plus "none", which is a disabled thinking field
+# rather than a budget), so do not also declare `efforts`.
 [models."claude-haiku-4-5"]
 thinking_budget = { low = 2048, medium = 8192, high = 16384 }
 
 [models."gpt-5.6-sol"]
 context_window = 400000
-efforts = ["low", "medium", "high", "xhigh", "max"]
+efforts = ["none", "low", "medium", "high", "xhigh", "max"]

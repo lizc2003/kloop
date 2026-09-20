@@ -174,3 +174,26 @@ openai-compat   request to https://gateway.example.com/v1/chat/completions faile
 三条 URL 同时印证了注释里写的拼接规则(messages 的 base 不带 `/v1`,另两条带)。
 注释里"`prompt_cache`/`thinking` 只在 messages 合法,写 `false` 也报错"这句也单独验了一次
 ——示例文档里的断言和代码一样会过期,能跑的验收才算数。
+
+
+### 追加订正 — budget 表把 `none` 弄丢了(同日)
+
+> 用户看 `config/config-demo.toml` 时指出"模型的 efforts 没有体现出 none"。顺着查出两处。
+
+**一、代码 bug。** 本 plan 让 budget 表的键充当该模型的 `efforts`,但 `none` 从来不是一个
+budget(`parse_thinking_budget` 明确拒绝给它预算),于是它没进那份派生列表——**渲染层和门禁
+就此不一致**:`ThinkingRouting::resolve` 首先判 `none → Off`(对的,那是 disabled thinking 字段,
+不是预算),而 `effort_supported` 会拒掉同一个值。`/effort none` 在 haiku 上被拦,拦的是渲染层
+本来处理得好好的东西。修法是派生列表里补上 `none`。
+
+**二、示例配置在教人把自己锁死。** `efforts` 是**整份**清单,漏写 `none` 就等于宣布该模型不能
+停止推理。demo 里三份清单都漏了,而这三个模型(opus-4-8 / sonnet-4-6 / gpt-5.6-sol)实际都收
+`none`。已补齐,并在 `[models.*]` 段首写明这条语义。
+
+判据:**一个派生出来的清单,要对着消费它的那一段逐条比,而不是对着它的来源。** 键来自 budget
+表是对的,但消费它的是效力门禁,门禁认的是"这个模型接受哪些档位"——两者差的正是那个不需要
+预算、却依然合法的档位。
+
+验证:`none_survives_a_budget_table_without_being_given_a_budget`(单测),外加真跑——
+`KLOOP_MODEL=claude-haiku-4-5 KLOOP_EFFORT=none` 走到发请求,而 `xhigh` 仍被拒并列出
+`none, low, medium, high`。提交见 git log(紧接 `c91a7aa`)。
