@@ -150,4 +150,4 @@ README 里 `KLOOP_CACHE` / `KLOOP_THINKING` 那半句是过时的——`provider
 - 验证:`cargo fmt --all`、`cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo test --workspace`(1595 passed)全绿;`cargo run -p kloop -- --mock --headless` 跑通。
   **真实网关未验**——opus-4-8 由"不思考"变成 adaptive 的实际差异要花用户额度,单独确认。
-- 提交:本次(plan 168,见 git log)。
+- 提交:`0e5de72`。
