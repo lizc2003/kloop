@@ -144,6 +144,37 @@ pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
     }
 }
 
+/// Both spellings of each: Go reads the uppercase form, curl prefers the
+/// lowercase one, and a shell that keeps either keeps the route.
+const MODEL_SHELL_PROXY_ENV: &[&str] = &[
+    "ALL_PROXY",
+    "all_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+/// The sandbox lets a command reach loopback, because that is where its own
+/// test servers listen — and a proxy on a loopback port is therefore reachable
+/// too, which turns a denied network back into an open one for every client
+/// that reads these variables, which is all of them. Seatbelt cannot separate
+/// the two: its network filter only matches on the host being `localhost`, and
+/// the port it appears to also match is not actually consulted (measured, plan
+/// 170 — `deny … "localhost:7897"` lets the proxy through, `"localhost:*"`
+/// blocks the test server as well). So the split is made here instead: with the
+/// network denied, the shell is simply not told where the proxy is. A command
+/// that spells the proxy out itself (`curl -x …`) still reaches it; that is the
+/// accepted edge, not an oversight — deliberate evasion has other routes out of
+/// a sandbox whose reads are full-disk.
+pub(super) fn scrub_model_shell_proxy_env(spec: &mut ProcessSpec) {
+    for name in MODEL_SHELL_PROXY_ENV {
+        spec.env_remove(*name);
+    }
+}
+
 /// The process spec for the frozen Bash-family executable's `-lc <command>`,
 /// wrapped in the OS sandbox when a policy applies. The env vars are hints only;
 /// enforcement is the profile.
@@ -166,6 +197,7 @@ fn shell_spec(
         spec.env("KLOOP_SANDBOX", "seatbelt");
         if !policy.allow_network {
             spec.env("KLOOP_SANDBOX_NETWORK_DISABLED", "1");
+            scrub_model_shell_proxy_env(&mut spec);
         }
     }
     // Provider/search credentials belong to the parent process, never to a
@@ -1490,6 +1522,57 @@ Wait-Process -Id $grandchild.Id
         assert!(text.contains("KEEP_ME=visible"), "{text}");
     }
 
+    /// Denying the network has to take the proxy route with it: loopback is
+    /// inside the sandbox's reach (that is where test servers listen), so a
+    /// proxy listening there is reachable too, and leaving these variables set
+    /// hands every HTTP client a way off the machine. With the network allowed
+    /// they are ordinary configuration and stay.
+    #[test]
+    fn a_denied_network_scrubs_the_proxy_route_an_allowed_one_keeps_it() {
+        let shell = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .expect("test shell is available");
+        let cwd = std::env::current_dir().unwrap();
+        let scrubbed = |allow_network: bool| {
+            let policy = crate::sandbox::SandboxPolicy::workspace(&cwd, &[], allow_network);
+            let spec = super::shell_spec("true", &cwd, Some(&policy), &shell);
+            let mut names: Vec<String> = spec
+                .env_remove
+                .iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let sorted = |names: &[&str]| {
+            let mut owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+            owned.sort();
+            owned
+        };
+        let secrets = [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "TAVILY_API_KEY",
+            "BRAVE_API_KEY",
+        ];
+        let proxies = [
+            "ALL_PROXY",
+            "all_proxy",
+            "FTP_PROXY",
+            "ftp_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ];
+        assert_eq!(
+            scrubbed(/*allow_network*/ false),
+            sorted(&[secrets.as_slice(), proxies.as_slice()].concat())
+        );
+        assert_eq!(scrubbed(/*allow_network*/ true), sorted(&secrets));
+    }
+
     #[tokio::test]
     async fn bash_merges_output_and_reports_exit_status() {
         let ctx = test_ctx(0, "bash");
@@ -2366,23 +2449,34 @@ Wait-Process -Id $grandchild.Id
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "freed\n");
         }
 
+        /// The denied network is a boundary around the machine, not around the
+        /// socket API: a command must still reach a listener of its own (plan
+        /// 170 — Go's httptest is this shape, and denying it is what drove a
+        /// whole session out of the sandbox), while anything off the host stays
+        /// refused.
         #[tokio::test]
-        async fn network_is_denied_where_the_bare_run_connects() {
-            // A real local listener makes the pair discriminating: bare
-            // connect succeeds, sandboxed connect is the one that fails.
+        async fn loopback_stays_reachable_while_the_machine_boundary_holds() {
+            // A real local listener makes the first half discriminating: the
+            // connect can only succeed if something is actually listening.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let connect = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
 
             let (ctx, _) = sandbox_ctx("net");
-            let (out, _) = run_tool("bash", bash_input(&connect), &ctx).await;
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("exec 3<>/dev/tcp/127.0.0.1/{port}")),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "loopback must stay reachable sandboxed: {out}");
+            assert!(!out.contains("Operation not permitted"), "{out}");
+
+            // TEST-NET-1 (RFC 5737), never routable. Seatbelt refuses at the
+            // connect syscall, so this needs no network and cannot hang on one.
+            let (out, _) =
+                run_tool("bash", bash_input("exec 3<>/dev/tcp/192.0.2.1/80"), &ctx).await;
             assert!(out.contains("Operation not permitted"), "{out}");
             assert!(out.contains("disable_sandbox: true"), "{out}");
-
-            let bare = test_ctx(0, "net-bare");
-            let (out, is_error) = run_tool("bash", bash_input(&connect), &bare).await;
-            assert!(!is_error, "control run must reach the listener: {out}");
-            assert!(!out.contains("Operation not permitted"), "{out}");
         }
 
         /// Escalation loop, approved: a contained write outside the writable

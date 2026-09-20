@@ -1,0 +1,32 @@
+; kloop's own section, appended when [sandbox] allow_network is OFF: "no
+; network" should not also mean "no local sockets". Go's httptest binds a
+; loopback port for nearly every HTTP test, and the blanket deny turned that
+; into `listen tcp6 [::1]:0: bind: operation not permitted` — which made the
+; model escalate out of the sandbox and stay out for the rest of the session,
+; so every later command lost the auto-allow that containment buys. Upstream
+; codex emits the same three rules (sandboxing/src/seatbelt.rs), in its
+; proxy-restricted mode.
+;
+; What these filters do, measured on macOS 25.4 rather than assumed:
+;
+;   - `host` accepts only `*` and `localhost`. `(local ip "127.0.0.1:*")` is not
+;     a narrower rule, it is a profile syntax error: "host must be * or
+;     localhost in network address".
+;   - On the REMOTE address the filter discriminates: outbound to anything off
+;     this machine stays denied (checked against 1.1.1.1:443).
+;   - On the LOCAL address it does NOT: `(local ip "localhost:*")` admits a
+;     `listen` on `0.0.0.0` exactly as `*:*` would. It is spelled `localhost`
+;     here to state the intent — if macOS ever teaches the local filter to
+;     discriminate, this tightens on its own — but today it is not a guarantee,
+;     and the boundary below is what actually holds.
+;   - `listen()` is gated by network-inbound, not network-bind: drop the inbound
+;     rule and a bound socket still cannot listen, which is the httptest case
+;     itself. So there is no spelling of this that admits httptest and keeps
+;     listening sockets on loopback only.
+;
+; The boundary, then: nothing leaves the machine, but a sandboxed process can
+; listen on every interface rather than just loopback. That is seatbelt's
+; ceiling, not an oversight — accepted deliberately (plan 170).
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))

@@ -24,15 +24,17 @@ pub const SEATBELT_EXE: &str = "/usr/bin/sandbox-exec";
 
 const SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base.sbpl");
 const SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network.sbpl");
+const SEATBELT_LOOPBACK_POLICY: &str = include_str!("seatbelt_loopback.sbpl");
 
 /// Appended to a failed sandboxed bash result when the failure looks like a
 /// sandbox denial — this is what teaches the model the escalation move (cc
 /// keeps the equivalent guidance in its system prompt; a hint at failure time
 /// needs no prompt budget until it is actually relevant).
-pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file writes limited to \
-    the workspace and temp directories; network disabled) and the failure looks like a sandbox \
-    denial. If the command legitimately needs the blocked access, retry with disable_sandbox: \
-    true — that run requires user approval.]";
+pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file writes limited \
+    to the workspace and temp directories; no network beyond this machine, though loopback — a test \
+    server of your own — still works) and the failure looks like a sandbox denial. If the command \
+    legitimately needs the blocked access, retry with disable_sandbox: true — that run requires \
+    user approval.]";
 
 /// Prepended to an escalated (re-run without the sandbox) result so the
 /// model sees the earlier sandboxed failure was resolved by escalation, not
@@ -362,6 +364,12 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
         sections.push(format!(
             "(allow network-outbound)\n(allow network-inbound)\n{SEATBELT_NETWORK_POLICY}"
         ));
+    } else {
+        // "Network off" is about leaving the machine, not about sockets: a test
+        // server on a loopback port never does. Without this the model has to
+        // take the whole sandbox off to run an ordinary test suite — see the
+        // section itself for what these filters can and cannot express.
+        sections.push(SEATBELT_LOOPBACK_POLICY.to_string());
     }
     (sections.join("\n"), params)
 }
@@ -589,9 +597,11 @@ mod tests {
              (require-not (literal (param \"WRITABLE_ROOT_0_RO_0\"))) \
              (require-not (subpath (param \"WRITABLE_ROOT_0_RO_0\"))) )\n\
              )";
+        // Network denied, so the loopback section is the tail — its own text is
+        // locked by `network_denied_still_allows_loopback_but_nothing_off_machine`.
         assert_eq!(
             profile,
-            format!("{SEATBELT_BASE_POLICY}\n{expected_dynamic}")
+            format!("{SEATBELT_BASE_POLICY}\n{expected_dynamic}\n{SEATBELT_LOOPBACK_POLICY}")
         );
         assert_eq!(
             params,
@@ -633,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn network_section_only_when_allowed() {
+    fn network_denied_still_allows_loopback_but_nothing_off_machine() {
         let root = || {
             vec![WritableRoot {
                 root: PathBuf::from("/w"),
@@ -641,14 +651,30 @@ mod tests {
                 read_only_subpaths: vec![],
             }]
         };
+        // Denying the network denies leaving the machine, not opening a socket
+        // on it: the blanket forms stay out, the loopback triple goes in.
         let (off, _) = seatbelt_profile(&policy_with(root(), false));
-        assert!(!off.contains("network-outbound"));
+        assert!(!off.contains("(allow network-outbound)"));
+        assert!(!off.contains("(allow network-inbound)"));
+        for rule in [
+            "(allow network-bind (local ip \"localhost:*\"))",
+            "(allow network-inbound (local ip \"localhost:*\"))",
+            "(allow network-outbound (remote ip \"localhost:*\"))",
+        ] {
+            assert!(off.contains(rule), "missing {rule}:\n{off}");
+        }
+        // Loopback resolves no names, so the DNS/TLS lookups the network
+        // policy exists to grant must not ride along with it.
+        assert!(!off.contains("com.apple.SystemConfiguration.DNSConfiguration"));
 
         let (on, _) = seatbelt_profile(&policy_with(root(), true));
         assert!(on.contains("(allow network-outbound)\n(allow network-inbound)"));
         assert!(on.contains("com.apple.SystemConfiguration.DNSConfiguration"));
+        // Already unrestricted — the loopback section would only be noise.
+        assert!(!on.contains("(allow network-bind (local ip \"localhost:*\"))"));
         // The base policy still opens with deny default either way.
         assert!(on.contains("(deny default)"));
+        assert!(off.contains("(deny default)"));
     }
 
     #[test]

@@ -2163,7 +2163,23 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   `.kloop` contains agent instructions/state; the rest of `.git` stays writable
   so `git commit` works sandboxed). The user-private `~/.kloop` state tree is a
   separate recursive deny-read/deny-write boundary.
-- **Reads** are full-disk; **network** is off unless configured.
+- **Reads** are full-disk; **network** is off unless configured — with one
+  deliberate exception: **loopback**. A denied network still admits `bind`,
+  `listen` and `connect` on this machine, because that is where the project's
+  own test servers listen (Go's `httptest` takes a loopback port for nearly
+  every HTTP test, and refusing it drove one real session to escalate out of
+  the sandbox and stay out for 15 commands). Two limits ride along, both
+  measured rather than assumed. Seatbelt's network filter matches only on the
+  host being `localhost`: the port it appears to match is never consulted, and
+  on the *local* address it does not discriminate at all — so a sandboxed
+  process can listen on **every interface**, not only loopback, and no rule can
+  tell a test server's random port from a proxy's. Since a loopback proxy would
+  therefore turn the denied network straight back into an open one, denying the
+  network also **strips `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`FTP_PROXY`**
+  (both spellings) from the command's environment — that is the route every
+  HTTP client takes by default, and in a denied sandbox the variables have no
+  other use. A command that spells the proxy out itself (`curl -x …`) still
+  reaches it; deliberate evasion is not what this boundary is for.
 - **Sandboxed = fewer questions** (`auto_allow`, default on): a bash call
   the sandbox will contain skips the asking layers of the permission gate —
   opaque scripts (substitutions, subshells) included, since OS containment
