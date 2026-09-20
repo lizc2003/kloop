@@ -2,7 +2,7 @@
 //! `kloop-web`. Core's `tools::web` module owns the agent-facing contracts;
 //! this layer selects network backends and binds execution without adding a
 //! network dependency to core. web_fetch is always on (except --mock);
-//! web_search needs `[web].api_key` and degrades to a warning without it.
+//! web_search needs `[web].api_key` and is quietly absent without it.
 
 use std::fmt;
 use std::future::Future;
@@ -89,16 +89,13 @@ pub fn load_web_config(root: &toml::Table) -> Result<WebConfig> {
     Ok(cfg)
 }
 
-/// Build the web ToolSource. Search backend selection degrades to
-/// fetch-only with a warning (missing key, unknown provider) — web tools
-/// never block startup.
+/// Build the web ToolSource. Search backend selection degrades to fetch-only
+/// — silently without a key, with a warning for an unknown provider — and web
+/// tools never block startup.
 pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn ToolSource>> {
-    // An unknown provider is reported ahead of a missing key: the name is the
-    // more basic mistake, and naming the key to add would send the user off to
-    // buy one for a backend kloop cannot build.
     let search: Option<Box<dyn SearchBackend>> = match cfg.search_provider.as_str() {
-        "tavily" => keyed(cfg, warn, |key| Box::new(Tavily::new(key))),
-        "brave" => keyed(cfg, warn, |key| Box::new(Brave::new(key))),
+        "tavily" => keyed(cfg, |key| Box::new(Tavily::new(key))),
+        "brave" => keyed(cfg, |key| Box::new(Brave::new(key))),
         other => {
             warn(&format!(
                 "web_search disabled: unknown [web].search_provider '{other}' \
@@ -117,22 +114,16 @@ pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn 
 }
 
 /// A known provider still needs its key, and `[web].api_key` is the one place
-/// that carries it.
+/// that carries it. No key passes without a word: that is a kloop without
+/// web_search, the same as a kloop without an MCP server, not a machine that
+/// was configured wrong. Warnings are for an intent that did not come true —
+/// a `search_provider` nobody implements — and a key typed empty never gets
+/// here, `load_web_config` refuses it outright.
 fn keyed(
     cfg: &WebConfig,
-    warn: &dyn Fn(&str),
     build: impl FnOnce(String) -> Box<dyn SearchBackend>,
 ) -> Option<Box<dyn SearchBackend>> {
-    match &cfg.api_key {
-        Some(key) => Some(build(key.clone())),
-        None => {
-            warn(
-                "web_search disabled: no [web].api_key in ~/.kloop/config.toml \
-                 (web_fetch still available)",
-            );
-            None
-        }
-    }
+    cfg.api_key.clone().map(build)
 }
 
 fn web_source(tools: WebTools) -> Arc<dyn ToolSource> {
@@ -253,7 +244,8 @@ mod tests {
     }
 
     /// Registration is a pure function of the config now that no environment
-    /// variable takes part, so all three outcomes are assertable here.
+    /// variable takes part, so all three outcomes — and which one is worth a
+    /// warning — are assertable here.
     #[test]
     fn build_web_source_registers_search_only_with_a_known_provider_and_a_key() {
         let build = |cfg: WebConfig| {
@@ -278,21 +270,16 @@ mod tests {
         assert_eq!(names, ["web_fetch", "web_search"]);
         assert_eq!(warnings, [] as [String; 0]);
 
+        // No key is not a misconfiguration — nothing to say about it.
         let (names, warnings) = build(WebConfig::default());
         assert_eq!(names, ["web_fetch"]);
-        assert_eq!(
-            warnings,
-            [
-                "web_search disabled: no [web].api_key in ~/.kloop/config.toml \
-              (web_fetch still available)"
-            ]
-        );
+        assert_eq!(warnings, [] as [String; 0]);
 
-        // The provider name is the more basic mistake: it is reported even
-        // when the key is missing too.
+        // An unknown provider is: it names an intent kloop cannot carry out,
+        // and it is reported even when a key was given.
         let (names, warnings) = build(WebConfig {
             search_provider: "duckduckgo".into(),
-            api_key: None,
+            api_key: Some("k".into()),
         });
         assert_eq!(names, ["web_fetch"]);
         assert_eq!(

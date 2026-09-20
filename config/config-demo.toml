@@ -63,8 +63,8 @@ efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 # [web] — which search backend web_search calls, and its key. Both halves live
 # here; no environment variable is read. web_search is registered only once
-# api_key is filled in — until then it stays off (startup says so) and
-# web_fetch, which needs no key, carries on.
+# api_key is filled in — until then it is quietly absent, and web_fetch, which
+# needs no key, carries on.
 
 [web]
 search_provider = "tavily"                              # or "brave"

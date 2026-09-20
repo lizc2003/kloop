@@ -104,6 +104,18 @@ fetch-only,启动 warning 正好告诉他该填哪一行。(provider 段的 `Bea
 上面那个取舍的锁。provider
 段要靠环境解析,不进这个测试。
 
+### 补记二(同会话,第三个提交):缺 key 不再警告
+
+用户:「缺 api_key 应该不报警,api_key="" 才需要报警吧」。成立,而且是上一笔改出来的——示例里的
+key 一被注释掉,那条 warning 就成了每次启动的固定噪音。**没有 key 就是这台机器没有 web_search,
+和没配 MCP server 一样,没什么可报的**;降级不是出错。
+
+于是警告只留给"意图没能实现"的那一种:`search_provider` 写了个没人实现的名字。`api_key = ""`
+保持**拒绝启动**(不是警告)——它自相矛盾,且 `providers.x.auth_header.x-api-key = ""` 早就是同
+样的判定。三条路径的 warning 归属由
+`build_web_source_registers_search_only_with_a_known_provider_and_a_key` 整串锁住;未知 provider
+那条顺手改成**带 key** 的配置,证明它与 key 在不在无关。
+
 ### 使用者须知
 
 本机 `~/.kloop/config.toml` 的 `[web]` 段现在要补一行 `api_key = "tvly-..."`,否则下次启动

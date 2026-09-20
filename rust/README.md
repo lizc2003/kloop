@@ -1980,8 +1980,11 @@ network-free, reqwest lives only in provider and web):
   only source: no environment variable is read, because every other credential
   kloop uses is already written in that one 0600 file, and a key that only an
   exported variable can carry works for whoever knows the variable's name and
-  silently degrades for everyone else. Without a usable key the tool is not
-  registered and startup warns, leaving web_fetch available.
+  silently degrades for everyone else. Without a key the tool is simply not
+  registered and web_fetch carries on — a kloop without web_search, not a
+  machine configured wrong, so startup says nothing. What does warn is a
+  `search_provider` nobody implements, an intent kloop cannot carry out; an
+  `api_key` written empty is refused outright.
 
 Both are read-only for concurrency; the permission gate treats them like any
 external tool (ask by default, with ordinary durable grants scoped to the
