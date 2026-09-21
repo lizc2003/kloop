@@ -64,6 +64,27 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
    185 的 server)开工第一步是 `grep -rn '<模块>::' crates/` 把现有对外符号列全,
    收工按这张表核对。
 
+## 〇之一、批外的一条:plan 187(2026-09-21 立)
+
+来源是一次「为什么模型列了六条候选却没调 task 工具」的对话。**不属于架构重整那一批,
+和 177–186 没有文件重叠,可任意顺序插入。**
+
+`task_*` 的依赖图(`blocked_by`、环检测、blocker gate、正反向投影)是 plan 71 为
+**多 agent 协调**建的:child agent 各自认领,dependent 被 blocker 挡住。plan 72 把图
+收紧成 depth-0 root-owned、child 再也看不见 `task_*` 之后,**那个世界没了,图留了下来**——
+现在只有 root 一个写入者,环检测在防它自己成环。plan 73 已经用同一个判据砍掉过 owner
+(「没有可执行语义的字段不该留在公开 schema 里」),**这次轮到 `blocked_by`**:它在
+`tools/task.rs` 之外唯一的真消费者是 `tui/src/render.rs:151` 的 `open_blockers`,
+换来的只是面板上一行标注。
+
+细节全在 `187-a-graph-with-only-one-writer.md`。两件事要知道:**第五节有一个必须先问
+用户的点**(状态倒退检查留不留),**第四节坑 5 要求开工第一步先核实 parity 生成物会不会动**。
+
+另外记一笔,两条相关但不在 187 里的:**(a)** 全仓 `<system-reminder>` 用了四处
+(`skills.rs:378`、`tool_search.rs:195`、`fs.rs:70/386/427`),**唯独 task 一处没有**,
+task 图也不回灌上下文——这才是「模型为什么不调用」的直接原因,值得单独立一条;
+**(b)** 五个 CRUD 要不要合成一个全量覆盖工具,等 187 做完再判。
+
 ## 〇之二、上一批:plan 149–156(2026-09-15 排定)+ 158(2026-09-17)+ 176
 
 来源是一次借鉴项目调研(`refs/grok-build` + `refs/deepseek-harness`,结论见 `refs/README.md`
