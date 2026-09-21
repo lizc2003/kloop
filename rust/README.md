@@ -186,7 +186,7 @@ line.
 
 ## Claude Code 2.1.220 parity baseline
 
-Plans 48–59 pin comparison to one exact Claude Code 2.1.220 darwin-arm64 binary and publish the auditable corpus under [`../refs/claude-code-2.1.220/`](../refs/claude-code-2.1.220/). The final generated snapshot contains:
+Plans 48–59 pin comparison to one exact Claude Code 2.1.220 darwin-arm64 binary. The auditable corpus is **not in this repository** and is not redistributable: its captures embed that product's own system prompt and tool definitions. It stays git-ignored under `refs/claude-code-2.1.220/` on the machine that generated it, and `make parity` skips when it is absent. The final generated snapshot contains:
 
 - 14 executed local profiles, 218 captures, and 65 two-capture determinism groups;
 - 214 static-evidence records;
@@ -201,7 +201,7 @@ Plan 59 also runs five core-dispatch cross-tool scenarios: file/search→Bash→
 
 The accepted scope is only exact 2.1.220, darwin-arm64 local CLI, `team=false`, `remote=false`, and the condition vectors recorded in `manifest.json`. The result is **limited behavioral compatibility**, not full-tool parity, wire/schema/UI identity, or a drop-in replacement claim. The five out-of-scope SendMessage `missing` cells, accepted safety differences, condition-bound `unknown`, profile/surface `n/a`, and three kloop-only rows remain explicit.
 
-See the [exact corpus guide](../refs/claude-code-2.1.220/README.md), [methodology and history](../refs/README.md), [Plan 59 final acceptance](../docs/plan/59-tool-parity-acceptance.md), and [capability report](../docs/capability-report.md).
+See [methodology and history](../refs/README.md), [Plan 59 final acceptance](../docs/plan/59-tool-parity-acceptance.md), and [capability report](../docs/capability-report.md).
 
 ## Platform shell support
 
@@ -1519,7 +1519,7 @@ stricter than Claude Code 2.1.220, which accepts partial qualification in some
 paths and may stale-recover an unambiguous edit. Plan 49's executor-level hook
 fixtures and dependent mutation pair use the same normalized call inputs as the
 real-dispatch kloop report; generated contracts in
-`refs/claude-code-2.1.220/paired-parity.json` compare call/event/result/order/workspace
+the corpus's `paired-parity.json` compare call/event/result/order/workspace
 projections and require exact-bundle bridges for cross-profile cells. Detailed
 policy differences remain in `tool-matrix.json`.
 

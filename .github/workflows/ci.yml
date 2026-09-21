@@ -19,9 +19,6 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -47,7 +44,6 @@ jobs:
           cargo +stable test --locked -p kloop-core permissions::tests
       - run: cargo +stable test --locked --workspace
       - run: cargo +stable run --locked -p kloop -- --mock
-      - run: python -B ../refs/claude-code-2.1.220/verify.py --corpus-only
 
   msrv:
     runs-on: ubuntu-latest

@@ -21,13 +21,3 @@ What is derived from it:
   rust/crates/core/src/sandbox/seatbelt_network.sbpl
       Copied verbatim from `codex-rs/sandboxing/src/`. The base policy
       is itself derived from Chrome's sandbox policy.
-
---------------------------------------------------------------------
-Third-party material in this repository, NOT covered by kloop's license:
-
-  refs/claude-code-2.1.220/
-      A pinned parity corpus generated against Anthropic's Claude Code
-      2.1.220 CLI: captured outputs of that program plus byte-anchored
-      excerpts of its bundle. It is kept as the evidence behind the
-      behavioural comparisons in docs/, not as kloop's own work. No
-      license to it is granted here; rights remain with Anthropic.

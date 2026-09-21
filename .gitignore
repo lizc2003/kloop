@@ -6,11 +6,11 @@ rust/target/
 rust/.kloop/
 
 # reference material (local copies of other repos, not ours to version) —
-# keep only our own guide and the pinned Claude Code parity fixtures
+# keep only our own guide. The Claude Code parity corpus lives here too and is
+# deliberately NOT versioned: its captures embed that product's own system
+# prompt and tool definitions, which are not ours to redistribute.
 refs/*
 !refs/README.md
-!refs/claude-code-2.1.220/
-!refs/claude-code-2.1.220/**
 
 # Python fixture tooling
 __pycache__/
