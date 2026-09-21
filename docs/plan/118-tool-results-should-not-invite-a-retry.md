@@ -15,8 +15,8 @@
 
 实测后果（plan 117 那次会话，主 agent 26 轮）：
 
-- `upstream/elevenlabs/batch.go` 被 `read_file` 读了 **7 次**
-- `gateway/orchestrator/async_submit.go` 3 次——其中一轮里同时发了
+- 同一个源文件被 `read_file` 读了 **7 次**
+- 另一个 3 次——其中一轮里同时发了
   `offset 1 limit 220` 和 `offset 1 limit 260` 两个**完全重叠**的调用
 - 典型序列是 limit 一路加码：220 → 260 → 520，430 → 620
 

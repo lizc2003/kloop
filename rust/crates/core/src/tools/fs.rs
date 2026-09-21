@@ -522,8 +522,8 @@ fn numbered_text_page(
     // Every exit that leaves content unread says how much is left and where to
     // resume. Without the total the model cannot tell a finished read from a
     // `limit`-shaped one, and its only recourse is to reread the same file with
-    // a bigger limit — measured on one review session: batch.go read 7 times,
-    // async_submit.go 3, twice in a single round with overlapping ranges.
+    // a bigger limit — measured on one review session: one file read 7 times,
+    // another 3, twice in a single round with overlapping ranges.
     if let Some(line) = partial_line {
         out.push_str(&format!(
             "\n\n[read output truncated within line {line} of {total_lines}; use grep or a narrower reader to inspect it]"

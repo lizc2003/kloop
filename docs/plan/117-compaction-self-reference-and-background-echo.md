@@ -63,13 +63,13 @@ final prioritized review`——它知道自己没做完。
 
 **17:41:16 主 agent 独立交付**（那时子 agent 还没回来）：
 
-1. P1 AUC submit 空 body — `<module>.go:183-207`
-2. P1 `language` 层级错位 — `<module>.go:694-750`
-3. P1 多 utterance words 截断 — `<module>.go:551-577`
-4. P2 静音结果绕过 verbose/diarized 校验 — `<module>.go:301-306`
+1. P1 submit 空 body
+2. P1 `language` 层级错位
+3. P1 多 utterance words 截断
+4. P2 静音结果绕过 verbose/diarized 校验
 
 **17:57:08 收到子 agent 结果后重发**：上面 4 条原样保留，静音那条从 P2 升到 P1，
-**新增 1 条 P2**（`model_ids` 带空白的 key，`<file>.go:771-778`）。
+**新增 1 条 P2**（配置 key 带空白）。
 
 净贡献 = **一条 P2 + 一次严重度上调**。代价 = 43 分钟、156 次工具调用、
 5.6M input token（主 agent 自己只用了 2.4M，子 agent 是它的 2.3 倍），外加用户
@@ -170,8 +170,8 @@ cache identity `{parent}-{agent_id}`，因为它的前缀和父的没有共同�
   `-A`/`-B`）。模型每次调用把 7 个开关全填满，还自相矛盾（`-A:15, -B:15, -C:15,
   context:0`）。瘦身能省输出 token，但这套参数名是 cc 形态，动之前要拍板。
   **→ 已由 plan 118 做掉：删的是 kloop 自己加的 `context` 别名，留下 cc 的 `-A`/`-B`/`-C`。**
-- **`read_file` 反复读同一文件**：本次 `upstream/elevenlabs/batch.go` 被读了 7 次，
-  `async_submit.go` 3 次——其中一轮里同时发了 `offset 1 limit 220` 和
+- **`read_file` 反复读同一文件**：本次同一个源文件被读了 7 次，
+  另一个 3 次——其中一轮里同时发了 `offset 1 limit 220` 和
   `offset 1 limit 260` 两个完全重叠的调用。典型模式是「先小 limit 试，不够再大
   limit 重读」（220→260→520，430→620）。工具结果里**回报文件总行数**大概率能掐掉
   这类试探。**→ 已由 plan 118 做掉。**
