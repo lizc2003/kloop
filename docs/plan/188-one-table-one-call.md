@@ -259,3 +259,64 @@ catalog-absence 列表),漏一处测试就红。`retired_tool_names_stay_reserve
 `make check`(fmt + clippy + **1600 test**)全绿、`make mock` 跑通、`make parity` 全绿
 (本机语料第三次跟着改:工具名、字段名、static-evidence 的文件名与行号区间、
 matrix 的 `kloop_name`)。
+
+## 十、兼容包袱删干净(2026-09-21,同日第三次提交)
+
+用户:「代码删干净,不要兼容,我喜欢干净的代码」。第九节改完名后盘了一遍,
+**兼容设施有四处,全删**。
+
+### 删的
+
+1. **`reject_unavailable` 的改名指引**(`tools/mod.rs`):
+   `task → run_agent`、`wait → wait_for_activity`、`kill_bash → stop_bash` 三条
+   `bail!`,以及一条 `bash.run_in_background → background`。删掉后这些名字统一走
+   `unknown tool: <name>`。**顺带发现那条 `run_in_background` 是重复的**——
+   `bash.rs` 的 `parse_bash_input` 里有一模一样的一条。
+2. **`bash.rs` 的 `run_in_background` 改名 `bail!`**:`BashInput` 本来就
+   `deny_unknown_fields`,删掉手写分支后它报 ``unknown field `run_in_background` ``,
+   **一样 fail-closed,只是不再手把手指路**。
+3. **`reserved_names()` 里的八个退役名**(`task`、`wait`、`kill_bash` + 五个 `task_*`)。
+   留下的只有 `builtin::ALL` 派生的在役名和 `structured_output`(内部协议名)。
+4. **只为上面三条存在的测试**:`retired_tool_names_stay_reserved_and_legacy_migrations_are_directed`、
+   `the_retired_tools_and_their_fields_are_gone`、reserved 测试里的退役名块、
+   `the_definition_is_one_strict_root_only_tool` 里两个退役枚举、plan52 的 `retired_tool_gate`。
+
+`reject_unavailable` 的 `input: &Value` 参数**只为那条 `run_in_background` 检查存在**,
+一并删掉,调用点跟着改。
+
+### 判据
+
+reserved 名单的理由是「MCP 工具不能冒名顶替 resumed history 里的旧调用」。这条理由
+经不起推敲:**模型是按当前工具数组决定调什么的**,不是按历史;真误调了,
+`unknown tool: X` 已经是足够清楚的答复;而这份名单**只会增长**——plan 188 一次就加了五个。
+换来的是「一个模型没理由发起的调用」的错误文案好一点点。
+
+同一判据也适用改名指引:`task → run_agent` 是 plan 66 那次改名的产物,两条 plan 之前的事。
+
+### 保留的三样(不是兼容包袱,别顺手删)
+
+- **`builtin::ALL` 派生的 reserved**:在役工具名不能被外部源占用,这是当前保护。
+- **`structured_output` reserved**:内部补全协议名,从来不是可配置工具。
+- **`rollout.rs` / `codemode.rs` 的 "legacy … cannot be resumed"**:那是**拒绝**旧数据
+  的 fail-closed,不是接受旧数据的兼容层。方向相反。
+
+### 两条负向断言留着,并写明它们守什么
+
+`the_reserved_set_covers_...` 里加了「`task`/`task_create` **不在** reserved」,
+`an_unknown_tool_name_fails_closed_with_no_rename_table` 拿 `task`/`task_create`/
+一个从未存在的名字当探针。**它们守的是「兼容包袱不要再长回来」**——删掉守卫,
+下一个人很容易又往 reserved 里加一行。这不违背「不要兼容」,是执行它。
+
+### 顺带收敛的两处历史枚举
+
+- `todo_write` 的行 schema 已经是 `additionalProperties:false` + `required:[subject,status]`,
+  再列一份 `["id","task_id","description","owner","blocked_by"]` 说明它们不在,是把历史
+  钉进断言。改成直接断言 `properties` 的键集合就是 `{subject,status}`。
+- plan52 的 `retired_field_gate` **改名 `foreign_field_gate`**:那几个字段是
+  **对照产品的 Task 记录带、kloop 的行不带**的,这是 parity 报告该说的差异证据,
+  不是 kloop 自己的历史。框架从「我们退役了什么」换成「对方有什么我们拒什么」。
+
+### 账
+
+`task.rs`(现 `todo.rs`)code 行 197 → **194**;`tools/mod.rs` 净减约 60 行;
+测试 1600 → **1599**(删两条、加一条)。`make check` / `make mock` / `make parity` 全绿。

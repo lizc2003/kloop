@@ -320,52 +320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_retired_tools_and_their_fields_are_gone() {
-        let ctx = test_ctx(0, "todo-retired");
-        for name in [
-            "task_create",
-            "task_get",
-            "task_update",
-            "task_list",
-            "task_clear",
-        ] {
-            let (output, is_error) = run_tool(name, json!({}), &ctx).await;
-            assert!(is_error, "{name}: {output}");
-        }
-
-        for (field, row) in [
-            (
-                "id",
-                json!({"subject": "x", "status": "pending", "id": "1"}),
-            ),
-            (
-                "task_id",
-                json!({"subject": "x", "status": "pending", "task_id": "1"}),
-            ),
-            (
-                "description",
-                json!({"subject": "x", "status": "pending", "description": "instructions"}),
-            ),
-            (
-                "owner",
-                json!({"subject": "x", "status": "pending", "owner": Value::Null}),
-            ),
-            (
-                "blocked_by",
-                json!({"subject": "x", "status": "pending", "blocked_by": ["2"]}),
-            ),
-        ] {
-            let (output, is_error) = run_tool("todo_write", json!({"todos": [row]}), &ctx).await;
-            assert!(is_error, "{field}: {output}");
-            assert!(
-                output.contains(&format!("unknown field `{field}`")),
-                "{output}"
-            );
-        }
-        assert!(ctx.cfg.todos.snapshot().todos.is_empty());
-    }
-
-    #[tokio::test]
     async fn strict_parsing_rejects_every_malformed_table() {
         let ctx = test_ctx(0, "todo-strict");
         for input in [
@@ -379,6 +333,7 @@ mod tests {
             json!({"todos": [{"subject": "x", "status": "done"}]}),
             json!({"todos": [{"subject": "x", "status": Value::Null}]}),
             json!({"todos": [{"subject": 1, "status": "pending"}]}),
+            json!({"todos": [{"subject": "x", "status": "pending", "note": "extra"}]}),
         ] {
             let (output, is_error) = run_tool("todo_write", input.clone(), &ctx).await;
             assert!(is_error, "{input}: {output}");
@@ -666,9 +621,14 @@ mod tests {
         let row = &definition.schema["properties"]["todos"]["items"];
         assert_eq!(row["additionalProperties"], false);
         assert_eq!(row["required"], json!(["subject", "status"]));
-        for retired in ["id", "task_id", "description", "owner", "blocked_by"] {
-            assert!(row["properties"].get(retired).is_none(), "{retired}");
-        }
+        assert_eq!(
+            row["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["status", "subject"]
+        );
 
         for depth in [0, 1, 2] {
             let names = crate::tools::tool_defs(
@@ -683,15 +643,6 @@ mod tests {
                 depth == 0,
                 "todo_write at depth {depth}"
             );
-            for retired in [
-                "task_create",
-                "task_get",
-                "task_update",
-                "task_list",
-                "task_clear",
-            ] {
-                assert!(!names.iter().any(|name| name == retired), "{retired}");
-            }
         }
     }
 }

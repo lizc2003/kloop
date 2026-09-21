@@ -536,9 +536,13 @@ fn partition_source_defs(
 /// Every name an external source may not claim: every built-in ([`builtin::ALL`],
 /// so it cannot drift from what is actually offered — including the
 /// surface-gated ones a host may not enable and the shells a host may not
-/// have), the structured-output protocol tool, and the retired built-ins, kept
-/// reserved so an MCP tool cannot impersonate an old call replayed out of
-/// resumed history.
+/// have) plus the structured-output protocol tool.
+///
+/// Retired names are **not** kept here. A name kloop no longer offers is not
+/// kloop's to reserve: the list only ever grew, and what it bought was a
+/// slightly better error for a call the model has no reason to make, since it
+/// picks from the tool array it was just sent. An unknown name already fails
+/// closed with `unknown tool: <name>`.
 ///
 /// Derived once. The derivation is what keeps the list honest, but paying for
 /// it per lookup meant rebuilding a dozen `json!` schemas just to read their
@@ -554,17 +558,6 @@ fn reserved_names() -> &'static std::collections::HashSet<String> {
                         // An internal completion protocol, appended past every
                         // catalog and filter — never a configurable tool.
                         "structured_output",
-                        // Retired built-ins stay reserved so an MCP tool cannot
-                        // impersonate an old call from resumed history before
-                        // the migration error fires.
-                        "task",
-                        "wait",
-                        "kill_bash",
-                        "task_create",
-                        "task_get",
-                        "task_update",
-                        "task_list",
-                        "task_clear",
                     ]
                     .into_iter()
                     .map(String::from),
@@ -871,18 +864,7 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 /// host has none of. Rejected before hooks, the permission gate or the registry
 /// handler can observe it: none of them has anything to decide about a call
 /// that was never legal.
-fn reject_unavailable(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
-    match name {
-        "task" => bail!(
-            "tool 'task' was renamed to 'run_agent'; task_* is reserved for the retired todo tools"
-        ),
-        "wait" => bail!("tool 'wait' was renamed to 'wait_for_activity'"),
-        "kill_bash" => bail!("tool 'kill_bash' was renamed to 'stop_bash'"),
-        _ => {}
-    }
-    if name == "bash" && input.get("run_in_background").is_some() {
-        bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
-    }
+fn reject_unavailable(name: &str, ctx: &ToolCtx) -> Result<()> {
     // The same gate table the request's tool array was built from: root-owned
     // controls a sub-agent is not sent, front-end capabilities this session did
     // not enable, a shell this host resolved no interpreter for. The catalog
@@ -1158,7 +1140,7 @@ async fn run_gated(
     local_send_committed: &AtomicBool,
     deadline: &CallDeadline,
 ) -> Result<ToolExecution> {
-    reject_unavailable(name, input, ctx)?;
+    reject_unavailable(name, ctx)?;
     // Freeze the workspace before validating a deferred capability. A stale
     // call is a discovery error, so neither hooks nor the human permission
     // gate should observe it. The same workspace snapshot is then used for
@@ -2083,20 +2065,14 @@ mod reserved_name_tests {
             );
         }
 
-        // Retired built-ins: a resumed transcript can still name them.
-        for name in [
-            "task",
-            "wait",
-            "kill_bash",
-            "task_create",
-            "task_get",
-            "task_update",
-            "task_list",
-            "task_clear",
-        ] {
+        // A name kloop retired is a name kloop released. This assertion is
+        // here so the list cannot start growing again: it only ever grew, and
+        // every entry bought a marginally better error for a call the model
+        // has no reason to make.
+        for name in ["task", "task_create"] {
             assert!(
-                reserved.contains(name),
-                "retired tool '{name}' is not reserved"
+                !reserved.contains(name),
+                "retired tool '{name}' is reserved"
             );
         }
 
@@ -2985,63 +2961,14 @@ mod tests {
         }
     }
 
+    /// A name the catalog does not carry fails closed with one answer, whether
+    /// it was never a tool or used to be one. `task` and `task_create` are the
+    /// probes because both once had a hand-written rename or reservation: this
+    /// test is what keeps that kind of entry from coming back.
     #[tokio::test]
-    async fn retired_tool_names_stay_reserved_and_legacy_migrations_are_directed() {
-        let retired = [
-            "task",
-            "wait",
-            "kill_bash",
-            "task_create",
-            "task_get",
-            "task_update",
-            "task_list",
-            "task_clear",
-        ];
-        let source: Arc<dyn ToolSource> = Arc::new(StubSource {
-            defs: retired
-                .iter()
-                .map(|name| ToolDef {
-                    name: (*name).into(),
-                    description: "must stay hidden".into(),
-                    schema: json!({"type": "object"}),
-                })
-                .collect(),
-            readonly: String::new(),
-        });
-        let names = all_tool_defs(
-            0,
-            &[source],
-            TOOL_DEFER_THRESHOLD,
-            interactive_surface(),
-            &ShellPrograms::native_posix(),
-        )
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-        for name in retired {
-            assert!(!names.iter().any(|candidate| candidate == name));
-        }
-
-        let ctx = test_ctx(0, "retired-tool-names");
-        for (name, input, replacement) in [
-            ("task", json!({"prompt": "x"}), "run_agent"),
-            ("wait", json!({}), "wait_for_activity"),
-            ("kill_bash", json!({"bash_id": "bg-1"}), "stop_bash"),
-        ] {
-            let (output, is_error) = run_tool(name, input, &ctx).await;
-            assert!(is_error, "{name}: {output}");
-            assert!(output.contains(replacement), "{name}: {output}");
-        }
-        // Plan 188's five: retired with no replacement to point at, because the
-        // one tool that replaced them is `todo_write` — a name this same list
-        // retired once before and plan 188 brought back into service.
-        for name in [
-            "task_create",
-            "task_get",
-            "task_update",
-            "task_list",
-            "task_clear",
-        ] {
+    async fn an_unknown_tool_name_fails_closed_with_no_rename_table() {
+        let ctx = test_ctx(0, "unknown-tool-names");
+        for name in ["task", "task_create", "never_was_a_tool"] {
             let (output, is_error) = run_tool(name, json!({}), &ctx).await;
             assert!(is_error, "{name}: {output}");
             assert_eq!(output, format!("unknown tool: {name}"));

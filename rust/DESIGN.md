@@ -2289,9 +2289,12 @@ instructions belong in the message or a plan file, not in a panel row. Subject
 stays capped at 200 single-line characters, and the list at 256 rows.
 
 Validation is whole-list and happens before anything is stored: an over-long
-list, an empty/multi-line/over-long subject, an unknown status, or any retired
-field (`id`, `task_id`, `description`, `owner`, `blocked_by`) is a strict
-rejection that leaves the previous list byte-identical. **A write whose content
+list, an empty/multi-line/over-long subject, an unknown status, or **any field
+other than `subject` and `status`** is a strict rejection that leaves the
+previous list byte-identical. That covers every field Claude Code's task record
+carries and a kloop row does not (`owner`, `id`, `description`, dependencies)
+without naming any of them: the row schema is closed, so there is no list to
+keep up to date. **A write whose content
 equals the current list advances no revision and publishes no snapshot**, so a
 model that restates the same list every round never flickers the panel.
 
@@ -2311,10 +2314,13 @@ or the registry. Foreground children return through their `run_agent` tool
 result; background children return through `SubAgentResult` in the parent Inbox.
 Neither path automatically changes the list: root decides when to rewrite it.
 There is no per-child todo list, assignment/owner field, Team claim, or
-list-to-execution binding. The five retired `task_*` names stay in the reserved
-set, so an MCP tool cannot impersonate a call replayed out of resumed history;
-`todo_write` left that set, because a name in the live catalog is reserved by
-being in it.
+list-to-execution binding. **Nothing reserves the five retired `task_*` names**,
+and nothing maps them to `todo_write`: a name kloop no longer offers is not
+kloop's to hold, so an MCP server may serve `task_create` and it is that
+server's tool. Only the live catalog and the `structured_output` protocol name
+are reserved. A call to a name the catalog does not carry gets one answer,
+`unknown tool: <name>` — the same answer whether the name was retired or never
+existed.
 
 Independent CLI sessions/native server threads and a resumed process get fresh
 empty registries. An in-process TUI fork keeps the same live registry; the list
@@ -2937,8 +2943,8 @@ rows, and the absence of public Task wire without changing any pinned Claude
 Code raw/normalized fixture. Plan 187 then deleted the dependency graph and the
 forward-only status rule, and Plan 188 the CRUD set itself: the native report's
 task scenario is now one whole-table write, a rewrite, an unchanged rewrite that
-publishes nothing, an empty-array clear, and rejection probes for every retired
-field and tool name. Nothing under `fixtures/` moved for any of it. See
+publishes nothing, an empty-array clear, and rejection probes for every Claude
+Code task field a kloop row does not carry. Nothing under `fixtures/` moved for any of it. See
 `docs/plan/52-agent-task-team-parity.md`,
 `docs/plan/66-background-tool-naming.md`,
 `docs/plan/71-task-v2-session-graph.md`,

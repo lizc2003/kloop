@@ -489,17 +489,7 @@ async fn native_surface_report() -> Value {
     // `the_program_surface_gates_run_program_and_its_stop_tool`.
     const EXPECTED_NATIVE: [&str; 4] =
         ["run_agent", "todo_write", "wait_for_activity", "stop_agent"];
-    // Plan 188 collapsed the five CRUD tools into one whole-table write; the
-    // names stay listed here because a resumed transcript can still carry them
-    // and the depth gate must refuse them as firmly as it refuses the live one.
-    const TODO_TOOLS: [&str; 6] = [
-        "todo_write",
-        "task_create",
-        "task_get",
-        "task_update",
-        "task_list",
-        "task_clear",
-    ];
+    const TODO_TOOLS: [&str; 1] = ["todo_write"];
     const CLAUDE_SURFACES: [&str; 10] = [
         "Agent",
         "TaskCreate",
@@ -563,11 +553,10 @@ async fn native_surface_report() -> Value {
     let mut ctx = test_ctx(0, "plan52-native-surface");
     ctx.ui = todo_ui.clone();
 
-    // Every field the list has shed — plan 73's `owner`, plan 187's
-    // `blocked_by`, plan 188's `id`/`task_id`/`description` — is rejected by
-    // name rather than ignored, so a transcript written against an older
-    // schema fails loudly instead of half-applying.
-    let mut retired_field_gate = Vec::new();
+    // Every field a Claude Code task record carries that a kloop row does not:
+    // rejected by name rather than ignored, so a call shaped like the other
+    // product's fails loudly instead of half-applying.
+    let mut foreign_field_gate = Vec::new();
     for (field, kind, row) in [
         (
             "owner",
@@ -606,26 +595,12 @@ async fn native_surface_report() -> Value {
             result.contains(&format!("unknown field `{field}`")),
             "{result}"
         );
-        retired_field_gate.push(json!({
+        foreign_field_gate.push(json!({
             "field": field,
             "kind": kind,
             "result": result,
             "is_error": is_error,
         }));
-    }
-
-    // And the five retired tool names are no longer callable at all.
-    let mut retired_tool_gate = Vec::new();
-    for name in [
-        "task_create",
-        "task_get",
-        "task_update",
-        "task_list",
-        "task_clear",
-    ] {
-        let (result, is_error) = run_tool(name, json!({}), &ctx).await;
-        assert!(is_error, "{name}: {result}");
-        retired_tool_gate.push(json!({"name": name, "result": result}));
     }
 
     let _ = todo_ui.take_events();
@@ -734,8 +709,7 @@ async fn native_surface_report() -> Value {
                 "events": strict_write_events,
             },
         },
-        "retired_field_gate": retired_field_gate,
-        "retired_tool_gate": retired_tool_gate,
+        "foreign_field_gate": foreign_field_gate,
         "child_todo_gate": child_write,
         "wait_for_activity": {
             "result": wait_output,

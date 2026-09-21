@@ -123,9 +123,6 @@ pub(super) fn foreground_timeout(input: &Value) -> Duration {
 const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 60_000;
 
 fn parse_bash_input(input: &Value) -> Result<BashInput> {
-    if input.get("run_in_background").is_some() {
-        bail!("bash: 'run_in_background' was renamed to 'background'; use background instead");
-    }
     super::optional_display_description(input, "bash")?;
     serde_json::from_value(input.clone()).context("bash: invalid input")
 }
@@ -2649,28 +2646,24 @@ Wait-Process -Id $grandchild.Id
     }
 
     #[tokio::test]
-    async fn background_field_is_strict_and_old_name_fails_closed() {
+    async fn background_field_is_strict_and_unknown_fields_fail_closed() {
         let ctx = test_ctx(0, "bash-background-field");
-        let (old, old_error) = run_tool(
-            "bash",
-            json!({"command": "printf should-not-run", "run_in_background": true}),
-            &ctx,
-        )
-        .await;
-        assert!(old_error);
-        assert!(old.contains("use background instead"), "{old}");
-
-        // cc spells the budget `timeout`; kloop only answers to `timeout_ms`,
-        // and a silently ignored unit would run under the wrong one.
-        let (unknown, unknown_error) = run_tool(
-            "bash",
-            json!({"command": "printf should-not-run", "timeout": 5000}),
-            &ctx,
-        )
-        .await;
-        assert!(unknown_error);
-        assert!(unknown.contains("unknown field `timeout`"), "{unknown}");
-
+        // Nothing here is spelled the way another product spells it — cc's
+        // `run_in_background` and its `timeout` both have to fail rather than
+        // be ignored, and the strict deserializer is what says so. There is no
+        // hand-written alias for either: a name kloop does not answer to is a
+        // name kloop does not answer to.
+        for field in [json!({"run_in_background": true}), json!({"timeout": 5000})] {
+            let (name, value) = field.as_object().unwrap().iter().next().unwrap();
+            let mut input = json!({"command": "printf should-not-run"});
+            input[name] = value.clone();
+            let (output, is_error) = run_tool("bash", input, &ctx).await;
+            assert!(is_error, "{output}");
+            assert!(
+                output.contains(&format!("unknown field `{name}`")),
+                "{output}"
+            );
+        }
         let (wrong_type, wrong_type_error) = run_tool(
             "bash",
             json!({"command": "printf should-not-run", "background": "yes"}),

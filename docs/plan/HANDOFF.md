@@ -105,6 +105,14 @@ TUI 面板不再标注 blocker、pending 不再分两组。`make check` 全绿,`
 字段名不同,strict parser 会拒)。全仓 "task graph" 措辞一并改成 "todo list"。
 **机械改名误伤了 `Item::SubAgent`/`Cell::Agent`/`BackgroundTask`/`tokio::task`,见教训 160。**
 
+**同日第三次提交:兼容包袱全删**(用户「代码删干净,不要兼容」)。`reject_unavailable` 的三条
+改名指引(`task`/`wait`/`kill_bash`)、`bash` 的 `run_in_background` 改名提示(两处重复)、
+`reserved_names()` 里的八个退役名、以及只为它们存在的测试,一起删。现在**退役名一律
+`unknown tool: <name>`**,MCP 服务器可以叫 `task_create`。保留的三样别顺手删:
+`builtin::ALL` 派生的 reserved(在役名保护)、`structured_output`(内部协议名)、
+`rollout`/`codemode` 的 "legacy … cannot be resumed"(那是**拒绝**旧数据,方向相反)。
+见教训 161。
+
 **190 `nobody-told-the-model-the-list-exists` 回答「为什么不调用」那一半**(187/188
 回答的是「复杂」那一半)。**前两条已落地,现在就是它的时候**:回灌的正好是一行标题
 加一个状态,而整表覆盖的价值全靠「模型知道当前表长什么样」兑现。全仓 `<system-reminder>` 用了四处(`skills.rs:378`、`tool_search.rs:195`、
@@ -1681,3 +1689,5 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
 159. **复数名词是 schema 变更漏改的高发区,它不报错。** plan 188 把工具从五个收成一个,`BASE_SYSTEM` 里那句 "track the work with the task tools" 的复数当场就错了——但它是提示词,没有任何编译器或测试会说话。改动模型可见的工具集合时,除了 catalog、gate 表、dispatch 这些编译期会拦的地方,还要**grep 一遍提示词与工具描述里的复数、"五个"、"其中之一"这类计数措辞**;`context.rs` 的 `BASE_SYSTEM`、各 `*_def()` 的 description、以及互相引用的工具描述(比如某个工具描述里写"use task_get for the full description")都算。
 
 160. **机械改名的危险不在编译器能抓到的地方,在注释和用户文案里。** plan 188 改名时用 `\btask\b → \btodo\b` 扫 `app.rs`/`render.rs`,误伤了 `Item::SubAgent { label, task }`、`Cell::Agent { agent, task }`、`Cell::BackgroundTask(task)`、`tokio::task`,还有 `Injected::Scheduled` 那句 `"scheduled task · {id}"`。**结构体字段编译器当场就报**,而注释("A panic in the worker task"、"drops task futures mid-await")和**字符串文案一个字都不会报**——`"scheduled todo · {id}"` 会一路静默走到用户屏幕上。判据两条:(a) 一个词在仓库里指几样东西,就不能用词边界全量替换,哪怕加了 `\b`;(b) 误伤发生后,**正确的动作是整文件全量还原、再逐条精确改回该改的那几处**,而不是在误伤堆里逐个挑——挑的成本是 O(误伤数),还原重来的成本是 O(该改数),而该改的通常少一个数量级(这次是 40+ 处误伤 vs 4 处该改)。顺带一条:改名还要同时看**名字的"在役/退役"身份有没有翻转**——`todo_write` 从退役名变回在役名,reserved 构造、reserved 测试、catalog-absence 列表三处要一起调,漏一处就红。
+
+161. **"兼容"和"拒绝旧数据"方向相反,删之前先分清——删错一个,fail-closed 就变成了静默接受。** plan 188 收尾时按用户"代码删干净,不要兼容"扫了一遍,`grep -iE "renamed|retired|legacy|deprecated|compat"` 捞出来的东西分两类:(a) **真兼容层**——`reject_unavailable` 里 `task → run_agent` 那三条改名 `bail!`、`bash` 的 `run_in_background` 提示、`reserved_names()` 里的八个退役名,它们的存在是为了让**旧输入继续工作或得到特殊待遇**;(b) **看着像、实则相反**——`rollout.rs` 的"旧格式 route 行必须失败而不是修复"、`codemode.rs` 的"legacy Program runs cannot be resumed",它们是**拒绝**旧数据的 fail-closed 守卫,删掉等于让旧数据静默通过。判据是**方向**:这行代码让旧东西**能用**,还是让它**明确失败**?能用的是包袱,失败的是守卫。三条推论:(1) 删兼容层前确认替代路径仍然 fail-closed——`bash` 那条删掉后靠 `deny_unknown_fields` 报 `unknown field`,验证过才删;(2) **兼容层常常重复**,`run_in_background` 在 `mod.rs` 和 `bash.rs` 各有一条一模一样的,删的时候才发现;(3) 删完要留一条**负向断言**钉住"不要再长回来"(reserved 里没有 `task_create`、未知名统一 `unknown tool`),否则下一个人很容易又加一行——reserved 名单就是这么从 0 长到 8 的。
