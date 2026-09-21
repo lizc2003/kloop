@@ -747,7 +747,7 @@ letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
 summary (green/red) above the line-numbered body (plan 38 slice 6) and scrolls
 with PgUp/PgDn, while the header, subject, options and key hint stay put. The
 panel is live chrome, counted in the same frozen-height budget as the activity
-and task rows, so a scrollback commit can never scroll it away. Prompts from a
+and todo rows, so a scrollback commit can never scroll it away. Prompts from a
 concurrent tool batch queue and are answered in order.
 
 Notices — a retry, a mode switch, a resumed session, a failed turn — render as
@@ -2240,32 +2240,42 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Root-owned session task list (Plans 71–74, 187, 188)
+## Root-owned session todo list (Plans 71–74, 187, 188)
 
-The task list is a **session-scoped flat list of work owned by the root/main
+The todo list is a **session-scoped flat list of work owned by the root/main
 Agent**. Only depth 0 receives or may execute its one native snake_case tool:
 
-- `task_write {tasks: [{subject, status}, …]}` **replaces the whole list** and
+- `todo_write {todos: [{subject, status}, …]}` **replaces the whole list** and
   returns the list that is now live. An empty array clears it. Statuses are
   `pending | in_progress | completed` and may move in any direction. There is
-  no other task tool: no read, no per-row patch, no delete, and no ID.
+  no other todo tool: no read, no per-row patch, no delete, and no ID.
 
-**Plan 188 collapsed five CRUD tools into this one.** Plan 71 replaced the old
-ID-free `todo_write` checklist precisely because a checklist "cannot carry
-stable IDs, owner or a dependency graph" — and today none of the three exists:
-owner left with plan 73, the dependency graph with plan 187, and **a stable ID
-was only ever the address those two needed**. Whole-table overwrite addresses
-nothing. So this is a return to `todo_write`'s *shape*, arrived at from the
-other direction and with its name left retired (see the reserved list below);
-what plan 71 rejected was the shape's inability to carry three things that have
-since been deleted for their own reasons.
+**Plan 188 collapsed five CRUD tools into this one, and gave it back the name
+plan 71 retired.** Plan 71 replaced the old ID-free `todo_write` checklist
+precisely because a checklist "cannot carry stable IDs, owner or a dependency
+graph" — and today none of the three exists: owner left with plan 73, the
+dependency graph with plan 187, and **a stable ID was only ever the address
+those two needed**. Whole-table overwrite addresses nothing, so what plan 71
+rejected was an inability to carry three things that have since been deleted
+for their own reasons.
+
+Reviving the name was a second decision, taken after the tool briefly shipped
+as `task_write`. `task` is **overloaded in kloop** — `BackgroundTask`,
+`ScheduledTask`, and this list — and the overload is paid on every call: the
+tool description has to spend characters on "it starts nothing, assigns
+nothing", and this section had to spend a sentence separating list state from
+execution lifecycle. `todo` names exactly one thing. The old and new tools are
+not the same tool (old: `{content, activeForm, status}`, every depth, one list
+per agent; new: `{subject, status}`, depth-0 only, one list per session), so a
+resumed transcript's old call fails on its field names rather than being
+silently reinterpreted.
 
 The argument for one call is consistency, not brevity. Plan 74's live
 acceptance showed both provider paths driving the five tools correctly, so the
 model **can** use CRUD; what CRUD asks is that it stay correct *across rounds* —
 remember the IDs, remember which row is `in_progress`, emit `task_update` at the
 right moment — while nothing tells it what the list currently looks like
-(`TaskGraphUpdated` reaches the TUI, never the context). A whole-table write
+(`TodoUpdated` reaches the TUI, never the context). A whole-table write
 makes consistency a property of one output: everything that is wrong is visible
 while it is being written. It also costs one call instead of N creates plus 2N
 updates, and one definition (241 characters) instead of five (1597) resent on
@@ -2300,10 +2310,11 @@ dispatcher rejects stale or forged calls before allowlists, hooks, permissions,
 or the registry. Foreground children return through their `run_agent` tool
 result; background children return through `SubAgentResult` in the parent Inbox.
 Neither path automatically changes the list: root decides when to rewrite it.
-There is no per-child task list, assignment/owner field, Team claim, or
-task-to-execution binding. The five retired names stay in the reserved set
-alongside `todo_write`, so an MCP tool cannot impersonate a call replayed out of
-resumed history.
+There is no per-child todo list, assignment/owner field, Team claim, or
+list-to-execution binding. The five retired `task_*` names stay in the reserved
+set, so an MCP tool cannot impersonate a call replayed out of resumed history;
+`todo_write` left that set, because a name in the live catalog is reserved by
+being in it.
 
 Independent CLI sessions/native server threads and a resumed process get fresh
 empty registries. An in-process TUI fork keeps the same live registry; the list
@@ -2318,8 +2329,8 @@ the composer's canonical visual rows, and overflow commit all consume the same
 viewport-height budget; no independently counted string-line total can make live
 chrome freeze into scrollback.
 
-`task_write` uses the ordinary `toolCall` lifecycle. A successful list-changing
-write additionally emits internal `TaskGraphUpdated`; only the TUI projects it
+`todo_write` uses the ordinary `toolCall` lifecycle. A successful list-changing
+write additionally emits internal `TodoUpdated`; only the TUI projects it
 as a read-only live list immediately above the composer. `Ctrl+T` toggles that
 projection without mutating the registry. When a turn ends the panel
 **retires**: it leaves the composer and takes its `Ctrl+T` hint with it, while
@@ -2834,7 +2845,7 @@ second turn against it. Headless one-shot execution remains bounded and does not
 expose this idle session surface; its teardown nevertheless reuses the selected
 text/NDJSON UI sink, so a queued mailbox event still receives its shutdown
 `undeliverable` terminal on the same stream.
-Sub-agents cannot spawn further sub-agents, so the whole background surface — `run_agent`, `wait_for_activity`, `stop_agent` — stays depth-0. One gate table answers for both halves of that: a child's catalog omits the tools, and the dispatcher refuses them before allowlists, hooks, permissions, or the handler, exactly as it does the task tool and the front-end surface block (`ask_user_question`, `cron_*`, `schedule_wakeup`, the plan-mode pair, `workflow`/`stop_workflow`, `run_program`/`stop_program`, the worktree pair), which a session whose front-end does not enable them is refused at depth 0 too.
+Sub-agents cannot spawn further sub-agents, so the whole background surface — `run_agent`, `wait_for_activity`, `stop_agent` — stays depth-0. One gate table answers for both halves of that: a child's catalog omits the tools, and the dispatcher refuses them before allowlists, hooks, permissions, or the handler, exactly as it does `todo_write` and the front-end surface block (`ask_user_question`, `cron_*`, `schedule_wakeup`, the plan-mode pair, `workflow`/`stop_workflow`, `run_program`/`stop_program`, the worktree pair), which a session whose front-end does not enable them is refused at depth 0 too.
 
 ### Local Agent Mailbox (Plan 70)
 
@@ -2892,14 +2903,15 @@ renamed the native surface without adding compatibility aliases:
 - kloop exposes `run_agent` and defaults to **synchronous** execution; Claude
   Code `Agent` requires both `description` and `prompt` and defaults to background
   unless `run_in_background:false` is explicit.
-- kloop exposes the native snake_case `task_write` list above only to the
+- kloop exposes the native snake_case `todo_write` list above only to the
   depth-0 root Agent, not as PascalCase Claude Code adapters or a child/Team
   collaboration surface. Child completion is an execution result; root
   explicitly rewrites the list. Claude Code's four-tool registry addresses rows
   by stable ID and its update carries owner, metadata, deletion and
   bidirectional dependencies; kloop has none of them — plan 73 removed `owner`,
   plan 187 removed `blocked_by`/`blocks`, and plan 188 replaced the CRUD set
-  with one whole-table write that has nothing to address. The TUI-only internal
+  with one whole-table write that has nothing to address — under the name cc
+  itself uses for that shape. The TUI-only internal
   snapshot projection is not a public Task wire. There are no
   `TaskOutput`/`TaskStop` aliases: those names belong to execution resources in
   Claude Code, while kloop keeps list state separate from
@@ -2913,7 +2925,7 @@ renamed the native surface without adding compatibility aliases:
 - Consecutive synchronous `run_agent` calls remain dispatcher-parallel; detached
   agent/program/workflow work remains capped at 8 per session.
 
-The Plan 52 executable report now consumes the native run_agent/task-list/wait
+The Plan 52 executable report now consumes the native run_agent/todo-list/wait
 surface while retaining the original Claude Code fixture corpus. Plan 66's
 dispatcher tests separately lock all twelve cross-resource stop combinations,
 the durable `wf_*` boundary, and strict background/wait parsing. Plan 71 added

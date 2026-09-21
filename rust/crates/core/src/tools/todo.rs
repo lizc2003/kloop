@@ -12,26 +12,26 @@ use serde_json::json;
 use super::ToolCtx;
 use crate::event::Event;
 
-const MAX_TASKS: usize = 256;
+const MAX_TODOS: usize = 256;
 const MAX_SUBJECT_CHARS: usize = 200;
 const MAX_DIAGNOSTIC_CHARS: usize = 80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
+pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
 }
 
-impl TaskStatus {
+impl TodoStatus {
     fn parse(value: Option<&Value>) -> Result<Self> {
         match value.and_then(Value::as_str) {
             Some("pending") => Ok(Self::Pending),
             Some("in_progress") => Ok(Self::InProgress),
             Some("completed") => Ok(Self::Completed),
-            Some(other) => bail!("task_write: unknown status `{}`", bounded_diagnostic(other)),
-            None => bail!("task_write: every task needs a 'status' string"),
+            Some(other) => bail!("todo_write: unknown status `{}`", bounded_diagnostic(other)),
+            None => bail!("todo_write: every todo needs a 'status' string"),
         }
     }
 }
@@ -41,29 +41,29 @@ impl TaskStatus {
 /// carries no ID — plan 188 deleted the ID space, its high-water mark and the
 /// epoch rollover that existed to reuse it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct TaskGraphTask {
+pub struct TodoItem {
     pub subject: String,
-    pub status: TaskStatus,
+    pub status: TodoStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct TaskGraphSnapshot {
+pub struct TodoSnapshot {
     pub revision: u64,
-    pub tasks: Vec<TaskGraphTask>,
+    pub todos: Vec<TodoItem>,
 }
 
 #[derive(Default)]
-struct TaskRegistryState {
+struct TodoRegistryState {
     revision: u64,
-    tasks: Vec<TaskGraphTask>,
+    todos: Vec<TodoItem>,
 }
 
 #[derive(Default)]
-pub struct TaskRegistry {
-    state: RwLock<TaskRegistryState>,
+pub struct TodoRegistry {
+    state: RwLock<TodoRegistryState>,
 }
 
-impl TaskRegistry {
+impl TodoRegistry {
     /// Replace the whole table. Returns the live table, plus the snapshot to
     /// publish — `None` when the write changed nothing, so a model that
     /// restates the same list every round never flickers the panel.
@@ -71,39 +71,36 @@ impl TaskRegistry {
     /// Everything is validated before the lock is taken and before a single
     /// row is stored: a rejected write leaves the previous table exactly as it
     /// was.
-    fn write(
-        &self,
-        tasks: Vec<TaskGraphTask>,
-    ) -> Result<(Vec<TaskGraphTask>, Option<TaskGraphSnapshot>)> {
-        if tasks.len() > MAX_TASKS {
-            bail!("task_write: task limit of {MAX_TASKS} exceeded");
+    fn write(&self, todos: Vec<TodoItem>) -> Result<(Vec<TodoItem>, Option<TodoSnapshot>)> {
+        if todos.len() > MAX_TODOS {
+            bail!("todo_write: todo limit of {MAX_TODOS} exceeded");
         }
-        for task in &tasks {
-            validate_subject(&task.subject)?;
+        for todo in &todos {
+            validate_subject(&todo.subject)?;
         }
         let mut state = self.state.write().unwrap();
-        if tasks == state.tasks {
-            return Ok((tasks, None));
+        if todos == state.todos {
+            return Ok((todos, None));
         }
-        let revision = next_revision(state.revision, "task_write")?;
-        state.tasks = tasks;
+        let revision = next_revision(state.revision, "todo_write")?;
+        state.todos = todos;
         state.revision = revision;
         let published = graph_snapshot(&state);
-        Ok((published.tasks.clone(), Some(published)))
+        Ok((published.todos.clone(), Some(published)))
     }
 
-    pub fn snapshot(&self) -> TaskGraphSnapshot {
+    pub fn snapshot(&self) -> TodoSnapshot {
         graph_snapshot(&self.state.read().unwrap())
     }
 
     /// The user's half of the registry: `/clear` empties the table, and the
     /// model has no tool that does. The revision advances unconditionally —
     /// it is the fence the TUI uses to reject a late pre-clear snapshot.
-    pub fn clear(&self) -> Result<(usize, TaskGraphSnapshot)> {
+    pub fn clear(&self) -> Result<(usize, TodoSnapshot)> {
         let mut state = self.state.write().unwrap();
         let revision = next_revision(state.revision, "clear")?;
-        let cleared_count = state.tasks.len();
-        state.tasks.clear();
+        let cleared_count = state.todos.len();
+        state.todos.clear();
         state.revision = revision;
         Ok((cleared_count, graph_snapshot(&state)))
     }
@@ -112,86 +109,86 @@ impl TaskRegistry {
 fn next_revision(revision: u64, tool: &str) -> Result<u64> {
     revision
         .checked_add(1)
-        .ok_or_else(|| anyhow!("{tool}: task graph revision exhausted"))
+        .ok_or_else(|| anyhow!("{tool}: todo list revision exhausted"))
 }
 
-fn graph_snapshot(state: &TaskRegistryState) -> TaskGraphSnapshot {
-    TaskGraphSnapshot {
+fn graph_snapshot(state: &TodoRegistryState) -> TodoSnapshot {
+    TodoSnapshot {
         revision: state.revision,
-        tasks: state.tasks.clone(),
+        todos: state.todos.clone(),
     }
 }
 
 fn validate_subject(subject: &str) -> Result<()> {
     if subject.trim().is_empty() {
-        bail!("task_write: subject must not be empty");
+        bail!("todo_write: subject must not be empty");
     }
     if subject.chars().count() > MAX_SUBJECT_CHARS {
-        bail!("task_write: subject exceeds the {MAX_SUBJECT_CHARS}-character limit");
+        bail!("todo_write: subject exceeds the {MAX_SUBJECT_CHARS}-character limit");
     }
     if subject
         .chars()
         .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
     {
-        bail!("task_write: subject must be a single line without control characters");
+        bail!("todo_write: subject must be a single line without control characters");
     }
     Ok(())
 }
 
-pub(super) fn task_write_def() -> ToolDef {
+pub(super) fn todo_write_def() -> ToolDef {
     ToolDef {
-        name: "task_write".into(),
-        description: "Record this session's task list. Every call replaces the whole list, so send every task you are still tracking with its current status; `[]` clears it. This records work only — it starts nothing, assigns nothing, and does not survive resume.".into(),
+        name: "todo_write".into(),
+        description: "Record this session's todo list. Every call replaces the whole list, so send every todo you are still tracking with its current status; `[]` clears it. This records work only — it starts nothing, assigns nothing, and does not survive resume.".into(),
         schema: json!({
             "type": "object",
-            "properties": {"tasks": {
+            "properties": {"todos": {
                 "type": "array",
-                "maxItems": MAX_TASKS,
+                "maxItems": MAX_TODOS,
                 "description": "The complete list, in the order it should be read",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS, "description": "Short single-line task title"},
+                        "subject": {"type": "string", "maxLength": MAX_SUBJECT_CHARS, "description": "Short single-line todo title"},
                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
                     },
                     "required": ["subject", "status"],
                     "additionalProperties": false
                 }
             }},
-            "required": ["tasks"],
+            "required": ["todos"],
             "additionalProperties": false
         }),
     }
 }
 
-pub(super) fn task_write_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let (tasks, snapshot) = ctx.cfg.tasks.write(parse_write(input)?)?;
+pub(super) fn todo_write_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    let (todos, snapshot) = ctx.cfg.todos.write(parse_write(input)?)?;
     if let Some(snapshot) = snapshot {
-        ctx.ui.emit(&Event::TaskGraphUpdated(snapshot));
+        ctx.ui.emit(&Event::TodoUpdated(snapshot));
     }
-    Ok(json!({"tasks": tasks}).to_string())
+    Ok(json!({"todos": todos}).to_string())
 }
 
-fn parse_write(input: &Value) -> Result<Vec<TaskGraphTask>> {
-    let object = strict_object(input, &["tasks"], "input")?;
+fn parse_write(input: &Value) -> Result<Vec<TodoItem>> {
+    let object = strict_object(input, &["todos"], "input")?;
     object
-        .get("tasks")
+        .get("todos")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("task_write: missing required array argument 'tasks'"))?
+        .ok_or_else(|| anyhow!("todo_write: missing required array argument 'todos'"))?
         .iter()
-        .map(parse_task)
+        .map(parse_todo)
         .collect()
 }
 
-fn parse_task(row: &Value) -> Result<TaskGraphTask> {
-    let object = strict_object(row, &["subject", "status"], "each task")?;
+fn parse_todo(row: &Value) -> Result<TodoItem> {
+    let object = strict_object(row, &["subject", "status"], "each todo")?;
     let subject = object
         .get("subject")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("task_write: every task needs a 'subject' string"))?;
-    Ok(TaskGraphTask {
+        .ok_or_else(|| anyhow!("todo_write: every todo needs a 'subject' string"))?;
+    Ok(TodoItem {
         subject: subject.to_string(),
-        status: TaskStatus::parse(object.get("status"))?,
+        status: TodoStatus::parse(object.get("status"))?,
     })
 }
 
@@ -202,13 +199,13 @@ fn strict_object<'a>(
 ) -> Result<&'a Map<String, Value>> {
     let object = value
         .as_object()
-        .ok_or_else(|| anyhow!("task_write: {what} must be an object"))?;
+        .ok_or_else(|| anyhow!("todo_write: {what} must be an object"))?;
     if let Some(unexpected) = object
         .keys()
         .find(|candidate| !allowed.contains(&candidate.as_str()))
     {
         bail!(
-            "task_write: unknown field `{}` in {what}",
+            "todo_write: unknown field `{}` in {what}",
             bounded_diagnostic(unexpected)
         );
     }
@@ -258,24 +255,24 @@ mod tests {
         }
     }
 
-    fn table(rows: &[(&str, TaskStatus)]) -> Vec<TaskGraphTask> {
+    fn table(rows: &[(&str, TodoStatus)]) -> Vec<TodoItem> {
         rows.iter()
-            .map(|(subject, status)| TaskGraphTask {
+            .map(|(subject, status)| TodoItem {
                 subject: (*subject).into(),
                 status: *status,
             })
             .collect()
     }
 
-    async fn write(ctx: &ToolCtx, tasks: Value) -> Value {
-        let (output, is_error) = run_tool("task_write", json!({"tasks": tasks}), ctx).await;
+    async fn write(ctx: &ToolCtx, todos: Value) -> Value {
+        let (output, is_error) = run_tool("todo_write", json!({"todos": todos}), ctx).await;
         assert!(!is_error, "{output}");
         serde_json::from_str(&output).unwrap()
     }
 
     #[tokio::test]
     async fn every_write_replaces_the_whole_table_and_returns_it() {
-        let ctx = test_ctx(0, "task-write");
+        let ctx = test_ctx(0, "todo-write");
         assert_eq!(
             write(
                 &ctx,
@@ -285,7 +282,7 @@ mod tests {
                 ]),
             )
             .await,
-            json!({"tasks": [
+            json!({"todos": [
                 {"subject": "First", "status": "in_progress"},
                 {"subject": "Second", "status": "pending"},
             ]})
@@ -302,36 +299,35 @@ mod tests {
                 ]),
             )
             .await,
-            json!({"tasks": [
+            json!({"todos": [
                 {"subject": "Second", "status": "completed"},
                 {"subject": "Third", "status": "pending"},
             ]})
         );
         assert_eq!(
             write(&ctx, json!([{"subject": "Second", "status": "pending"}])).await,
-            json!({"tasks": [{"subject": "Second", "status": "pending"}]})
+            json!({"todos": [{"subject": "Second", "status": "pending"}]})
         );
 
-        assert_eq!(write(&ctx, json!([])).await, json!({"tasks": []}));
+        assert_eq!(write(&ctx, json!([])).await, json!({"todos": []}));
         assert_eq!(
-            ctx.cfg.tasks.snapshot(),
-            TaskGraphSnapshot {
+            ctx.cfg.todos.snapshot(),
+            TodoSnapshot {
                 revision: 4,
-                tasks: Vec::new(),
+                todos: Vec::new(),
             }
         );
     }
 
     #[tokio::test]
     async fn the_retired_tools_and_their_fields_are_gone() {
-        let ctx = test_ctx(0, "task-retired");
+        let ctx = test_ctx(0, "todo-retired");
         for name in [
             "task_create",
             "task_get",
             "task_update",
             "task_list",
             "task_clear",
-            "todo_write",
         ] {
             let (output, is_error) = run_tool(name, json!({}), &ctx).await;
             assert!(is_error, "{name}: {output}");
@@ -359,47 +355,47 @@ mod tests {
                 json!({"subject": "x", "status": "pending", "blocked_by": ["2"]}),
             ),
         ] {
-            let (output, is_error) = run_tool("task_write", json!({"tasks": [row]}), &ctx).await;
+            let (output, is_error) = run_tool("todo_write", json!({"todos": [row]}), &ctx).await;
             assert!(is_error, "{field}: {output}");
             assert!(
                 output.contains(&format!("unknown field `{field}`")),
                 "{output}"
             );
         }
-        assert!(ctx.cfg.tasks.snapshot().tasks.is_empty());
+        assert!(ctx.cfg.todos.snapshot().todos.is_empty());
     }
 
     #[tokio::test]
     async fn strict_parsing_rejects_every_malformed_table() {
-        let ctx = test_ctx(0, "task-strict");
+        let ctx = test_ctx(0, "todo-strict");
         for input in [
             json!("not an object"),
             json!({}),
-            json!({"task": []}),
-            json!({"tasks": {}}),
-            json!({"tasks": ["First"]}),
-            json!({"tasks": [{"subject": "x"}]}),
-            json!({"tasks": [{"status": "pending"}]}),
-            json!({"tasks": [{"subject": "x", "status": "done"}]}),
-            json!({"tasks": [{"subject": "x", "status": Value::Null}]}),
-            json!({"tasks": [{"subject": 1, "status": "pending"}]}),
+            json!({"todo": []}),
+            json!({"todos": {}}),
+            json!({"todos": ["First"]}),
+            json!({"todos": [{"subject": "x"}]}),
+            json!({"todos": [{"status": "pending"}]}),
+            json!({"todos": [{"subject": "x", "status": "done"}]}),
+            json!({"todos": [{"subject": "x", "status": Value::Null}]}),
+            json!({"todos": [{"subject": 1, "status": "pending"}]}),
         ] {
-            let (output, is_error) = run_tool("task_write", input.clone(), &ctx).await;
+            let (output, is_error) = run_tool("todo_write", input.clone(), &ctx).await;
             assert!(is_error, "{input}: {output}");
         }
-        assert!(ctx.cfg.tasks.snapshot().tasks.is_empty());
+        assert!(ctx.cfg.todos.snapshot().todos.is_empty());
     }
 
     #[tokio::test]
     async fn budgets_and_bad_text_fail_before_the_table_moves() {
-        let ctx = test_ctx(0, "task-budgets");
+        let ctx = test_ctx(0, "todo-budgets");
         write(&ctx, json!([{"subject": "Keep me", "status": "pending"}])).await;
-        let before = ctx.cfg.tasks.snapshot();
+        let before = ctx.cfg.todos.snapshot();
 
-        let oversized = (0..=MAX_TASKS)
-            .map(|index| json!({"subject": format!("Task {index}"), "status": "pending"}))
+        let oversized = (0..=MAX_TODOS)
+            .map(|index| json!({"subject": format!("Todo {index}"), "status": "pending"}))
             .collect::<Vec<_>>();
-        for tasks in [
+        for todos in [
             json!([{"subject": "", "status": "pending"}]),
             json!([{"subject": "   ", "status": "pending"}]),
             json!([{"subject": "two\nlines", "status": "pending"}]),
@@ -412,35 +408,35 @@ mod tests {
             ]),
             Value::Array(oversized),
         ] {
-            let (output, is_error) = run_tool("task_write", json!({"tasks": tasks}), &ctx).await;
+            let (output, is_error) = run_tool("todo_write", json!({"todos": todos}), &ctx).await;
             assert!(is_error, "{output}");
-            assert_eq!(ctx.cfg.tasks.snapshot(), before);
+            assert_eq!(ctx.cfg.todos.snapshot(), before);
         }
 
         // One row under the limits, and the whole budget's worth of them.
         write(
             &ctx,
             Value::Array(
-                (0..MAX_TASKS)
-                    .map(|index| json!({"subject": format!("Task {index}"), "status": "pending"}))
+                (0..MAX_TODOS)
+                    .map(|index| json!({"subject": format!("Todo {index}"), "status": "pending"}))
                     .collect(),
             ),
         )
         .await;
-        assert_eq!(ctx.cfg.tasks.snapshot().tasks.len(), MAX_TASKS);
+        assert_eq!(ctx.cfg.todos.snapshot().todos.len(), MAX_TODOS);
     }
 
     #[test]
     fn rewriting_the_same_table_publishes_nothing() {
-        let registry = TaskRegistry::default();
-        let rows = table(&[("First", TaskStatus::Pending)]);
+        let registry = TodoRegistry::default();
+        let rows = table(&[("First", TodoStatus::Pending)]);
         let (live, snapshot) = registry.write(rows.clone()).unwrap();
         assert_eq!(live, rows);
         assert_eq!(
             snapshot,
-            Some(TaskGraphSnapshot {
+            Some(TodoSnapshot {
                 revision: 1,
-                tasks: rows.clone(),
+                todos: rows.clone(),
             })
         );
 
@@ -452,15 +448,15 @@ mod tests {
         // Order is part of the table: the same rows, moved, are a new revision.
         let (_, snapshot) = registry
             .write(table(&[
-                ("Second", TaskStatus::Pending),
-                ("First", TaskStatus::Pending),
+                ("Second", TodoStatus::Pending),
+                ("First", TodoStatus::Pending),
             ]))
             .unwrap();
         assert_eq!(snapshot.unwrap().revision, 2);
         let (_, snapshot) = registry
             .write(table(&[
-                ("First", TaskStatus::Pending),
-                ("Second", TaskStatus::Pending),
+                ("First", TodoStatus::Pending),
+                ("Second", TodoStatus::Pending),
             ]))
             .unwrap();
         assert_eq!(snapshot.unwrap().revision, 3);
@@ -468,16 +464,16 @@ mod tests {
 
     #[test]
     fn revision_overflow_fails_before_mutation() {
-        let registry = TaskRegistry::default();
+        let registry = TodoRegistry::default();
         registry
-            .write(table(&[("Existing", TaskStatus::Pending)]))
+            .write(table(&[("Existing", TodoStatus::Pending)]))
             .unwrap();
         registry.state.write().unwrap().revision = u64::MAX;
         let before = registry.snapshot();
 
         assert!(
             registry
-                .write(table(&[("New", TaskStatus::Pending)]))
+                .write(table(&[("New", TodoStatus::Pending)]))
                 .is_err()
         );
         assert_eq!(registry.snapshot(), before);
@@ -486,20 +482,20 @@ mod tests {
 
         // An unchanged rewrite never needs a revision, so it still succeeds.
         let (_, snapshot) = registry
-            .write(table(&[("Existing", TaskStatus::Pending)]))
+            .write(table(&[("Existing", TodoStatus::Pending)]))
             .unwrap();
         assert_eq!(snapshot, None);
     }
 
     #[test]
     fn concurrent_writes_are_serialized_and_registries_stay_independent() {
-        let registry = Arc::new(TaskRegistry::default());
+        let registry = Arc::new(TodoRegistry::default());
         let handles = (0..64)
             .map(|index| {
                 let registry = Arc::clone(&registry);
                 std::thread::spawn(move || {
                     registry
-                        .write(table(&[(&format!("Task {index}"), TaskStatus::Pending)]))
+                        .write(table(&[(&format!("Todo {index}"), TodoStatus::Pending)]))
                         .unwrap()
                         .0
                 })
@@ -509,15 +505,15 @@ mod tests {
             assert_eq!(handle.join().unwrap().len(), 1);
         }
         let snapshot = registry.snapshot();
-        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.todos.len(), 1);
         assert_eq!(snapshot.revision, 64);
 
-        let independent = TaskRegistry::default();
+        let independent = TodoRegistry::default();
         assert_eq!(
             independent.snapshot(),
-            TaskGraphSnapshot {
+            TodoSnapshot {
                 revision: 0,
-                tasks: Vec::new(),
+                todos: Vec::new(),
             }
         );
     }
@@ -525,12 +521,12 @@ mod tests {
     #[tokio::test]
     async fn mutations_emit_full_snapshots_inside_ordinary_tool_lifecycle() {
         let ui = Arc::new(RecordingUi::default());
-        let mut ctx = test_ctx(0, "task-events");
+        let mut ctx = test_ctx(0, "todo-events");
         ctx.ui = ui.clone();
 
         let (output, is_error) = run_tool(
-            "task_write",
-            json!({"tasks": [{"subject": "Visible", "status": "pending"}]}),
+            "todo_write",
+            json!({"todos": [{"subject": "Visible", "status": "pending"}]}),
             &ctx,
         )
         .await;
@@ -542,12 +538,12 @@ mod tests {
             Event::ItemStarted {
                 item: Item::ToolCall { name, .. },
                 ..
-            } if name == "task_write"
+            } if name == "todo_write"
         ));
         assert!(matches!(
             &events[1],
-            Event::TaskGraphUpdated(snapshot)
-                if snapshot.revision == 1 && snapshot.tasks[0].subject == "Visible"
+            Event::TodoUpdated(snapshot)
+                if snapshot.revision == 1 && snapshot.todos[0].subject == "Visible"
         ));
         assert_eq!(events[1].as_note(), None);
         assert!(matches!(
@@ -555,44 +551,44 @@ mod tests {
             Event::ItemCompleted {
                 item: Item::ToolCall { name, .. },
                 ..
-            } if name == "task_write"
+            } if name == "todo_write"
         ));
 
         // A repeated identical write and a rejected write both leave the panel
         // alone: two lifecycle events, no snapshot.
-        let before = ctx.cfg.tasks.snapshot();
+        let before = ctx.cfg.todos.snapshot();
         let quiet = |events: Vec<Event>| {
             assert_eq!(events.len(), 2);
             assert!(
                 !events
                     .iter()
-                    .any(|event| matches!(event, Event::TaskGraphUpdated(_)))
+                    .any(|event| matches!(event, Event::TodoUpdated(_)))
             );
         };
         let (output, is_error) = run_tool(
-            "task_write",
-            json!({"tasks": [{"subject": "Visible", "status": "pending"}]}),
+            "todo_write",
+            json!({"todos": [{"subject": "Visible", "status": "pending"}]}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{output}");
         quiet(ui.take());
-        assert_eq!(ctx.cfg.tasks.snapshot(), before);
+        assert_eq!(ctx.cfg.todos.snapshot(), before);
 
         for input in [
-            json!({"tasks": [{"subject": "x".repeat(MAX_SUBJECT_CHARS + 1), "status": "pending"}]}),
-            json!({"tasks": "not an array"}),
+            json!({"todos": [{"subject": "x".repeat(MAX_SUBJECT_CHARS + 1), "status": "pending"}]}),
+            json!({"todos": "not an array"}),
         ] {
-            let (output, is_error) = run_tool("task_write", input, &ctx).await;
+            let (output, is_error) = run_tool("todo_write", input, &ctx).await;
             assert!(is_error, "{output}");
-            assert_eq!(ctx.cfg.tasks.snapshot(), before);
+            assert_eq!(ctx.cfg.todos.snapshot(), before);
             quiet(ui.take());
         }
     }
 
     #[tokio::test]
-    async fn clear_changes_only_the_task_registry() {
-        let ctx = test_ctx(0, "task-clear-scope");
+    async fn clear_changes_only_the_todo_registry() {
+        let ctx = test_ctx(0, "todo-clear-scope");
         let executions = [
             (ExecutionKind::Agent, "agent-201"),
             (ExecutionKind::Program, "program-201"),
@@ -627,13 +623,13 @@ mod tests {
         };
 
         write(&ctx, json!([{"subject": "Discarded", "status": "pending"}])).await;
-        let (cleared_count, snapshot) = ctx.cfg.tasks.clear().unwrap();
+        let (cleared_count, snapshot) = ctx.cfg.todos.clear().unwrap();
         assert_eq!(cleared_count, 1);
         assert_eq!(
             snapshot,
-            TaskGraphSnapshot {
+            TodoSnapshot {
                 revision: 2,
-                tasks: Vec::new(),
+                todos: Vec::new(),
             }
         );
         assert_eq!(ctx.cfg.background_executions.running_count(), 3);
@@ -657,8 +653,8 @@ mod tests {
 
     #[test]
     fn the_definition_is_one_strict_root_only_tool() {
-        let definition = task_write_def();
-        assert_eq!(definition.name, "task_write");
+        let definition = todo_write_def();
+        assert_eq!(definition.name, "todo_write");
         // Plan 188's budget: five definitions cost 1597 characters, and the
         // model called none of them. One table, one call, one short paragraph.
         assert!(
@@ -667,7 +663,7 @@ mod tests {
             definition.description.chars().count()
         );
         assert_eq!(definition.schema["additionalProperties"], false);
-        let row = &definition.schema["properties"]["tasks"]["items"];
+        let row = &definition.schema["properties"]["todos"]["items"];
         assert_eq!(row["additionalProperties"], false);
         assert_eq!(row["required"], json!(["subject", "status"]));
         for retired in ["id", "task_id", "description", "owner", "blocked_by"] {
@@ -683,9 +679,9 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
             assert_eq!(
-                names.iter().any(|name| name == "task_write"),
+                names.iter().any(|name| name == "todo_write"),
                 depth == 0,
-                "task_write at depth {depth}"
+                "todo_write at depth {depth}"
             );
             for retired in [
                 "task_create",
@@ -693,7 +689,6 @@ mod tests {
                 "task_update",
                 "task_list",
                 "task_clear",
-                "todo_write",
             ] {
                 assert!(!names.iter().any(|name| name == retired), "{retired}");
             }

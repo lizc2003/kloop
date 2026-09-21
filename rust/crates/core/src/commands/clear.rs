@@ -11,9 +11,9 @@ use crate::history::History;
 pub const SUMMARY: &str = "clear the conversation and start fresh";
 
 pub fn run(history: &mut History, cfg: &Arc<Config>) -> SlashResult {
-    // Advance the graph revision before touching the other session state. This is
+    // Advance the list revision before touching the other session state. This is
     // the reset fence the TUI uses to reject any delayed pre-clear snapshot.
-    let (_, snapshot) = match cfg.tasks.clear() {
+    let (_, snapshot) = match cfg.todos.clear() {
         Ok(cleared) => cleared,
         Err(error) => return SlashResult::message(format!("clear failed: {error:#}")),
     };

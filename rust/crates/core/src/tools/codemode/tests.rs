@@ -1238,7 +1238,7 @@ fn ts_type_covers_common_shapes() {
 }
 
 #[test]
-fn program_surface_excludes_agent_and_task_control_tools() {
+fn program_surface_excludes_agent_and_todo_control_tools() {
     let names = program_tool_names(&[], &crate::shell_programs::ShellPrograms::test_fixture());
     assert!(names.iter().any(|n| n == "read_file"));
     assert!(names.iter().any(|n| n == "bash"));
@@ -1249,7 +1249,7 @@ fn program_surface_excludes_agent_and_task_control_tools() {
         "stop_bash",
         "send_message",
         "list_agents",
-        "task_write",
+        "todo_write",
     ] {
         assert!(
             !names.iter().any(|name| name == excluded),

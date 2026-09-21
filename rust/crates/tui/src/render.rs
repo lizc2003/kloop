@@ -17,9 +17,9 @@ use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
 use kloop_core::event::BackgroundTaskStatus;
 use kloop_core::permissions::ConfirmRequest;
-use kloop_core::tools::TaskGraphSnapshot;
-use kloop_core::tools::TaskGraphTask;
-use kloop_core::tools::TaskStatus;
+use kloop_core::tools::TodoItem;
+use kloop_core::tools::TodoSnapshot;
+use kloop_core::tools::TodoStatus;
 use kloop_protocol::RoutePickerStage;
 
 use std::time::Duration;
@@ -64,14 +64,14 @@ pub struct Hud {
     pub reduced_motion: bool,
 }
 
-const TASK_PANEL_MAX_ROWS: usize = 8;
-const TASK_PANEL_COMPLETED_LIMIT: usize = 3;
+const TODO_PANEL_MAX_ROWS: usize = 8;
+const TODO_PANEL_COMPLETED_LIMIT: usize = 3;
 
 #[derive(Debug)]
 pub struct LiveChromeLayout {
     pub activity_visible: bool,
     pub activity_spacer: bool,
-    pub task_lines: Vec<Line<'static>>,
+    pub todo_lines: Vec<Line<'static>>,
     /// The inline choice panel — an approval, a question, a picker — laid out to
     /// the rows it may occupy. None when nothing owns the keyboard. It is chrome
     /// like the rest: it never enters native scrollback, and its rows must be in
@@ -83,7 +83,7 @@ impl LiveChromeLayout {
     pub fn reserved_rows(&self) -> usize {
         usize::from(self.activity_visible)
             + usize::from(self.activity_spacer)
-            + self.task_lines.len()
+            + self.todo_lines.len()
             // The panel carries one blank row above it, separating it from the
             // transcript.
             + self.panel.as_ref().map_or(0, |panel| panel.lines.len() + 1)
@@ -95,17 +95,17 @@ impl LiveChromeLayout {
 /// conversation that led to the prompt off screen.
 const PANEL_MAX_ROWS: usize = 20;
 
-fn task_panel_allowed(app: &App) -> bool {
-    app.show_task_graph
+fn todo_panel_allowed(app: &App) -> bool {
+    app.show_todos
         && app.interactions.is_empty()
         && app.fork_picker.is_none()
         && app.provider_picker.is_none()
         && app.popup.is_none()
-        && app.live_task_graph().is_some()
+        && app.live_todos().is_some()
 }
 
 /// Compute all mutable chrome that lives between transcript cells and the
-/// composer. Draw and native-scrollback commit use this exact helper so a Task
+/// composer. Draw and native-scrollback commit use this exact helper so a todo
 /// row can never be counted on screen but omitted from the frozen-height budget.
 pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     let width = usize::from(viewport.width).max(1);
@@ -116,7 +116,7 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     let fixed_bottom = 2 + composer_height(app, width) + 1;
     let transcript_capacity = terminal_height.saturating_sub(fixed_bottom).max(1);
     // The panel is the user's whole job while it is up, so it is served before
-    // the task list — but never all the way to the top: two rows are held back
+    // the todo list — but never all the way to the top: two rows are held back
     // so the separator and at least one line of transcript survive.
     let panel = active_panel(app, width).map(|panel| {
         let rows = transcript_capacity
@@ -125,16 +125,16 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
         choice::panel_lines(&panel, width, rows, app.panel_scroll)
     });
     let panel_rows = panel.as_ref().map_or(0, |panel| panel.lines.len() + 1);
-    let max_task_rows = transcript_capacity
+    let max_todo_rows = transcript_capacity
         .saturating_sub(activity_rows)
         .saturating_sub(panel_rows)
         .saturating_sub(1)
-        .min(TASK_PANEL_MAX_ROWS);
-    let task_lines = if task_panel_allowed(app) && max_task_rows > 0 {
-        task_panel_lines(
-            app.live_task_graph().expect("allowed graph exists"),
+        .min(TODO_PANEL_MAX_ROWS);
+    let todo_lines = if todo_panel_allowed(app) && max_todo_rows > 0 {
+        todo_panel_lines(
+            app.live_todos().expect("allowed list exists"),
             width,
-            max_task_rows,
+            max_todo_rows,
         )
     } else {
         Vec::new()
@@ -142,24 +142,24 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     LiveChromeLayout {
         activity_visible,
         activity_spacer,
-        task_lines,
+        todo_lines,
         panel,
     }
 }
 
-fn task_line(task: &TaskGraphTask, first: bool, width: usize) -> Line<'static> {
+fn todo_line(todo: &TodoItem, first: bool, width: usize) -> Line<'static> {
     // `⎿` is one column wide (neutral width), so the continuation indent is two
     // spaces — three would push every row after the first one column right of
     // the glyph it is meant to line up under.
     let prefix = if first { "⎿ " } else { "  " };
-    let (glyph, glyph_style, subject_style) = match task.status {
-        TaskStatus::InProgress => (
+    let (glyph, glyph_style, subject_style) = match todo.status {
+        TodoStatus::InProgress => (
             "◼",
             Style::new().fg(Color::Cyan),
             Style::new().add_modifier(Modifier::BOLD),
         ),
-        TaskStatus::Pending => ("◻", DIM, DIM),
-        TaskStatus::Completed => (
+        TodoStatus::Pending => ("◻", DIM, DIM),
+        TodoStatus::Completed => (
             "✔",
             Style::new().fg(Color::Green),
             DIM.add_modifier(Modifier::CROSSED_OUT),
@@ -171,11 +171,11 @@ fn task_line(task: &TaskGraphTask, first: bool, width: usize) -> Line<'static> {
         Span::styled(prefix.to_string(), DIM),
         Span::styled(glyph.to_string(), glyph_style),
         Span::raw(" "),
-        Span::styled(truncate(&task.subject, body_width.max(1)), subject_style),
+        Span::styled(truncate(&todo.subject, body_width.max(1)), subject_style),
     ])
 }
 
-fn task_summary_line(label: String, first: bool, width: usize) -> Line<'static> {
+fn todo_summary_line(label: String, first: bool, width: usize) -> Line<'static> {
     let prefix = if first { "⎿ " } else { "  " };
     let budget = width.saturating_sub(display_width(prefix)).max(1);
     Line::from(vec![
@@ -184,10 +184,10 @@ fn task_summary_line(label: String, first: bool, width: usize) -> Line<'static> 
     ])
 }
 
-fn visible_task_counts(unfinished: usize, completed: usize, cap: usize) -> (usize, usize) {
+fn visible_todo_counts(unfinished: usize, completed: usize, cap: usize) -> (usize, usize) {
     let mut best = (0, 0);
     for visible_unfinished in 0..=unfinished.min(cap) {
-        for visible_completed in 0..=completed.min(TASK_PANEL_COMPLETED_LIMIT).min(cap) {
+        for visible_completed in 0..=completed.min(TODO_PANEL_COMPLETED_LIMIT).min(cap) {
             let rows = visible_unfinished
                 + visible_completed
                 + usize::from(visible_unfinished < unfinished)
@@ -200,28 +200,28 @@ fn visible_task_counts(unfinished: usize, completed: usize, cap: usize) -> (usiz
     best
 }
 
-pub fn task_panel_lines(
-    snapshot: &TaskGraphSnapshot,
+pub fn todo_panel_lines(
+    snapshot: &TodoSnapshot,
     width: usize,
     max_rows: usize,
 ) -> Vec<Line<'static>> {
-    if snapshot.tasks.is_empty() || max_rows == 0 || width < 8 {
+    if snapshot.todos.is_empty() || max_rows == 0 || width < 8 {
         return Vec::new();
     }
     let mut in_progress = Vec::new();
     let mut pending = Vec::new();
     let mut completed = Vec::new();
-    for task in &snapshot.tasks {
-        match task.status {
-            TaskStatus::InProgress => in_progress.push(task),
-            TaskStatus::Pending => pending.push(task),
-            TaskStatus::Completed => completed.push(task),
+    for todo in &snapshot.todos {
+        match todo.status {
+            TodoStatus::InProgress => in_progress.push(todo),
+            TodoStatus::Pending => pending.push(todo),
+            TodoStatus::Completed => completed.push(todo),
         }
     }
     let unfinished = in_progress.into_iter().chain(pending).collect::<Vec<_>>();
-    let cap = max_rows.min(TASK_PANEL_MAX_ROWS);
+    let cap = max_rows.min(TODO_PANEL_MAX_ROWS);
     let (visible_unfinished, visible_completed) =
-        visible_task_counts(unfinished.len(), completed.len(), cap);
+        visible_todo_counts(unfinished.len(), completed.len(), cap);
     if visible_unfinished == 0
         && visible_completed == 0
         && usize::from(!unfinished.is_empty()) + usize::from(!completed.is_empty()) > cap
@@ -230,23 +230,23 @@ pub fn task_panel_lines(
     }
 
     let mut lines = Vec::new();
-    for task in unfinished.iter().take(visible_unfinished) {
-        lines.push(task_line(task, lines.is_empty(), width));
+    for todo in unfinished.iter().take(visible_unfinished) {
+        lines.push(todo_line(todo, lines.is_empty(), width));
     }
     let hidden_unfinished = unfinished.len().saturating_sub(visible_unfinished);
     if hidden_unfinished > 0 {
-        lines.push(task_summary_line(
+        lines.push(todo_summary_line(
             format!("… +{hidden_unfinished} unfinished"),
             lines.is_empty(),
             width,
         ));
     }
-    for task in completed.iter().take(visible_completed) {
-        lines.push(task_line(task, lines.is_empty(), width));
+    for todo in completed.iter().take(visible_completed) {
+        lines.push(todo_line(todo, lines.is_empty(), width));
     }
     let hidden_completed = completed.len().saturating_sub(visible_completed);
     if hidden_completed > 0 {
-        lines.push(task_summary_line(
+        lines.push(todo_summary_line(
             format!("… +{hidden_completed} completed"),
             lines.is_empty(),
             width,
@@ -823,11 +823,11 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     } else {
         "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
     };
-    if app.live_task_graph().is_some() {
-        hints.push_str(if app.show_task_graph {
-            " · ctrl+t to hide tasks"
+    if app.live_todos().is_some() {
+        hints.push_str(if app.show_todos {
+            " · ctrl+t to hide todos"
         } else {
-            " · ctrl+t to show tasks"
+            " · ctrl+t to show todos"
         });
     }
     // Right-aligned system status; dropped if the row is too narrow to fit it
@@ -920,7 +920,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     .areas(full);
 
     let mut lines = visible_transcript(app, hud, width.max(1));
-    // Activity and tasks are mutable live chrome, never transcript Cells. The
+    // Activity and todos are mutable live chrome, never transcript Cells. The
     // shared layout helper above also supplies commit_overflow's reserve.
     if chrome.activity_visible {
         if chrome.activity_spacer {
@@ -930,7 +930,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
             lines.push(activity);
         }
     }
-    lines.extend(chrome.task_lines);
+    lines.extend(chrome.todo_lines);
     // The choice panel closes the transcript: a blank row, then its own rows, so
     // it sits directly on the composer's top rule — the eye is already there.
     let panel_rows = chrome.panel.as_ref().map_or(0, |panel| panel.lines.len());
@@ -1384,15 +1384,15 @@ mod tests {
         )
     }
 
-    fn task(subject: &str, status: TaskStatus) -> TaskGraphTask {
-        TaskGraphTask {
+    fn todo(subject: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
             subject: subject.into(),
             status,
         }
     }
 
-    fn task_graph(tasks: Vec<TaskGraphTask>) -> TaskGraphSnapshot {
-        TaskGraphSnapshot { revision: 1, tasks }
+    fn todo_snapshot(todos: Vec<TodoItem>) -> TodoSnapshot {
+        TodoSnapshot { revision: 1, todos }
     }
 
     #[test]
@@ -1403,17 +1403,17 @@ mod tests {
     }
 
     #[test]
-    fn task_panel_sorts_styles_and_collapses_completed() {
-        let snapshot = task_graph(vec![
-            task("Done one", TaskStatus::Completed),
-            task("Active", TaskStatus::InProgress),
-            task("Ready", TaskStatus::Pending),
-            task("Next", TaskStatus::Pending),
-            task("Done five", TaskStatus::Completed),
-            task("Done six", TaskStatus::Completed),
-            task("Done seven", TaskStatus::Completed),
+    fn todo_panel_sorts_styles_and_collapses_completed() {
+        let snapshot = todo_snapshot(vec![
+            todo("Done one", TodoStatus::Completed),
+            todo("Active", TodoStatus::InProgress),
+            todo("Ready", TodoStatus::Pending),
+            todo("Next", TodoStatus::Pending),
+            todo("Done five", TodoStatus::Completed),
+            todo("Done six", TodoStatus::Completed),
+            todo("Done seven", TodoStatus::Completed),
         ]);
-        let lines = task_panel_lines(&snapshot, 80, TASK_PANEL_MAX_ROWS);
+        let lines = todo_panel_lines(&snapshot, 80, TODO_PANEL_MAX_ROWS);
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
         assert_eq!(
             texts,
@@ -1450,15 +1450,15 @@ mod tests {
     }
 
     #[test]
-    fn task_panel_hard_cap_preserves_accurate_group_summaries_and_width() {
-        let mut tasks = (1..=12)
-            .map(|id| task(&format!("未完成任务{id}"), TaskStatus::Pending))
+    fn todo_panel_hard_cap_preserves_accurate_group_summaries_and_width() {
+        let mut todos = (1..=12)
+            .map(|id| todo(&format!("未完成任务{id}"), TodoStatus::Pending))
             .collect::<Vec<_>>();
-        tasks.extend((13..=17).map(|id| task(&format!("已完成任务{id}"), TaskStatus::Completed)));
-        let snapshot = task_graph(tasks);
-        let lines = task_panel_lines(&snapshot, 18, TASK_PANEL_MAX_ROWS);
+        todos.extend((13..=17).map(|id| todo(&format!("已完成任务{id}"), TodoStatus::Completed)));
+        let snapshot = todo_snapshot(todos);
+        let lines = todo_panel_lines(&snapshot, 18, TODO_PANEL_MAX_ROWS);
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
-        assert_eq!(lines.len(), TASK_PANEL_MAX_ROWS);
+        assert_eq!(lines.len(), TODO_PANEL_MAX_ROWS);
         assert!(texts.iter().any(|line| line == "  … +6 unfinished"));
         assert!(texts.iter().any(|line| line == "  … +5 completed"));
         assert!(
@@ -1468,13 +1468,13 @@ mod tests {
             "{texts:?}"
         );
 
-        let completed_only = task_graph(
+        let completed_only = todo_snapshot(
             (1..=5)
-                .map(|id| task(&format!("Done {id}"), TaskStatus::Completed))
+                .map(|id| todo(&format!("Done {id}"), TodoStatus::Completed))
                 .collect(),
         );
         assert_eq!(
-            task_panel_lines(&completed_only, 40, 8)
+            todo_panel_lines(&completed_only, 40, 8)
                 .iter()
                 .map(line_text)
                 .collect::<Vec<_>>(),
@@ -1485,28 +1485,28 @@ mod tests {
     #[test]
     fn a_finished_graph_leaves_the_chrome_and_the_footer_hint_with_the_turn() {
         let mut app = App::new("s".into());
-        app.task_graph = Some(task_graph(vec![task("Done", TaskStatus::Completed)]));
+        app.todos = Some(todo_snapshot(vec![todo("Done", TodoStatus::Completed)]));
         let viewport = Rect::new(0, 0, 80, 24);
-        assert_eq!(live_chrome_layout(&app, viewport).task_lines.len(), 1);
-        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
+        assert_eq!(live_chrome_layout(&app, viewport).todo_lines.len(), 1);
+        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide todos"));
 
         app.apply(crate::events::AgentEvent::Core(
             kloop_core::event::Event::TurnEnded(kloop_core::agent::EndReason::Completed),
         ));
         assert!(
-            live_chrome_layout(&app, viewport).task_lines.is_empty(),
+            live_chrome_layout(&app, viewport).todo_lines.is_empty(),
             "the retired panel gives its rows back to the transcript"
         );
         assert!(!line_text(&footer_line(&app, 140)).contains("ctrl+t"));
     }
 
     #[test]
-    fn live_chrome_hides_tasks_for_overlays_and_tiny_terminals() {
+    fn live_chrome_hides_todos_for_overlays_and_tiny_terminals() {
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("transcript".into()));
-        app.task_graph = Some(task_graph(vec![task("Visible", TaskStatus::Pending)]));
+        app.todos = Some(todo_snapshot(vec![todo("Visible", TodoStatus::Pending)]));
         let normal = live_chrome_layout(&app, Rect::new(0, 0, 80, 24));
-        assert_eq!(normal.task_lines.len(), 1);
+        assert_eq!(normal.todo_lines.len(), 1);
         assert_eq!(normal.reserved_rows(), 1);
 
         app.fork_picker = Some(crate::app::ForkPicker {
@@ -1515,7 +1515,7 @@ mod tests {
         });
         assert!(
             live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-                .task_lines
+                .todo_lines
                 .is_empty()
         );
         app.fork_picker = None;
@@ -1533,7 +1533,7 @@ mod tests {
         });
         assert!(
             live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-                .task_lines
+                .todo_lines
                 .is_empty()
         );
         app.interactions.clear();
@@ -1557,7 +1557,7 @@ mod tests {
         });
         assert!(
             live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-                .task_lines
+                .todo_lines
                 .is_empty()
         );
         app.interactions.clear();
@@ -1573,43 +1573,43 @@ mod tests {
         });
         assert!(
             live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-                .task_lines
+                .todo_lines
                 .is_empty()
         );
         app.popup = None;
 
         assert!(
             live_chrome_layout(&app, Rect::new(0, 0, 80, 5))
-                .task_lines
+                .todo_lines
                 .is_empty()
         );
-        app.show_task_graph = false;
+        app.show_todos = false;
         assert!(
             live_chrome_layout(&app, Rect::new(0, 0, 80, 24))
-                .task_lines
+                .todo_lines
                 .is_empty()
         );
     }
 
     #[test]
-    fn draw_keeps_activity_then_tasks_immediately_above_composer() {
+    fn draw_keeps_activity_then_todos_immediately_above_composer() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("history".into()));
         app.running = true;
-        app.task_graph = Some(task_graph(vec![
-            task("Done one", TaskStatus::Completed),
-            task("Active", TaskStatus::InProgress),
-            task(
+        app.todos = Some(todo_snapshot(vec![
+            todo("Done one", TodoStatus::Completed),
+            todo("Active", TodoStatus::InProgress),
+            todo(
                 "需要处理一个非常非常非常非常长的中文任务标题并且还要再长一点",
-                TaskStatus::Pending,
+                TodoStatus::Pending,
             ),
-            task("Done four", TaskStatus::Completed),
-            task("Done five", TaskStatus::Completed),
-            task("Done six", TaskStatus::Completed),
-            task("Done seven", TaskStatus::Completed),
+            todo("Done four", TodoStatus::Completed),
+            todo("Done five", TodoStatus::Completed),
+            todo("Done six", TodoStatus::Completed),
+            todo("Done seven", TodoStatus::Completed),
         ]));
         let mut terminal = Terminal::new(TestBackend::new(50, 18)).unwrap();
         terminal
@@ -1627,14 +1627,14 @@ mod tests {
             .iter()
             .position(|row| row.contains("Working"))
             .expect("activity row");
-        let first_task = rows
+        let first_todo = rows
             .iter()
             .position(|row| row.contains("⎿ ◼ Active"))
-            .expect("first task row");
+            .expect("first todo row");
         let cjk = rows
             .iter()
             .position(|row| row.contains('需'))
-            .unwrap_or_else(|| panic!("CJK task row: {rows:#?}"));
+            .unwrap_or_else(|| panic!("CJK todo row: {rows:#?}"));
         assert!(rows[cjk].contains('…'), "CJK subject truncates: {rows:#?}");
         let completed_summary = rows
             .iter()
@@ -1648,15 +1648,15 @@ mod tests {
             .map(|(index, _)| index)
             .expect("composer top rule");
         assert!(
-            activity < first_task
-                && first_task < cjk
+            activity < first_todo
+                && first_todo < cjk
                 && cjk < completed_summary
                 && completed_summary < rule
         );
         assert_eq!(
             app.cells,
             vec![Cell::Assistant("history".into())],
-            "Task projection is not a transcript Cell"
+            "Todo projection is not a transcript Cell"
         );
     }
 
@@ -1682,7 +1682,7 @@ mod tests {
 
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("history".into()));
-        app.task_graph = Some(task_graph(vec![task("Toggle me", TaskStatus::Pending)]));
+        app.todos = Some(todo_snapshot(vec![todo("Toggle me", TodoStatus::Pending)]));
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
 
         terminal
@@ -1690,7 +1690,7 @@ mod tests {
             .unwrap();
         let visible = screen(&terminal);
         assert!(visible.contains("⎿ ◻ Toggle me"), "{visible}");
-        assert!(visible.contains("ctrl+t to hide tasks"), "{visible}");
+        assert!(visible.contains("ctrl+t to hide todos"), "{visible}");
 
         app.on_key(80, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         terminal
@@ -1698,7 +1698,7 @@ mod tests {
             .unwrap();
         let hidden = screen(&terminal);
         assert!(!hidden.contains("Toggle me"), "{hidden}");
-        assert!(hidden.contains("ctrl+t to show tasks"), "{hidden}");
+        assert!(hidden.contains("ctrl+t to show todos"), "{hidden}");
 
         app.on_key(80, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         terminal
@@ -2387,11 +2387,11 @@ mod tests {
         assert!(activity_line(&app, &hud).is_none());
         assert!(!has_activity_line(&app));
 
-        app.task_graph = Some(task_graph(vec![task("Visible", TaskStatus::Pending)]));
-        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
-        app.show_task_graph = false;
-        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to show tasks"));
-        app.show_task_graph = true;
+        app.todos = Some(todo_snapshot(vec![todo("Visible", TodoStatus::Pending)]));
+        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide todos"));
+        app.show_todos = false;
+        assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to show todos"));
+        app.show_todos = true;
 
         app.mode = Mode::Plan;
         assert!(line_text(&footer_line(&app, 80)).starts_with("[plan]  "));

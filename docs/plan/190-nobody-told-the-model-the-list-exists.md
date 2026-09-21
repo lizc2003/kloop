@@ -13,7 +13,7 @@
 (`tool_search.rs:195`)、重读同一文件的劝阻与图片/空文件提示(`fs.rs:70/386/427`)。
 **task 一处都没有。**
 
-而且 task 图**不回灌上下文**:`TaskGraphUpdated`(`event.rs:129`)在
+而且 todo 表**不回灌上下文**:`TodoUpdated`(`event.rs:129`)在
 `event.rs:309` 和 `server/src/wire.rs:281` 都返回 `None`,只有 TUI 投影它。
 模型写完一张表之后,**下一轮它对这张表的全部认知,就是自己几轮前那条 tool_result**,
 中间隔着几十 K 的工具输出。
@@ -36,7 +36,7 @@
 「Project instructions and the skills catalog are **session-stable**」,
 只有 MCP 目录「may replace the deferred-tools notice **at a round boundary**」。
 
-第一条 user 消息在**缓存前缀的最前面**。每轮变化的 task 表放进去,
+第一条 user 消息在**缓存前缀的最前面**。每轮变化的 todo 表放进去,
 **整个会话的缓存每轮全废**——不是掉几个百分点,是前缀从头断。
 
 plan 120 用 2019 轮 usage 采样量过这件事:单轮增量 0–2k 的轮次命中率中位数 **97%**,
@@ -66,7 +66,7 @@ user message.」注入的内容作为 **user message 追加在历史末尾**,在
 
 - **表非空,且距上次注入已过 N 轮**(N 开工时定,建议 3),**且表在这期间没有变化**。
   「表没变」正是该提醒的信号:模型在干活,但没有回来更新状态。
-- 注入后记下 `revision`(`TaskGraphSnapshot.revision`,现成的),
+- 注入后记下 `revision`(`TodoSnapshot.revision`,现成的),
   **同一个 revision 只注入一次**。
 - **表为空时不提醒**,或至多在会话首轮之后提醒一次。空表提醒最容易变成噪音——
   它要求判断「这次的活该不该记清单」,而那个判断模型自己做得比一条固定规则好。
@@ -84,7 +84,7 @@ user message.」注入的内容作为 **user message 追加在历史末尾**,在
 2. **`/clear` 之后要清节流状态**。`commands/clear.rs:16` 调 `cfg.tasks.clear()`
    并无条件推进 revision(教训 87 的 reset fence)。上次注入的 revision 记录必须跟着复位,
    否则清空后第一张新表会因为「revision 变了但没到 N 轮」被吞掉,或者反过来立刻重发。
-3. **子 agent 不注入。** 五个 task 工具是 `Gate::Depth0`(`builtin.rs:340`),
+3. **子 agent 不注入。** `todo_write` 是 `Gate::Depth0`(`builtin.rs`),
    depth>0 根本看不见这张表,给它们注入是纯噪音。
 4. **这是行为改动,不是删代码,测试断言只能守住机制**(注入位置在历史末尾、
    同 revision 不重复、`/clear` 后复位、depth>0 不注入)。**它到底有没有用,
@@ -107,3 +107,18 @@ user message.」注入的内容作为 **user message 追加在历史末尾**,在
 - **缓存侧**:按 plan 120 的口径取 usage,确认命中率**没有**因为这条改动下降。
   如果掉了,第一嫌疑是注入位置错了(见第二节),不是注入内容太大。
 - DESIGN.md:task 那一段(2243–2295)补注入契约;**先读现在那段还成不成立再决定改写还是追加**。
+
+## 八、188 之后的形状更新(2026-09-21)
+
+本 plan 立于 plan 187/188 之前,正文里的 `task_*` 措辞已按落地结果改过。开工时的
+事实是:
+
+- 工具只有一个 **`todo_write`**,整表覆盖,`{"todos":[{"subject","status"}]}`,
+  两字段都必填。没有读工具——**这正是本 plan 存在的理由**:模型除了自己上一次的
+  写入,没有任何途径知道表现在长什么样。
+- 回灌的内容因此很小:一行 subject 加一个 status,256 行封顶,subject 200 字符封顶。
+  不再有 `description`(188 删掉)、没有 ID、没有 `blocked_by`。
+- 类型名:`TodoSnapshot { revision, todos }`、`TodoItem { subject, status }`、
+  `TodoStatus`、`Event::TodoUpdated`、`Config.todos: Arc<TodoRegistry>`。
+- `BASE_SYSTEM`(`context.rs`)那句已经是 `todo_write` 单数措辞,
+  **但「never as a round of its own」那半句仍未动**,留给本 plan(第五节)。

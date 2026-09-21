@@ -111,7 +111,7 @@ fn is_program_callable(name: &str) -> bool {
             | "stop_workflow"
             | "send_message"
             | "list_agents"
-            | "task_write"
+            | "todo_write"
     )
 }
 

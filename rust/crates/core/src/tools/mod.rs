@@ -38,7 +38,7 @@ mod scheduler;
 mod search;
 mod skill;
 mod subagent;
-mod task;
+mod todo;
 mod tool_search;
 pub mod web;
 mod workflow;
@@ -62,10 +62,10 @@ pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the run_agent sub-agent machinery.
 pub(crate) use subagent::fork_skill;
-pub use task::TaskGraphSnapshot;
-pub use task::TaskGraphTask;
-pub use task::TaskRegistry;
-pub use task::TaskStatus;
+pub use todo::TodoItem;
+pub use todo::TodoRegistry;
+pub use todo::TodoSnapshot;
+pub use todo::TodoStatus;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -560,7 +560,6 @@ fn reserved_names() -> &'static std::collections::HashSet<String> {
                         "task",
                         "wait",
                         "kill_bash",
-                        "todo_write",
                         "task_create",
                         "task_get",
                         "task_update",
@@ -720,7 +719,7 @@ fn source_route_state(sources: &[Arc<dyn ToolSource>], name: &str) -> SourceRout
     }
 }
 
-/// The built-in tool defs (bash, file, search, and — at depth 0 — tasks plus
+/// The built-in tool defs (bash, file, search, and — at depth 0 — todos plus
 /// `run_agent`): every [`builtin::Builtin`] whose gate puts it in the catalog.
 /// This is the set `run_program` derives its TypeScript API from, so it
 /// excludes `run_program` itself — structurally, because that tool's gate is a
@@ -875,7 +874,7 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
 fn reject_unavailable(name: &str, input: &Value, ctx: &ToolCtx) -> Result<()> {
     match name {
         "task" => bail!(
-            "tool 'task' was renamed to 'run_agent'; task_* is reserved for the structured task graph"
+            "tool 'task' was renamed to 'run_agent'; task_* is reserved for the retired todo tools"
         ),
         "wait" => bail!("tool 'wait' was renamed to 'wait_for_activity'"),
         "kill_bash" => bail!("tool 'kill_bash' was renamed to 'stop_bash'"),
@@ -1596,7 +1595,7 @@ fn execute_tool<'a>(
                 )
                 .await
             }
-            Builtin::TaskWrite => task::task_write_tool(input, ctx),
+            Builtin::TodoWrite => todo::todo_write_tool(input, ctx),
             Builtin::Skill => skill::skill_tool(input, ctx, workspace).await,
             Builtin::ToolSearch => tool_search::tool_search_tool(input, ctx, workspace).await,
             // Only malformed envelopes reach this arm — well-formed ones were
@@ -1865,7 +1864,7 @@ pub(crate) mod testutil {
                 tool_allowlist: None,
                 defer_threshold: 30,
                 unlocked_tools: Default::default(),
-                tasks: Default::default(),
+                todos: Default::default(),
                 inbox: Arc::clone(&inbox),
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),
@@ -2089,7 +2088,6 @@ mod reserved_name_tests {
             "task",
             "wait",
             "kill_bash",
-            "todo_write",
             "task_create",
             "task_get",
             "task_update",
@@ -2743,7 +2741,7 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "task_write",
+                "todo_write",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2794,7 +2792,7 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "task_write",
+                "todo_write",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2817,7 +2815,7 @@ mod tests {
         // The whole background-agent surface, not just its spawn tool: listing
         // only `run_agent` here is how `stop_agent` and `wait_for_activity`
         // went unnoticed on the execution side for as long as they did.
-        for root_only in ["run_agent", "wait_for_activity", "stop_agent", "task_write"] {
+        for root_only in ["run_agent", "wait_for_activity", "stop_agent", "todo_write"] {
             assert!(root.iter().any(|name| name == root_only), "{root_only}");
             assert!(!child.iter().any(|name| name == root_only), "{root_only}");
         }
@@ -2934,7 +2932,7 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "task_write",
+                "todo_write",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2989,7 +2987,16 @@ mod tests {
 
     #[tokio::test]
     async fn retired_tool_names_stay_reserved_and_legacy_migrations_are_directed() {
-        let retired = ["task", "wait", "kill_bash", "todo_write"];
+        let retired = [
+            "task",
+            "wait",
+            "kill_bash",
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ];
         let source: Arc<dyn ToolSource> = Arc::new(StubSource {
             defs: retired
                 .iter()
@@ -3025,9 +3032,20 @@ mod tests {
             assert!(is_error, "{name}: {output}");
             assert!(output.contains(replacement), "{name}: {output}");
         }
-        let (output, is_error) = run_tool("todo_write", json!({}), &ctx).await;
-        assert!(is_error, "{output}");
-        assert_eq!(output, "unknown tool: todo_write");
+        // Plan 188's five: retired with no replacement to point at, because the
+        // one tool that replaced them is `todo_write` — a name this same list
+        // retired once before and plan 188 brought back into service.
+        for name in [
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ] {
+            let (output, is_error) = run_tool(name, json!({}), &ctx).await;
+            assert!(is_error, "{name}: {output}");
+            assert_eq!(output, format!("unknown tool: {name}"));
+        }
     }
 
     #[test]
@@ -3521,11 +3539,11 @@ mod tests {
     /// A child cannot gain the root task list through an explicit custom
     /// allowlist, a forged call, or the deferred call_tool envelope.
     #[tokio::test]
-    async fn child_task_calls_fail_before_the_registry_even_when_allowlisted() {
+    async fn child_todo_calls_fail_before_the_registry_even_when_allowlisted() {
         let root = test_ctx(0, "root-task-gate");
         let (written, is_error) = run_tool(
-            "task_write",
-            json!({"tasks":[{"subject":"root work","status":"pending"}]}),
+            "todo_write",
+            json!({"todos":[{"subject":"root work","status":"pending"}]}),
             &root,
         )
         .await;
@@ -3533,7 +3551,7 @@ mod tests {
 
         let mut cfg = root.cfg.test_clone();
         cfg.tool_allowlist = Some(Arc::new(
-            ["task_write"].into_iter().map(str::to_string).collect(),
+            ["todo_write"].into_iter().map(str::to_string).collect(),
         ));
         let child = ToolCtx {
             cfg: Arc::new(cfg),
@@ -3541,34 +3559,34 @@ mod tests {
             ..root.clone()
         };
         for input in [
-            json!({"tasks":[{"subject":"forged","status":"pending"}]}),
-            json!({"tasks":[]}),
+            json!({"todos":[{"subject":"forged","status":"pending"}]}),
+            json!({"todos":[]}),
         ] {
-            let (output, is_error) = run_tool("task_write", input, &child).await;
+            let (output, is_error) = run_tool("todo_write", input, &child).await;
             assert!(is_error, "{output}");
             assert_eq!(
                 output,
-                "tool 'task_write' is only available to the root agent"
+                "tool 'todo_write' is only available to the root agent"
             );
         }
         let (output, is_error) = run_tool(
             "call_tool",
-            json!({"tool_name":"task_write","params":{"tasks":[]}}),
+            json!({"tool_name":"todo_write","params":{"todos":[]}}),
             &child,
         )
         .await;
         assert!(is_error, "{output}");
         assert_eq!(
             output,
-            "tool 'task_write' is only available to the root agent"
+            "tool 'todo_write' is only available to the root agent"
         );
 
         // The child shares the Arc; what it never reaches is the registry.
         assert_eq!(
-            root.cfg.tasks.snapshot().tasks,
-            vec![crate::tools::TaskGraphTask {
+            root.cfg.todos.snapshot().todos,
+            vec![crate::tools::TodoItem {
                 subject: "root work".into(),
-                status: crate::tools::TaskStatus::Pending,
+                status: crate::tools::TodoStatus::Pending,
             }]
         );
     }
@@ -3626,7 +3644,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn child_task_gate_runs_before_pre_tool_hooks() {
+    async fn child_todo_gate_runs_before_pre_tool_hooks() {
         let marker =
             std::env::temp_dir().join(format!("kloop-child-task-hook-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&marker);
@@ -3640,7 +3658,7 @@ mod tests {
                     "-c".into(),
                     format!("printf ran > '{}'", marker.display()),
                 ],
-                matcher: Some("task_write".into()),
+                matcher: Some("todo_write".into()),
                 timeout_ms: crate::hooks::DEFAULT_TIMEOUT_MS,
             }],
         });
@@ -3649,11 +3667,11 @@ mod tests {
             ..base
         };
 
-        let (output, is_error) = run_tool("task_write", json!({"tasks": []}), &child).await;
+        let (output, is_error) = run_tool("todo_write", json!({"todos": []}), &child).await;
         assert!(is_error, "{output}");
         assert_eq!(
             output,
-            "tool 'task_write' is only available to the root agent"
+            "tool 'todo_write' is only available to the root agent"
         );
         assert!(!marker.exists(), "pre-tool hook ran before the root gate");
     }
@@ -4083,7 +4101,7 @@ mod tests {
             "stop_bash",
             &json!({"bash_id": "bg-1"})
         ));
-        assert!(!is_concurrency_safe("task_write", &json!({"tasks": []})));
+        assert!(!is_concurrency_safe("todo_write", &json!({"todos": []})));
         assert!(!is_concurrency_safe(
             "write_file",
             &json!({"path": "x", "content": ""})

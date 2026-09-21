@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::Ui;
 use crate::config::Config;
 use crate::history::History;
-use crate::tools::TaskGraphSnapshot;
+use crate::tools::TodoSnapshot;
 
 mod clear;
 mod compact;
@@ -45,7 +45,7 @@ pub struct SlashResult {
     /// a skill invoked as `/name args` expands to a prompt to act on, unlike
     /// the built-in commands which only produce `output` (`output` is empty).
     pub run_turn: Option<String>,
-    pub task_graph: Option<TaskGraphSnapshot>,
+    pub todos: Option<TodoSnapshot>,
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.
     pub quit: bool,
@@ -69,7 +69,7 @@ impl SlashResult {
             output: output.into(),
             cleared: false,
             run_turn: None,
-            task_graph: None,
+            todos: None,
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -77,12 +77,12 @@ impl SlashResult {
     }
 
     /// `/clear`: text plus a transcript reset.
-    fn cleared_message(output: impl Into<String>, task_graph: TaskGraphSnapshot) -> Self {
+    fn cleared_message(output: impl Into<String>, todos: TodoSnapshot) -> Self {
         Self {
             output: output.into(),
             cleared: true,
             run_turn: None,
-            task_graph: Some(task_graph),
+            todos: Some(todos),
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -95,7 +95,7 @@ impl SlashResult {
             output: String::new(),
             cleared: false,
             run_turn: Some(prompt),
-            task_graph: None,
+            todos: None,
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -111,7 +111,7 @@ impl SlashResult {
             output: output.into(),
             cleared: false,
             run_turn: None,
-            task_graph: None,
+            todos: None,
             quit: false,
             route_changed: changed,
             open_picker,
@@ -124,7 +124,7 @@ impl SlashResult {
             output: output.into(),
             cleared: false,
             run_turn: None,
-            task_graph: None,
+            todos: None,
             quit: true,
             route_changed: false,
             open_picker: None,
@@ -294,7 +294,7 @@ mod tests {
     }
 
     /// A Config wired to the given provider; only the fields the commands read
-    /// (provider route/context_window/tasks/inbox) matter here.
+    /// (provider route/context_window/todos/inbox) matter here.
     fn test_cfg(provider: kloop_provider::Provider, window: Option<u64>) -> Arc<Config> {
         crate::tools::testutil::TestConfig::new("cmd-test")
             .provider(provider)
@@ -649,12 +649,12 @@ mod tests {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("some earlier work"));
-        let mut task_ctx = crate::tools::testutil::test_ctx(0, "command-clear");
-        task_ctx.cfg = Arc::clone(&cfg);
+        let mut todo_ctx = crate::tools::testutil::test_ctx(0, "command-clear");
+        todo_ctx.cfg = Arc::clone(&cfg);
         let (output, is_error) = crate::tools::testutil::run_tool(
-            "task_write",
-            serde_json::json!({"tasks":[{"subject":"leftover","status":"pending"}]}),
-            &task_ctx,
+            "todo_write",
+            serde_json::json!({"todos":[{"subject":"leftover","status":"pending"}]}),
+            &todo_ctx,
         )
         .await;
         assert!(!is_error, "{output}");
@@ -673,14 +673,14 @@ mod tests {
             result,
             SlashResult::cleared_message(
                 "conversation cleared",
-                TaskGraphSnapshot {
+                TodoSnapshot {
                     revision: 2,
-                    tasks: Vec::new(),
+                    todos: Vec::new(),
                 },
             )
         );
         assert!(history.messages().is_empty());
-        assert!(task_ctx.cfg.tasks.snapshot().tasks.is_empty());
+        assert!(todo_ctx.cfg.todos.snapshot().todos.is_empty());
         assert!(cfg.inbox.is_empty());
     }
 

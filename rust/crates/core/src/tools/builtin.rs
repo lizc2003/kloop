@@ -27,7 +27,7 @@ use super::plan_mode;
 use super::question;
 use super::scheduler;
 use super::skill;
-use super::task;
+use super::todo;
 use super::tool_search;
 use super::workflow;
 use super::worktree_tool;
@@ -53,7 +53,7 @@ pub(crate) enum Builtin {
     NotebookEdit,
     Grep,
     Glob,
-    TaskWrite,
+    TodoWrite,
     SendMessage,
     ListAgents,
     RunAgent,
@@ -94,7 +94,7 @@ pub(crate) const ALL: &[Builtin] = &[
     Builtin::NotebookEdit,
     Builtin::Grep,
     Builtin::Glob,
-    Builtin::TaskWrite,
+    Builtin::TodoWrite,
     Builtin::SendMessage,
     Builtin::ListAgents,
     Builtin::RunAgent,
@@ -246,7 +246,7 @@ impl Builtin {
             "notebook_edit" => Self::NotebookEdit,
             "grep" => Self::Grep,
             "glob" => Self::Glob,
-            "task_write" => Self::TaskWrite,
+            "todo_write" => Self::TodoWrite,
             "send_message" => Self::SendMessage,
             "list_agents" => Self::ListAgents,
             "run_agent" => Self::RunAgent,
@@ -284,7 +284,7 @@ impl Builtin {
             Self::NotebookEdit => "notebook_edit",
             Self::Grep => "grep",
             Self::Glob => "glob",
-            Self::TaskWrite => "task_write",
+            Self::TodoWrite => "todo_write",
             Self::SendMessage => "send_message",
             Self::ListAgents => "list_agents",
             Self::RunAgent => "run_agent",
@@ -319,9 +319,9 @@ impl Builtin {
             | Self::NotebookEdit
             | Self::Grep
             | Self::Glob => Gate::Always,
-            // The session task list is root-owned even though child Configs
+            // The session todo list is root-owned even though child Configs
             // retain the same Arc.
-            Self::TaskWrite => Gate::Depth0,
+            Self::TodoWrite => Gate::Depth0,
             // Local Agent mailbox tools remain available at every depth.
             Self::SendMessage | Self::ListAgents => Gate::Always,
             // Sub-agents cannot spawn further sub-agents, so the whole
@@ -409,7 +409,7 @@ impl Builtin {
             Self::NotebookEdit => "Edit notebook",
             Self::Grep => "Search file contents",
             Self::Glob => "Find files by name",
-            Self::TaskWrite => "Write task list",
+            Self::TodoWrite => "Write todo list",
             Self::SendMessage => "Message an agent",
             Self::ListAgents => "List agents",
             Self::RunAgent => "Run sub-agent",
@@ -492,7 +492,7 @@ impl Builtin {
             | Self::StopWorkflow
             | Self::SendMessage
             | Self::ListAgents
-            | Self::TaskWrite
+            | Self::TodoWrite
             | Self::CronCreate
             | Self::CronDelete
             | Self::CronList
@@ -539,7 +539,7 @@ impl Builtin {
             | Self::CronCreate
             | Self::CronDelete
             | Self::ScheduleWakeup
-            | Self::TaskWrite => false,
+            | Self::TodoWrite => false,
             // Consecutive run_agent calls may run in parallel; child tool calls
             // are still gated independently. The two code executors say the
             // same thing for the same reason: the program itself touches
@@ -597,10 +597,10 @@ impl Builtin {
             // Only a malformed envelope is still a call_tool here; a well-formed
             // one is judged as the tool it wraps.
             Self::CallTool => false,
-            // The task list mutates only session memory — nothing on the
+            // The todo list mutates only session memory — nothing on the
             // user's system to sign off on. Dispatcher concurrency still
             // serializes the write independently of this permission fact.
-            Self::TaskWrite => true,
+            Self::TodoWrite => true,
             // skill only loads a local skill file's instructions into the
             // conversation — no system side effect (cc never prompts to
             // activate one); tools those instructions later prompt are gated
@@ -629,7 +629,7 @@ impl Builtin {
             Self::NotebookEdit => notebook_edit_def(),
             Self::Grep => grep_def(),
             Self::Glob => glob_def(),
-            Self::TaskWrite => task::task_write_def(),
+            Self::TodoWrite => todo::todo_write_def(),
             Self::SendMessage => agent_message::send_message_def(),
             Self::ListAgents => agent_message::list_agents_def(),
             Self::RunAgent => run_agent_def(),

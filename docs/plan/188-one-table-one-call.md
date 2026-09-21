@@ -155,7 +155,7 @@ plan 73 记过一次实证:同一个显式 Task 生命周期,模型**一次主�
   三段删掉、`todo_write` 那句的措辞要改——**它现在说「不做 alias、同步或迁移」,
   而本条等于回到它的形状,得把这段历史讲对**。2865–2895 对照差异段同步。
 
-## 八、完成记录(2026-09-21,提交 a942f93)
+## 八、完成记录(2026-09-21,提交 a942f93;改名见第九节)
 
 **已落地。** 删除面按第三节执行完毕,验收逐条核对:
 
@@ -208,3 +208,54 @@ kloop-only 行改指 `task_write` 后重新生成。`make parity` 全绿。
 
 第六节那条「缺 reminder」已立为 **plan 190**,现在是它最该做的时候:整表覆盖的价值
 全靠「模型知道当前表长什么样」兑现,而这次之后回灌的内容正好是一行标题加一个状态。
+
+## 九、工具改名 `task_write` → `todo_write`(2026-09-21,同日第二次提交)
+
+第八节落地后用户一句「task 这个名字太重了」,复核后认同并改掉。**这是名字的问题,
+不是形状的问题**——第二节定下的整表覆盖、两字段必填、幂等、校验时机全部不变。
+
+### 判据
+
+`task` 在 kloop 里**已经指三样东西**:`BackgroundTask`(后台执行)、`ScheduledTask`
+(定时任务)、和这张清单。超载的代价是**每次调用都在付**:工具描述要花字符写
+"it starts nothing, assigns nothing",DESIGN 要专门写一句把清单状态和执行生命周期
+分开。`todo` 只指一样,而且先验最强——cc 的 `TodoWrite` 就是这个形状,kloop 自己
+plan 20(提交 `63209d4`)也用过这个名字两个月。
+
+**复用退役名的顾虑核查过,不成立**:担心的是 resumed history 里的旧调用被静默错认,
+但旧 `todo_write` 是 `{"todos":[{content, activeForm, status}]}`,新的是
+`{"todos":[{subject, status}]}`,**item 字段名不同,strict parser 会当场拒绝**,
+不会半应用。两者本来也不是同一个工具:旧的**每个 agent 各自一张表、全 depth 露出**,
+新的是 depth-0 root-only 一张表(plan 72 的结果)。这层历史写进了 DESIGN。
+
+### 改动面
+
+| 层 | 改动 |
+|---|---|
+| 模型面 | `task_write` → `todo_write`;参数 `tasks` → `todos` |
+| reserved | `todo_write` **移出**退役名单(回到服役,由 `builtin::ALL` 自动保留);五个 `task_*` 留着 |
+| 类型 | `TaskRegistry`→`TodoRegistry`、`TaskGraphSnapshot`→`TodoSnapshot`、`TaskGraphTask`→`TodoItem`、`TaskStatus`→`TodoStatus`、`Event::TaskGraphUpdated`→`Event::TodoUpdated`、`Builtin::TaskWrite`→`Builtin::TodoWrite`、`Config.tasks`→`Config.todos` |
+| 文件 | `tools/task.rs` → `tools/todo.rs`(`git mv`,保住历史) |
+| TUI | `app.todos` / `show_todos` / `live_todos()` / `todo_panel_lines` / `todo_line` / `TODO_PANEL_*`;工具行 "Todo write";footer 提示 "ctrl+t to hide todos" |
+| 文案 | `BASE_SYSTEM` 的 `todo_write`、`--mock` 的 "root-owned todos"、`builtin` 标题 "Write todo list" |
+| 措辞 | 全仓 "task graph" → "todo list"——`graph` 是 187 删掉的依赖图时代的遗留词,已经名不副实两条 plan 了 |
+
+### 两个真实的坑(教训 160)
+
+机械改名用 `\btask\b → \btodo\b` 跑,**在 `app.rs` 和 `render.rs` 上误伤了**:
+`Item::SubAgent { label, task }`、`Cell::Agent { agent, task }`、
+`Cell::BackgroundTask(task)`、`tokio::task`、`Injected::Scheduled` 的 "scheduled task"
+文案,全被改成了 todo。编译器抓住了结构体字段那几处,**但注释和字符串文案不会报错**
+——`"scheduled todo · {id}"` 会一路静默到用户屏幕上。处理方式:**先全量还原,再逐条
+精确改回该改的那四五处**,而不是在误伤堆里逐个挑。
+
+第二个坑:`todo_write` 从「退役名」变回「在役名」,三处列表要同时调整
+(reserved 的构造、`reserved_name_tests` 的断言、`retired_tool_names_...` 的
+catalog-absence 列表),漏一处测试就红。`retired_tool_names_stay_reserved_and_legacy_migrations_are_directed`
+里那条 `assert_eq!(output, "unknown tool: todo_write")` 现在指向五个 `task_*`。
+
+### 验证
+
+`make check`(fmt + clippy + **1600 test**)全绿、`make mock` 跑通、`make parity` 全绿
+(本机语料第三次跟着改:工具名、字段名、static-evidence 的文件名与行号区间、
+matrix 的 `kloop_name`)。

@@ -390,13 +390,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_graph_snapshot_has_no_plain_projection() {
+    fn todo_snapshot_has_no_plain_projection() {
         let ui = StdoutUi::default();
-        let event = Event::TaskGraphUpdated(kloop_core::tools::TaskGraphSnapshot {
+        let event = Event::TodoUpdated(kloop_core::tools::TodoSnapshot {
             revision: 1,
-            tasks: vec![kloop_core::tools::TaskGraphTask {
+            todos: vec![kloop_core::tools::TodoItem {
                 subject: "Do not print me".into(),
-                status: kloop_core::tools::TaskStatus::Pending,
+                status: kloop_core::tools::TodoStatus::Pending,
             }],
         });
         assert_eq!(event.as_note(), None);

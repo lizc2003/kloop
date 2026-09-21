@@ -917,7 +917,7 @@ pub(crate) fn config_from_settings(
         tool_allowlist: None,
         defer_threshold: runtime.defer_threshold,
         unlocked_tools: Default::default(),
-        tasks: Default::default(),
+        todos: Default::default(),
         inbox,
         scheduler,
         program_limits: runtime.program_limits,
@@ -936,7 +936,7 @@ pub(crate) fn config_from_settings(
     })
 }
 
-/// Scripted turns for `--mock`, exercising all five bets plus the root-owned task
+/// Scripted turns for `--mock`, exercising all five bets plus the root-owned todo
 /// list without an API key: round 1 writes the list down, round 2 rewrites the
 /// same list with the first row finished,
 /// round 3 batches two read-only bash calls concurrently, round 4 runs an unsafe
@@ -955,8 +955,8 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
             text("Writing down the plan…\n"),
             tool_use(
                 "t0",
-                "task_write",
-                json!({"tasks":[
+                "todo_write",
+                json!({"todos":[
                     {"subject":"Look around","status":"in_progress"},
                     {"subject":"Offload output","status":"pending"},
                 ]}),
@@ -966,8 +966,8 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
             text("Advancing the list…\n"),
             tool_use(
                 "t0b",
-                "task_write",
-                json!({"tasks":[
+                "todo_write",
+                json!({"todos":[
                     {"subject":"Look around","status":"completed"},
                     {"subject":"Offload output","status":"in_progress"},
                 ]}),
@@ -999,7 +999,7 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
         // consumed by the sub-agent's own run_turn
         vec![text("hi from the sub-agent")],
         vec![text(
-            "Demo complete: root-owned tasks, parallel batch, offload + query-in-place, and a result-only sub-agent all worked.",
+            "Demo complete: root-owned todos, parallel batch, offload + query-in-place, and a result-only sub-agent all worked.",
         )],
     ]
 }

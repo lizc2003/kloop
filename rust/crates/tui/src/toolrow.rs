@@ -182,13 +182,13 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         "list_agents" => ("List Agents".into(), String::new()),
         // The panel above the composer already carries the list; the row only
         // has to say how long it now is.
-        "task_write" => {
-            let detail = match v.get("tasks").and_then(Value::as_array).map_or(0, Vec::len) {
+        "todo_write" => {
+            let detail = match v.get("todos").and_then(Value::as_array).map_or(0, Vec::len) {
                 0 => "cleared".into(),
-                1 => "1 task".into(),
-                count => format!("{count} tasks"),
+                1 => "1 todo".into(),
+                count => format!("{count} todos"),
             };
-            ("Task write".into(), detail)
+            ("Todo write".into(), detail)
         }
         "cron_create" => ("Cron create".into(), s("cron")),
         "cron_delete" => ("Cron delete".into(), s("id")),
@@ -734,7 +734,7 @@ mod tests {
     }
 
     /// The rows that used to fall through to the raw-name fallback: a session
-    /// tool rendered as `task_write {"tasks":[…]}` told the
+    /// tool rendered as `todo_write {"todos":[…]}` told the
     /// user less than its own name would have.
     #[test]
     fn session_tools_render_as_a_verb_and_the_thing_they_act_on() {
@@ -761,16 +761,16 @@ mod tests {
             ),
             ("list_agents", "{}", "✓ List Agents"),
             (
-                "task_write",
-                r#"{"tasks":[{"subject":"drain the queue","status":"in_progress"}]}"#,
-                "✓ Task write 1 task",
+                "todo_write",
+                r#"{"todos":[{"subject":"drain the queue","status":"in_progress"}]}"#,
+                "✓ Todo write 1 todo",
             ),
             (
-                "task_write",
-                r#"{"tasks":[{"subject":"a","status":"completed"},{"subject":"b","status":"pending"}]}"#,
-                "✓ Task write 2 tasks",
+                "todo_write",
+                r#"{"todos":[{"subject":"a","status":"completed"},{"subject":"b","status":"pending"}]}"#,
+                "✓ Todo write 2 todos",
             ),
-            ("task_write", r#"{"tasks":[]}"#, "✓ Task write cleared"),
+            ("todo_write", r#"{"todos":[]}"#, "✓ Todo write cleared"),
             (
                 "cron_create",
                 r#"{"cron":"0 9 * * 1","prompt":"weekly sweep"}"#,

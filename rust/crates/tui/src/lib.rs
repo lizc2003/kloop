@@ -194,9 +194,9 @@ pub async fn run(
         },
     );
     // Seed through the same event seam used by live mutations. Keeping revision 0
-    // as a real first snapshot lets App distinguish an empty graph from a seed
+    // as a real first snapshot lets App distinguish an empty list from a seed
     // that has not arrived yet.
-    channel_ui.emit(&CoreEvent::TaskGraphUpdated(cfg.tasks.snapshot()));
+    channel_ui.emit(&CoreEvent::TodoUpdated(cfg.todos.snapshot()));
     let cwd = effective_cwd;
 
     let shutdown_ui: Arc<dyn Ui> = channel_ui.clone();
@@ -325,11 +325,9 @@ fn send_command_result_events(
     if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
         return false;
     }
-    if let Some(snapshot) = &result.task_graph
+    if let Some(snapshot) = &result.todos
         && events
-            .send(AgentEvent::Core(CoreEvent::TaskGraphUpdated(
-                snapshot.clone(),
-            )))
+            .send(AgentEvent::Core(CoreEvent::TodoUpdated(snapshot.clone())))
             .is_err()
     {
         return false;
@@ -437,7 +435,7 @@ async fn agent_worker(
                     let _ = events.send(AgentEvent::ProviderChanged(route));
                 }
                 // Clear first (drops the old cells), then apply the exact empty
-                // graph fence, then show the result on the now-blank transcript.
+                // list fence, then show the result on the now-blank transcript.
                 if !send_command_result_events(&events, &result, history.estimated_tokens()) {
                     return;
                 }
@@ -748,7 +746,7 @@ fn spawn_input_thread(
 /// The transcript rows a draw at `viewport` leaves for the live tail: the
 /// viewport minus the composer, its rules, the footer and any mutable chrome.
 /// Draw and commit share this one calculation — activity plus the revisioned
-/// Task panel must both stay out of native scrollback.
+/// Todo panel must both stay out of native scrollback.
 fn overflow_active_h(app: &App, viewport: Rect) -> usize {
     let width = usize::from(viewport.width).max(1);
     let height = usize::from(viewport.height);
@@ -1369,13 +1367,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn snapshot(revision: u64, tasks: usize) -> kloop_core::tools::TaskGraphSnapshot {
-        kloop_core::tools::TaskGraphSnapshot {
+    fn snapshot(revision: u64, todos: usize) -> kloop_core::tools::TodoSnapshot {
+        kloop_core::tools::TodoSnapshot {
             revision,
-            tasks: (1..=tasks)
-                .map(|id| kloop_core::tools::TaskGraphTask {
-                    subject: format!("Task {id}"),
-                    status: kloop_core::tools::TaskStatus::Pending,
+            todos: (1..=todos)
+                .map(|id| kloop_core::tools::TodoItem {
+                    subject: format!("Todo {id}"),
+                    status: kloop_core::tools::TodoStatus::Pending,
                 })
                 .collect(),
         }
@@ -1385,11 +1383,11 @@ mod tests {
     fn startup_seed_uses_the_channel_ui_event_seam() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ui = ChannelUi::new(tx);
-        ui.emit(&CoreEvent::TaskGraphUpdated(snapshot(0, 0)));
+        ui.emit(&CoreEvent::TodoUpdated(snapshot(0, 0)));
         assert!(matches!(
             rx.try_recv().unwrap(),
-            AgentEvent::Core(CoreEvent::TaskGraphUpdated(graph))
-                if graph.revision == 0 && graph.tasks.is_empty()
+            AgentEvent::Core(CoreEvent::TodoUpdated(snapshot))
+                if snapshot.revision == 0 && snapshot.todos.is_empty()
         ));
     }
 
@@ -1400,7 +1398,7 @@ mod tests {
             output: "cleared".into(),
             cleared: true,
             run_turn: None,
-            task_graph: Some(snapshot(7, 0)),
+            todos: Some(snapshot(7, 0)),
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -1412,8 +1410,8 @@ mod tests {
         ));
         assert!(matches!(
             rx.try_recv().unwrap(),
-            AgentEvent::Core(CoreEvent::TaskGraphUpdated(graph))
-                if graph.revision == 7 && graph.tasks.is_empty()
+            AgentEvent::Core(CoreEvent::TodoUpdated(snapshot))
+                if snapshot.revision == 7 && snapshot.todos.is_empty()
         ));
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -1543,19 +1541,19 @@ mod tests {
     }
 
     #[test]
-    fn overflow_budget_reserves_live_tasks_without_committing_them() {
-        let mut app = App::new("task-overflow".into());
+    fn overflow_budget_reserves_live_todos_without_committing_them() {
+        let mut app = App::new("todo-overflow".into());
         app.cells = (1..=8)
             .map(|index| Cell::Assistant(format!("history {index}")))
             .collect();
         let cells = app.cells.clone();
-        let without_tasks = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
+        let without_todos = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
 
-        app.task_graph = Some(snapshot(1, 3));
-        let with_tasks = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
-        assert!(with_tasks > without_tasks);
+        app.todos = Some(snapshot(1, 3));
+        let with_todos = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
+        assert!(with_todos > without_todos);
         assert_eq!(app.cells, cells);
-        assert_eq!(app.task_graph.as_ref().unwrap().tasks.len(), 3);
+        assert_eq!(app.todos.as_ref().unwrap().todos.len(), 3);
     }
 
     #[test]

@@ -386,12 +386,12 @@ pub struct Config {
     /// discovered source snapshot to the current workspace, policy and Agent
     /// authority; stale bindings fail closed and are never persisted.
     pub unlocked_tools: Arc<DeferredToolUnlocks>,
-    /// Root-owned, session-scoped structured task graph. Child Configs retain
-    /// this Arc as an internal session service, but depth gates keep Task tools out
+    /// Root-owned, session-scoped todo list. Child Configs retain
+    /// this Arc as an internal session service, but depth gates keep todo_write out
     /// of child catalogs and reject forged child calls. It is process state,
     /// not history or durable storage: a fresh Config (including resume) starts
-    /// with an empty graph.
-    pub tasks: Arc<crate::tools::TaskRegistry>,
+    /// with an empty list.
+    pub todos: Arc<crate::tools::TodoRegistry>,
     /// Step-boundary injection queue (plans 22, 26, and 51). Items pushed here —
     /// user steering, detached-task results, or a background shell's terminal
     /// notification — are drained at round boundaries (never mid-request) and
@@ -808,7 +808,7 @@ mod subagent_contract_tests {
             &child.powershell_execution_gate
         ));
         assert!(Arc::ptr_eq(&parent.agent_types, &child.agent_types));
-        assert!(Arc::ptr_eq(&parent.tasks, &child.tasks));
+        assert!(Arc::ptr_eq(&parent.todos, &child.todos));
         assert!(Arc::ptr_eq(&parent.scheduler, &child.scheduler));
         assert!(Arc::ptr_eq(
             &parent.background_executions,

@@ -26,7 +26,7 @@ use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
 use kloop_core::rollout::ForkPoint;
-use kloop_core::tools::TaskGraphSnapshot;
+use kloop_core::tools::TodoSnapshot;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
 use kloop_protocol::Injected;
@@ -451,19 +451,19 @@ pub struct App {
     /// off. The width is part of the state because the count only means anything
     /// at the width it was wrapped for.
     pub(crate) head_frozen: Option<(usize, usize)>,
-    /// Latest immutable projection of the root-owned task graph. `None` means the
+    /// Latest immutable projection of the root-owned todo list. `None` means the
     /// startup seed has not arrived yet; an accepted revision-0 empty snapshot is
     /// therefore distinct from uninitialized state.
-    pub task_graph: Option<TaskGraphSnapshot>,
+    pub todos: Option<TodoSnapshot>,
     /// Pure display preference. Snapshot updates, turns, rewinds, and `/clear`
     /// never reset it; Ctrl+T is its only mutator.
-    pub show_task_graph: bool,
+    pub show_todos: bool,
     /// Set when a turn ends: the panel steps off the composer, though the
     /// snapshot — and the registry records behind it — stay. The next accepted
-    /// snapshot clears it. Plan 74 keeps a finished graph queryable, so this
+    /// snapshot clears it. Plan 74 keeps a finished list queryable, so this
     /// retires the display only; it is not a reset, and it never touches
-    /// `show_task_graph`.
-    task_panel_retired: bool,
+    /// `show_todos`.
+    todo_panel_retired: bool,
     /// The multi-line input widget (plan 38 slice 3): text, cursor, input
     /// history, paste placeholders, and image attachments.
     pub composer: Composer,
@@ -552,9 +552,9 @@ impl App {
             session_id,
             cells: Vec::new(),
             head_frozen: None,
-            task_graph: None,
-            show_task_graph: true,
-            task_panel_retired: false,
+            todos: None,
+            show_todos: true,
+            todo_panel_retired: false,
             composer: Composer::new(),
             submit_images: Vec::new(),
             running: false,
@@ -789,14 +789,14 @@ impl App {
             Event::ItemCompleted { id, item } => self.apply_item_completed(id, item),
             // The turn bracket has no dedicated transcript cell.
             Event::TurnStarted => {}
-            Event::TaskGraphUpdated(snapshot) => {
+            Event::TodoUpdated(snapshot) => {
                 let accept = self
-                    .task_graph
+                    .todos
                     .as_ref()
                     .is_none_or(|current| snapshot.revision > current.revision);
                 if accept {
-                    self.task_graph = Some(snapshot);
-                    self.task_panel_retired = false;
+                    self.todos = Some(snapshot);
+                    self.todo_panel_retired = false;
                 }
             }
             Event::BackgroundTaskUpdated(task) => self.apply_background_task(task),
@@ -1122,11 +1122,11 @@ impl App {
         self.panel_scroll = 0;
         // The panel tracks a turn in flight, not a standing checklist:
         // it leaves the composer with the turn that raised it, finished
-        // or not. Keeping an unfinished graph pinned there was the
+        // or not. Keeping an unfinished list pinned there was the
         // common case — a model that has delivered its answer rarely
         // goes back to tick its own boxes — and between turns it read as
-        // work still running. The next task update brings it back.
-        self.task_panel_retired = true;
+        // work still running. The next todo update brings it back.
+        self.todo_panel_retired = true;
         // An interrupted turn drops task futures mid-await, so a
         // sub-agent's completion may never arrive: no row may outlive
         // its turn still spinning.
@@ -1145,14 +1145,14 @@ impl App {
         }
     }
 
-    /// The task graph as the chrome above the composer sees it: `None` while the
-    /// graph is empty or the panel has retired, even though the snapshot is still
+    /// The todo list as the chrome above the composer sees it: `None` while the
+    /// list is empty or the panel has retired, even though the snapshot is still
     /// held. The panel, Ctrl+T and the footer hint all ask this one question, so
     /// they can never disagree about whether there is a panel to toggle.
-    pub fn live_task_graph(&self) -> Option<&TaskGraphSnapshot> {
-        self.task_graph
+    pub fn live_todos(&self) -> Option<&TodoSnapshot> {
+        self.todos
             .as_ref()
-            .filter(|snapshot| !snapshot.tasks.is_empty() && !self.task_panel_retired)
+            .filter(|snapshot| !snapshot.todos.is_empty() && !self.todo_panel_retired)
     }
 
     fn refresh_display_streaming(&mut self) {
@@ -1300,9 +1300,9 @@ impl App {
         }
         if ctrl
             && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
-            && self.live_task_graph().is_some()
+            && self.live_todos().is_some()
         {
-            self.show_task_graph = !self.show_task_graph;
+            self.show_todos = !self.show_todos;
             return Command::None;
         }
         // A pending interaction captures the keyboard.
@@ -2128,19 +2128,19 @@ mod tests {
             },
         })
     }
-    fn task_snapshot(revision: u64, subject: &str) -> TaskGraphSnapshot {
-        TaskGraphSnapshot {
+    fn todo_snapshot(revision: u64, subject: &str) -> TodoSnapshot {
+        TodoSnapshot {
             revision,
-            tasks: vec![kloop_core::tools::TaskGraphTask {
+            todos: vec![kloop_core::tools::TodoItem {
                 subject: subject.into(),
-                status: kloop_core::tools::TaskStatus::Pending,
+                status: kloop_core::tools::TodoStatus::Pending,
             }],
         }
     }
 
-    fn completed_task_snapshot(revision: u64, subject: &str) -> TaskGraphSnapshot {
-        let mut snapshot = task_snapshot(revision, subject);
-        snapshot.tasks[0].status = kloop_core::tools::TaskStatus::Completed;
+    fn completed_todo_snapshot(revision: u64, subject: &str) -> TodoSnapshot {
+        let mut snapshot = todo_snapshot(revision, subject);
+        snapshot.todos[0].status = kloop_core::tools::TodoStatus::Completed;
         snapshot
     }
 
@@ -2353,94 +2353,92 @@ mod tests {
     }
 
     #[test]
-    fn task_graph_revisions_replace_atomically_and_ctrl_t_is_display_only() {
+    fn todo_revisions_replace_atomically_and_ctrl_t_is_display_only() {
         let mut app = App::new("s".into());
         app.apply(text_delta("streaming"));
         let cells = app.cells.clone();
         assert!(app.streaming_assistant());
 
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             0, "Seed",
         ))));
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 0);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 0);
         assert_eq!(app.cells, cells);
         assert!(app.streaming_assistant());
 
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             2, "Newest",
         ))));
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             1, "Stale",
         ))));
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             2,
             "Duplicate",
         ))));
-        assert_eq!(app.task_graph.as_ref().unwrap().tasks[0].subject, "Newest");
+        assert_eq!(app.todos.as_ref().unwrap().todos[0].subject, "Newest");
         assert_eq!(app.cells, cells);
         assert!(app.streaming_assistant());
 
-        assert!(app.show_task_graph);
+        assert!(app.show_todos);
         assert_eq!(app.on_key(80, ctrl('t')), Command::None);
-        assert!(!app.show_task_graph);
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
+        assert!(!app.show_todos);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 2);
         assert_eq!(app.on_key(80, ctrl('t')), Command::None);
-        assert!(app.show_task_graph);
+        assert!(app.show_todos);
 
         app.apply(turn_ended(EndReason::Completed));
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(
-            TaskGraphSnapshot {
-                revision: 3,
-                tasks: Vec::new(),
-            },
-        )));
-        assert!(app.task_graph.as_ref().unwrap().tasks.is_empty());
-        assert!(app.show_task_graph);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 2);
+        app.apply(AgentEvent::Core(Event::TodoUpdated(TodoSnapshot {
+            revision: 3,
+            todos: Vec::new(),
+        })));
+        assert!(app.todos.as_ref().unwrap().todos.is_empty());
+        assert!(app.show_todos);
         assert_eq!(app.on_key(80, ctrl('t')), Command::None);
-        assert!(app.show_task_graph, "an empty graph has no toggle target");
+        assert!(app.show_todos, "an empty list has no toggle target");
     }
 
     #[test]
     fn the_panel_retires_with_the_turn_that_raised_it() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             1, "Open",
         ))));
-        assert!(app.live_task_graph().is_some(), "still up mid-turn");
-        // An unfinished graph goes too: the model that stopped answering is not
+        assert!(app.live_todos().is_some(), "still up mid-turn");
+        // An unfinished list goes too: the model that stopped answering is not
         // going to come back and tick its own boxes.
         app.apply(turn_ended(EndReason::Aborted));
-        assert!(app.live_task_graph().is_none());
+        assert!(app.live_todos().is_none());
 
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(
-            completed_task_snapshot(2, "Open"),
+        app.apply(AgentEvent::Core(Event::TodoUpdated(
+            completed_todo_snapshot(2, "Open"),
         )));
-        assert!(app.live_task_graph().is_some());
+        assert!(app.live_todos().is_some());
         app.apply(turn_ended(EndReason::Completed));
-        assert!(app.live_task_graph().is_none());
+        assert!(app.live_todos().is_none());
 
         // Display-only: the snapshot, its revision fence and the Ctrl+T
         // preference all survive, so a stale snapshot still loses and cannot
         // bring the panel back.
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 2);
-        assert!(app.show_task_graph);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 2);
+        assert!(app.show_todos);
         assert_eq!(app.on_key(80, ctrl('t')), Command::None);
-        assert!(app.show_task_graph, "a retired panel has no toggle target");
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        assert!(app.show_todos, "a retired panel has no toggle target");
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             1, "Stale",
         ))));
-        assert!(app.live_task_graph().is_none());
+        assert!(app.live_todos().is_none());
 
-        // The next accepted snapshot — the next epoch's first task — brings it
+        // The next accepted snapshot — the next epoch's first todo — brings it
         // back with no keypress.
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             3,
             "Next epoch",
         ))));
         assert_eq!(
-            app.live_task_graph()
-                .map(|graph| graph.tasks[0].subject.as_str()),
+            app.live_todos()
+                .map(|snapshot| snapshot.todos[0].subject.as_str()),
             Some("Next epoch")
         );
     }
@@ -2750,23 +2748,23 @@ mod tests {
     fn steering_while_running_queues_without_a_new_turn() {
         let mut app = App::new("s".into());
         app.running = true;
-        app.apply(AgentEvent::Core(Event::TaskGraphUpdated(task_snapshot(
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
             4,
             "Retained while steering",
         ))));
-        app.show_task_graph = false;
+        app.show_todos = false;
         type_str(&mut app, "also do X");
         let cmd = app.on_key(80, key(KeyCode::Enter));
         assert_eq!(cmd, Command::Steer("also do X".into()));
         assert!(app.running, "steering does not end or restart the turn");
         assert_eq!(app.composer.text(), "");
         assert_eq!(app.cells, vec![Cell::User("also do X".into())]);
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 4);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 4);
         assert_eq!(
-            app.task_graph.as_ref().unwrap().tasks[0].subject,
+            app.todos.as_ref().unwrap().todos[0].subject,
             "Retained while steering"
         );
-        assert!(!app.show_task_graph);
+        assert!(!app.show_todos);
     }
 
     /// Steering with an image attached: only the text steers the running turn;
@@ -2858,15 +2856,15 @@ mod tests {
 
         app.background_task_cells.insert("agent-8".into(), 0);
         app.frozen_background_tasks.insert("program-8".into());
-        app.task_graph = Some(task_snapshot(4, "Keep until fenced"));
-        app.show_task_graph = false;
+        app.todos = Some(todo_snapshot(4, "Keep until fenced"));
+        app.show_todos = false;
         app.apply(AgentEvent::ClearTranscript);
         assert!(app.cells.is_empty());
         assert!(app.tool_cells.is_empty());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 4);
-        assert!(!app.show_task_graph);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 4);
+        assert!(!app.show_todos);
 
         // A terminal update arriving after clear has no stale row to mutate, so it
         // starts a fresh linked lifecycle row rather than disappearing.
@@ -3298,8 +3296,8 @@ mod tests {
         app.cells.push(Cell::User("stale".into()));
         app.background_task_cells.insert("agent-old".into(), 0);
         app.frozen_background_tasks.insert("program-old".into());
-        app.task_graph = Some(task_snapshot(7, "Shared registry"));
-        app.show_task_graph = false;
+        app.todos = Some(todo_snapshot(7, "Shared registry"));
+        app.show_todos = false;
         app.apply(AgentEvent::Forked {
             session_id: "new".into(),
             messages: vec![
@@ -3329,8 +3327,8 @@ mod tests {
         assert!(app.fork_picker.is_none());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
-        assert_eq!(app.task_graph.as_ref().unwrap().revision, 7);
-        assert!(!app.show_task_graph);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 7);
+        assert!(!app.show_todos);
     }
 
     #[test]

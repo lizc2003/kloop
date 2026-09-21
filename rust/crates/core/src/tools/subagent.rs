@@ -2019,15 +2019,15 @@ mod tests {
         assert_eq!(output, "null description accepted");
     }
 
-    /// A foreground child may forge a Task tool call, but the depth gate rejects
+    /// A foreground child may forge a todo_write call, but the depth gate rejects
     /// it; the child still returns its result and only root advances the task.
     #[tokio::test]
-    async fn foreground_subagent_reports_without_mutating_the_root_task() {
+    async fn foreground_subagent_reports_without_mutating_the_root_todos() {
         let provider = Provider::mock(vec![
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
-                name: "task_write".into(),
-                input: json!({"tasks":[{"subject":"root task","status":"completed"}]}),
+                name: "todo_write".into(),
+                input: json!({"todos":[{"subject":"root task","status":"completed"}]}),
             }],
             vec![AssistantBlock::Text {
                 text: "sub done".into(),
@@ -2035,8 +2035,8 @@ mod tests {
         ]);
         let ctx = with_provider(test_ctx(0, "root-task-foreground"), provider);
         let (written, is_error) = run_tool(
-            "task_write",
-            json!({"tasks":[{"subject":"root task","status":"pending"}]}),
+            "todo_write",
+            json!({"todos":[{"subject":"root task","status":"pending"}]}),
             &ctx,
         )
         .await;
@@ -2057,38 +2057,38 @@ mod tests {
         );
 
         assert_eq!(
-            ctx.cfg.tasks.snapshot().tasks,
-            vec![crate::tools::TaskGraphTask {
+            ctx.cfg.todos.snapshot().todos,
+            vec![crate::tools::TodoItem {
                 subject: "root task".into(),
-                status: crate::tools::TaskStatus::Pending,
+                status: crate::tools::TodoStatus::Pending,
             }]
         );
 
         let (updated, is_error) = run_tool(
-            "task_write",
-            json!({"tasks":[{"subject":"root task","status":"completed"}]}),
+            "todo_write",
+            json!({"todos":[{"subject":"root task","status":"completed"}]}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{updated}");
         assert_eq!(
-            ctx.cfg.tasks.snapshot().tasks,
-            vec![crate::tools::TaskGraphTask {
+            ctx.cfg.todos.snapshot().todos,
+            vec![crate::tools::TodoItem {
                 subject: "root task".into(),
-                status: crate::tools::TaskStatus::Completed,
+                status: crate::tools::TodoStatus::Completed,
             }]
         );
     }
 
     /// A background child has the same result-only contract: forged task calls
-    /// fail, terminal text reaches the parent Inbox, and root updates the graph.
+    /// fail, terminal text reaches the parent Inbox, and root rewrites the list.
     #[tokio::test]
-    async fn background_subagent_reports_without_mutating_the_root_task() {
+    async fn background_subagent_reports_without_mutating_the_root_todos() {
         let provider = Provider::mock(vec![
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
-                name: "task_write".into(),
-                input: json!({"tasks":[{"subject":"root task","status":"completed"}]}),
+                name: "todo_write".into(),
+                input: json!({"todos":[{"subject":"root task","status":"completed"}]}),
             }],
             vec![AssistantBlock::Text {
                 text: "background task done".into(),
@@ -2096,8 +2096,8 @@ mod tests {
         ]);
         let ctx = with_provider(test_ctx(0, "root-task-background"), provider);
         let (written, is_error) = run_tool(
-            "task_write",
-            json!({"tasks":[{"subject":"root task","status":"pending"}]}),
+            "todo_write",
+            json!({"todos":[{"subject":"root task","status":"pending"}]}),
             &ctx,
         )
         .await;
@@ -2114,10 +2114,10 @@ mod tests {
         assert!(!is_error, "{waited}");
 
         assert_eq!(
-            ctx.cfg.tasks.snapshot().tasks,
-            vec![crate::tools::TaskGraphTask {
+            ctx.cfg.todos.snapshot().todos,
+            vec![crate::tools::TodoItem {
                 subject: "root task".into(),
-                status: crate::tools::TaskStatus::Pending,
+                status: crate::tools::TodoStatus::Pending,
             }]
         );
         let delivered = ctx.cfg.inbox.drain();
@@ -2130,17 +2130,17 @@ mod tests {
         );
 
         let (updated, is_error) = run_tool(
-            "task_write",
-            json!({"tasks":[{"subject":"root task","status":"completed"}]}),
+            "todo_write",
+            json!({"todos":[{"subject":"root task","status":"completed"}]}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{updated}");
         assert_eq!(
-            ctx.cfg.tasks.snapshot().tasks,
-            vec![crate::tools::TaskGraphTask {
+            ctx.cfg.todos.snapshot().todos,
+            vec![crate::tools::TodoItem {
                 subject: "root task".into(),
-                status: crate::tools::TaskStatus::Completed,
+                status: crate::tools::TodoStatus::Completed,
             }]
         );
     }

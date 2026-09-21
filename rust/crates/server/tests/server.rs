@@ -270,7 +270,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
-            tasks: Default::default(),
+            todos: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
@@ -719,7 +719,7 @@ fn worktree_factory(
             tool_allowlist: None,
             defer_threshold: 30,
             unlocked_tools: Default::default(),
-            tasks: Default::default(),
+            todos: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
@@ -2538,7 +2538,7 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// `task_write` uses the ordinary toolCall lifecycle; the native wire has no
+/// `todo_write` uses the ordinary toolCall lifecycle; the native wire has no
 /// task-board or retired todo item type.
 ///
 /// Per-thread registry isolation was pinned here while a write returned a
@@ -2547,11 +2547,11 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
 /// shared — the property is no longer observable from the wire, and the core
 /// registry test is what pins it now.
 #[tokio::test]
-async fn task_write_surfaces_as_an_ordinary_tool_call() {
+async fn todo_write_surfaces_as_an_ordinary_tool_call() {
     let dirs = test_dirs("task-write");
-    let input = json!({"tasks":[{"subject":"Parse","status":"in_progress"}]});
+    let input = json!({"todos":[{"subject":"Parse","status":"in_progress"}]});
     let turns = vec![
-        vec![tool_use("t1", "task_write", input.clone())],
+        vec![tool_use("t1", "todo_write", input.clone())],
         vec![text("done")],
     ];
     let mut client = start_server(factory(turns, dirs.offload.clone(), false), &dirs);
@@ -2577,13 +2577,13 @@ async fn task_write_surfaces_as_an_ordinary_tool_call() {
                     Some("task" | "taskGraph")
                 )
         }),
-        "the internal Task graph snapshot must not become public wire: {log:?}"
+        "the internal todo snapshot must not become public wire: {log:?}"
     );
     let calls = log
         .iter()
         .filter(|message| {
             message["params"]["item"]["type"] == "toolCall"
-                && message["params"]["item"]["name"] == "task_write"
+                && message["params"]["item"]["name"] == "todo_write"
         })
         .collect::<Vec<_>>();
     assert_eq!(calls.len(), 2, "started and completed toolCall: {log:?}");

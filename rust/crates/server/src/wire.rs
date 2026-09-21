@@ -276,9 +276,9 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
         Event::CwdChanged { cwd, branch } => {
             Some(("thread/cwd/updated", json!({"cwd": cwd, "branch": branch})))
         }
-        // The task graph snapshot is an internal TUI projection. Task tools keep
-        // their ordinary toolCall lifecycle, with no public graph notification.
-        Event::TaskGraphUpdated(_) => None,
+        // The todo snapshot is an internal TUI projection. todo_write keeps
+        // their ordinary toolCall lifecycle, with no public list notification.
+        Event::TodoUpdated(_) => None,
         // A mode change has no dedicated wire in slice 1 (config/model is a
         // slice-4 read surface); it and plain notes surface as a `note`.
         Event::Note(_) | Event::ModeChanged(_) => {
@@ -464,12 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn internal_task_graph_snapshots_have_no_public_wire_projection() {
-        let event = Event::TaskGraphUpdated(kloop_core::tools::TaskGraphSnapshot {
+    fn internal_todo_snapshots_have_no_public_wire_projection() {
+        let event = Event::TodoUpdated(kloop_core::tools::TodoSnapshot {
             revision: 9,
-            tasks: vec![kloop_core::tools::TaskGraphTask {
+            todos: vec![kloop_core::tools::TodoItem {
                 subject: "Internal only".into(),
-                status: kloop_core::tools::TaskStatus::Pending,
+                status: kloop_core::tools::TodoStatus::Pending,
             }],
         });
         assert_eq!(project_event(&event, 2), None);

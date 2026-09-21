@@ -227,7 +227,7 @@ fn projected_background_events(events: &[Event], agent_id: &str) -> Vec<Value> {
         .collect()
 }
 
-fn projected_task_events(events: &[Event], tool_name: &str) -> Vec<Value> {
+fn projected_todo_events(events: &[Event], tool_name: &str) -> Vec<Value> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -235,10 +235,10 @@ fn projected_task_events(events: &[Event], tool_name: &str) -> Vec<Value> {
                 item: Item::ToolCall { name, .. },
                 ..
             } if name == tool_name => Some(json!({"kind": "item_started", "tool": name})),
-            Event::TaskGraphUpdated(snapshot) => Some(json!({
-                "kind": "task_graph_updated",
+            Event::TodoUpdated(snapshot) => Some(json!({
+                "kind": "todo_updated",
                 "revision": snapshot.revision,
-                "subjects": snapshot.tasks.iter().map(|task| task.subject.as_str()).collect::<Vec<_>>(),
+                "subjects": snapshot.todos.iter().map(|todo| todo.subject.as_str()).collect::<Vec<_>>(),
             })),
             Event::ItemCompleted {
                 item: Item::ToolCall { name, status, .. },
@@ -488,12 +488,12 @@ async fn native_surface_report() -> Value {
     // default surface. Its own gating is pinned by
     // `the_program_surface_gates_run_program_and_its_stop_tool`.
     const EXPECTED_NATIVE: [&str; 4] =
-        ["run_agent", "task_write", "wait_for_activity", "stop_agent"];
+        ["run_agent", "todo_write", "wait_for_activity", "stop_agent"];
     // Plan 188 collapsed the five CRUD tools into one whole-table write; the
     // names stay listed here because a resumed transcript can still carry them
     // and the depth gate must refuse them as firmly as it refuses the live one.
-    const TASK_TOOLS: [&str; 6] = [
-        "task_write",
+    const TODO_TOOLS: [&str; 6] = [
+        "todo_write",
         "task_create",
         "task_get",
         "task_update",
@@ -534,12 +534,12 @@ async fn native_surface_report() -> Value {
         .filter(|name| names_zero.contains(name))
         .collect();
     assert_eq!(native_zero, EXPECTED_NATIVE);
-    let depth_one_tasks = TASK_TOOLS
+    let depth_one_todos = TODO_TOOLS
         .iter()
         .copied()
         .filter(|name| names_one.contains(name))
         .collect::<Vec<_>>();
-    assert!(depth_one_tasks.is_empty());
+    assert!(depth_one_todos.is_empty());
     let claude_present: Vec<&str> = CLAUDE_SURFACES
         .iter()
         .copied()
@@ -552,18 +552,18 @@ async fn native_surface_report() -> Value {
         .expect("run_agent definition missing")
         .schema
         .clone();
-    let task_schema = depth_zero
+    let todo_schema = depth_zero
         .iter()
-        .find(|def| def.name == "task_write")
-        .expect("task_write definition missing")
+        .find(|def| def.name == "todo_write")
+        .expect("todo_write definition missing")
         .schema
         .clone();
 
-    let task_ui = Arc::new(RecordingUi::default());
+    let todo_ui = Arc::new(RecordingUi::default());
     let mut ctx = test_ctx(0, "plan52-native-surface");
-    ctx.ui = task_ui.clone();
+    ctx.ui = todo_ui.clone();
 
-    // Every field the graph has shed — plan 73's `owner`, plan 187's
+    // Every field the list has shed — plan 73's `owner`, plan 187's
     // `blocked_by`, plan 188's `id`/`task_id`/`description` — is rejected by
     // name rather than ignored, so a transcript written against an older
     // schema fails loudly instead of half-applying.
@@ -600,8 +600,8 @@ async fn native_surface_report() -> Value {
             json!({"subject":"forged","status":"pending","description":"instructions"}),
         ),
     ] {
-        let (result, is_error) = run_tool("task_write", json!({"tasks":[row]}), &ctx).await;
-        assert!(is_error, "task_write/{field}: {result}");
+        let (result, is_error) = run_tool("todo_write", json!({"todos":[row]}), &ctx).await;
+        assert!(is_error, "todo_write/{field}: {result}");
         assert!(
             result.contains(&format!("unknown field `{field}`")),
             "{result}"
@@ -628,10 +628,10 @@ async fn native_surface_report() -> Value {
         retired_tool_gate.push(json!({"name": name, "result": result}));
     }
 
-    let _ = task_ui.take_events();
+    let _ = todo_ui.take_events();
     let (first_write, first_write_error) = run_tool(
-        "task_write",
-        json!({"tasks":[
+        "todo_write",
+        json!({"todos":[
             {"subject":"first","status":"in_progress"},
             {"subject":"second","status":"pending"},
         ]}),
@@ -639,13 +639,13 @@ async fn native_surface_report() -> Value {
     )
     .await;
     assert!(!first_write_error, "{first_write}");
-    let first_write_events = projected_task_events(&task_ui.take_events(), "task_write");
+    let first_write_events = projected_todo_events(&todo_ui.take_events(), "todo_write");
 
     // A status moving backwards, a row dropped and a row added, all in the one
     // call that is the whole truth about the list.
     let (rewrite, rewrite_error) = run_tool(
-        "task_write",
-        json!({"tasks":[
+        "todo_write",
+        json!({"todos":[
             {"subject":"first","status":"completed"},
             {"subject":"second","status":"pending"},
             {"subject":"third","status":"pending"},
@@ -654,11 +654,11 @@ async fn native_surface_report() -> Value {
     )
     .await;
     assert!(!rewrite_error, "{rewrite}");
-    let rewrite_events = projected_task_events(&task_ui.take_events(), "task_write");
+    let rewrite_events = projected_todo_events(&todo_ui.take_events(), "todo_write");
 
     let (no_op, no_op_error) = run_tool(
-        "task_write",
-        json!({"tasks":[
+        "todo_write",
+        json!({"todos":[
             {"subject":"first","status":"completed"},
             {"subject":"second","status":"pending"},
             {"subject":"third","status":"pending"},
@@ -667,11 +667,11 @@ async fn native_surface_report() -> Value {
     )
     .await;
     assert!(!no_op_error, "{no_op}");
-    let no_op_events = projected_task_events(&task_ui.take_events(), "task_write");
+    let no_op_events = projected_todo_events(&todo_ui.take_events(), "todo_write");
 
     let mut child_cfg = ctx.cfg.test_clone();
     child_cfg.tool_allowlist = Some(Arc::new(
-        TASK_TOOLS.iter().map(|name| (*name).to_string()).collect(),
+        TODO_TOOLS.iter().map(|name| (*name).to_string()).collect(),
     ));
     let child_ctx = ToolCtx {
         cfg: Arc::new(child_cfg),
@@ -679,28 +679,28 @@ async fn native_surface_report() -> Value {
         ..ctx.clone()
     };
     let (child_write, child_write_error) = run_tool(
-        "task_write",
-        json!({"tasks":[{"subject":"forged","status":"pending"}]}),
+        "todo_write",
+        json!({"todos":[{"subject":"forged","status":"pending"}]}),
         &child_ctx,
     )
     .await;
     assert!(child_write_error, "{child_write}");
     assert_eq!(
         child_write,
-        "tool 'task_write' is only available to the root agent"
+        "tool 'todo_write' is only available to the root agent"
     );
     // The refused child call is an ordinary failed tool call on the same Ui;
     // drop its two lifecycle events so the next scenario reads its own.
-    let _ = task_ui.take_events();
+    let _ = todo_ui.take_events();
 
-    let (cleared, cleared_error) = run_tool("task_write", json!({"tasks":[]}), &ctx).await;
+    let (cleared, cleared_error) = run_tool("todo_write", json!({"todos":[]}), &ctx).await;
     assert!(!cleared_error, "{cleared}");
-    let cleared_events = projected_task_events(&task_ui.take_events(), "task_write");
+    let cleared_events = projected_todo_events(&todo_ui.take_events(), "todo_write");
 
     let (strict_write, strict_write_error) =
-        run_tool("task_write", json!({"unexpected": true}), &ctx).await;
+        run_tool("todo_write", json!({"unexpected": true}), &ctx).await;
     assert!(strict_write_error, "{strict_write}");
-    let strict_write_events = projected_task_events(&task_ui.take_events(), "task_write");
+    let strict_write_events = projected_todo_events(&todo_ui.take_events(), "todo_write");
 
     ctx.cfg
         .inbox
@@ -719,11 +719,11 @@ async fn native_surface_report() -> Value {
 
     json!({
         "depth_zero_native_tools": native_zero,
-        "depth_one_native_tools": depth_one_tasks,
+        "depth_one_native_tools": depth_one_todos,
         "claude_named_tools_present": claude_present,
         "agent_schema": agent_schema,
-        "task_schema": task_schema,
-        "task_list": {
+        "todo_schema": todo_schema,
+        "todo_list": {
             "first_write": {"result": first_write, "events": first_write_events},
             "rewrite": {"result": rewrite, "events": rewrite_events},
             "no_op": {"result": no_op, "events": no_op_events},
@@ -736,7 +736,7 @@ async fn native_surface_report() -> Value {
         },
         "retired_field_gate": retired_field_gate,
         "retired_tool_gate": retired_tool_gate,
-        "child_task_gate": child_write,
+        "child_todo_gate": child_write,
         "wait_for_activity": {
             "result": wait_output,
             "pending_after_wait": pending_after_wait.into_iter().map(InboxItem::into_message).collect::<Vec<_>>(),
