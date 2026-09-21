@@ -192,7 +192,10 @@ plan 71 建这套图时,它是**多 agent 协调机制**:共享 `Arc<TaskRegistr
 语料验证器会跑 kloop 自己的原生报告并硬断言 task schema 属性集、blocker gate 错误文案、
 `blocks` 反向投影;它另有 static-evidence 把行号区间钉进 `task.rs`,删行即
 "range outside file"。语料被 `.gitignore` 排除、只在本机,CI 与别的机器都跳过。
-**更新它不在本 plan 的删除面内**(改 parity 生成物本就写明出范围),留作本机维护。
+**更新它不在本 plan 的删除面内**(改 parity 生成物本就写明出范围),但用户当天要求一并改掉,
+已改完:行号区间重新对齐、原生报告的断言改成「传 `blocked_by` 必须被 strict parser 拒绝」、
+补两条 mutation-negative(伪造 `blocked_by` 被接受 / 伪造 `blocks` 投影)、matrix 那句 notes
+重写后重新生成。`make parity` 全绿。**这些改动全在语料里,不在版本控制中,没有对应提交。**
 
 **行为放宽,已写进 DESIGN.md**:`task_update` 从此接受任意状态转移,`completed` 可以改回
 `in_progress`。这是第五节拍板的终点——plan 188 整表覆盖时必须能改回去。

@@ -81,9 +81,9 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 **187 已完成(2026-09-21)**:依赖图与状态倒退检查一起删,`task_*` 退化成一张平表。
 五个工具描述 1597 → 892 字符(`task_update` 472 → 109),`task.rs` code 行 628 → 424,
 TUI 面板不再标注 blocker、pending 不再分两组。`make check` 全绿,`make mock` 跑通。
-**留了一笔账:`make parity` 红**——本机语料验证器断言 task schema/错误文案,还把行号区间
-钉进 `task.rs`,删行就 "range outside file"。语料不在版本控制里,更新它是本机维护,
-不在 187 的删除面内。教训 156 记了这件事。
+`make parity` 当时红了一下:本机语料验证器断言 task schema/错误文案,还把行号区间
+钉进 `task.rs`,删行就 "range outside file"。**同一天已按用户指示改好,现在全绿**——
+改的是本机语料,不在版本控制里,仓库无对应提交。教训 156 记了这件事。
 
 **188 `one-table-one-call` 硬依赖 187**:把五个 CRUD 收成一个整表覆盖的 `task_write`。
 理由同样来自 plan 71 第 27 行——它当初换成五个工具,是为了「稳定 ID、owner、依赖图」
