@@ -21,7 +21,9 @@
 
 ## 二、切法
 
-`mcp.rs` 变成 `mcp/` 目录:
+**`mcp.rs` 留在原地当门面,新文件进 `mcp/` 子目录**(仓库里 `agent.rs + agent/`、
+`fs.rs + fs/` 都是这个形状)。不要改成 `mcp/mod.rs`——那是一次路径改名,
+基线里那一行会变成"文件没了",白白多一道手续:
 
 | 新文件 | 内容 | 预估 |
 |---|---|---|
@@ -29,7 +31,7 @@
 | `mcp/lifecycle.rs` | 生命周期、健康、就绪回执、`McpLifecycleOwner` / `McpConnections` + `spawn_health_monitor` | ≈330 |
 | `mcp/tools.rs` | `McpToolSource` 全套 + `build_catalog` / `build_source` / `spawn_tool_refresh` | ≈620 |
 | `mcp/resources.rs` | 1437–1922 整段 | ≈461 |
-| `mcp/mod.rs`(留) | `connect_servers` 启动编排 + `classify_startup_failure` + `pub use` | ≈250 |
+| `mcp.rs`(留,原地) | `connect_servers` 启动编排 + `classify_startup_failure` + `mod` 声明 + `pub use` | ≈250 |
 
 五块没有一块超过 800,而且每一块都能用一句话说清自己是什么。
 
@@ -50,5 +52,4 @@
 ## 四、验收
 
 - `make check` 全绿;`mcp::` 的对外符号表一个不少不多。
-- 五个文件都 ≤800;原 `mcp.rs` 变成 `mcp/mod.rs`——**注意这是一次路径改名**,
-  基线里 `"crates/cli/src/mcp.rs"` 那一行会变成"文件没了",跑 `make arch-baseline` 摘掉它。
+- 四个新文件都 ≤800;`mcp.rs` 原地降到 ≈250 后跑 `make arch-baseline`,它会从基线里被摘掉。

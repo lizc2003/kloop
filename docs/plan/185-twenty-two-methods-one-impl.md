@@ -37,6 +37,7 @@ Rust 允许同一 crate 里多个 `impl` 块,这是最不伤内聚的拆法:
 | `methods/threads.rs` | `impl Server` 的线程生命周期那八个 | ≈350 |
 | `methods/query.rs` | 只读查询那六个 | ≈300 |
 | `methods/turn.rs` | turn 三个 | ≈150 |
+| `methods.rs` | 只有三行 `mod` 声明——`methods/` 需要一个门面,它不放逻辑 | ≈5 |
 | `lib.rs`(留) | `serve` / `write_loop` / `Server` 定义 / 分发与握手 / `pub use` | ≈400 |
 
 ## 三、坑
