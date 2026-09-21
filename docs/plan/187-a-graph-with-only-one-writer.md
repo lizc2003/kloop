@@ -40,6 +40,8 @@ plan 71 建这套图时,它是**多 agent 协调机制**:共享 `Arc<TaskRegistr
 | 360–367 | 8 | `blocks_for` — 反向投影 |
 | 368–371 | 4 | `ids_as_strings` — 只有 344/355 两个调用点,都是 blocked_by/blocks |
 | 582–604 | 23 | `optional_blocked_by` — 解析 |
+| 42–48 | 7 | `TaskStatus::rank` — 只服务倒退检查 |
+| 372–378 | 7 | `status_name` — 只服务倒退检查那条错误信息 |
 
 字段:`StoredTask.blocked_by`(57)、`TaskView.blocked_by/blocks`(66–67)、
 `TaskGraphTask.blocked_by/blocks`(75–76)。
@@ -48,8 +50,9 @@ plan 71 建这套图时,它是**多 agent 协调机制**:共享 `Arc<TaskRegistr
 
 - **`create`(107–139)**:删 `rollover` 条件里的 `input.blocked_by.is_empty()`(151)、
   `validate_dependencies` 调用(123)、`StoredTask` 构造里的字段。
-- **`update`(147–199)**:删 `patch.blocked_by` 分支(164–166)、三个校验调用(176–179)、
-  `display_changed` 里的 `blocked_by` 比较(190)。删完这个函数少掉约三分之一。
+- **`update`(147–199)**:删 `patch.blocked_by` 分支(164–166)、三个依赖校验调用(176–179)、
+  **状态倒退检查(169–175)**、`display_changed` 里的 `blocked_by` 比较(190)。
+  删完这个函数少掉一半。
 - **五个 `*_def`(393–465)**:`task_create` schema 去一项 + 描述尾句;`task_update`
   描述里依赖那一大段;`task_get` 的「computed reverse blocks projection」;
   `task_list` 的 blocked_by/blocks。**目标:`task_update` 从 472 字符降到 150 以内,
@@ -91,8 +94,8 @@ plan 71 建这套图时,它是**多 agent 协调机制**:共享 `Arc<TaskRegistr
 4. **测试按「测的是依赖还是状态机」分**,不要按名字猜:
    - `graph_constraints_are_atomic`(768) — 整条删。
    - `combined_dependency_and_status_patch_validates_the_candidate_atomically`(912) — 整条删。
-   - `blockers_gate_forward_status_and_status_never_moves_backward`(795) — **一半删一半留**:
-     blocker gate 那半删,状态不可倒退那半保留并改名。
+   - `blockers_gate_forward_status_and_status_never_moves_backward`(795) — **整条删**
+     (两半分别对应 blocker gate 与倒退检查,本 plan 两样都删)。
    - helper `create(ctx, subject, blocked_by)`(656) 去掉第三个参数,全部调用点跟着改;
      `snapshots_revision_and_epoch_rollover_are_atomic`(1052) 里的
      `input(subject, blocked_by)` 同理。
@@ -100,18 +103,25 @@ plan 71 建这套图时,它是**多 agent 协调机制**:共享 `Arc<TaskRegistr
    DESIGN.md:2870 一段写着 plan 74「不改 218 份 pinned raw/normalized capture」。
    先跑 `make test` 看这条路径会不会动 matrix 行数/cells 数;**如果会动,停下来问用户**
    ——改 parity 生成物不在本 plan 范围内。
-6. **不碰**:`TaskStatus::rank`(42) 与状态倒退检查(见第五节)、`task_clear`、epoch、
-   revision、ID 高水位、`MAX_TASKS`/`MAX_SUBJECT_CHARS`/`MAX_DESCRIPTION_BYTES` 三个上限。
+6. **不碰**:`task_clear`、epoch rollover、revision、ID 高水位、
+   `MAX_TASKS`/`MAX_SUBJECT_CHARS`/`MAX_DESCRIPTION_BYTES` 三个上限。
+   `TaskStatus` 这个 enum 本身留着(三个状态值不变),删的只是 `rank` 与那条倒退检查。
 
-## 五、开工时定(问用户)
+## 五、状态倒退检查一起删(2026-09-21 用户拍板)
 
-**状态倒退检查(`pending → in_progress → completed` 不可逆)留不留?**
+**`pending → in_progress → completed` 不可逆这条约束,和 `blocked_by` 一起删。**
 
-本 plan 默认**保留**,只删依赖图。但它和 `blocked_by` 是同一类东西:约束的是模型自己,
-没有第二个写入者要防。真实场景里模型发现「这条其实没做完」时无法把 completed 改回
-in_progress,只能新建一条。如果决定一起删,删除面多出 `TaskStatus::rank`(42–49)、
-`update` 里的倒退检查(170–175)、`status_name`(372,只服务那条错误信息)、
-以及第四节 4 里说的那半条测试——**改动性质相同,规模很小,但这是行为放宽,要用户点头**。
+它和依赖图是同一类东西:约束的是模型自己,没有第二个写入者要防。但拍板的真正理由是
+**终点**——plan 188 要把五个 CRUD 收成一个整表写入工具,那时模型每次重写整张表,
+**必须能把一条写错的 `completed` 改回 `in_progress`**;倒退检查会让它只能新建一条,
+图反而更脏。既然 188 早晚要删,就不要在 187 留一个马上要拆的约束。
+
+删除面(已并入第二节表格与 `update` 改动点):`TaskStatus::rank`(42–48)、
+`update` 里的倒退检查(169–175)、`status_name`(372–378,删掉倒退检查后没有调用者)、
+以及第四节坑 4 里那条整删的测试。**`TaskStatus` enum 与三个状态值不动。**
+
+这是**行为放宽**:`task_update` 从此接受任意状态转移。DESIGN.md 里
+「They move only forward ... completed tasks cannot reopen」那句要跟着改写。
 
 ## 六、不在本 plan 内
 
@@ -120,8 +130,9 @@ in_progress,只能新建一条。如果决定一起删,删除面多出 `TaskStat
   `TaskGraphUpdated` 只进事件流给 TUI。**模型写下候选的那一刻,列表已经在它自己的
   上下文里了,调 task 换不回任何它还没有的东西。** 这是「为什么不调用」的直接原因,
   值得单独一条 plan,但和本条的删除面不重叠。
-- **五个 CRUD 要不要合成一个全量覆盖的写入工具。** 砍掉图之后 task 退化成一张表,
-  那时候才谈得上——也就是 plan 71 当年删掉的形状,但这次是有理由地回去。**先做完本条再判。**
+- **五个 CRUD 合成一个整表写入工具 → 已立 `188-one-table-one-call.md`,依赖本条。**
+  砍掉图之后 task 退化成一张表,那时候才谈得上——也就是 plan 71 当年删掉的形状,
+  但这次是有理由地回去。**187 必须先落地**,188 的删除面建立在本条的结果上。
 - `rust/crates/tui/src/snapshots/kloop_tui__session_picker__tests__session_picker_18x60.snap.new`
   是一份被提交进仓库的 insta 未接受快照,**和本 plan 无关**,顺手记一笔别顺手删。
 
@@ -130,11 +141,14 @@ in_progress,只能新建一条。如果决定一起删,删除面多出 `TaskStat
 - `make check` 全绿。
 - `make mock` 跑通(demo 脚本已重写)。
 - 五个工具描述合计 **< 900 字符**(现 1597),其中 `task_update` **< 150**(现 472)。
-- `task.rs` code 行从 628 降到 **500 以下**;`blocked_by` 在全仓 `--include=*.rs` 的
-  出现次数为 **0**。
+- `task.rs` code 行从 628 降到 **480 以下**;`blocked_by` 与 `status_name` 在全仓
+  `--include=*.rs` 的出现次数均为 **0**。
 - `grep -rn "TaskGraphTask\|TaskGraphSnapshot\|TaskView" rust/crates/` 逐个核对字段使用。
 - DESIGN.md 两处同步——**先读那一段现在还成不成立,再决定改写还是追加**:
   - **2243–2295「Root-owned session task graph (Plans 71–74)」**:三条工具描述、
     「A task cannot enter a non-pending state until all blockers are completed」、
     missing/self/duplicate/cycles 那句、「256 blockers per task」——**改写,不追加**。
+  - **2243–2295 同一段里的状态机那句**(「They move only forward ... completed tasks
+    cannot reopen」)——第五节把它删了,**这是本 plan 唯一的行为放宽,必须在 DESIGN.md
+    和提交信息里都写明**。
   - **2865–2895** 对照差异那段里提到 dependency 的一句。
