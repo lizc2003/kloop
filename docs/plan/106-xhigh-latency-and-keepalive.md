@@ -182,7 +182,7 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 即 **chat 轨的缓存是真的会生效的**,命中时 prompt 成本降约 12 倍。`prompt_tokens_details` **只在命中时出现**,缺席意味着「没命中」而不是「不上报」——kloop 的 `openai.rs:253` 把缺失读作 0 而不是报错,行为正确;`/cost` 在命中时会显示真实数字。另外命中出现在第 3 次而非第 2 次,与 Responses 轨 0/6656/0 的抖动同型,是缓存亲和这条线的旁证。
 
-按用户的界定,`cost_breakdown` / `prompt_cached_cost` 是 example.com 平台自己的字段而非 OpenAI 标准,所以 **kloop 不解析它**(`Usage` 是 provider 无关类型);它只作为诊断手段记在这里。顺带观测:chat 的 `router_detail.router_name` 是 `ccp`,responses 是 `polo`,两条轨走不同上游。
+按用户的界定,`cost_breakdown` / `prompt_cached_cost` 是该网关平台自己的字段而非 OpenAI 标准,所以 **kloop 不解析它**(`Usage` 是 provider 无关类型);它只作为诊断手段记在这里。顺带观测:chat 的 `router_detail.router_name` 是 `ccp`,responses 是 `polo`,两条轨走不同上游。
 
 因此这一片**接受与收益都是实测的**。测试 `chat_carries_the_session_id_as_prompt_cache_key` 只断言 wire 形状(给 key 则发、空串不发、None 不发),命中率属于端点不属于我们。
 
