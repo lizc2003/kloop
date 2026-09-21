@@ -1047,6 +1047,44 @@ auth_header = { Authorization = "Bearer key" }
         assert_eq!(window("", ""), None);
     }
 
+    /// The shipped demo is the config every new user copies, and its numbers
+    /// have to survive a `/model`. A provider that lists several models cannot
+    /// state the window once on the profile: that number is then a claim about
+    /// whichever model happens to be selected and the siblings inherit it —
+    /// which is how a 200K model came to be budgeted against a sibling's 1M.
+    /// A single-model provider is exempt; there the two levels say the same
+    /// thing. Nothing else reads the demo's `[models]` tables.
+    #[test]
+    fn every_model_the_demo_can_switch_to_declares_its_own_window() {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../config/config-demo.toml"),
+        )
+        .expect("config/config-demo.toml");
+        let table: toml::Table = raw.parse().expect("demo config parses");
+        let knowledge = parse_model_knowledge(&table).expect("demo model table");
+
+        for (id, profile) in table["providers"].as_table().expect("providers table") {
+            let models: Vec<&str> = profile
+                .get("models")
+                .and_then(Value::as_array)
+                .map(|models| models.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if models.len() < 2 {
+                continue;
+            }
+            for model in models {
+                assert!(
+                    knowledge
+                        .get(model)
+                        .is_some_and(|facts| facts.context_window.is_some()),
+                    "demo provider '{id}' can switch to '{model}', \
+                     which declares no context_window"
+                );
+            }
+        }
+    }
+
     /// `efforts` is a claim the user made after testing, so it is checked at
     /// startup rather than at the first 400. Declaring nothing means no limit;
     /// declaring a list means exactly that list, `none` included — on the OpenAI

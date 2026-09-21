@@ -16,7 +16,6 @@ base_url    = "https://gateway.example.com"
 auth_header = { Authorization = "Bearer REPLACE-ME" }   # or { x-api-key = "sk-ant-..." }
 model       = "claude-opus-4-8"
 models      = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
-context_window = 1000000                                # what this gateway caps at
 effort      = "xhigh"
 # prompt_cache = true                                   # messages-only; false for a
                                                         # gateway rejecting cache_control
@@ -28,7 +27,8 @@ base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
 model       = "gpt-5.6-sol"
 models      = ["gpt-5.6-sol", "gpt-5.6-terra"]
-context_window = 258400
+# context_window = 200000                               # only if the gateway hands out
+                                                        # less than the model itself takes
 effort      = "xhigh"
 
 # chat → POST {base_url}/chat/completions
@@ -41,24 +41,36 @@ effort      = "max"
 
 
 # [models."<id>"] — facts about a model, shared by every provider. All optional.
+# `context_window` is the model's own window; the budget is the smaller of it and
+# the provider's cap, so a model that is smaller than its siblings says so here.
 # A declared `efforts` list is the WHOLE list: leave "none" out and /effort none
 # is refused on that model, so list it unless the model really rejects it.
 
 [models."claude-opus-4-8"]
+context_window = 1000000
 efforts = ["none", "low", "medium", "high", "xhigh", "max"]
 
 [models."claude-sonnet-4-6"]
+context_window = 1000000
 efforts = ["none", "low", "medium", "high", "max"]      # no xhigh
 
 # Models that read a token budget instead of an effort field. The keys are this
 # model's accepted levels too (plus "none", which is a disabled thinking field
 # rather than a budget), so do not also declare `efforts`.
 [models."claude-haiku-4-5"]
+context_window = 200000                                 # a fifth of what the other two
+                                                        # on that provider take
 thinking_budget = { low = 2048, medium = 8192, high = 16384 }
 
 [models."gpt-5.6-sol"]
-context_window = 400000
+context_window = 272000                                 # the default; this family can be
+                                                        # configured as far as 872000
 efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+
+[models."gpt-5.6-terra"]
+context_window = 272000                                 # same as sol, 872000 max; a
+                                                        # sibling's entry does not cover
+                                                        # it — undeclared means 200000
 
 
 # [web] — which search backend web_search calls, and its key. Both halves live

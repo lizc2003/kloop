@@ -254,13 +254,16 @@ stays on the provider block. The budget is the smaller of the two:
 
 ```toml
 [providers.gw_router]
-context_window = 258400        # what this gateway caps at
+context_window = 200000        # what this gateway hands out
 
 [models."gpt-5.6-sol"]
-context_window = 400000        # what the model itself takes
+context_window = 272000        # what the model itself takes
 ```
 
-The provider's number wins over the model's, and the budget is re-derived for
+Neither side is privileged by being the provider: the smaller number decides, so
+a model narrower than the gateway's cap lowers the budget exactly as the cap
+does — which is what makes the model table worth filling in for every model a
+provider lists, not just the one it defaults to. The budget is re-derived for
 the new (provider, model) pair on every `/provider` switch — carrying the old
 number across would mean a smaller window is only discovered by being rejected.
 (`/context` pins a number for the session; configuration never does.) When
@@ -3307,10 +3310,10 @@ cargo run -- --mock
 #   auth_header = { Authorization = "Bearer ..." }   # or { x-api-key = "..." }
 #   model = "gpt-5.6-sol"               # this provider's default model
 #   models = ["gpt-5.6-sol", "gpt-5.6-mini"]   # optional; omitted = just `model`
-#   context_window = 258400             # optional; what this gateway caps at
+#   context_window = 200000             # optional; what this gateway caps at
 #
 #   [models."gpt-5.6-sol"]              # facts about the model, not settings
-#   context_window = 400000
+#   context_window = 272000
 #   efforts = ["low", "high", "xhigh", "max"]
 #
 #   [models."claude-haiku-4-5"]         # a model whose only dial is a budget
