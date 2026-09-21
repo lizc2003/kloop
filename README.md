@@ -1,53 +1,64 @@
 # kloop
 
-一个用 Rust 从零写的终端编码 agent。给它一句话,它自己读代码、改文件、跑命令、查资料,
-一直做到交差。
+A terminal coding agent written in Rust from scratch. Give it a sentence and it
+reads the code, edits files, runs commands and looks things up until the job is done.
 
-> 状态:自用中,不是发行版。配置和接口还在改,没有兼容承诺。
+> Status: in daily use by its author, not a release. Configuration and interfaces
+> still change, and nothing here is a compatibility promise.
 
-## 它能做什么
+## What it does
 
-- **接任何网关** —— messages / responses / chat 三条线协议各一套完整实现,一个 provider
-  写一段 profile。模型、effort、上下文窗口都在配置里说清,运行时不做发现。
-- **一整套工具** —— 读/写/编辑文件、bash(前台可中断、后台可轮询)、grep/glob、
-  notebook、网页抓取与搜索;Windows 上是原生 PowerShell,不是 bash 模拟。
-- **先问再动手** —— 每次工具调用都过一遍权限判定,读文件放行、删东西问你;同意过的可以
-  记住。macOS 上再套一层 seatbelt 沙箱:写只能落在白名单里,还能整个断网。
-- **会话是可以回到过去的** —— 全部落盘。`-c` 续上一次,`-r` 从列表里挑一个,
-  `--fork <id>#<行号>` 从中间某一步分叉重来。
-- **不是一个模型在干活** —— 子 agent(同步派或后台跑)、MCP 客户端(stdio / HTTP /
-  OAuth 登录)、skills、code mode(让模型写一段 JS 来编排工具,一百次循环只回一条结果)。
-- **不止 TUI** —— `--headless` 一次跑完适合进脚本(可输出 NDJSON 事件流),`--plain` 是
-  行模式 REPL,`app-server` 把它变成一个跑在 stdio 上的 agent 服务。
+- **Talks to any gateway** — a complete implementation of each of the three wire
+  protocols (messages / responses / chat); a provider is one profile in one file.
+  Model, effort and context window are stated in that config; nothing is discovered
+  at runtime.
+- **A full set of tools** — read/write/edit files, bash (interruptible in the
+  foreground, pollable in the background), grep/glob, notebooks, web fetch and
+  search. On Windows that is native PowerShell, not an emulated bash.
+- **Asks before it acts** — every tool call goes through a permission decision:
+  reads pass, destructive things ask you, and an approval can be remembered. On
+  macOS a seatbelt sandbox sits underneath: writes land only inside an allow-list,
+  and the network can be shut off entirely.
+- **Sessions you can go back into** — everything is persisted. `-c` continues the
+  last one, `-r` picks one from a list, and `--fork <id>#<line>` branches from a
+  step in the middle and runs it differently.
+- **Not one model doing the work** — sub-agents (dispatched synchronously or run in
+  the background), an MCP client (stdio / HTTP / OAuth login), skills, and code mode,
+  where the model writes a little JavaScript to orchestrate tools so that a
+  hundred-item loop comes back as one result.
+- **More than a TUI** — `--headless` runs a single turn for scripts (optionally
+  emitting an NDJSON event stream), `--plain` is a line-based REPL, and `app-server`
+  turns it into an agent service speaking over stdio.
 
-## 装上
+## Install
 
-需要 Rust 1.96+。主力平台是 macOS(沙箱目前只有 macOS 后端);Linux 和 Windows 能编能跑,
-CI 三个平台都跑。
+Rust 1.96+. macOS is the primary platform (the sandbox has a macOS backend only);
+Linux and Windows build and run, and CI covers all three.
 
 ```sh
-make install          # release 构建 + 装进 ~/.local/bin(PREFIX= 可改)
+make install          # release build, installed into ~/.local/bin (override PREFIX=)
 ```
 
-第一次安装会把 `config/config-demo.toml` 铺成 `~/.kloop/config.toml`(目录 0700、文件 0600),
-**然后你必须去改它** —— demo 里的 key 全是 `REPLACE-ME`,kloop 没有任何兜底。
-已经有配置的话它一个字节都不碰,只换二进制。
+The first install also copies `config/config-demo.toml` to `~/.kloop/config.toml`
+(directory 0700, file 0600) and **you have to edit it before the first run** — every
+key in the demo says `REPLACE-ME`, and kloop has no fallback. If a config is already
+there, it is not touched: only the binary is replaced.
 
-## 用起来
+## Use it
 
 ```sh
-kloop                          # 进 TUI,当前目录就是工作区
-kloop --mock                   # 不要 key 的演示,跑一遍就知道长什么样
-kloop -c                       # 接着上次那个会话
-kloop --headless "修一下 CI 里那个 flaky 测试"
-kloop --worktree=fix-ci        # 在一棵独立的 git worktree 里干活
-kloop --help                   # 全部开关
+kloop                          # start the TUI; the current directory is the workspace
+kloop --mock                   # keyless scripted demo — one run shows you the shape
+kloop -c                       # continue the previous session
+kloop --headless "fix the flaky test in CI"
+kloop --worktree=fix-ci        # work inside an isolated git worktree
+kloop --help                   # every flag
 ```
 
-## 配置
+## Configuration
 
-只有一个文件:`~/.kloop/config.toml`。没有任何环境变量能决定这次运行接哪个网关——
-换了 shell 也不会换答案。
+One file: `~/.kloop/config.toml`. No environment variable decides which gateway a run
+talks to, so the answer cannot change with the shell that started it.
 
 ```toml
 provider = "my-gateway"
@@ -55,25 +66,27 @@ provider = "my-gateway"
 [providers.my-gateway]
 wire_api    = "messages"                                # messages | responses | chat
 base_url    = "https://gateway.example.com"
-auth_header = { Authorization = "Bearer ..." }          # 或 { x-api-key = "..." }
+auth_header = { Authorization = "Bearer ..." }          # or { x-api-key = "..." }
 model       = "claude-opus-4-8"
 effort      = "high"
 ```
 
-权限、沙箱、MCP、hooks、skills、子 agent、code mode 的开关也都在这个文件里,
-完整字段见 [`config/config-demo.toml`](config/config-demo.toml)。
+Permissions, sandbox, MCP, hooks, skills, sub-agents and code mode are configured in
+that same file; the full field reference is
+[`config/config-demo.toml`](config/config-demo.toml).
 
-## 仓库里有什么
+## What is in the repository
 
-| 路径 | 是什么 |
+| Path | What it is |
 |---|---|
-| `rust/` | cargo workspace,10 个 crate:`core` 是引擎,`cli` 是二进制入口,`tui` / `server` 是另外两种前端 |
-| `rust/README.md` | 设计与行为的详细说明:每条取舍为什么是这样。长,但那是唯一权威 |
-| `docs/plan/` | 一个编号文件 = 一次开发任务,连同踩过的坑;`HANDOFF.md` 是当前状态 |
-| `config/` | 配置样例 |
+| `rust/` | The cargo workspace, 10 crates: `core` is the engine, `cli` the binary entry point, `tui` / `server` two other front ends |
+| `rust/README.md` | Design and behaviour in detail — why each trade-off is what it is. Long, and the only authority |
+| `docs/plan/` | One numbered file per development task, including what went wrong; `HANDOFF.md` is the current state (written in Chinese) |
+| `config/` | Configuration example |
 
-`make help` 列出全部构建目标(`make check` = fmt + clippy + test,与 CI 同令)。
+`make help` lists every build target (`make check` = fmt + clippy + test, the same
+three commands CI runs).
 
-## 许可
+## License
 
-[Apache-2.0](LICENSE),Copyright 2026 lizc2003@gmail.com。
+[Apache-2.0](LICENSE), Copyright 2026 lizc2003@gmail.com.
