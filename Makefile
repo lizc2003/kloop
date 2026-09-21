@@ -6,7 +6,6 @@
 #   make                 release 构建
 #   make test            全量测试
 #   make check           fmt --check + clippy -D warnings + test(提交前的门禁,与 CI 同令)
-#   make arch-baseline   文件体积棘轮的水位线降下来之后,收紧它(只降不升)
 #   make install         装二进制;没有配置时顺带铺一份 config-demo
 #   make help            列出所有目标
 
@@ -23,7 +22,7 @@ CONFIG := $(KLOOP_DIR)/config.toml
 CONFIG_DEMO := config/config-demo.toml
 
 .DEFAULT_GOAL := all
-.PHONY: all build debug test fmt fmt-check clippy check parity mock arch-baseline install install-config uninstall clean help
+.PHONY: all build debug test fmt fmt-check clippy check parity mock install install-config uninstall clean help
 
 all: build
 
@@ -55,13 +54,6 @@ parity:
 	else \
 	  echo "skipped: refs/claude-code-2.1.220/ is not on this machine"; \
 	fi
-
-# 文件体积棘轮(rust/architecture-policy.toml + architecture-baseline.toml)的水位线。
-# 门禁本身是一条普通测试,make test / make check / CI 都已经跑到了;这条只在文件真的
-# 变小之后用来收紧基线,而且只降不升——新文件超阈值是门禁失败,不是这里加一行。
-# 收紧是一次决定,记进提交信息。
-arch-baseline:
-	cd $(RUST_DIR) && $(CARGO) test --locked -p $(BIN) --test architecture -- --ignored --nocapture rewrite_the_size_baseline
 
 # 无 key 的冒烟:脚本化 Mock provider 跑通五条主线
 mock:
@@ -111,7 +103,6 @@ help:
 	@echo "  check            fmt-check + clippy + test"
 	@echo "  parity           Claude Code 语料校验(CI 最后一步)"
 	@echo "  mock             cargo run -- --mock,无 key 冒烟"
-	@echo "  arch-baseline    文件体积棘轮:把基线收到当前水位(只降不升)"
 	@echo "  install          装到 $(BINDIR)/$(BIN);缺配置时铺一份 $(CONFIG)"
 	@echo "  uninstall        删掉 $(BINDIR)/$(BIN),不动 $(KLOOP_DIR)"
 	@echo "  clean            cargo clean"

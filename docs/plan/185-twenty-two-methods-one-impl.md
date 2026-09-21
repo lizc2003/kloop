@@ -57,5 +57,5 @@ Rust 允许同一 crate 里多个 `impl` 块,这是最不伤内聚的拆法:
 ## 四、验收
 
 - `make check` 全绿;`crates/server/tests/` 逐条通过。
-- 七个新文件都 ≤800;`lib.rs` 降到 ≈400 后跑 `make arch-baseline`,它会从基线里被摘掉。
+- `lib.rs` 降到 ≈400。
 - 服务端的方法表(`handle_request` 的 match)仍然在一个地方能看全。

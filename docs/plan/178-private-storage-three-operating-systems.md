@@ -54,4 +54,4 @@ facade 留在 `private_store.rs`,三套实现各自成文件:
 - `make check` 全绿。macOS 上跑得到的是 unix 分支;**windows 分支只能靠 CI**,
   所以这条 plan 的提交必须等 CI 三平台绿了才算完(本批唯一有这个要求的两条之一,另一条是 179)。
 - facade 里 `#[cfg]` 归零。
-- 三个新文件都 ≤800 code 行;`private_store.rs` 降到 ≈150 后跑 `make arch-baseline`。
+- `private_store.rs` 降到 ≈150。

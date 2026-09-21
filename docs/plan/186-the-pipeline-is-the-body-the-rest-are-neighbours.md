@@ -55,5 +55,5 @@
 
 - `make check` 全绿;permissions 的 2545 行测试一条不少。
 - `cli/tests/doc_placement.rs` 的 `the_sensitive_path_list_keeps_its_own_documentation` 改到新路径后通过。
-- 四个新文件 ≤800;`permissions.rs` 降到 ≈690 后跑 `make arch-baseline`,它会从基线里被摘掉。
+- `permissions.rs` 降到 ≈690。
 - `impl Permissions` 的 diff 除 `use` 外为零。

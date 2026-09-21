@@ -1,5 +1,12 @@
 # Plan 176 — 没有一道门拦着文件继续长
 
+> **⚠️ 这道门禁已于 2026-09-21 整体删除,本文件只作历史。** `tests/architecture.rs`、
+> `architecture-policy.toml`、`architecture-baseline.toml` 与 `make arch-baseline` 都不在了。
+> 删的理由不是"卡增量"这个想法错,而是这道门禁**两个方向都报错**:文件变小也失败、
+> 要你跑一次 `make arch-baseline` 提交一份基线 diff 才肯绿——于是它恰好在它本该鼓励的
+> 事情上发作,而 177–186 那一批的全部目的就是把基线上那 23 个文件改小。
+> 完整复盘见 `HANDOFF.md` 教训 172 的后记。
+
 > 来源:2026-09-21 调研 `zai-org/ZCode@872ad960`(Apache-2.0)时,用户看到现状的行数后
 > 一句「架构治理值得做啊,现状的文件太大了」。ZCode 那套做法里可移植的是**机制**
 > (policy + baseline + 只卡增量),不是它的模块分层规则——后者 Cargo 已经免费给了,见第六节。

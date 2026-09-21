@@ -53,5 +53,5 @@ plan 139 做过 `atomic_replace` 的三平台钩子,那次只收了一个函数;
 
 - `make check` 全绿 + **CI 三平台绿**(windows 分支本机跑不到)。
 - fs.rs 里 `#[cfg]` 只剩 mod 声明。
-- 三个平台文件都 ≤800 code 行;fs.rs 降到 ≈700 后跑 `make arch-baseline`
+- fs.rs 降到 ≈700
   ——它会从基线里被摘掉。

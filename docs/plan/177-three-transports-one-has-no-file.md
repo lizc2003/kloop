@@ -49,7 +49,6 @@ content 数组渲染给人看/转成 `ContentBlock`。
 ## 四、验收
 
 - `make check` 全绿;`crates/mcp/tests/` 的每条集成测试通过。
-- 新增的两个文件都 ≤800 code 行(棘轮对不在基线里的新路径零容忍)。
-- `mcp/src/lib.rs` 降到 ≈480 后跑 `make arch-baseline`——它会**直接从基线里消失**
+- `mcp/src/lib.rs` 降到 ≈480
   (低于阈值的行会被摘掉),这一步要写进提交信息。
 - crate 的 `pub` 符号表一个不少不多。

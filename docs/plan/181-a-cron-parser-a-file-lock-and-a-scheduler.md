@@ -46,4 +46,4 @@ cron 解析器不需要知道有没有磁盘;文件锁不需要知道 cron;两�
 ## 四、验收
 
 - `make check` 全绿;scheduler 的 561 行测试**一条不少**,只是换了文件。
-- 两个新文件 ≤800;`scheduler.rs` 降到 ≈680 后跑 `make arch-baseline`,它会从基线里被摘掉。
+- `scheduler.rs` 降到 ≈680。

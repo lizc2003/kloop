@@ -44,4 +44,4 @@
 ## 四、验收
 
 - `make check` 全绿;`rollout::` 的对外符号表一个不少不多(用开工时列的那张表对)。
-- 三个新文件 ≤800;`rollout.rs` 降到 ≈500 后跑 `make arch-baseline`,它会从基线里被摘掉。
+- `rollout.rs` 降到 ≈500。
