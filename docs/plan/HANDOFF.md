@@ -28,7 +28,7 @@ plan 文件里写够了开工所需的一切;**八条互相独立、可任意顺
 | ~~**164** 自己产的 reasoning,被自己判成不可能~~ ✅ | `validate_provenance` 的 `Plain` 形状不再禁止 chat 家族 | 小 | **2026-09-18 紧接 163 的第二轮报错,当场查完做完,一次提交**。`provider/src/openai.rs` 把 `reasoning_content` 转成 signature-less thinking(有测试锁死,glm/deepseek 都发),`core/src/provider_route.rs` 却断言 "Chat carries no reasoning at all"——那句注释把**不回放**写成了**不产生**。后果是 chat 轨上任何会开始 thinking 的模型**走不过第二轮**,且落盘校验共用同一个函数,**已写出的会话连 resume 都打不开**。只放宽 `Plain`(`Redacted` 仍然只有 Anthropic 有);strip 留在 `history.rs` 的投影里不动——它本来就写对了,只是被排在前面的校验挡得没机会跑。教训 160 |
 | ~~**165** 模型自己写坏的 JSON,不是坏掉的协议~~ ✅ | tool arguments 先白名单修复,修不动的变成可回灌的失败调用 | 中 | **2026-09-18 换轨后的第三次报错,用户拍「先兼容,再可恢复」,当场做完,一次提交**。第一次报错只有 serde 的列号、原文没人留,于是先让错误带上原文(400 字节封顶),**下一次报错立刻定性**:`"description": 查看提交概要与文件列表` 少了引号,responses 轨同样复现——与轨无关,是模型通病(13 次采样全合法,偶发但一发就是一整轮)。新 `provider/src/tool_input.rs` 只修三种读法唯一的失误(裸值补引号、字符串里的裸控制字符、尾随逗号),**重写完仍交给 serde 判定**,歧义一律拒绝——参数会变成 shell 命令,靠猜的修复就是一条模型没写过的命令。修不动的走新 `AssistantBlock::InvalidToolUse`,**只活在 provider→core 这段流里**:落历史规范化成 `input: {}` 的普通 `tool_use`(于是 rollout / native / 回放一行不用改),原文和解析错误走 `is_error` 的 `tool_result` 回给模型,这一条不分发、同轮其它调用照常。三条轨统一,Anthropic 也不留例外。教训 161 |
 | ~~**166** 别人的审查清单,只留门禁抓不到的~~ ✅ | 上游 rust.md 摘成 `.kloop/skills/rust-review` | 小 | **2026-09-18 用户丢来 `alibaba/open-code-review` 问「对项目是否有帮助」,调研完的结论是工具不装、只摘它的 Rust 规则清单,用户拍「摘成 .kloop/skills 技能」,当场做完,一次提交**。筛选标准只有一条:**CI 的 clippy `-D warnings` 能抓的一律不收**——builtin `code-review` 本来就把 linter 能抓的排除在 finding 之外,收进来就是走不到审查那一步的噪音。于是「锁跨 await」整条改写(默认 lint `await_holding_lock` 已覆盖 std guard,只留 tokio guard 与跨用户代码那一面),`unwrap_used`/`redundant_clone`/`cast_possible_truncation` 这类**故意不开**的 lint 则保留并在条目里注明原因。另加一节上游没有的「与外部流的契约」,四条全部来自 plan 163/164/165 与教训 7/8。**发现是 cwd 相对的**,所以它只在仓库根起的会话里存在;**当天即移出仓库**:接着做的 `go-review`(上游 `rule_docs/go.md`)把位置戳穿了——kloop 仓库里没有一行 Go 代码,而发现是 cwd 相对的,放 `.kloop/skills/` 的 Go 清单永远不会出现在有 Go 代码的地方。于是两份都落在 `~/.kloop/skills/`,`.gitignore` 的洞与那条测试一并回滚,**仓库里最终只留下 docs**。代价是两份清单不在版本控制、也没有任何东西检查它们;要拿回这两样只有做成 builtin。教训 162 |
-| **176** 没有一道门拦着文件继续长 | 文件体积棘轮:policy + baseline + 只卡增量,做成一个 `cargo test` 直接进 `make check` | 中 | **2026-09-21 排定**,用户看到行数后一句「架构治理值得做啊,现状的文件太大了」。现状:127 个非测试文件、5.51 万 code 行,阈值 800 时 22 个超标(`tui/src/render.rs` 2148 居首)。口径(排测试文件 + 配平剔 `#[cfg(test)]` 块 + 不数空行与纯注释)比阈值更要紧,两种口径差 2.5 倍。开工前定一个点:阈值 |
+| ~~**176** 没有一道门拦着文件继续长~~ ✅ | 文件体积棘轮:policy + baseline + 只卡增量,做成一个 `cargo test` 直接进 `make check` | 中 | **2026-09-21 排定并完成,一次提交**。用户拍阈值 800(唯一待定点)。`rust/architecture-policy.toml` + `architecture-baseline.toml` + `crates/cli/tests/architecture.rs`(门禁 + `#[ignore]` 的更新器 + 8 条口径单测)+ `make arch-baseline`。**plan 第一节那张表是错的**:按行扫两个方向都会错,`render.rs` 真值 1126 不是 2148(测试里 `"}}]"` 打平了配平)、`windows.rs` 真值 1173 不是 1090(`#[cfg(test)] use …;` 没花括号,按行扫一路吞到下一个块),所以口径落在一个小词法器上。真实现状 127 文件 / 53685 code 行 / 23 个超标。**一处偏离 plan**:基线落后于现实做成失败而不是提示——libtest 吞掉通过测试的输出,提示谁都看不见;不危险是因为更新器只降不升、从不新增。教训 172 |
 
 **同一轮调研里查过但不立 plan 的一条**:grok 记录了 macOS Seatbelt 的 `mv x y && cat y`
 绕过(deny 按路径,文件被移出被 deny 的路径就绕过了)。查下来 kloop **已经防住**——
@@ -1508,3 +1508,18 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
    窗口——单模型 provider 豁免(两级说的是同一句话)。这让这份文件从"没人读的样例"变成门禁的
    一部分。顺带记下一条没修的:codex 的 gpt-5.6 家族有一档 `ultra` 在 `max` 之上,kloop 的
    `ReasoningEffort` 阶梯到 `max` 为止,**这一档目前表达不了**。
+172. 来自 2026-09-21 plan 176(文件体积棘轮)。**一个只在通过时说话的门禁,等于没有门禁。**
+   plan 写「实际值低于 baseline 时报一行提示」,写得很合理,但 libtest 默认吞掉通过测试的
+   stdout/stderr——这行提示在 `make check` 里一次都不会被人看到,正是这条 plan 自己在批的
+   "无声地绕过"。改成失败,并把修复命令写进失败信息。**能这么改的前提是更新器安全**:
+   `make arch-baseline` 只降不升、从不新增,不在基线里的路径加不进去,所以没人能靠跑一次命令
+   把新的超标文件合法化——如果更新器能新增,"失败 → 跑一下命令"就成了绕过门禁的标准动作。
+   第二条,**给代码定量的规则,口径必须自己写词法器,不能按行扫**。本仓库两个方向都被咬到:
+   `render.rs` 的测试里一句 `.ends_with("}}]")`,字符串里两个裸 `}` 把 `#[cfg(test)]` 的花括号
+   配平提前打平,后面 ~1200 行测试全被当成 production(2148 vs 真值 1126,它根本不是榜首);
+   `#[cfg(test)] use super::*;` 这种没有花括号的项,按行扫会一路吞到下一个 `{...}`,
+   `windows.rs` 因此少算 83 行。做法是先把文件投影成"去掉注释、每个字面量塌成一个字符"的
+   字符流再配平,投影本身顺带把"纯注释行"判准了。**认不出的 cfg 谓词一律当 production**:
+   多算是响亮的失败,少算是无声的放松,方向不能选错。第三条,**门禁的数写进 plan 之前先用
+   将要落地的那份口径量一遍**——plan 的表是调研时按行扫出来的,23 个文件里有 5 个数不对,
+   阈值讨论和 baseline 都建立在它上面。落地后另写了一份独立实现逐文件对照,23 个数全一致。

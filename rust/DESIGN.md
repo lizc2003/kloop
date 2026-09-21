@@ -3673,6 +3673,29 @@ Every session is saved and resumable — see Session persistence above.
   stay, because they say what the test means and the baseline says what the
   screen holds. `cargo insta review` accepts an intended change.
 
+Two repository-wide invariants ride in the binary's integration tests, because
+they belong to no single crate: `doc_placement.rs` pins a doc comment to the item
+it describes, and `architecture.rs` is the file-size ratchet. The ratchet reads
+`rust/architecture-policy.toml` (`[file_size] max_code_lines = 800`) and
+`rust/architecture-baseline.toml`, and counts code lines the only way that makes
+the number mean anything: test files (`tests/`, `tests.rs`, `*_tests.rs`) are out
+of scope, `#[cfg(test)]` items are cut out brace-balanced, and blank and
+comment-only lines do not count. Balancing runs over a projection that has
+already dropped comments and collapsed every literal to one character, so a `}`
+inside a string cannot end the test module early and a `//` inside one cannot
+blank the rest of the line — both occur in this tree, and a line-based count gets
+`tui/src/render.rs` wrong by 1022 lines. Raw line counts are no substitute
+either: `core/src/permissions.rs` is 4177 lines, 2233 without its tests, 1632 as
+code. The 23 files already over the threshold are frozen at their current counts
+in the baseline and may only shrink; every other file, new ones included, has to
+fit. `make arch-baseline` lowers a row once a file has actually shrunk and drops
+one that fell under the threshold, but never adds a row — a new oversized file is
+a gate failure, not a new line in a list — and CI never writes that file. Module
+layering is deliberately not policed: Cargo already enforces crate dependencies
+at compile time, and kloop has no domain/app/adapter split to declare. The policy
+file is sectioned so a later rule gets its own section rather than more keys in
+this one, and both structs reject unknown keys so a rule nothing reads fails loud.
+
 Beyond the suite: `cargo run -p kloop -- --mock` exercises six scripted
 rounds. Plan 63 acceptance also runs the real stdio binary for an exact native
 protocol 2.0 handshake and protocol 1.0 refusal, plus the Desktop companion's Bun,
