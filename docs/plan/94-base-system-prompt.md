@@ -2,7 +2,7 @@
 
 > 状态：✅ 已完成（2026-08-24；提交见本次 git log，plan94）
 >
-> 依赖：无硬依赖；沿用现有 `context::assemble_system`/`assemble_instructions`（Plan「项目上下文」）与工具定义（各 tool def 自带说明）。参考来源：`~/work/claude-code`（Claude Code 系统提示分节结构）、`refs/codewhale`（constitution 型原则与优先级）、`refs/codex`（codex-rs 的 CLI 编码 agent 人设/最终回答体裁）。
+> 依赖：无硬依赖；沿用现有 `context::assemble_system`/`assemble_instructions`（Plan「项目上下文」）与工具定义（各 tool def 自带说明）。参考来源：cc 源码参考（Claude Code 系统提示分节结构）、`refs/codewhale`（constitution 型原则与优先级）、`refs/codex`（codex-rs 的 CLI 编码 agent 人设/最终回答体裁）。
 >
 > 开发期决策：
 > - 正文用**英文**（系统法条与三参考一致；codewhale 亦明确 constitution/system law 保持英文）。对开发者的中文交流由 `<project-instructions>`（CLAUDE.md）承载，不进 base。

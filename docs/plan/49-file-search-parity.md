@@ -98,7 +98,7 @@ kloop 侧优先复用：
 5. 新增或改变的 deterministic profile 连跑两次，normalized bytes 必须一致。
 6. 在产品修改前先运行 `build_matrix.py` 更新已证实单元格；证据不足的单元格保持 `unknown`。
 
-公开文档、旧逆向源码和参考仓只能帮助设计 probe，不能裁决 2.1.220 契约。
+公开文档、旧源码参考和参考仓只能帮助设计 probe，不能裁决 2.1.220 契约。
 
 ## 实施切片
 

@@ -7,7 +7,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | 参考 | 位置 | 看什么 |
 |---|---|---|
 | **codex** | `refs/codex`(上游 openai/codex,固定 `02a8f038b87ad34d4a1dc5058eda26972ed7aa6c`) | 分层循环:`codex-rs/core/src/session/turn.rs`;工具注册:`core/src/tools/spec_plan.rs`;并行锁:`core/src/tools/parallel.rs`;压缩全家桶:`core/src/compact*.rs`;Responses 线路:`codex-api/src/common.rs`(请求体)+ `codex-api/src/sse/responses.rs`(事件);集成测试:`core/tests/suite`(mock SSE + wiremock 范式)。**系统面(2026-09-15 补:此前一直只当"循环与压缩的参考",用窄了)**:沙箱三平台 `linux-sandbox`(landlock + seccompiler + bwrap,1.03 万行)/`windows-sandbox-rs`(CreateRestrictedToken + 私有 desktop + JobObject + ConPTY,2.43 万行原生)/`core/src/sandboxing`(seatbelt);原生协议 `app-server*`(server 17.5 万 + protocol 3.45 万 + transport 1.8 万 + daemon 6668 行);`hooks`(1.57 万行,9 类事件 + hook 可以是 MCP tool + `output_spill`);工具执行策略 `execpolicy` + `shell-escalation` |
-| **claude-code(逆向 TS 版)** | `refs/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
+| **claude-code(TS 版)** | `refs/claude-code` | 主循环:`src/query.ts`(七层压缩流水线在 queryLoop 每轮开头);压缩:`src/services/compact/*`;工具并发分批:`toolOrchestration.ts`(partitionToolCalls);子 agent 递归:`AgentTool/runAgent.ts`;重试:`withRetry.ts`;溢出检测:`services/api/errors.ts` |
 | **claw-code（已退休）** | 历史快照 `claw-code@b71afddae100ced324457337925a694686b8fef2`（本地 clone 已移除） | **不可作底座**。只保留四项局部结论：① mock/request-capture 与 CLI output-contract 测试纪律；② OpenAI-compatible tool_calls 流式 reducer 的兼容边界；③ compact 不切开 tool_use/tool_result pair 的边界回归；④ typed lifecycle/degraded error 的阅读材料。kloop 已按自身协议和安全边界重实现，不复制 claw runtime。
 | **CodeWhale** | `refs/codewhale`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
 | **grok-build** | `refs/grok-build`(xAI 官方,固定 `37949780c144e37df692e3d669051a21fec24f20`;其 `SOURCE_REV` 指向上游 monorepo `c4ea71cf`) | **同语言同形态的第二个生产参考**(175 万行 Rust,与 codex 同量级)。重点看 PTY harness 分层(`xai-grok-pager-pty-harness`,4 万行:真 PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务)、`xai-codebase-graph`(tree-sitter 符号索引 + 增量重建 + mmap)、`xai-hunk-tracker`(agent/外部改动归因)、`xai-fast-worktree`(CoW + BTRFS O(1) 快照)、hooks 的 16 事件 macro 表驱动、permission 的 `bash_command_splitting`/`exec_risk`/`managed_policy`、`xai-sqlite-journal` 的 NFS 教训;不抄 hub/computer-hub 远程 workspace 面、plugin-marketplace、voice/announcements/mixpanel 遥测 |
@@ -198,29 +198,18 @@ crate，而按上面的判断 `nono` 并不是首选。
 不变，但 ACP 是"被编辑器直接接入"的行业口子，将来要不要另开一个面，需要单独拍板。
 
 
-Plan 48 将工具对齐目标钉死在本机精确二进制,不再拿滚动产品文档或旧逆向源码补实现:
+Plan 48 将工具对齐目标钉死在本机安装的那一个 `2.1.220 (Claude Code)`,不再拿滚动产品
+文档或旧源码参考补实现。目标的指纹与静态锚点只在本机的语料里核验,不抄进文档。
 
-- `~/.local/bin/claude` 指向
-  `~/.local/share/claude/versions/2.1.220`;
-- `claude --version` 为 `2.1.220 (Claude Code)`,文件大小 `<redacted>` bytes,
-  SHA-256 为 `<redacted>`;
-- Mach-O 内 bundle 元数据(byte `<redacted>` 附近)记录构建时间
-  `2026-07-24T22:17:45Z` 与 commit
-  `<redacted>`;
-- bundle 中统一工具适配器有 66 个 `$i({` 构造点,公共接口覆盖
-  name/aliases/schema/enabled/concurrency/read-only/open-world/permission/call/render/result mapping;
-  最终工具数组受 feature、平台、入口、权限档、plan/worktree/team/remote、MCP/defer/depth
-  条件过滤,不是静态全量表。
-
-已定位的 2.1.220 静态锚点:别名归一化 byte `<redacted>`;默认工具能力位
-`<redacted>`;Glob `<redacted>`;ToolSearch `<redacted>`;ExitPlanMode `<redacted>`;
-WebFetch `<redacted>`;Agent `<redacted>`;Bash `<redacted>`;Notebook/Edit stale-read 稳定串
-`<redacted>`。这些只是静态入口,没有走完 schema→parser→executor→permission/concurrency→
-output/lifecycle 或黑盒 fixture 的维度一律仍是 `unknown`。
+读出来的一条结构性事实要记住:最终工具数组受 feature、平台、入口、权限档、
+plan/worktree/team/remote、MCP/defer/depth 条件过滤,**不是静态全量表**——所以任何
+"工具清单"式的对比都必须带上条件向量。没有走完
+schema→parser→executor→permission/concurrency→output/lifecycle 或黑盒 fixture 的维度,
+一律仍标 `unknown`。
 
 本轮也重新固定了两个架构参考的快照:
 
-- `refs/claude-code`（当时在 `~/work/claude-code`）commit `<redacted>`;
+- `refs/claude-code`(本机的一份 cc 源码参考,非 2.1.220);
 - archived snapshot: `claw-code@4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d` (the local clone was later verified at `b71afddae100ced324457337925a694686b8fef2` before retirement).
 
 回源交叉核对的收敛点:工具计划/条件注册与执行分发分层;编辑前保存并校验文件读取状态;
@@ -327,8 +316,8 @@ plain/server 在下一 turn 交付。agent/program 的结果回灌语义不变�
 process group，并在 active worktree teardown 前等待，防 orphan、重复通知和 server sender 挂账。
 自动后台化、stall policy 与逐事件 Monitor 保留为明确的产品边界。
 
-Plan 62 的 Windows shell 结论只使用固定逆向源码 `<redacted>`
-作架构参考：原生 Windows 的 Bash 仍是经 Git for Windows 布局验证的独立 `bash.exe -lc`，
+Plan 62 的 Windows shell 结论只把那份 cc 源码参考
+当架构参考：原生 Windows 的 Bash 仍是经 Git for Windows 布局验证的独立 `bash.exe -lc`，
 PowerShell 是另一个 foreground-only 工具，WSL 按 Linux 分流。kloop 将所有 model shell 收敛到
 跨平台 process-tree façade；Windows 采用 suspended `CreateProcessW`、value-lifetime 自持的 stdio
 handle list、Windows ordinal-case UTF-16 environment、assign-before-resume 的专属 Job Object，
@@ -580,7 +569,7 @@ predictiveThreshold = effectiveContextWindow - estimateMaxTurnGrowth
 
 **Reactive**(cc `src/query.ts:1349-1470` + `services/api/errors.ts`):检测匹配 `'prompt is too long'`(大小写不敏感);正则抽 `actual > limit` 算溢出缺口;每 turn 单发守卫 → 完整压缩 → 继续循环重试,失败才浮出错误(流式期间错误对 UI 暂扣);摘要请求自身溢出时按"整 API 轮"分组丢头部(缺口定量,兜底 20%,最多 3 次);连续 3 次压缩失败熔断。
 
-**其余 cc 常数**(移植时对照):autocompact buffer 按窗口 50k/30k/13k;手动 compact 预留 3k;警告带 20k;单消息工具结果预算 200k 字符、单工具默认 50k;摘要 prompt 九段式(kloop 的 COMPACT_INSTRUCTION 是其精简版);全量压缩后重注入最近读过的 ≤5 个文件现状。
+**其余 cc 常数**(移植时对照):autocompact buffer 按窗口 50k/30k/13k;手动 compact 预留 3k;警告带 20k;单消息工具结果预算 200k 字符、单工具默认 50k;摘要 prompt 分节式(kloop 的 COMPACT_INSTRUCTION 取同一种分节形状,文本是自己写的);全量压缩后重注入最近读过的 ≤5 个文件现状。
 
 ## 会话持久化对比(2026-07-09,plan 7/7b 调研)
 

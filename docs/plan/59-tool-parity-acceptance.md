@@ -6,7 +6,7 @@
 >
 > 依赖：Plan 49–58（均已完成）
 >
-> 固定目标：Claude Code 2.1.220 exact binary；SHA-256 `<redacted>`。
+> 固定目标：Claude Code 2.1.220 exact binary（指纹只在本机核验）。
 >
 > 验收范围：darwin-arm64 本地 CLI、`team=false`、`remote=false` 的 manifest 已执行 profile/condition vector。
 

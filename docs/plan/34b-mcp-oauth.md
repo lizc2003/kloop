@@ -7,7 +7,7 @@
 
 ## 回源结论(2026-07-16,两家真读,file:line)
 
-约定:`cc/` = `~/work/claude-code/src/`;cc 的 SDK 指
+约定:`cc/` = `<cc-src>/`;cc 的 SDK 指
 `@modelcontextprotocol/sdk` 的 `client/auth.js`(cc 把协议编排全委托给它)。
 `sky/` = `refs/codex/codex-rs/rmcp-client/src/`;codex
 把协议原语委托给 `rmcp` crate(v1.8.0,feat `auth`)+ `oauth2` crate v5,

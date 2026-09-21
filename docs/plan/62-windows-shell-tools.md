@@ -6,7 +6,7 @@
 >
 > 交界：Plan 51 已完成显式后台 lifecycle/通知/回灌与 session cleanup；自动后台化、stall 和逐事件 Monitor 仍为产品边界
 >
-> 调研/实现基线：kloop `4ab04b5`；Claude Code 固定源码 `<redacted>` 只作 Windows 架构参考，精确 2.1.220 target 是 darwin-arm64，不能充当 Windows 运行证据。
+> 调研/实现基线：kloop `4ab04b5`；Claude Code 源码参考只作 Windows 架构参考，精确 2.1.220 target 是 darwin-arm64，不能充当 Windows 运行证据。
 
 ## 背景
 

@@ -93,7 +93,7 @@ plan 第一个真决定,不是默认抄 codex 的 V8。
 
 ## 回源结论(2026-07-13,三家真读 + Anthropic 博客,file:line 见下引)
 
-三家各自深读代码(codex Rust/V8 一手实现、cc 逆向 TS `packages/workflow-engine`、
+三家各自深读代码(codex Rust/V8 一手实现、cc TS 源码 `packages/workflow-engine`、
 Anthropic 工程博客),交叉核对后收敛信号很干净。核心文件索引在本节末。
 
 ### 引擎无关的"必然解"(教训 14 收敛点,kloop 照搬)

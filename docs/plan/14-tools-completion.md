@@ -18,11 +18,11 @@
 ## 完成记录(第二片:web_fetch + web_search,2026-07-10)
 
 - **开工拍板**:走 cli 注册的 ToolSource 缝(core 零改动);web_search 也做,默认后端 Brave Search API(agent 生态最常用的中立选项;Bing API 已退役、Google CSE 限额难用、DDG 无官方 API),`SearchBackend` trait 保证可扩展(加 provider = 一个 trait 实现 + cli match 一条臂);Anthropic 服务端 web_search 不用(provider 层的另一条缝,OpenAI 轨无对等物),记为将来可选第二实现。
-- **回源核对 cc**:WebFetch = url+prompt、turndown 转 Markdown、Haiku 加工、15 分钟缓存、跨 host 重定向不跟随(返回 REDIRECT DETECTED 让模型显式重发)、http→https 升级、URL≤2000、拒绝内嵌凭据;SSRF 防护很弱(只查 hostname 段数)。WebSearch = 适配器工厂(api/tavily/bing/brave/exa,这个逆向版默认自建 tavily 代理)。**抄了**:跨 host 重定向不跟随、http→https 升级、凭据拒绝、URL 长度上限。**没抄**:prompt+小模型加工(kloop 无小模型缝)、缓存、turndown(手写 HTML→text,零新依赖)、preapproved 域名白名单;SSRF 用 kloop 自己的 IP 级检查(环回/私网/link-local/CGNAT/元数据段全拒,域名解析后逐地址查,比 cc 强)。
+- **回源核对 cc**:WebFetch = url+prompt、turndown 转 Markdown、Haiku 加工、15 分钟缓存、跨 host 重定向不跟随(返回 REDIRECT DETECTED 让模型显式重发)、http→https 升级、URL≤2000、拒绝内嵌凭据;SSRF 防护很弱(只查 hostname 段数)。WebSearch = 适配器工厂(api/tavily/bing/brave/exa,这个cc 默认自建 tavily 代理)。**抄了**:跨 host 重定向不跟随、http→https 升级、凭据拒绝、URL 长度上限。**没抄**:prompt+小模型加工(kloop 无小模型缝)、缓存、turndown(手写 HTML→text,零新依赖)、preapproved 域名白名单;SSRF 用 kloop 自己的 IP 级检查(环回/私网/link-local/CGNAT/元数据段全拒,域名解析后逐地址查,比 cc 强)。
 - **结构**:新 crate `kloop-web`(reqwest 网络实现;fetch.rs/html.rs/search.rs),cli `web.rs` 胶合(`[web]` 配置解析 + ToolSource 适配,web 源注册在 MCP 之前)。原实现把模型可见 ToolDef 也放在 `kloop-web`;plan 44 后移到 `core/src/tools/web.rs`(工具名/描述/schema),CLI 将 core 契约绑定到 `kloop-web` 操作,core 仍不依赖网络。web_fetch 常开(--mock 除外);`BRAVE_API_KEY` 未设或 provider 未知时 web_search 不注册、启动警告降级。两工具 readonly 进并发批;权限门按外部工具处理(默认询问,`web_fetch` allow 规则可放行)。
 - **测试**:+20(223 总):SSRF 拒绝表(loopback/私网/link-local/169.254 元数据/CGNAT/v4-mapped/localhost/file/ftp)、URL 卫生(升级/凭据/超长)、同 host 重定向跟随与循环上限、跨 host 重定向报告不跟随、HTML→text 契约(script/style/注释剥除、实体解码、块级换行、畸形输入)、大小写截断文案、非文本类型拒绝、Brave wiremock 契约(query/header/高亮剥除/429/空结果)、`[web]` 配置解析与降级路径。
 - **验收(全部销账)**:web_fetch 双轨真 key 过(sonnet-5 抓 example.com 摘要;gpt-5.4-mini 给 http URL 自动升级 https 无异常);web_search 真实 Tavily 端点双轨过——sonnet-5 走 搜索→挑结果→web_fetch 验证内容 的完整闭环,gpt-5.4-mini 主动带 site: 限定与 max_results 查到 tokio 最新版本并给来源 URL,均首试正确。
-- **拍板变更(同日,3a86009)**:默认搜索后端 Brave → **Tavily**——Brave 已取消无卡免费套餐,默认值应该开箱能用;Tavily 免费档 1000 次/月无卡,且是 agent 生态最常用后端(cc 逆向版默认适配器就是 tavily)。Brave 实现保留,`[web] search_provider = "brave"` + `BRAVE_API_KEY` 可切换。key 环境变量按 provider:`TAVILY_API_KEY` / `BRAVE_API_KEY`。
+- **拍板变更(同日,3a86009)**:默认搜索后端 Brave → **Tavily**——Brave 已取消无卡免费套餐,默认值应该开箱能用;Tavily 免费档 1000 次/月无卡,且是 agent 生态最常用后端(cc 默认适配器就是 tavily)。Brave 实现保留,`[web] search_provider = "brave"` + `BRAVE_API_KEY` 可切换。key 环境变量按 provider:`TAVILY_API_KEY` / `BRAVE_API_KEY`。
 - **挂账**:搜索后端第三实现(searxng 或 Anthropic 服务端);fetch 缓存、`prompt` 参数小模型加工(等有便宜模型缝)。
 
 ## 备选池(未承诺)
@@ -44,7 +44,7 @@ fmt/clippy/test 全绿;真 key 手工验收按所选切片(至少:模型用 grep
 
 ## 完成记录(第一片:grep + glob,2026-07-10)
 
-- **开工拍板**:选片只做 1;纯 Rust 库实现(`grep-searcher`/`grep-regex`/`ignore`,rg 同源 crate);list_dir 判据 = "cc 有才做",回源核对发现 cc(逆向 TS 版)已移除 LS 工具(目录探索 = Glob+Grep+bash ls),所以不做。
+- **开工拍板**:选片只做 1;纯 Rust 库实现(`grep-searcher`/`grep-regex`/`ignore`,rg 同源 crate);list_dir 判据 = "cc 有才做",回源核对发现 cc(TS 版)已移除 LS 工具(目录探索 = Glob+Grep+bash ls),所以不做。
 - **形态对齐 cc**(两个参考库都回源核对过):grep 参数面 `pattern/path/glob/type/output_mode/-i/-n/-A/-B/-C/head_limit(默认 250,0=不限)/offset/multiline`,三种 output_mode 的文案、空结果文案("No matches found"/"No files found")、500 列单行截断、`--hidden` + 尊重 .gitignore + 显式排除 VCS 目录、20s 预算;glob 上限 100 + cc 原文截断提示。未抄:cc 的 `context` 参数(-C 的冗余别名)。
 - **两处有意偏离 cc**:① glob 也尊重 .gitignore(cc 的 glob 默认 `--no-ignore`,Rust 仓库不滤 target/ 全是垃圾);② glob/grep-files 排序都是 mtime 新→旧再截断(cc 的 glob 是 rg `--sort=modified` 旧→新再取前 100,截掉的恰是最新文件;claw-code 也是新→旧)。
 - **claw-code 调研结论**(反面教材,细节见会话):walkdir+regex 自研,不尊重 .gitignore、glob/grep 忽略策略不对称、multiline 语义失效、无超时——印证选 ripgrep crate 族。

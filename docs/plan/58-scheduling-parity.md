@@ -46,7 +46,7 @@ Exact bundle locator 另固定 parser、store、jitter fallback、ScheduleWakeup
 - server-selected effective recurring jitter；
 - restart/re-arm 与 enabled dynamic-loop 成功路径。
 
-原因是固定 Mach-O 没有可控 clock/gate seam；注入时钟会改变目标 SHA-256。model-facing 描述是 recurring 10%/15min，bundle fallback 是 50%/30min，不能把任一值冒充 exact effective profile。
+原因是固定目标没有可控 clock/gate seam；注入时钟就不再是同一个二进制。model-facing 描述是 recurring 10%/15min，bundle fallback 是 50%/30min，不能把任一值冒充 exact effective profile。
 
 最终 corpus：
 

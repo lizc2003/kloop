@@ -11,22 +11,14 @@ golden/parity fixture，不能据工具名、公开文档或 Viewer 的候选差
 
 ## 固定参考载体
 
-目标二进制：
+目标二进制：本机安装的 `2.1.220 (Claude Code)`,只此一个版本。
 
-- 路径：`~/.local/share/claude/versions/2.1.220`
-- `claude --version`：`2.1.220 (Claude Code)`
-- 文件大小：`<redacted>` bytes
-- SHA-256：`<redacted>`
-- bundle commit：`<redacted>`
-- 构建时间：`2026-07-24T22:17:45Z`
-
-二进制本体不进入仓库。采集器运行前必须校验版本、大小和 SHA-256；任一不符立即退出，
-禁止把其他版本生成的结果混进本基线。
+二进制本体不进入仓库,它的指纹(大小、SHA-256、构建标识)也不写进文档——采集器在本机
+校验,不符立即退出,禁止把其他版本生成的结果混进本基线。
 
 三个代码库只作架构参考：
 
-- `~/work/claude-code`：commit `<redacted>`；不是
-  2.1.220，不能裁决当前契约。
+- 本机的一份 cc 源码参考：不是 2.1.220，不能裁决当前契约。
 - `refs/codex`：commit
   `bb21ed4b8d8f74567cd6fecb3c7d4fba795bc6e3`。
 - `refs/claw-code`：commit `4ea31c1bc91c4e9bcbd67d51c550c01e127e6d0d`；只取经
@@ -70,18 +62,7 @@ Plan 48 是“**版本基线 + fixture 基建 + parity matrix + 后续路线图*
 - kloop：repo-relative `file:line` + 对应测试；
 - reference：仓库 commit + `file:line`，并标注“仅架构参考”。
 
-已确认的 2.1.220 静态锚点先入账：
-
-- bundle 元数据：byte `<redacted>`；
-- 统一工具适配器默认能力位：byte `<redacted>`；
-- Task/Agent 等别名归一化：byte `<redacted>`；
-- Glob：byte `<redacted>`；
-- ToolSearch：byte `<redacted>`；
-- ExitPlanMode：byte `<redacted>`；
-- WebFetch：byte `<redacted>`；
-- Agent：byte `<redacted>`；
-- Bash：byte `<redacted>`；
-- Notebook/Edit stale-read 相关稳定字符串：byte `<redacted>`。
+已确认的 2.1.220 静态锚点先入账（锚点本身只在本机的语料里，不抄进文档）。
 
 这些锚点只是起点；没有追完整链或黑盒 fixture 的维度仍标 `unknown`。
 
@@ -297,9 +278,8 @@ Plan 48 不做：
 
 ## 完成记录 ✅（2026-07-27）
 
-- 目标身份已固定并由采集器/校验器双重守卫：`2.1.220 (Claude Code)`、
-  `<redacted>` bytes、SHA-256
-  `<redacted>`；二进制未入仓。
+- 目标身份已固定并由采集器/校验器双重守卫：`2.1.220 (Claude Code)`，指纹只在本机核验；
+  二进制未入仓。
 - hermetic collector 已落地 6 个完整条件 profile 和 38 组 raw/normalized captures。采集环境从
   白名单构造，使用临时 HOME/config/cwd、本地 fake provider/Web/MCP，禁 telemetry/updater/error
   reporting，公网代理指向不可用 loopback；clean determinism pair 的 normalized bytes 完全相同。

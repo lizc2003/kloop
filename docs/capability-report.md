@@ -8,7 +8,7 @@
 
 ## 一、总评
 
-- **规模**:kloop 10 crate 共 ~3.1 万行 Rust;codex codex-rs ~118 万行、cc(逆向
+- **规模**:kloop 10 crate 共 ~3.1 万行 Rust;codex codex-rs ~118 万行、cc(TS
   TS)~71 万行。kloop 用约 3% 的代码量覆盖核心引擎面——对比按"同一能力的质量"看,
   不按面积。
 - **形态完成度:约九成**。refs 标注的"必然解"收敛面全部落地,多处质量反超(见二)。
@@ -325,7 +325,7 @@ D/D/U/U/D/D/U/U，Workflow 为 C/D/D/C/D/C/C/C；Ask parser 使用正交 empty/t
 | send_message / addressable mailbox | CC/Codex 均有，但 routing 契约不同 | **✅ Plan 70（2026-08-10）**：同 session `main ↔ agent-N` 与 sibling，typed local identity、严格有界 FIFO、safe-boundary delivery、独立 lifecycle；A2A 1.0 aligned 但不是 A2A endpoint/support | 已完成 |
 | ListAgents / local live roster | CC exact bundle 有 descriptor/gate；远程/team profile 不权威 | **✅ Plan 70（2026-08-10）**：严格 `list_agents {}` 只列同 directory Open peers；不做 remote discovery、Agent Card 或团队持久态 | 已完成 |
 | child/background execution provenance | CodeWhale receipt 思路 + kloop 分型生命周期 | **✅ Plan 88（2026-08-15）**：core-private 2 KiB typed receipt 冻结 execution parent、Agent-only mailbox、transient/durable、rollout、workspace 与 terminal owner；现有 registries 持 receipt/typed handle；Program/Workflow bounded `provenance.json` 与 journal v3 保存审计 evidence，v1/v2 不兼容 replay，public wire/Task/billing 不变 | 已完成 |
-| Agent 并发上限 | exact 2.1.220 profile 测不出;逆向源码里 cc 的 `AgentTool` 与 `Read` 共用同一个 10 | **✅ Plan 154(2026-09-16)**:批内统一 `MAX_CONCURRENT_TOOL_CALLS` = 10(cc / deepseek-harness 同值),`run_agent` 与其他工具同一个上限;后台 agent/program 每 session 8 不变 | 已完成 |
+| Agent 并发上限 | exact 2.1.220 profile 测不出;cc 源码参考里 `AgentTool` 与 `Read` 共用同一个 10 | **✅ Plan 154(2026-09-16)**:批内统一 `MAX_CONCURRENT_TOOL_CALLS` = 10(cc / deepseek-harness 同值),`run_agent` 与其他工具同一个上限;后台 agent/program 每 session 8 不变 | 已完成 |
 | agent 类型 per-type effort/max_turns | cc 单家 | plan 17 片 2 未做节 | 有真实 agent 类型库再说 |
 
 ### 6. code mode——✅ 无挂账(plan 24/27 全清)

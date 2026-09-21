@@ -14,7 +14,7 @@ Plan 94 真实回归时,Anthropic rail(claude-sonnet-4-6)一轮里模型用 `bas
 - `grep` 工具描述里也有一句 "prefer this over grep/rg in bash"(`tools/mod.rs`)。
 - **但 `bash` 工具描述本身只字未提**别拿 bash 干 grep/cat/find/sed。模型恰恰是在**调 bash 的那一刻**做决定的,决策点上没有拦它的话。
 
-参考三引擎(`~/work/claude-code`、`refs/codex` 的 codex-rs)都把这条红线放进 **bash 工具描述**("avoid `find`/`grep`, use Grep; avoid `cat`/`head`/`tail`, use Read"),正是补在决策点。
+参考三引擎(cc 源码参考、`refs/codex` 的 codex-rs)都把这条红线放进 **bash 工具描述**("avoid `find`/`grep`, use Grep; avoid `cat`/`head`/`tail`, use Read"),正是补在决策点。
 
 ## 已拍板设计(软方案)
 

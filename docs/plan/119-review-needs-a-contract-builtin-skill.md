@@ -37,7 +37,7 @@ kloop 的 rollout 里，这条出现过：
 
 三处直接对应物，都读了原文：
 
-1. **cc 的内置 skill 机制** — `~/work/claude-code/src/skills/bundledSkills.ts` +
+1. **cc 的内置 skill 机制** — `<cc-src>/skills/bundledSkills.ts` +
    `src/skills/bundled/verify/SKILL.md`。形状是"真正的 `SKILL.md` 原文编译进二进制
    → 解析 frontmatter 拿 description → `registerBundledSkill`"，和本片的做法一致。
    cc 多一个 `files: Record<string,string>` 字段：附加参考文件在**首次调用时解压到

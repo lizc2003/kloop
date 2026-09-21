@@ -83,7 +83,7 @@ fmt/clippy/test 全绿,一次 commit;README 补 commands 目录;本文件补完�
 限面);③ commands **不进模型 catalog / `skill` 工具**(只 `/name` 可调,cc 的
 `disable-model-invocation` 默认);④ 命名空间/子目录挂账(单人工具先平铺)。
 
-**回源核对(2026-07-16,复核 plan 备忘无误)**:cc `~/work/claude-code`
+**回源核对(2026-07-16,复核 plan 备忘无误)**:cc 源码参考
 `src/skills/loadSkillsDir.ts` — `loadSkillsFromCommandsDir` 确支持单文件 `*.md`(+目录
 SKILL.md),`loadedFrom:'commands_DEPRECATED'`,命令名=去 `.md` 文件名(frontmatter
 `name` 被 `displayName:undefined` 覆盖),默认 `userInvocable:true`;无 `description`
@@ -123,7 +123,7 @@ description + `$0`)→ `/greet Ada` → 模型回 `kloop-cmd-ok greeting Ada`;
 
 ## 完成记录(二片:`!cmd`/`@file` 注入,提交 93570b1)
 
-**回源核对(2026-07-16)**:cc `~/work/claude-code`——`!cmd` 在
+**回源核对(2026-07-16)**:cc 源码参考——`!cmd` 在
 `src/utils/promptShellExecution.ts`:`BLOCK_PATTERN=/```!\s*\n?([\s\S]*?)\n?```/g` +
 `INLINE_PATTERN=/(?<=^|\s)!`([^`]+)`/gm`(inline 要求 `!` 前是行首/空白),在命令
 `call()` 里**参数替换、`${CLAUDE_SKILL_DIR}` 替换之后**执行;先 `hasPermissionsToUseTool(
