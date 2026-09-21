@@ -96,7 +96,7 @@ TUI 面板不再标注 blocker、pending 不再分两组。`make check` 全绿,`
 两处 plan 没预见的:**server 的线程隔离测试删了**(整表覆盖让那条性质从工具面不可观测,
 见教训 158),**`BASE_SYSTEM` 那句复数顺带改了半句**(另半句留给 190,见教训 159)。
 
-**同日第二次提交:工具改名 `task_write` → `todo_write`**(用户一句「task 这个名字太重了」)。
+**同日第二次提交 `f50dec0`:工具改名 `task_write` → `todo_write`**(用户一句「task 这个名字太重了」)。
 形状一个字没变,改的是名字和它带起的整个类型族:`TodoRegistry` / `TodoSnapshot{revision,todos}` /
 `TodoItem{subject,status}` / `TodoStatus` / `Event::TodoUpdated` / `Config.todos`,
 文件 `tools/task.rs` → `tools/todo.rs`。判据是 **`task` 在 kloop 里超载三样**
