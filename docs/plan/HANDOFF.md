@@ -113,7 +113,7 @@ TUI 面板不再标注 blocker、pending 不再分两组。`make check` 全绿,`
 `rollout`/`codemode` 的 "legacy … cannot be resumed"(那是**拒绝**旧数据,方向相反)。
 见教训 161。
 
-**190 已完成(2026-09-21,提交 `PENDING`)**:表停住就把它还给模型。
+**190 已完成(2026-09-21,提交 `7f7da73`)**:表停住就把它还给模型。
 `TodoRegistry::round_boundary_reminder()` 在每个 **depth-0 round 边界**被问一次,
 到点了就把一个 `<system-reminder>` 块当 user message **追加在历史末尾**
 (`agent.rs` 的 `remind_todos`,和 `drain_inbox`/`drain_local_mailbox` 并排)。
