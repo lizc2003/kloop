@@ -2,7 +2,59 @@
 
 > 全局约束(定位、工作方式、风格、偏好)在根目录 CLAUDE.md(自动加载)。本文件是细节:读完即可开工,无需重新调研。参考库知识在 `refs/README.md`;与 cc/codex 的能力差距与补齐路线在 `docs/capability-report.md`(补能力前对着挑项,完成后销账)。
 
-## 〇、待做的一批:plan 149–156(2026-09-15 排定)+ 158(2026-09-17)
+## 〇、当前这一批:架构重整 plan 177–186(2026-09-21 排定)
+
+来源:plan 176 的体积棘轮落地当天,用户看了现状后一句「我要的是现有文件的架构重整啊」。
+棘轮只是把债冻住,这一批是把债还掉。**十条互相独立、可任意顺序**,每条一个会话任务,
+plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑、验收),不必重读本节。
+
+**判据:只拆职责堆叠,不追行数**(用户 2026-09-21 拍板)。行数只是发现问题的手段,
+不是目标——这也是 plan 176 第二节自己写的判据。于是:
+
+- **23 个超标文件里,10 个进这一批**(下表),它们的边界是现成的,拆完每块都能用一句话说清自己是什么。
+- **3 个明确不拆**:`core/src/process_tree/windows.rs`(一整块 Win32 unsafe,Job/Debugger/spawn
+  互相咬合)、`provider/src/responses.rs`(一台 SSE 状态机)、`core/src/agent.rs`
+  (plan 142 刚把 `turn_rounds` 降到 123 行,`Turn` impl 是回合本体)。硬拆就是 plan 176
+  警告的"为了一个数把 `impl` 的内聚切碎"。**留在基线上,让棘轮盯住它们不再长。**
+- **5 个中间档,这一批不排**:`tui/src/app.rs`(一个 1338 行的 `impl App`)、
+  `core/src/tools/mod.rs`、`core/src/provider_route.rs`、`tui/src/render.rs`、`tui/src/markdown.rs`。
+  它们要读进去才能判边界,**没读之前不立 plan**——本批的十条都是读过骨架之后才排的。
+
+| plan | 文件(code 行)| 拆出什么 | 规模 |
+|---|---|---|---|
+| **177** 三个传输里,只有 stdio 没有自己的文件 | `mcp/src/lib.rs` 884 | `stdio.rs` + `render.rs` | 小,**建议先做** |
+| **178** 私有存储:一个文件里住着三套系统调用 | `cli/src/private_store.rs` 1088 | `private_store/{unix,windows,fallback}.rs` | 中 |
+| **179** 平台分支已经盖好半间房子了 | `core/src/tools/fs.rs` 1551 | `fs/{unix,fallback}.rs` + 扩充已有的 `fs/windows.rs` | 中 |
+| **180** 前台跑完就结束,后台要活一整个会话 | `core/src/tools/bash.rs` 958 | `bash/background.rs` | 中 |
+| **181** 一个 cron 解析器、一把文件锁、一个调度器 | `core/src/scheduler.rs` 1187 | `scheduler/{cron,store}.rs` | 中 |
+| **182** 追加一行,和读一个会话目录,不是一件事 | `core/src/rollout.rs` 1500 | `rollout/{sessions,line,validate}.rs` | 大 |
+| **183** main.rs 里藏着一个完整的 REPL | `cli/src/main.rs` 833 | `plain.rs` | 中 |
+| **184** 配置、生命周期、两个 ToolSource,一个文件 | `cli/src/mcp.rs` 1909 | `mcp/{config,lifecycle,tools,resources}.rs` | 大 |
+| **185** 二十二个方法排成一张表,表在一个 impl 里 | `server/src/lib.rs` 1910 | `{dto,params,worker,thread_ui}.rs` + `methods/{threads,query,turn}.rs` | 大 |
+| **186** 管线才是本体,另外四样只是邻居 | `core/src/permissions.rs` 1632 | `permissions/{rule,policy,facts,describe}.rs` | 大,**建议放最后** |
+
+顺序建议:177 → 178/179(同一个形状做两遍)→ 180/181/183 → 182/184/185 → 186。
+177 最小,做完一次就知道这批的节奏对不对;186 语义风险最高,前面九条做完手感最好。
+
+### 这一批的统一纪律
+
+1. **行为零变更。** 重构提交里不夹修 bug、不夹收紧、不夹改文案。搬代码时发现 bug,
+   单独记、单独提交、单独带测试。几个安全边界文件(178/179/186)的自查标准是:
+   diff 里除 `use` 之外应该接近零改动。
+2. **测试跟着代码走。** 这些文件的测试都在文件底部的 `#[cfg(test)] mod tests` 里,
+   靠 `use super::*` 够私有项。搬走一块代码,覆盖它的测试必须一起搬,否则够不到。
+   **按测试实际触达的私有项分,不要按测试名猜。** 几条大的(181/182/186)测试搬运量
+   比代码搬运量还大:permissions 4177 总行里 2545 行是测试。
+3. **新文件必须 ≤800 code 行。** 棘轮对不在基线里的新路径零容忍,所以切法要一次切到位;
+   **原文件降到多少都行**(它保着自己的基线行),收工跑 `make arch-baseline` 收水位——
+   本批每一条做完,那个文件都会直接从基线里被摘掉。**永远不要手改基线**。
+4. **可见性只提到够用为止。** 文件私有的项搬进子模块后父模块要用,提 `pub(super)`;
+   跨模块才提 `pub(crate)`。别顺手改 `pub`——那会把内部形状变成 crate 的 API。
+5. **对外符号表一个不少不多。** 几条 `pub` 面大的(182 的 `rollout::`、184 的 `mcp::`、
+   185 的 server)开工第一步是 `grep -rn '<模块>::' crates/` 把现有对外符号列全,
+   收工按这张表核对。
+
+## 〇之二、上一批:plan 149–156(2026-09-15 排定)+ 158(2026-09-17)+ 176
 
 来源是一次借鉴项目调研(`refs/grok-build` + `refs/deepseek-harness`,结论见 `refs/README.md`
 的 2026-09-15 节),收尾时用户问"kloop 主要在 macOS 上用,该提高哪些能力",按 **macOS-only**
@@ -57,7 +109,7 @@ ancestor is untouched")说明这个配对是有意的。**唯一值得补的是�
 - **Plan 67 这次差点被重复立一遍**(一份 plan 157 写出来又删掉):它从来没进过本文件,也没进过
   capability-report——那两处只写"PDF 原生分页读取仍待实现",不点 plan 号。教训 152。
 
-## 〇之二、上一批:plan 138–142(2026-09-11 排定,已全部完成)
+## 〇之三、更早一批:plan 138–142(2026-09-11 排定,已全部完成)
 
 plan 136 的全仓通读(12.5 万行)把当时不该混进清账的条目挂成非目标;用户要求把它们排成
 计划。五条**互相独立、可任意顺序**,每条都是一个会话任务,plan 文件里写够了开工所需的
