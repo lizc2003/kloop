@@ -561,12 +561,16 @@ fn reasoning_part_mut(
     else {
         return Err(protocol("reasoning event referenced a non-reasoning item"));
     };
-    let part = if summary {
-        summaries.get_mut(&index)
-    } else {
-        content.get_mut(&index)
-    }
-    .ok_or_else(|| protocol("reasoning event referenced an unknown part"))?;
+    // The first delta may be the part's only announcement: a gateway streams
+    // raw reasoning with no `content_part.added` and no `.done`, closing the
+    // part only through the item's final `content` array. Opening it here gives
+    // up nothing, for the same reason the per-part `.done` did — what verifies
+    // the stream is `verify_reasoning_parts` at the item boundary (dense
+    // indices, exact text against the final array), and an index the server
+    // never announced still fails there.
+    let part = if summary { summaries } else { content }
+        .entry(index)
+        .or_default();
     if part.part_closed || part.field_done {
         return Err(protocol("reasoning event referenced a closed part"));
     }

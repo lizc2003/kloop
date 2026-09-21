@@ -2067,6 +2067,97 @@ async fn unclosed_reasoning_part_still_fails_when_final_text_diverges() {
         "provider protocol error: openai-responses final reasoning text did not match streamed text"
     );
 }
+
+/// Another real gateway's reasoning shape, on the raw-content channel this
+/// time: the item opens, every `reasoning_text` delta arrives with a
+/// `content_index` that no `content_part.added` ever announced, and no
+/// `content_part.done` closes it — the item's final `content` array is the only
+/// place the part is ever described. Requiring the opening frame here refused
+/// every turn such a model took, on the first delta.
+#[tokio::test]
+async fn raw_reasoning_content_parts_may_open_on_their_first_delta() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            // No item status either, and the id is a `msg_` one on a reasoning
+            // item — both as captured.
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "msg_1", "content": [], "summary": []
+            }}),
+            json!({"type": "response.reasoning_text.delta", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "delta": "raw "}),
+            json!({"type": "response.reasoning_text.delta", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "delta": "thinking"}),
+            json!({"type": "response.reasoning_text.done", "output_index": 0,
+                "item_id": "msg_1", "content_index": 0, "text": "raw thinking"}),
+            // No `encrypted_content`: this reasoning is signature-less, which
+            // is a shape history accepts and never replays as a blob.
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "msg_1", "summary": [],
+                "content": [{"type": "reasoning_text", "text": "raw thinking"}]
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(&ok[0], StreamEvent::ThinkingDelta(t) if t == "raw "));
+    assert!(matches!(&ok[1], StreamEvent::ThinkingDelta(t) if t == "thinking"));
+    assert!(matches!(
+        &ok[2],
+        StreamEvent::BlockDone(AssistantBlock::Thinking { thinking, signature })
+            if thinking == "raw thinking" && signature.is_empty()
+    ));
+    assert!(matches!(
+        &ok[3],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::EndTurn,
+            ..
+        }
+    ));
+    assert_eq!(ok.len(), 4);
+}
+
+/// Opening a part on its first delta did not make the index a free-for-all: a
+/// delta on an index the final array does not account for still fails closed at
+/// the item boundary, which is where the guarantee lives.
+#[tokio::test]
+async fn a_reasoning_delta_on_an_unaccounted_index_still_fails_closed() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs_1", "content": [], "summary": []
+            }}),
+            json!({"type": "response.reasoning_text.delta", "output_index": 0,
+                "item_id": "rs_1", "content_index": 1, "delta": "raw thinking"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs_1", "summary": [],
+                "content": [{"type": "reasoning_text", "text": "raw thinking"}]
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    let error = events.into_iter().find_map(|e| e.err()).unwrap();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert_eq!(
+        error.to_string(),
+        "provider protocol error: openai-responses reasoning part indices were not dense"
+    );
+}
+
 /// A gateway's `keepalive` heartbeat, on the real wire shape, is skipped like
 /// `codex.*`. It arrives while the model is still thinking — the more thinking,
 /// the more of them — so a high reasoning effort makes it the norm, not an edge

@@ -23,7 +23,7 @@
 "crates/core/src/tools/mod.rs" = 1211
 "crates/core/src/tools/subagent.rs" = 923
 "crates/mcp/src/lib.rs" = 884
-"crates/provider/src/responses.rs" = 1161
+"crates/provider/src/responses.rs" = 1158
 "crates/server/src/lib.rs" = 1910
 "crates/tui/src/app.rs" = 1584
 "crates/tui/src/lib.rs" = 925

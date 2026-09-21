@@ -3398,15 +3398,16 @@ cargo run -- --mock
 # response, and 1 MiB per unfinished SSE frame. Anthropic requires message_stop;
 # Responses requires response.completed/incomplete; Chat requires finish_reason
 # ([DONE] only ends the transport). Complete frames and EOF residuals are strict
-# UTF-8; malformed JSON, unknown semantic events, unclosed output items/parts,
-# missing final tool identity, and non-object arguments fail closed. Responses
-# message/function_call item status remains required. A reasoning item may omit
-# status on added/done (a production wire shape); when present, added must still
-# say in_progress, while done accepts completed or incomplete: a response that
-# runs out of output budget stamps incomplete on every item it emitted, including
-# byte-complete function calls, so that status describes the response and not the
-# item. Explicit null or any other value fails and names what it got, and an item
-# reporting truncation under a completed response fails closed.
+# UTF-8; malformed JSON, unknown semantic events, unclosed output items,
+# unclosed message parts, missing final tool identity, and non-object arguments
+# fail closed. Responses message/function_call item status remains required. A
+# reasoning item may omit status on added/done (a production wire shape); when
+# present, added must still say in_progress, while done accepts completed or
+# incomplete: a response that runs out of output budget stamps incomplete on
+# every item it emitted, including byte-complete function calls, so that status
+# describes the response and not the item. Explicit null or any other value
+# fails and names what it got, and an item reporting truncation under a
+# completed response fails closed.
 # The lifecycle frames (response.created/in_progress) are read for identity
 # only: their status is never consumed downstream, so a missing key or an
 # unfamiliar value there is not a violation, while the terminal frames still
@@ -3414,7 +3415,15 @@ cargo run -- --mock
 # (*_part.added) may likewise omit their text/refusal field — an opening part
 # holds nothing yet, every character arrives as a delta — but the closing .done
 # twin still requires it, since that value is compared against the accumulated
-# deltas.
+# deltas. Reasoning parts go further and need no part frames at all: one wire
+# opens every summary part but closes only the last, another streams raw
+# reasoning_text deltas on a content_index that no content_part.added ever
+# announced and closes nothing, so a reasoning part opens on whichever frame
+# addresses it first and may never be closed. What verifies that channel is the
+# item boundary — indices must be dense and each accumulated part must equal the
+# final summary/content entry at its position — so an index the server never
+# accounted for still fails, one frame later. Message parts keep both frames
+# strictly, because their opening frame is what decides text vs refusal.
 # Optional Agent/Program/Workflow string controls likewise expose the same
 # non-empty ID/metadata constraints enforced by their strict runtime parsers;
 # nullable options use null for omission, while an empty identity remains invalid.
