@@ -85,7 +85,8 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 三样,**今天一个不剩**(owner→73,依赖图→187,而 ID 只是前两个的附庸:整表覆盖不需要寻址)。
 模型**能**用这五个工具(plan 74 真实验收两条 provider 路都跑通了生命周期),难的是跨轮次
 维持一致——CRUD 要它记住 ID 和时机,整表覆盖把一致性变成一次输出的产物。
-188 第五节有**一个必须先问用户的点**(`description` 留不留),坑 1 是最易错的:
+188 第五节已定:**`description` 删掉,只留 subject**(整表覆盖每轮重发全表,8 KiB × 256
+撑不住;`task_get` 最后一点存在理由也随之没了)。坑 1 是最易错的:
 **`TaskRegistry::clear()`/`snapshot()` 不能跟着 `task_clear` 工具一起删**,
 `commands/clear.rs:16` 的 `/clear` 和 `tui/src/lib.rs:199` 在用。
 

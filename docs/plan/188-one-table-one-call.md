@@ -45,10 +45,9 @@ plan 73 记过一次实证:同一个显式 Task 生命周期,模型**一次主�
 - **没有 ID**:模型面不出现,内部也不需要(见第三节「顺带消失的三样」)。
 - **没有 blocked_by / blocks**(187 已删)、**没有 owner**(plan 73 已删)、
   **没有状态倒退约束**(187 已删,整表覆盖必须能把写错的 `completed` 改回去)。
+- **没有 `description`**(第五节,用户已拍板):一条任务就是一行标题加一个状态。
 - 上限沿用:`MAX_TASKS` 256、subject 200 字符单行。
 - 描述目标:**一个工具 < 400 字符**(现在五个合计 1597)。
-
-`description` 字段留不留见第五节,**这是开工前要问用户的点**。
 
 ## 三、删除面
 
@@ -64,6 +63,12 @@ plan 73 记过一次实证:同一个显式 Task 生命周期,模型**一次主�
 - **顺带消失的三样**:`next_id` 与 ID 高水位、epoch rollover(`create` 里那段
   「图非空 + 全完成 → 清表换代」的逻辑)、`TaskView` 这个类型。
   整表覆盖时模型直接写新表,旧表被覆盖,**rollover 天然就发生了**,不需要这个概念。
+- **`description` 的删除面**(第五节已定):`MAX_DESCRIPTION_BYTES`(19);
+  `validate_task_text`(241–256) 去掉三段 description 校验后只剩一行
+  `validate_single_line(subject, …)`,**整个函数并掉、调用点直接调 `validate_single_line`**;
+  字段 `StoredTask.description`(55)、`TaskCreateInput.description`(382)、
+  `TaskPatch.description`(388);schema 的 `required`(404)、strict key 列表(504)、
+  `required_string` 取值(508)。**TUI 零影响**——`TaskGraphTask`(70–77)本来就不带 description。
 - **`revision` 保留**:它是 TUI 的 stale fence(乱序/重复 snapshot 丢弃),和 ID 无关。
 
 ### builtin.rs — 十处 match 臂
@@ -112,16 +117,22 @@ plan 73 记过一次实证:同一个显式 Task 生命周期,模型**一次主�
 5. 187 的坑 2 同样适用:失败必须**完全不改状态**。整表覆盖天生容易做对(先全量校验、
    再一次性替换),但别写成边校验边 push。
 
-## 五、开工时定(问用户)
+## 五、`description` 删掉,只留 subject(2026-09-21 用户拍板)
 
-**`description` 字段留不留?**
+**一条任务 = 一行 subject + 一个 status。**
 
-倾向**删掉,只留 `subject`**:整表覆盖每轮重发全表,而 `description` 上限 8 KiB,
-256 条就是 2 MB 级别的表——这个形状撑不住。删掉之后 task 就是一行标题加一个状态,
-`task_get` 消失得也更自然(它存在的唯一理由就是「list 省略 description,要全文去 get」)。
+理由是整表覆盖的形状决定的:每轮重发全表,而 `description` 上限 8 KiB,
+256 条就是 MB 级的表,撑不住。删掉之后 **`task_get` 最后一点存在理由也没了**——
+它存在的唯一原因就是「`task_list` 省略 description,要全文去 `get`」。
 
-但这是**产品面收窄**:模型再不能给一条任务写详细指令。如果你要留,那 `task_write`
-的表必须限长(比如 description 降到 512 字符),不能沿用 8 KiB。
+这是**产品面收窄**,要认:模型不能再给一条任务写详细指令。判断是——
+清单的用处是「让模型和用户都看见还剩什么」,不是承载任务说明书;
+真要写详细指令,那是消息正文或 plan 文件的事,不是面板上一行。
+
+**记一笔:`subject` 从此是唯一的信息通道,上限 200 字符单行。**
+本 plan **不动这个上限**——一行标题 200 字符够用,放宽它等于把 description
+从后门放回来。若开工时发现模型频繁撞上限,那是「它在往 subject 里塞说明书」的信号,
+该在工具描述里说清楚,不是抬高数字。
 
 ## 六、不在本 plan 内
 
@@ -134,6 +145,8 @@ plan 73 记过一次实证:同一个显式 Task 生命周期,模型**一次主�
 
 - `make check` 全绿;`make mock` 跑通(demo 脚本已改)。
 - `task.rs` code 行 **< 200**(187 之后约 480,现 628)。
+- `description` 在 `task.rs` 里只作为 `ToolDef.description` 与 schema 里的字段说明
+  出现,**不再是任务的字段**;`MAX_DESCRIPTION_BYTES` 归零引用。
 - 工具定义:**1 个**,描述 **< 400 字符**(现 5 个 / 1597 字符)。
 - `grep -rn "task_create\|task_get\|task_update\|task_list\|task_clear" rust/crates/`
   只剩 `tools/mod.rs` 的 reserved 名单一处。
