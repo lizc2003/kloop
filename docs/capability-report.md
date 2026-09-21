@@ -1,16 +1,20 @@
 # kloop 能力对比报告(vs claude-code / codex)
 
-> 基线:2026-08-15,plan 1–59、61–66、68–88 已完成（plan 60/67 为编号保留/并行任务）；精确 Claude Code 2.1.220
-> parity corpus、Plan 49–58 各工具簇取证与 Plan 59 总体验收见对应计划。
+> 滚动更新,不设基线日期:**以各行自己的销账为准**(✅ + 日期 + 提交号)。
+> 头部写死一个基线会过期而没人回头看——2026-08-15 那版就写着"到 plan 88",
+> 正文却已经销账到 plan 156。精确 Claude Code 2.1.220 parity 的取证与验收见
+> Plan 48–59 各自的计划文件。
 > 用途:**补齐能力时对着本报告挑项**——每项差距标了出处、收敛强度、补齐路径与触发
 > 条件;完成后在对应行销账(标日期 + 提交号)。项目状态细节在 `docs/plan/HANDOFF.md`,
 > 参考库知识在 `refs/README.md`,本文件只管"差在哪、补不补、何时补"。
 
 ## 一、总评
 
-- **规模**:kloop 10 crate 共 ~3.1 万行 Rust;codex codex-rs ~118 万行、cc(TS
-  TS)~71 万行。kloop 用约 3% 的代码量覆盖核心引擎面——对比按"同一能力的质量"看,
-  不按面积。
+- **规模**(2026-09-21 重量):kloop 10 crate 共 **13.5 万行** Rust,其中约 7.2 万行
+  是测试(集成 1.2 万 + 单元 6.0 万)——**production 约 6.3 万行**;codex codex-rs
+  ~118 万行、cc(TS 版)~71 万行。kloop 用约 5% 的代码量覆盖核心引擎面——对比按
+  "同一能力的质量"看,不按面积。(2026-08-15 这里写的是"~3.1 万行",四十个 plan
+  之后没人回头改过。)
 - **形态完成度:约九成**。refs 标注的"必然解"收敛面全部落地,多处质量反超(见二)。
 - **差距集中三类**:①长尾纵深(每能力主干齐、cc 的兜底层缺);②平台/生态宽度(沙箱
   单平台、MCP 单传输、前端打磨);③**实战里程**(唯一抄不来的,靠 dogfood 还)。
@@ -398,6 +402,8 @@ codex 拉取式增量观察。
 | TUI grapheme / visual-row / paste-atom correctness | kloop native correctness surface | **✅ Plan 76（2026-08-11）**：strong byte ranges、whole-grapheme edit/Delete、canonical hard+soft row layout、exact-width EOL cursor、exact completion target、stable paste atom、completed-frame viewport geometry；cross-platform unit/TestBackend，real-binary PTY 仅 Unix | 已完成；本次 macOS 实跑，不外推 ConPTY/native scrollback parity |
 | server 不转发 thinking delta | — | HANDOFF 记录在案 | client 需要时 |
 | scheduled prompt 空闲投递 | kloop 原生；CC timed runtime 证据仍有 unknown | **✅ Plan 58（2026-08-03）**：TUI idle Wake、plain stdin/Inbox select、server single-flight 完整 turn；不伪造 `turnId:0` | 已完成 |
+| `--resume` 挑会话:全屏 picker 而非编号列表 | cc 单家 | **✅ Plan 162(2026-09-18)**:全屏卡片 + 输入即搜 + `↑↓`/Enter/Esc;底部那排(跨项目/分支/worktree/预览/重命名)未做 | 已完成 |
+| 选 provider / model / effort 的统一入口 | cc 有 `/model`;codex 有 profile 切换 | **✅ Plan 159(2026-09-17)**:picker 补第三级 effort,新 `/model` 入口,三个命令按起始层级分工 | 已完成 |
 | vim mode / 主题 / statusline | cc 单家 | 不立 | 定位外 |
 
 ### 14. headless / 脚本化——✅
@@ -452,3 +458,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 - 新回源发现改变收敛强度时(如教训 32 的否定断言翻转):当行更新并注日期。
 - 本报告与 HANDOFF 分工:HANDOFF 记"已有什么、怎么实现的",本报告记"缺什么、
   何时补";能力落地后细节归 HANDOFF,本报告只留销账行。
+- **2026-09-21 对齐 plan 157–175**:这一批多数是 dogfood 驱动的设计修正与轨道
+  稳健性(config 字段审计、effort 单旋钮、凭证收口、chat/responses 三次线上报错、
+  Makefile),**不对应本报告的任何差距行**——它们不是"参考项目有而 kloop 缺"。
+  真正销掉的只有两条,都在第 13 节(Plan 162 的 resume picker、Plan 159 的三级选择器)。
