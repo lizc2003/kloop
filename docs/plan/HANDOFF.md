@@ -105,7 +105,7 @@ TUI 面板不再标注 blocker、pending 不再分两组。`make check` 全绿,`
 字段名不同,strict parser 会拒)。全仓 "task graph" 措辞一并改成 "todo list"。
 **机械改名误伤了 `Item::SubAgent`/`Cell::Agent`/`BackgroundTask`/`tokio::task`,见教训 160。**
 
-**同日第三次提交:兼容包袱全删**(用户「代码删干净,不要兼容」)。`reject_unavailable` 的三条
+**同日第三次提交 `019660f`:兼容包袱全删**(用户「代码删干净,不要兼容」)。`reject_unavailable` 的三条
 改名指引(`task`/`wait`/`kill_bash`)、`bash` 的 `run_in_background` 改名提示(两处重复)、
 `reserved_names()` 里的八个退役名、以及只为它们存在的测试,一起删。现在**退役名一律
 `unknown tool: <name>`**,MCP 服务器可以叫 `task_create`。保留的三样别顺手删:
