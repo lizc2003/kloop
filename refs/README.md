@@ -12,6 +12,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **CodeWhale** | `refs/codewhale`(本地克隆,固定 `b494236312ef3ac36489c83706a0b11ab73935a1`) | 本地 agent 平台的控制面。重点看 provider stream guard、runtime event `seq`/replay、tool preparation/resource claim、subagent lifecycle、context no-follow、MCP/Skills catalog budget 与 loopback Web bootstrap；不照搬巨型 TUI runtime、多套协议/MCP 面或未接通的 Fleet/remote scaffold |
 | **grok-build** | `refs/grok-build`(xAI 官方,固定 `37949780c144e37df692e3d669051a21fec24f20`;其 `SOURCE_REV` 指向上游 monorepo `c4ea71cf`) | **同语言同形态的第二个生产参考**(175 万行 Rust,与 codex 同量级)。重点看 PTY harness 分层(`xai-grok-pager-pty-harness`,4 万行:真 PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务)、`xai-codebase-graph`(tree-sitter 符号索引 + 增量重建 + mmap)、`xai-hunk-tracker`(agent/外部改动归因)、`xai-fast-worktree`(CoW + BTRFS O(1) 快照)、hooks 的 16 事件 macro 表驱动、permission 的 `bash_command_splitting`/`exec_risk`/`managed_policy`、`xai-sqlite-journal` 的 NFS 教训;不抄 hub/computer-hub 远程 workspace 面、plugin-marketplace、voice/announcements/mixpanel 遥测 |
 | **deepseek-harness** | `refs/deepseek-harness`(DeepSeek 官方,固定 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`) | **唯一非 Rust 参考**(79 万行 TS),代码不可移植,价值全在边界语义:沙箱 fail-closed(`SANDBOX_UNAVAILABLE` / full-partial 强制等级 / 被拒后申请更宽一档)、spill 三层(失败退回内联)、guard(重复调用 advisory、cooperative 超时)、session-query(cwd 完全相同才允许跨会话)、session 格式迁移链。**不抄 Cordis「万物皆插件」+ profile/bundle/patch 组合**——kloop 是单体 Rust,那会把编译期检查换成运行期装配 |
+| **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留三条:① 项目级 hook 的信任/准入模型(→ plan 176);② 文件体积棘轮的机制(→ plan 177);③ microcompact 的一份具体取值。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -546,6 +547,54 @@ capture 的授权。应在可丢弃副本运行，或比较 normalized 后恢复
 `docs/plan/59-tool-parity-acceptance.md`、`docs/plan/61-file-tool-correctives.md` 与
 `docs/plan/62-windows-shell-tools.md`。Plan 59 的通过只产生上述受限行为兼容结论，不产生
 “全工具已对齐”或“可替换 Claude Code”的产品声明。
+
+## ZCode 固定源码调研与即刻退休(2026-09-21)
+
+基线固定为 `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;
+仓库只有两个 commit——`Initial commit` 与 `feat: open source`,是一次性开源的内部代码)。
+agent 运行时在 `apps/zcode-cli`,约 28.9 万行 TS(core 9.6 万 / bootstrap 6.4 万 /
+adapters 5.2 万 / contracts 2.1 万 / dynamic-workflow 2.0 万 / tui 1.4 万 / cli 1.0 万)。
+**读完即退休**:结论全部固化在本节与 plan 176/177,本地 clone(126 MB)可删。它是公开仓库,
+要回源重新 clone 即可——**这一点与 claw-code 不同,所以本节照常写 `file:line`**。
+
+**先看它开源时剥掉了什么,再谈参考价值。** 这是本轮最该留下的方法,下面四条里有三条是这么发现的:
+
+- **测试全没了**。整仓 4 个测试文件 631 行,`apps/zcode-cli` 下 **0 个**,而它自己的
+  `apps/zcode-cli/AGENTS.md` 写着"测试 case 很关键"。**不能当行为对照语料**——读别人的
+  边界回归测试是 kloop 用 refs 的主要方式之一,这条直接归零。
+- **没有 OS 沙箱**。`sandbox-exec|seatbelt|landlock|bubblewrap` 在整个 agent 运行时零命中;
+  它的 `NOTICE.md` 自认"当前共享 Agent 执行适配器不提供默认的操作系统沙箱"。kloop 的
+  Linux/Windows 沙箱缺口在这里一无所获,仍然对着 codex 补(见上面 2026-09-15 节)。
+  顺带记一个对照:它默认 `build` 权限模式,`--prompt` 非交互默认 **`yolo`**。
+- **provider/wire 被掏空**。`adapters/src/provider/index.ts` 是 `export {}`,模型调用实际走
+  Vercel AI SDK(`@ai-sdk/anthropic` + `@ai-sdk/openai-compatible`,各打了一个 patch)。
+  kloop 的双轨 provider + 三线协议是反超点,这里没有对照物。
+- **两个 placeholder**:`packages/zcode-cua` 整包 fail-closed(README 自述 "ships without
+  Computer Use"),`apps/zcode-cli/packages/swift-bridge` 是 20 行 TODO 桩。macOS 原生能力没有。
+
+**留下的三条:**
+
+1. **项目级 hook 的信任与准入 → `docs/plan/176-workspace-hook-trust.md`(条件 plan)。**
+   两级 digest(bundle / 单条声明)、七个状态 + 一张 `STATE_ADMISSION_MAP` 钉死准入三元组、
+   槽位比对判 `stale_digest`(信任过这个位置上的那条,它的内容变了)、policy 三模式带修订号、
+   评估顺序里的 fail-closed(信任库损坏判 blocked,而不是当空库再问一遍)。kloop 的 hooks
+   只从 `~/.kloop/config.toml` 读,这个口子还没开,所以是条件 plan。
+2. **文件体积棘轮的机制 → `docs/plan/177-file-size-ratchet.md`。** 可移植的是
+   `architecture-policy.yaml` + `.architecture-baseline.json` + 只卡增量 + CI 从不自动刷
+   baseline 这套**机制**;它的模块/分层规则不抄——crate 之间的依赖 Cargo 编译期已经强制,
+   `domain/app/adapters` 在 kloop 没有对应概念,强加会造出假边界。
+3. **microcompact 的一份具体取值**(`apps/zcode-cli/packages/core/src/compact/microcompact.ts`,
+   282 行):保留最近 5 条 tool result、阈值 ratio 0.9 + buffer 2000 token、闲置 60 分钟也触发、
+   预计省不到 256 token 就不做、可压缩工具白名单(Read/Bash/Grep/Glob/WebFetch/WebSearch/
+   Edit/Write/ApplyPatch)、清掉的结果换成固定占位串。已并进 `docs/capability-report.md` 的
+   microcompaction 行。**信号强度要打折**:ZCode 大量对标 cc(Skills/Plugins/marketplace、
+   Explore + general-purpose 子 agent、工具同名),它与 cc 收敛不算独立双家。
+
+**看着新、但判不适用的一条**:`dynamic-workflow`(1.99 万行)——主 agent 写 TS 脚本,编译器
+用 TypeScript compiler API 做 typecheck、`ask<T>` → JSON Schema 合成、污点分析定点,再投影出
+因果图 / 控制流图 / hand-off 图与 mermaid。这条路线六个既有参考都没有,但整套建在 TS 编译器上,
+Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行期路线。作为"编排能否
+静态验证"的阅读材料可以,**不作补齐来源**。
 
 ## 调研结论(三轮调研的浓缩)
 
