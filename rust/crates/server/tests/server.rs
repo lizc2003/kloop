@@ -2538,14 +2538,20 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// Task tools use the ordinary toolCall lifecycle; the native wire has no
+/// `task_write` uses the ordinary toolCall lifecycle; the native wire has no
 /// task-board or retired todo item type.
+///
+/// Per-thread registry isolation was pinned here while a write returned a
+/// per-registry ID. Plan 188 made every call a whole-table overwrite, so the
+/// result is the table the caller just sent whether or not the registry is
+/// shared — the property is no longer observable from the wire, and the core
+/// registry test is what pins it now.
 #[tokio::test]
-async fn task_create_surfaces_as_an_ordinary_tool_call() {
-    let dirs = test_dirs("task-create");
-    let input = json!({"subject":"Parse","description":"Parse the input"});
+async fn task_write_surfaces_as_an_ordinary_tool_call() {
+    let dirs = test_dirs("task-write");
+    let input = json!({"tasks":[{"subject":"Parse","status":"in_progress"}]});
     let turns = vec![
-        vec![tool_use("t1", "task_create", input.clone())],
+        vec![tool_use("t1", "task_write", input.clone())],
         vec![text("done")],
     ];
     let mut client = start_server(factory(turns, dirs.offload.clone(), false), &dirs);
@@ -2577,7 +2583,7 @@ async fn task_create_surfaces_as_an_ordinary_tool_call() {
         .iter()
         .filter(|message| {
             message["params"]["item"]["type"] == "toolCall"
-                && message["params"]["item"]["name"] == "task_create"
+                && message["params"]["item"]["name"] == "task_write"
         })
         .collect::<Vec<_>>();
     assert_eq!(calls.len(), 2, "started and completed toolCall: {log:?}");
@@ -2585,71 +2591,9 @@ async fn task_create_surfaces_as_an_ordinary_tool_call() {
     assert_eq!(calls[0]["params"]["item"]["input"], input);
     assert_eq!(calls[1]["method"], "item/completed");
     assert_eq!(calls[1]["params"]["item"]["status"], "completed");
-    assert!(
-        calls[1]["params"]["item"]["output"]
-            .as_str()
-            .is_some_and(|output| output.contains("\"id\":\"1\""))
-    );
-
-    client.shutdown().await;
-    let _ = std::fs::remove_dir_all(&dirs.root);
-}
-
-#[tokio::test]
-async fn task_graph_is_isolated_per_server_thread() {
-    let dirs = test_dirs("task-thread-isolation");
-    let turns = vec![
-        vec![tool_use(
-            "t1",
-            "task_create",
-            json!({"subject":"Thread task","description":"must stay local"}),
-        )],
-        vec![text("done")],
-    ];
-    let mut client = start_server(factory(turns, dirs.offload.clone(), false), &dirs);
-    client.initialize().await;
-    client.request("thread/start", json!({})).await;
-    let first = client.recv().await["result"]["thread"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    client.request("thread/start", json!({})).await;
-    let second = client.recv().await["result"]["thread"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    client
-        .request("turn/start", json!({"threadId":first,"input":"create"}))
-        .await;
-    client
-        .request("turn/start", json!({"threadId":second,"input":"create"}))
-        .await;
-    let mut completed = 0;
-    let log = client
-        .recv_until(|message| {
-            if message["method"] == "turn/completed" {
-                completed += 1;
-            }
-            completed == 2
-        })
-        .await;
-    for thread_id in [&first, &second] {
-        let output = log
-            .iter()
-            .find(|message| {
-                message["method"] == "item/completed"
-                    && message["params"]["threadId"] == *thread_id
-                    && message["params"]["item"]["name"] == "task_create"
-            })
-            .and_then(|message| message["params"]["item"]["output"].as_str())
-            .unwrap_or_else(|| panic!("missing task_create completion for {thread_id}: {log:?}"));
-        let output: Value = serde_json::from_str(output).unwrap();
-        assert_eq!(
-            output["task"]["id"], "1",
-            "each server thread owns a fresh registry"
-        );
-    }
+    let output: Value =
+        serde_json::from_str(calls[1]["params"]["item"]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(output, input);
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);

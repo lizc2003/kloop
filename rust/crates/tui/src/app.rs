@@ -2132,7 +2132,6 @@ mod tests {
         TaskGraphSnapshot {
             revision,
             tasks: vec![kloop_core::tools::TaskGraphTask {
-                id: "1".into(),
                 subject: subject.into(),
                 status: kloop_core::tools::TaskStatus::Pending,
             }],

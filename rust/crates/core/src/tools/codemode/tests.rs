@@ -1249,11 +1249,7 @@ fn program_surface_excludes_agent_and_task_control_tools() {
         "stop_bash",
         "send_message",
         "list_agents",
-        "task_create",
-        "task_get",
-        "task_update",
-        "task_list",
-        "task_clear",
+        "task_write",
     ] {
         assert!(
             !names.iter().any(|name| name == excluded),

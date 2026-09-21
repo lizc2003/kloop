@@ -154,3 +154,57 @@ plan 73 记过一次实证:同一个显式 Task 生命周期,模型**一次主�
 - DESIGN.md **2243–2295 整段重写**(不是追加):五工具 → 一工具、ID/rollover/高水位
   三段删掉、`todo_write` 那句的措辞要改——**它现在说「不做 alias、同步或迁移」,
   而本条等于回到它的形状,得把这段历史讲对**。2865–2895 对照差异段同步。
+
+## 八、完成记录(2026-09-21,提交 fb1fb39)
+
+**已落地。** 删除面按第三节执行完毕,验收逐条核对:
+
+| 验收项 | 目标 | 实际 |
+|---|---|---|
+| `make check` | 全绿 | ✅ fmt + clippy + 1600 test |
+| `make mock` | 跑通 | ✅ demo 两轮改成写表 / 重写同一张表 |
+| `task.rs` code 行 | < 200 | **197**(187 之后 424) |
+| 工具定义数 | 1 | **1**(`task_write`) |
+| 工具描述字符 | < 400 | **241**(原五个合计 1597) |
+| `builtin::ALL` 长度 | −4 | **36 → 32**,`builtin_all_is_complete` 守住 |
+| `description` 作为任务字段 | 0 | ✅ `MAX_DESCRIPTION_BYTES` 已删,零引用 |
+
+工具形状:`{"tasks":[{"subject","status"}]}`,`subject` 与 `status` **都必填**——
+整表覆盖本来就要求模型重述每一行的状态,让 status 可省而默认 pending,等于给
+「忘了写」准备一条静默回退路径。
+
+### 与 plan 预期不同的四处
+
+1. **五个退役名不止进 reserved,还进了断言。** 验收原文写「grep 只剩 `tools/mod.rs`
+   一处」,实际是五处:reserved 名单本身、它的 `reserved_name_tests`、`task.rs` 的
+   「退役工具不可调用」测试、以及 plan52 原生报告的 `retired_tool_gate`。判据同 187:
+   **名字没了,断言它没了的测试留着**——reserved 这件事只有被断言才不会烂掉。
+2. **server 的 `task_graph_is_isolated_per_server_thread` 删了。** 它靠「每个线程都拿到
+   ID `1`」证明 registry 不共享;整表覆盖之后,**共享与不共享返回的是同一张表**
+   (调用方刚发的那张),这条性质从工具面**不再可观测**。没有把它改写成一条永远为真的
+   断言,而是删掉并在 `task_write_surfaces_as_an_ordinary_tool_call` 的文档注释里
+   写明它去哪了;线程级 Config 隔离另有 `thread_start_resolves_per_thread_cwd_and_model`
+   和 `parallel_threads_do_not_cross_streams`,registry 独立性由 core 单测钉住。
+3. **`BASE_SYSTEM` 顺带改了一句**(`context.rs:119-121`)。原文是「track the work with
+   the task tools and keep their state current」,工具只剩一个,复数就是错的。只改了这
+   半句为 `task_write` 并点明「每次重写整张表」;**「never as a round of their own」那半句
+   留给 plan 190**——190 第六节已经写明它管的是更新不是开列,要连回灌一起改。
+4. **`concurrency_safe` 从「Get/List 安全、其余不安全」收成一条 false。** 没有只读的
+   task 工具了,整张表的写入必须串行。`readonly`(权限面)仍是 true:改的只有会话内存。
+
+### `make parity`(本机语料,教训 156 的第二次实践)
+
+红了,原因与 187 同:static-evidence 把行号区间钉进 `task.rs`(1190 → 702 行)和
+`plan52_parity_tests.rs`;验证器另有一整段硬断言旧报告结构(`task_schemas` 五个 schema、
+`task_graph` 的 blocker/rollover/high-water、`owner_field_gate`、`child_task_gate` 数组)。
+已当场改完:行号重新对齐、原生报告断言改成整表写入的五个场景(首写/重写/同表重写不发
+快照/空数组清空/strict 拒绝)、负向探针重写成七条(伪造 owner schema、缺 schema、child
+catalog 提权、child 运行时绕过、事件乱序、无变化却发快照、**发出的快照与返回的表不一致**
+——整表版的「非原子」、接受退役字段、复活退役工具名),matrix 的四条 CC 行与那条
+kloop-only 行改指 `task_write` 后重新生成。`make parity` 全绿。
+**这些改动全在 `refs/` 语料里,被 `.gitignore` 排除,不在版本控制中,没有对应提交。**
+
+### 下一条
+
+第六节那条「缺 reminder」已立为 **plan 190**,现在是它最该做的时候:整表覆盖的价值
+全靠「模型知道当前表长什么样」兑现,而这次之后回灌的内容正好是一行标题加一个状态。

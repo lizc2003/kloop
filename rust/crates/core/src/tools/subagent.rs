@@ -2026,24 +2026,21 @@ mod tests {
         let provider = Provider::mock(vec![
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
-                name: "task_update".into(),
-                input: json!({
-                    "task_id": "1",
-                    "status": "completed"
-                }),
+                name: "task_write".into(),
+                input: json!({"tasks":[{"subject":"root task","status":"completed"}]}),
             }],
             vec![AssistantBlock::Text {
                 text: "sub done".into(),
             }],
         ]);
         let ctx = with_provider(test_ctx(0, "root-task-foreground"), provider);
-        let (created, is_error) = run_tool(
-            "task_create",
-            json!({"subject":"root task","description":"child reports work"}),
+        let (written, is_error) = run_tool(
+            "task_write",
+            json!({"tasks":[{"subject":"root task","status":"pending"}]}),
             &ctx,
         )
         .await;
-        assert!(!is_error, "{created}");
+        assert!(!is_error, "{written}");
 
         let results = dispatch_tools(
             vec![("t1".into(), "run_agent".into(), json!({"prompt": "go"}))],
@@ -2059,22 +2056,28 @@ mod tests {
             }
         );
 
-        let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
-        assert!(!is_error, "{task}");
-        let task: Value = serde_json::from_str(&task).unwrap();
-        assert!(task["task"].get("owner").is_none());
-        assert_eq!(task["task"]["status"], "pending");
+        assert_eq!(
+            ctx.cfg.tasks.snapshot().tasks,
+            vec![crate::tools::TaskGraphTask {
+                subject: "root task".into(),
+                status: crate::tools::TaskStatus::Pending,
+            }]
+        );
 
         let (updated, is_error) = run_tool(
-            "task_update",
-            json!({"task_id":"1","status":"completed"}),
+            "task_write",
+            json!({"tasks":[{"subject":"root task","status":"completed"}]}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{updated}");
-        let updated: Value = serde_json::from_str(&updated).unwrap();
-        assert!(updated["task"].get("owner").is_none());
-        assert_eq!(updated["task"]["status"], "completed");
+        assert_eq!(
+            ctx.cfg.tasks.snapshot().tasks,
+            vec![crate::tools::TaskGraphTask {
+                subject: "root task".into(),
+                status: crate::tools::TaskStatus::Completed,
+            }]
+        );
     }
 
     /// A background child has the same result-only contract: forged task calls
@@ -2084,24 +2087,21 @@ mod tests {
         let provider = Provider::mock(vec![
             vec![AssistantBlock::ToolUse {
                 id: "s1".into(),
-                name: "task_update".into(),
-                input: json!({
-                    "task_id":"1",
-                    "status":"completed"
-                }),
+                name: "task_write".into(),
+                input: json!({"tasks":[{"subject":"root task","status":"completed"}]}),
             }],
             vec![AssistantBlock::Text {
                 text: "background task done".into(),
             }],
         ]);
         let ctx = with_provider(test_ctx(0, "root-task-background"), provider);
-        let (created, is_error) = run_tool(
-            "task_create",
-            json!({"subject":"root task","description":"background child reports work"}),
+        let (written, is_error) = run_tool(
+            "task_write",
+            json!({"tasks":[{"subject":"root task","status":"pending"}]}),
             &ctx,
         )
         .await;
-        assert!(!is_error, "{created}");
+        assert!(!is_error, "{written}");
         let (started, is_error) = run_tool(
             "run_agent",
             json!({"prompt":"report task 1 result","background":true}),
@@ -2113,11 +2113,13 @@ mod tests {
             run_tool("wait_for_activity", json!({"timeout_ms":10_000}), &ctx).await;
         assert!(!is_error, "{waited}");
 
-        let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &ctx).await;
-        assert!(!is_error, "{task}");
-        let task: Value = serde_json::from_str(&task).unwrap();
-        assert!(task["task"].get("owner").is_none());
-        assert_eq!(task["task"]["status"], "pending");
+        assert_eq!(
+            ctx.cfg.tasks.snapshot().tasks,
+            vec![crate::tools::TaskGraphTask {
+                subject: "root task".into(),
+                status: crate::tools::TaskStatus::Pending,
+            }]
+        );
         let delivered = ctx.cfg.inbox.drain();
         assert_eq!(delivered.len(), 1);
         assert!(
@@ -2128,15 +2130,19 @@ mod tests {
         );
 
         let (updated, is_error) = run_tool(
-            "task_update",
-            json!({"task_id":"1","status":"completed"}),
+            "task_write",
+            json!({"tasks":[{"subject":"root task","status":"completed"}]}),
             &ctx,
         )
         .await;
         assert!(!is_error, "{updated}");
-        let updated: Value = serde_json::from_str(&updated).unwrap();
-        assert!(updated["task"].get("owner").is_none());
-        assert_eq!(updated["task"]["status"], "completed");
+        assert_eq!(
+            ctx.cfg.tasks.snapshot().tasks,
+            vec![crate::tools::TaskGraphTask {
+                subject: "root task".into(),
+                status: crate::tools::TaskStatus::Completed,
+            }]
+        );
     }
 
     /// Fire-and-forget: run_agent {background:true} returns a "started" message

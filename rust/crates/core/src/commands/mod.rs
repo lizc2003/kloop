@@ -652,8 +652,8 @@ mod tests {
         let mut task_ctx = crate::tools::testutil::test_ctx(0, "command-clear");
         task_ctx.cfg = Arc::clone(&cfg);
         let (output, is_error) = crate::tools::testutil::run_tool(
-            "task_create",
-            serde_json::json!({"subject":"leftover","description":"clear me"}),
+            "task_write",
+            serde_json::json!({"tasks":[{"subject":"leftover","status":"pending"}]}),
             &task_ctx,
         )
         .await;
@@ -680,13 +680,7 @@ mod tests {
             )
         );
         assert!(history.messages().is_empty());
-        let (tasks, is_error) =
-            crate::tools::testutil::run_tool("task_list", serde_json::json!({}), &task_ctx).await;
-        assert!(!is_error, "{tasks}");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&tasks).unwrap(),
-            serde_json::json!({"tasks": []})
-        );
+        assert!(task_ctx.cfg.tasks.snapshot().tasks.is_empty());
         assert!(cfg.inbox.is_empty());
     }
 

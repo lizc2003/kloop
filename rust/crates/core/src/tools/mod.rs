@@ -561,6 +561,11 @@ fn reserved_names() -> &'static std::collections::HashSet<String> {
                         "wait",
                         "kill_bash",
                         "todo_write",
+                        "task_create",
+                        "task_get",
+                        "task_update",
+                        "task_list",
+                        "task_clear",
                     ]
                     .into_iter()
                     .map(String::from),
@@ -1591,11 +1596,7 @@ fn execute_tool<'a>(
                 )
                 .await
             }
-            Builtin::TaskCreate => task::task_create_tool(input, ctx),
-            Builtin::TaskGet => task::task_get_tool(input, ctx),
-            Builtin::TaskUpdate => task::task_update_tool(input, ctx),
-            Builtin::TaskList => task::task_list_tool(input, ctx),
-            Builtin::TaskClear => task::task_clear_tool(input, ctx),
+            Builtin::TaskWrite => task::task_write_tool(input, ctx),
             Builtin::Skill => skill::skill_tool(input, ctx, workspace).await,
             Builtin::ToolSearch => tool_search::tool_search_tool(input, ctx, workspace).await,
             // Only malformed envelopes reach this arm — well-formed ones were
@@ -2084,7 +2085,17 @@ mod reserved_name_tests {
         }
 
         // Retired built-ins: a resumed transcript can still name them.
-        for name in ["task", "wait", "kill_bash", "todo_write"] {
+        for name in [
+            "task",
+            "wait",
+            "kill_bash",
+            "todo_write",
+            "task_create",
+            "task_get",
+            "task_update",
+            "task_list",
+            "task_clear",
+        ] {
             assert!(
                 reserved.contains(name),
                 "retired tool '{name}' is not reserved"
@@ -2732,11 +2743,7 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "task_create",
-                "task_get",
-                "task_update",
-                "task_list",
-                "task_clear",
+                "task_write",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2787,11 +2794,7 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "task_create",
-                "task_get",
-                "task_update",
-                "task_list",
-                "task_clear",
+                "task_write",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -2814,16 +2817,7 @@ mod tests {
         // The whole background-agent surface, not just its spawn tool: listing
         // only `run_agent` here is how `stop_agent` and `wait_for_activity`
         // went unnoticed on the execution side for as long as they did.
-        for root_only in [
-            "run_agent",
-            "wait_for_activity",
-            "stop_agent",
-            "task_create",
-            "task_get",
-            "task_update",
-            "task_list",
-            "task_clear",
-        ] {
+        for root_only in ["run_agent", "wait_for_activity", "stop_agent", "task_write"] {
             assert!(root.iter().any(|name| name == root_only), "{root_only}");
             assert!(!child.iter().any(|name| name == root_only), "{root_only}");
         }
@@ -2940,11 +2934,7 @@ mod tests {
                 "notebook_edit",
                 "grep",
                 "glob",
-                "task_create",
-                "task_get",
-                "task_update",
-                "task_list",
-                "task_clear",
+                "task_write",
                 "send_message",
                 "list_agents",
                 "run_agent",
@@ -3528,73 +3518,59 @@ mod tests {
         assert!(!out.contains("not available to this agent type"), "{out}");
     }
 
-    /// A child cannot gain root Task graph capability through an explicit custom
+    /// A child cannot gain the root task list through an explicit custom
     /// allowlist, a forged call, or the deferred call_tool envelope.
     #[tokio::test]
     async fn child_task_calls_fail_before_the_registry_even_when_allowlisted() {
         let root = test_ctx(0, "root-task-gate");
-        let (created, is_error) = run_tool(
-            "task_create",
-            json!({"subject":"root work","description":"owned by root"}),
+        let (written, is_error) = run_tool(
+            "task_write",
+            json!({"tasks":[{"subject":"root work","status":"pending"}]}),
             &root,
         )
         .await;
-        assert!(!is_error, "{created}");
+        assert!(!is_error, "{written}");
 
-        let task_tools = [
-            "task_create",
-            "task_get",
-            "task_update",
-            "task_list",
-            "task_clear",
-        ];
         let mut cfg = root.cfg.test_clone();
         cfg.tool_allowlist = Some(Arc::new(
-            task_tools.into_iter().map(str::to_string).collect(),
+            ["task_write"].into_iter().map(str::to_string).collect(),
         ));
         let child = ToolCtx {
             cfg: Arc::new(cfg),
             depth: 1,
             ..root.clone()
         };
-        for (name, input) in [
-            (
-                "task_create",
-                json!({"subject":"forged","description":"must not exist"}),
-            ),
-            ("task_get", json!({"task_id":"1"})),
-            ("task_update", json!({"task_id":"1","status":"completed"})),
-            ("task_list", json!({})),
-            ("task_clear", json!({})),
+        for input in [
+            json!({"tasks":[{"subject":"forged","status":"pending"}]}),
+            json!({"tasks":[]}),
         ] {
-            let (output, is_error) = run_tool(name, input, &child).await;
-            assert!(is_error, "{name}: {output}");
+            let (output, is_error) = run_tool("task_write", input, &child).await;
+            assert!(is_error, "{output}");
             assert_eq!(
                 output,
-                format!("tool '{name}' is only available to the root agent")
+                "tool 'task_write' is only available to the root agent"
             );
         }
         let (output, is_error) = run_tool(
             "call_tool",
-            json!({"tool_name":"task_list","params":{}}),
+            json!({"tool_name":"task_write","params":{"tasks":[]}}),
             &child,
         )
         .await;
         assert!(is_error, "{output}");
         assert_eq!(
             output,
-            "tool 'task_list' is only available to the root agent"
+            "tool 'task_write' is only available to the root agent"
         );
 
-        let (task, is_error) = run_tool("task_get", json!({"task_id":"1"}), &root).await;
-        assert!(!is_error, "{task}");
-        let task: Value = serde_json::from_str(&task).unwrap();
-        assert_eq!(task["task"]["status"], "pending");
-        assert!(task["task"].get("owner").is_none());
-        let (listed, is_error) = run_tool("task_list", json!({}), &root).await;
-        assert!(!is_error, "{listed}");
-        let listed: Value = serde_json::from_str(&listed).unwrap();
-        assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+        // The child shares the Arc; what it never reaches is the registry.
+        assert_eq!(
+            root.cfg.tasks.snapshot().tasks,
+            vec![crate::tools::TaskGraphTask {
+                subject: "root work".into(),
+                status: crate::tools::TaskStatus::Pending,
+            }]
+        );
     }
 
     /// The recurrence guard. Whatever a builder would leave out of the request,
@@ -3642,10 +3618,10 @@ mod tests {
                 checked += 1;
             }
         }
-        // 8 root-only controls, plus 13 surface-gated tools refused twice —
+        // 4 root-only controls, plus 13 surface-gated tools refused twice —
         // once for the depth, once for the front-end. A gate table that stopped
         // naming them would pass every assertion above without running one.
-        assert_eq!(checked, 8 + 13 * 2);
+        assert_eq!(checked, 4 + 13 * 2);
     }
 
     #[cfg(unix)]
@@ -3664,7 +3640,7 @@ mod tests {
                     "-c".into(),
                     format!("printf ran > '{}'", marker.display()),
                 ],
-                matcher: Some("task_list".into()),
+                matcher: Some("task_write".into()),
                 timeout_ms: crate::hooks::DEFAULT_TIMEOUT_MS,
             }],
         });
@@ -3673,11 +3649,11 @@ mod tests {
             ..base
         };
 
-        let (output, is_error) = run_tool("task_list", json!({}), &child).await;
+        let (output, is_error) = run_tool("task_write", json!({"tasks": []}), &child).await;
         assert!(is_error, "{output}");
         assert_eq!(
             output,
-            "tool 'task_list' is only available to the root agent"
+            "tool 'task_write' is only available to the root agent"
         );
         assert!(!marker.exists(), "pre-tool hook ran before the root gate");
     }
@@ -4107,17 +4083,7 @@ mod tests {
             "stop_bash",
             &json!({"bash_id": "bg-1"})
         ));
-        assert!(is_concurrency_safe("task_get", &json!({"task_id":"1"})));
-        assert!(is_concurrency_safe("task_list", &json!({})));
-        assert!(!is_concurrency_safe("task_clear", &json!({})));
-        assert!(!is_concurrency_safe(
-            "task_create",
-            &json!({"subject":"x","description":"y"})
-        ));
-        assert!(!is_concurrency_safe(
-            "task_update",
-            &json!({"task_id":"1","status":"completed"})
-        ));
+        assert!(!is_concurrency_safe("task_write", &json!({"tasks": []})));
         assert!(!is_concurrency_safe(
             "write_file",
             &json!({"path": "x", "content": ""})

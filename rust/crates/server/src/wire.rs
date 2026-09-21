@@ -468,7 +468,6 @@ mod tests {
         let event = Event::TaskGraphUpdated(kloop_core::tools::TaskGraphSnapshot {
             revision: 9,
             tasks: vec![kloop_core::tools::TaskGraphTask {
-                id: "4".into(),
                 subject: "Internal only".into(),
                 status: kloop_core::tools::TaskStatus::Pending,
             }],

@@ -54,7 +54,7 @@ fn mock_headless_text_keeps_answer_on_stdout() {
     );
     assert!(!stderr.contains("Demo complete:"));
     assert!(!stdout.contains("item/"));
-    assert!(!stdout.contains("task_create"));
+    assert!(!stdout.contains("task_write"));
 }
 
 #[test]

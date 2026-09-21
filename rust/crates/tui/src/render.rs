@@ -1384,9 +1384,8 @@ mod tests {
         )
     }
 
-    fn task(id: u64, subject: &str, status: TaskStatus) -> TaskGraphTask {
+    fn task(subject: &str, status: TaskStatus) -> TaskGraphTask {
         TaskGraphTask {
-            id: id.to_string(),
             subject: subject.into(),
             status,
         }
@@ -1406,13 +1405,13 @@ mod tests {
     #[test]
     fn task_panel_sorts_styles_and_collapses_completed() {
         let snapshot = task_graph(vec![
-            task(1, "Done one", TaskStatus::Completed),
-            task(2, "Active", TaskStatus::InProgress),
-            task(3, "Ready", TaskStatus::Pending),
-            task(4, "Next", TaskStatus::Pending),
-            task(5, "Done five", TaskStatus::Completed),
-            task(6, "Done six", TaskStatus::Completed),
-            task(7, "Done seven", TaskStatus::Completed),
+            task("Done one", TaskStatus::Completed),
+            task("Active", TaskStatus::InProgress),
+            task("Ready", TaskStatus::Pending),
+            task("Next", TaskStatus::Pending),
+            task("Done five", TaskStatus::Completed),
+            task("Done six", TaskStatus::Completed),
+            task("Done seven", TaskStatus::Completed),
         ]);
         let lines = task_panel_lines(&snapshot, 80, TASK_PANEL_MAX_ROWS);
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
@@ -1453,11 +1452,9 @@ mod tests {
     #[test]
     fn task_panel_hard_cap_preserves_accurate_group_summaries_and_width() {
         let mut tasks = (1..=12)
-            .map(|id| task(id, &format!("未完成任务{id}"), TaskStatus::Pending))
+            .map(|id| task(&format!("未完成任务{id}"), TaskStatus::Pending))
             .collect::<Vec<_>>();
-        tasks.extend(
-            (13..=17).map(|id| task(id, &format!("已完成任务{id}"), TaskStatus::Completed)),
-        );
+        tasks.extend((13..=17).map(|id| task(&format!("已完成任务{id}"), TaskStatus::Completed)));
         let snapshot = task_graph(tasks);
         let lines = task_panel_lines(&snapshot, 18, TASK_PANEL_MAX_ROWS);
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
@@ -1473,7 +1470,7 @@ mod tests {
 
         let completed_only = task_graph(
             (1..=5)
-                .map(|id| task(id, &format!("Done {id}"), TaskStatus::Completed))
+                .map(|id| task(&format!("Done {id}"), TaskStatus::Completed))
                 .collect(),
         );
         assert_eq!(
@@ -1488,7 +1485,7 @@ mod tests {
     #[test]
     fn a_finished_graph_leaves_the_chrome_and_the_footer_hint_with_the_turn() {
         let mut app = App::new("s".into());
-        app.task_graph = Some(task_graph(vec![task(1, "Done", TaskStatus::Completed)]));
+        app.task_graph = Some(task_graph(vec![task("Done", TaskStatus::Completed)]));
         let viewport = Rect::new(0, 0, 80, 24);
         assert_eq!(live_chrome_layout(&app, viewport).task_lines.len(), 1);
         assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
@@ -1507,7 +1504,7 @@ mod tests {
     fn live_chrome_hides_tasks_for_overlays_and_tiny_terminals() {
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("transcript".into()));
-        app.task_graph = Some(task_graph(vec![task(1, "Visible", TaskStatus::Pending)]));
+        app.task_graph = Some(task_graph(vec![task("Visible", TaskStatus::Pending)]));
         let normal = live_chrome_layout(&app, Rect::new(0, 0, 80, 24));
         assert_eq!(normal.task_lines.len(), 1);
         assert_eq!(normal.reserved_rows(), 1);
@@ -1603,17 +1600,16 @@ mod tests {
         app.cells.push(Cell::Assistant("history".into()));
         app.running = true;
         app.task_graph = Some(task_graph(vec![
-            task(1, "Done one", TaskStatus::Completed),
-            task(2, "Active", TaskStatus::InProgress),
+            task("Done one", TaskStatus::Completed),
+            task("Active", TaskStatus::InProgress),
             task(
-                3,
                 "需要处理一个非常非常非常非常长的中文任务标题并且还要再长一点",
                 TaskStatus::Pending,
             ),
-            task(4, "Done four", TaskStatus::Completed),
-            task(5, "Done five", TaskStatus::Completed),
-            task(6, "Done six", TaskStatus::Completed),
-            task(7, "Done seven", TaskStatus::Completed),
+            task("Done four", TaskStatus::Completed),
+            task("Done five", TaskStatus::Completed),
+            task("Done six", TaskStatus::Completed),
+            task("Done seven", TaskStatus::Completed),
         ]));
         let mut terminal = Terminal::new(TestBackend::new(50, 18)).unwrap();
         terminal
@@ -1686,7 +1682,7 @@ mod tests {
 
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("history".into()));
-        app.task_graph = Some(task_graph(vec![task(1, "Toggle me", TaskStatus::Pending)]));
+        app.task_graph = Some(task_graph(vec![task("Toggle me", TaskStatus::Pending)]));
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
 
         terminal
@@ -2391,7 +2387,7 @@ mod tests {
         assert!(activity_line(&app, &hud).is_none());
         assert!(!has_activity_line(&app));
 
-        app.task_graph = Some(task_graph(vec![task(1, "Visible", TaskStatus::Pending)]));
+        app.task_graph = Some(task_graph(vec![task("Visible", TaskStatus::Pending)]));
         assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
         app.show_task_graph = false;
         assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to show tasks"));

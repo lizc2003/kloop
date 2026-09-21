@@ -238,7 +238,7 @@ fn projected_task_events(events: &[Event], tool_name: &str) -> Vec<Value> {
             Event::TaskGraphUpdated(snapshot) => Some(json!({
                 "kind": "task_graph_updated",
                 "revision": snapshot.revision,
-                "task_ids": snapshot.tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>(),
+                "subjects": snapshot.tasks.iter().map(|task| task.subject.as_str()).collect::<Vec<_>>(),
             })),
             Event::ItemCompleted {
                 item: Item::ToolCall { name, status, .. },
@@ -487,17 +487,13 @@ async fn native_surface_report() -> Value {
     // `program` surface, which is off by default, and this report reads the
     // default surface. Its own gating is pinned by
     // `the_program_surface_gates_run_program_and_its_stop_tool`.
-    const EXPECTED_NATIVE: [&str; 8] = [
-        "run_agent",
-        "task_create",
-        "task_get",
-        "task_update",
-        "task_list",
-        "task_clear",
-        "wait_for_activity",
-        "stop_agent",
-    ];
-    const TASK_TOOLS: [&str; 5] = [
+    const EXPECTED_NATIVE: [&str; 4] =
+        ["run_agent", "task_write", "wait_for_activity", "stop_agent"];
+    // Plan 188 collapsed the five CRUD tools into one whole-table write; the
+    // names stay listed here because a resumed transcript can still carry them
+    // and the depth gate must refuse them as firmly as it refuses the live one.
+    const TASK_TOOLS: [&str; 6] = [
+        "task_write",
         "task_create",
         "task_get",
         "task_update",
@@ -556,104 +552,122 @@ async fn native_surface_report() -> Value {
         .expect("run_agent definition missing")
         .schema
         .clone();
-    let task_schemas = TASK_TOOLS
+    let task_schema = depth_zero
         .iter()
-        .map(|name| {
-            let schema = depth_zero
-                .iter()
-                .find(|def| def.name == *name)
-                .unwrap_or_else(|| panic!("{name} definition missing"))
-                .schema
-                .clone();
-            ((*name).to_string(), schema)
-        })
-        .collect::<serde_json::Map<String, Value>>();
+        .find(|def| def.name == "task_write")
+        .expect("task_write definition missing")
+        .schema
+        .clone();
 
     let task_ui = Arc::new(RecordingUi::default());
     let mut ctx = test_ctx(0, "plan52-native-surface");
     ctx.ui = task_ui.clone();
-    let mut owner_field_gate = Vec::new();
-    for (owner_kind, owner) in [("string", json!("assistant")), ("null", Value::Null)] {
-        let (result, is_error) = run_tool(
-            "task_create",
-            json!({
-                "subject":"forged owner",
-                "description":"must not create",
-                "owner": owner,
-            }),
-            &ctx,
-        )
-        .await;
-        assert!(is_error, "task_create/{owner_kind}: {result}");
-        assert!(result.contains("unknown field `owner`"), "{result}");
-        owner_field_gate.push(json!({
-            "name": "task_create",
-            "owner_kind": owner_kind,
+
+    // Every field the graph has shed — plan 73's `owner`, plan 187's
+    // `blocked_by`, plan 188's `id`/`task_id`/`description` — is rejected by
+    // name rather than ignored, so a transcript written against an older
+    // schema fails loudly instead of half-applying.
+    let mut retired_field_gate = Vec::new();
+    for (field, kind, row) in [
+        (
+            "owner",
+            "string",
+            json!({"subject":"forged","status":"pending","owner":"assistant"}),
+        ),
+        (
+            "owner",
+            "null",
+            json!({"subject":"forged","status":"pending","owner":Value::Null}),
+        ),
+        (
+            "blocked_by",
+            "array",
+            json!({"subject":"forged","status":"pending","blocked_by":["1"]}),
+        ),
+        (
+            "task_id",
+            "string",
+            json!({"subject":"forged","status":"pending","task_id":"1"}),
+        ),
+        (
+            "id",
+            "string",
+            json!({"subject":"forged","status":"pending","id":"1"}),
+        ),
+        (
+            "description",
+            "string",
+            json!({"subject":"forged","status":"pending","description":"instructions"}),
+        ),
+    ] {
+        let (result, is_error) = run_tool("task_write", json!({"tasks":[row]}), &ctx).await;
+        assert!(is_error, "task_write/{field}: {result}");
+        assert!(
+            result.contains(&format!("unknown field `{field}`")),
+            "{result}"
+        );
+        retired_field_gate.push(json!({
+            "field": field,
+            "kind": kind,
             "result": result,
             "is_error": is_error,
         }));
     }
-    let (blocker, blocker_error) = run_tool(
+
+    // And the five retired tool names are no longer callable at all.
+    let mut retired_tool_gate = Vec::new();
+    for name in [
         "task_create",
-        json!({"subject":"first","description":"finish first"}),
-        &ctx,
-    )
-    .await;
-    assert!(!blocker_error, "{blocker}");
-    let (dependent, dependent_error) = run_tool(
-        "task_create",
-        json!({
-            "subject":"second",
-            "description":"do after first"
-        }),
-        &ctx,
-    )
-    .await;
-    assert!(!dependent_error, "{dependent}");
-    let (forged_blocked_by, forged_blocked_by_error) = run_tool(
+        "task_get",
         "task_update",
-        json!({"task_id":"2","blocked_by":["1"]}),
-        &ctx,
-    )
-    .await;
-    assert!(forged_blocked_by_error, "{forged_blocked_by}");
-    assert!(
-        forged_blocked_by.contains("unknown field `blocked_by`"),
-        "{forged_blocked_by}"
-    );
-    let (complete_blocker, complete_blocker_error) = run_tool(
-        "task_update",
-        json!({"task_id":"1","status":"completed"}),
-        &ctx,
-    )
-    .await;
-    assert!(!complete_blocker_error, "{complete_blocker}");
-    let (start_dependent, start_dependent_error) = run_tool(
-        "task_update",
-        json!({"task_id":"2","status":"in_progress"}),
-        &ctx,
-    )
-    .await;
-    assert!(!start_dependent_error, "{start_dependent}");
-    for (owner_kind, owner) in [("string", json!("assistant")), ("null", Value::Null)] {
-        let (result, is_error) = run_tool(
-            "task_update",
-            json!({"task_id":"2","status":"completed","owner":owner}),
-            &ctx,
-        )
-        .await;
-        assert!(is_error, "task_update/{owner_kind}: {result}");
-        assert!(result.contains("unknown field `owner`"), "{result}");
-        owner_field_gate.push(json!({
-            "name": "task_update",
-            "owner_kind": owner_kind,
-            "result": result,
-            "is_error": is_error,
-        }));
+        "task_list",
+        "task_clear",
+    ] {
+        let (result, is_error) = run_tool(name, json!({}), &ctx).await;
+        assert!(is_error, "{name}: {result}");
+        retired_tool_gate.push(json!({"name": name, "result": result}));
     }
-    let (get_dependent, get_dependent_error) =
-        run_tool("task_get", json!({"task_id":"2"}), &ctx).await;
-    assert!(!get_dependent_error, "{get_dependent}");
+
+    let _ = task_ui.take_events();
+    let (first_write, first_write_error) = run_tool(
+        "task_write",
+        json!({"tasks":[
+            {"subject":"first","status":"in_progress"},
+            {"subject":"second","status":"pending"},
+        ]}),
+        &ctx,
+    )
+    .await;
+    assert!(!first_write_error, "{first_write}");
+    let first_write_events = projected_task_events(&task_ui.take_events(), "task_write");
+
+    // A status moving backwards, a row dropped and a row added, all in the one
+    // call that is the whole truth about the list.
+    let (rewrite, rewrite_error) = run_tool(
+        "task_write",
+        json!({"tasks":[
+            {"subject":"first","status":"completed"},
+            {"subject":"second","status":"pending"},
+            {"subject":"third","status":"pending"},
+        ]}),
+        &ctx,
+    )
+    .await;
+    assert!(!rewrite_error, "{rewrite}");
+    let rewrite_events = projected_task_events(&task_ui.take_events(), "task_write");
+
+    let (no_op, no_op_error) = run_tool(
+        "task_write",
+        json!({"tasks":[
+            {"subject":"first","status":"completed"},
+            {"subject":"second","status":"pending"},
+            {"subject":"third","status":"pending"},
+        ]}),
+        &ctx,
+    )
+    .await;
+    assert!(!no_op_error, "{no_op}");
+    let no_op_events = projected_task_events(&task_ui.take_events(), "task_write");
 
     let mut child_cfg = ctx.cfg.test_clone();
     child_cfg.tool_allowlist = Some(Arc::new(
@@ -664,83 +678,29 @@ async fn native_surface_report() -> Value {
         depth: 1,
         ..ctx.clone()
     };
-    let mut child_task_gate = Vec::new();
-    for (name, input) in [
-        (
-            "task_create",
-            json!({"subject":"forged","description":"child must not create"}),
-        ),
-        ("task_get", json!({"task_id":"2"})),
-        ("task_update", json!({"task_id":"2","status":"completed"})),
-        ("task_list", json!({})),
-        ("task_clear", json!({})),
-    ] {
-        let (result, is_error) = run_tool(name, input, &child_ctx).await;
-        assert!(is_error, "{name}: {result}");
-        assert_eq!(
-            result,
-            format!("tool '{name}' is only available to the root agent")
-        );
-        child_task_gate.push(json!({
-            "name": name,
-            "result": result,
-            "is_error": is_error,
-        }));
-    }
-    let (complete_dependent, complete_dependent_error) = run_tool(
-        "task_update",
-        json!({"task_id":"2","status":"completed"}),
-        &ctx,
+    let (child_write, child_write_error) = run_tool(
+        "task_write",
+        json!({"tasks":[{"subject":"forged","status":"pending"}]}),
+        &child_ctx,
     )
     .await;
-    assert!(!complete_dependent_error, "{complete_dependent}");
-    let (list_tasks, list_tasks_error) = run_tool("task_list", json!({}), &ctx).await;
-    assert!(!list_tasks_error, "{list_tasks}");
+    assert!(child_write_error, "{child_write}");
+    assert_eq!(
+        child_write,
+        "tool 'task_write' is only available to the root agent"
+    );
+    // The refused child call is an ordinary failed tool call on the same Ui;
+    // drop its two lifecycle events so the next scenario reads its own.
     let _ = task_ui.take_events();
-    let (description_only, description_only_error) = run_tool(
-        "task_update",
-        json!({"task_id":"2","description":"display projection unchanged"}),
-        &ctx,
-    )
-    .await;
-    assert!(!description_only_error, "{description_only}");
-    let description_only_events = projected_task_events(&task_ui.take_events(), "task_update");
 
-    let (no_op, no_op_error) = run_tool(
-        "task_update",
-        json!({"task_id":"2","description":"display projection unchanged"}),
-        &ctx,
-    )
-    .await;
-    assert!(!no_op_error, "{no_op}");
-    let no_op_events = projected_task_events(&task_ui.take_events(), "task_update");
+    let (cleared, cleared_error) = run_tool("task_write", json!({"tasks":[]}), &ctx).await;
+    assert!(!cleared_error, "{cleared}");
+    let cleared_events = projected_task_events(&task_ui.take_events(), "task_write");
 
-    let (rollover, rollover_error) = run_tool(
-        "task_create",
-        json!({"subject":"new epoch","description":"independent work"}),
-        &ctx,
-    )
-    .await;
-    assert!(!rollover_error, "{rollover}");
-    let rollover_events = projected_task_events(&task_ui.take_events(), "task_create");
-
-    let (strict_clear, strict_clear_error) =
-        run_tool("task_clear", json!({"unexpected": true}), &ctx).await;
-    assert!(strict_clear_error, "{strict_clear}");
-    let strict_clear_events = projected_task_events(&task_ui.take_events(), "task_clear");
-
-    let (clear, clear_error) = run_tool("task_clear", json!({}), &ctx).await;
-    assert!(!clear_error, "{clear}");
-    let clear_events = projected_task_events(&task_ui.take_events(), "task_clear");
-
-    let (after_clear, after_clear_error) = run_tool(
-        "task_create",
-        json!({"subject":"after clear","description":"high water survives"}),
-        &ctx,
-    )
-    .await;
-    assert!(!after_clear_error, "{after_clear}");
-    let after_clear_events = projected_task_events(&task_ui.take_events(), "task_create");
+    let (strict_write, strict_write_error) =
+        run_tool("task_write", json!({"unexpected": true}), &ctx).await;
+    assert!(strict_write_error, "{strict_write}");
+    let strict_write_events = projected_task_events(&task_ui.take_events(), "task_write");
 
     ctx.cfg
         .inbox
@@ -762,47 +722,21 @@ async fn native_surface_report() -> Value {
         "depth_one_native_tools": depth_one_tasks,
         "claude_named_tools_present": claude_present,
         "agent_schema": agent_schema,
-        "task_schemas": task_schemas,
-        "task_graph": {
-            "blocker": blocker,
-            "dependent": dependent,
-            "forged_blocked_by": {
-                "result": forged_blocked_by,
-                "is_error": forged_blocked_by_error,
-            },
-            "complete_blocker": complete_blocker,
-            "start_dependent": start_dependent,
-            "get_dependent": get_dependent,
-            "complete_dependent": complete_dependent,
-            "list": list_tasks,
-            "description_only": {
-                "result": description_only,
-                "events": description_only_events,
-            },
-            "no_op": {
-                "result": no_op,
-                "events": no_op_events,
-            },
-            "rollover": {
-                "result": rollover,
-                "events": rollover_events,
-            },
-            "strict_clear": {
-                "result": strict_clear,
-                "is_error": strict_clear_error,
-                "events": strict_clear_events,
-            },
-            "clear": {
-                "result": clear,
-                "events": clear_events,
-            },
-            "after_clear": {
-                "result": after_clear,
-                "events": after_clear_events,
+        "task_schema": task_schema,
+        "task_list": {
+            "first_write": {"result": first_write, "events": first_write_events},
+            "rewrite": {"result": rewrite, "events": rewrite_events},
+            "no_op": {"result": no_op, "events": no_op_events},
+            "cleared": {"result": cleared, "events": cleared_events},
+            "strict_write": {
+                "result": strict_write,
+                "is_error": strict_write_error,
+                "events": strict_write_events,
             },
         },
-        "owner_field_gate": owner_field_gate,
-        "child_task_gate": child_task_gate,
+        "retired_field_gate": retired_field_gate,
+        "retired_tool_gate": retired_tool_gate,
+        "child_task_gate": child_write,
         "wait_for_activity": {
             "result": wait_output,
             "pending_after_wait": pending_after_wait.into_iter().map(InboxItem::into_message).collect::<Vec<_>>(),

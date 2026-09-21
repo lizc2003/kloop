@@ -2240,83 +2240,99 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Root-owned session task graph (Plans 71–74, 187)
+## Root-owned session task list (Plans 71–74, 187, 188)
 
-The Task graph is a **session-scoped flat list of work owned by the root/main
-Agent**. Only depth 0 receives or may execute its five native snake_case Task
-tools:
+The task list is a **session-scoped flat list of work owned by the root/main
+Agent**. Only depth 0 receives or may execute its one native snake_case tool:
 
-- `task_create {subject, description}` creates a pending task and returns an
-  opaque stable ID (`"1"`, `"2"`, …). If the existing non-empty graph is entirely
-  completed, the same write transaction atomically rolls to a new epoch
-  containing only that task.
-- `task_get {task_id}` returns the full record: subject, description, status.
-- `task_update {task_id, ...patch}` atomically changes subject, description, or
-  status.
-- `task_list {}` returns compact records in numeric-ID order; use `task_get`
-  for the full description.
-- `task_clear {}` explicitly abandons the graph without clearing conversation
-  history or stopping Agent, Program, Workflow, or Bash work. It preserves the
-  stable-ID high-water mark.
+- `task_write {tasks: [{subject, status}, …]}` **replaces the whole list** and
+  returns the list that is now live. An empty array clears it. Statuses are
+  `pending | in_progress | completed` and may move in any direction. There is
+  no other task tool: no read, no per-row patch, no delete, and no ID.
 
-Statuses are `pending | in_progress | completed` and **may move in any
-direction** — plan 187 removed the forward-only rule together with the
-dependency graph. Both constrained only the one writer that exists, and a
-mistyped `completed` has to be correctable in place rather than by appending a
-second row. Invalid text and failed rollover/clear validation still fail
-atomically without consuming an ID or partially changing the graph. Completed
-tasks remain addressable until rollover or clear; there is no single-task
-delete, filter, pagination, metadata, active-form, or dependency field.
+**Plan 188 collapsed five CRUD tools into this one.** Plan 71 replaced the old
+ID-free `todo_write` checklist precisely because a checklist "cannot carry
+stable IDs, owner or a dependency graph" — and today none of the three exists:
+owner left with plan 73, the dependency graph with plan 187, and **a stable ID
+was only ever the address those two needed**. Whole-table overwrite addresses
+nothing. So this is a return to `todo_write`'s *shape*, arrived at from the
+other direction and with its name left retired (see the reserved list below);
+what plan 71 rejected was the shape's inability to carry three things that have
+since been deleted for their own reasons.
 
-**Plan 187 deleted `blocked_by`/`blocks` outright.** Plan 71 built the graph as a
-multi-agent coordination mechanism: children claimed tasks and a dependent was
-gated until its blockers completed. Plan 72 made the graph depth-0 root-owned and
-took that world away; what survived was cycle detection defending the graph
-against itself and a blocker gate stopping its only writer from moving on. This
-is the same judgement plan 73 applied to `owner` — a constraint that cannot form
-a runtime invariant is description text the model pays for on every call. The
-one real consumer, the TUI panel's `› blocked by #N` annotation and its separate
-"blocked" sort group, went with it.
+The argument for one call is consistency, not brevity. Plan 74's live
+acceptance showed both provider paths driving the five tools correctly, so the
+model **can** use CRUD; what CRUD asks is that it stay correct *across rounds* —
+remember the IDs, remember which row is `in_progress`, emit `task_update` at the
+right moment — while nothing tells it what the list currently looks like
+(`TaskGraphUpdated` reaches the TUI, never the context). A whole-table write
+makes consistency a property of one output: everything that is wrong is visible
+while it is being written. It also costs one call instead of N creates plus 2N
+updates, and one definition (241 characters) instead of five (1597) resent on
+every request.
+
+**`description` went with the CRUD set.** Re-sending the whole list every round
+cannot carry an 8 KiB field per row, and once subject is the only text,
+`task_get` — which existed solely because `task_list` omitted descriptions —
+had nothing left to return. A task is one line and a status; detailed
+instructions belong in the message or a plan file, not in a panel row. Subject
+stays capped at 200 single-line characters, and the list at 256 rows.
+
+Validation is whole-list and happens before anything is stored: an over-long
+list, an empty/multi-line/over-long subject, an unknown status, or any retired
+field (`id`, `task_id`, `description`, `owner`, `blocked_by`) is a strict
+rejection that leaves the previous list byte-identical. **A write whose content
+equals the current list advances no revision and publishes no snapshot**, so a
+model that restates the same list every round never flickers the panel.
+
+Plan 187 had already deleted `blocked_by`/`blocks` outright. Plan 71 built the
+graph as a multi-agent coordination mechanism: children claimed tasks and a
+dependent was gated until its blockers completed. Plan 72 made the graph
+depth-0 root-owned and took that world away; what survived was cycle detection
+defending the graph against itself and a blocker gate stopping its only writer
+from moving on. This is the same judgement plan 73 applied to `owner` — a
+constraint that cannot form a runtime invariant is description text the model
+pays for on every call.
 
 The registry is an `Arc<TaskRegistry>` on `Config`. Child Configs retain the Arc
-as an internal session service, but their depth>0 catalogs omit all five tools
-and the dispatcher rejects stale or forged calls before allowlists, hooks,
-permissions, or registry handlers. Foreground children return through their
-`run_agent` tool result; background children return through `SubAgentResult` in
-the parent Inbox. Neither path automatically changes a task: root decides when
-to call `task_update`. There is no per-child task list, assignment/owner field,
-Team claim, or task-to-execution binding.
+as an internal session service, but their depth>0 catalogs omit the tool and the
+dispatcher rejects stale or forged calls before allowlists, hooks, permissions,
+or the registry. Foreground children return through their `run_agent` tool
+result; background children return through `SubAgentResult` in the parent Inbox.
+Neither path automatically changes the list: root decides when to rewrite it.
+There is no per-child task list, assignment/owner field, Team claim, or
+task-to-execution binding. The five retired names stay in the reserved set
+alongside `todo_write`, so an MCP tool cannot impersonate a call replayed out of
+resumed history.
 
 Independent CLI sessions/native server threads and a resumed process get fresh
-empty registries. An in-process TUI fork keeps the same live registry; the graph
-is not written to rollout or reconstructed from history. Every panel-visible
-mutation publishes a revisioned canonical full snapshot. `/clear` preserves the
-ID high-water mark, unconditionally advances the graph revision, and hands the
-TUI its exact empty snapshot as a reset fence against late older events. The
-registry is bounded to 256 tasks, 200-character single-line subjects, and 8 KiB
-descriptions. Task rows, activity, the composer's
-canonical visual rows, and overflow commit all consume the same viewport-height
-budget; no independently counted string-line total can make live chrome freeze
-into scrollback.
+empty registries. An in-process TUI fork keeps the same live registry; the list
+is not written to rollout or reconstructed from history. (Per-thread isolation
+is no longer observable from the tool surface — a whole-table write returns the
+table the caller just sent either way — so the core registry test is what pins
+it.) Every panel-visible mutation publishes a revisioned canonical full
+snapshot. `/clear` is the other half of the registry: the model has no tool for
+it, and it unconditionally advances the revision and hands the TUI its exact
+empty snapshot as a reset fence against late older events. Task rows, activity,
+the composer's canonical visual rows, and overflow commit all consume the same
+viewport-height budget; no independently counted string-line total can make live
+chrome freeze into scrollback.
 
-Task calls still use the ordinary `toolCall` lifecycle. A successful
-panel-visible mutation additionally emits internal `TaskGraphUpdated`; only the
-TUI projects it as a read-only live graph immediately above the composer.
-`Ctrl+T` toggles that projection without mutating the registry. When a turn ends
-the panel **retires**: it leaves the composer and takes its `Ctrl+T` hint with it,
-while the snapshot, its revision fence, the registry records and the `Ctrl+T`
-preference all survive — the next accepted snapshot (the next epoch's first task)
-brings it back with no keypress. Retirement is unconditional (plan 114): the panel
-tracks a turn in flight, not a standing checklist, and an unfinished graph is the
-common case — a model that has delivered its answer rarely goes back to tick its
-own boxes, and a checklist pinned above an idle composer reads as work still
-running. Plain mode prints
-no checklist, and server/headless add no Task notification, native item, or
-public wire. The permission gate auto-allows these session-memory operations
-(including in plan mode); create/update/clear are serial and get/list are
-concurrency-safe. Program/Workflow JavaScript and real child Agents cannot call
-these tools. `todo_write` and its old checklist/wire path remain deleted rather
-than forming a second writable task model.
+`task_write` uses the ordinary `toolCall` lifecycle. A successful list-changing
+write additionally emits internal `TaskGraphUpdated`; only the TUI projects it
+as a read-only live list immediately above the composer. `Ctrl+T` toggles that
+projection without mutating the registry. When a turn ends the panel
+**retires**: it leaves the composer and takes its `Ctrl+T` hint with it, while
+the snapshot, its revision fence, the registry records and the `Ctrl+T`
+preference all survive — the next accepted snapshot brings it back with no
+keypress. Retirement is unconditional (plan 114): the panel tracks a turn in
+flight, not a standing checklist, and an unfinished list is the common case — a
+model that has delivered its answer rarely goes back to tick its own boxes, and
+a checklist pinned above an idle composer reads as work still running. Plain
+mode prints no checklist, and server/headless add no Task notification, native
+item, or public wire. The permission gate auto-allows this session-memory
+operation (including in plan mode); the write is serial. Program/Workflow
+JavaScript and real child Agents cannot call it.
 
 ## Steering — mid-turn injection (Phase 2, fifteenth slice)
 
@@ -2818,7 +2834,7 @@ second turn against it. Headless one-shot execution remains bounded and does not
 expose this idle session surface; its teardown nevertheless reuses the selected
 text/NDJSON UI sink, so a queued mailbox event still receives its shutdown
 `undeliverable` terminal on the same stream.
-Sub-agents cannot spawn further sub-agents, so the whole background surface — `run_agent`, `wait_for_activity`, `stop_agent` — stays depth-0. One gate table answers for both halves of that: a child's catalog omits the tools, and the dispatcher refuses them before allowlists, hooks, permissions, or the handler, exactly as it does the Task tools and the front-end surface block (`ask_user_question`, `cron_*`, `schedule_wakeup`, the plan-mode pair, `workflow`/`stop_workflow`, `run_program`/`stop_program`, the worktree pair), which a session whose front-end does not enable them is refused at depth 0 too.
+Sub-agents cannot spawn further sub-agents, so the whole background surface — `run_agent`, `wait_for_activity`, `stop_agent` — stays depth-0. One gate table answers for both halves of that: a child's catalog omits the tools, and the dispatcher refuses them before allowlists, hooks, permissions, or the handler, exactly as it does the task tool and the front-end surface block (`ask_user_question`, `cron_*`, `schedule_wakeup`, the plan-mode pair, `workflow`/`stop_workflow`, `run_program`/`stop_program`, the worktree pair), which a session whose front-end does not enable them is refused at depth 0 too.
 
 ### Local Agent Mailbox (Plan 70)
 
@@ -2876,16 +2892,18 @@ renamed the native surface without adding compatibility aliases:
 - kloop exposes `run_agent` and defaults to **synchronous** execution; Claude
   Code `Agent` requires both `description` and `prompt` and defaults to background
   unless `run_in_background:false` is explicit.
-- kloop exposes the native snake_case `task_create/get/update/list/clear` graph
-  above only to the depth-0 root Agent, not as PascalCase Claude Code adapters
-  or a child/Team collaboration surface. Child completion is an execution
-  result; root explicitly advances graph state. Claude Code's task update carries
-  owner, metadata, deletion and bidirectional dependencies; kloop has none of
-  them — plan 73 removed `owner` and plan 187 removed `blocked_by`/`blocks`,
-  leaving a flat list. The TUI-only internal snapshot
-  projection is not a public Task wire. There are no `TaskOutput`/`TaskStop`
-  aliases: those names belong to execution resources in Claude Code, while
-  kloop keeps graph state separate from Agent/Program/Workflow/Shell lifecycle.
+- kloop exposes the native snake_case `task_write` list above only to the
+  depth-0 root Agent, not as PascalCase Claude Code adapters or a child/Team
+  collaboration surface. Child completion is an execution result; root
+  explicitly rewrites the list. Claude Code's four-tool registry addresses rows
+  by stable ID and its update carries owner, metadata, deletion and
+  bidirectional dependencies; kloop has none of them — plan 73 removed `owner`,
+  plan 187 removed `blocked_by`/`blocks`, and plan 188 replaced the CRUD set
+  with one whole-table write that has nothing to address. The TUI-only internal
+  snapshot projection is not a public Task wire. There are no
+  `TaskOutput`/`TaskStop` aliases: those names belong to execution resources in
+  Claude Code, while kloop keeps list state separate from
+  Agent/Program/Workflow/Shell lifecycle.
 - `wait_for_activity` is non-draining and ID-free. Typed `stop_agent`,
   `stop_program`, `stop_workflow`, and `stop_bash` deliberately replace a
   universal TaskStop façade.
@@ -2895,25 +2913,28 @@ renamed the native surface without adding compatibility aliases:
 - Consecutive synchronous `run_agent` calls remain dispatcher-parallel; detached
   agent/program/workflow work remains capped at 8 per session.
 
-The Plan 52 executable report now consumes the native run_agent/task-graph/wait
+The Plan 52 executable report now consumes the native run_agent/task-list/wait
 surface while retaining the original Claude Code fixture corpus. Plan 66's
 dispatcher tests separately lock all twelve cross-resource stop combinations,
 the durable `wf_*` boundary, and strict background/wait parsing. Plan 71 added
 Task V2 and removed the old checklist; Plan 72 supersedes only its child-sharing
 contract by making the session graph root-owned and child execution result-only.
-Plan 74 extends the current native graph to five tools and locks strict clear,
-atomic rollover, ID high-water, revisioned full-snapshot ordering, ordinary
-ToolCall rows, and the absence of public Task wire without changing any pinned
-Claude Code raw/normalized fixture. Plan 187 then deleted the dependency graph
-and the forward-only status rule, which shrank the Plan 52 native report's task
-scenario from a blocker gate to a rejected-unknown-field probe. See
+Plan 74 extended that graph to five tools and locked strict clear, atomic
+rollover, ID high-water, revisioned full-snapshot ordering, ordinary ToolCall
+rows, and the absence of public Task wire without changing any pinned Claude
+Code raw/normalized fixture. Plan 187 then deleted the dependency graph and the
+forward-only status rule, and Plan 188 the CRUD set itself: the native report's
+task scenario is now one whole-table write, a rewrite, an unchanged rewrite that
+publishes nothing, an empty-array clear, and rejection probes for every retired
+field and tool name. Nothing under `fixtures/` moved for any of it. See
 `docs/plan/52-agent-task-team-parity.md`,
 `docs/plan/66-background-tool-naming.md`,
 `docs/plan/71-task-v2-session-graph.md`,
 `docs/plan/72-task-v2-root-owned-session-graph.md`,
 `docs/plan/73-task-v2-remove-owner.md`,
-`docs/plan/74-task-graph-tui.md`, and
-`docs/plan/187-a-graph-with-only-one-writer.md`.
+`docs/plan/74-task-graph-tui.md`,
+`docs/plan/187-a-graph-with-only-one-writer.md`, and
+`docs/plan/188-one-table-one-call.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 

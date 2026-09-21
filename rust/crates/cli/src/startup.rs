@@ -936,9 +936,9 @@ pub(crate) fn config_from_settings(
     })
 }
 
-/// Scripted turns for `--mock`, exercising all five bets plus the root-owned Task
-/// V2 list without an API key: round 1 writes two tasks down, round 2 advances
-/// both and reads the list back,
+/// Scripted turns for `--mock`, exercising all five bets plus the root-owned task
+/// list without an API key: round 1 writes the list down, round 2 rewrites the
+/// same list with the first row finished,
 /// round 3 batches two read-only bash calls concurrently, round 4 runs an unsafe
 /// command whose oversized output triggers offloading, round 5 reads it back,
 /// round 6 spawns a result-only sub-agent (round 7 is the sub-agent's own reply),
@@ -955,28 +955,23 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
             text("Writing down the plan…\n"),
             tool_use(
                 "t0",
-                "task_create",
-                json!({"subject":"Look around","description":"Inspect the workspace"}),
-            ),
-            tool_use(
-                "t0b",
-                "task_create",
-                json!({"subject":"Offload output","description":"Generate a big result"}),
+                "task_write",
+                json!({"tasks":[
+                    {"subject":"Look around","status":"in_progress"},
+                    {"subject":"Offload output","status":"pending"},
+                ]}),
             ),
         ],
         vec![
             text("Advancing the list…\n"),
             tool_use(
-                "t0c",
-                "task_update",
-                json!({"task_id":"1","status":"completed"}),
+                "t0b",
+                "task_write",
+                json!({"tasks":[
+                    {"subject":"Look around","status":"completed"},
+                    {"subject":"Offload output","status":"in_progress"},
+                ]}),
             ),
-            tool_use(
-                "t0d",
-                "task_update",
-                json!({"task_id":"2","status":"in_progress"}),
-            ),
-            tool_use("t0e", "task_list", json!({})),
         ],
         vec![
             text("Looking around (these two run as one concurrent batch)…\n"),

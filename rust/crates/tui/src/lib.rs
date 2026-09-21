@@ -1374,7 +1374,6 @@ mod tests {
             revision,
             tasks: (1..=tasks)
                 .map(|id| kloop_core::tools::TaskGraphTask {
-                    id: id.to_string(),
                     subject: format!("Task {id}"),
                     status: kloop_core::tools::TaskStatus::Pending,
                 })
