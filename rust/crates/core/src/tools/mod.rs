@@ -62,6 +62,8 @@ pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the run_agent sub-agent machinery.
 pub(crate) use subagent::fork_skill;
+#[cfg(test)]
+pub(crate) use todo::REMINDER_STALE_ROUNDS;
 pub use todo::TodoItem;
 pub use todo::TodoRegistry;
 pub use todo::TodoSnapshot;

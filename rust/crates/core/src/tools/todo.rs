@@ -16,6 +16,13 @@ const MAX_TODOS: usize = 256;
 const MAX_SUBJECT_CHARS: usize = 200;
 const MAX_DIAGNOSTIC_CHARS: usize = 80;
 
+/// Depth-0 round boundaries the list must stand still before the model is
+/// reminded it exists (plan 190). The reminder is a low-frequency backstop,
+/// not a metronome: the model's only other view of the list is its own
+/// `todo_write` arguments, which sink out of reach within a few rounds of
+/// tool output.
+pub(crate) const REMINDER_STALE_ROUNDS: u32 = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
@@ -32,6 +39,16 @@ impl TodoStatus {
             Some("completed") => Ok(Self::Completed),
             Some(other) => bail!("todo_write: unknown status `{}`", bounded_diagnostic(other)),
             None => bail!("todo_write: every todo needs a 'status' string"),
+        }
+    }
+
+    /// The wire word, reused by the reminder so its rows read exactly as the
+    /// model wrote them.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
         }
     }
 }
@@ -56,6 +73,23 @@ pub struct TodoSnapshot {
 struct TodoRegistryState {
     revision: u64,
     todos: Vec<TodoItem>,
+    reminder: ReminderState,
+}
+
+/// Throttle for the round-boundary reminder. It lives beside the list rather
+/// than in the turn: the list is session-scoped, so "rounds since it last
+/// changed" has to survive the turn that wrote it.
+#[derive(Default)]
+struct ReminderState {
+    /// Revision seen at the previous round boundary.
+    seen_revision: u64,
+    /// Round boundaries since the list last changed.
+    rounds_unchanged: u32,
+    /// Revision already announced; a standing list is announced once, not
+    /// every `REMINDER_STALE_ROUNDS` rounds for as long as it stands.
+    announced_revision: Option<u64>,
+    /// An empty list is announced once per conversation.
+    announced_empty: bool,
 }
 
 #[derive(Default)]
@@ -102,8 +136,65 @@ impl TodoRegistry {
         let cleared_count = state.todos.len();
         state.todos.clear();
         state.revision = revision;
+        // `/clear` starts a new conversation, so the reminder starts over with
+        // it: the once-per-conversation empty notice is re-armed, and the
+        // staleness count restarts from the empty list it just produced.
+        state.reminder = ReminderState {
+            seen_revision: revision,
+            ..ReminderState::default()
+        };
         Ok((cleared_count, graph_snapshot(&state)))
     }
+
+    /// One depth-0 round boundary: advance the staleness count and return the
+    /// reminder text when one is due (plan 190).
+    ///
+    /// Due means the list has stood still for [`REMINDER_STALE_ROUNDS`]
+    /// boundaries and this state has not been announced yet — a standing list
+    /// once per revision, the empty list once per conversation. A write resets
+    /// the count, so a model that keeps its list current is never reminded.
+    pub fn round_boundary_reminder(&self) -> Option<String> {
+        let mut state = self.state.write().unwrap();
+        if state.reminder.seen_revision != state.revision {
+            state.reminder.seen_revision = state.revision;
+            state.reminder.rounds_unchanged = 0;
+            return None;
+        }
+        state.reminder.rounds_unchanged = state.reminder.rounds_unchanged.saturating_add(1);
+        if state.reminder.rounds_unchanged < REMINDER_STALE_ROUNDS {
+            return None;
+        }
+        if state.todos.is_empty() {
+            if state.reminder.announced_empty {
+                return None;
+            }
+            state.reminder.announced_empty = true;
+            return Some(EMPTY_REMINDER.to_string());
+        }
+        if state.reminder.announced_revision == Some(state.revision) {
+            return None;
+        }
+        state.reminder.announced_revision = Some(state.revision);
+        Some(render_reminder(&graph_snapshot(&state)))
+    }
+}
+
+/// What the model is told when it has recorded no list at all. The list it is
+/// missing is the one it would have written, so there is nothing to project —
+/// this is the whole message.
+const EMPTY_REMINDER: &str = "<system-reminder>\nYou have not recorded a todo list this session. If the work in front of you has several steps, write it down with todo_write now — a plan that exists only in your last message is out of reach by the next round, and the list is also what the user sees. If this work does not need one, ignore this. Never mention this reminder to the user.\n</system-reminder>";
+
+/// The reminder body: a direct projection of the snapshot, so the panel, the
+/// tool result and this text can never disagree about what the list says.
+fn render_reminder(snapshot: &TodoSnapshot) -> String {
+    let mut out = String::from(
+        "<system-reminder>\nYour todo list has not changed for several rounds. It currently reads:\n",
+    );
+    for todo in &snapshot.todos {
+        out.push_str(&format!("\n- [{}] {}", todo.status.label(), todo.subject));
+    }
+    out.push_str("\n\nIf that is no longer what you are doing, rewrite the whole list with todo_write in the same round as your next piece of work: mark what is finished, and mark what you are on now as in_progress. If it is still accurate, ignore this and carry on. Never mention this reminder to the user.\n</system-reminder>");
+    out
 }
 
 fn next_revision(revision: u64, tool: &str) -> Result<u64> {
@@ -415,6 +506,137 @@ mod tests {
             ]))
             .unwrap();
         assert_eq!(snapshot.unwrap().revision, 3);
+    }
+
+    /// The staleness count, not a metronome: a list that keeps moving is never
+    /// announced, and one that stands still is announced once per revision.
+    #[test]
+    fn a_standing_list_is_announced_once_per_revision() {
+        let registry = TodoRegistry::default();
+        registry
+            .write(table(&[
+                ("Wire the reminder", TodoStatus::InProgress),
+                ("Update the design note", TodoStatus::Pending),
+            ]))
+            .unwrap();
+
+        // The first boundary after a write only notices the new revision; the
+        // count runs from there.
+        for round in 0..REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
+        }
+        let reminder = registry.round_boundary_reminder().unwrap();
+        assert!(
+            reminder.starts_with("<system-reminder>\n") && reminder.ends_with("</system-reminder>"),
+            "{reminder}"
+        );
+        assert!(
+            reminder.contains("\n- [in_progress] Wire the reminder"),
+            "{reminder}"
+        );
+        assert!(
+            reminder.contains("\n- [pending] Update the design note"),
+            "{reminder}"
+        );
+        assert!(reminder.contains("todo_write"), "{reminder}");
+
+        // Standing still longer is not a reason to say it again, and neither is
+        // restating the same list — that write advances no revision, so as far
+        // as the reminder is concerned nothing moved.
+        for _ in 0..4 * REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+        registry
+            .write(table(&[
+                ("Wire the reminder", TodoStatus::InProgress),
+                ("Update the design note", TodoStatus::Pending),
+            ]))
+            .unwrap();
+        for _ in 0..4 * REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+
+        // A real change re-arms it, and the second reminder projects the list
+        // as it now stands.
+        registry
+            .write(table(&[("Wire the reminder", TodoStatus::Completed)]))
+            .unwrap();
+        for _ in 0..REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+        let reminder = registry.round_boundary_reminder().unwrap();
+        assert!(
+            reminder.contains("\n- [completed] Wire the reminder"),
+            "{reminder}"
+        );
+        assert!(!reminder.contains("Update the design note"), "{reminder}");
+    }
+
+    /// The empty list is the case plan 190 came from — a model that listed its
+    /// steps in prose and wrote no list at all. It is told once, and `/clear`
+    /// starts a new conversation that may be told again.
+    #[test]
+    fn an_empty_list_is_announced_once_per_conversation() {
+        let registry = TodoRegistry::default();
+        for round in 0..REMINDER_STALE_ROUNDS - 1 {
+            assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
+        }
+        let reminder = registry.round_boundary_reminder().unwrap();
+        assert_eq!(reminder, EMPTY_REMINDER);
+        for _ in 0..4 * REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+
+        // A list written after the notice is on the ordinary standing-list
+        // clock, not the empty one.
+        registry
+            .write(table(&[("Wrote one after all", TodoStatus::Pending)]))
+            .unwrap();
+        for _ in 0..REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+        assert!(
+            registry
+                .round_boundary_reminder()
+                .unwrap()
+                .contains("Wrote one after all")
+        );
+
+        registry.clear().unwrap();
+        for round in 0..REMINDER_STALE_ROUNDS - 1 {
+            assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
+        }
+        assert_eq!(registry.round_boundary_reminder().unwrap(), EMPTY_REMINDER);
+    }
+
+    /// `/clear` advances the revision and empties the list; the throttle has to
+    /// come with it, or the first list of the new conversation is judged
+    /// against the old one's count.
+    #[test]
+    fn clear_resets_the_reminder_clock_with_the_list() {
+        let registry = TodoRegistry::default();
+        registry
+            .write(table(&[("From the old conversation", TodoStatus::Pending)]))
+            .unwrap();
+        for _ in 0..REMINDER_STALE_ROUNDS / 2 {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+        registry.clear().unwrap();
+        registry
+            .write(table(&[("From the new one", TodoStatus::InProgress)]))
+            .unwrap();
+
+        // The half-run count from before the clear buys the new list nothing:
+        // it waits the full stretch.
+        for round in 0..REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
+        }
+        let reminder = registry.round_boundary_reminder().unwrap();
+        assert!(reminder.contains("From the new one"), "{reminder}");
+        assert!(
+            !reminder.contains("From the old conversation"),
+            "{reminder}"
+        );
     }
 
     #[test]

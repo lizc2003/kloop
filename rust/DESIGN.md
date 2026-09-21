@@ -2240,7 +2240,7 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Root-owned session todo list (Plans 71–74, 187, 188)
+## Root-owned session todo list (Plans 71–74, 187, 188, 190)
 
 The todo list is a **session-scoped flat list of work owned by the root/main
 Agent**. Only depth 0 receives or may execute its one native snake_case tool:
@@ -2275,11 +2275,12 @@ acceptance showed both provider paths driving the five tools correctly, so the
 model **can** use CRUD; what CRUD asks is that it stay correct *across rounds* —
 remember the IDs, remember which row is `in_progress`, emit `task_update` at the
 right moment — while nothing tells it what the list currently looks like
-(`TodoUpdated` reaches the TUI, never the context). A whole-table write
-makes consistency a property of one output: everything that is wrong is visible
-while it is being written. It also costs one call instead of N creates plus 2N
-updates, and one definition (241 characters) instead of five (1597) resent on
-every request.
+(`TodoUpdated` reaches the TUI, never the context; the round-boundary reminder
+below is a backstop measured in rounds, not a per-round mirror). A whole-table
+write makes consistency a property of one output: everything that is wrong is
+visible while it is being written. It also costs one call instead of N creates
+plus 2N updates, and one definition (241 characters) instead of five (1597)
+resent on every request.
 
 **`description` went with the CRUD set.** Re-sending the whole list every round
 cannot carry an 8 KiB field per row, and once subject is the only text,
@@ -2307,7 +2308,7 @@ from moving on. This is the same judgement plan 73 applied to `owner` — a
 constraint that cannot form a runtime invariant is description text the model
 pays for on every call.
 
-The registry is an `Arc<TaskRegistry>` on `Config`. Child Configs retain the Arc
+The registry is an `Arc<TodoRegistry>` on `Config`. Child Configs retain the Arc
 as an internal session service, but their depth>0 catalogs omit the tool and the
 dispatcher rejects stale or forged calls before allowlists, hooks, permissions,
 or the registry. Foreground children return through their `run_agent` tool
@@ -2334,6 +2335,56 @@ empty snapshot as a reset fence against late older events. Task rows, activity,
 the composer's canonical visual rows, and overflow commit all consume the same
 viewport-height budget; no independently counted string-line total can make live
 chrome freeze into scrollback.
+
+**The model is handed its own list back when the list stands still (plan
+190).** Nothing else tells it: `TodoUpdated` is a TUI event, there is no read
+tool, and the only view the model has is its own `todo_write` arguments, which
+a few rounds of tool output push out of reach. At every depth-0 round boundary
+the registry is asked for a reminder; when one is due it is appended to history
+as a user message wrapping a `<system-reminder>` block, and that block is a
+direct projection of the snapshot — one renderer, so the panel, the tool result
+and the reminder cannot disagree about what the list says.
+
+**Where it lands is the whole design.** It is appended at the *end* of history,
+after the cache prefix, where it costs one small increment. It must never join
+the synthetic first user message (project instructions, skills catalog,
+deferred-tools notice), which is session-stable precisely because it sits at the
+*head* of the prefix: a table that changes per round put there would break the
+prefix for the rest of the session — plan 120's usage sampling measured a 97%
+median hit rate for rounds adding 0–2k and 14% above 20k, with the miss
+spilling into the rounds after it. The round boundary is also what makes the
+append safe: it is never mid-request, so a sampling in flight never sees a
+partial write and no `tool_result` block is interleaved.
+
+Due means the list has stood still for 8 boundaries **and** this state has not
+been announced yet: a standing list once per revision, the empty list once per
+conversation. A write resets the count, so a model that keeps its list current
+is never reminded; restating the same list does not, because that advances no
+revision and nothing actually moved. `/clear` resets the throttle with the list
+it empties — the new conversation's first list waits the full stretch, and its
+empty notice is re-armed. Depth > 0 is skipped outright: a sub-agent has no
+`todo_write` and no list, so a reminder there is pure noise, and its boundaries
+do not advance the root's count either.
+
+Eight is chosen to be a backstop rather than a metronome, and it is the one
+number here with no derivation. cc's equivalent nag waits ten assistant turns
+since the tool was last *called* and may repeat on the same list; kloop counts
+rounds since the list last *changed* — the stricter of the two, since a
+restatement is not a change — waits eight of them, and never repeats on the
+same revision. The bound that matters is not the interval but the once: over a
+long session cc's shape can deliver several reminders about one unchanged list,
+and this one delivers exactly one.
+
+The reminder is the second half of an answer whose first half is free. Plan 190
+started from a session where the model listed six candidate steps in prose and
+recorded none of them, and the base prompt was part of the reason: it said to
+send list updates in the same round as the work they describe and never as a
+round of their own, which at the moment a plan takes shape forbids the one call
+that should happen — there is no work yet to carry it. The prompt now separates
+the two: **writing the list down when the plan is clear is worth a round of its
+own**, and only the updates after it ride along with the work. That half is
+session-stable and costs no cache; the reminder exists for the rounds after it,
+where the model has the list but has stopped looking at it.
 
 `todo_write` uses the ordinary `toolCall` lifecycle. A successful list-changing
 write additionally emits internal `TodoUpdated`; only the TUI projects it

@@ -91,6 +91,56 @@ fn run_agent_schema_only_advertises_configured_agent_types() {
     assert!(run_agent.description.contains("reviewer"));
 }
 
+/// Plan 190: where the reminder lands is the whole design. It is appended at
+/// the end of history, after the cache prefix — never into `injected_context`,
+/// which is the synthetic first user message at the head of it — and a
+/// sub-agent, which has no `todo_write` and no list, is never reminded.
+#[tokio::test]
+async fn a_stale_todo_list_is_reminded_at_the_end_of_history_and_only_at_depth_zero() {
+    let cfg = crate::tools::testutil::TestConfig::new("agent-todo-reminder").build();
+    let ctx = crate::tools::testutil::test_ctx_with_cfg(0, Arc::clone(&cfg));
+    let (output, is_error) = crate::tools::testutil::run_tool(
+        "todo_write",
+        json!({"todos": [{"subject": "Ship the reminder", "status": "in_progress"}]}),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{output}");
+
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("ship it"));
+
+    // A sub-agent's boundaries neither remind nor advance the clock — if they
+    // advanced it, the depth-0 stretch below would fire early and fail.
+    let mut child_history = History::new(cfg.offload_dir.clone());
+    for _ in 0..4 * crate::tools::REMINDER_STALE_ROUNDS {
+        assert!(!remind_todos(&cfg, &mut child_history, 1));
+    }
+    assert!(child_history.messages().is_empty());
+
+    for round in 0..crate::tools::REMINDER_STALE_ROUNDS {
+        assert!(!remind_todos(&cfg, &mut history, 0), "round {round}");
+    }
+    assert_eq!(history.messages().len(), 1);
+    assert!(remind_todos(&cfg, &mut history, 0));
+
+    {
+        let messages = history.messages();
+        assert_eq!(messages.len(), 2);
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        let ContentBlock::Text { text } = &last.content[0] else {
+            panic!("expected text, got {:?}", last.content[0]);
+        };
+        assert!(text.starts_with("<system-reminder>"), "{text}");
+        assert!(text.contains("- [in_progress] Ship the reminder"), "{text}");
+    }
+
+    // Said once: the next boundary appends nothing.
+    assert!(!remind_todos(&cfg, &mut history, 0));
+    assert_eq!(history.messages().len(), 2);
+}
+
 #[test]
 fn drain_inbox_offloads_only_large_machine_results() {
     let dir = std::env::temp_dir().join(format!("kloop-inbox-offload-{}", std::process::id()));

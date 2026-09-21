@@ -941,6 +941,7 @@ async fn turn_rounds(
         // started) so this is a no-op. Never touches an in-flight request.
         drain_inbox(&cfg.inbox, turn.history, ui);
         drain_local_mailbox(cfg, turn.history, ui);
+        remind_todos(cfg, turn.history, depth);
         // The injected context is outside history and a dynamic MCP refresh may
         // replace its deferred-tool notice between rounds, so account for the
         // current version rather than pinning the turn's first estimate.
@@ -1269,6 +1270,28 @@ fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
         }
         history.record(item.into_user_message());
     }
+    true
+}
+
+/// Hand the model its own todo list back when the list has stood still (plan
+/// 190). Its only other view of the list is its own `todo_write` arguments,
+/// which a few rounds of tool output push out of reach.
+///
+/// This belongs here, at the round boundary, and nowhere near
+/// [`injected_context`]: that is the synthetic first user message, at the head
+/// of the cache prefix, where a per-round change would break the prefix for
+/// the whole session. Appended at the end of history it is a small increment
+/// after the prefix instead. `todo_write` is depth-0 only, so a sub-agent —
+/// which cannot see or write the list — is never reminded of it.
+fn remind_todos(cfg: &Config, history: &mut History, depth: u8) -> bool {
+    if depth > 0 {
+        return false;
+    }
+    let Some(reminder) = cfg.todos.round_boundary_reminder() else {
+        return false;
+    };
+    let reminder = history.offload_text(reminder);
+    history.record(Message::user_text(reminder));
     true
 }
 

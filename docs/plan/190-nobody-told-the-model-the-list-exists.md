@@ -122,3 +122,41 @@ user message.」注入的内容作为 **user message 追加在历史末尾**,在
   `TodoStatus`、`Event::TodoUpdated`、`Config.todos: Arc<TodoRegistry>`。
 - `BASE_SYSTEM`(`context.rs`)那句已经是 `todo_write` 单数措辞,
   **但「never as a round of its own」那半句仍未动**,留给本 plan(第五节)。
+
+## ✅ 完成(2026-09-21)
+
+一次提交(SHA 即本条所在提交),`make check`(fmt + clippy -D warnings + 全量测试)全绿。
+
+**第五节那两个数,先查参考项目再定**(用户问「参考项目怎么做的」):
+
+- `refs/codex` 的 `update_plan` 根本不存状态——`core/src/tools/handlers/plan.rs` 的
+  handler 只发一个 UI 事件,工具结果是一句 `"Plan updated"`;`core/src/context/` 那一排
+  注入片段(时间、token 预算、guardian…)里**没有 plan**。它的赌注全在
+  `core/gpt_5_2_prompt.md:290-298` 那一节规矩上。
+- cc **做了**这件事,形状和第三节几乎重合:ephemeral 附件包成 `<system-reminder>` 的
+  meta user 消息;触发是两个计数器——距上次**调用**工具 ≥10 个 assistant 轮 **且** 距上次
+  提醒 ≥10 轮;**空表照样提醒**(正文固定,表非空才把表附在后面);同一张表可以反复提醒。
+- codewhale 一条都没有(整个 TUI 没有回灌通道);另一个参考产品没有 todo 回灌,
+  但有同形状近亲(「当前会话目标状态」作 model-only 合成 user 消息注入 + 投影层过滤)。
+
+于是两个数都改了原来的建议:**N=3 → 8**(向 cc 的 10 靠,但我们同 revision 只发一次,
+比它严),**空表不提醒 → 空表提醒一次**(空表恰恰是本 plan 起因的那一档)。
+
+**落地**:
+
+- `tools/todo.rs`:`ReminderState`(seen_revision / rounds_unchanged / announced_revision /
+  announced_empty)住进 `TodoRegistryState`,`round_boundary_reminder()` 是唯一入口;
+  `render_reminder()` 直接投影 `TodoSnapshot`(坑 1:不另写一套格式化);
+  `clear()` 连节流一起复位(坑 2)。
+- `agent.rs`:`remind_todos()` 和 `drain_inbox`/`drain_local_mailbox` 并排在 round 边界,
+  depth>0 直接返回(坑 3),文本过 `history.offload_text` 封上限。走第三节的**路线 2**。
+- `context.rs`:`BASE_SYSTEM` 那句拆成「计划清楚就开列(值得单开一轮)」+「之后的更新
+  和工作同轮」。
+- 测试(坑 4,只守机制):registry 三条(同 revision 只发一次 / 空表一会话一次 /
+  `clear` 复位),agent 一条(落在历史末尾、depth>0 不注入且不推进计数、说过一次不再说)。
+- DESIGN.md「Root-owned session todo list」一节补注入契约,顺手改掉过期的
+  `Arc<TaskRegistry>` 和「`TodoUpdated` 从不进上下文」那半句。
+
+**还欠着(第六节的效果侧与缓存侧)**:机制有测试钉着,但「模型是否在计划成形时就建表」
+「未完成任务在表里停留几轮」必须真实 dogfood 几个会话对照,缓存命中率要按 plan 120 的
+口径取一次 usage 确认没掉。这两件测试答不了,**没做就是没做**。
