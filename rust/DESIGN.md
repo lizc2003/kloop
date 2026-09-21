@@ -2356,15 +2356,28 @@ spilling into the rounds after it. The round boundary is also what makes the
 append safe: it is never mid-request, so a sampling in flight never sees a
 partial write and no `tool_result` block is interleaved.
 
-Due means the list has stood still for 8 boundaries **and** this state has not
-been announced yet: a standing list once per revision, the empty list once per
-conversation. A write resets the count, so a model that keeps its list current
-is never reminded; restating the same list does not, because that advances no
-revision and nothing actually moved. `/clear` resets the throttle with the list
-it empties — the new conversation's first list waits the full stretch, and its
-empty notice is re-armed. Depth > 0 is skipped outright: a sub-agent has no
+Due means the list has stood still for 8 boundaries **and** this revision has
+not been announced yet — one rule, no second clock. A write resets the count,
+so a model that keeps its list current is never reminded; restating the same
+list does not reset it, because that advances no revision and nothing actually
+moved. `/clear` resets the throttle with the list it empties, and its new
+revision re-arms the notice. Depth > 0 is skipped outright: a sub-agent has no
 `todo_write` and no list, so a reminder there is pure noise, and its boundaries
 do not advance the root's count either.
+
+**What it says depends on whether anything in the list is still open.** Rows
+the model can still act on are handed back as they stand. A list with none —
+empty, or finished to the last row — is the same situation as having written
+none at all, so it gets a notice saying so instead of a projection nobody can
+act on. **That notice never suggests clearing the finished list**: clearing
+costs a round and buys nothing, because the panel has already left the composer
+when the turn ended and the list reaches the context through this reminder and
+nowhere else. A write replaces the whole list, so the only call worth making
+there is the new list itself — and that one is the call the base prompt says is
+worth a round of its own. Folding the empty list into the same branch also
+retires its separate once-per-conversation clock: an empty list leaves revision
+0 only through a write (which fills it) or `/clear` (which starts a new
+conversation), so once per revision already means once per conversation for it.
 
 Eight is chosen to be a backstop rather than a metronome, and it is the one
 number here with no derivation. cc's equivalent nag waits ten assistant turns

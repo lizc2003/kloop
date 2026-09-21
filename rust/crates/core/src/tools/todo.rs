@@ -85,11 +85,12 @@ struct ReminderState {
     seen_revision: u64,
     /// Round boundaries since the list last changed.
     rounds_unchanged: u32,
-    /// Revision already announced; a standing list is announced once, not
-    /// every `REMINDER_STALE_ROUNDS` rounds for as long as it stands.
+    /// Revision already announced; every state is announced once, not every
+    /// `REMINDER_STALE_ROUNDS` rounds for as long as it stands. One rule
+    /// covers the empty list too: it only leaves revision 0 through a write
+    /// (which fills it) or `/clear` (which starts a new conversation), so
+    /// "once per revision" is "once per conversation" for it.
     announced_revision: Option<u64>,
-    /// An empty list is announced once per conversation.
-    announced_empty: bool,
 }
 
 #[derive(Default)]
@@ -137,8 +138,8 @@ impl TodoRegistry {
         state.todos.clear();
         state.revision = revision;
         // `/clear` starts a new conversation, so the reminder starts over with
-        // it: the once-per-conversation empty notice is re-armed, and the
-        // staleness count restarts from the empty list it just produced.
+        // it: the new revision re-arms the notice, and the staleness count
+        // restarts from the empty list it just produced.
         state.reminder = ReminderState {
             seen_revision: revision,
             ..ReminderState::default()
@@ -150,9 +151,14 @@ impl TodoRegistry {
     /// reminder text when one is due (plan 190).
     ///
     /// Due means the list has stood still for [`REMINDER_STALE_ROUNDS`]
-    /// boundaries and this state has not been announced yet — a standing list
-    /// once per revision, the empty list once per conversation. A write resets
+    /// boundaries and this revision has not been announced yet. A write resets
     /// the count, so a model that keeps its list current is never reminded.
+    ///
+    /// What it says depends on whether anything in the list is still open. A
+    /// list with open rows is handed back as it stands; a list with none —
+    /// empty, or finished to the last row — is the same situation as having
+    /// written none at all, so it gets the "write one if this work needs one"
+    /// notice instead of a projection nobody can act on.
     pub fn round_boundary_reminder(&self) -> Option<String> {
         let mut state = self.state.write().unwrap();
         if state.reminder.seen_revision != state.revision {
@@ -161,28 +167,32 @@ impl TodoRegistry {
             return None;
         }
         state.reminder.rounds_unchanged = state.reminder.rounds_unchanged.saturating_add(1);
-        if state.reminder.rounds_unchanged < REMINDER_STALE_ROUNDS {
-            return None;
-        }
-        if state.todos.is_empty() {
-            if state.reminder.announced_empty {
-                return None;
-            }
-            state.reminder.announced_empty = true;
-            return Some(EMPTY_REMINDER.to_string());
-        }
-        if state.reminder.announced_revision == Some(state.revision) {
+        if state.reminder.rounds_unchanged < REMINDER_STALE_ROUNDS
+            || state.reminder.announced_revision == Some(state.revision)
+        {
             return None;
         }
         state.reminder.announced_revision = Some(state.revision);
-        Some(render_reminder(&graph_snapshot(&state)))
+        let open = state
+            .todos
+            .iter()
+            .any(|todo| todo.status != TodoStatus::Completed);
+        Some(match open {
+            true => render_reminder(&graph_snapshot(&state)),
+            false => NO_LIVE_LIST_REMINDER.to_string(),
+        })
     }
 }
 
-/// What the model is told when it has recorded no list at all. The list it is
-/// missing is the one it would have written, so there is nothing to project —
-/// this is the whole message.
-const EMPTY_REMINDER: &str = "<system-reminder>\nYou have not recorded a todo list this session. If the work in front of you has several steps, write it down with todo_write now — a plan that exists only in your last message is out of reach by the next round, and the list is also what the user sees. If this work does not need one, ignore this. Never mention this reminder to the user.\n</system-reminder>";
+/// What the model is told when nothing in the list is open — it wrote none, or
+/// it finished the one it wrote. There is nothing to project that it could act
+/// on, so this says the one thing it can act on instead.
+///
+/// It never suggests clearing the finished list. Clearing costs a round and
+/// buys nothing: the panel has already left the composer, and the list reaches
+/// the context through this reminder and nowhere else. A new list is a whole
+/// list, so writing one is the only call worth making here.
+const NO_LIVE_LIST_REMINDER: &str = "<system-reminder>\nYou have no unfinished todos recorded. If the work in front of you has several steps, write the list down with todo_write now — a plan that exists only in your last message is out of reach by the next round, and the list is also what the user sees. A write replaces the whole list, so a finished one needs no clearing first. If this work does not need a list, ignore this. Never mention this reminder to the user.\n</system-reminder>";
 
 /// The reminder body: a direct projection of the snapshot, so the panel, the
 /// tool result and this text can never disagree about what the list says.
@@ -557,9 +567,12 @@ mod tests {
         }
 
         // A real change re-arms it, and the second reminder projects the list
-        // as it now stands.
+        // as it now stands — finished rows included, as long as one is open.
         registry
-            .write(table(&[("Wire the reminder", TodoStatus::Completed)]))
+            .write(table(&[
+                ("Wire the reminder", TodoStatus::Completed),
+                ("Dogfood it", TodoStatus::Pending),
+            ]))
             .unwrap();
         for _ in 0..REMINDER_STALE_ROUNDS {
             assert_eq!(registry.round_boundary_reminder(), None);
@@ -569,28 +582,37 @@ mod tests {
             reminder.contains("\n- [completed] Wire the reminder"),
             "{reminder}"
         );
+        assert!(reminder.contains("\n- [pending] Dogfood it"), "{reminder}");
         assert!(!reminder.contains("Update the design note"), "{reminder}");
     }
 
     /// The empty list is the case plan 190 came from — a model that listed its
-    /// steps in prose and wrote no list at all. It is told once, and `/clear`
-    /// starts a new conversation that may be told again.
+    /// steps in prose and wrote no list at all. A list finished to the last row
+    /// is the same situation: nothing in it is open, so it gets the same
+    /// notice rather than a projection nobody can act on. Once per revision
+    /// covers both, and for the empty list that is once per conversation.
     #[test]
-    fn an_empty_list_is_announced_once_per_conversation() {
+    fn a_list_with_nothing_open_is_announced_once_per_revision() {
         let registry = TodoRegistry::default();
         for round in 0..REMINDER_STALE_ROUNDS - 1 {
             assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
         }
         let reminder = registry.round_boundary_reminder().unwrap();
-        assert_eq!(reminder, EMPTY_REMINDER);
+        assert_eq!(reminder, NO_LIVE_LIST_REMINDER);
+        // Nothing here tells the model to clear anything: that call would cost
+        // a round and buy nothing.
+        assert!(!reminder.contains("[]"), "{reminder}");
         for _ in 0..4 * REMINDER_STALE_ROUNDS {
             assert_eq!(registry.round_boundary_reminder(), None);
         }
 
         // A list written after the notice is on the ordinary standing-list
-        // clock, not the empty one.
+        // clock, and its rows are handed back while any of them is open.
         registry
-            .write(table(&[("Wrote one after all", TodoStatus::Pending)]))
+            .write(table(&[
+                ("Wrote one after all", TodoStatus::Completed),
+                ("Still going", TodoStatus::InProgress),
+            ]))
             .unwrap();
         for _ in 0..REMINDER_STALE_ROUNDS {
             assert_eq!(registry.round_boundary_reminder(), None);
@@ -599,14 +621,33 @@ mod tests {
             registry
                 .round_boundary_reminder()
                 .unwrap()
-                .contains("Wrote one after all")
+                .contains("Still going")
+        );
+
+        // Finishing the last open row is a new revision, and with nothing left
+        // open the list is no longer worth handing back.
+        registry
+            .write(table(&[
+                ("Wrote one after all", TodoStatus::Completed),
+                ("Still going", TodoStatus::Completed),
+            ]))
+            .unwrap();
+        for _ in 0..REMINDER_STALE_ROUNDS {
+            assert_eq!(registry.round_boundary_reminder(), None);
+        }
+        assert_eq!(
+            registry.round_boundary_reminder().unwrap(),
+            NO_LIVE_LIST_REMINDER
         );
 
         registry.clear().unwrap();
         for round in 0..REMINDER_STALE_ROUNDS - 1 {
             assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
         }
-        assert_eq!(registry.round_boundary_reminder().unwrap(), EMPTY_REMINDER);
+        assert_eq!(
+            registry.round_boundary_reminder().unwrap(),
+            NO_LIVE_LIST_REMINDER
+        );
     }
 
     /// `/clear` advances the revision and empties the list; the throttle has to

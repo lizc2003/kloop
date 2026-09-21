@@ -144,14 +144,26 @@ user message.」注入的内容作为 **user message 追加在历史末尾**,在
 
 **落地**:
 
-- `tools/todo.rs`:`ReminderState`(seen_revision / rounds_unchanged / announced_revision /
-  announced_empty)住进 `TodoRegistryState`,`round_boundary_reminder()` 是唯一入口;
+- `tools/todo.rs`:`ReminderState`(seen_revision / rounds_unchanged / announced_revision)
+  住进 `TodoRegistryState`,`round_boundary_reminder()` 是唯一入口;
   `render_reminder()` 直接投影 `TodoSnapshot`(坑 1:不另写一套格式化);
   `clear()` 连节流一起复位(坑 2)。
 - `agent.rs`:`remind_todos()` 和 `drain_inbox`/`drain_local_mailbox` 并排在 round 边界,
   depth>0 直接返回(坑 3),文本过 `history.offload_text` 封上限。走第三节的**路线 2**。
 - `context.rs`:`BASE_SYSTEM` 那句拆成「计划清楚就开列(值得单开一轮)」+「之后的更新
   和工作同轮」。
+**收尾时改掉的一处设计**(用户问「都 completed 了是不是该清掉」):**不自动清**——
+表是模型的(它自己能写 `[]`),`/clear` 是用户那一半,harness 悄悄删会多出第三个写入者,
+而且面板退场已经解决了显示问题,删了还查不回来。但**全 completed 的表不该走整表投影那条文案**:
+它没过期,它是做完了,回灌整张表只能是噪音。于是改成按「有没有还开着的行」分支——
+空表和全 completed 是同一种情况(没有在役清单),走同一条「需要就现在写一张」的文案。
+**那条文案不提「清掉」**(用户第二问:「岂不是要多走一轮」):清一张做完的表要花一轮、
+换不来任何东西(面板已退场、表本来也不在上下文里,**唯一**让它进上下文的就是这条提醒本身),
+而整表覆盖本来就替换旧表——值得花的那一轮是**写新表**,不是清旧表。
+顺带把两条节流规则合成一条:**每 revision 只通报一次**;空表离开 revision 0 只有两条路
+(写入填满它 / `/clear` 开新会话),所以对它而言「每 revision 一次」就是「每会话一次」,
+`announced_empty` 这个字段没了。
+
 - 测试(坑 4,只守机制):registry 三条(同 revision 只发一次 / 空表一会话一次 /
   `clear` 复位),agent 两条——单元一条(落在历史末尾、depth>0 不注入且不推进计数、
   说过一次不再说),**端到端一条**(真 `run_turn` 过 mock provider 跑满 10 轮:提醒作为
