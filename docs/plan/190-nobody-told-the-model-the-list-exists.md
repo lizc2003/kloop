@@ -1,0 +1,109 @@
+# Plan 190 — 没有人告诉模型那张表还在
+
+> 来源:2026-09-21,和 187/188 同一次对话的起点。用户看到模型列了六条候选、
+> 一条 task 都没建,问「是不是这个系列工具太复杂了」。187/188 回答的是「复杂」那一半,
+> **这条回答「为什么不调用」那一半**。
+>
+> **不硬依赖 187/188,但建议排在它们之后**:那时回灌的是一行标题加一个状态,
+> 而不是一张带依赖边的图。编号跳过 189(已被占用)。
+
+## 一、缺什么
+
+全仓 `<system-reminder>` 用在四处:skills 目录(`skills.rs:378`)、延迟工具清单
+(`tool_search.rs:195`)、重读同一文件的劝阻与图片/空文件提示(`fs.rs:70/386/427`)。
+**task 一处都没有。**
+
+而且 task 图**不回灌上下文**:`TaskGraphUpdated`(`event.rs:129`)在
+`event.rs:309` 和 `server/src/wire.rs:281` 都返回 `None`,只有 TUI 投影它。
+模型写完一张表之后,**下一轮它对这张表的全部认知,就是自己几轮前那条 tool_result**,
+中间隔着几十 K 的工具输出。
+
+于是两件事各缺一半:
+
+- **它不知道表现在长什么样**(几轮之后,那条 tool_result 早被挤到上下文深处)。
+- **它想不起来有这个工具**。`BASE_SYSTEM`(`context.rs:119-121`)只有一句
+  「For multi-step tasks, track the work with the task tools」,埋在 `# Using your tools`
+  第三条。更要命的是那句话的后半:「**send those updates in the same round as the work
+  they describe, never as a round of their own**」——模型在「先列候选、下一轮再查证」
+  的那一刻,**这一轮没有 work 可以捎带,按字面它就不该发**。行为完全合规,结果是永远不发。
+
+## 二、绝对不能放哪
+
+**不能放进 `injected_context`(`agent.rs:1302`)。**
+
+那是合成的**第一条 user 消息**,装着 plan-mode reminder、项目指示、skills 目录、
+延迟工具清单。它的 doc 注释写明了为什么这些东西能放在那里:
+「Project instructions and the skills catalog are **session-stable**」,
+只有 MCP 目录「may replace the deferred-tools notice **at a round boundary**」。
+
+第一条 user 消息在**缓存前缀的最前面**。每轮变化的 task 表放进去,
+**整个会话的缓存每轮全废**——不是掉几个百分点,是前缀从头断。
+
+plan 120 用 2019 轮 usage 采样量过这件事:单轮增量 0–2k 的轮次命中率中位数 **97%**,
+>20k 掉到 **14%**;而且一轮大增量会让**随后几轮**都读不到本来就没写进去的缓存条目。
+一张几行标题的表落在最好那一档——**只要位置对**。位置不对,增量再小也没用。
+
+## 三、放哪、什么时候放
+
+**放哪:`drain_inbox`(`agent.rs:1213`)那个 round-boundary 注入口。**
+
+它的注释正好写着需要的保证:「Called only at round boundaries (top of the loop, and
+just before the turn would end) — **never mid-request**, so an in-flight sampling never
+sees a partial write and **tool_result blocks are never interleaved** with the injected
+user message.」注入的内容作为 **user message 追加在历史末尾**,在缓存前缀之后,
+只计入增量。`history.rs:417` 已有 `offload_text` 给机器产生的文本封边界。
+
+两条实现路线,**推荐第二条**:
+
+1. 新增一个 `InboxItem` 变体,复用 `into_message` 的加框。代码最少,
+   但语义别扭——inbox 装的是**外部塞进来的**东西(steering、子 agent 结果、后台 shell
+   终止通知),而这条提醒是 agent 对自己状态的判断。
+2. 在 round 边界直接判断并 push 一条 user message,和 `drain_inbox` 并列调用。
+   语义干净,且节流状态(见下)本来就该住在 agent 的 turn 状态里,而不是 inbox 里。
+
+**什么时候放——节流是这条 plan 的全部难点。** 每轮都发,历史里就堆起十份互相矛盾的
+过期快照,既占上下文又误导模型。建议的触发条件:
+
+- **表非空,且距上次注入已过 N 轮**(N 开工时定,建议 3),**且表在这期间没有变化**。
+  「表没变」正是该提醒的信号:模型在干活,但没有回来更新状态。
+- 注入后记下 `revision`(`TaskGraphSnapshot.revision`,现成的),
+  **同一个 revision 只注入一次**。
+- **表为空时不提醒**,或至多在会话首轮之后提醒一次。空表提醒最容易变成噪音——
+  它要求判断「这次的活该不该记清单」,而那个判断模型自己做得比一条固定规则好。
+
+同时**改 `BASE_SYSTEM` 那句**(`context.rs:119-121`):把「never as a round of their own」
+这条限制说清楚它管的是**更新**,不是**开列**——计划成形的那一刻就该记下来,
+那时本来就没有 work 可捎带。这一句的改动比整个注入机制更可能立刻见效,
+**而且它是 session-stable 的,不伤缓存**。
+
+## 四、坑
+
+1. **别把回灌做成第二份真相。** 面板(TUI)、tool_result、注入的 reminder 三处都在讲
+   同一张表。注入的那份必须是 `TaskRegistry::snapshot()`(`task.rs:206`)的直接投影,
+   **不要另写一套格式化**,否则三处会漂。
+2. **`/clear` 之后要清节流状态**。`commands/clear.rs:16` 调 `cfg.tasks.clear()`
+   并无条件推进 revision(教训 87 的 reset fence)。上次注入的 revision 记录必须跟着复位,
+   否则清空后第一张新表会因为「revision 变了但没到 N 轮」被吞掉,或者反过来立刻重发。
+3. **子 agent 不注入。** 五个 task 工具是 `Gate::Depth0`(`builtin.rs:340`),
+   depth>0 根本看不见这张表,给它们注入是纯噪音。
+4. **这是行为改动,不是删代码,测试断言只能守住机制**(注入位置在历史末尾、
+   同 revision 不重复、`/clear` 后复位、depth>0 不注入)。**它到底有没有用,
+   测试答不了**——见验收。
+
+## 五、开工时定(问用户)
+
+**N 取几轮,以及空表要不要提醒一次。**
+
+建议 N=3、空表不提醒。但这两个数字**没有可以推导出来的正确答案**,
+而且调错方向就是往每一轮上下文里加噪音。开工时按第六节的方式先量一版再定。
+
+## 六、验收
+
+- 机制侧(测试守得住的):注入落在历史末尾而非 `injected_context`;同 revision 只注入一次;
+  `/clear` 后节流状态复位;depth>0 不注入;`make check` 全绿。
+- **效果侧(测试守不住的,必须真实 dogfood)**:拿一个真会用到清单的任务跑几个会话,
+  看两个数——**模型是否在计划成形时就建表**(而不是根本不建),
+  以及**未完成任务在表里停留的轮数**(它是否回来更新)。对照组是改动前的会话。
+- **缓存侧**:按 plan 120 的口径取 usage,确认命中率**没有**因为这条改动下降。
+  如果掉了,第一嫌疑是注入位置错了(见第二节),不是注入内容太大。
+- DESIGN.md:task 那一段(2243–2295)补注入契约;**先读现在那段还成不成立再决定改写还是追加**。
