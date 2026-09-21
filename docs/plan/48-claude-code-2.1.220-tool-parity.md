@@ -267,7 +267,7 @@ Plan 48 不做：
 - 所有已知工具进入 registration matrix；六个 anchor 的完整行为链有明确证据。
 - 每个 `missing`、`compatible`、`unknown` 都映射到后续计划或明确排除理由。
 - kloop-only 工具单列，不计入 CC 缺口。
-- `refs/README.md`、`docs/plan/HANDOFF.md` 与 `rust/README.md` 同步基线结论；在完成前不得
+- `refs/README.md`、`docs/plan/HANDOFF.md` 与 `rust/DESIGN.md` 同步基线结论；在完成前不得
   使用“全工具已对齐”或“可替换 Claude Code”的表述。
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`

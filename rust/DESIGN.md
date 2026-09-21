@@ -1,7 +1,13 @@
-# kloop
+# kloop — design and behaviour
 
-k is for keel — a minimal Rust agent MVP (~1200 lines, single crate) built to
-validate five architectural bets before committing to a larger agent design.
+This is the authority on what kloop does today and why each trade-off is what it
+is. It is a specification, not an introduction: the repository's README is the
+way in. Keep it current by **rewriting** the section a change affects — a doc
+that is only ever appended to is how yesterday's behaviour survives as today's
+claim.
+
+k is for keel. The engine started as a ~1200-line single crate built to validate
+the five architectural bets below; it is now ten crates, and every bet held.
 
 ## The five bets
 

@@ -66,7 +66,7 @@ fn arguments_agree(a: &str, b: &str) -> bool {
 
 - `rust/crates/provider/src/responses.rs` — 唯一实质改动:加 `arguments_agree`;`:1078` 与 `:689` 两处比对改调用它。
 - `rust/crates/provider/tests/responses.rs` — 新增契约测试(harness 已有 `sse_body`/`mount_sse`/`responses`/`collect`)。
-- `rust/README.md` — Provider seam 一句补充(若合适):Responses 函数参数按 JSON 值比对,容忍代理的 pretty/compact 差异;开工看现状定要不要加。
+- `rust/DESIGN.md` — Provider seam 一句补充(若合适):Responses 函数参数按 JSON 值比对,容忍代理的 pretty/compact 差异;开工看现状定要不要加。
 - `docs/plan/HANDOFF.md` — 补一条教训(严格解析器对"结构化字段"应比语义值、对"逐字文本"才比字节;真实代理的 pretty/compact 差异;以 codex 取 done 为权威作对照)。
 
 ## 非目标

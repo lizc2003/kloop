@@ -100,7 +100,7 @@ Plan 76 已在基线 `1ab5d7e` 建立 terminal correctness 契约和分层回归
 - `rust/crates/tui/src/lib.rs`：`PinnedBackend`/`StagedSizeBackend` associated error、inline terminal、size-pin commit transaction。
 - `rust/crates/tui/src/{text_layout.rs,composer.rs,render.rs,markdown.rs,toolrow.rs}`：Unicode 行为回归；原则上只在确认的数据语义变化时改测试/实现。
 - `rust/crates/cli/tests/{tui_pty.rs,tui_pty_support/mod.rs}`：vt100 compatibility 与 real-binary terminal gates。
-- `.github/workflows/ci.yml`、`rust/README.md`、`docs/capability-report.md`、`docs/plan/{78-tui-terminal-dependency-upgrade.md,HANDOFF.md}`：MSRV、CI、契约与完成记录。
+- `.github/workflows/ci.yml`、`rust/DESIGN.md`、`docs/capability-report.md`、`docs/plan/{78-tui-terminal-dependency-upgrade.md,HANDOFF.md}`：MSRV、CI、契约与完成记录。
 
 ## 完成记录
 

@@ -58,7 +58,7 @@ cpr marks (us): [1291114, 1326642, 1498297, 1777043, 1905814]
 - `rust/crates/tui/src/terminal/scrollback.rs` — 删末尾 `terminal.clear()`;签名收紧成 `Terminal<PinnedBackend<B>>` 并在函数内开合提交窗口(调用方想漏都漏不掉);`ClearCountingBackend` 加数光标查询,断言提交 = 1 次 clear + **0 次** CPR。
 - `rust/crates/tui/src/lib.rs` — `FrameWriter` 接进 `setup_terminal`/`Terminal` 别名;新 `draw_and_hand_over`(draw + 交帧)取代三处裸 `terminal.draw`;`TerminalSession::restore` 先交帧再还原终端。
 - `rust/crates/cli/tests/tui_pty.rs` — 溢出提交测试补断言:回合中**不出现** `ESC[6n`;clear 落在一对同步输出之内,且重画在同一对之内。
-- `rust/README.md` — inline/scrollback 段补这三条。
+- `rust/DESIGN.md` — inline/scrollback 段补这三条。
 
 ## 非目标
 

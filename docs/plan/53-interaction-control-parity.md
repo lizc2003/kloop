@@ -230,7 +230,7 @@ Workflow meta 用 `tree-sitter-javascript` 定位并验证首条 `export const m
 
 - 本文件：完成记录、测试和提交号。
 - `docs/plan/HANDOFF.md`：Questioner/Approver 分离、ModeState、Workflow profile、`structured_output`、RunStore 安全教训。
-- `rust/README.md`：四前端 Ask、Plan control、Workflow 与 run_program 区别、resume、internal `structured_output`、headless 降级。
+- `rust/DESIGN.md`：四前端 Ask、Plan control、Workflow 与 run_program 区别、resume、internal `structured_output`、headless 降级。
 - `refs/README.md`、`docs/capability-report.md`、server native protocol 文档。
 - `refs/claude-code-2.1.220/{static-evidence.jsonl,tool-matrix.json,verify.py}` 和生成产物；保留本会话新增 fixtures。
 

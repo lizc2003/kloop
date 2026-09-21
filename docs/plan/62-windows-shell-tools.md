@@ -199,7 +199,7 @@ Windows-only schema：
 关键文件：
 
 - `.github/workflows/ci.yml`
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `refs/README.md`

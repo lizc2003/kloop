@@ -522,7 +522,7 @@ pub enum Decision {
 
 文档：
 
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `docs/plan/46-global-user-config.md` 只补 supersession note，不改写历史记录

@@ -556,7 +556,7 @@ Plan 56/57/58 native、scripted provider、sensitive information **将近四周�
 > 与 sleep 猜测进程是否重叠；handle leak 回归应在隔离 test process 中逐轮观察 cleanup/drop 后趋势，不能
 > 等 30 秒 settle 后只看一个终值。
 
-**结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `rust/README.md` Layout 节):
+**结构**:Cargo workspace,十个 crate,到 core 为止主能力链保持单向，另有 `kloop-process-spawn` 作为 core/MCP/CLI/TUI 共用的无业务 child-creation gate；其上两个平级前端 + 三个依赖驱动旁支(详见 `rust/DESIGN.md` Layout 节):
 `kloop-protocol`(零依赖线格式)← `kloop-provider`(适配缝,独占 reqwest)← `kloop-core`(agent 本体,无网络)← {`kloop-tui`(ratatui 前端,独占终端), `kloop-server`(多会话 JSON-RPC 前端)} ← `kloop`(cli,解析参数后分发);`kloop-mcp`(MCP wire)和 `kloop-web`(Web 网络操作)由 cli 胶合到 core 的 ToolSource 缝;`kloop-codemode`(QuickJS)由 core 通过 HostBridge 驱动。
 
 **能力**(全部真实 API 验证过,除注明):

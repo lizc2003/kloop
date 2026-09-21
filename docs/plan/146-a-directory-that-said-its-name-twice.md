@@ -29,7 +29,7 @@ plan 28 的 cwd 陷阱条里。套娃本身不产生 bug,但它每出现一次�
 - `refs/claude-code-2.1.220/static-evidence.jsonl` 里 54 条 `source_type:"kloop"` 的
   `location`:`verify_repo_location` 会**逐条 open 文件并校验行号在范围内**,不是死文本。
 
-**只是给人读的**:`AGENTS.md` 的 `cd kloop`、`rust/README.md`、`refs/claude-code-2.1.220/README.md`,
+**只是给人读的**:`AGENTS.md` 的 `cd kloop`、`rust/DESIGN.md`、`refs/claude-code-2.1.220/README.md`,
 以及 `docs/` 下 55 个文件约 470 处 `kloop/crates/...`。用户拍板一起改——留一批指向旧路径
 的死链,比历史文件的大 diff 更糟。
 

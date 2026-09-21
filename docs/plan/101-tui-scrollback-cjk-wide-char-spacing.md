@@ -37,7 +37,7 @@ ratatui-core 0.1.2 `terminal/inline.rs`:kloop 关了 scrolling-regions,走 `inse
 
 - `rust/crates/tui/src/lib.rs` — `PinnedBackend::draw` 加宽字符续格 skip(唯一改动;用 `unicode_width::UnicodeWidthStr`,该 crate 已是 tui 依赖)。
 - `rust/crates/tui/src/lib.rs`(tests)— 新增 `RecordingBackend`(记录 `draw` 收到的 `(x,y,symbol)`);集成测试 `scrollback_commit_drops_wide_char_continuation_cells`:走生产 `PinnedBackend<RecordingBackend>` + `insert_scrollback_blocks`,断言 `关键Ab` 提交后发给终端的行是 `[(0,关),(2,键),(4,A),(5,b),(6,space),(7,space)]` —— 续格 x=1/3 被丢、宽字符间隔 2、行尾是真 padding。
-- `rust/README.md` — inline/scrollback 段补一句:默认路径会把宽字符续格 `" "` 原样 blit,`Terminal::draw` 的 diff 会跳而 `insert_before` 不跳,故 backend 包装统一复刻该 skip。
+- `rust/DESIGN.md` — inline/scrollback 段补一句:默认路径会把宽字符续格 `" "` 原样 blit,`Terminal::draw` 的 diff 会跳而 `insert_before` 不跳,故 backend 包装统一复刻该 skip。
 
 ## 非目标
 

@@ -36,7 +36,7 @@
 
 - `rust/crates/tui/src/lib.rs` — 新增 `SCROLLBACK_BATCH_ROWS` + `coalesce_scrollback_batches`;`insert_scrollback_blocks` 改按批 `insert_before`。
 - `rust/crates/tui/src/lib.rs`(tests)— 纯函数单测(N 个短 cell → 批数 = ceil(总行/上限),展平内容与顺序不变;超高单 cell 自成一批);计数 backend 集成测试:满屏 inline viewport + 大量短 cell,断言 `clear_region` 次数 = 批数(O(批)),不随 cell 数线性增长;沿用 `scrollback_insert_clears_viewport_without_clearing_history` 证内容正确。
-- `rust/README.md` — overflow/resume 段补一句:首帧提交按批合并(每 cell 一次 `insert_before` → 分批一次),避免长历史 resume 逐格清屏重绘。
+- `rust/DESIGN.md` — overflow/resume 段补一句:首帧提交按批合并(每 cell 一次 `insert_before` → 分批一次),避免长历史 resume 逐格清屏重绘。
 
 ## 非目标
 

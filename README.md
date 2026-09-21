@@ -80,7 +80,7 @@ that same file; the full field reference is
 | Path | What it is |
 |---|---|
 | `rust/` | The cargo workspace, 10 crates: `core` is the engine, `cli` the binary entry point, `tui` / `server` two other front ends |
-| `rust/README.md` | Design and behaviour in detail — why each trade-off is what it is. Long, and the only authority |
+| `rust/DESIGN.md` | Design and behaviour in detail — why each trade-off is what it is. Long, and the only authority |
 | `docs/plan/` | One numbered file per development task, including what went wrong; `HANDOFF.md` is the current state (written in Chinese) |
 | `config/` | Configuration example |
 

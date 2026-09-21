@@ -94,7 +94,7 @@ kloop 已有 `crates/core/src/compact.rs` 的 predictive/reactive 压缩、`Hist
 ### 5. 同步文档与证据边界
 
 - 实施完成时回填本文件状态、实际日期、commit SHA、focused/workspace 验证结果和未执行环境；不在规划阶段宣称已实现能力。
-- 更新 `rust/README.md` 的 Compaction 段，说明 predictive/reactive/manual 共用 seam、replacement/no-op、ToolUse/ToolResult boundary、pressure 不等于 billing、失败不改 history。
+- 更新 `rust/DESIGN.md` 的 Compaction 段，说明 predictive/reactive/manual 共用 seam、replacement/no-op、ToolUse/ToolResult boundary、pressure 不等于 billing、失败不改 history。
 - 在 `docs/plan/HANDOFF.md` 顶部补完成事实与教训，明确 Plan 81 ledger 与 context estimate 的分层；只在 `docs/capability-report.md` 已有 compaction 条目时做最小销账，不宣称 server-side compaction。
 - 如需更新 `refs/README.md`，只补 CodeWhale 当前观察 HEAD/固定证据边界，不把候选设计写成 CodeWhale 或 kloop 已实现的更大能力。
 
@@ -116,7 +116,7 @@ kloop 已有 `crates/core/src/compact.rs` 的 predictive/reactive 压缩、`Hist
 - `rust/crates/core/src/agent.rs`
 - `rust/crates/core/src/commands/compact.rs`
 - `rust/crates/core/src/agent/tests.rs`（若当前测试布局需要补 lifecycle coverage）
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/86-cache-stable-agent-compaction.md`
 - `docs/plan/HANDOFF.md`
 - 必要时 `docs/capability-report.md`、`refs/README.md`

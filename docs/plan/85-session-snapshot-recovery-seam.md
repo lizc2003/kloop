@@ -74,7 +74,7 @@ kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 �
 
 ### 5. 同步文档与证据边界
 
-- 更新 `rust/README.md` 的 session/recovery 说明、`docs/plan/HANDOFF.md` 顶部完成事实与教训、`docs/capability-report.md` 的对应路线销账，以及 `refs/README.md` 的 CodeWhale 当前 HEAD/借鉴范围。
+- 更新 `rust/DESIGN.md` 的 session/recovery 说明、`docs/plan/HANDOFF.md` 顶部完成事实与教训、`docs/capability-report.md` 的对应路线销账，以及 `refs/README.md` 的 CodeWhale 当前 HEAD/借鉴范围。
 - 保留 CodeWhale 固定 HEAD、提交 `c0e69f4ab` 和只读审计边界；不要把候选设计写成已实现能力。
 
 ## 必须复用的现有 seam
@@ -98,7 +98,7 @@ kloop 已有 Plan 77 的 generation/sequence/cursor/snapshot 分层和 Plan 81 �
 - `rust/crates/server/tests/server.rs`
 - `rust/crates/cli/src/args.rs`
 - `rust/crates/tui/src/lib.rs`
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `refs/README.md`

@@ -193,7 +193,7 @@ kloop 侧优先复用：
 - 覆盖 observation 容量/淘汰、partial/full read、取消、写后刷新、同路径竞争和 sub-agent fresh state。
 - 更新 `build_matrix.py`、`tool-matrix.json`、`paired-parity.json` 和 `verify.py`：每个非 `unknown`/`n/a` 单元引用 exact evidence；`same` 必须引用覆盖该精确 cell 的 generated `pair:` contract，并执行比较 CC fixture projection 与 kloop real-dispatch report。
 - 新增 Read/Write/Edit/Grep 静态 anchor 完整性检查；禁止手工修改生成物绕过 generator。
-- 同步本 plan、`docs/plan/HANDOFF.md`、`refs/README.md`、`rust/README.md` 和 `docs/capability-report.md`。只更新当前 matrix 计数，不改写 Plan 48 的历史数字。
+- 同步本 plan、`docs/plan/HANDOFF.md`、`refs/README.md`、`rust/DESIGN.md` 和 `docs/capability-report.md`。只更新当前 matrix 计数，不改写 Plan 48 的历史数字。
 
 ## 最终裁决的有意差异
 

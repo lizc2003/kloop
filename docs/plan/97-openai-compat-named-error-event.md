@@ -129,7 +129,7 @@ if !value["error"].is_null() {                                     // ← 已有
 
 - `rust/crates/provider/src/openai.rs` — 唯一实质改动:守卫放行 `error` 帧名;加 `stream_error`/`is_transient_stream_error`;`data.error` 处理改调 `stream_error`。
 - `rust/crates/provider/tests/openai.rs` — 新增契约测试(harness 已有 `sse_body`/`mount_sse`/`collect`;`mount_sse` 收原始 body,可直接塞 `event: error\ndata: {...}\n\n`)。
-- `rust/README.md` — Provider seam 若有 SSE 行为描述则补一句“Chat rail 识别具名 `event: error` 帧、如实报错、瞬时上游错误可重试”;开工看现状定要不要加。
+- `rust/DESIGN.md` — Provider seam 若有 SSE 行为描述则补一句“Chat rail 识别具名 `event: error` 帧、如实报错、瞬时上游错误可重试”;开工看现状定要不要加。
 - `docs/plan/HANDOFF.md` — 补一条教训(严格 SSE 解析对“错误帧”应先如实报错再谈严格;事件名守卫别挡在错误处理之前;瞬时 vs 致命的显式白名单;以 Responses `error` 事件与 `incomplete_protocol` 为对照)。
 
 ## 非目标

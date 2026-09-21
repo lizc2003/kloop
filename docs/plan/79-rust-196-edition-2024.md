@@ -94,7 +94,7 @@ components = ["clippy", "rustfmt"]
 - `.github/workflows/ci.yml`：保留 stable macOS/Linux/Windows 矩阵、Windows focused tests、workspace test、mock 和 corpus verifier。
 - 因 `rust/rust-toolchain.toml` 会成为目录默认，stable job 的所有 Rust/Cargo 命令显式使用 `+stable`，防止所谓 stable 矩阵实际被 pin 到 1.96.1。
 - MSRV job 从 1.88.0 改为 1.96.1，先记录 `rustc +1.96.1 -Vv`、`cargo +1.96.1 -V`，再运行 locked all-target/all-feature check。
-- 完成本文件；更新 `rust/README.md` 的 Rust 1.96、edition 2024、toolchain pin 与 stable CI 说明。
+- 完成本文件；更新 `rust/DESIGN.md` 的 Rust 1.96、edition 2024、toolchain pin 与 stable CI 说明。
 - 更新 `docs/plan/HANDOFF.md`，记录 env 注入、inner unsafe、drop-order 按诊断审计的教训。
 - `docs/capability-report.md` 只记 engineering maintenance，不改变 parity matrix/captures/pair/bridge 或平台能力结论。
 - 不改历史 Plan78/Plan67 原文；本文件说明后继关系即可。
@@ -152,7 +152,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 - 配置：`rust/Cargo.toml`、`rust/rust-toolchain.toml`、`rust/crates/codemode/Cargo.toml`、`.github/workflows/ci.yml`
 - 已知兼容点：`rust/crates/cli/src/mcp.rs`、`rust/crates/cli/src/provider_config.rs`、`rust/crates/core/src/tools/fs/windows.rs`
 - 生命周期路径：实际 lint 命中的 `rust/crates/{mcp,provider,core,server}/src/**` 与现有 tests
-- 文档：本文件、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`rust/README.md`
+- 文档：本文件、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`rust/DESIGN.md`
 
 ## 后续 — 最后一处 `set_var` 清掉(2026-09-20)
 

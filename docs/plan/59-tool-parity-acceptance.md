@@ -129,7 +129,7 @@ Verifier 明确拒绝：
 - `refs/claude-code-2.1.220/profile-bridges.json`
 - `refs/claude-code-2.1.220/README.md`
 - Plan 53/59 Rust reports及 `tools/mod.rs` test registration
-- 本 plan、`HANDOFF.md`、`refs/README.md`、`rust/README.md`、`docs/capability-report.md`
+- 本 plan、`HANDOFF.md`、`refs/README.md`、`rust/DESIGN.md`、`docs/capability-report.md`
 
 ## 验证
 

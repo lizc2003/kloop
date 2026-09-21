@@ -30,7 +30,7 @@ plain 是传统 line-based REPL，不需要复制 TUI 的 raw-key composer。按
 - `rust/crates/cli/tests/plain_pty.rs` 与 `tui_pty_support/mod.rs`
   - 泛化现有 hermetic PTY harness 以传入 `--plain`。
   - 真 binary 覆盖 idle 单次 Ctrl+C 退出、运行中 Ctrl+C cancel→history patch→退出、banner 不再广告 Ctrl+D。
-- `rust/README.md`、`docs/plan/HANDOFF.md`
+- `rust/DESIGN.md`、`docs/plan/HANDOFF.md`
   - 同步 plain 与 TUI 的有意差异，以及 Ctrl+D 是 canonical EOF 而非应用快捷键的分层。
 
 ## 验证

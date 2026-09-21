@@ -100,7 +100,7 @@ CodeWhale 已提供目标 UX：`/provider` 打开 picker，`/provider <name>` �
 - `rust/crates/tui/src/` 的 slash routing、picker、status/header 与 idle worker
 - `rust/crates/server/src/{lib.rs,events.rs,wire.rs}`
 - CLI/TUI/server/provider/core 的 route lifecycle、request capture、resume/fork/rewind/compaction tests
-- `rust/README.md`、`docs/plan/HANDOFF.md`、Plan 91 acceptance matrix
+- `rust/DESIGN.md`、`docs/plan/HANDOFF.md`、Plan 91 acceptance matrix
 
 ## 非目标
 

@@ -163,7 +163,7 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 
 - `rust/crates/core/src/commands/cost.rs`
 - `rust/crates/core/src/commands/mod.rs`
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/HANDOFF.md`
 - `docs/capability-report.md`
 - `refs/README.md`
@@ -221,7 +221,7 @@ ledger 不进入 provider replay messages，不写入 public display event，也
 - `rust/crates/core/src/commands/cost.rs`
 - `rust/crates/provider/src/lib.rs`
 - resume signature 的机械调用点：`rust/crates/{cli/src/args.rs,tui/src/lib.rs,server/src/lib.rs}`
-- `rust/README.md`、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`refs/README.md`
+- `rust/DESIGN.md`、`docs/plan/HANDOFF.md`、`docs/capability-report.md`、`refs/README.md`
 
 预计不修改三个真实 provider adapter、`core/src/event.rs`、`server/src/events.rs`、`server/src/wire.rs`、Desktop 仓库、Cargo manifests 或 `Cargo.lock`。若最终 diff 触及这些文件，完成记录必须逐项解释，且不得突破本计划的 public/security/无新增依赖边界。
 

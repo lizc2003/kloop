@@ -56,7 +56,7 @@ git diff --check
 
 - `rust/crates/tui/src/app.rs`
 - `rust/crates/cli/tests/tui_pty.rs`
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/38-tui-cc-parity.md`
 - `docs/plan/HANDOFF.md`
 

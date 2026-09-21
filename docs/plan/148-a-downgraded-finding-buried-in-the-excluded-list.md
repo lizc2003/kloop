@@ -46,7 +46,7 @@
 
 ## ✅ 已完成(2026-09-15;提交 SHA 以本条所在提交为准)
 
-SKILL.md 三处如上,`skills.rs` 补一条 clause 断言,`rust/README.md` 的 builtin 段同步
+SKILL.md 三处如上,`skills.rs` 补一条 clause 断言,`rust/DESIGN.md` 的 builtin 段同步
 (降级项进 findings 列表、不进 excluded 尾巴)。
 
 ### 验证

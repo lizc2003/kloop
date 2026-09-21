@@ -170,7 +170,7 @@ task; prefer URLs the user or local files provide.
 
 - `rust/crates/core/src/context.rs` — 替换 `BASE_SYSTEM` 常量（唯一实质改动）。
 - `rust/crates/cli/src/context.rs` — `mock()` 拼接如选方案 B 才改；`gather()` 无需改（已走 `assemble_system(BASE_SYSTEM, …)`）。
-- `rust/README.md` — 行为变更同步：一句说明系统提示词从一行升级为分节方针。
+- `rust/DESIGN.md` — 行为变更同步：一句说明系统提示词从一行升级为分节方针。
 - `docs/plan/HANDOFF.md` — 补进度与教训（如「base 只写方针、工具说明留在 tool def」）。
 
 ## 非目标

@@ -244,7 +244,7 @@ Plan 60 首推的 provider stream guard 仍是独立候选，不并入本计划�
 
 实现完成后更新：
 
-- `rust/README.md`：raw Read/Edit 上限、Read 的 LF 逻辑展示、Edit exact-first newline fallback、Write 原样整体替换、批准后安全创建缺失父目录，以及 Unix/Windows 在 ACL/mode 与 crash-durability 上的真实边界。
+- `rust/DESIGN.md`：raw Read/Edit 上限、Read 的 LF 逻辑展示、Edit exact-first newline fallback、Write 原样整体替换、批准后安全创建缺失父目录，以及 Unix/Windows 在 ACL/mode 与 crash-durability 上的真实边界。
 - `docs/capability-report.md`：把 Plan 61 记为 Plan 49 后续 correctness/resource corrective，不改写历史 parity 结论。
 - `docs/plan/HANDOFF.md`：记录“模型输出预算不等于 I/O 预算”、CRLF logical-match/raw-preservation 规则与完成状态。
 - 本文件：补实际裁决、验证结果、日期、提交号和 `✅`。

@@ -115,7 +115,7 @@ helper 测试覆盖 combining mark、ZWJ family/technologist、skin tone、flag�
 - `rust/crates/tui/src/{text_layout.rs,composer.rs,menu.rs,app.rs,render.rs,lib.rs}`：统一 offset/layout、visual navigation 及 terminal geometry。
 - `rust/crates/cli/tests/{tui_pty.rs,tui_pty_support/*}`：真实 binary PTY、CPR、ANSI frame 和本地 SSE fixture。
 - `rust/{Cargo.toml,crates/tui/Cargo.toml,crates/cli/Cargo.toml}`：Unicode 与 Unix-only dev 依赖。
-- `rust/README.md`、`docs/plan/{76-tui-terminal-correctness.md,HANDOFF.md}`、`docs/capability-report.md`：当前契约和完成记录。
+- `rust/DESIGN.md`、`docs/plan/{76-tui-terminal-correctness.md,HANDOFF.md}`、`docs/capability-report.md`：当前契约和完成记录。
 
 ## 验证
 

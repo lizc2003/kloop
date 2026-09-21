@@ -564,7 +564,7 @@ response remained truncated after <N> continuation attempts
 
 文档：
 
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/HANDOFF.md`
 - 本计划完成记录
 

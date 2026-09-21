@@ -128,7 +128,7 @@ PDF 页图是转换后的展示，显式 `pages` 还可能只覆盖源文件的�
 
 同步更新：
 
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/capability-report.md`
 - `docs/plan/HANDOFF.md`
 - `refs/README.md`

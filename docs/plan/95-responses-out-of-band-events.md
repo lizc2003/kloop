@@ -62,7 +62,7 @@ fn is_out_of_band(event: &str) -> bool {
 
 - `rust/crates/provider/src/responses.rs` — 唯一实质改动:加 `is_out_of_band`;上移两行解析并改 terminal 后守卫;match 加带外守卫臂。
 - `rust/crates/provider/tests/responses.rs` — 新增 wiremock 契约测试(harness 已有 `sse_body`/`mount_sse`/`responses`/`collect`)。
-- `rust/README.md` — 若有"provider/SSE 行为"描述则补一句"Responses 放行 `codex.*` 厂商带外遥测事件";无则不加(避免为内部细节新增段落,开工时看 README 现状定)。
+- `rust/DESIGN.md` — 若有"provider/SSE 行为"描述则补一句"Responses 放行 `codex.*` 厂商带外遥测事件";无则不加(避免为内部细节新增段落,开工时看 README 现状定)。
 - `docs/plan/HANDOFF.md` — 补一条教训(带外遥测 vs 语义流的分层、窄口放行前缀、两处拒绝点须一致、以另一 rail 的既有先例为模板);编号取所在教训列表的下一个。
 
 ## 非目标

@@ -1,7 +1,7 @@
 # kloop provider config — one profile per wire protocol. Copy to
 # ~/.kloop/config.toml; kloop requires 0700 on the directory and 0600 on the
 # file. Full reference, and the other sections (mcp, hooks, sandbox, shells,
-# agents, program, permissions), in rust/README.md.
+# agents, program, permissions), in rust/DESIGN.md.
 #
 #   mkdir -p ~/.kloop && chmod 700 ~/.kloop
 #   cp config/config-demo.toml ~/.kloop/config.toml && chmod 600 ~/.kloop/config.toml

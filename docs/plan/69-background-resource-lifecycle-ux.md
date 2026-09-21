@@ -140,7 +140,7 @@ Inbox 注入使用稳定来源 framing：
 
 ### 5. 文档与真实 dogfood
 
-- 同步 `rust/README.md`、`docs/capability-report.md` 和完成时的 `docs/plan/HANDOFF.md`。
+- 同步 `rust/DESIGN.md`、`docs/capability-report.md` 和完成时的 `docs/plan/HANDOFF.md`。
 - 文档分别列出 wire tool name、UI product name、execution ID、durable ID 和 stop/resume 用途。
 - 用真实 Anthropic 与 OpenAI Chat 各运行一组后台 Agent、后台 Program 和 Workflow：模型可正确生成 `description`/`background`，无需 `TaskOutput`，协议事件与自动 delivery 完成闭环。
 - dogfood 只记录脱敏后的资源类型、计数、状态和 ID 形状；不记录 key、endpoint、raw provider response 或 transcript。

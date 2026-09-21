@@ -61,7 +61,7 @@ TUI 的 `Composer` 已有完整多行文档模型：`ComposerLayout` 统一硬�
 - `rust/crates/tui/src/lib.rs`
 - `rust/crates/tui/src/app.rs`
 - `rust/crates/cli/tests/tui_pty.rs`
-- `rust/README.md`
+- `rust/DESIGN.md`
 - `docs/plan/HANDOFF.md`
 
 ## 验证
