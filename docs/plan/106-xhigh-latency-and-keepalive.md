@@ -1,4 +1,4 @@
-# Plan 106 — gateway xhigh 实测:放行 `keepalive` 带外事件、补 `prompt_cache_key`
+# Plan 106 — 网关 xhigh 实测:放行 `keepalive` 带外事件、补 `prompt_cache_key`
 
 > 状态：进行中（2026-08-31）
 >
@@ -11,24 +11,15 @@
 
 ## Context — 诊断实测
 
-用真实 gateway(`~/.kloop/config.toml` 的 `gw_router` / `gpt-5.6-sol`)逐条测出来的:
+用真实网关(`~/.kloop/config.toml` 的 responses 档 / `gpt-5.6-sol`)逐条测出来的。
+具体数字(端点延迟、token 用量)属于那个网关,不抄进公开文档;下面只留结论:
 
-**1. 「codex 也是 xhigh」这个前提不成立。** 扫本机 `~/.codex/sessions` + `archived_sessions` 全部 110 个 rollout 的 `reasoning_effort`:
+**1. 「codex 也是 xhigh」这个前提不成立。** 扫本机 codex 的历史会话,`reasoning_effort`
+绝大多数是 `medium`、没有一次 xhigh——它的配置没设 effort 走默认,而 kloop 配置写死
+`effort = "xhigh"`。同端点同模型下,xhigh 的首字延迟比 low 高一个数量级,每请求
+reasoning token 也从 0 涨到上万。**慢的主因是 effort 档位差,不是 kloop 的实现。**
 
-```
-118 次 "medium"   1 次 "low"   0 次 "xhigh"
-```
-
-`~/.codex/config.toml` 无 effort 设定,走默认 medium;kloop 配置写死 `effort = "xhigh"`。同端点同模型实测首字延迟:
-
-| effort | ttft_ms | 单请求 reasoning tokens |
-| --- | --- | --- |
-| low | 2,822 | 0 |
-| xhigh | 69,205 ~ 238,276 | 9,840 ~ 12,040 |
-
-codex medium 会话每请求 reasoning 中位 0、最大 516。**慢的主因是 effort 档位差,不是 kloop 的实现。**
-
-**2. `max_output_tokens` 这条排除掉了。** kloop 发 `max_output_tokens: 8192`(codex 的 `ResponsesApiRequest` 无此字段),一度怀疑 xhigh 推理超限触发 `agent.rs:665` 的截断续跑。实测把该字段原样发出去:回 `status: completed`、`output_tokens: 12489`(> 8192)、`incomplete_details: null` —— **gateway 忽略这个字段**,截断续跑从未触发。本计划不动它。
+**2. `max_output_tokens` 这条排除掉了。** kloop 发 `max_output_tokens: 8192`(codex 的 `ResponsesApiRequest` 无此字段),一度怀疑 xhigh 推理超限触发 `agent.rs:665` 的截断续跑。实测把该字段原样发出去:回 `status: completed`、`output_tokens: 12489`(> 8192)、`incomplete_details: null` —— **网关 忽略这个字段**,截断续跑从未触发。本计划不动它。
 
 **3. 真 bug:`keepalive`。** kloop 真跑一轮 xhigh 直接死于
 `provider protocol error: openai-responses returned an unknown semantic event`。抓 SSE 原始帧:
@@ -38,7 +29,7 @@ event: keepalive
 data: {"sequence_number":2,"type":"keepalive"}
 ```
 
-gateway 在**模型思考期间**填 keepalive,思考越久填得越多——这正是 xhigh 的常态:
+网关 在**模型思考期间**填 keepalive,思考越久填得越多——这正是 xhigh 的常态:
 
 | effort | keepalive 数 |
 | --- | --- |
@@ -69,7 +60,7 @@ gateway 在**模型思考期间**填 keepalive,思考越久填得越多——这
 
 ### 片 1 回归暴露的后续缺陷 — reasoning summary part 生命周期不匹配
 
-放行 keepalive 后,真实 xhigh 轮改报 `openai-responses reasoning parts overlapped`(`responses.rs:931`)。抓包看 gateway 对**每个** reasoning item 的实际形状是:
+放行 keepalive 后,真实 xhigh 轮改报 `openai-responses reasoning parts overlapped`(`responses.rs:931`)。抓包看 网关 对**每个** reasoning item 的实际形状是:
 
 ```
 part.added sidx=0 → text.delta sidx=0
@@ -99,7 +90,7 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 ### 片 3 — reasoning summary part 生命周期放宽 ✅（2026-08-31；提交 SHA 以本条所在提交为准；用户已拍板"接受"）
 
-片 1 回归暴露的那道墙。gateway 对每个 reasoning item 的真实形状是「每个 part 都 added+delta,只有最后一个 part 有 `.done`」,kloop 假设严格嵌套并在三处强制它。按用户拍板放宽,**放宽的只是冗余复核,真正的保证一个没动**:
+片 1 回归暴露的那道墙。网关 对每个 reasoning item 的真实形状是「每个 part 都 added+delta,只有最后一个 part 有 `.done`」,kloop 假设严格嵌套并在三处强制它。按用户拍板放宽,**放宽的只是冗余复核,真正的保证一个没动**:
 
 - `reasoning_summary_part.added`:去掉"有未关闭 part 就报错"的守卫。
 - `add_content_part` 的 `ItemKind::Reasoning` 分支:同样去掉。两处是同一个生命周期问题,只放宽一半会留下另一半随时再炸。**Message 分支保持严格**——没有观测到消息内容 part 重叠,窄口不外扩。
@@ -170,7 +161,7 @@ Responses 请求体加 `prompt_cache_key`,取会话内稳定值。
 
 片 2 把 Chat 轨列为非目标,理由是「无实测」。用户要求补上,于是**先测再定**(教训 84c:探针必须带一行「不发这个字段」的对照)。
 
-真实 gateway `/chat/completions`,body 形状照抄 kloop 实际所发(`max_tokens`、`stream_options`、tools、`reasoning_effort`):
+真实 网关 `/chat/completions`,body 形状照抄 kloop 实际所发(`max_tokens`、`stream_options`、tools、`reasoning_effort`):
 
 | 行 | 结果 |
 | --- | --- |
@@ -241,7 +232,7 @@ input[12] function_call_output  2093 字符  …[full output offloaded, id=off-0
 ## 慢的真正原因(推翻本文件前面的判断)
 
 用户指出对照组是 **codex 源头、手选 xhigh**,不是 codex 的 medium 记录。重测,同一个 commit、
-同一个 gateway、都走本地抓包代理:
+同一个 网关、都走本地抓包代理:
 
 | | 墙钟 | 请求数 | provider 耗时 | 本地工具耗时 |
 | --- | --- | --- | --- | --- |
@@ -278,12 +269,12 @@ provider 只占 31%,其余全花在本地——它检出了一个 git worktree,�
 
 ## 片 10 ✅ — 真实场景复测:仓库找错了,结论重来
 
-用户指出实测仓库是 `被审仓库`,不是 kloop 仓库。这推翻了
-片 9 那套「上下文不对称」的因果:**gateway 的 `CLAUDE.md` 内容就是 `@AGENTS.md`**,
+用户指出实测仓库是被审的那个 Go 仓库,不是 kloop 仓库。这推翻了
+片 9 那套「上下文不对称」的因果:**被审仓库的 `CLAUDE.md` 内容就是 `@AGENTS.md`**,
 两个工具读的是同一份 15,960 字节文件,codex 也照着里面第 160 行跑了 `go test`、
 `make docs-check`。不对称在那里根本不存在。
 
-同 commit(`2bb28b48`)、同 xhigh、同 gateway 实测:
+同 commit(`2bb28b48`)、同 xhigh、同 网关 实测:
 
 | | 请求数 | 总提示量 | 缓存命中 | 单请求上下文 | 墙钟 | 产出 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -364,7 +355,7 @@ agent 固定无上限;人显式设的 `--max-rounds`(headless 跑飞兜底)保�
 ## 片 12 ✅ — 修完之后的六轮实测,以及一次被实测推翻的自己的改动
 
 片 11 只跑了单元测试就写完了,**没有实测**。用户问"慢的问题实测解决了吗",答案是没有,
-补测之后结论如下(同 commit `2bb28b48`、同 xhigh、同 gateway):
+补测之后结论如下(同 commit `2bb28b48`、同 xhigh、同一网关):
 
 | | 请求数 | 墙钟 | 产出 |
 | --- | --- | --- | --- |
@@ -408,7 +399,7 @@ agent 固定无上限;人显式设的 `--max-rounds`(headless 跑飞兜底)保�
 
 ## 片 13 ✅ — 两处按实测结论的改动
 
-**(a) `STREAM_OPEN_TIMEOUT` 45s → 300s。** 这个超时等的是**响应头**,而在 gateway
+**(a) `STREAM_OPEN_TIMEOUT` 45s → 300s。** 这个超时等的是**响应头**,而在 网关
 这类代理上,头要等到模型开始产出才发,于是思考时间被折进了这个窗口:实测 TTFT 低
 effort 约 3 秒,xhigh 是 69~238 秒。45 秒等于把"慢但健康的 xhigh 请求"判成断连——
 一轮真实审查触发了 34 次,每次代价是空等加整个请求重发。codex 的同位旋钮
@@ -652,7 +643,7 @@ per-provider 配置位。真要固化,应该先加配置位而不是改全局默
 按性质不该用平均耗时衡量;只有"子 agent 结论"和"别重新推导"这两条声称能**减少压缩后
 重读**。这一条是可测的,于是测了。
 
-设计:唯一变量是提示词二进制(A = `2340c02^`,B = 当前),同一个 gateway worktree、
+设计:唯一变量是提示词二进制(A = `2340c02^`,B = 当前),同一个被审仓库 worktree、
 同一个 commit、同一句 prompt,`KLOOP_CONTEXT_WINDOW=100000` 压低窗口强制压缩。
 
 **第一版设计是错的。**直接比全程重读率得到 A 58% / B 72%,看起来新提示词更差——但两组

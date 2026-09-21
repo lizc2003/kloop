@@ -296,11 +296,11 @@ fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, Provide
     Ok(kind)
 }
 
-/// gateway/Codex 代理往 Responses 流里塞的厂商带外事件只携带遥测或心跳、
+/// Codex 式代理往 Responses 流里塞的厂商带外事件只携带遥测或心跳、
 /// 不属官方语义族——识别后跳过,其余未知事件仍 fail-closed(见 match 兜底)。
 /// 对齐 anthropic 的 `ping` 处理。名单两类:
 /// - `codex.*`:厂商命名空间前缀,目前只见 `codex.rate_limits` 的限流遥测。
-/// - `keepalive`:裸名心跳,gateway 在模型思考期间填。填得多少只取决于思考
+/// - `keepalive`:裸名心跳,代理在模型思考期间填。填得多少只取决于思考
 ///   多久——实测 effort=low 一个没有,xhigh 一轮 2~14 个——所以它对高 effort
 ///   是常态而非异常。
 /// - `responsesapi.*`:另一个厂商命名空间,目前只见 `responsesapi.websocket_timing`
@@ -502,7 +502,7 @@ fn add_content_part(
             Ok(kind == MessagePartKind::Refusal)
         }
         ItemKind::Reasoning { content, .. } => {
-            // No overlap guard here, unlike Message above: gateway opens every
+            // No overlap guard here, unlike Message above: the proxy opens every
             // reasoning part and streams its delta but closes only the last one,
             // so a new part legitimately opens while earlier ones are still
             // open. Reasoning parts are independent by index, and correctness
@@ -701,7 +701,7 @@ fn verify_reasoning_parts(
     let mut texts = Vec::with_capacity(parts.len());
     for (position, (index, part)) in parts.into_iter().enumerate() {
         // Indices must still be dense and ordered, but an unclosed part is not
-        // an error: gateway closes only the last one. What actually verifies
+        // an error: the proxy closes only the last one. What actually verifies
         // the stream is the text comparison below against the final array —
         // per-part `.done` was only ever a redundant, earlier check.
         if index != position as u64 {

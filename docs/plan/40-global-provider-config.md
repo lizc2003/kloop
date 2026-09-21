@@ -21,7 +21,7 @@ model_provider = "gw_router"
 model_reasoning_effort = "xhigh"
 
 [model_providers.gw_router]
-name = "gateway" # 可选展示名
+name = "网关" # 可选展示名
 wire_api = "responses" # responses | chat | anthropic
 base_url = "https://example/v1"
 http_headers = { Authorization = "Bearer ..." }

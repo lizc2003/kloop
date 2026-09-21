@@ -9,7 +9,7 @@
 
 约定:`cc/` = `<cc-src>/`;cc 的 SDK 指
 `@modelcontextprotocol/sdk` 的 `client/auth.js`(cc 把协议编排全委托给它)。
-`sky/` = `refs/codex/codex-rs/rmcp-client/src/`;codex
+`cx/` = `refs/codex/codex-rs/rmcp-client/src/`;codex
 把协议原语委托给 `rmcp` crate(v1.8.0,feat `auth`)+ `oauth2` crate v5,
 `RMCP` = 该 crate 的 `transport/auth.rs`。
 
@@ -18,7 +18,7 @@
   发现缓存 + 刷新锁;PKCE/DCR/授权 URL/code 换 token 全由 SDK `auth()` 做
   (`cc/services/mcp/auth.ts:847 performMCPOAuthFlow`、`:1376 ClaudeAuthProvider`)。
 - **codex**:自实现登录编排(`rmcp-client/src/perform_oauth_login.rs`)+ token 持久化
-  (`sky/oauth.rs`)+ HTTP 适配 + 传输挂钩(`sky/rmcp_client.rs`);PKCE/discovery/
+  (`cx/oauth.rs`)+ HTTP 适配 + 传输挂钩(`cx/rmcp_client.rs`);PKCE/discovery/
   DCR/交换/refresh 全在 `rmcp`(`RMCP` 全文),`rmcp` 又建在 `oauth2` v5 上。
 
 **两家收敛的骨架(必然解,直接照抄机制)**:
@@ -26,55 +26,55 @@
 1. **授权码 + PKCE(S256)+ state**。verifier = 随机 32B、challenge =
    base64url(sha256(verifier))、`code_challenge_method=S256`;state = 随机 CSRF,
    回调**必须校验一致**才收 code。两家:cc SDK `auth.js:705-728` + 回调校验
-   `cc/…/auth.ts:1109-1118`;sky `RMCP:1200-1241`(PKCE+CSRF)+ 客户端要求
-   `code`&`state` 同在 `sky/perform_oauth_login.rs:354-355`。verifier/state 只需
+   `cc/…/auth.ts:1109-1118`;codex `RMCP:1200-1241`(PKCE+CSRF)+ 客户端要求
+   `code`&`state` 同在 `cx/perform_oauth_login.rs:354-355`。verifier/state 只需
    单次 flow 内存持有(cc 明确不落盘 `auth.ts:1946-1949`)。
 
 2. **两步 discovery + 从 401 拿 metadata URL**(RFC 9728 → RFC 8414):
    - GET server URL,读 **401 的 `WWW-Authenticate` 头**,正则抠
-     `resource_metadata="…"`(cc SDK `auth.js:399-408`;sky `RMCP:1817-1848,1906-1923`)。
+     `resource_metadata="…"`(cc SDK `auth.js:399-408`;codex `RMCP:1817-1848,1906-1923`)。
    - GET 该 protected-resource metadata → 取 `authorization_servers[0]`
-     (cc `auth.js:662-685`;sky `RMCP:1727-1758`)。
+     (cc `auth.js:662-685`;codex `RMCP:1727-1758`)。
    - 对 AS GET `.well-known/oauth-authorization-server`(失败退
      `openid-configuration`)拿 `authorization_endpoint`/`token_endpoint`/
      `registration_endpoint`。**必须带 path-aware 变体**(`/.well-known/oauth-
      authorization-server/<path>`,path-scoped server 很常见):cc `auth.js:555-586`
-     + `cc/…/auth.ts:302-310`;sky `RMCP:1671-1682,834-848`。
+     + `cc/…/auth.ts:302-310`;codex `RMCP:1671-1682,834-848`。
 
 3. **本地 loopback 回调 server**:`127.0.0.1:<随机高位端口>`、path `/callback`、
    `redirect_uri = http://localhost:<port>/callback`(RFC 8252 §7.3:loopback 只需
    path 匹配、端口任意);oneshot/channel 等 code、**~5 分钟超时**、收到回 200 HTML。
    cc `auth.ts:1099-1213` + `oauthPort.ts`(端口随机、可 `MCP_OAUTH_CALLBACK_PORT`
-   固定);sky 用 `tiny_http` 随机端口 + `spawn_blocking` + `timeout(300s)`
-   `sky/perform_oauth_login.rs:260-303,507-596`。
+   固定);codex 用 `tiny_http` 随机端口 + `spawn_blocking` + `timeout(300s)`
+   `cx/perform_oauth_login.rs:260-303,507-596`。
 
 4. **client_id:预配 vs DCR(RFC 7591)**。有预配 client_id 就直接用;否则 POST
    `registration_endpoint`(body `grant_types:[authorization_code,refresh_token]`、
    `token_endpoint_auth_method:"none"` = public client、`response_types:["code"]`),
    取回 `client_id` 存下复用。cc `auth.js:892-916` + `cc/…/auth.ts:1417-1538`;
-   sky `RMCP:1077-1170,2476-2497`。**CIMD(SEP-991,URL-as-client_id)是 Anthropic 托管
+   codex `RMCP:1077-1170,2476-2497`。**CIMD(SEP-991,URL-as-client_id)是 Anthropic 托管
    专属**(cc `clientMetadataUrl` 固定 claude.ai,`auth.ts:1445-1452`)→ kloop 不做。
 
 5. **token 存储:绝对 `expires_at`,key=`name|hash(url)`**。存
    `{url, client_id, access_token, refresh_token, expires_at(绝对时间), scope}`;
    **持久化算绝对过期时间而非存相对 `expires_in`**(否则重启无法判临期——两家都
-   踩过并这么修:sky `oauth.rs:733-745,155-175`;cc `auth.ts:1704-1731`)。后端:
-   两家都 keyring 优先、file 回退(sky `oauth.rs:103-283`;cc `utils/secureStorage/`)。
+   踩过并这么修:codex `oauth.rs:733-745,155-175`;cc `auth.ts:1704-1731`)。后端:
+   两家都 keyring 优先、file 回退(codex `oauth.rs:103-283`;cc `utils/secureStorage/`)。
 
 6. **刷新:请求前临期主动刷 + 401 兜底 + 失败清 token**。剩余寿命 < skew
-   (sky 30s `oauth.rs:71`;cc 300s `auth.ts:1650`)就 `grant_type=refresh_token`
-   先刷再发;`invalid_grant`/refresh 失败 → 清 token、标记需重登(sky `RMCP:1570-
+   (codex 30s `oauth.rs:71`;cc 300s `auth.ts:1650`)就 `grant_type=refresh_token`
+   先刷再发;`invalid_grant`/refresh 失败 → 清 token、标记需重登(codex `RMCP:1570-
    1616`+`persist`;cc `auth.ts:2177-2359`)。跨进程刷新锁两家都有(file lock),对
    kloop 是 nice-to-have,单进程先 `Mutex`/in-flight 去重。
 
 7. **不在 401 自动弹浏览器**(两家一致,关键 UX):连接/请求 401 → 只标记该 server
    `needs-auth`(cc 15min 缓存避免反复探测 `client.ts:2313-2329`),**交互式登录由
    用户命令显式触发**,不后台抢 TTY。cc `performMCPOAuthFlow` 全仓无自动调用点;
-   sky 交互登录是独立入口。
+   codex 交互登录是独立入口。
 
 8. **RFC 8707 `resource` 参数**:授权 URL 与 token/refresh 请求都带
    `resource=<mcp server url>`(audience 绑定),面向强校验 audience 的 server 必需。
-   cc `auth.js:725-726`;sky `RMCP:1209` + `perform_oauth_login.rs:546-550`。
+   cc `auth.js:725-726`;codex `RMCP:1209` + `perform_oauth_login.rs:546-550`。
 
 ## kloop 现状与落点
 

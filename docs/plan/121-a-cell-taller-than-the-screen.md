@@ -2,7 +2,7 @@
 
 > 状态：✅ 已完成（2026-09-04；提交 SHA 以本条所在提交为准）
 >
-> 来源：2026-09-04 dogfood。用户 `kloop -r` 恢复 gateway 的审查会话
+> 来源：2026-09-04 dogfood。用户 `kloop -r` 恢复那个 Go 仓库的审查会话
 > （`20260904-063311`，32 message(s)），「看不到最后的完整结论」。
 >
 > 依赖 / 前情：Plan 38 切片 0（inline `insert_before` 进 native scrollback）、

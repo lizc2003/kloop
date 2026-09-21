@@ -1,4 +1,4 @@
-# gateway prompt cache：三个可复现的问题
+# 网关 prompt cache：三个可复现的问题
 
 > 2026-09-07。证据来自 kloop（一个 Rust coding agent）本机 84 个会话 2636 轮真实
 > 采样，加上一组针对性的对照实验（9 + 4 个 trial）。本文自足，不需要 kloop 的上下文。

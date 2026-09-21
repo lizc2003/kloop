@@ -23,7 +23,7 @@ use crate::sse::SseParser;
 
 /// How long to wait for response *headers*. Generous because on some proxies the
 /// headers do not arrive until the model starts producing, which folds thinking
-/// time into this window: measured TTFT on gateway is ~3s at low effort but
+/// time into this window: measured TTFT on 网关 is ~3s at low effort but
 /// 69–238s at xhigh. At 45s a slow-but-healthy xhigh request looked like a dead
 /// connection — one real review burned 34 timeouts, each costing the wait plus a
 /// full re-request. Codex's comparable knob (`stream_idle_timeout`) defaults to

@@ -1,6 +1,6 @@
 # Plan 117 — 压缩别把自己写进摘要，agent 别复制我的任务
 
-> 来源：2026-09-03 dogfood。同一句 prompt（`审查：cc0a236b，951a19cb`）在 gateway
+> 来源：2026-09-03 dogfood。同一句 prompt（`审查：cc0a236b，951a19cb`）在那个 Go 仓库
 > 仓库跑 claude / codex / kloop 三家做对比，读 rollout 找出的差距。
 > kloop 会话：`~/.kloop/projects/v1/p1_434f98d7…/sessions/20260903-091113{,-agent-1}.jsonl`
 
@@ -144,7 +144,7 @@ cache identity `{parent}-{agent_id}`，因为它的前缀和父的没有共同�
 - **cache 命中率 ~20%**（主 590k/(2.40M+590k)，子 1.34M/(5.64M+1.34M)；同一天的
   claude 会话是 96%，口径不同不可直接比）。不是 kloop 的 bug：`prompt_cache_key` 已经在发
   （`provider/src/lib.rs:543`），逐轮数据呈「要么 0 要么几乎全中」的跳跃，正是
-  `lib.rs:433-436` 注释里已经实测记录过的 gateway 亲和不稳（同一 7,697-token
+  `lib.rs:433-436` 注释里已经实测记录过的 网关 亲和不稳（同一 7,697-token
   前缀连发三次：0 / 6,656 / 0）。
   **后续更正（见 plan 118 第四节）**：拿到 key 做了两组对照实验——同渠道同模型下
   codex 41.3% / kloop 19.7%，而受控条件下两种请求布局都能到 90%+。所以命中率是

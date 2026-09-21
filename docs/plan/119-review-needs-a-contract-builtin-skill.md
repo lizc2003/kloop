@@ -1,6 +1,6 @@
 # Plan 119 — 审查要有产出契约：kloop 的第一个内置 skill
 
-> 来源：2026-09-04 的三家对比。同一 prompt `审查：7fed2427`（gateway，
+> 来源：2026-09-04 的三家对比。同一 prompt `审查：7fed2427`（被审的 Go 仓库，
 > `fix: bind video assets to channel`，11 文件 242+/89-），claude / codex / kloop
 > 同一分钟起跑，各跑一遍。产出：**claude 11 条（复核后 10 条 + 1 条显式降级）、
 > codex 2 条、kloop 1 条**；耗时 17.5 / 48.4 / 36.8 分钟。
@@ -10,7 +10,7 @@
 
 ## 现场：候选缺陷在收尾时蒸发
 
-三家都命中、且回 gateway 源码核实为真的那条最重的缺陷是：删掉 selector 之后，
+三家都命中、且回被审仓库源码核实为真的那条最重的缺陷是：删掉 selector 之后，
 未知 channel 由 `router.<err>` → 400 退化成 `<err>` → **503 +
 `<err>` + 静态文案 + `c.Error(err)` 记成服务端错误**
 （`gateway/resource/<file>.go:813`、`gateway/handler/<file>.go:193`）。
@@ -68,7 +68,7 @@ findings... empty array if nothing survived verification"——**不要求报告
 ## 一、内置 skill：kloop 现在一个 skill 都没有
 
 `load_skills`（`crates/cli/src/startup.rs:485`）只扫两个磁盘根：`<cwd>/.kloop/skills/`
-和 `~/.kloop/skills/`。gateway 两个都没有，所以那次会话 kloop 的 skill catalog 是空的，
+和 `~/.kloop/skills/`。被审仓库两个都没有，所以那次会话 kloop 的 skill catalog 是空的，
 而 claude 第一步就 `Skill(code-review, 7fed2427)`。能力已经齐了（`SkillContext::Fork`
 是现成的），缺的是**随二进制分发的那一层**。
 
@@ -120,7 +120,7 @@ kloop 那次跑了 `go test ./...`、`-tags=integration`、`make test`、`make l
 `make lint` 因本地 `golangci-lint` 环境故障失败，还占了终稿一段。claude 只跑了
 `go build ./...` + 3 个受影响包，codex 跑了 3 个包 + `docs-check`。
 
-依据被误读了：gateway `AGENTS.md:160` 写的是「**合并前**按影响运行 `make test`、
+依据被误读了：被审仓库 `AGENTS.md:160` 写的是「**合并前**按影响运行 `make test`、
 `make lint`、`go vet ./...`」。审查一个已经在 `origin/test` 上的 commit 不是合并前
 自检。cc 的 code-review 插件把这条写死成一句：「Do not check build signal or attempt
 to build or typecheck the app. These will run separately, and are not relevant to

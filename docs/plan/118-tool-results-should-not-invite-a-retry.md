@@ -70,7 +70,7 @@ You need to enable JavaScript to run this app.
 
 ## 四、附：修正 Plan 117 第四节关于 prompt cache 的结论
 
-Plan 117 写的是「cache 命中率 20% 是 gateway 亲和不稳，kloop 侧无可修」。拿到 key
+Plan 117 写的是「cache 命中率 20% 是 网关 亲和不稳，kloop 侧无可修」。拿到 key
 之后做了两组对照实验（脚本一次性的，未入库），结论要改写：
 
 **实验 1**（同一请求连发 3 次，各自独立 cache_key）：

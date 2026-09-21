@@ -83,9 +83,9 @@ validate five architectural bets before committing to a larger agent design.
 5. **Provider seam.** Internals speak Anthropic Messages shape only; adapters
    translate Anthropic native SSE and OpenAI-compat `tool_calls` streaming
    into one `StreamEvent` enum. A Mock provider enables keyless end-to-end
-   runs. The Responses adapter passes gateway/Codex vendor out-of-band
+   runs. The Responses adapter passes Codex-style vendor out-of-band
    events — `codex.*` telemetry (e.g. `codex.rate_limits`) and the `keepalive`
-   heartbeat gateway emits while the model is thinking — through as a no-op
+   heartbeat such a proxy emits while the model is thinking — through as a no-op
    both before and after the terminal, mirroring Anthropic's `ping`. Every
    other unknown SSE event still fails closed, naming the event. Responses function-call
    arguments are reconciled by JSON value (the proxy may stream compact deltas

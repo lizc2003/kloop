@@ -4,7 +4,7 @@
 >
 > ```
 > set -eu
-> tmp=$(mktemp -d /tmp/gateway-review-44e9be49.XXXXXX)
+> tmp=$(mktemp -d /tmp/review-44e9be49.XXXXXX)
 > git archive 44e9be49… | tar -x -C "$tmp"
 > cd "$tmp"
 > ⚠ the OS sandbox blocked this (network) — run it without the sandbox?

@@ -21,7 +21,7 @@
 
 ## Context(真实验证地面真相)
 
-对三 rail 做真实回归(gateway,`--headless --permission-mode bypass`,每轮全新临时 HOME 走 env-only)时,Chat rail(`KLOOP_PROVIDER=openai`)间歇 fail-close,报:
+对三 rail 做真实回归(网关,`--headless --permission-mode bypass`,每轮全新临时 HOME 走 env-only)时,Chat rail(`KLOOP_PROVIDER=openai`)间歇 fail-close,报:
 
 ```
 provider protocol error: openai-compat returned an unknown SSE event name
@@ -34,7 +34,7 @@ event: error
 data: {"error":{"message":"Upstream service temporarily unavailable","type":"upstream_error"}}
 ```
 
-即:**gateway 代理用具名 `event: error` 帧回传了一个真实的上游瞬时错误**(`type: upstream_error`,“暂时不可用”),不是 Plan 95 那种 `codex.*` 带外遥测。诊断改动已 `git checkout` 还原,工作树干净。
+即:**网关 代理用具名 `event: error` 帧回传了一个真实的上游瞬时错误**(`type: upstream_error`,“暂时不可用”),不是 Plan 95 那种 `codex.*` 带外遥测。诊断改动已 `git checkout` 还原,工作树干净。
 
 对照 Responses rail:同段真实回归里 run 4 撞到 `response.failed (server_error)`——那是走正规 `response.failed` 事件、如实报出的。Chat rail 因为错误裹在 `event: error` 里、且事件名守卫在错误处理**之前**,就退化成了误导性的 "unknown SSE event name"。
 
@@ -163,7 +163,7 @@ if !value["error"].is_null() {                                     // ← 已有
 
 提交 `cd2e3e7`,工作树干净;本地 `cargo fmt --all -- --check` + `cargo test -p kloop-provider` 全绿(openai/responses/anthropic 契约 34+19+19、及 provider 24,共含 plan97 新例)。
 
-真实 key 回归(gateway Chat/Responses + 真实 Anthropic 端点,`--headless --permission-mode bypass`;Chat/Anthropic 每轮全新临时 HOME 走 env-only,Responses 用 `~/.kloop/config.toml` 的 `gw_router`/`gpt-5.6-sol`):
+真实 key 回归(网关 Chat/Responses + 真实 Anthropic 端点,`--headless --permission-mode bypass`;Chat/Anthropic 每轮全新临时 HOME 走 env-only,Responses 用 `~/.kloop/config.toml` 的 `gw_router`/`gpt-5.6-sol`):
 
 - **Chat rail(决定性确证)**:22 轮里 21 轮干净收口,第 3 轮命中偶发具名 `event: error`(即诊断期抓到的 `type: upstream_error`)。plan 97 行为全兑现:错误如实报为 `openai-compat stream error (upstream_error)`(不再是误导的 `unknown SSE event name`)→ 判为可重试 → core 退避重试(attempt 1/3、2/3)→ **重试成功、整轮正常收口**。修复前同条件为硬挂 + 信息丢失。
 - **Responses rail**:4/4 干净收口(`read_file` 工具轮 + 中文总结),共享助手重构无回归。

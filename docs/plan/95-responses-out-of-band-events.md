@@ -12,7 +12,7 @@
 
 ## Context
 
-真实 gateway/Codex 代理在 Responses SSE 流里会私自塞一个**私有带外事件** `codex.rate_limits`:它不进官方语义流水线(`response.created → output_item.* → response.completed`),只捎带限流配额遥测(参考 codex `codex-api/src/rate_limits.rs:123` 的 `RateLimitEvent`:`plan_type`/`rate_limits.{primary,secondary}.{used_percent,window_minutes,reset_at}`/`credits`/`metered_limit_name`),与助手回答的字节无关。事件名的 `codex.` 前缀 = 厂商命名空间,不在 OpenAI 公开 Responses 事件族内。
+真实 网关/Codex 代理在 Responses SSE 流里会私自塞一个**私有带外事件** `codex.rate_limits`:它不进官方语义流水线(`response.created → output_item.* → response.completed`),只捎带限流配额遥测(参考 codex `codex-api/src/rate_limits.rs:123` 的 `RateLimitEvent`:`plan_type`/`rate_limits.{primary,secondary}.{used_percent,window_minutes,reset_at}`/`credits`/`metered_limit_name`),与助手回答的字节无关。事件名的 `codex.` 前缀 = 厂商命名空间,不在 OpenAI 公开 Responses 事件族内。
 
 codex 自己不靠这个 SSE 事件取限流:它从 HTTP header 解析(`parse_all_rate_limits(&headers)`),SSE 里这个同名事件对它冗余,故在 `codex-api/src/sse/responses.rs:454` `_ => trace!("unhandled…")` 静默丢弃。而 kloop 的 Responses 解析器是严格 fail-closed(Plan 89/92 纪律),任何没登记的事件名一律当致命协议错误——于是这条纯遥测事件把整轮 turn 打断,真实跑报 `provider protocol error: openai-responses returned an unknown semantic event`。
 
@@ -29,7 +29,7 @@ codex 自己不靠这个 SSE 事件取限流:它从 HTTP header 解析(`parse_al
 在 `responses.rs` 加一个小分类器:
 
 ```rust
-/// gateway/Codex 代理往 Responses 流里塞的厂商带外事件(如
+/// 网关/Codex 代理往 Responses 流里塞的厂商带外事件(如
 /// `codex.rate_limits`)只携带限流遥测、不属官方语义族——识别后跳过,
 /// 其余未知事件仍 fail-closed(见 match 兜底)。对齐 anthropic 的 `ping` 处理。
 fn is_out_of_band(event: &str) -> bool {

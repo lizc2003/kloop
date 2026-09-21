@@ -1,6 +1,6 @@
 # Plan 123 — 一个可重试的错误，两道门都没让它重试
 
-> 来源：2026-09-07 dogfood。用户在 gateway 审查会话里三次被同一条 note 打断，
+> 来源：2026-09-07 dogfood。用户在那次代码审查会话里三次被同一条 note 打断，
 > 每次都要手打「继续」：
 >
 > ```
@@ -49,7 +49,7 @@ if partial_landed && error.is_retryable() && stream_resumes < STREAM_RESUME_LIMI
 
 两道门的交集是「**已经有 semantic output，但没有任何可回放的 block**」。这个窗口
 从请求发出一直持续到模型吐出第一个 text 或 tool_use——在 xhigh 下这段时间很长,
-而 gateway 的 `server_error` 是随机抖动。于是：
+而 网关 的 `server_error` 是随机抖动。于是：
 
 - 一个被明确标注为 retryable 的错误（`crates/provider/src/lib.rs:198` 的注释：
   transient 条件"deliberately absent so they default to retryable"）

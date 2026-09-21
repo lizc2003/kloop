@@ -659,7 +659,7 @@ async fn http_status_and_retry_after_remain_typed() {
     assert_eq!(error.retry_after(), None);
 }
 
-/// The real gateway frame: a proxy relays a transient upstream error as a
+/// The real 网关 frame: a proxy relays a transient upstream error as a
 /// named `event: error` frame. It must surface the true `type` and be retryable,
 /// not degrade into the misleading "unknown SSE event name".
 #[tokio::test]

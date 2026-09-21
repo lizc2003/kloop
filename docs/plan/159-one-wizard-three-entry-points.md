@@ -127,7 +127,7 @@ picker 走完发 `/provider <id> <model> <effort>` 一条。**不要发 `/provid
 
 ## 六、附录:2026-09-17 的实测数据(§3.2 的依据)
 
-对 `deepseek-v4-flash-0731`(走 gw-cn 的 responses 端点)实测。**这些是那一天、那个网关、
+对 `deepseek-v4-flash-0731`(走 cn 网关的 responses 端点)实测。**这些是那一天、那个网关、
 那个模型的测量,不是普适事实**——换模型或换网关要重测,别当常量用。
 
 **(a) 哪些档位不被拒。** `cargo test -p kloop-provider --test effort_probe -- --ignored --nocapture`

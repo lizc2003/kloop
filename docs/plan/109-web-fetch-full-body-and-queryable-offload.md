@@ -84,7 +84,7 @@ run_program 直接查那个文件。
   - web：超过 50k 的正文原样返回、不再有裁剪标记；下载上限仍独立报告且被下载的部分全保留。
   - core：spill 指针含字符数、绝对路径与 `path="…"` 形式，且该路径上的文件与原文逐字节相等。
   - core：`read_offloaded` 在剩余窗口数超阈值时不再给出下一个 offset，改为指向文件。
-- 真实端到端（`--headless`，gateway `gpt-5.6-sol`）：`web_fetch` 该 URL 后落盘
+- 真实端到端（`--headless`，网关 `gpt-5.6-sol`）：`web_fetch` 该 URL 后落盘
   **2,111,302 字节**，`json.load` 可解析，`SpeechToTextChunkResponseModel.required` /
   `MultichannelSpeechToTextResponseModel.required` 都能读出来——**这正是改动前结构上够不着的事实**。
 

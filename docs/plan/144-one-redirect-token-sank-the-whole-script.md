@@ -109,5 +109,5 @@ README 六处:解析规则段(新增 stream-only 例外 + `go test ./x 2>&1 | ta
 ### 用户那份 permissions.json
 
 38 条死规则已删(45 → 7 条,14.4 KB → 0.5 KB),`revision` 45 → 46,原文件备份在本次会话的
-scratchpad。留下的 7 条里有两条 `sandbox_escalate(cd /tmp/gateway-…-<随机后缀> *)` 同样
+scratchpad。留下的 7 条里有两条 `sandbox_escalate(cd /tmp/review-…-<随机后缀> *)` 同样
 是一次性的,但它们是用户当时按前缀批的,不属于本轮清理范围。

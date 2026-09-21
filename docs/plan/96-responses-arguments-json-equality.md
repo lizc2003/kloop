@@ -11,7 +11,7 @@
 
 ## Context(真实验证地面真相)
 
-Plan 95 让真实 Responses 轮越过 `codex.rate_limits` 后,`gpt-5.6-sol` 经 gateway 的真实工具轮**间歇**报 `provider protocol error: openai-responses arguments done did not match accumulated delta`(~4 次真实轮命中 2 次)。临时给错误信息加上有界取值抓到:
+Plan 95 让真实 Responses 轮越过 `codex.rate_limits` 后,`gpt-5.6-sol` 经 网关 的真实工具轮**间歇**报 `provider protocol error: openai-responses arguments done did not match accumulated delta`(~4 次真实轮命中 2 次)。临时给错误信息加上有界取值抓到:
 
 - `.done` 全量 arguments:`{"limit": 3, "offset": 1, "path": "README.md"}`(46 字节,冒号/逗号后有空格,pretty)
 - 累积 `.delta`:`{"limit":3,"offset":1,"path":"README.md"}`(41 字节,compact)
@@ -99,4 +99,4 @@ fn arguments_agree(a: &str, b: &str) -> bool {
 - `responses.rs` 加 `arguments_agree`(解析成 `Value` 比相等,任一侧非合法 JSON 回退字节相等);两处比对(`function_call_arguments.done`、`finish_function_call`)改调用它,错误文案不变,其余校验(started/done 关闭、call_id/name 一致、`parse_tool_input(final_arguments)`)未动。
 - 新增契约测试:`function_arguments_agree_across_pretty_and_compact`(compact delta + pretty done/output_item.done,断言 `ToolUse{ input == {"limit":3,"offset":1,"path":"README.md"} }` + `Terminal(ToolUse)`,无错误)、`function_arguments_differing_values_still_fail_closed`(`{"a":1}` vs `{"a":2}` → Protocol、不可重试);保留 `malformed_function_arguments_fail_closed`(两侧 `"{oops"`)绿。
 - `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、workspace `cargo test`(provider 23 例含两新例全绿)均通过。
-- 真实 key 回归:`gw_router`/`gpt-5.6-sol` 经 gateway,`--headless --permission-mode bypass` 连跑 8 个带 `read`/`bash` 工具调用的真实 Responses 轮,全部完成、无 `arguments ... did not match`(此前 ~4 轮命中 2)。
+- 真实 key 回归:`gw_router`/`gpt-5.6-sol` 经 网关,`--headless --permission-mode bypass` 连跑 8 个带 `read`/`bash` 工具调用的真实 Responses 轮,全部完成、无 `arguments ... did not match`(此前 ~4 轮命中 2)。

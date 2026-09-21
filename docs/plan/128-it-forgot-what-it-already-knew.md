@@ -118,7 +118,7 @@ e1f59ef4 后半    6 个单工具轮：read_file 3 · grep 2 · bash:git 1
 
 ```
 kloop 轮3：把整个 diff 导出成文件
-      轮4：read(gateway-1257d99c.diff, 450) × 6 并发
+      轮4：read(review-1257d99c.diff, 450) × 6 并发
            ctx 20,574 → 53,965，其中未缓存 53,965（整轮零命中）
 
 codex 轮2：wc -l <几份文档>                       ← 先探大小

@@ -579,7 +579,7 @@ impl Provider {
     /// shared by sampling, compaction, and sub-agents. It only steers which
     /// backend serves the request — never what the request means — so a wrong
     /// or missing value costs cache hits, not correctness. Measured against
-    /// gateway, sending nothing makes hits a coin flip: the same 7,697-token
+    /// 网关, sending nothing makes hits a coin flip: the same 7,697-token
     /// prefix sent three times in a row cached 0, then 6,656, then 0 again.
     ///
     /// Each rail carries it the way its ecosystem expects: Responses as the

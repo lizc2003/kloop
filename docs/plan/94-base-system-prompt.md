@@ -215,7 +215,7 @@ task; prefer URLs the user or local files provide.
 
 ## 真实回归补记（2026-08-25）
 
-「可选真实 key 回归」本次补齐,三 rail 全通(gateway Chat/Responses + gateway Anthropic 通道,`--headless --permission-mode bypass`;同一只读探针:让 agent 一句话说出 `context.rs` 里 `BASE_SYSTEM` 分了哪几节)。三 rail 喂的是**同一个 provider 中立 `BASE_SYSTEM` 常量**,分节方针一致生效(动手前先核查、终端式简短、镜像中文、不臆造):
+「可选真实 key 回归」本次补齐,三 rail 全通(网关 Chat/Responses + 网关 Anthropic 通道,`--headless --permission-mode bypass`;同一只读探针:让 agent 一句话说出 `context.rs` 里 `BASE_SYSTEM` 分了哪几节)。三 rail 喂的是**同一个 provider 中立 `BASE_SYSTEM` 常量**,分节方针一致生效(动手前先核查、终端式简短、镜像中文、不臆造):
 
 - **Chat rail**(Chat wire):`grep` → `read_file` → 一句话中文,分节准确(先查后答、用专用工具而非 `cat`、镜像语言)。
 - **Responses rail**(gpt-5.6-sol,responses wire):`read_file`×2 → 一句话中文「五节」,准确。
