@@ -471,8 +471,6 @@ mod tests {
                 id: "4".into(),
                 subject: "Internal only".into(),
                 status: kloop_core::tools::TaskStatus::Pending,
-                blocked_by: Vec::new(),
-                blocks: Vec::new(),
             }],
         });
         assert_eq!(project_event(&event, 2), None);

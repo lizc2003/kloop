@@ -398,8 +398,6 @@ mod tests {
                 id: "1".into(),
                 subject: "Do not print me".into(),
                 status: kloop_core::tools::TaskStatus::Pending,
-                blocked_by: Vec::new(),
-                blocks: Vec::new(),
             }],
         });
         assert_eq!(event.as_note(), None);

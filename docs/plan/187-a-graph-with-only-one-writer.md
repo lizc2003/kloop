@@ -152,3 +152,50 @@ plan 71 建这套图时,它是**多 agent 协调机制**:共享 `Arc<TaskRegistr
     cannot reopen」)——第五节把它删了,**这是本 plan 唯一的行为放宽,必须在 DESIGN.md
     和提交信息里都写明**。
   - **2865–2895** 对照差异那段里提到 dependency 的一句。
+
+## 八、完成记录(2026-09-21)
+
+**已落地。** 删除面按第二/三节执行完毕,验收逐条核对:
+
+| 验收项 | 目标 | 实际 |
+|---|---|---|
+| `make check` | 全绿 | ✅ fmt + clippy + test |
+| `make mock` | 跑通 | ✅ demo 脚本已重写 |
+| 五个工具描述合计 | < 900 | **892**(原 1597) |
+| `task_update` 描述 | < 150 | **109**(原 472) |
+| `task.rs` code 行 | < 480 | **424**(原 628) |
+
+`blocked_by` 在全仓只剩 **9 处,全是负向守卫**——`task_update` 收到它必须报
+「unknown field」,`task.rs` 的 strict-parser 测试与 plan52 原生报告各占一处。
+验收原文写的「出现次数为 0」按这个意思放宽:字段没了,断言它没了的测试留着。
+`status_name` 在 task 路径为 0;`plan49/plan50_parity_tests.rs` 里同名的是各自
+`ItemStatus` 的本地 helper,与本 plan 无关。
+
+三处与 plan 预期不同,记下来:
+
+1. **坑 2 的替代触发方式**:`failed_create_does_not_consume_an_id_and_clear_keeps_high_water`
+   原先用坏依赖触发,已换成超长 subject。同一文件里另外两处失败探针
+   (`snapshots_...` 的 `input("Invalid", vec![99])`、`mutations_emit_full_snapshots...`
+   的两个 `blocked_by:["99"]`)plan 没点名,同样换成超长 subject——**保住"注册表级校验
+   失败"这条语义**,而不是退化成 strict-parser 的未知字段错误(那条另有测试)。
+2. **体积棘轮卡了一次**:演示脚本重写后 `startup.rs` 涨到 876 行、基线 872。
+   rustfmt 会把 `tool_use(...)` 拆成 5 行(`fn_call_width` 60),所以行数不由你写法决定。
+   最终把两个 `task_create` 的 json! 缩短到能放进一行参数位,round 2 用两次
+   `task_update` + `task_list`,**demo 里不再调 `task_get`**。`render.rs` 反向缩了
+   1126 → 1068,跑了 `make arch-baseline` 把水位收下来(只降不升)。
+3. **`draw_keeps_activity_then_tasks_immediately_above_composer` 的 CJK 截断断言**:
+   原先靠 `› blocked by #2` 占掉半个宽度才触发截断,hint 删掉后 18 个汉字在 50 列里
+   放得下,断言失效。把标题加长到 30 个汉字重新触发,变量 `blocked` 改名 `cjk`。
+
+**坑 5 的答案,以及它问窄了(教训 156)**:`make test` 不碰语料;matrix 行数/cells 数
+也没动(只有一个 `notes` 文案因此过期)。但 **`make parity` 现在是红的**,两层原因:
+语料验证器会跑 kloop 自己的原生报告并硬断言 task schema 属性集、blocker gate 错误文案、
+`blocks` 反向投影;它另有 static-evidence 把行号区间钉进 `task.rs`,删行即
+"range outside file"。语料被 `.gitignore` 排除、只在本机,CI 与别的机器都跳过。
+**更新它不在本 plan 的删除面内**(改 parity 生成物本就写明出范围),留作本机维护。
+
+**行为放宽,已写进 DESIGN.md**:`task_update` 从此接受任意状态转移,`completed` 可以改回
+`in_progress`。这是第五节拍板的终点——plan 188 整表覆盖时必须能改回去。
+
+**rollover 条件看着放宽、其实等价**(坑 1):`create` 的 epoch 滚动条件原为
+「图非空 + 全完成 + 新任务无依赖」,删掉第三项后没有「带依赖的新任务」这种东西了。

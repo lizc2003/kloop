@@ -2240,34 +2240,43 @@ process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
 sandboxes.
 
-## Root-owned session task graph (Plans 71–74)
+## Root-owned session task graph (Plans 71–74, 187)
 
-The Task graph is a **session-scoped structured work graph owned by the
-root/main Agent**. Only depth 0 receives or may execute its five native
-snake_case Task tools:
+The Task graph is a **session-scoped flat list of work owned by the root/main
+Agent**. Only depth 0 receives or may execute its five native snake_case Task
+tools:
 
-- `task_create {subject, description, blocked_by?}` creates a pending task and
-  returns an opaque stable ID (`"1"`, `"2"`, …). If the existing non-empty graph
-  is entirely completed and the new task has no dependencies, the same write
-  transaction atomically rolls to a new epoch containing only that task.
-- `task_get {task_id}` returns the full record, including direct `blocked_by`
-  dependencies and the computed reverse `blocks` projection.
-- `task_update {task_id, ...patch}` atomically changes subject, description,
-  status, or the complete `blocked_by` list.
+- `task_create {subject, description}` creates a pending task and returns an
+  opaque stable ID (`"1"`, `"2"`, …). If the existing non-empty graph is entirely
+  completed, the same write transaction atomically rolls to a new epoch
+  containing only that task.
+- `task_get {task_id}` returns the full record: subject, description, status.
+- `task_update {task_id, ...patch}` atomically changes subject, description, or
+  status.
 - `task_list {}` returns compact records in numeric-ID order; use `task_get`
   for the full description.
 - `task_clear {}` explicitly abandons the graph without clearing conversation
   history or stopping Agent, Program, Workflow, or Bash work. It preserves the
   stable-ID high-water mark.
 
-Statuses are `pending | in_progress | completed`. They move only forward:
-`pending` may become in-progress or completed, and in-progress may complete;
-completed tasks cannot reopen. A task cannot enter a non-pending state until
-all blockers are completed. Missing dependencies, self-dependencies, duplicate
-edges, cycles, invalid text, and failed rollover/clear validation fail atomically
-without consuming an ID or partially changing the graph. Completed tasks remain
-addressable until rollover or clear; there is no single-task delete, filter,
-pagination, metadata, or active-form field.
+Statuses are `pending | in_progress | completed` and **may move in any
+direction** — plan 187 removed the forward-only rule together with the
+dependency graph. Both constrained only the one writer that exists, and a
+mistyped `completed` has to be correctable in place rather than by appending a
+second row. Invalid text and failed rollover/clear validation still fail
+atomically without consuming an ID or partially changing the graph. Completed
+tasks remain addressable until rollover or clear; there is no single-task
+delete, filter, pagination, metadata, active-form, or dependency field.
+
+**Plan 187 deleted `blocked_by`/`blocks` outright.** Plan 71 built the graph as a
+multi-agent coordination mechanism: children claimed tasks and a dependent was
+gated until its blockers completed. Plan 72 made the graph depth-0 root-owned and
+took that world away; what survived was cycle detection defending the graph
+against itself and a blocker gate stopping its only writer from moving on. This
+is the same judgement plan 73 applied to `owner` — a constraint that cannot form
+a runtime invariant is description text the model pays for on every call. The
+one real consumer, the TUI panel's `› blocked by #N` annotation and its separate
+"blocked" sort group, went with it.
 
 The registry is an `Arc<TaskRegistry>` on `Config`. Child Configs retain the Arc
 as an internal session service, but their depth>0 catalogs omit all five tools
@@ -2284,8 +2293,8 @@ is not written to rollout or reconstructed from history. Every panel-visible
 mutation publishes a revisioned canonical full snapshot. `/clear` preserves the
 ID high-water mark, unconditionally advances the graph revision, and hands the
 TUI its exact empty snapshot as a reset fence against late older events. The
-registry is bounded to 256 tasks, 256 blockers per task, 200-character
-single-line subjects, and 8 KiB descriptions. Task rows, activity, the composer's
+registry is bounded to 256 tasks, 200-character single-line subjects, and 8 KiB
+descriptions. Task rows, activity, the composer's
 canonical visual rows, and overflow commit all consume the same viewport-height
 budget; no independently counted string-line total can make live chrome freeze
 into scrollback.
@@ -2870,7 +2879,10 @@ renamed the native surface without adding compatibility aliases:
 - kloop exposes the native snake_case `task_create/get/update/list/clear` graph
   above only to the depth-0 root Agent, not as PascalCase Claude Code adapters
   or a child/Team collaboration surface. Child completion is an execution
-  result; root explicitly advances graph state. The TUI-only internal snapshot
+  result; root explicitly advances graph state. Claude Code's task update carries
+  owner, metadata, deletion and bidirectional dependencies; kloop has none of
+  them — plan 73 removed `owner` and plan 187 removed `blocked_by`/`blocks`,
+  leaving a flat list. The TUI-only internal snapshot
   projection is not a public Task wire. There are no `TaskOutput`/`TaskStop`
   aliases: those names belong to execution resources in Claude Code, while
   kloop keeps graph state separate from Agent/Program/Workflow/Shell lifecycle.
@@ -2892,13 +2904,16 @@ contract by making the session graph root-owned and child execution result-only.
 Plan 74 extends the current native graph to five tools and locks strict clear,
 atomic rollover, ID high-water, revisioned full-snapshot ordering, ordinary
 ToolCall rows, and the absence of public Task wire without changing any pinned
-Claude Code raw/normalized fixture. See
+Claude Code raw/normalized fixture. Plan 187 then deleted the dependency graph
+and the forward-only status rule, which shrank the Plan 52 native report's task
+scenario from a blocker gate to a rejected-unknown-field probe. See
 `docs/plan/52-agent-task-team-parity.md`,
 `docs/plan/66-background-tool-naming.md`,
 `docs/plan/71-task-v2-session-graph.md`,
 `docs/plan/72-task-v2-root-owned-session-graph.md`,
-`docs/plan/73-task-v2-remove-owner.md`, and
-`docs/plan/74-task-graph-tui.md`.
+`docs/plan/73-task-v2-remove-owner.md`,
+`docs/plan/74-task-graph-tui.md`, and
+`docs/plan/187-a-graph-with-only-one-writer.md`.
 
 ## Skills (Phase 2, nineteenth slice)
 

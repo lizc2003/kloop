@@ -1377,8 +1377,6 @@ mod tests {
                     id: id.to_string(),
                     subject: format!("Task {id}"),
                     status: kloop_core::tools::TaskStatus::Pending,
-                    blocked_by: Vec::new(),
-                    blocks: Vec::new(),
                 })
                 .collect(),
         }

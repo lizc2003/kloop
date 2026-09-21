@@ -2135,8 +2135,6 @@ mod tests {
                 id: "1".into(),
                 subject: subject.into(),
                 status: kloop_core::tools::TaskStatus::Pending,
-                blocked_by: Vec::new(),
-                blocks: Vec::new(),
             }],
         }
     }

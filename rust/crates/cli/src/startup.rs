@@ -937,7 +937,8 @@ pub(crate) fn config_from_settings(
 }
 
 /// Scripted turns for `--mock`, exercising all five bets plus the root-owned Task
-/// V2 graph without an API key: rounds 1–2 create and inspect dependent tasks,
+/// V2 list without an API key: round 1 writes two tasks down, round 2 advances
+/// both and reads the list back,
 /// round 3 batches two read-only bash calls concurrently, round 4 runs an unsafe
 /// command whose oversized output triggers offloading, round 5 reads it back,
 /// round 6 spawns a result-only sub-agent (round 7 is the sub-agent's own reply),
@@ -951,7 +952,7 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
     let text = |t: &str| AssistantBlock::Text { text: t.into() };
     vec![
         vec![
-            text("Creating a root-owned task graph…\n"),
+            text("Writing down the plan…\n"),
             tool_use(
                 "t0",
                 "task_create",
@@ -960,21 +961,21 @@ fn mock_demo_turns() -> Vec<Vec<AssistantBlock>> {
             tool_use(
                 "t0b",
                 "task_create",
-                json!({
-                    "subject":"Offload a big output",
-                    "description":"Generate a large result and read it back",
-                    "blocked_by":["1"]
-                }),
+                json!({"subject":"Offload output","description":"Generate a big result"}),
             ),
         ],
         vec![
-            text("Completing the blocker and inspecting the graph…\n"),
+            text("Advancing the list…\n"),
             tool_use(
                 "t0c",
                 "task_update",
                 json!({"task_id":"1","status":"completed"}),
             ),
-            tool_use("t0d", "task_get", json!({"task_id":"2"})),
+            tool_use(
+                "t0d",
+                "task_update",
+                json!({"task_id":"2","status":"in_progress"}),
+            ),
             tool_use("t0e", "task_list", json!({})),
         ],
         vec![

@@ -604,20 +604,23 @@ async fn native_surface_report() -> Value {
         "task_create",
         json!({
             "subject":"second",
-            "description":"wait for first",
-            "blocked_by":["1"]
+            "description":"do after first"
         }),
         &ctx,
     )
     .await;
     assert!(!dependent_error, "{dependent}");
-    let (blocked_start, blocked_start_error) = run_tool(
+    let (forged_blocked_by, forged_blocked_by_error) = run_tool(
         "task_update",
-        json!({"task_id":"2","status":"in_progress"}),
+        json!({"task_id":"2","blocked_by":["1"]}),
         &ctx,
     )
     .await;
-    assert!(blocked_start_error, "{blocked_start}");
+    assert!(forged_blocked_by_error, "{forged_blocked_by}");
+    assert!(
+        forged_blocked_by.contains("unknown field `blocked_by`"),
+        "{forged_blocked_by}"
+    );
     let (complete_blocker, complete_blocker_error) = run_tool(
         "task_update",
         json!({"task_id":"1","status":"completed"}),
@@ -763,7 +766,10 @@ async fn native_surface_report() -> Value {
         "task_graph": {
             "blocker": blocker,
             "dependent": dependent,
-            "blocked_start": {"result": blocked_start, "is_error": blocked_start_error},
+            "forged_blocked_by": {
+                "result": forged_blocked_by,
+                "is_error": forged_blocked_by_error,
+            },
             "complete_blocker": complete_blocker,
             "start_dependent": start_dependent,
             "get_dependent": get_dependent,

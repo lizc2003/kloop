@@ -22,7 +22,6 @@ use kloop_core::tools::TaskGraphTask;
 use kloop_core::tools::TaskStatus;
 use kloop_protocol::RoutePickerStage;
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::app::App;
@@ -148,23 +147,7 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     }
 }
 
-fn open_blockers<'a>(task: &'a TaskGraphTask, completed: &HashSet<&str>) -> Vec<&'a str> {
-    let mut blockers = task
-        .blocked_by
-        .iter()
-        .map(String::as_str)
-        .filter(|id| !completed.contains(id))
-        .collect::<Vec<_>>();
-    blockers.sort_by_key(|id| id.parse::<u64>().unwrap_or(u64::MAX));
-    blockers
-}
-
-fn task_line(
-    task: &TaskGraphTask,
-    completed: &HashSet<&str>,
-    first: bool,
-    width: usize,
-) -> Line<'static> {
+fn task_line(task: &TaskGraphTask, first: bool, width: usize) -> Line<'static> {
     // `⎿` is one column wide (neutral width), so the continuation indent is two
     // spaces — three would push every row after the first one column right of
     // the glyph it is meant to line up under.
@@ -184,41 +167,12 @@ fn task_line(
     };
     let fixed_width = display_width(prefix) + display_width(glyph) + 1;
     let body_width = width.saturating_sub(fixed_width);
-    let blockers = if task.status == TaskStatus::Pending {
-        open_blockers(task, completed)
-    } else {
-        Vec::new()
-    };
-    let hint = (!blockers.is_empty()).then(|| {
-        format!(
-            " › blocked by {}",
-            blockers
-                .iter()
-                .map(|id| format!("#{id}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    });
-
-    let (subject, hint) = match hint {
-        None => (truncate(&task.subject, body_width.max(1)), None),
-        Some(hint) => {
-            let hint_budget = display_width(&hint).min((body_width / 2).max(1));
-            let hint = truncate(&hint, hint_budget);
-            let subject_budget = body_width.saturating_sub(display_width(&hint)).max(1);
-            (truncate(&task.subject, subject_budget), Some(hint))
-        }
-    };
-    let mut spans = vec![
+    Line::from(vec![
         Span::styled(prefix.to_string(), DIM),
         Span::styled(glyph.to_string(), glyph_style),
         Span::raw(" "),
-        Span::styled(subject, subject_style),
-    ];
-    if let Some(hint) = hint {
-        spans.push(Span::styled(hint, DIM));
-    }
-    Line::from(spans)
+        Span::styled(truncate(&task.subject, body_width.max(1)), subject_style),
+    ])
 }
 
 fn task_summary_line(label: String, first: bool, width: usize) -> Line<'static> {
@@ -254,31 +208,17 @@ pub fn task_panel_lines(
     if snapshot.tasks.is_empty() || max_rows == 0 || width < 8 {
         return Vec::new();
     }
-    let completed_ids = snapshot
-        .tasks
-        .iter()
-        .filter(|task| task.status == TaskStatus::Completed)
-        .map(|task| task.id.as_str())
-        .collect::<HashSet<_>>();
     let mut in_progress = Vec::new();
     let mut pending = Vec::new();
-    let mut blocked = Vec::new();
     let mut completed = Vec::new();
     for task in &snapshot.tasks {
         match task.status {
             TaskStatus::InProgress => in_progress.push(task),
-            TaskStatus::Pending if open_blockers(task, &completed_ids).is_empty() => {
-                pending.push(task)
-            }
-            TaskStatus::Pending => blocked.push(task),
+            TaskStatus::Pending => pending.push(task),
             TaskStatus::Completed => completed.push(task),
         }
     }
-    let unfinished = in_progress
-        .into_iter()
-        .chain(pending)
-        .chain(blocked)
-        .collect::<Vec<_>>();
+    let unfinished = in_progress.into_iter().chain(pending).collect::<Vec<_>>();
     let cap = max_rows.min(TASK_PANEL_MAX_ROWS);
     let (visible_unfinished, visible_completed) =
         visible_task_counts(unfinished.len(), completed.len(), cap);
@@ -291,7 +231,7 @@ pub fn task_panel_lines(
 
     let mut lines = Vec::new();
     for task in unfinished.iter().take(visible_unfinished) {
-        lines.push(task_line(task, &completed_ids, lines.is_empty(), width));
+        lines.push(task_line(task, lines.is_empty(), width));
     }
     let hidden_unfinished = unfinished.len().saturating_sub(visible_unfinished);
     if hidden_unfinished > 0 {
@@ -302,7 +242,7 @@ pub fn task_panel_lines(
         ));
     }
     for task in completed.iter().take(visible_completed) {
-        lines.push(task_line(task, &completed_ids, lines.is_empty(), width));
+        lines.push(task_line(task, lines.is_empty(), width));
     }
     let hidden_completed = completed.len().saturating_sub(visible_completed);
     if hidden_completed > 0 {
@@ -1444,13 +1384,11 @@ mod tests {
         )
     }
 
-    fn task(id: u64, subject: &str, status: TaskStatus, blocked_by: &[u64]) -> TaskGraphTask {
+    fn task(id: u64, subject: &str, status: TaskStatus) -> TaskGraphTask {
         TaskGraphTask {
             id: id.to_string(),
             subject: subject.into(),
             status,
-            blocked_by: blocked_by.iter().map(u64::to_string).collect(),
-            blocks: Vec::new(),
         }
     }
 
@@ -1466,15 +1404,15 @@ mod tests {
     }
 
     #[test]
-    fn task_panel_sorts_styles_blocks_and_collapses_completed() {
+    fn task_panel_sorts_styles_and_collapses_completed() {
         let snapshot = task_graph(vec![
-            task(1, "Done one", TaskStatus::Completed, &[]),
-            task(2, "Active", TaskStatus::InProgress, &[]),
-            task(3, "Ready", TaskStatus::Pending, &[1]),
-            task(4, "Blocked", TaskStatus::Pending, &[2, 1]),
-            task(5, "Done five", TaskStatus::Completed, &[]),
-            task(6, "Done six", TaskStatus::Completed, &[]),
-            task(7, "Done seven", TaskStatus::Completed, &[]),
+            task(1, "Done one", TaskStatus::Completed),
+            task(2, "Active", TaskStatus::InProgress),
+            task(3, "Ready", TaskStatus::Pending),
+            task(4, "Next", TaskStatus::Pending),
+            task(5, "Done five", TaskStatus::Completed),
+            task(6, "Done six", TaskStatus::Completed),
+            task(7, "Done seven", TaskStatus::Completed),
         ]);
         let lines = task_panel_lines(&snapshot, 80, TASK_PANEL_MAX_ROWS);
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
@@ -1483,7 +1421,7 @@ mod tests {
             vec![
                 "⎿ ◼ Active",
                 "  ◻ Ready",
-                "  ◻ Blocked › blocked by #2",
+                "  ◻ Next",
                 "  ✔ Done one",
                 "  ✔ Done five",
                 "  ✔ Done six",
@@ -1515,10 +1453,10 @@ mod tests {
     #[test]
     fn task_panel_hard_cap_preserves_accurate_group_summaries_and_width() {
         let mut tasks = (1..=12)
-            .map(|id| task(id, &format!("未完成任务{id}"), TaskStatus::Pending, &[]))
+            .map(|id| task(id, &format!("未完成任务{id}"), TaskStatus::Pending))
             .collect::<Vec<_>>();
         tasks.extend(
-            (13..=17).map(|id| task(id, &format!("已完成任务{id}"), TaskStatus::Completed, &[])),
+            (13..=17).map(|id| task(id, &format!("已完成任务{id}"), TaskStatus::Completed)),
         );
         let snapshot = task_graph(tasks);
         let lines = task_panel_lines(&snapshot, 18, TASK_PANEL_MAX_ROWS);
@@ -1535,7 +1473,7 @@ mod tests {
 
         let completed_only = task_graph(
             (1..=5)
-                .map(|id| task(id, &format!("Done {id}"), TaskStatus::Completed, &[]))
+                .map(|id| task(id, &format!("Done {id}"), TaskStatus::Completed))
                 .collect(),
         );
         assert_eq!(
@@ -1550,12 +1488,7 @@ mod tests {
     #[test]
     fn a_finished_graph_leaves_the_chrome_and_the_footer_hint_with_the_turn() {
         let mut app = App::new("s".into());
-        app.task_graph = Some(task_graph(vec![task(
-            1,
-            "Done",
-            TaskStatus::Completed,
-            &[],
-        )]));
+        app.task_graph = Some(task_graph(vec![task(1, "Done", TaskStatus::Completed)]));
         let viewport = Rect::new(0, 0, 80, 24);
         assert_eq!(live_chrome_layout(&app, viewport).task_lines.len(), 1);
         assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
@@ -1574,12 +1507,7 @@ mod tests {
     fn live_chrome_hides_tasks_for_overlays_and_tiny_terminals() {
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("transcript".into()));
-        app.task_graph = Some(task_graph(vec![task(
-            1,
-            "Visible",
-            TaskStatus::Pending,
-            &[],
-        )]));
+        app.task_graph = Some(task_graph(vec![task(1, "Visible", TaskStatus::Pending)]));
         let normal = live_chrome_layout(&app, Rect::new(0, 0, 80, 24));
         assert_eq!(normal.task_lines.len(), 1);
         assert_eq!(normal.reserved_rows(), 1);
@@ -1675,18 +1603,17 @@ mod tests {
         app.cells.push(Cell::Assistant("history".into()));
         app.running = true;
         app.task_graph = Some(task_graph(vec![
-            task(1, "Done one", TaskStatus::Completed, &[]),
-            task(2, "Active", TaskStatus::InProgress, &[]),
+            task(1, "Done one", TaskStatus::Completed),
+            task(2, "Active", TaskStatus::InProgress),
             task(
                 3,
-                "需要处理一个非常非常长的中文任务标题",
+                "需要处理一个非常非常非常非常长的中文任务标题并且还要再长一点",
                 TaskStatus::Pending,
-                &[2],
             ),
-            task(4, "Done four", TaskStatus::Completed, &[]),
-            task(5, "Done five", TaskStatus::Completed, &[]),
-            task(6, "Done six", TaskStatus::Completed, &[]),
-            task(7, "Done seven", TaskStatus::Completed, &[]),
+            task(4, "Done four", TaskStatus::Completed),
+            task(5, "Done five", TaskStatus::Completed),
+            task(6, "Done six", TaskStatus::Completed),
+            task(7, "Done seven", TaskStatus::Completed),
         ]));
         let mut terminal = Terminal::new(TestBackend::new(50, 18)).unwrap();
         terminal
@@ -1708,14 +1635,11 @@ mod tests {
             .iter()
             .position(|row| row.contains("⎿ ◼ Active"))
             .expect("first task row");
-        let blocked = rows
+        let cjk = rows
             .iter()
-            .position(|row| row.contains('需') && row.contains("blocked by #2"))
-            .unwrap_or_else(|| panic!("blocked CJK task row: {rows:#?}"));
-        assert!(
-            rows[blocked].contains('…'),
-            "CJK subject truncates: {rows:#?}"
-        );
+            .position(|row| row.contains('需'))
+            .unwrap_or_else(|| panic!("CJK task row: {rows:#?}"));
+        assert!(rows[cjk].contains('…'), "CJK subject truncates: {rows:#?}");
         let completed_summary = rows
             .iter()
             .position(|row| row.contains("… +2 completed"))
@@ -1723,14 +1647,14 @@ mod tests {
         let rule = rows
             .iter()
             .enumerate()
-            .skip(blocked + 1)
+            .skip(cjk + 1)
             .find(|(_, row)| row.trim_matches('─').is_empty() && row.contains('─'))
             .map(|(index, _)| index)
             .expect("composer top rule");
         assert!(
             activity < first_task
-                && first_task < blocked
-                && blocked < completed_summary
+                && first_task < cjk
+                && cjk < completed_summary
                 && completed_summary < rule
         );
         assert_eq!(
@@ -1762,12 +1686,7 @@ mod tests {
 
         let mut app = App::new("s".into());
         app.cells.push(Cell::Assistant("history".into()));
-        app.task_graph = Some(task_graph(vec![task(
-            1,
-            "Toggle me",
-            TaskStatus::Pending,
-            &[],
-        )]));
+        app.task_graph = Some(task_graph(vec![task(1, "Toggle me", TaskStatus::Pending)]));
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
 
         terminal
@@ -2472,12 +2391,7 @@ mod tests {
         assert!(activity_line(&app, &hud).is_none());
         assert!(!has_activity_line(&app));
 
-        app.task_graph = Some(task_graph(vec![task(
-            1,
-            "Visible",
-            TaskStatus::Pending,
-            &[],
-        )]));
+        app.task_graph = Some(task_graph(vec![task(1, "Visible", TaskStatus::Pending)]));
         assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to hide tasks"));
         app.show_task_graph = false;
         assert!(line_text(&footer_line(&app, 140)).contains("ctrl+t to show tasks"));
