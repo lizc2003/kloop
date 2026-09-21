@@ -141,6 +141,83 @@ async fn a_stale_todo_list_is_reminded_at_the_end_of_history_and_only_at_depth_z
     assert_eq!(history.messages().len(), 2);
 }
 
+/// The same reminder seen from the loop rather than from its own function: a
+/// real `run_turn` over a mock provider that writes a list and then works
+/// without touching it. The reminder has to arrive as a user message of its
+/// own, at a round boundary — after the round's `tool_result` message, before
+/// the next assistant message — and never inside the tool_result block list.
+#[tokio::test]
+async fn the_reminder_arrives_between_rounds_of_a_real_turn() {
+    let rounds = crate::tools::REMINDER_STALE_ROUNDS as usize + 2;
+    let mut script = vec![vec![tool_use_named(
+        "t0",
+        "todo_write",
+        json!({"todos": [
+            {"subject": "Read the reference projects", "status": "in_progress"},
+            {"subject": "Wire the round-boundary reminder", "status": "pending"},
+        ]}),
+    )]];
+    for round in 0..rounds {
+        script.push(vec![tool_use_named(
+            &format!("t{round}"),
+            "bash",
+            json!({"command": "true"}),
+        )]);
+    }
+    script.push(vec![AssistantBlock::Text {
+        text: "done".into(),
+    }]);
+
+    let cfg = crate::tools::testutil::TestConfig::new("agent-todo-reminder-loop")
+        .provider(Provider::mock(script))
+        .max_rounds(Some(rounds + 4))
+        .build();
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("do the multi-step thing"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+
+    let reminders: Vec<usize> = history
+        .messages()
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.role == Role::User
+                && matches!(&message.content[0], ContentBlock::Text { text } if text
+                    .starts_with("<system-reminder>"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(reminders.len(), 1, "one reminder, once per revision");
+
+    let messages = history.messages();
+    let reminder = &messages[reminders[0]];
+    assert_eq!(reminder.content.len(), 1, "a message of its own");
+    let ContentBlock::Text { text } = &reminder.content[0] else {
+        panic!("expected text");
+    };
+    assert!(
+        text.contains("- [in_progress] Read the reference projects"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- [pending] Wire the round-boundary reminder"),
+        "{text}"
+    );
+    // Round boundary: the round before it closed with its tool_result, and the
+    // next message is the assistant's answer to both.
+    assert!(
+        messages[reminders[0] - 1]
+            .content
+            .iter()
+            .all(|block| matches!(block, ContentBlock::ToolResult { .. })),
+        "{:?}",
+        messages[reminders[0] - 1]
+    );
+    assert_eq!(messages[reminders[0] + 1].role, Role::Assistant);
+}
+
 #[test]
 fn drain_inbox_offloads_only_large_machine_results() {
     let dir = std::env::temp_dir().join(format!("kloop-inbox-offload-{}", std::process::id()));

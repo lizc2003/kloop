@@ -153,7 +153,12 @@ user message.」注入的内容作为 **user message 追加在历史末尾**,在
 - `context.rs`:`BASE_SYSTEM` 那句拆成「计划清楚就开列(值得单开一轮)」+「之后的更新
   和工作同轮」。
 - 测试(坑 4,只守机制):registry 三条(同 revision 只发一次 / 空表一会话一次 /
-  `clear` 复位),agent 一条(落在历史末尾、depth>0 不注入且不推进计数、说过一次不再说)。
+  `clear` 复位),agent 两条——单元一条(落在历史末尾、depth>0 不注入且不推进计数、
+  说过一次不再说),**端到端一条**(真 `run_turn` 过 mock provider 跑满 10 轮:提醒作为
+  **独立的 user 消息**落在某轮 `tool_result` 与下一条 assistant 之间,不与 `tool_result`
+  同块,整轮只出现一次)。
+- `make mock` 照不到这条路:那个脚本 7 轮,兜底要 8 个边界。**没有为了演示去加轮数**——
+  smoke 的五条主线不该被一条兜底稀释,端到端测试才是钉它的地方。
 - DESIGN.md「Root-owned session todo list」一节补注入契约,顺手改掉过期的
   `Arc<TaskRegistry>` 和「`TodoUpdated` 从不进上下文」那半句。
 
