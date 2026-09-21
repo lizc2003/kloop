@@ -289,7 +289,7 @@ async fn effort_maps_to_reasoning_field() {
 }
 
 /// A relay re-sending the opening lifecycle frames is not a protocol violation.
-/// 网关 does it — an internal retry replays `response.created` /
+/// One real gateway does it — an internal retry replays `response.created` /
 /// `response.in_progress` — and treating it as one killed the whole turn over a
 /// frame that carries nothing the first one did not.
 #[tokio::test]
@@ -1963,7 +1963,7 @@ async fn out_of_band_codex_event_after_terminal_is_ignored() {
     ));
 }
 
-/// 网关's real reasoning shape: every summary part is opened and streamed,
+/// A real gateway's reasoning shape: every summary part is opened and streamed,
 /// but only the last one is closed with `text.done` + `part.done`. Two
 /// independent captures, 24 reasoning items, all this shape — so the parts are
 /// independent by index, not strictly nested. Correctness rides on the item
@@ -2067,7 +2067,7 @@ async fn unclosed_reasoning_part_still_fails_when_final_text_diverges() {
         "provider protocol error: openai-responses final reasoning text did not match streamed text"
     );
 }
-/// 网关's `keepalive` heartbeat, on the real wire shape, is skipped like
+/// A gateway's `keepalive` heartbeat, on the real wire shape, is skipped like
 /// `codex.*`. It arrives while the model is still thinking — the more thinking,
 /// the more of them — so a high reasoning effort makes it the norm, not an edge
 /// case, and treating it as fatal killed every xhigh turn.

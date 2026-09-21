@@ -1067,7 +1067,7 @@ async fn turn_samples_at_the_session_effort() {
 
 /// The session id rides every sampling request as the prompt-cache routing
 /// hint. It is a routing hint only — a missing one costs cache hits, never
-/// correctness — but on 网关 that cost is real: without it an identical
+/// correctness — but on one real gateway that cost is real: without it an identical
 /// prefix hit the cache on only one of three consecutive requests.
 #[tokio::test]
 async fn turn_samples_with_the_session_id_as_the_cache_key() {
