@@ -312,6 +312,25 @@ pub fn utc_date(unix_secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// UTC timestamp for a unix time, `YYYY-MM-DDTHH:MM:SSZ` — the readable form
+/// for a record a human may open, next to the millisecond `ts` the rollout log
+/// uses for a record only kloop reads.
+pub fn utc_timestamp(unix_secs: u64) -> String {
+    let date = utc_date(unix_secs);
+    let day = unix_secs % 86_400;
+    let (hours, minutes, seconds) = (day / 3600, (day % 3600) / 60, day % 60);
+    format!("{date}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+/// Now, as [`utc_timestamp`].
+pub fn utc_now_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    utc_timestamp(secs)
+}
+
 pub fn utc_today() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -484,6 +503,14 @@ mod tests {
         let assembled = assemble_instructions(&files, 4);
         assert!(assembled.message.unwrap().contains("abcd"));
         assert!(assembled.warnings.is_empty());
+    }
+
+    /// Epoch, a leap day, and the second before midnight.
+    #[test]
+    fn utc_timestamp_carries_the_time_of_day() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(utc_timestamp(1_709_251_199), "2024-02-29T23:59:59Z");
     }
 
     #[test]

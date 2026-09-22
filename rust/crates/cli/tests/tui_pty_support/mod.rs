@@ -497,7 +497,8 @@ impl PtyHarness {
             std::fs::write(
                 &trust,
                 format!(
-                    "{{\n  \"version\": 1,\n  \"projectId\": \"{project_id}\",\n  \"trusted\": true\n}}\n"
+                    "{{\n  \"version\": 1,\n  \"projectId\": \"{project_id}\",\n  \
+                     \"grantedAt\": \"2026-09-22T00:00:00Z\"\n}}\n"
                 ),
             )
             .context("write PTY trust.json")?;

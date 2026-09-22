@@ -121,31 +121,26 @@ impl ProjectStore {
         })
     }
 
-    /// Whether this project was trusted in an earlier session. Anything that
-    /// is not an intact "yes" — no file, unreadable, unparseable, a different
-    /// project's record — reads as untrusted and the human is asked again.
+    /// Whether this project is one kloop has state for. The directory under
+    /// the private state root is the whole answer: nothing but kloop creates
+    /// it, so its existence means this machine's owner has already run here —
+    /// whether it holds a trust record, transcripts, or durable approvals.
+    /// That is also why the grant below writes a file at all: creating this
+    /// directory is its job, the contents are for a human to read.
     pub(crate) fn trusted_blocking(&self, project_id: &ProjectId) -> bool {
-        let Ok(Some(dir)) = self.open_project(project_id) else {
-            return false;
-        };
-        let Ok(Some(raw)) = dir.read_string(OsStr::new(TRUST_FILE), TRUST_LABEL) else {
-            return false;
-        };
-        let Ok(file) = serde_json::from_str::<TrustFile>(&raw) else {
-            return false;
-        };
-        file.version == 1 && file.project_id == project_id.as_str() && file.trusted
+        self.project_dir(project_id).is_dir()
     }
 
-    /// Record the human's "yes". A failure to persist is reported: the session
-    /// still runs on the answer just given, but the next one asks again.
+    /// Record the human's "yes" — which creates the project directory. A
+    /// failure to persist is reported: the session still runs on the answer
+    /// just given, but the next one asks again.
     pub(crate) fn grant_trust_blocking(&self, project_id: &ProjectId) -> Result<()> {
         let dir = self.ensure_project(project_id)?;
         let _lock = dir.open_lock(OsStr::new(TRUST_LOCK_FILE), TRUST_LABEL)?;
         let file = TrustFile {
             version: 1,
             project_id: project_id.as_str().to_string(),
-            trusted: true,
+            granted_at: kloop_core::context::utc_now_timestamp(),
         };
         let mut encoded = serde_json::to_vec_pretty(&file)?;
         encoded.push(b'\n');
@@ -187,7 +182,6 @@ impl ProjectStore {
         self.project_dir(project_id).join(TRUST_FILE)
     }
 
-    #[cfg(test)]
     fn project_dir(&self, project_id: &ProjectId) -> PathBuf {
         self.root
             .join(PROJECTS)
@@ -213,14 +207,17 @@ impl ProjectPermissionWriter for ProjectStore {
     }
 }
 
-/// The trust record. `trusted` is spelled out rather than implied by the
-/// file's existence so a half-written or hand-edited file reads as "no".
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// The trust record — write-only: nothing reads it back, because the decision
+/// is the directory it lands in. It is what a human finds when they open that
+/// directory and wonder where the grant came from, so it says which project it
+/// belongs to and when the answer was given. Revoking is deleting the
+/// directory, not editing this.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TrustFile {
     version: u32,
     project_id: String,
-    trusted: bool,
+    granted_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -299,13 +296,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    /// Trust is a separate file with a separate lock: granting it must not
-    /// disturb the rule table, and an empty store is untrusted without
-    /// creating anything.
+    /// The decision is the directory: absent before anything ran here, present
+    /// once the grant lands, and equally present for a project that only ever
+    /// held transcripts or durable approvals. The record beside the rules is
+    /// what a human reads, and granting twice is idempotent.
     #[test]
-    fn trust_round_trips_beside_the_rules_without_touching_them() {
+    fn the_project_directory_is_the_answer_and_the_record_is_for_humans() {
         let (base, store, id) = fixture("trust");
-        assert!(!store.trusted_blocking(&id), "nothing granted yet");
+        assert!(!store.trusted_blocking(&id), "nothing has run here");
         assert!(
             !base.join(".kloop").exists(),
             "asking must not create state"
@@ -314,44 +312,35 @@ mod tests {
         store.grant_trust_blocking(&id).unwrap();
         assert!(store.trusted_blocking(&id));
         assert!(!store.policy_path(&id).exists(), "rules are untouched");
+        let mut written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.trust_path(&id)).unwrap()).unwrap();
+        let granted_at = written["grantedAt"].take();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &std::fs::read_to_string(store.trust_path(&id)).unwrap()
-            )
-            .unwrap(),
+            written,
             serde_json::json!({
                 "version": 1,
                 "projectId": id.as_str(),
-                "trusted": true,
+                "grantedAt": null,
             })
         );
+        let granted_at = granted_at.as_str().expect("grantedAt is a string");
+        assert_eq!(granted_at.len(), 20, "{granted_at}");
+        assert!(granted_at.ends_with('Z'), "{granted_at}");
 
-        // Granting twice is the same state, not an error.
         store.grant_trust_blocking(&id).unwrap();
         assert!(store.trusted_blocking(&id));
-        let _ = std::fs::remove_dir_all(base);
-    }
 
-    /// Anything that is not an intact yes reads as untrusted — the human is
-    /// asked again rather than let through on a damaged record.
-    #[test]
-    fn a_damaged_or_foreign_trust_record_reads_as_untrusted() {
-        let (base, store, id) = fixture("trust-damaged");
-        store.grant_trust_blocking(&id).unwrap();
-        let path = store.trust_path(&id);
-        let other = ProjectId::from_str(&format!("p1_{}", "b".repeat(64))).unwrap();
-        for damaged in [
-            serde_json::json!({"version": 1, "projectId": id.as_str(), "trusted": false}),
-            serde_json::json!({"version": 2, "projectId": id.as_str(), "trusted": true}),
-            serde_json::json!({"version": 1, "projectId": other.as_str(), "trusted": true}),
-            serde_json::json!({"version": 1, "projectId": id.as_str()}),
-            serde_json::json!("yes"),
-        ] {
-            std::fs::write(&path, serde_json::to_vec(&damaged).unwrap()).unwrap();
-            assert!(!store.trusted_blocking(&id), "{damaged}");
-        }
-        std::fs::write(&path, b"{not json").unwrap();
-        assert!(!store.trusted_blocking(&id), "unparseable");
+        // A project that predates the question — sessions but no record — is
+        // answered for all the same, and one project says nothing about another.
+        let (other_base, other_store, other_id) = fixture("trust-sessions");
+        let untouched = ProjectId::from_str(&format!("p1_{}", "b".repeat(64))).unwrap();
+        std::fs::create_dir_all(other_store.project_dir(&other_id).join("sessions")).unwrap();
+        assert!(other_store.trusted_blocking(&other_id));
+        assert!(
+            !other_store.trusted_blocking(&untouched),
+            "a different project"
+        );
+        let _ = std::fs::remove_dir_all(other_base);
         let _ = std::fs::remove_dir_all(base);
     }
 

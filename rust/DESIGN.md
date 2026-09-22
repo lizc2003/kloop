@@ -569,9 +569,18 @@ plan 193): a raw-mode two-option list — `No, exit` / `Yes, I trust this
 directory` — with the exit preselected, so a stray Enter is the safe answer.
 Arrow keys move, Enter settles, and Esc / Ctrl+C / an unreadable terminal all
 mean exit. A terminal that will not go raw falls back to a one-line read with
-the same default. Answering no exits with status 0; answering yes is recorded in
-`~/.kloop/projects/v1/<ProjectId>/trust.json`, beside the permission policy and
-under its own lock — trust is not a rule, it is whether the rules get to start.
+the same default. Answering no exits with status 0.
+
+**The answer is the project's own directory** under the private state root,
+`~/.kloop/projects/v1/<ProjectId>/`: nothing but kloop creates it, so its
+existence means this machine's owner has already run here — whether it holds a
+trust record, transcripts, or durable approvals. That is what keeps the
+question a one-time event instead of something every project predating it would
+meet, and it is why answering yes writes `trust.json` there: creating the
+directory is the point, and the file (`{version, projectId, grantedAt}`,
+write-only — nothing reads it back) is what a human finds later when they
+wonder where the grant came from. Revoking is deleting the directory. Trust is
+not a rule, which is why it does not live in the rule table beside it.
 
 The question exists because kloop's *policy* surface is closed to the
 repository but its *instruction* surface is not. Permissions, hooks, MCP
@@ -583,15 +592,6 @@ can still steer the model: `AGENTS.md`, `.kloop/rules/*.md` and
 skills are model-activatable, and a skill body's `` !`cmd` `` inline really
 executes. Since the contained-writes layer
 below, an in-cwd file write does not stop for a human either.
-
-A project that already has transcripts of its own is not asked at all: session
-files live in the private state root, never in the repository, so one existing
-means this machine's owner has worked here before — the same answer in another
-form, and the reason the question does not greet every project that predates
-it. It does not make the record redundant: a session that never produced
-content deletes itself on drop, so answering yes and quitting without a word
-leaves no transcript — `trust.json` is what survives that, and it keeps
-meaning "a human said yes".
 
 Each interactive launch also prints a full-width rule before anything else, so
 several kloop runs in one scrollback are told apart at a glance.

@@ -53,29 +53,16 @@ pub(crate) fn asks_for_trust(serve: bool, headless: bool, mock: bool, stdin_is_t
     !serve && !headless && !mock && stdin_is_tty
 }
 
-/// Ask unless this project is already answered for. `false` means the human
+/// Ask unless this project is already answered for — which the project's own
+/// directory under the private state root answers, whether it holds a trust
+/// record, transcripts, or durable approvals (see `ProjectStore`). `false` means the human
 /// declined and the caller should exit without starting anything.
-pub(crate) fn ensure_trusted(
-    store: Option<&Arc<ProjectStore>>,
-    sessions: &Path,
-    cwd: &Path,
-) -> bool {
+pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> bool {
     let identity = WorkspaceIdentity::resolve(cwd);
     let project = identity.project_id().zip(store);
     if let Some((project_id, store)) = project
         && store.trusted_blocking(project_id)
     {
-        return true;
-    }
-    // A transcript of this project's own is an answer in another form: they
-    // live in the private state root, never in the repository, so one existing
-    // means this machine's owner has already worked here. Asking now would
-    // protect nothing and would greet every project that predates the
-    // question. It does NOT make `trust.json` redundant: an empty session
-    // deletes itself on drop (`Rollout::drop`), so saying yes and quitting
-    // without a word leaves no transcript — the record is what survives that,
-    // and it keeps meaning "a human said yes".
-    if has_prior_sessions(sessions) {
         return true;
     }
     if ask(identity.cwd(), project.is_none()) == Answer::Exit {
@@ -87,11 +74,6 @@ pub(crate) fn ensure_trusted(
         eprintln!("\x1b[2m[trust was not saved ({error}); this directory will ask again]\x1b[0m");
     }
     true
-}
-
-/// Whether this project's private session directory holds anything at all.
-fn has_prior_sessions(sessions: &Path) -> bool {
-    std::fs::read_dir(sessions).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Pure key handling, so the answer's shape is testable without a terminal.
@@ -251,23 +233,6 @@ mod tests {
             step(key(KeyCode::Char('x')), Answer::Exit),
             Step::Select(Answer::Exit)
         );
-    }
-
-    /// A project with transcripts of its own has been worked in before, so
-    /// the question is already answered; an empty or absent directory is not.
-    #[test]
-    fn prior_sessions_answer_the_question() {
-        let root = std::env::temp_dir().join(format!("kloop-trust-prior-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(!has_prior_sessions(&root), "no directory at all");
-        std::fs::create_dir_all(&root).unwrap();
-        assert!(
-            !has_prior_sessions(&root),
-            "an empty directory is not a session"
-        );
-        std::fs::write(root.join("20260922-000000.jsonl"), b"{}\n").unwrap();
-        assert!(has_prior_sessions(&root));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// One marker, on the selected line only.

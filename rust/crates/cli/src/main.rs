@@ -357,11 +357,7 @@ async fn run_front_end(
         // One rule per interactive launch, so several launches in one
         // scrollback are told apart at a glance.
         launch_rule();
-        if !trust::ensure_trusted(
-            process.runtime.project_store(),
-            &session_store.dirs(&cwd).sessions,
-            &cwd,
-        ) {
+        if !trust::ensure_trusted(process.runtime.project_store(), &cwd) {
             return Ok(ExitCode::SUCCESS);
         }
     }
