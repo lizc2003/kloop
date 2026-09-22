@@ -12,8 +12,9 @@
 `~/.kloop/config.toml` 一个私有文件(plan 46 删掉了 cwd config),cwd 只是 workspace
 anchor。**一个陌生仓库改不了你的闸门。**
 
-但它改得了模型**做什么**。今天从仓库里读进来的有:`AGENTS.md` / `CLAUDE.md` /
-`AGENTS.local.md`、`.kloop/rules/*.md`、以及**项目级 skills 与 commands**——skill 对模型
+但它改得了模型**做什么**。今天从仓库里读进来的有:`AGENTS.md`、`.kloop/rules/*.md`、
+`AGENTS.local.md`(`context.rs:70` 只认这三个名字——plan 13/32 里写的 "CLAUDE.md 兼容
+回退"在现在的代码里**不存在**,写提示语时照旧记载写错过一次)、以及**项目级 skills 与 commands**——skill 对模型
 可见、可由模型自己激活,而 skill 正文里的 `` !`cmd` `` 内联是**会真执行**的(过闸门,
 沙箱 contained 就不问)。也就是说:策略面是封住的,指令面是敞开的。
 
@@ -65,13 +66,14 @@ plan 192 之后还多了一条:cwd 内的结构化写不再询问。围栏的论
 (fmt + clippy `-D warnings` + 全工作区 test)。开工前问用户的那一个点(非交互入口怎么办)
 答案是"视为已信任",已落进 `asks_for_trust`。
 
-落地形状:`cli/src/trust.rs`(新,约 130 行含测试)+ `project_store.rs` 的 `trust.json`
+落地形状:`cli/src/trust.rs`(新,raw mode 两项选择,约 200 行含测试)+ `project_store.rs` 的 `trust.json`
 读写 + `main.rs` 分发前一行 + `startup.rs` 暴露 store。
 
 | 测试 | 锁住什么 |
 |---|---|
 | `trust::tests::only_an_interactive_launch_asks` | 裁决本身:serve / headless / mock / 非 TTY 四种都不问,只有交互式启动问 |
-| `trust::tests::nothing_but_yes_continues` | 只有 `y`/`yes` 放行;空行、`no`、`yep`、EOF 全是退出 |
+| `trust::tests::every_exit_leads_to_exit_and_only_a_move_down_trusts` | Enter(默认)、Esc、Ctrl+C/D、读不到键全是退出;只有明确下移再 Enter 才信任;未知键不结束提问 |
+| `trust::tests::only_the_selected_option_is_marked` | 标记只在选中那行 |
 | `project_store::tests::trust_round_trips_beside_the_rules_without_touching_them` | 授权前不创建任何状态;授权后 `trust.json` 整对象断言,`permissions.json` 不受影响;重复授权幂等 |
 | `project_store::tests::a_damaged_or_foreign_trust_record_reads_as_untrusted` | 六种坏记录(`trusted:false`、版本不符、别的项目、缺字段、不是对象、不是 JSON)一律 fail-closed |
 
@@ -79,7 +81,17 @@ plan 192 之后还多了一条:cwd 内的结构化写不再询问。围栏的论
 且不建会话文件;答 `y` 进 REPL 且 `~/.kloop/projects/v1/<id>/trust.json` 落盘;同目录
 第二次启动直接进 REPL 不再问。验完删掉了那条演示记录。
 
-两件比设计更清楚的事:
+三件比设计更清楚的事:
+
+0. **第一版的提示写成了一段说明文,两个毛病:话不准,而且太长。** 它逐条列 kloop 会读什么、
+   沙箱怎么样——其中"读 CLAUDE.md"照的是 plan 13/32 的旧记载,而 `context.rs:70` 只认
+   `AGENTS.md` / `AGENTS.local.md` / `.kloop/rules/*.md`(`CLAUDE.md` 在 `rust/` 整个历史里
+   一次都没出现过,用户当场指出);"Commands still run in the OS sandbox"又只在 macOS 成立。
+   **用户要的是两项上下选择、文案短**(截图)。最终形状:`Accessing workspace:` + 路径 +
+   两句话 + `❯ No, exit` / `Yes, I trust this directory`,Esc 预选在退出上。
+   顺带解决了准确性——短到不必声明那些细节,"read, edit and run files here, and follow
+   instructions it finds in them"同样是真话,而且在哪个平台都成立。**说大了范围和说小了
+   一样是错的,而最省事的修法常常是少说。** 教训 172。
 
 1. **门开在启动路径上,代价落在所有 pty e2e 上。** `plain_pty` / `tui_pty` 共用的
    `ChatFixture` 起的是真二进制、真 pty,于是它们的第一屏全变成了这个提示,24 条全红

@@ -16,6 +16,7 @@ kloop-tui = { workspace = true }
 kloop-web = { workspace = true }
 
 anyhow = { workspace = true }
+crossterm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # MCP OAuth token store (plan 34b): serde derives the on-disk credential record,

@@ -4,25 +4,46 @@
 //! kloop's *policy* surface is already closed to the repository — permissions,
 //! hooks, MCP servers and the sandbox all come from the one private
 //! `~/.kloop/config.toml`, so a hostile checkout cannot move the gate. What it
-//! can still do is steer the model: `AGENTS.md` / `CLAUDE.md` / `.kloop/rules`
-//! ride into the system prompt, this project's skills are model-activatable,
-//! and a skill body's `` !`cmd` `` inline really executes. Since plan 192 an
-//! in-cwd file write does not stop for the human either. That is what this
-//! question is for, and it is the only thing it is for: it is not a permission
-//! mode, and answering yes changes no layer of the gate.
+//! can still do is steer the model: `AGENTS.md`, `.kloop/rules/*.md` and
+//! `AGENTS.local.md` ride into the system prompt, this project's skills are
+//! model-activatable, and a skill body's `` !`cmd` `` inline really executes.
+//! Since plan 192 an in-cwd file write does not stop for the human either.
+//! That is what this question is for, and the only thing it is for: it is not
+//! a permission mode, and answering yes changes no layer of the gate.
 //!
-//! The answer is keyed by [`ProjectId`], so a Git project is trusted once for
-//! all of its subdirectories and linked worktrees, and a plain directory is
-//! trusted as itself.
+//! The answer is keyed by [`ProjectId`](kloop_core::project::ProjectId), so a
+//! Git project is trusted once for all of its subdirectories and linked
+//! worktrees, and a plain directory is trusted as itself.
 
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
+use crossterm::event::Event;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use crossterm::terminal;
+
 use kloop_core::project::WorkspaceIdentity;
 
 use crate::project_store::ProjectStore;
+
+/// The two choices, in the order they are listed. `Exit` is first and starts
+/// selected: the safe answer is the one a stray Enter gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    Exit,
+    Trust,
+}
+
+/// What one keypress does: move the selection, or settle it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Select(Answer),
+    Done(Answer),
+}
 
 /// Whether this launch has a human who can answer. `--serve` and `--headless`
 /// are started by something that already made the call — whoever launches them
@@ -30,12 +51,6 @@ use crate::project_store::ProjectStore;
 /// touches the durable store, and a non-TTY stdin has nobody behind it.
 pub(crate) fn asks_for_trust(serve: bool, headless: bool, mock: bool, stdin_is_tty: bool) -> bool {
     !serve && !headless && !mock && stdin_is_tty
-}
-
-/// Only an explicit yes continues. A typo, an empty line, an EOF or `n` all
-/// mean the same thing: this is not a directory the human vouched for.
-pub(crate) fn accepts(answer: &str) -> bool {
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Ask unless this project was trusted in an earlier session. `false` means
@@ -48,7 +63,7 @@ pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> b
     {
         return true;
     }
-    if !ask(identity.cwd(), project.is_none()) {
+    if ask(identity.cwd(), project.is_none()) == Answer::Exit {
         return false;
     }
     if let Some((project_id, store)) = project
@@ -59,29 +74,89 @@ pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> b
     true
 }
 
-/// The prompt itself. Blocking, and deliberately before any async stdin reader
-/// exists — the REPL's own reader would otherwise buffer past this line.
-fn ask(cwd: &Path, unremembered: bool) -> bool {
+/// Pure key handling, so the answer's shape is testable without a terminal.
+fn step(key: KeyEvent, selected: Answer) -> Step {
+    match (key.code, key.modifiers) {
+        (KeyCode::Up | KeyCode::Char('k'), _) => Step::Select(Answer::Exit),
+        (KeyCode::Down | KeyCode::Char('j'), _) => Step::Select(Answer::Trust),
+        (KeyCode::Enter, _) => Step::Done(selected),
+        (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+            Step::Done(Answer::Exit)
+        }
+        _ => Step::Select(selected),
+    }
+}
+
+/// The two option lines, selected one marked and highlighted.
+fn options(selected: Answer) -> [String; 2] {
+    let line = |answer: Answer, text: &str| {
+        if answer == selected {
+            format!("\x1b[36m❯ {text}\x1b[0m")
+        } else {
+            format!("  {text}")
+        }
+    };
+    [
+        line(Answer::Exit, "No, exit"),
+        line(Answer::Trust, "Yes, I trust this directory"),
+    ]
+}
+
+/// The prompt. Raw mode, arrow keys, `Exit` preselected. Runs before any
+/// front-end owns the terminal and before any async stdin reader exists.
+fn ask(cwd: &Path, unremembered: bool) -> Answer {
     let path = cwd.display();
-    let scope = if unremembered {
-        "\n  This directory has no stable project identity, so the answer cannot be remembered."
+    let note = if unremembered {
+        "\r\n\x1b[2mNo stable project identity here, so this answer is not remembered.\x1b[0m\r\n"
     } else {
         ""
     };
     print!(
-        "\n\x1b[1mTrust this directory?\x1b[0m\n\n  {path}\n\n\
-         kloop reads the files here, follows the instructions it finds in AGENTS.md,\n\
-         CLAUDE.md and .kloop/rules, lets the model activate this project's own skills,\n\
-         and edits files inside this directory without asking. Commands still run in the\n\
-         OS sandbox, and writes to .git, .kloop and .env* still ask every time.\n\n\
-         Continue only if you know where this directory came from.{scope}\n\n  \
-         y = trust it (this project and its worktrees) · anything else = exit\n> "
+        "\r\n\x1b[1;33mAccessing workspace:\x1b[0m\r\n\r\n  \x1b[1m{path}\x1b[0m\r\n\r\n\
+         Is this a directory you created, or one you trust? kloop will read, edit and\r\n\
+         run files here, and follow instructions it finds in them.\r\n{note}\r\n"
     );
+    if terminal::enable_raw_mode().is_err() {
+        return ask_by_line();
+    }
+    let mut selected = Answer::Exit;
+    let answer = loop {
+        let [first, second] = options(selected);
+        print!(
+            "{first}\r\n{second}\r\n\r\n\x1b[2mEnter to confirm · ↑↓ to move · Esc to cancel\x1b[0m\r\n"
+        );
+        let _ = std::io::stdout().flush();
+        let key = match crossterm::event::read() {
+            Ok(Event::Key(key)) if key.is_press() => key,
+            Ok(_) => {
+                print!("\x1b[4A\x1b[J");
+                continue;
+            }
+            Err(_) => break Answer::Exit,
+        };
+        // Redraw in place: the four lines just printed are the whole widget.
+        print!("\x1b[4A\x1b[J");
+        match step(key, selected) {
+            Step::Select(next) => selected = next,
+            Step::Done(answer) => break answer,
+        }
+    };
+    let [first, second] = options(answer);
+    print!("{first}\r\n{second}\r\n");
+    let _ = std::io::stdout().flush();
+    let _ = terminal::disable_raw_mode();
+    println!();
+    answer
+}
+
+/// Fallback for a terminal that will not go raw: one line, same default.
+fn ask_by_line() -> Answer {
+    print!("  Trust this directory? [y = yes, anything else = exit] > ");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
     match std::io::stdin().read_line(&mut answer) {
-        Ok(0) | Err(_) => false,
-        Ok(_) => accepts(&answer),
+        Ok(read) if read > 0 && matches!(answer.trim(), "y" | "Y") => Answer::Trust,
+        _ => Answer::Exit,
     }
 }
 
@@ -94,6 +169,10 @@ pub(crate) fn stdin_is_tty() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     /// The ruling this module exists to encode: only an interactive launch
     /// asks. Everything else is somebody else's decision, already made.
@@ -115,15 +194,53 @@ mod tests {
         }
     }
 
-    /// Yes is exact; everything else — including a near-miss and an empty
-    /// line — exits.
+    /// Exit is preselected and is what every way out gives: Enter on the
+    /// default, Esc, Ctrl+C, Ctrl+D, and an unreadable terminal. Only a
+    /// deliberate move down and Enter trusts.
     #[test]
-    fn nothing_but_yes_continues() {
-        for yes in ["y", "Y", "yes", "YES", " y \n"] {
-            assert!(accepts(yes), "{yes:?}");
-        }
-        for no in ["", "\n", "n", "no", "yep", "sure", "1", "trust"] {
-            assert!(!accepts(no), "{no:?}");
-        }
+    fn every_exit_leads_to_exit_and_only_a_move_down_trusts() {
+        assert_eq!(
+            step(key(KeyCode::Enter), Answer::Exit),
+            Step::Done(Answer::Exit)
+        );
+        assert_eq!(
+            step(key(KeyCode::Esc), Answer::Trust),
+            Step::Done(Answer::Exit)
+        );
+        assert_eq!(
+            step(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Answer::Trust
+            ),
+            Step::Done(Answer::Exit)
+        );
+        assert_eq!(
+            step(key(KeyCode::Down), Answer::Exit),
+            Step::Select(Answer::Trust)
+        );
+        assert_eq!(
+            step(key(KeyCode::Up), Answer::Trust),
+            Step::Select(Answer::Exit)
+        );
+        assert_eq!(
+            step(key(KeyCode::Enter), Answer::Trust),
+            Step::Done(Answer::Trust)
+        );
+        // An unknown key changes nothing rather than settling the question.
+        assert_eq!(
+            step(key(KeyCode::Char('x')), Answer::Exit),
+            Step::Select(Answer::Exit)
+        );
+    }
+
+    /// One marker, on the selected line only.
+    #[test]
+    fn only_the_selected_option_is_marked() {
+        let [exit, trust] = options(Answer::Exit);
+        assert!(exit.contains("❯ No, exit"));
+        assert!(trust.starts_with("  Yes,"));
+        let [exit, trust] = options(Answer::Trust);
+        assert!(exit.starts_with("  No,"));
+        assert!(trust.contains("❯ Yes, I trust this directory"));
     }
 }

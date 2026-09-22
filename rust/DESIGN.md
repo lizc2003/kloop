@@ -565,7 +565,11 @@ nested dirs or codex's SQLite `thread_spawn_edges`:
 
 Before any front-end reads the working directory, an interactive launch asks
 once per project whether this directory is trusted (`crates/cli/src/trust.rs`,
-plan 193). Answering no exits with status 0; answering yes is recorded in
+plan 193): a raw-mode two-option list — `No, exit` / `Yes, I trust this
+directory` — with the exit preselected, so a stray Enter is the safe answer.
+Arrow keys move, Enter settles, and Esc / Ctrl+C / an unreadable terminal all
+mean exit. A terminal that will not go raw falls back to a one-line read with
+the same default. Answering no exits with status 0; answering yes is recorded in
 `~/.kloop/projects/v1/<ProjectId>/trust.json`, beside the permission policy and
 under its own lock — trust is not a rule, it is whether the rules get to start.
 
@@ -573,9 +577,11 @@ The question exists because kloop's *policy* surface is closed to the
 repository but its *instruction* surface is not. Permissions, hooks, MCP
 servers and the sandbox come only from the one private `~/.kloop/config.toml`
 (plan 46 deleted cwd config), so a hostile checkout cannot move the gate. It
-can still steer the model: `AGENTS.md` / `CLAUDE.md` / `.kloop/rules` ride into
-the system prompt, the project's own skills are model-activatable, and a skill
-body's `` !`cmd` `` inline really executes. Since the contained-writes layer
+can still steer the model: `AGENTS.md`, `.kloop/rules/*.md` and
+`AGENTS.local.md` ride into the system prompt (those three names and no others
+— there is no `CLAUDE.md` fallback in the discovery layer), the project's own
+skills are model-activatable, and a skill body's `` !`cmd` `` inline really
+executes. Since the contained-writes layer
 below, an in-cwd file write does not stop for a human either.
 
 The answer is keyed by `ProjectId`, so a Git project is trusted once for every
