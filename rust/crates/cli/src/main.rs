@@ -330,6 +330,19 @@ async fn run() -> Result<ExitCode> {
     result
 }
 
+/// A full-width rule, printed once when an interactive launch starts. Several
+/// kloop runs in one terminal otherwise run together in the scrollback.
+fn launch_rule() {
+    // A terminal that reports no width (a pty with no window size set) gets
+    // the conventional 80 rather than a rule of nothing.
+    let width = crossterm::terminal::size()
+        .map(|(columns, _)| usize::from(columns))
+        .ok()
+        .filter(|columns| *columns >= 8)
+        .unwrap_or(80);
+    println!("\x1b[2m{}\x1b[0m", "─".repeat(width.min(200)));
+}
+
 /// Pick the front-end the flags asked for and run it to completion.
 async fn run_front_end(
     args: CliArgs,
@@ -340,10 +353,17 @@ async fn run_front_end(
     // Workspace trust (plan 193) comes before everything a front-end does —
     // before a session file exists, before the directory is read. A declined
     // directory is not an error: the human chose to leave.
-    if trust::asks_for_trust(args.serve, args.headless, args.mock, trust::stdin_is_tty())
-        && !trust::ensure_trusted(process.runtime.project_store(), &cwd)
-    {
-        return Ok(ExitCode::SUCCESS);
+    if trust::asks_for_trust(args.serve, args.headless, args.mock, trust::stdin_is_tty()) {
+        // One rule per interactive launch, so several launches in one
+        // scrollback are told apart at a glance.
+        launch_rule();
+        if !trust::ensure_trusted(
+            process.runtime.project_store(),
+            &session_store.dirs(&cwd).sessions,
+            &cwd,
+        ) {
+            return Ok(ExitCode::SUCCESS);
+        }
     }
     if args.serve {
         return run_serve(args, process, session_store).await;

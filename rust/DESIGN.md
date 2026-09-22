@@ -584,6 +584,16 @@ skills are model-activatable, and a skill body's `` !`cmd` `` inline really
 executes. Since the contained-writes layer
 below, an in-cwd file write does not stop for a human either.
 
+A project that already has transcripts of its own is not asked at all: session
+files live in the private state root, never in the repository, so one existing
+means this machine's owner has worked here before — the same answer in another
+form, and the reason the question does not greet every project that predates
+it. That is not recorded as a grant; `trust.json` keeps meaning "a human said
+yes".
+
+Each interactive launch also prints a full-width rule before anything else, so
+several kloop runs in one scrollback are told apart at a glance.
+
 The answer is keyed by `ProjectId`, so a Git project is trusted once for every
 subdirectory and linked worktree, and a plain directory is trusted as itself
 (`WorkspaceIdentity::resolve` gives a directory-domain id when there is no Git
