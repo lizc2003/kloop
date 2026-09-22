@@ -78,13 +78,13 @@
 | `project_store::tests::the_project_directory_is_the_answer_and_the_label_carries_the_grant` | 授权前不创建任何状态;授权后 `project.json` 整对象断言(含 anchor 与 granted_at);`permissions.json` 不受影响;**分区里只有这一个文件、没有 `.lock`**;重复授权仍是同一个答案 |
 | `project_store::tests::the_grant_writes_the_anchor_a_cross_project_listing_reads_back` | 真实接线与两种交错顺序:core 先建标签、grant 再写进去(0644 会红),以及 grant 之后那次 `ensure()` 不抹掉 `granted_at`;anchor 经 `buckets()` 读回来等于 `partition_anchor()`(传 cwd 会红) |
 | `session_store::tests::a_label_that_already_names_the_project_is_left_alone` | 合并的承重点:带 `granted_at` 的标签被随后的 `ensure()` 一字不改地留下 |
-| `session_store::tests::a_foreign_or_unreadable_label_is_repaired` | 自愈仍在:别人的 id / **别的 anchor** / 不是 JSON / 空文件都会被重写成自己的标签 |
+| `session_store::tests::a_foreign_or_unreadable_label_is_repaired` | 自愈仍在:别人的 id / **别的 anchor** / 不是 JSON / 空文件都会被重写成自己的标签;而**修复会带上原有的 `granted_at`**——它是这个写者从没观察过的那一个字段 |
 | `session_store::tests::created_state_is_owner_only` | 标签是 `0600`——不是整洁问题,CLI 的 grant 经同一个读路径打开它,0644 会让 grant 直接失败 |
 
 真二进制验过(见提交信息):临时 `$HOME` 下交互式起一次、答 yes,`projects/v1/<id>/` 里只有
 `project.json`(0600)且含 `granted_at`;第二次启动不再问,且该文件的 `granted_at` 与首次逐字相同。
 
-## 六、复审后的修正(第二次提交)
+## 六、复审后的修正(后续两次提交)
 
 用户复审提了四条,逐条核过**全部成立**,一个 `fix(plan196)` 提交:
 
@@ -100,6 +100,14 @@
 3. **DESIGN.md 自相矛盾。** 我写的"a single write of a file nobody reads back"与上一段的
    `read_project_anchor` 冲突——准确说法是"没有任何读点拿 `granted_at` 做判断"。两处都改了。
 4. 标签改回 pretty:旧 `trust.json` 就是 `to_vec_pretty`,而这是分区里唯一给人看的文件。
+
+**第三次提交(复审的第二轮)**:复审指出"修复整份重写会把 `granted_at` 顺手丢掉,而 DESIGN 的
+'repairs itself' 读起来是无损的",并给了两条路——补一句说明,或者把字段带过去(但等于把 RMW 语义
+请回来),他自己倾向不请。**用户拍板:保留 `granted_at`。** 于是 `write_project_label` 在重写时把
+读到的 `granted_at` 带进新标签(哪怕是"写着别人 id"的坏标签也带——文件就在这个分区里,而那个字段
+是字条不是判据)。这不构成之前担心的那种 RMW:没有别的写者会并发改这个字段(grant 只在目录缺席时
+发生,而修复只在目录存在时发生),而且没有任何读点拿它做判断——最坏情况下一次竞争丢的是字条,不是
+决定。DESIGN.md 两处相应改准,测试里"错 anchor + 带 grant"的用例现在断言 anchor 被修回、grant 被留下。
 
 顺带:grant 的 anchor 接线补了测试(单测原本只喂编造的 `/work/here`);失败提示改成实话——
 `ensure_project` 已经把目录建出来了,所以只有"连目录都没建成"的失败才会再问,提示不再一律声称会再问。

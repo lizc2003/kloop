@@ -326,9 +326,11 @@ launch wrote, and there is nothing to update. The rule is "leave a label that
 already names this project and this anchor alone, byte for byte" — absent,
 unreadable, another project, or another anchor is replaced, so a damaged label
 repairs itself. This is what lets the trust grant live in the same file as the
-label (see Workspace trust below) without either writer erasing the other, and
-it is why there is no lock beside it: a read-modify-write needs one, a single
-write whose one variable field no reader acts on does not.
+label (see Workspace trust below) without either writer erasing the other. A
+repair carries a grant forward rather than dropping it — that field records a
+human's answer, which this writer never observed — and that much
+read-modify-write still needs no lock: nothing acts on the field, so the worst a
+race can lose is the note, never the decision.
 
 Consequences worth knowing:
 
@@ -631,9 +633,9 @@ meet, and it is why answering yes writes the partition's own label
 and the record is what a human finds later when they wonder where the grant
 came from. No reader acts on that record — the anchor beside it is read back
 (for cross-project listings), the grant is not — and the label is written once,
-so an ordinary start leaves a file that already names its project alone (plan
-196). That is what lets the grant and the anchor share one file with no lock
-between them. A label without `granted_at` is a project nobody was ever asked
+so an ordinary start leaves a file that already names its project alone, while a
+repair of a damaged one carries the grant forward (plan 196). That is what lets
+the grant and the anchor share one file with no lock between them. A label without `granted_at` is a project nobody was ever asked
 about: a `--headless` or `--serve` run created it, and those are trusted by
 whoever launched them. Revoking is deleting the directory. Trust is not a rule,
 which is why it does not live in the rule table beside it.

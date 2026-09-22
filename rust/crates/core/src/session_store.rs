@@ -236,15 +236,25 @@ fn label_names(value: &serde_json::Value, project_id: &ProjectId, anchor: &Path)
 /// label repairs itself instead of staying wrong forever. The anchor is in that
 /// list because it is the field a listing actually reads: a wrong one written
 /// once and never corrected would be the expensive kind.
+///
+/// A repair keeps whatever `granted_at` it found. That field records something
+/// this writer never observed — a human answering yes — and dropping it while
+/// fixing an unrelated field would be a loss nobody asked for.
 fn write_project_label(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io::Result<()> {
     let path = dir.join(PROJECT_LABEL);
-    if let Ok(existing) = std::fs::read_to_string(&path)
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing)
-        && label_names(&value, project_id, anchor)
+    let existing = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    if let Some(value) = existing.as_ref()
+        && label_names(value, project_id, anchor)
     {
         return Ok(());
     }
-    let bytes = project_label_bytes(project_id, anchor, None)?;
+    let granted_at = existing
+        .as_ref()
+        .and_then(|value| value.get("granted_at"))
+        .and_then(serde_json::Value::as_str);
+    let bytes = project_label_bytes(project_id, anchor, granted_at)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     // Owner-only, like everything else in this directory — and load-bearing
@@ -458,20 +468,44 @@ mod tests {
         let partition = dirs.sessions.parent().unwrap().to_path_buf();
         let identity = WorkspaceIdentity::resolve(&repo);
         let project_id = identity.session_partition();
-        let expected = project_label_bytes(&project_id, identity.partition_anchor(), None).unwrap();
-        let elsewhere = project_label_bytes(
-            &project_id,
-            Path::new("/elsewhere"),
-            Some("2026-09-22T07:46:15Z"),
-        )
-        .unwrap();
+        let repaired = |granted_at: Option<&str>| {
+            project_label_bytes(&project_id, identity.partition_anchor(), granted_at).unwrap()
+        };
 
-        for damaged in [
-            String::new(),
-            "{".to_string(),
-            serde_json::json!({"version": 1, "project_id": "p1_elsewhere", "anchor": "/elsewhere"})
+        for (damaged, expected) in [
+            (String::new(), repaired(None)),
+            ("{".to_string(), repaired(None)),
+            (
+                serde_json::json!({"version": 1, "project_id": "p1_elsewhere", "anchor": "/elsewhere"})
+                    .to_string(),
+                repaired(None),
+            ),
+            // A wrong anchor is repaired, and the grant that came with it is
+            // not collateral damage: this writer never observed it.
+            (
+                String::from_utf8(
+                    project_label_bytes(
+                        &project_id,
+                        Path::new("/elsewhere"),
+                        Some("2026-09-22T07:46:15Z"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                repaired(Some("2026-09-22T07:46:15Z")),
+            ),
+            // Even a label naming another project keeps its grant: the file is
+            // in *this* partition, and the field is a note, not a decision.
+            (
+                serde_json::json!({
+                    "version": 1,
+                    "project_id": "p1_elsewhere",
+                    "anchor": "/elsewhere",
+                    "granted_at": "2026-09-22T07:46:15Z",
+                })
                 .to_string(),
-            String::from_utf8(elsewhere).unwrap(),
+                repaired(Some("2026-09-22T07:46:15Z")),
+            ),
         ] {
             std::fs::write(partition.join(PROJECT_LABEL), &damaged).unwrap();
             store.ensure(&repo).unwrap();
