@@ -588,8 +588,10 @@ A project that already has transcripts of its own is not asked at all: session
 files live in the private state root, never in the repository, so one existing
 means this machine's owner has worked here before — the same answer in another
 form, and the reason the question does not greet every project that predates
-it. That is not recorded as a grant; `trust.json` keeps meaning "a human said
-yes".
+it. It does not make the record redundant: a session that never produced
+content deletes itself on drop, so answering yes and quitting without a word
+leaves no transcript — `trust.json` is what survives that, and it keeps
+meaning "a human said yes".
 
 Each interactive launch also prints a full-width rule before anything else, so
 several kloop runs in one scrollback are told apart at a glance.

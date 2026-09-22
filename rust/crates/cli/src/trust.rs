@@ -67,12 +67,14 @@ pub(crate) fn ensure_trusted(
     {
         return true;
     }
-    // Sessions of this project's own are the same answer in another form: the
-    // transcripts live in the private state root, never in the repository, so
-    // one existing means this machine's owner has already worked here. Asking
-    // now would protect nothing and would greet every project that predates
-    // the question. It is not recorded as a grant — `trust.json` keeps meaning
-    // "a human said yes".
+    // A transcript of this project's own is an answer in another form: they
+    // live in the private state root, never in the repository, so one existing
+    // means this machine's owner has already worked here. Asking now would
+    // protect nothing and would greet every project that predates the
+    // question. It does NOT make `trust.json` redundant: an empty session
+    // deletes itself on drop (`Rollout::drop`), so saying yes and quitting
+    // without a word leaves no transcript — the record is what survives that,
+    // and it keeps meaning "a human said yes".
     if has_prior_sessions(sessions) {
         return true;
     }
