@@ -188,6 +188,36 @@ impl FileState {
         self.evict_to_limits(&mut inner);
     }
 
+    /// Put an observation back into a slot this session cleared, unless something
+    /// newer has already filled it.
+    ///
+    /// A mutation clears the path before it starts, because past that point a
+    /// directory, a temp file or a rename may already exist. One whose refusal
+    /// never reached the write calls this to undo that: the read it dropped is
+    /// still a true statement about the path, and dropping it makes the next
+    /// mutation of the same turn fail for never having read a file the model did
+    /// read (plan 195).
+    ///
+    /// Vacancy is the whole condition. A record that appeared in the meantime
+    /// belongs to a mutation that did commit, and this caller's older read must
+    /// not displace it.
+    pub(crate) fn restore_cleared(&self, path: &Path, observation: FileObservation) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.observations.contains_key(path) {
+            return;
+        }
+        inner.sequence = inner.sequence.wrapping_add(1);
+        let last_updated = inner.sequence;
+        inner.observations.insert(
+            path.to_path_buf(),
+            Entry {
+                observation,
+                last_updated,
+            },
+        );
+        self.evict_to_limits(&mut inner);
+    }
+
     /// Record that `observation`'s lines just reached the model, and answer how
     /// many times this path has now been read over lines the model already had.
     ///
@@ -450,6 +480,17 @@ impl FileVersion {
     #[cfg(test)]
     pub(crate) fn matches(&self, bytes: &[u8], metadata: &std::fs::Metadata) -> bool {
         self == &Self::new(bytes, metadata)
+    }
+
+    /// Whether two versions were taken over the same bytes, ignoring every
+    /// piece of metadata around them.
+    ///
+    /// The fingerprint is over the whole file even for a partial read, so this
+    /// answers "are these the bytes the session saw" for any observation. It is
+    /// what separates a rewrite from a `touch` or a `chmod`, which move
+    /// `modified`, `mode` or `created` without moving a single byte.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
     }
 
     pub(crate) fn metadata_matches(&self, metadata: &std::fs::Metadata) -> bool {

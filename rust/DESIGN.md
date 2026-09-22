@@ -1648,18 +1648,42 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   delete/recreate cannot inherit old coverage even when bytes and metadata resemble
   the previous object. The bounded table is process-memory only and deterministically
   evicts old entries.
+- A mutation clears its path before it starts, because past that point a directory, a
+  temp file, or a rename may already exist and a cancelled `await` must not leave a
+  read standing over replaced bytes. A refusal that never reached the write puts the
+  record back (Plan 195): the file is as the read found it, so "this session read this
+  path" is still true, and dropping it reported one root cause twice — the next
+  mutation of the same turn was refused for never having read a file the model did
+  read. That reverses Plan 57's conservative clear for `notebook_edit`, where one
+  wrong `cell_id` used to cost the notebook qualification. The single exception is a
+  target that is gone: nothing describes a missing path, reading one records nothing,
+  and `write_file` reads a leftover record as a stale one — so keeping it would refuse
+  every later write of that path with no way left to lift the refusal. Vacancy is also
+  required: a record staged by a mutation that did commit is never displaced by an
+  older read.
 - **write_file** writes the model-provided full content exactly as supplied; it does
   not inherit old line endings and its replacement content is not limited by the
   5 MiB Read/Edit ceiling. For a new leaf it may plan missing parent directories,
   show that plan during approval, and create them only after approval while holding
   the effective-target path lock. Replacing an existing file still requires a
   complete fresh read.
-- **edit_file** requires an existing, fresh UTF-8 target of at most 5 MiB that this
+- **edit_file** requires an existing UTF-8 target of at most 5 MiB that this
   session has read at least once — any range, including one that never showed the
   `old_string` (Plan 155, overturning Plan 49's complete-read rule for this one
   tool). What keeps a narrow read honest is that `old_string` must still match the
   bytes on disk uniquely, which is where every reference implementation draws the
-  line or looser; freshness is untouched, so an external change still refuses.
+  line or looser. A target that changed since that read is reported, not refused
+  (Plan 195): the admission check could be satisfied by any 30-line read, including
+  one that never covered the `old_string`, so it charged a round trip without buying
+  the freshness it named — and charged it before the anchor's verdict, the one thing
+  that decides whether the edit is honest, had been computed at all. The fact now
+  travels on all three outcomes, placed directly after the path, and is decided by
+  the observation's whole-file fingerprint so that a `touch` or a `chmod` says
+  nothing. `write_file` and `notebook_edit` keep refusing: the first replaces every
+  byte and would discard whatever the change was, the second addresses cells it never
+  saw. Freshness between kloop's own read and kloop's rename is unaffected — the
+  commit's compare-and-swap is what stops a change landing inside that window, and it
+  is now `edit_file`'s only freshness guard.
   Raw exact matching wins. Only when raw matches are absent does LF input match CRLF
   text; the helper maps logical offsets back to raw byte ranges, restores local (or
   dominant) EOLs in replacement text, and leaves all unmatched bytes—including

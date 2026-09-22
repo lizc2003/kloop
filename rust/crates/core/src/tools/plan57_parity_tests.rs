@@ -392,14 +392,19 @@ async fn guard_report() -> Value {
     assert!(missing_error && missing.contains("not found in notebook"));
     assert_eq!(std::fs::read(&path).unwrap(), external_bytes);
 
-    let (cleared, cleared_error) = run_tool(
+    // Plan 57 cleared the notebook qualification on every failure, "conservatively";
+    // plan 195 found what that cost. The refusal above never wrote, so the
+    // complete-notebook read it was granted is still a true statement and the
+    // retry lands. Before, one wrong `cell_id` was reported a second time as
+    // never having read the file — one root cause, two diagnoses.
+    let (retried, retry_error) = run_tool(
         "notebook_edit",
         json!({"notebook_path": absolute, "cell_id": "code-002", "new_source": "x"}),
         &context,
     )
     .await;
-    assert!(cleared_error && cleared.contains("File has not been read yet"));
-    assert_eq!(std::fs::read(&path).unwrap(), external_bytes);
+    assert!(!retry_error, "{retried}");
+    assert_ne!(std::fs::read(&path).unwrap(), external_bytes);
 
     let (_, reread_error) = run_tool("read_file", json!({"path": absolute}), &context).await;
     assert!(!reread_error);
@@ -425,7 +430,7 @@ async fn guard_report() -> Value {
         "unread": unread,
         "stale": stale,
         "missing": missing,
-        "failure_cleared_qualification": cleared,
+        "failure_kept_qualification": retried,
         "ordinary_mutation_revoked_qualification": generic,
         "failure_bytes_unchanged": true,
     })

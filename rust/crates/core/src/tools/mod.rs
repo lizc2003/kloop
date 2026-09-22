@@ -2818,7 +2818,7 @@ mod tests {
         );
         assert_eq!(
             definition("edit_file").description,
-            "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The file must have been read in this session — any range qualifies — and must not have changed since. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory."
+            "Replace exact old_string matches with new_string in an existing UTF-8 file of at most 5 MiB. The file must have been read in this session — any range qualifies; if it changed since that read the edit still applies and the result says so. Raw matches take priority; when none exist, LF old_string may match CRLF text without normalizing untouched bytes. Fails if old_string is absent or matches more than once without replace_all. Never creates a missing file or parent directory."
         );
         for name in ["read_file", "write_file", "edit_file"] {
             assert!(

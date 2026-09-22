@@ -188,6 +188,12 @@ enum CommitFault {
     BeforeRename,
     #[cfg(test)]
     ReplaceTempName,
+    /// Rewrite the target between the staged read and the rename. Plan 195 left
+    /// [`verify_target_unchanged`] as `edit_file`'s only freshness guard, so it
+    /// needs a way to be exercised: nothing else can change a file inside the
+    /// window between kloop reading it and kloop replacing it.
+    #[cfg(test)]
+    ChangeTargetBeforeRename,
 }
 
 pub(super) async fn prepare_read(
@@ -689,8 +695,11 @@ async fn mutate_file(
 
     // From this point the executor may have created directories, a temp file, or
     // committed a rename. Clear eagerly; only run_one's final successful
-    // tool_result stages replacement authority back in.
+    // tool_result stages replacement authority back in. A failure that left the
+    // file exactly as the read found it hands the qualification back below.
     state.apply(FileStateUpdate::Clear { path: key.clone() });
+    let restore_state = Arc::clone(&state);
+    let restore_key = key.clone();
     let path_for_error = path.to_string();
     let (outcome, path_lock) = tokio::task::spawn_blocking(move || {
         let materialized = materialize_parent(parent, &missing_parents, tool, &path_for_error);
@@ -704,6 +713,11 @@ async fn mutate_file(
             };
             let outcome = commit_mutation(target, expected.as_ref(), mutation, CommitFault::None);
             if outcome.is_err() {
+                if let Some(expected) = expected
+                    && target_still_present(&parent, &parent_path, &leaf, tool, &path_for_error)
+                {
+                    restore_state.restore_cleared(&restore_key, expected);
+                }
                 drop(parent);
                 cleanup_created_directories(created);
             }
@@ -1172,6 +1186,37 @@ fn file_identity(_file: &std::fs::File) -> Result<FileIdentity> {
     bail!("safe file mutation is unsupported on this platform")
 }
 
+/// Whether the path still holds a file the session's read can describe.
+///
+/// The clear ahead of a mutation is unconditional on purpose: past it a
+/// directory, a temp file or a rename may already exist, and a cancelled `await`
+/// must not leave a read standing over bytes kloop replaced. But a refusal that
+/// never reached the write leaves the file as the read found it, and forgetting
+/// there reports one root cause twice — the next `edit_file` of the same turn is
+/// refused for never having read a file the model did read (plan 195). Every
+/// reference harness that gates on a prior read records only after a successful
+/// write, and none of them drops the record on a refusal.
+///
+/// Existence is the whole test, and deliberately not freshness: "the session
+/// read this path" stays true however the bytes move afterwards, and that is the
+/// only claim `edit_file` rests on. Refusing to restore a *changed* file would
+/// re-impose, one call later, exactly the freshness gate plan 195 removed.
+///
+/// A target that is gone is the one record that has to go with it. Nothing
+/// describes a missing path, reading one records nothing, and `write_file` reads
+/// a leftover record as "changed since it was read" — so keeping it would refuse
+/// every later write of that path with no way left to lift the refusal.
+fn target_still_present(
+    parent: &std::fs::File,
+    parent_path: &Path,
+    leaf: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> bool {
+    open_regular_target(parent, parent_path, leaf, tool, display_path)
+        .is_ok_and(|target| target.is_some())
+}
+
 fn commit_mutation(
     target: CommitTarget<'_>,
     expected: Option<&FileObservation>,
@@ -1249,31 +1294,31 @@ fn commit_mutation(
             )?;
             let snapshot = read_bounded(&mut target.file, MAX_IMAGE_BYTES)
                 .with_context(|| format!("edit_file: cannot read {display_path}"))?;
-            validate_observation_version(
-                expected,
-                &snapshot.version,
-                tool,
-                display_path,
-                ReadRequirement::AnyRead,
-            )?;
+            // Where `validate_observation_version` used to stand. `edit_file`
+            // reads the fact for itself so that relaxing it cannot reach
+            // `write_file` or `notebook_edit` through a shared signature, and so
+            // that all three outcomes below can carry it — the verdict that
+            // decides whether this edit is honest is the anchor's, and that one
+            // had not been computed yet at the refusal this replaces (plan 195).
+            let note = TargetChange::between(expected, &snapshot.version).note();
             let current = String::from_utf8(snapshot.bytes).map_err(|_| {
                 anyhow::anyhow!("edit_file: {display_path} is not valid UTF-8 text")
             })?;
             let edit = apply_text_edit(&current, &old, &new, replace_all);
             if edit.match_count == 0 {
-                bail!("edit_file: old_string not found in {display_path}");
+                bail!("edit_file: old_string not found in {display_path}{note}");
             }
             if edit.match_count > 1 && !replace_all {
                 let count = edit.match_count;
                 bail!(
-                    "edit_file: old_string matches {count} times in {display_path}; add surrounding context to disambiguate or set replace_all"
+                    "edit_file: old_string matches {count} times in {display_path}{note}; add surrounding context to disambiguate or set replace_all"
                 );
             }
             let updated = edit
                 .updated
                 .expect("a unique or replace-all edit produces updated text");
             let content = format!(
-                "edited {display_path} ({} replacement(s))",
+                "edited {display_path} ({} replacement(s)){note}",
                 edit.replacement_count
             );
             (
@@ -1345,16 +1390,19 @@ fn parenthesized(hint: impl FnOnce() -> Option<String>) -> String {
     hint().map_or_else(String::new, |hint| format!(" ({hint})"))
 }
 
-/// How much of the target one mutation demands the session have already read.
-///
-/// Freshness is a separate question and no variant relaxes it: the observed
-/// version and identity must still match what is on disk.
+/// How much of the target one mutation demands the session have already read —
+/// and, since plan 195, whether a target that moved after that read ends the
+/// call or is only reported. The two questions travel together because the
+/// second follows from what the tool is about to write.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ReadRequirement {
-    /// `write_file` replaces every byte, so it demands having seen every byte.
+    /// `write_file` replaces every byte, so it demands having seen every byte,
+    /// and refuses a target that changed: overwriting one discards whatever the
+    /// change was.
     CompleteFile,
     /// `notebook_edit` is cell-aware, so a raw read of the same bytes does not
-    /// qualify, and its refusals keep their own wording.
+    /// qualify, and its refusals keep their own wording. It refuses a changed
+    /// target for the same reason `write_file` does.
     CompleteNotebook,
     /// `edit_file`: one read of the path is the whole entrance fee (plan 155).
     /// A narrow read qualifies the file, including for an `old_string` outside
@@ -1372,6 +1420,52 @@ impl ReadRequirement {
 
     fn complete(self) -> bool {
         matches!(self, Self::CompleteFile | Self::CompleteNotebook)
+    }
+
+    /// Whether a target that moved after the read is a remark rather than a
+    /// refusal. Only `edit_file` earns that: its anchor is `old_string` matching
+    /// uniquely against the current bytes, and one read of *any* range
+    /// re-qualifies the path — so refusing here charged a round trip without
+    /// buying the freshness it named, and charged it before the anchor's verdict
+    /// had even been computed (plan 195). The whole-file tools have no anchor to
+    /// fall back on.
+    fn tolerates_change(self) -> bool {
+        matches!(self, Self::AnyRead)
+    }
+}
+
+/// Whether the bytes `edit_file` is about to change are still the bytes the
+/// session read.
+///
+/// Content only, from the observation's whole-file fingerprint: `touch` and
+/// `chmod` move a version without moving a byte, and remarking on those would
+/// make the note noise on every edit that follows one.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TargetChange {
+    UnchangedSinceRead,
+    ChangedSinceRead,
+}
+
+impl TargetChange {
+    fn between(read: &FileObservation, current: &FileVersion) -> Self {
+        if read.version().same_content(current) {
+            Self::UnchangedSinceRead
+        } else {
+            Self::ChangedSinceRead
+        }
+    }
+
+    /// The one sentence `edit_file`'s three outcomes share, each placing it
+    /// directly after the path so the fact sits next to what it is about.
+    ///
+    /// A fact and nothing more: a [`FileObservation`] keeps a fingerprint, not
+    /// the bytes, so there is no diff to offer, and the two refusals already say
+    /// what to do next.
+    fn note(self) -> &'static str {
+        match self {
+            Self::UnchangedSinceRead => "",
+            Self::ChangedSinceRead => "; the file changed since you read it",
+        }
     }
 }
 
@@ -1407,7 +1501,8 @@ fn unread_edit_hint(file: &mut std::fs::File, old: &str) -> Option<String> {
 /// `unread_hint` is consulted only on the never-read verdict. That is the one
 /// verdict a read can clear for the only tool that supplies a hint: `edit_file`
 /// asks for [`ReadRequirement::AnyRead`], so it never reaches the incomplete
-/// branch, and the tools that do reach it supply no hint.
+/// branch — nor, since plan 195, the changed-since-read one — and the tools that
+/// do reach them supply no hint.
 fn validate_observation_metadata<'a>(
     expected: Option<&'a FileObservation>,
     metadata: &std::fs::Metadata,
@@ -1429,6 +1524,14 @@ fn validate_observation_metadata<'a>(
     }
     if requirement.complete() && !expected.is_complete() {
         bail!("{tool}: must read the entire file {path} before modifying it");
+    }
+    if requirement.tolerates_change() {
+        // Everything below is the freshness comparison, and `edit_file` runs its
+        // own after reading the bytes: metadata cannot tell a rewrite from a
+        // `touch`, and the verdict belongs after the anchor's, not before it
+        // (plan 195). Returning here is also what keeps the relaxation off the
+        // shared path — `write_file` and `notebook_edit` cannot reach it.
+        return Ok(expected);
     }
     if expected.identity() != identity || !expected.version().metadata_matches(metadata) {
         if requirement.notebook() {
@@ -1688,6 +1791,12 @@ fn atomic_replace(
                     format!("{tool}: cannot inject temporary replacement for {display_path}")
                 })?);
             }
+            #[cfg(test)]
+            if matches!(fault, CommitFault::ChangeTargetBeforeRename) {
+                std::fs::write(parent_path.join(leaf), FAULT_TARGET_BYTES).with_context(|| {
+                    format!("{tool}: cannot inject target change for {display_path}")
+                })?;
+            }
             #[cfg(not(test))]
             let _ = fault;
             verify_target_unchanged(
@@ -1739,6 +1848,11 @@ fn atomic_replace(
 ) -> Result<()> {
     bail!("safe file mutation is unsupported on this platform")
 }
+
+/// What [`CommitFault::ChangeTargetBeforeRename`] leaves at the target, so a
+/// test can tell an injected change apart from the edit it interrupted.
+#[cfg(test)]
+const FAULT_TARGET_BYTES: &[u8] = b"changed underneath the commit\n";
 
 fn verify_target_unchanged(
     parent: &std::fs::File,
@@ -1898,13 +2012,14 @@ mod tests {
     fn commit_target<'a>(
         prepared: &'a super::PreparedMutation,
         display_path: &'a str,
+        tool: &'static str,
     ) -> super::CommitTarget<'a> {
         super::CommitTarget {
             parent: &prepared.parent,
             parent_path: &prepared.parent_path,
             leaf: &prepared.leaf,
             display_path,
-            tool: "write_file",
+            tool,
         }
     }
 
@@ -2674,7 +2789,10 @@ mod tests {
         assert!(is_error);
         assert!(out.contains("changed since it was read"), "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "external\n");
-        assert!(ctx.cfg.file_state.observation(&key).is_none());
+        // Nothing was written, so the read stays on record and keeps naming the
+        // real problem — a cleared slot would refuse the next write for never
+        // having read the file at all (plan 195).
+        assert!(ctx.cfg.file_state.observation(&key).is_some());
 
         observe_whole(&path, &ctx).await;
         let (out, is_error) = run_tool(
@@ -2720,7 +2838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_over_text_read_limit_fails_before_temp_and_clears_authority() {
+    async fn edit_over_text_read_limit_fails_before_temp_and_keeps_authority() {
         let dir = std::env::temp_dir().join(format!("kloop-large-edit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2751,7 +2869,8 @@ mod tests {
         assert!(is_error, "{out}");
         assert!(out.contains("byte limit"), "{out}");
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(ctx.cfg.file_state.observation(&key).is_none());
+        // Nothing was written, so the read still describes the file (plan 195).
+        assert!(ctx.cfg.file_state.observation(&key).is_some());
         assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -2771,6 +2890,7 @@ mod tests {
         std::fs::write(&path, "original\n").unwrap();
         let ctx = test_ctx(0, "write-delete");
         observe_whole(&path, &ctx).await;
+        let key = std::fs::canonicalize(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
         let (out, is_error) = run_tool(
@@ -2783,6 +2903,10 @@ mod tests {
         assert!(is_error);
         assert!(out.contains("changed since it was read"), "{out}");
         assert!(!path.exists(), "stale failure must not recreate the leaf");
+        // The one refusal whose recovery depends on forgetting: a read of a path
+        // that no longer exists is a dead qualification, and keeping it would
+        // refuse every later write of this path with no way left to clear it.
+        assert!(ctx.cfg.file_state.observation(&key).is_none());
         #[cfg(windows)]
         assert!(
             !dir.exists(),
@@ -2796,9 +2920,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The shape of the two real failures plan 195 came from: something rewrote
+    /// the file elsewhere, and the anchor the model was holding is still there,
+    /// still unique. One call, and the result says the file moved.
+    ///
+    /// What the old refusal bought was a round trip: the model re-read thirty
+    /// arbitrary lines — which is all `AnyRead` ever asked for — and re-sent a
+    /// byte-identical `old_string`. The freshness it named was never in the
+    /// admission check; it is in the anchor, and in the commit's compare-and-swap.
     #[tokio::test]
-    async fn stale_edit_rejects_even_when_old_string_remains_unique() {
+    async fn a_changed_file_still_takes_an_anchored_edit() {
         let path = temp_file("edit-stale", "alpha\nbeta\n");
+        let target = path.to_str().unwrap();
         let key = std::fs::canonicalize(&path).unwrap();
         let ctx = test_ctx(0, "edit-stale");
         observe_whole(&path, &ctx).await;
@@ -2806,21 +2939,224 @@ mod tests {
 
         let (out, is_error) = run_tool(
             "edit_file",
-            json!({
-                "path": path.to_str().unwrap(),
-                "old_string": "beta",
-                "new_string": "BETA"
-            }),
+            json!({"path": target, "old_string": "beta", "new_string": "BETA"}),
             &ctx,
         )
         .await;
-        assert!(is_error);
-        assert!(out.contains("changed since it was read"), "{out}");
+
+        assert_eq!(
+            (out, is_error),
+            (
+                format!("edited {target} (1 replacement(s)); the file changed since you read it"),
+                false
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "external\nalpha\nBETA\n"
+        );
+        // The commit refreshes the qualification, so the change is reported once
+        // and the next edit of the same turn owes nothing.
+        assert!(ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The fact the old order spent and threw away. A missing or ambiguous
+    /// `old_string` is exactly when "the file moved under you" is worth hearing,
+    /// and before plan 195 it was consumed by an admission check that ran before
+    /// the anchor had been tested at all.
+    #[tokio::test]
+    async fn anchor_refusals_on_a_changed_file_say_it_changed() {
+        let path = temp_file("edit-stale-refusal", "alpha\nbeta\n");
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-stale-refusal");
+        observe_whole(&path, &ctx).await;
+        std::fs::write(&path, "beta\nalpha\nbeta\n").unwrap();
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "gamma", "new_string": "x"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edit_file: old_string not found in {target}; the file changed since you read it"
+                ),
+                true
+            )
+        );
+
+        // Reached only because the refusal above kept the qualification: one
+        // root cause, one diagnosis.
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "beta", "new_string": "BETA"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edit_file: old_string matches 2 times in {target}; the file changed since you \
+                     read it; add surrounding context to disambiguate or set replace_all"
+                ),
+                true
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "beta\nalpha\nbeta\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A `touch` or a `chmod` is not a change. The note has to stay rare to stay
+    /// worth reading, and the whole-file fingerprint is what tells a rewrite from
+    /// a metadata bump — which is also why the check this replaces could never
+    /// have made the call: it ran before the bytes were read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_metadata_only_change_draws_no_note() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = temp_file("edit-chmod", "alpha\nbeta\n");
+        let target = path.to_str().unwrap();
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "edit-chmod");
+        observe_whole(&path, &ctx).await;
+        let observation = ctx.cfg.file_state.observation(&key).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !observation
+                .version()
+                .metadata_matches(&std::fs::metadata(&path).unwrap()),
+            "the chmod must be the kind of change the old admission check refused"
+        );
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "beta", "new_string": "BETA"}),
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            (out, is_error),
+            (format!("edited {target} (1 replacement(s))"), false)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The line plan 195 does not cross, half one. `write_file` replaces every
+    /// byte, so it has no anchor to be right about: overwriting a file that
+    /// changed since the read discards whatever the change was, and no remark
+    /// substitutes for not doing that. The same scenario `edit_file` now takes.
+    #[tokio::test]
+    async fn write_file_still_refuses_a_changed_file() {
+        let path = temp_file("write-stale", "alpha\nbeta\n");
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "write-stale");
+        observe_whole(&path, &ctx).await;
+        std::fs::write(&path, "external\nalpha\nbeta\n").unwrap();
+
+        let (out, is_error) = run_tool(
+            "write_file",
+            json!({"path": target, "content": "replacement\n"}),
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "write_file: {target} changed since it was read; read it again before modifying it"
+                ),
+                true
+            )
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "external\nalpha\nbeta\n"
         );
-        assert!(ctx.cfg.file_state.observation(&key).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The line plan 195 does not cross, half two. `notebook_edit` asks for a
+    /// complete notebook read because it addresses cells, not bytes; a file that
+    /// moved has cells it never saw, and its refusals keep their own wording.
+    #[tokio::test]
+    async fn notebook_edit_still_refuses_a_changed_file() {
+        let notebook = |source: &str| {
+            format!(
+                r#"{{"cells":[{{"cell_type":"code","id":"c1","source":["{source}"],"metadata":{{}},"outputs":[],"execution_count":null}}],"metadata":{{}},"nbformat":4,"nbformat_minor":5}}"#
+            )
+        };
+        let path = temp_file("notebook-stale.ipynb", &notebook("x = 1"));
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "notebook-stale");
+        observe_whole(&path, &ctx).await;
+        let changed = notebook("x = 2");
+        std::fs::write(&path, &changed).unwrap();
+
+        let (out, is_error) = run_tool(
+            "notebook_edit",
+            json!({"notebook_path": target, "cell_id": "c1", "new_source": "x = 3"}),
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            (out, is_error),
+            (
+                "File has been modified since read, either by the user or by a linter. \
+                 Read it again before attempting to write it."
+                    .to_string(),
+                true
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// One bad anchor must not poison the rest of the turn. The refusal left the
+    /// file exactly as the read found it, so the qualification is still a true
+    /// statement — and dropping it reported one root cause as two, the second
+    /// edit being refused for never having read a file the model did read.
+    #[tokio::test]
+    async fn a_refused_edit_leaves_the_turn_still_qualified() {
+        let path = temp_file("edit-batch", "alpha\nbeta\n");
+        let target = path.to_str().unwrap();
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "edit-batch");
+        observe_whole(&path, &ctx).await;
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "gamma", "new_string": "x"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (format!("edit_file: old_string not found in {target}"), true)
+        );
+        assert!(ctx.cfg.file_state.observation(&key).is_some());
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "beta", "new_string": "BETA"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (format!("edited {target} (1 replacement(s))"), false)
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -2836,7 +3172,7 @@ mod tests {
         let prepared =
             super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
         let error = match super::commit_mutation(
-            commit_target(&prepared, path.to_str().unwrap()),
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
             Some(&expected),
             super::Mutation::Write {
                 bytes: b"replacement".to_vec(),
@@ -2932,7 +3268,7 @@ mod tests {
             super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
 
         let error = match super::commit_mutation(
-            commit_target(&prepared, path.to_str().unwrap()),
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
             Some(&expected),
             super::Mutation::Write {
                 bytes: b"replacement".to_vec(),
@@ -2968,7 +3304,7 @@ mod tests {
         let prepared =
             super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
         super::commit_mutation(
-            commit_target(&prepared, path.to_str().unwrap()),
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
             Some(&expected),
             super::Mutation::Write {
                 bytes: b"first".to_vec(),
@@ -2977,7 +3313,7 @@ mod tests {
         )
         .unwrap();
         let error = match super::commit_mutation(
-            commit_target(&prepared, path.to_str().unwrap()),
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
             Some(&expected),
             super::Mutation::Write {
                 bytes: b"second".to_vec(),
@@ -3509,11 +3845,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The line plan 155 must not cross: relaxing *eligibility* leaves
-    /// *freshness* exactly where it was. A narrow read is now enough to qualify
-    /// a path, and it is still not enough to edit bytes that changed since.
+    /// Plan 155 relaxed *eligibility* and left *freshness* where it was, on the
+    /// reasoning that the two were separable. Plan 195 finished the thought: a
+    /// narrow read qualifies a path it has barely seen, so a second narrow read
+    /// re-qualifies bytes it has barely seen too — the rule could be satisfied
+    /// without doing the thing it asked for. Here the read covered ten lines, the
+    /// change landed above all of them, and the edit is on line 33: none of the
+    /// three overlap, and the anchor is still what decides.
     #[tokio::test]
-    async fn a_narrow_read_does_not_survive_an_external_change() {
+    async fn a_narrow_read_survives_an_external_change() {
         let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
         let path = temp_file("edit-narrow-stale", &body);
         let target = path.to_str().unwrap();
@@ -3534,23 +3874,28 @@ mod tests {
         assert_eq!(
             (out, is_error),
             (
-                format!(
-                    "edit_file: {target} changed since it was read; read it again before modifying it"
-                ),
-                true
+                format!("edited {target} (1 replacement(s)); the file changed since you read it"),
+                false
             )
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
-        assert!(ctx.cfg.file_state.observation(&key).is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            changed.replace("line 33\n", "line 33!\n")
+        );
+        assert!(ctx.cfg.file_state.observation(&key).unwrap().is_complete());
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The constraint at the capture of `expected` in [`mutate_file`], now that
-    /// a partial observation can authorize an edit: two edits based on one
-    /// narrow read must not both commit. The version check is what stops the
-    /// second, so eligibility never had to carry it.
+    /// Two edits on one narrow read — the shape of a parallel batch, where the
+    /// second carries the qualification captured before the first committed.
+    /// Both land now, and that is the point: each one's anchor was tested against
+    /// the bytes that were actually on disk when it ran, which is the guarantee
+    /// the version check was standing in for. What still stops a second commit
+    /// from clobbering the first is the compare-and-swap inside the window
+    /// between kloop's read and kloop's rename — see
+    /// [`a_change_inside_the_commit_window_still_loses`].
     #[test]
-    fn one_partial_read_cannot_authorize_two_edits() {
+    fn one_partial_read_authorizes_two_edits_that_both_still_anchor() {
         let dir = std::env::temp_dir().join(format!("kloop-double-edit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3569,24 +3914,66 @@ mod tests {
             replace_all: false,
         };
         super::commit_mutation(
-            commit_target(&prepared, path.to_str().unwrap()),
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
             Some(&expected),
             edit("beta", "BETA"),
             super::CommitFault::None,
         )
         .unwrap();
-        let error = match super::commit_mutation(
-            commit_target(&prepared, path.to_str().unwrap()),
+        let outcome = super::commit_mutation(
+            commit_target(&prepared, path.to_str().unwrap(), "edit_file"),
             Some(&expected),
             edit("alpha", "ALPHA"),
             super::CommitFault::None,
-        ) {
-            Ok(_) => panic!("stale second edit unexpectedly succeeded"),
-            Err(error) => error,
-        };
+        )
+        .unwrap();
 
-        assert!(error.to_string().contains("changed since it was read"));
-        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nBETA\n");
+        assert!(
+            outcome
+                .content
+                .ends_with("; the file changed since you read it"),
+            "{}",
+            outcome.content
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"ALPHA\nBETA\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Plan 195 left this compare-and-swap as `edit_file`'s only freshness guard,
+    /// and until now nothing exercised its version arm — no ordinary test can
+    /// change a file inside the window between kloop reading the bytes and kloop
+    /// renaming the replacement in. The injected change is what that window looks
+    /// like from the outside, and it must still lose.
+    #[test]
+    fn a_change_inside_the_commit_window_still_loses() {
+        let dir = std::env::temp_dir().join(format!("kloop-commit-window-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, b"alpha\nbeta\n").unwrap();
+        let expected = full_observation(&path, b"alpha\nbeta\n");
+        let prepared =
+            super::prepare_mutation(&dir, &path, "edit_file", path.to_str().unwrap()).unwrap();
+
+        let error = super::commit_mutation(
+            commit_target(&prepared, path.to_str().unwrap(), "edit_file"),
+            Some(&expected),
+            super::Mutation::Edit {
+                old: "beta".to_string(),
+                new: "BETA".to_string(),
+                replace_all: false,
+            },
+            super::CommitFault::ChangeTargetBeforeRename,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("changed immediately before commit"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), super::FAULT_TARGET_BYTES);
         let _ = std::fs::remove_dir_all(dir);
     }
 
