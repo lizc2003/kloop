@@ -66,7 +66,7 @@ impl EventsSyncParams {
         let parsed: Self = serde_json::from_value(params.clone())
             .map_err(|error| format!("invalid thread/events/sync params: {error}"))?;
         if parsed.thread_id.trim().is_empty() {
-            return Err("threadId must not be empty".into());
+            return Err("thread_id must not be empty".into());
         }
         if let Some(cursor) = &parsed.event_cursor {
             cursor.validate().map_err(|error| error.to_string())?;

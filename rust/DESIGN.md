@@ -1133,8 +1133,8 @@ text behind it.
 **Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
 
 
-**Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
-`{serverInfo, protocolVersion, capabilities}` accepts exactly protocol `"2.0"`
+**Handshake.** `initialize {client_info, protocol_version, capabilities}` →
+`{server_info, protocol_version, capabilities}` accepts exactly protocol `"2.0"`
 and gates every other method until it succeeds. Plan 63 changes the scoped
 approval schema in place because the native protocol had no external users; it
 does not add a compatibility adapter, fallback, alias, or silent downgrade.
@@ -1142,12 +1142,12 @@ Capabilities are structured: `{streaming, subagents, mcp,
 images, approvals:{scopes:["once","workspace_session","project"]}, questions,
 events:{sequence:true,sync:true,snapshot:true}, threads:{list,
 read,resume,fork}, providers:{catalog:true,switch:true}, config:{read}, skills:{list},
-mcpServers:{status}}`. Event recovery is part of the only current protocol contract,
+mcp_servers:{status}}`. Event recovery is part of the only current protocol contract,
 not an opt-in compatibility switch; the Desktop adapter rejects a server that does
 not advertise all three event capabilities.
 
 **Methods:** `thread/start {cwd?, provider_id?, model?}` → `{thread:{id,route}}`;
-`thread/list {limit?, cursor?}` → `{threads, nextCursor}` (newest first,
+`thread/list {limit?, cursor?}` → `{threads, next_cursor}` (newest first,
 sub-agent sidechains hidden, `limit` capped at 500); `thread/read {thread_id}` →
 `{thread:{id,cwd,route,resumable,forked_from,messages,terminals}}`;
 `thread/resume {thread_id}` and `thread/fork {thread_id, cut?}` →
@@ -1245,8 +1245,8 @@ dropped replies fail closed and pending reverse requests are removed when their
 turn is interrupted.
 
 ```jsonc
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2.0","capabilities":{"events":{"sequence":true,"sync":true,"snapshot":true},"providers":{"catalog":true,"switch":true}}}}
-← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"2.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"providers":{"catalog":true,"switch":true},"events":{"sequence":true,"sync":true,"snapshot":true},"threads":{"list":true,"read":true,"resume":true,"fork":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":"2.0","capabilities":{"events":{"sequence":true,"sync":true,"snapshot":true},"providers":{"catalog":true,"switch":true}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"server_info":{"name":"kloop","version":"0.1.0"},"protocol_version":"2.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"providers":{"catalog":true,"switch":true},"events":{"sequence":true,"sync":true,"snapshot":true},"threads":{"list":true,"read":true,"resume":true,"fork":true},"config":{"read":true},"skills":{"list":true},"mcp_servers":{"status":true}}}}
 → {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"provider_id":"anthropic","model":"claude-sonnet-5"}}
 ← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146","route":{"revision":1,"provider_id":"anthropic","api_family":"anthropic_messages","model":"claude-sonnet-5"}}}}
 → {"jsonrpc":"2.0","id":3,"method":"thread/events/sync","params":{"thread_id":"20260721-135146"}}

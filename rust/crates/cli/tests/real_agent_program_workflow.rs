@@ -572,9 +572,9 @@ fn real_agent_program_workflow_contract() {
     let mut client = NativeClient::spawn(&root);
     let initialized = client.request(
         "initialize",
-        json!({"protocolVersion": "2.0", "capabilities": {}}),
+        json!({"protocol_version": "2.0", "capabilities": {}}),
     );
-    assert_eq!(initialized["protocolVersion"], "2.0");
+    assert_eq!(initialized["protocol_version"], "2.0");
     let started = client.request(
         "thread/start",
         json!({"cwd": root.workspace(), "model": model}),
@@ -935,9 +935,9 @@ fn real_local_agent_mailbox_contract() {
     let mut client = NativeClient::spawn_with_permission_mode(&root, "bypass");
     let initialized = client.request(
         "initialize",
-        json!({"protocolVersion": "2.0", "capabilities": {}}),
+        json!({"protocol_version": "2.0", "capabilities": {}}),
     );
-    assert_eq!(initialized["protocolVersion"], "2.0");
+    assert_eq!(initialized["protocol_version"], "2.0");
     let started = client.request(
         "thread/start",
         json!({"cwd": root.workspace(), "model": model}),

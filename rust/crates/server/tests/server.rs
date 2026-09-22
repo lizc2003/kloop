@@ -115,15 +115,15 @@ impl TestClient {
             .request(
                 "initialize",
                 json!({
-                    "clientInfo": {"name": "test", "version": "0"},
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "client_info": {"name": "test", "version": "0"},
+                    "protocol_version": PROTOCOL_VERSION,
                     "capabilities": capabilities,
                 }),
             )
             .await;
         let resp = self.recv().await;
         assert_eq!(resp["id"], id);
-        assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(resp["result"]["protocol_version"], PROTOCOL_VERSION);
         resp["result"]["capabilities"].clone()
     }
 
@@ -778,7 +778,7 @@ async fn handshake_gates_and_negotiates() {
     client
         .request(
             "initialize",
-            json!({"protocolVersion": "1.0", "capabilities": {}}),
+            json!({"protocol_version": "1.0", "capabilities": {}}),
         )
         .await;
     let err = client.recv().await;
@@ -787,7 +787,7 @@ async fn handshake_gates_and_negotiates() {
         err["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("unsupported protocolVersion")
+            .contains("unsupported protocol_version")
     );
 
     // A good handshake reports capabilities and unlocks the rest.
@@ -800,7 +800,7 @@ async fn handshake_gates_and_negotiates() {
     assert_eq!(caps["providers"], json!({"catalog": true, "switch": true}));
     assert_eq!(caps["config"], json!({"read": true}));
     assert_eq!(caps["skills"], json!({"list": true}));
-    assert_eq!(caps["mcpServers"], json!({"status": true}));
+    assert_eq!(caps["mcp_servers"], json!({"status": true}));
     assert_eq!(
         caps["events"],
         json!({"sequence": true, "sync": true, "snapshot": true})
@@ -921,7 +921,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
             "events": {"sequence": true, "snapshot": true, "sync": true},
             "images": true,
             "mcp": true,
-            "mcpServers": {"status": true},
+            "mcp_servers": {"status": true},
             "providers": {"catalog": true, "switch": true},
             "questions": true,
             "skills": {"list": true},

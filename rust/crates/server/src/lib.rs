@@ -556,12 +556,12 @@ impl Server {
     /// the protocol version. A version we don't speak is a hard error — no
     /// silent downgrade. Succeeding flips `initialized` so real work can begin.
     fn initialize(&mut self, params: &Value) -> MethodResult {
-        let version = params["protocolVersion"].as_str().unwrap_or("");
+        let version = params["protocol_version"].as_str().unwrap_or("");
         if version != wire::PROTOCOL_VERSION {
             return Err((
                 wire::INVALID_PARAMS,
                 format!(
-                    "unsupported protocolVersion '{version}'; this engine speaks '{}'",
+                    "unsupported protocol_version '{version}'; this engine speaks '{}'",
                     wire::PROTOCOL_VERSION
                 ),
             ));
@@ -573,8 +573,8 @@ impl Server {
             .unwrap_or(false);
         self.initialized = true;
         Ok(json!({
-            "serverInfo": {"name": "kloop", "version": env!("CARGO_PKG_VERSION")},
-            "protocolVersion": wire::PROTOCOL_VERSION,
+            "server_info": {"name": "kloop", "version": env!("CARGO_PKG_VERSION")},
+            "protocol_version": wire::PROTOCOL_VERSION,
             "capabilities": {
                 "streaming": true,
                 "subagents": true,
@@ -587,7 +587,7 @@ impl Server {
                 "providers": {"catalog": true, "switch": true},
                 "config": {"read": true},
                 "skills": {"list": true},
-                "mcpServers": {"status": true},
+                "mcp_servers": {"status": true},
                 "events": {
                     "sequence": true,
                     "sync": true,
@@ -889,7 +889,7 @@ impl Server {
         }
         let consumed = offset.saturating_add(limit).min(paths.len());
         let next_cursor = (consumed < paths.len()).then(|| consumed.to_string());
-        Ok(json!({"threads": threads, "nextCursor": next_cursor}))
+        Ok(json!({"threads": threads, "next_cursor": next_cursor}))
     }
 
     fn thread_read(&self, params: &Value) -> MethodResult {
@@ -1083,7 +1083,7 @@ impl Server {
         Ok(json!({"servers": &self.mcp_servers}))
     }
 
-    /// Resolve the cwd selected by `{threadId? | cwd?}`. With no selector, use
+    /// Resolve the cwd selected by `{thread_id? | cwd?}`. With no selector, use
     /// the server's canonical startup cwd. A dormant thread reads its persisted
     /// runtime; legacy sessions without runtime metadata fail closed.
     fn read_scope(
