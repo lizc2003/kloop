@@ -135,3 +135,55 @@ pub enum ConfirmPreview {
    结局的方案。
 3. server 的 `kind` 新增一个值,有没有外部客户端需要照顾(若没有,按仓库惯例
    不考虑兼容性,直接改干净)。
+
+## 七、开工时定的三个点(2026-09-22,用户逐条拍板)
+
+1. **`Cell::Plan` 的视觉**:不带框,一行 `▌ Plan` 标题 + markdown 正文。`SessionHeader`
+   的框是一次性横幅、四行定长字段;计划是几十行带列表/代码块/表格的东西,加框要在每行
+   左右各吃两列。落地时标题直接复用 `choice::header_line` 的那套(`▌ ` + BRAND + BOLD)——
+   同一套视觉词汇,不新造第二种竖条。
+2. **拒绝之后留不留痕**:**两边都补**。计划 cell 在弹层弹出之前就进转录,于是"没有标记"
+   本来就表示"还没答";只标拒绝的话,"没标记"要同时表示"批准了"和"还没答",而这两态
+   确实会同屏出现。做成 `Cell::Plan { text, status: PlanStatus }`,答完就地改。
+3. **server 的 `kind`**:仓库内只有 DESIGN.md 的协议表和 server 自己的契约测试读它,
+   没有外部客户端。按仓库惯例不考虑兼容性,直接加第三个值 `plan`。
+
+## 八、✅ 完成
+
+2026-09-22 当次会话做完,一次提交。`make check` 全绿。
+
+### 与 plan 的两处偏离
+
+- **`is_committable` 不给 `Cell::Plan` 开特例。** 原打算"待答的计划不许冻进 scrollback",
+  写完发现它会连带关掉 plan 99 的 `head_freeze_lines`(那个函数第一句就是
+  `!is_committable(&cells[0])` 直接返回)——于是一份比视口高的计划顶部会被 `draw`
+  剪掉**且进不了 scrollback**,正是本条要消灭的那个失败。取舍:**能看见 > 有标记**。
+  一份在答复之前就滚进 scrollback 的计划会少一个 ✓/✗,而它已经滚出视线了。
+- **`settle_plan` 用"最老的待答计划",不用 id 映射。** `exit_plan_mode` 的
+  `is_concurrency_safe` 是 false,同一时刻不可能有两个计划弹层排队,所以"最老的待答"
+  就是精确匹配;计划 cell 已被冻进 scrollback 时它是 no-op——和迟到的 ToolEnd 落在
+  已提交行上同一个惯例。
+
+### 测试
+
+| 测试 | 锁住什么 |
+|---|---|
+| `permissions::tests::confirm_request_carries_a_change_preview` | 三个写工具的 preview 是 `ConfirmPreview::FileChange`,非文件调用仍是 `None`——**种类跟着文本走** |
+| `permissions::tests::confirm_exit_plan_switches_back_or_stays` | `confirm_exit_plan` 填的是 `ConfirmPreview::Plan`,不是裸串 |
+| `render::tests::a_plan_goes_to_the_transcript_and_leaves_the_panel_a_question` | 面板 body 为空 + 整 10 行逐行断言(一句问话两个答案);计划整段在转录里、无 `+0 -N`、**没有任何一个 span 是红的** |
+| `render::tests::a_plan_cell_marks_how_it_ended` | 三态各自的末行:待答无标记、`✓ approved`、`✗ not approved — still planning` |
+| `render::tests::draw_shows_a_tall_plan_in_the_transcript_under_a_ten_row_panel` | 真 `TestBackend` 一帧:40 条 step 一条不少地在屏上,`▌ Plan` 在,面板从 header 到 hint 正好 10 行、不带滚动提示 |
+| `app::tests::plan_cells_are_posted_on_arrival_and_stamped_in_queue_order` | 两份计划都在**答复之前**就进了转录;Esc/Enter 各自盖到自己那份(整对象断言两个 cell) |
+| `app::tests::a_turn_ending_declines_the_plan_it_left_unanswered` | 轮次死掉 → sender 被丢 → core 读作拒绝,转录里同步盖上 ✗(否则它会永远停在待答态) |
+| `choice::tests::a_panel_with_no_body_keeps_its_separators_and_its_height` | 无 body 的布局分支:分隔空行还在,10 行就是 10 行,给 20 行也不涨 |
+| `server.rs::plan_approval_is_not_reported_as_a_file_change` | 端到端(scripted provider 真走 `enter_plan_mode` → `exit_plan_mode`):`kind == "plan"`、preview 逐字等于计划原文、decline 之后 tool_call 是 `completed` 不是 `failed` |
+| `ui::tests::a_plan_preview_is_printed_as_written_and_a_diff_is_coloured` | plain:计划原样打印,diff 仍上 ANSI,无 preview 仍是空串 |
+
+### 没做(有意)
+
+- **拒绝附理由**——本条第二节已经写明不做,落地后仍成立。顺带一个读数:TUI 的拒绝行
+  现在就写着 `No, and tell kloop what to do differently`,入口本来就在。
+- **`PANEL_MAX_ROWS = 20`** 一个字没动。
+- **一份待答的、比视口还高的计划,顶部仍会被剪掉**(它是最后一个 cell,而 plan 99 的
+  `head_freeze_lines` 明说"最后一个 cell 一律不碰")。这是 plan 99 划的边界,对任何一个
+  高过视口的末位 cell 都成立,答完之后它就正常冻进 scrollback。要改是另立一条。

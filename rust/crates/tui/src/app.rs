@@ -22,6 +22,7 @@ use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
 use kloop_core::permissions::ApprovalScope;
+use kloop_core::permissions::ConfirmPreview;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
@@ -67,6 +68,17 @@ pub enum ToolStatus {
     Running,
     Ok,
     Failed,
+}
+
+/// Where a plan in the transcript stands. The cell is written the moment the
+/// approval prompt is queued, so "shown, not yet answered" is a state the user
+/// sees — and a second plan can be posted under a first one that was turned
+/// down, which is exactly the comparison a rejection invites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    Approved,
+    Declined,
 }
 
 /// One transcript entry. Tool calls are collapsed to a single status row —
@@ -124,6 +136,16 @@ pub enum Cell {
     /// Output of a slash command — a wrapped, dim multi-line block (unlike a
     /// Note, which collapses to one truncated line).
     System(String),
+    /// A plan put up for approval (plan 194). It arrives with a prompt, but it
+    /// is transcript content, not popup content: a popup body is a handful of
+    /// rows and the first thing a short terminal takes away, while a plan
+    /// routinely runs past forty. Here it is read with the ordinary scrollback,
+    /// rendered as the markdown it is, and a plan that was turned down stays on
+    /// screen next to the one that replaced it.
+    Plan {
+        text: String,
+        status: PlanStatus,
+    },
     /// The opening session banner (plan 38 slice 6): a rounded box with the
     /// brand title plus the build's version, the model, cwd, branch, and
     /// starting mode. Built once in `run` with display-ready strings (the
@@ -763,6 +785,16 @@ impl App {
                 self.fork_picker = None;
             }
             AgentEvent::Confirm { req, reply } => {
+                // The plan goes in at the moment it was proposed, not when its
+                // turn at the front of the queue comes: prompts can stack up
+                // behind one another, and a plan that appeared third would read
+                // as if it had been written after whatever came in meanwhile.
+                if let Some(ConfirmPreview::Plan(plan)) = &req.preview {
+                    self.cells.push(Cell::Plan {
+                        text: plan.clone(),
+                        status: PlanStatus::Pending,
+                    });
+                }
                 self.interactions.push_back(PendingInteraction::Confirm {
                     req,
                     reply,
@@ -1132,10 +1164,17 @@ impl App {
         // sub-agent's completion may never arrive: no row may outlive
         // its turn still spinning.
         for cell in &mut self.cells {
-            if let Cell::Agent { status, .. } = cell
-                && *status == ToolStatus::Running
-            {
-                *status = ToolStatus::Failed;
+            match cell {
+                Cell::Agent { status, .. } if *status == ToolStatus::Running => {
+                    *status = ToolStatus::Failed;
+                }
+                // The queue was just dropped, which core reads as a denial. Say
+                // so: a plan left unanswered would sit in the transcript looking
+                // like one that was signed off — and never become committable.
+                Cell::Plan { status, .. } if *status == PlanStatus::Pending => {
+                    *status = PlanStatus::Declined;
+                }
+                _ => {}
             }
         }
         match reason {
@@ -1215,6 +1254,21 @@ impl App {
             .find(|c| matches!(c, Cell::Thinking { seconds: None, .. }))
         {
             *s = Some(seconds);
+        }
+    }
+
+    /// Stamp the oldest plan still awaiting an answer. `exit_plan_mode` is not
+    /// concurrency-safe, so two plans are never on the table at once and the
+    /// oldest pending cell is this answer's. If it has already been frozen into
+    /// scrollback there is nothing left to stamp, and this is a no-op — the
+    /// same way a late ToolEnd for a committed row is.
+    fn settle_plan(&mut self, status: PlanStatus) {
+        if let Some(Cell::Plan {
+            status: current, ..
+        }) = self.cells.iter_mut().find(
+            |cell| matches!(cell, Cell::Plan { status, .. } if *status == PlanStatus::Pending),
+        ) {
+            *current = status;
         }
     }
 
@@ -1709,9 +1763,15 @@ impl App {
             return Command::None;
         };
         let pending = self.interactions.pop_front().expect("checked non-empty");
-        let PendingInteraction::Confirm { reply, .. } = pending else {
+        let PendingInteraction::Confirm { req, reply, .. } = pending else {
             unreachable!("interaction type changed while handling approval")
         };
+        if matches!(req.preview, Some(ConfirmPreview::Plan(_))) {
+            self.settle_plan(match decision {
+                Decision::Allow(_) => PlanStatus::Approved,
+                Decision::Deny => PlanStatus::Declined,
+            });
+        }
         // The next queued prompt (if any) starts unscrolled.
         self.panel_scroll = 0;
         let _ = reply.send(decision);
@@ -3534,6 +3594,99 @@ mod tests {
         assert_eq!(
             app.cells.last(),
             Some(&Cell::User(pasted.trim().to_string()))
+        );
+    }
+
+    /// A plan cell is written when the prompt is queued and stamped when it is
+    /// answered. Two plans can be waiting at once — prompts queue — and each
+    /// answer belongs to the oldest one still unanswered, so the marks cannot
+    /// land on the wrong draft.
+    #[tokio::test]
+    async fn plan_cells_are_posted_on_arrival_and_stamped_in_queue_order() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        let post = |app: &mut App, plan: &str| {
+            let (reply, rx) = oneshot::channel();
+            app.apply(AgentEvent::Confirm {
+                req: ConfirmRequest {
+                    description: "Exit plan mode and start on this plan?".into(),
+                    approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                    preview: Some(ConfirmPreview::Plan(plan.into())),
+                    ..Default::default()
+                },
+                reply,
+            });
+            rx
+        };
+
+        // Both plans are in the transcript before either has been answered.
+        let first = post(&mut app, "first draft");
+        let second = post(&mut app, "second draft");
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Plan {
+                    text: "first draft".into(),
+                    status: PlanStatus::Pending,
+                },
+                Cell::Plan {
+                    text: "second draft".into(),
+                    status: PlanStatus::Pending,
+                },
+            ]
+        );
+
+        // Esc denies the front prompt, which is the first plan; Enter takes the
+        // cursor's default (Yes) on the second.
+        app.on_key(80, key(KeyCode::Esc));
+        assert_eq!(first.await.unwrap(), Decision::Deny);
+        app.on_key(80, key(KeyCode::Enter));
+        assert_eq!(
+            second.await.unwrap(),
+            Decision::Allow(kloop_core::permissions::ApprovalScope::Once)
+        );
+
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::Plan {
+                    text: "first draft".into(),
+                    status: PlanStatus::Declined,
+                },
+                Cell::Plan {
+                    text: "second draft".into(),
+                    status: PlanStatus::Approved,
+                },
+            ],
+            "each answer stamped its own plan"
+        );
+    }
+
+    /// A turn that dies with a plan still on the table drops the prompt, which
+    /// core reads as a denial. The transcript has to say the same thing — an
+    /// unstamped plan reads as an approved one, and never becomes committable.
+    #[tokio::test]
+    async fn a_turn_ending_declines_the_plan_it_left_unanswered() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        let (reply, rx) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "Exit plan mode and start on this plan?".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                preview: Some(ConfirmPreview::Plan("a draft".into())),
+                ..Default::default()
+            },
+            reply,
+        });
+        app.apply(turn_ended(EndReason::Aborted));
+        assert!(rx.await.is_err(), "the dropped sender is core's deny");
+        assert_eq!(
+            app.cells.first(),
+            Some(&Cell::Plan {
+                text: "a draft".into(),
+                status: PlanStatus::Declined,
+            })
         );
     }
 

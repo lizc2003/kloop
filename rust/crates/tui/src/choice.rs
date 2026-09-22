@@ -428,6 +428,42 @@ mod tests {
         assert_eq!(layout.editor_cursor, None);
     }
 
+    /// A panel with no body at all — the shape every plan approval has since
+    /// the plan moved into the transcript (plan 194), so it is the common case
+    /// rather than a corner. The blocks keep their separators and the panel
+    /// takes only the rows it needs, however much room it was offered.
+    #[test]
+    fn a_panel_with_no_body_keeps_its_separators_and_its_height() {
+        let bodyless = Panel {
+            header: "Exit plan mode".into(),
+            subject: vec![Line::from("Exit plan mode and start on this plan?")],
+            body: Vec::new(),
+            items: vec![Item::new("Yes"), Item::new("No")],
+            ..panel()
+        };
+        let layout = panel_lines(&bodyless, 40, 20, 0);
+        assert_eq!(
+            texts(&layout),
+            vec![
+                "▌ Exit plan mode",
+                "",
+                "Exit plan mode and start on this plan?",
+                "",
+                "Do you want to proceed?",
+                "",
+                "> 1. Yes",
+                "  2. No",
+                "",
+                "Enter select",
+            ]
+        );
+        // Nothing scrolls, so the hint carries no scroll affordance.
+        assert_eq!((layout.more_above, layout.more_below), (false, false));
+        // The same panel in a 10-row terminal is the same panel: it never
+        // needed the other ten.
+        assert_eq!(texts(&panel_lines(&bodyless, 40, 10, 0)), texts(&layout));
+    }
+
     /// Squeezed, the body gives way first — the options, the hint, the header
     /// and the subject the answer is about all survive.
     #[test]

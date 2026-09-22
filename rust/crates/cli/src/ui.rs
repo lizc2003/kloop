@@ -16,8 +16,24 @@ use kloop_core::interaction::QuestionRequest;
 use kloop_core::interaction::Questioner;
 use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::Approver;
+use kloop_core::permissions::ConfirmPreview;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
+
+/// The preview block the plain prompt prints above its answer line, leading
+/// newline included, or empty when there is nothing to show.
+///
+/// A diff gets its signs coloured; a plan is printed as it was written. The
+/// plain REPL has no markdown renderer and should not grow one for this — but
+/// running a plan through `color_diff` (what it did until plan 194) paints
+/// every `-` list item red, which is worse than plain text.
+fn preview_block(req: &ConfirmRequest) -> String {
+    match &req.preview {
+        Some(ConfirmPreview::FileChange(diff)) => format!("\n{}", color_diff(diff)),
+        Some(ConfirmPreview::Plan(plan)) => format!("\n{plan}"),
+        None => String::new(),
+    }
+}
 
 /// ANSI-color a diff preview for the plain REPL: additions green, deletions
 /// red, everything else (context, hunk gaps, markers) dim.
@@ -52,11 +68,7 @@ impl Approver for CliApprover {
         Box::pin(async move {
             let _one_at_a_time = self.prompting.lock().await;
             let options = approval_options(&req);
-            let preview = req
-                .preview
-                .as_deref()
-                .map(|p| format!("\n{}", color_diff(p)))
-                .unwrap_or_default();
+            let preview = preview_block(&req);
             // Same layering as the TUI panel, flattened for a line-oriented
             // terminal: what kind of action, what it acts on, why it is asked.
             let heading = req.title.as_deref().unwrap_or("approve?");
@@ -410,6 +422,29 @@ mod tests {
             color_diff("+1  add\n-2  del\n 3  ctx"),
             "\x1b[32m+1  add\x1b[0m\n\x1b[31m-2  del\x1b[0m\n\x1b[2m 3  ctx\x1b[0m"
         );
+    }
+
+    /// A plan is not a diff. Running it through `color_diff` (what the prompt
+    /// did until plan 194) turns every `-` bullet red and dims the rest.
+    #[test]
+    fn a_plan_preview_is_printed_as_written_and_a_diff_is_coloured() {
+        let plan = "## Plan\n\n- read the parser\n- rewrite it";
+        let planned = ConfirmRequest {
+            preview: Some(ConfirmPreview::Plan(plan.into())),
+            ..Default::default()
+        };
+        assert_eq!(preview_block(&planned), format!("\n{plan}"));
+
+        let changed = ConfirmRequest {
+            preview: Some(ConfirmPreview::FileChange("-1  foo\n+1  bar".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            preview_block(&changed),
+            "\n\x1b[31m-1  foo\x1b[0m\n\x1b[32m+1  bar\x1b[0m"
+        );
+
+        assert_eq!(preview_block(&ConfirmRequest::default()), "");
     }
 
     #[test]

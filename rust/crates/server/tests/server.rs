@@ -2844,6 +2844,53 @@ async fn approval_declined_then_accepted() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// A plan awaiting sign-off is its own kind of approval. It used to arrive as
+/// `file_change`, because the wire read the kind off the preview's presence and
+/// a plan is the only other thing that carries one (plan 194).
+#[tokio::test]
+async fn plan_approval_is_not_reported_as_a_file_change() {
+    let dirs = test_dirs("planapproval");
+    let plan = "## Plan\n\n- read the parser\n- rewrite it";
+    let script = vec![
+        vec![tool_use("t1", "enter_plan_mode", json!({}))],
+        vec![tool_use("t2", "exit_plan_mode", json!({"plan": plan}))],
+        vec![text("still planning")],
+    ];
+    let mut client = start_server(factory(script, dirs.offload.clone(), true), &dirs);
+    let thread_id = client.init_and_start().await;
+
+    client
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "plan it"}),
+        )
+        .await;
+    let log = client
+        .recv_until(|m| m["method"] == "approval/request")
+        .await;
+    let request = log.last().unwrap();
+    assert_eq!(request["params"]["kind"], "plan");
+    // The whole plan reaches the client, verbatim — its markdown intact, not
+    // pre-formatted as a diff.
+    assert_eq!(request["params"]["preview"], plan);
+
+    let srv_id = request["id"].as_i64().unwrap();
+    client
+        .send(json!({"jsonrpc": "2.0", "id": srv_id, "result": {"decision": "decline"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    // A declined plan is not a failed call: the model asked and got "not yet".
+    assert!(
+        log.iter().any(|m| m["method"] == "item/completed"
+            && m["params"]["item"]["type"] == "tool_call"
+            && m["params"]["item"]["status"] == "completed"),
+        "a declined plan keeps planning rather than failing: {log:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 #[tokio::test]
 async fn negotiated_questions_round_trip_multiple_answers() {
     let dirs = test_dirs("questions");

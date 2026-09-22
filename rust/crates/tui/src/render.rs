@@ -16,6 +16,7 @@ use ratatui::widgets::Paragraph;
 use kloop_core::event::AgentMessageStatus;
 use kloop_core::event::BackgroundTaskKind;
 use kloop_core::event::BackgroundTaskStatus;
+use kloop_core::permissions::ConfirmPreview;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::tools::TodoItem;
 use kloop_core::tools::TodoSnapshot;
@@ -29,6 +30,7 @@ use crate::app::Cell;
 use crate::app::ForkPicker;
 use crate::app::PendingInteraction;
 use crate::app::PendingQuestion;
+use crate::app::PlanStatus;
 use crate::app::ProviderPicker;
 use crate::app::QuestionPhase;
 use crate::app::ToolStatus;
@@ -488,6 +490,36 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 lines.push(Line::from(Span::styled(l, DIM)));
             }
         }
+        Cell::Plan { text, status } => {
+            // Markdown, like the sealed assistant cell — a plan is prose with
+            // lists and code in it, and colouring it by leading +/- (what the
+            // popup used to do to it) paints every list item as a deletion.
+            // The bar and title keep it from reading as something the model
+            // merely said: this one is waiting on an answer.
+            lines.push(Line::default());
+            // The same `▌ title` a panel header wears (`choice::header_line`):
+            // one block with a name on it, which is what this is.
+            let title = Style::new().fg(BRAND).add_modifier(Modifier::BOLD);
+            lines.push(Line::from(vec![
+                Span::styled("▌ ", title),
+                Span::styled("Plan", title),
+            ]));
+            lines.extend(crate::markdown::markdown_lines(text, width));
+            // Both answers are marked, not just the refusal: the cell is on
+            // screen before there is an answer at all, so "no mark" already
+            // means "not answered yet" and cannot also mean "approved".
+            let outcome = match status {
+                PlanStatus::Pending => None,
+                PlanStatus::Approved => Some(("✓", "approved", Color::Green)),
+                PlanStatus::Declined => Some(("✗", "not approved — still planning", Color::Yellow)),
+            };
+            if let Some((mark, label, color)) = outcome {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), Style::new().fg(color)),
+                    Span::styled(truncate(label, width.saturating_sub(4)), DIM),
+                ]));
+            }
+        }
         Cell::SessionHeader {
             version,
             model,
@@ -643,6 +675,12 @@ fn is_committable(cell: &Cell) -> bool {
         Cell::Tool { status, .. } | Cell::Agent { status, .. } => *status != ToolStatus::Running,
         Cell::BackgroundTask(task) => task.status != BackgroundTaskStatus::Running,
         Cell::AgentMessage(message) => message.status != AgentMessageStatus::Queued,
+        // A plan awaiting its ✓/✗ is deliberately not listed: holding it back
+        // would also hold back [`head_freeze_lines`], and a plan is routinely
+        // taller than the viewport — its top would be clipped off screen
+        // without ever reaching scrollback, which is the very thing plan 194
+        // set out to stop. A plan that scrolls away before it is answered
+        // keeps no mark; one the user can still see is worth more.
         _ => true,
     }
 }
@@ -1108,11 +1146,15 @@ fn confirm_panel(req: &ConfirmRequest, cursor: usize, width: usize) -> choice::P
         );
     }
     let mut body: Vec<Line<'static>> = Vec::new();
-    if let Some(preview) = &req.preview {
-        if let Some(stats) = diff_stats_line(preview) {
+    // Only a file change is popup content. A plan was written into the
+    // transcript when the prompt arrived (plan 194), so the panel here is one
+    // question and two answers — and shrinks to about a third of its old
+    // height, which is the conversation it stops covering up.
+    if let Some(ConfirmPreview::FileChange(diff)) = &req.preview {
+        if let Some(stats) = diff_stats_line(diff) {
             body.push(stats);
         }
-        body.extend(diff_preview_lines(preview, width));
+        body.extend(diff_preview_lines(diff, width));
     }
     let items = confirm_choices(req)
         .into_iter()
@@ -1903,7 +1945,7 @@ mod tests {
             notice: None,
             approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
             remember_rules: None,
-            preview: Some("+1  hello\n+2  world".into()),
+            preview: Some(ConfirmPreview::FileChange("+1  hello\n+2  world".into())),
         };
         let panel = confirm_panel(&req, 0, 40);
         assert_eq!(
@@ -1913,6 +1955,108 @@ mod tests {
         assert_eq!(
             panel.body.iter().map(line_text).collect::<Vec<_>>(),
             vec!["+2 -0", "+1  hello", "+2  world"]
+        );
+    }
+
+    /// A plan takes the other road: it goes into the transcript when the prompt
+    /// arrives and the panel keeps only the question. Before plan 194 it was
+    /// popup body — eight rows of it, coloured as a diff, with a `+0 -N` summary
+    /// counting its bullets as deletions.
+    #[test]
+    fn a_plan_goes_to_the_transcript_and_leaves_the_panel_a_question() {
+        use crate::events::AgentEvent;
+
+        let plan = "## Rewrite the parser\n\n- read the parser\n- rewrite it\n- delete the old one";
+        let mut app = App::new("s".into());
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "Exit plan mode and start on this plan?".into(),
+                title: Some("Exit plan mode".into()),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                preview: Some(ConfirmPreview::Plan(plan.into())),
+                ..Default::default()
+            },
+            reply,
+        });
+
+        let panel = active_panel(&app, 60).expect("the prompt owns the keyboard");
+        assert!(panel.body.is_empty(), "the plan is not popup content");
+        let rows = choice::panel_lines(&panel, 60, PANEL_MAX_ROWS, 0)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                "▌ Exit plan mode",
+                "",
+                "Exit plan mode and start on this plan?",
+                "",
+                "Do you want to proceed?",
+                "",
+                "> 1. Yes",
+                "  2. No, and tell kloop what to do differently",
+                "",
+                "Enter select · ↑↓ move · 1-9 pick · Esc deny",
+            ],
+            "the panel is one question and two answers — ten rows, not twenty"
+        );
+
+        // The whole plan is in the transcript, as markdown: every source line
+        // is there, and nothing is coloured like a deleted diff line.
+        let cell = app.cells.last().expect("the plan is a transcript cell");
+        let lines = cell_lines(cell, 60);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        for source in [
+            "Rewrite the parser",
+            "read the parser",
+            "rewrite it",
+            "delete the old one",
+        ] {
+            assert!(
+                rendered.contains(source),
+                "{source} missing from:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("-0") && !rendered.contains("+0"),
+            "no diff summary:\n{rendered}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg == Some(Color::Red)),
+            "a bullet is not a deletion"
+        );
+    }
+
+    /// Each outcome gets a mark, not only the refusal: the cell is on screen
+    /// before there is an answer, so a plain plan already means "not answered
+    /// yet" and cannot also mean "approved".
+    #[test]
+    fn a_plan_cell_marks_how_it_ended() {
+        let last = |status| {
+            cell_lines(
+                &Cell::Plan {
+                    text: "do the thing".into(),
+                    status,
+                },
+                40,
+            )
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .pop()
+            .unwrap()
+        };
+        assert_eq!(last(PlanStatus::Pending), "do the thing");
+        assert_eq!(last(PlanStatus::Approved), "  ✓ approved");
+        assert_eq!(
+            last(PlanStatus::Declined),
+            "  ✗ not approved — still planning"
         );
     }
 
@@ -1955,7 +2099,7 @@ mod tests {
                 notice: None,
                 approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
                 remember_rules: None,
-                preview: Some(preview),
+                preview: Some(ConfirmPreview::FileChange(preview)),
             },
             reply,
         });
@@ -2008,6 +2152,71 @@ mod tests {
             rendered[15].contains("Enter select"),
             "hint still pinned:\n{screen}"
         );
+    }
+
+    /// The same frame, for a plan: the one that started plan 194 was 47 display
+    /// rows and got eight of them, in a panel that left the conversation one
+    /// line. Here the whole plan is on screen and the panel is ten rows.
+    #[test]
+    fn draw_shows_a_tall_plan_in_the_transcript_under_a_ten_row_panel() {
+        use crate::events::AgentEvent;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use tokio::sync::oneshot;
+
+        let rows = |term: &Terminal<TestBackend>| -> Vec<String> {
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(""))
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let mut plan = String::from("## Rewrite the parser\n\n");
+        for i in 1..=40 {
+            plan.push_str(&format!("- step {i}\n"));
+        }
+        let mut app = App::new("s".into());
+        app.cells.push(Cell::Assistant("earlier turn".into()));
+        let (reply, _rx) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "Exit plan mode and start on this plan?".into(),
+                title: Some("Exit plan mode".into()),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                preview: Some(ConfirmPreview::Plan(plan)),
+                ..Default::default()
+            },
+            reply,
+        });
+
+        let mut term = Terminal::new(TestBackend::new(64, 60)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        let rendered = rows(&term);
+        let screen = rendered.join("\n");
+
+        // Every step of the plan, first to last, plus its heading.
+        assert!(screen.contains("Rewrite the parser"), "{screen}");
+        for i in 1..=40 {
+            assert!(screen.contains(&format!("step {i}")), "step {i}:\n{screen}");
+        }
+        assert!(screen.contains("▌ Plan"), "titled as a plan:\n{screen}");
+        // The panel is the question and the answers, and nothing scrolls in it.
+        let panel_top = rendered
+            .iter()
+            .position(|row| row.contains("▌ Exit plan mode"))
+            .expect("the panel is on screen");
+        let hint = rendered
+            .iter()
+            .position(|row| row.contains("Enter select"))
+            .expect("the hint is on screen");
+        assert_eq!(hint + 1 - panel_top, 10, "a ten-row panel:\n{screen}");
+        assert!(!screen.contains("PgUp/PgDn scroll"), "{screen}");
+        assert!(!screen.contains("-0"), "no diff summary:\n{screen}");
     }
 
     /// A model question renders through the same panel: its own header, the

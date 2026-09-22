@@ -807,7 +807,11 @@ The TUI colors the preview (green adds, red deletes, dim context) inside the
 inline choice panel and **scrolls it** (PageUp/PageDown, with a `PgUp/PgDn
 scroll` hint on the panel's key-hint row and the numbered answers pinned below
 it), the plain REPL prints the same ANSI, the server adds a `preview` field to
-`approval/request`. Alongside the flat one-line `description` every frontend can
+`approval/request`. The preview carries its **kind** (`ConfirmPreview::FileChange`
+/ `Plan`) rather than a bare string: a diff is the only thing that should be read
+by its leading `+`/`-`, and all three frontends used to assume every preview was
+one — colouring a plan's bullets as deletions, counting them into a `+0 -N`
+summary, and reporting a plan approval over the wire as a file change. Alongside the flat one-line `description` every frontend can
 print, the request carries `title` / `detail` / `notice` — the same facts pulled
 apart for a frontend that lays a prompt out over several lines.
 
@@ -850,9 +854,21 @@ bash, and sub-agents (each re-gated per call) still run. A plan-mode reminder
 rides every request so the model knows to plan, not act. The top-level model can
 call **`enter_plan_mode {}`** from manual or bypass; entering is
 idempotent and remembers the exact previous mode. When ready, it calls
-**`exit_plan_mode`** with the plan text; that rides the approval panel a
-change-diff does (the plan is the scrollable `preview`). Approve restores the
-remembered mode and the model implements; reject leaves the session in Plan.
+**`exit_plan_mode`** with the plan text. **The plan goes in the transcript, not
+in the prompt**: a panel body is a handful of rows and the first thing a short
+terminal takes away, while a plan routinely runs past forty — the plan that
+prompted this rule got eight of its forty-seven rows, coloured as a diff, and
+was twice rejected by a user who had never seen it. So the request tags the text
+`ConfirmPreview::Plan`, the TUI writes it into the transcript as markdown the
+moment the prompt is queued and leaves the panel one question and two answers
+(twenty rows down to ten, and the conversation no longer covered), the plain
+REPL prints it uncoloured, and the server sends `kind:"plan"`. Each plan is
+marked with how it ended (`✓ approved` / `✗ not approved`), because the cell is
+on screen before there is an answer — so a rejected plan stays put with the one
+that replaced it below it, which is the comparison a rejection invites. Approve
+restores the remembered mode and the model implements; reject leaves the session
+in Plan. The tool description says to put the plan in the argument and not
+repeat it in the reply — it is now shown in full.
 Sub-agents inherit Plan mode and are read-only, but cannot enter or exit it.
 The provider tool array advertises both controls for the whole session, so mode
 changes do not invalidate the prompt-cache prefix.
@@ -899,7 +915,8 @@ brand-accented header (`▌ Bash command` — every built-in has a human name;
 only an MCP tool keeps the raw name, because that is the one the user
 configured), the pinned subject it acts on, a yellow one-line notice when
 something warrants a pause (a hazard, a sub-agent, no OS sandbox), the
-scrollable preview, and numbered answers: `↑↓` (or `j`/`k`) moves, `1`–`9`
+scrollable preview (a file-change diff; a plan is in the transcript instead, so
+its panel has no body at all), and numbered answers: `↑↓` (or `j`/`k`) moves, `1`–`9`
 picks a row directly, Enter takes the cursor row, and Esc is
 always the last row — deny, or cancel. Approvals keep their `y`/`a`/`p`/`n`
 letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
@@ -1252,8 +1269,10 @@ business adapter ignores them. A missing or malformed generation/sequence is a
 hard protocol failure—there is no direct-ingest fallback.
 
 **Interactions use two independent reverse requests.** Permission decisions use
-`approval/request {thread_id, turn_id, kind:"command"|"file_change",
-description, preview?, remember_rules?, approval_scopes}` (server ids are integers
+`approval/request {thread_id, turn_id, kind:"command"|"file_change"|"plan",
+description, preview?, remember_rules?, approval_scopes}` (the kind comes from
+core, which knows what it built — it used to be read off `preview.is_some()`,
+which made every plan arrive as a file change) (server ids are integers
 in the server's own counter space), answered `{"decision": "accept" |
 "accept_for_session" | "accept_for_project" | "decline"}`. The request is
 authoritative: the client must offer only its advertised scopes, and core rejects
@@ -3831,8 +3850,9 @@ Every session is saved and resumable — see Session persistence above.
   contained-writes cwd boundary, glob rules, WorkspaceId-partitioned session cache,
   ProjectId identity and durable ProjectStore publication/RMW, legacy
   `[permissions].allow` rejection, opaque scripts cacheable for the
-  session but never durable, `ConfirmRequest.preview` carrying an
-  edit/write diff while other calls carry none); Windows shell contracts
+  session but never durable, `ConfirmRequest.preview` carrying a
+  kind-tagged edit/write diff while other calls carry none and a plan exit
+  carries `ConfirmPreview::Plan`); Windows shell contracts
   (Git for Windows layout discovery, conditional catalog, CreateProcessW
   suspended→Job assignment→resume fail-closed ordering, leader-exit/inherited-
   pipe cleanup, idempotent terminate, Drop and handle-count checks, fixed

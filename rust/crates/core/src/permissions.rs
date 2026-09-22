@@ -102,6 +102,30 @@ pub struct PermissionNotice {
     pub message: String,
 }
 
+/// The supporting detail an approval carries, and what kind of thing it is.
+/// Core knows which kind it just built; a frontend handed a bare string can
+/// only guess, and the guesses were wrong in all three of them — a plan read as
+/// a diff comes out coloured like deletions, summarised as `+0 -7`, and
+/// reported over the wire as a file change (plan 194).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmPreview {
+    /// A file change's diff: lines prefixed `+`/`-`/space by [`crate::diff`],
+    /// meant to be read with those signs coloured.
+    FileChange(String),
+    /// A plan put up for sign-off: markdown, and long enough that it belongs in
+    /// the transcript rather than a popup body.
+    Plan(String),
+}
+
+impl ConfirmPreview {
+    /// The text itself, for a surface that shows it without distinguishing.
+    pub fn text(&self) -> &str {
+        match self {
+            ConfirmPreview::FileChange(text) | ConfirmPreview::Plan(text) => text,
+        }
+    }
+}
+
 /// One confirmation request. `approval_scopes` is authoritative: frontends
 /// render only those choices and core rejects any answer outside the list.
 ///
@@ -118,7 +142,7 @@ pub struct ConfirmRequest {
     pub notice: Option<String>,
     pub approval_scopes: Vec<ApprovalScope>,
     pub remember_rules: Option<Vec<String>>,
-    pub preview: Option<String>,
+    pub preview: Option<ConfirmPreview>,
 }
 
 /// The outcome of [`Permissions::escalate_sandbox`] — the code-level
@@ -834,7 +858,7 @@ impl Permissions {
             notice: sub_agent_notice(depth),
             approval_scopes: vec![ApprovalScope::Once],
             remember_rules: None,
-            preview: Some(plan.to_string()),
+            preview: Some(ConfirmPreview::Plan(plan.to_string())),
         };
         match approver.confirm(req).await {
             Decision::Allow(ApprovalScope::Once) => PlanExitOutcome::Approved(self.exit_plan()),
@@ -1101,7 +1125,8 @@ impl Permissions {
             approval_scopes: approval_scopes.clone(),
             remember_rules: remember.as_ref().map(|remember| remember.echo.clone()),
             preview: crate::diff::file_change_preview_with_context(name, input, preview_context)
-                .await,
+                .await
+                .map(ConfirmPreview::FileChange),
         };
         let decision = approver.confirm(req).await;
         let Decision::Allow(scope) = decision else {
@@ -2245,7 +2270,8 @@ fn describe_escalation(command: &str, depth: u8) -> String {
 }
 
 /// The exit-plan-mode prompt heading; the plan text itself rides in the
-/// popup's scrollable `preview`.
+/// request's `preview` as [`ConfirmPreview::Plan`], which the frontends put in
+/// the transcript rather than the prompt (plan 194).
 fn describe_plan_exit(depth: u8) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     format!("{agent}Exit plan mode and start on this plan?")
@@ -3502,7 +3528,8 @@ mod tests {
     }
 
     /// The approval request carries a file-change diff for edit/write so the
-    /// human sees the change; other tools carry none.
+    /// human sees the change; other tools carry none. The kind travels with the
+    /// text: a frontend must never have to infer "this is a diff".
     #[tokio::test]
     async fn confirm_request_carries_a_change_preview() {
         let approver = ScriptedApprover::new(vec![Decision::Deny, Decision::Deny, Decision::Deny]);
@@ -3525,8 +3552,14 @@ mod tests {
         let _ = p.check("bash", &bash("rm -rf x"), 0).await;
         let asked = approver.asked();
         // The file cannot be read here, so the edit degrades to a two-string diff.
-        assert_eq!(asked[0].preview.as_deref(), Some("-1  foo\n+1  bar"));
-        assert_eq!(asked[1].preview.as_deref(), Some("(new file)\n+1  hi"));
+        assert_eq!(
+            asked[0].preview,
+            Some(ConfirmPreview::FileChange("-1  foo\n+1  bar".into()))
+        );
+        assert_eq!(
+            asked[1].preview,
+            Some(ConfirmPreview::FileChange("(new file)\n+1  hi".into()))
+        );
         assert_eq!(asked[2].preview, None, "non-file calls carry no preview");
     }
 
@@ -3896,8 +3929,12 @@ mod tests {
             PlanExitOutcome::Approved(Mode::Bypass)
         );
         assert_eq!(p.mode(), Mode::Bypass, "restored the pre-plan mode");
-        // The approver saw the plan text as the popup preview.
-        assert_eq!(approver.asked()[0].preview.as_deref(), Some("the plan"));
+        // The approver saw the plan text, tagged as a plan — not as a diff,
+        // which is what every frontend used to assume a preview was.
+        assert_eq!(
+            approver.asked()[0].preview,
+            Some(ConfirmPreview::Plan("the plan".into()))
+        );
 
         // Back into plan, this time deny: stay put.
         p.set_mode(Mode::Plan);

@@ -27,6 +27,7 @@ use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
 use crate::permissions::Approver;
+use crate::permissions::ConfirmPreview;
 use crate::permissions::ConfirmRequest;
 use crate::permissions::Decision;
 use crate::permissions::Mode;
@@ -566,12 +567,11 @@ async fn permission_report() -> Value {
     assert!(requests[0].description.contains("notebook_edit"));
     assert!(requests[0].description.contains(&absolute));
     assert!(!requests[0].description.contains("/sub/../"));
-    assert!(
-        requests[0]
-            .preview
-            .as_deref()
-            .is_some_and(|preview| preview.starts_with("(replace notebook cell code-002)"))
-    );
+    assert!(requests[0].preview.as_ref().is_some_and(|preview| {
+        preview
+            .text()
+            .starts_with("(replace notebook cell code-002)")
+    }));
 
     let contained = Permissions::new(
         Mode::Manual,
@@ -627,7 +627,7 @@ async fn permission_report() -> Value {
     json!({
         "approval_count": requests.len(),
         "description": requests[0].description,
-        "preview": requests[0].preview,
+        "preview": requests[0].preview.as_ref().map(ConfirmPreview::text),
         "accept_edits": true,
         "plan_blocked": plan_error.contains("plan mode"),
         "deny_blocked": deny_error.contains("deny permission rule"),

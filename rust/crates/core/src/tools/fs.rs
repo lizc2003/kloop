@@ -2461,7 +2461,11 @@ mod tests {
             !dir.join("deep").exists(),
             "approval wait has no side effects"
         );
-        let preview = request.preview.expect("new write carries a preview");
+        let preview = request
+            .preview
+            .expect("new write carries a preview")
+            .text()
+            .to_string();
         assert!(
             preview.contains("will create parent directories"),
             "{preview}"
@@ -3686,7 +3690,11 @@ mod tests {
                 .await
                 .expect("edit must reach approval")
                 .expect("approval channel remains open");
-        let preview = request.preview.expect("edit approval carries preview");
+        let preview = request
+            .preview
+            .expect("edit approval carries preview")
+            .text()
+            .to_string();
         assert!(preview.contains("-2  one"), "{preview}");
         assert!(preview.contains("+2  ONE"), "{preview}");
         reply

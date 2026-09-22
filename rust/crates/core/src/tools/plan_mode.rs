@@ -3,8 +3,9 @@
 //! approval the session leaves plan mode (restoring the pre-plan mode) and the
 //! model may act, on denial it stays in plan mode to keep planning — cc's
 //! ExitPlanMode. Session-control like the worktree tools: depth-0 only, and the
-//! approval itself runs inside `Permissions::confirm_exit_plan` so the plan text
-//! rides the same y/n popup a file-change diff does (its scrollable `preview`).
+//! approval itself runs inside `Permissions::confirm_exit_plan`, which tags the
+//! plan text `ConfirmPreview::Plan` — the popup asks the question, the plan goes
+//! into the transcript where there is room to read it (plan 194).
 
 use anyhow::Result;
 use anyhow::bail;
@@ -54,8 +55,10 @@ pub(super) fn exit_plan_mode_def() -> ToolDef {
             mode. Use this ONLY when the session is in plan mode and you have finished exploring \
             (read-only) and have a concrete, step-by-step plan. Pass the full plan text; the user \
             sees it and approves or rejects. On approval, plan mode turns off and you may make \
-            changes; on rejection, you stay in plan mode — refine the plan and call this again. Do \
-            not use it to ask general questions or when not in plan mode."
+            changes; on rejection, you stay in plan mode — refine the plan and call this again. The \
+            plan goes in the `plan` argument and nowhere else: it is shown in full, so do not also \
+            repeat it in your reply. Do not use it to ask general questions or when not in plan \
+            mode."
             .into(),
         schema: json!({
             "type": "object",
@@ -105,6 +108,7 @@ pub(super) async fn exit_plan_mode_tool(
 #[cfg(test)]
 mod tests {
     use crate::permissions::Approver;
+    use crate::permissions::ConfirmPreview;
     use crate::permissions::ConfirmRequest;
     use crate::permissions::Decision;
     use crate::permissions::Mode;
@@ -123,7 +127,7 @@ mod tests {
     /// text it was shown.
     struct PlanApprover {
         script: Mutex<Vec<Decision>>,
-        previews: Mutex<Vec<Option<String>>>,
+        previews: Mutex<Vec<Option<ConfirmPreview>>>,
     }
 
     impl PlanApprover {
@@ -236,7 +240,7 @@ mod tests {
         assert_eq!(ctx.cfg.permissions.mode(), Mode::Manual, "left plan mode");
         assert_eq!(
             approver.previews.lock().unwrap().as_slice(),
-            &[Some("1. do X\n2. do Y".to_string())]
+            &[Some(ConfirmPreview::Plan("1. do X\n2. do Y".to_string()))]
         );
 
         // The loop closes: a write that was hard-blocked in plan mode now

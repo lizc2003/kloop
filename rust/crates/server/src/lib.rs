@@ -61,6 +61,7 @@ use kloop_core::interaction::QuestionRequest;
 use kloop_core::interaction::Questioner;
 use kloop_core::permissions::ApprovalScope;
 use kloop_core::permissions::Approver;
+use kloop_core::permissions::ConfirmPreview;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::provider_route::ProviderCatalog;
@@ -2045,12 +2046,13 @@ impl Approver for ThreadUi {
             .lock()
             .unwrap()
             .insert(id.clone(), PendingInteraction::Approval(reply));
-        // A file change carries a diff preview; nothing else does — so the
-        // preview's presence is exactly the command/file_change discriminant.
-        let kind = if req.preview.is_some() {
-            "file_change"
-        } else {
-            "command"
+        // The kind comes from core, which knows what it built. Reading it off
+        // the preview's presence instead (what this did until plan 194) made
+        // every plan approval arrive as a file change.
+        let kind = match &req.preview {
+            Some(ConfirmPreview::FileChange(_)) => "file_change",
+            Some(ConfirmPreview::Plan(_)) => "plan",
+            None => "command",
         };
         let approval_scopes = req
             .approval_scopes
@@ -2068,7 +2070,7 @@ impl Approver for ThreadUi {
             params["remember_rules"] = json!(rules);
         }
         if let Some(preview) = &req.preview {
-            params["preview"] = Value::String(preview.clone());
+            params["preview"] = Value::String(preview.text().to_string());
         }
         params["thread_id"] = Value::String(self.thread_id.clone());
         let sent = self

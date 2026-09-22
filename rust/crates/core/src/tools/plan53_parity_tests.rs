@@ -21,7 +21,9 @@ use crate::event::{BackgroundTaskStatus, Event};
 use crate::history::History;
 use crate::inbox::InboxItem;
 use crate::interaction::{QuestionAnswer, QuestionOutcome, QuestionRequest, Questioner};
-use crate::permissions::{Approver, ConfirmRequest, Decision, Mode, PermissionRules, Permissions};
+use crate::permissions::{
+    Approver, ConfirmPreview, ConfirmRequest, Decision, Mode, PermissionRules, Permissions,
+};
 
 static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -92,7 +94,7 @@ impl Questioner for ScriptedQuestioner {
 
 struct ScriptedApprover {
     decisions: Mutex<VecDeque<Decision>>,
-    previews: Mutex<Vec<Option<String>>>,
+    previews: Mutex<Vec<Option<ConfirmPreview>>>,
 }
 
 impl ScriptedApprover {
@@ -382,7 +384,7 @@ async fn plan_control_report() -> Value {
     assert_eq!(context.cfg.permissions.mode(), Mode::Bypass);
     assert_eq!(
         approver.previews.lock().unwrap().as_slice(),
-        &[Some(plan.to_string())]
+        &[Some(ConfirmPreview::Plan(plan.to_string()))]
     );
     let names_after: Vec<String> =
         all_tool_defs(0, &[], 30, context.cfg.surface, &context.cfg.shell_programs)
