@@ -67,7 +67,7 @@ Plan 91 的 Plan 87–90 先行验收只增加 conformance evidence，不新增�
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 仓库推远端、Linux CI 可跑 |
+| Linux(bwrap+seccomp) | 双家 | **plan 19 余片**(设计已定:sibling `linux.rs`) | 一台能跑的 Linux 机器(CI 已于 2026-09-22 去掉) |
 | Windows model-shell process tree（Job Object） | safety product boundary | **✅ Plan 62（2026-08-05）**：suspended assign-before-resume；所有 Bash/PowerShell 走 per-process initial-breakpoint debug admission；admission/terminate 同锁；bounded cleanup | corrective 原生 Windows 已复跑通过；filesystem/network sandbox 未销账 |
 | Windows filesystem/network sandbox（restricted token/AppContainer） | cc 单家 | plan 19 更后；Job containment 不销此账 | 有 Windows sandbox 需求 |
 
@@ -96,7 +96,7 @@ ConPTY,配 `windows-sandbox-service`),它走的是 restricted token 一路;macOS
 | `read_file` 读图只管字节、不管像素 | 四家参考(cc/grok/codex/codewhale/dsh)都做客户端降采样,kloop 只有字节上限且是拒绝 | **✅ Plan 156(2026-09-16)**:`image.rs` 加像素预算(长边 2000)、3.75 MiB 传输字节目标、PNG→JPEG 阶梯与边长阶梯、解压炸弹守卫(64 Mpx / 256 MiB);降采样必告知模型。**5 MiB 读上限不动**(plan 61 的裁决) | 已完成 |
 | `bash` 缺 display `description` | cc `Bash` 有、kloop 无 | **✅ Plan 156(2026-09-16)**:补上,沿用 `run_agent`/`run_program` 同一套 display-only 约束(200 Unicode 字符、非空白、单行、无控制字符),不进 shell、不改结果;TUI 行以它开头、命令原文跟在后面 | 已完成 |
 | notebook cell 读取与编辑 | cc 单家 | **✅ Plan 57（2026-08-03）**：`read_file(.ipynb)` internal adapter + strict `notebook_edit`（CC：`NotebookEdit`）；完整 fresh cell-aware qualification、ordered 保真与原子提交 | 已完成 |
-| 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；Windows 原生 CI 持续门禁 |
+| 文件工具资源/EOL/父目录纠偏 | correctness + 跨平台安全 | **✅ Plan 61（2026-08-04）**：普通 Read/Edit 5 MiB、Notebook 10 MiB、preview 1 MiB；streaming fingerprint/equality；exact-first CRLF Edit；批准后 Unix FD / Windows HANDLE-relative recursive Write；Windows identity-bound cleanup、Unix 失败时保守保留新空目录 | 已完成；当时的 Windows 原生 CI 持续门禁已随 CI 于 2026-09-22 去掉 |
 | model-visible LSP / language-server client | cc 条件分支 | **Plan 57 保留 unknown**：env gate 单独开启仍未注册，正常发现链还依赖 enabled plugin；kloop 不加推测性 client | 取得权威 hermetic enabled-plugin profile 与完整 stdio lifecycle 时 |
 | CC WebFetch `prompt` + 二级模型/cache/Markdown pipeline | cc 单家 | **Plan 55 intentional-diff**：kloop 保留 strict `{url}` 有界纯抓取与更强逐跳安全边界 | 出现必须“按指令读页并总结”的产品需求再另立 adapter |
 | WebSearch timeout/large/dynamic concurrency/CCR proxy、remote=true/cloud lifecycle | cc 条件分支 | **Plan 55 保留 unknown**：本地 fake provider 已闭合 success/empty/error；remote 仅证明 gate-false fallback | 取得合规 hermetic profile 或官方暴露入口 |
@@ -108,7 +108,7 @@ Pre/Post hook barrier 证明 Read/Glob/Grep 真并发，dependent Edit/Edit/Writ
 串行；generated pair contract 再以相同规范化调用输入与真实 `dispatch_tools` Rust call/event report 比较，
 跨 profile cell 必须额外引用覆盖该维度的 exact-bundle bridge。Plan 49 当时的 matrix 保留 237 个跨其他
 工具簇或不可运行分支的 `unknown`；8 个 `same` 只覆盖上述并发/串行分类与 Glob/Grep 无孤儿
-lifecycle，不外推“全工具一致”。默认 verifier 校 exact binary，corpus-only 同语义门已进双平台 CI。
+lifecycle，不外推“全工具一致”。默认 verifier 校 exact binary，corpus-only 同语义门当时已进双平台 CI（CI 已于 2026-09-22 去掉，现只剩本机 `make parity`）。
 
 Plan 61 在不改写 Plan 49 历史 parity 裁决的前提下补了资源与平台安全边界：普通
 Read/Edit 在同一已打开对象上执行 5 MiB metadata 预检、limit+1 与读后版本复核，Notebook
@@ -120,8 +120,8 @@ nearest-existing-ancestor capability 逐段建目录；Unix 使用 `mkdirat/open
 `NtSetInformationFile(FileRenameInformationEx)` handle-relative rename。Windows 失败路径会释放 retained
 child、相对 retained parent 重开 cleanup candidate、复核 identity，并只对匹配且为空的 handle 设置
 disposition；POSIX 没有 portable atomic handle-bound `rmdir`，inode check→`unlinkat(name)` 会留下同 UID name-swap
-窗口，因此 Unix 失败路径保守保留本次新建的空目录，不冒险删除替换对象。Windows 原生 CI 是
-持续门禁，不用 cross-compile 冒充运行验收。
+窗口，因此 Unix 失败路径保守保留本次新建的空目录，不冒险删除替换对象。这条当初的 Windows 原生持续门禁已随 CI 于 2026-09-22 去掉，
+剩下的只有本机实跑；cross-compile 仍不冒充运行验收。
 
 Plan 50 已销账前台 Bash：schema/output/timeout-tree/cancel-tree determinism pairs 与 hook-based
 concurrency singleton 将 exact corpus 扩至 82 captures/109 evidence，matrix 为 56 行/448 单元；
@@ -417,8 +417,8 @@ session-only scheduled job 消失，durable job 保留，等待同 owner 在可�
 
 | 差距项 | 补齐路径 | 触发条件 |
 |---|---|---|
-| 远端 CI 首次实跑(workflow 只做过本地等价验证) | workflow 已扩为 macOS/Linux/Windows 全 workspace + mock + corpus-only；仍待可用远端执行 | 用户提供/启用 runner |
-| Windows Plan 62 原生 lifecycle gate | **✅ 2026-08-05 本地 Windows 10 x64 全门通过**；focused selectors 继续进 workflow | 已完成；远端 CI 持续门禁 |
+| ~~远端 CI 首次实跑~~ | **⛔ 2026-09-22 停**（用户判「目前不需要 CI」）。推远端后一共跑过 9 次、9 次全红，且每次都红在同一处：matrix 要 `+stable`（当时已到 1.98.1）而仓库 pin 1.96.1，`-D warnings` 把这个版本差判成失败——同一批里 pin 1.96.1 的 MSRV job 始终绿。`.github/` 整个删除 | 不再有触发条件；要回来就是重开一个钉住 1.96.1 的 workflow |
+| Windows Plan 62 原生 lifecycle gate | **✅ 2026-08-05 本地 Windows 10 x64 全门通过**；focused selectors 继续进 workflow | 已完成；持续门禁随 CI 于 2026-09-22 去掉，Windows 再验只能本机跑 |
 | Plan 63 project permission / native protocol 1.0 | **✅ 2026-08-06**：kloop fmt/clippy/workspace/mock、real binary v1/v2-refusal smoke；Desktop 887 pass/52 skip/0 fail、TS/build、Tauri 229 tests；companion `54056dc5` | 已完成；private-store Windows target check/clippy已过，本次未做原生Windows runtime或真实Tauri GUI点击smoke |
 | Plan 76 TUI correctness evidence boundary | **✅ 2026-08-11**：Composer/render/TestBackend 为 cross-platform suite，本次 macOS workspace 实跑；CI 已配置 macOS/Linux/Windows，`cfg(unix)` real-binary PTY 回答 `ESC[6n`、驱动 resize/input、解析有界 raw ANSI/current viewport | Windows 的 n/a/skip 不是 ConPTY pass；vt100 不证明 DECSTBM native scrollback，真实终端字形/scrollback 另作人工证据 |
 | Plan 78 terminal dependency/MSRV maintenance | **✅ 2026-08-12**：Rust 1.88 workspace MSRV；Ratatui 0.30.2/Crossterm 0.29.0/Unicode/vt100 受控升级；associated backend error、target graph 与既有 TUI/PTY gates 验证原契约 | maintenance/correctness only；不改变 parity 裁决，Windows graph 排除 Unix PTY edges 不是 ConPTY pass |
@@ -445,7 +445,7 @@ repo 性能、并发边角、UI 体感只有用出来。**收敛路径 = dogfood
 - **T0 下一产品切片**：暂无。原队首 `read_file` PDF 原生分页读取 **⛔ 2026-09-17 停**（用户判「目前不需要支持 PDF」，**Plan 67**；拦住它的不是技术前置，是需求）。session-scoped Task graph/TUI 已由 **Plan 71–74（2026-08-11）** 完成：五工具、稳定 ID/DAG、无 owner、root-owned/result-only child 边界、revisioned snapshot、atomic rollover/clear fence 与 TUI-only live panel；旧 `todo_write` 已删除。
 - **T0 架构与 correctness**：Plan 61–66 已完成；Plan 63 已把 durable permission 收到 ProjectId、session cache 收到 WorkspaceId，Plan 66 已把后台资源名与 ID 域分开。后续只按 dogfood 证据继续细化 Config façade，不把类型拆分本身当独立能力缺口。
 - **T0 parity 余线**：Plan 59 已完成（2026-08-03）；后续内部重构不得外推或改写固定版本、平台和已执行条件下的受限行为兼容结论。
-- **T1 有明确外部触发**：Linux 沙箱 + CI 首跑（推远端后）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
+- **T1 有明确外部触发**：Linux 沙箱（需要一台 Linux 机器；CI 那条已于 2026-09-22 判停）；Responses 回放契约销账 + `/compact` 真 key 验收（拿到官方 key 时）。
 - **T2 痛感驱动**：hooks JSON 协议、provider/model 价格与跨 transcript/child 全局金额归因、压缩后重注入、TUI 打磨件、HeadTailBuffer、send_message、MCP resource templates/prompts/双向 request、子目录懒加载、会话性能工程。
 - **⛔ 已判不做(别再议,除非前提变)**:write_stdin(plan 30)、token budget(教训
   24)、并发 pacing、V8 引擎、旧版 SSE 传输、worktree 自动合回、bedrock/vertex、

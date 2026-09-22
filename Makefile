@@ -1,11 +1,11 @@
 # kloop — build / test / install
 #
-# 仓库根不是 cargo workspace 根,workspace 在 rust/ 下(与 CI 的 working-directory 一致)。
+# 仓库根不是 cargo workspace 根,workspace 在 rust/ 下,所以每个目标都先 cd 进去。
 # 覆盖点:PREFIX / BINDIR(装到哪)、KLOOP_DIR(私有状态根,配置就在它下面)。
 #
 #   make                 release 构建
 #   make test            全量测试
-#   make check           fmt --check + clippy -D warnings + test(提交前的门禁,与 CI 同令)
+#   make check           fmt --check + clippy -D warnings + test(提交前的门禁,本地唯一一道)
 #   make install         装二进制;没有配置时顺带铺一份 config-demo
 #   make help            列出所有目标
 
@@ -101,7 +101,7 @@ help:
 	@echo "  fmt / fmt-check  rustfmt 写入 / 只检查"
 	@echo "  clippy           clippy --all-targets --all-features -D warnings"
 	@echo "  check            fmt-check + clippy + test"
-	@echo "  parity           Claude Code 语料校验(CI 最后一步)"
+	@echo "  parity           Claude Code 语料校验(只在有语料的机器上)"
 	@echo "  mock             cargo run -- --mock,无 key 冒烟"
 	@echo "  install          装到 $(BINDIR)/$(BIN);缺配置时铺一份 $(CONFIG)"
 	@echo "  uninstall        删掉 $(BINDIR)/$(BIN),不动 $(KLOOP_DIR)"

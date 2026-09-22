@@ -33,7 +33,8 @@ reads the code, edits files, runs commands and looks things up until the job is 
 ## Install
 
 Rust 1.96+. macOS is the primary platform (the sandbox has a macOS backend only);
-Linux and Windows build and run, and CI covers all three.
+Linux and Windows build and run, but only macOS is exercised routinely — there is
+no CI, so `make check` on the developer's machine is the whole gate.
 
 ```sh
 make install          # release build, installed into ~/.local/bin (override PREFIX=)
@@ -84,8 +85,8 @@ that same file; the full field reference is
 | `docs/plan/` | One numbered file per development task, including what went wrong; `HANDOFF.md` is the current state (written in Chinese) |
 | `config/` | Configuration example |
 
-`make help` lists every build target (`make check` = fmt + clippy + test, the same
-three commands CI runs).
+`make help` lists every build target (`make check` = fmt + clippy + test, the three
+commands to run before every commit).
 
 ## License
 
