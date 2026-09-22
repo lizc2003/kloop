@@ -50,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::agent::run_turn;
+use kloop_core::agent::run_turn_with_input;
 // Aliased: `Event` alone is crossterm's terminal event in this module.
 use kloop_core::Config;
 use kloop_core::event::Event as CoreEvent;
@@ -381,8 +382,16 @@ async fn agent_worker(
                 } else {
                     Message::user_with_blocks(turn.text, images)
                 };
-                history.record(msg);
-                let outcome = run_turn(&cfg, &mut history, &ui, &turn.cancel, 0).await;
+                let (outcome, returned) =
+                    run_turn_with_input(&cfg, &mut history, &ui, &turn.cancel, 0, msg).await;
+                // Interrupted before the model said anything: the turn is not in
+                // history and not in the session file, so the transcript must
+                // drop it too and the text goes back to the composer to be
+                // fixed. `--image` blocks that rode this turn ride the next one.
+                if let Some(input) = returned {
+                    let (text, images) = split_user_input(input);
+                    let _ = events.send(AgentEvent::InputReturned { text, images });
+                }
                 let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
                     history.estimated_tokens(),
                 )));
@@ -877,6 +886,28 @@ where
         }
     }
     unreachable!("bounded geometry retry loop always returns")
+}
+
+/// Take a returned user message apart into what the composer holds: the text as
+/// it was typed, and its attachments. The label an attachment was submitted
+/// under is not in the message, so it comes back as the media type — the same
+/// placeholder a resumed session shows for an image.
+fn split_user_input(input: Message) -> (String, Vec<(String, ContentBlock)>) {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in input.content {
+        match &block {
+            ContentBlock::Text { text: part } => text.push_str(part),
+            ContentBlock::Image {
+                source: kloop_protocol::ImageSource::Base64 { media_type, .. },
+            } => {
+                let label = media_type.clone();
+                images.push((label, block));
+            }
+            _ => {}
+        }
+    }
+    (text, images)
 }
 
 /// Recognize a pasted/dragged image-file path and load it into an Image block

@@ -47,6 +47,13 @@ pub(super) enum Sampled {
     Overflow,
     Cancelled {
         partial: Vec<ContentBlock>,
+        /// Nothing at all came down the stream before the cancel — not a
+        /// token, not a reasoning delta, not a finished block. Distinct from
+        /// an empty `partial`, which also happens when plenty arrived and
+        /// none of it is replayable (unsigned reasoning, a complete but
+        /// undispatched tool call). Only the former means the turn can be
+        /// taken back as if it never ran.
+        produced_nothing: bool,
     },
     /// A retryable failure exhausted the primary model's attempt budget and may
     /// proceed to the configured fallback model.
@@ -62,6 +69,7 @@ pub(super) enum Sampled {
 enum SampleError {
     Cancelled {
         partial: Vec<ContentBlock>,
+        produced_nothing: bool,
     },
     Overflow,
     Provider(ProviderFailure),
@@ -124,7 +132,15 @@ pub(super) async fn sample_with_retry(
         .await
         {
             Ok(ok) => return Sampled::Ok(ok),
-            Err(SampleError::Cancelled { partial }) => return Sampled::Cancelled { partial },
+            Err(SampleError::Cancelled {
+                partial,
+                produced_nothing,
+            }) => {
+                return Sampled::Cancelled {
+                    partial,
+                    produced_nothing,
+                };
+            }
             // Retrying an oversized request verbatim can never succeed; hand
             // it straight to the reactive compaction path.
             Err(SampleError::Overflow) => return Sampled::Overflow,
@@ -154,7 +170,15 @@ pub(super) async fn sample_with_retry(
                     attempt + 1
                 )));
                 tokio::select! {
-                    _ = cancel.cancelled() => return Sampled::Cancelled { partial: Vec::new() },
+                    // Waiting out a backoff means the attempt before it failed
+                    // without semantic output — an attempt that had produced
+                    // any would have come back `AfterOutput`, which never
+                    // retries. So nothing has reached the conversation and the
+                    // turn is still takeable-back.
+                    _ = cancel.cancelled() => return Sampled::Cancelled {
+                        partial: Vec::new(),
+                        produced_nothing: true,
+                    },
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
@@ -206,8 +230,18 @@ async fn sample_once(
                     &think_accum,
                     ItemStatus::Failed,
                 );
+                // Read before `blocks` is consumed. The three together are
+                // everything the stream has handed us this round; all empty
+                // means the cancel beat the first byte of the response, and
+                // only then can the turn be taken back whole. `partial` is
+                // not the test — it is empty for a round of unsigned
+                // reasoning too, and two minutes of visible thinking is not
+                // "nothing happened".
+                let produced_nothing =
+                    blocks.is_empty() && text_accum.is_empty() && think_accum.is_empty();
                 return Err(SampleError::Cancelled {
                     partial: replayable_partial(blocks, &text_accum),
+                    produced_nothing,
                 });
             },
             event = rx.recv() => match event {

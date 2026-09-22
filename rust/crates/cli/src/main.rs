@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::agent::run_turn;
+use kloop_core::agent::run_turn_with_input;
 use kloop_core::history::History;
 use kloop_core::skills::Skill;
 use kloop_core::tools::ToolSource;
@@ -951,10 +952,13 @@ async fn plain_main(
         } else {
             Message::user_with_blocks(line, std::mem::take(&mut pending_images))
         };
-        history.record(msg);
         let cancel = CancellationToken::new();
-        let (outcome, exit_requested) = run_plain_operation(
-            run_turn(&cfg, &mut history, &ui, &cancel, 0),
+        // Staged, not recorded: an interrupt before the model produces anything
+        // leaves the session exactly as it was. There is no composer to hand
+        // the text back to here, so the line is simply gone — which is why the
+        // `Aborted` arm below says so.
+        let ((outcome, returned), exit_requested) = run_plain_operation(
+            run_turn_with_input(&cfg, &mut history, &ui, &cancel, 0, msg),
             &cancel,
             &mut ctrl_c,
         )
@@ -968,6 +972,9 @@ async fn plain_main(
                     cfg.max_rounds
                         .expect("MaxRounds requires a configured limit")
                 )
+            }
+            EndReason::Aborted if returned.is_some() => {
+                println!("[interrupted before the model replied — that message was not recorded]")
             }
             EndReason::Aborted => println!("[interrupted — history patched; exiting]"),
             EndReason::Error(e) => println!("[error: {e}]"),

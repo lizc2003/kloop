@@ -90,6 +90,15 @@ pub enum MockTurn {
         release: tokio::sync::oneshot::Receiver<()>,
         blocks: Vec<AssistantBlock>,
     },
+    /// Stream these blocks as deltas, then wait for release before completing
+    /// them. Where [`MockTurn::Gate`] holds a request that has said nothing,
+    /// this one holds a request that has already shown the user output — the
+    /// distinction a cancel has to make when none of that output is replayable
+    /// (unsigned reasoning), because the round still happened.
+    DeltasThenGate {
+        release: tokio::sync::oneshot::Receiver<()>,
+        deltas: Vec<AssistantBlock>,
+    },
     /// Blocks delivered, but the stream reports the output limit was hit.
     Truncated(Vec<AssistantBlock>),
     /// Content deltas arrive, then the stream fails before any block completes.
@@ -785,6 +794,13 @@ async fn run_mock_turn(
             let _ = release.await;
             let outcome = mock_outcome(&blocks);
             (blocks, outcome, None, true)
+        }
+        MockTurn::DeltasThenGate { release, deltas } => {
+            emit_deltas(&deltas, sink).await?;
+            let _ = release.await;
+            let outcome = mock_outcome(&deltas);
+            // Already streamed above; completing them must not send them twice.
+            (deltas, outcome, None, false)
         }
         MockTurn::Truncated(blocks) => (
             blocks,

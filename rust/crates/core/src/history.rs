@@ -77,6 +77,14 @@ pub struct History {
     /// in-memory-only histories (sub-agents, tests).
     rollout: Option<Rollout>,
     next_memory_boundary: u64,
+    /// This turn's input: already in the request the model is being sent, not
+    /// yet in the conversation. A turn the user interrupts before the model has
+    /// produced anything discards it, and neither `items` nor the session file
+    /// ever learns that turn happened — which is what makes "I mistyped, esc"
+    /// leave no trace. Every write that orders itself against the conversation
+    /// commits this first, so the input can never land behind something that
+    /// happened after it.
+    staged: Vec<Message>,
 }
 
 impl History {
@@ -91,6 +99,7 @@ impl History {
             provider_routes: Vec::new(),
             rollout: None,
             next_memory_boundary: 1,
+            staged: Vec::new(),
         }
     }
 
@@ -116,6 +125,7 @@ impl History {
             provider_routes,
             next_memory_boundary: resumed.rollout.next_boundary(),
             rollout: Some(resumed.rollout),
+            staged: Vec::new(),
         }
     }
 
@@ -133,7 +143,44 @@ impl History {
         self.usage_anchor = None;
     }
 
-    pub fn record(&mut self, mut msg: Message) {
+    /// Hold this turn's input outside the conversation until the turn produces
+    /// something. It rides every request from here on (see
+    /// [`History::provider_request_view`]) and counts toward the context
+    /// estimate, but `messages()` — the view compaction and the rollout work
+    /// from — does not see it.
+    pub fn stage(&mut self, msg: Message) {
+        self.staged.push(msg);
+    }
+
+    /// Whether this turn's input is still outside the conversation, i.e. not
+    /// one thing has been written since it was staged.
+    pub fn has_staged(&self) -> bool {
+        !self.staged.is_empty()
+    }
+
+    /// Drop the staged input and hand it back. The conversation and the session
+    /// file are exactly as they were before it was staged.
+    pub fn take_staged(&mut self) -> Vec<Message> {
+        std::mem::take(&mut self.staged)
+    }
+
+    /// Move the staged input into the conversation. Called by every write that
+    /// has to come after it; a no-op once it has landed. Public because a turn
+    /// can produce something the conversation does not keep — a round of
+    /// unsigned reasoning is dropped on the way in — and that turn still
+    /// happened, so its input has to land with nothing else to carry it.
+    pub fn commit_staged(&mut self) {
+        for msg in std::mem::take(&mut self.staged) {
+            self.record_committed(msg);
+        }
+    }
+
+    pub fn record(&mut self, msg: Message) {
+        self.commit_staged();
+        self.record_committed(msg);
+    }
+
+    fn record_committed(&mut self, mut msg: Message) {
         assert!(
             msg.provider_provenance.is_none(),
             "provider assistant messages must use History::record_provider_assistant"
@@ -167,6 +214,7 @@ impl History {
         blocks: Vec<ContentBlock>,
         attempt: &FrozenProviderAttempt,
     ) {
+        self.commit_staged();
         let origin_boundary = self
             .rollout
             .as_ref()
@@ -249,11 +297,23 @@ impl History {
         &self.provider_routes
     }
 
+    /// What this request carries: the conversation, then this turn's staged
+    /// input. The model has to see the input to answer it — being outside
+    /// `items` is about what the *session* has committed to, not about what is
+    /// sent.
     pub fn provider_request_view(
         &self,
         attempt: &FrozenProviderAttempt,
     ) -> Result<Vec<Message>, kloop_provider::ProviderFailure> {
-        provider_request_view(&self.items, &self.provider_routes, attempt)
+        let mut view = provider_request_view(&self.items, &self.provider_routes, attempt)?;
+        if !self.staged.is_empty() {
+            view.extend(provider_request_view(
+                &self.staged,
+                &self.provider_routes,
+                attempt,
+            )?);
+        }
+        Ok(view)
     }
 
     pub(crate) fn provider_request_view_for(
@@ -438,7 +498,12 @@ impl History {
 
     /// Persist a model turn's display-only terminal state. It never enters
     /// `items`, so provider replay and token accounting remain unchanged.
+    ///
+    /// Commits the staged input first: the terminal is where a turn ends, and a
+    /// line written after it belongs to the next turn — which is how the rewind
+    /// picker reads the file.
     pub fn record_turn_terminal(&mut self, terminal: TurnTerminal) {
+        self.commit_staged();
         self.persist(|rollout| rollout.append_turn_terminal(&terminal));
     }
 
@@ -462,6 +527,13 @@ impl History {
         &self.provider_usage
     }
 
+    /// Does *not* commit the staged input, unlike the writes that order
+    /// themselves against the conversation. A usage line is a ledger entry, not
+    /// a place in the transcript, and compaction records one between computing
+    /// its replacement and installing it — committing here would hand the
+    /// staged input to a rewrite computed without it, which is to say lose it.
+    /// The agent loop commits explicitly when it accepts a round, so a turn's
+    /// usage line still follows the message that paid for it.
     pub fn record_provider_usage(&mut self, record: ProviderUsageRecord) {
         self.persist(|rollout| rollout.append_provider_usage(&record));
         self.provider_usage.push(record);
@@ -507,11 +579,14 @@ impl History {
     }
 
     /// Current context size: the last real usage anchor plus a ~4 chars/token
-    /// estimate for everything recorded after it.
+    /// estimate for everything recorded after it. The staged input counts — it
+    /// is in the next request, and a large paste is exactly the input that can
+    /// overflow the window before it has been recorded.
     pub fn estimated_tokens(&self) -> u64 {
         let (anchored_len, anchored_tokens) = self.usage_anchor.unwrap_or((0, 0));
         let tail: u64 = self.items[anchored_len.min(self.items.len())..]
             .iter()
+            .chain(self.staged.iter())
             .map(estimate_message_tokens)
             .sum();
         anchored_tokens + tail
@@ -521,6 +596,12 @@ impl History {
     /// history. The usage anchor no longer describes the new items, so it is
     /// dropped and the estimate runs purely on the char heuristic until the
     /// next sampled response re-anchors it.
+    ///
+    /// The one write that must *not* commit the staged input: `items` was
+    /// computed from `messages()`, which excludes it, so committing first would
+    /// replace it away. It stays staged and lands after the summary, where it
+    /// belongs — it is the newest thing in the conversation, not part of what
+    /// was folded up.
     pub fn replace_all(&mut self, items: Vec<Message>) {
         self.persist(|rollout| rollout.append_compacted(&items));
         self.items = items;
@@ -1729,6 +1810,86 @@ mod tests {
                 provider_provenance: None,
                 injected: None,
             }
+        );
+    }
+
+    /// The staged input is in the request but not in the conversation: the
+    /// model has to answer it, while compaction, the rollout and `messages()`
+    /// still describe a session that has not committed to it.
+    #[test]
+    fn a_staged_input_rides_the_request_without_joining_the_conversation() {
+        use crate::provider_route::ProviderCatalog;
+        use crate::provider_route::ProviderCatalogEntry;
+        use kloop_protocol::ProviderAvailabilityCode;
+        use kloop_provider::Provider;
+        use std::sync::Arc;
+
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![ProviderCatalogEntry {
+                id: "a".into(),
+                api_family: ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                default_model: "a-model".into(),
+                models: vec!["a-model".into()],
+                context_window: None,
+                availability: ProviderAvailabilityCode::Ready,
+                default_effort: None,
+                factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
+            }])
+            .unwrap(),
+        );
+        let route = catalog.initial_route("a", None).unwrap();
+        let mut h = History::new(temp_dir("staged-view"));
+        h.ensure_initial_provider_route(&route).unwrap();
+        h.record(Message::user_text("earlier"));
+        let before = h.estimated_tokens();
+
+        h.stage(Message::user_text("just typed"));
+
+        assert!(h.has_staged());
+        assert_eq!(h.messages(), &[Message::user_text("earlier")]);
+        assert_eq!(
+            h.provider_request_view(&route.primary_attempt()).unwrap(),
+            vec![
+                Message::user_text("earlier"),
+                Message::user_text("just typed"),
+            ]
+        );
+        assert!(
+            h.estimated_tokens() > before,
+            "a staged input is in the next request, so it is in the estimate"
+        );
+
+        // Taken back: the session is exactly what it was before it was staged.
+        assert_eq!(h.take_staged(), vec![Message::user_text("just typed")]);
+        assert!(!h.has_staged());
+        assert_eq!(h.messages(), &[Message::user_text("earlier")]);
+        assert_eq!(h.estimated_tokens(), before);
+    }
+
+    /// The one write that must not commit the stage. A replacement computed
+    /// from `messages()` never contained the staged input, so committing first
+    /// would replace it away; it belongs after the summary either way, being
+    /// the newest thing in the conversation.
+    #[test]
+    fn compaction_does_not_swallow_the_staged_input() {
+        let mut h = History::new(temp_dir("staged-compaction"));
+        h.record(Message::user_text("old turn"));
+        h.stage(Message::user_text("the new question"));
+
+        assert_eq!(h.messages(), &[Message::user_text("old turn")]);
+        h.replace_all(vec![Message::user_text("[summary]")]);
+        assert!(h.has_staged(), "replace_all must leave the stage alone");
+
+        // The next write of any kind commits it — after the summary.
+        h.record(Message::user_text("and then"));
+        assert_eq!(
+            h.messages(),
+            &[
+                Message::user_text("[summary]"),
+                Message::user_text("the new question"),
+                Message::user_text("and then"),
+            ]
         );
     }
 }

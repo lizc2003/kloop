@@ -12,7 +12,9 @@ the five architectural bets below; it is now ten crates, and every bet held.
 ## The five bets
 
 1. **Append-only history + offload at record time.** History is only ever
-   appended. A tool result over `OFFLOAD_CAP_CHARS` (32000) is spilled to the
+   appended — a turn's input waits outside it until the turn produces something
+   (see *A turn that never happened*), and once in, nothing is rewritten except
+   by compaction. A tool result over `OFFLOAD_CAP_CHARS` (32000) is spilled to the
    session store when recorded; the history keeps a head/tail preview plus the
    spilled file's **absolute path** and character count.
 
@@ -361,10 +363,12 @@ estimate and never enters provider replay, public display events, or snapshots.
 The same append-only chain also carries recovery-only `session`
 records (the canonical cwd and resolved model) and display `turn_terminal`
 records (completed/maxRounds/aborted/error, positioned after a message index).
-Every turn writes exactly one, from the agent loop's own exits rather than from
-a front end — including the two that end a turn before its first sampling
-request — so a transcript always says why the turn stopped; a slash-command line
-is not a model turn and records none. Error terminals add an internal typed
+Every turn that happened writes exactly one, from the agent loop's own exits
+rather than from a front end — including the two that end a turn before its
+first sampling request — so a transcript always says why the turn stopped; a
+slash-command line is not a model turn and records none. Neither does a turn
+interrupted before the model produced anything: it writes no line at all, not
+even `aborted` (see **A turn that never happened** below). Error terminals add an internal typed
 provider outcome/failure while preserving the protocol 2.0 status/error
 projection; terminals never enter provider replay or token accounting. If a stream fails or is cancelled after visible text, that
 partial assistant block and its provider provenance are recorded before the
@@ -445,6 +449,38 @@ is configured now, and earlier receipts are not re-checked against today's
 catalog at all. Reasoning the new rail cannot replay is dropped from the request
 view (`continuity: filtered`), exactly as after an explicit switch, while the
 canonical transcript keeps it.
+
+### A turn that never happened
+
+Someone sends a message, sees the typo, and hits esc. Recording the message
+when the turn *starts* leaves that typo in the session forever, unanswered and
+in front of the model on the next request. So a turn's input is **staged**, not
+recorded: it rides the request view and the context estimate, while `messages()`
+— the view compaction, the rollout and the transcript work from — does not see
+it. The first write that has to order itself after it commits it, at the write
+entry point rather than in the callers, which is why `drain_inbox`'s steering
+messages can never land in front of the message they steer. Two writes
+deliberately do not commit: `replace_all`, because compaction's replacement was
+computed from a `messages()` that excluded the staged input and committing
+first would replace it away (it belongs after the summary, being the newest
+thing in the conversation), and `record_provider_usage`, because compaction
+records one between computing that replacement and installing it — the agent
+loop commits explicitly when it accepts a round instead, which keeps a turn's
+usage line behind the message that paid for it.
+
+A turn that ends `Aborted` with its input still staged therefore did not
+happen: `items` and the session file are untouched, no terminal line is
+written, and the input goes back to the front end — the TUI drops the cells it
+echoed and refills the composer, the server discards the turn from its
+snapshot. Two interrupts stay on the recorded path. An `Error` is worth keeping
+("I asked this and it broke" is history, and a failure line with nothing in
+front of it reads as a failure from nowhere), and an interrupt with steering
+already queued keeps the message that steering answers.
+
+The test is what reached the stream — `blocks`, accumulated text and
+accumulated reasoning all empty — not what survived into history. Unsigned
+reasoning is dropped on the way in, so a round can record nothing at all after
+two minutes of visible thinking, and that is not a turn that never happened.
 
 ### Fork (and rewind)
 

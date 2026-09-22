@@ -686,6 +686,7 @@ impl App {
                     self.frozen_route = Some(route);
                 }
             }
+            AgentEvent::InputReturned { text, images } => self.return_input(text, images),
             AgentEvent::ProviderPicker(catalog) => {
                 if catalog.providers.is_empty() {
                     self.cells
@@ -1554,6 +1555,64 @@ impl App {
     /// the user message with them). Empty for a text-only turn.
     pub fn take_submit_images(&mut self) -> Vec<ContentBlock> {
         std::mem::take(&mut self.submit_images)
+    }
+
+    /// The turn never happened — interrupted before the model produced a thing,
+    /// so it is in neither history nor the session file. Undo the echo and put
+    /// the input back in the composer to be fixed and resent.
+    fn return_input(&mut self, text: String, images: Vec<(String, ContentBlock)>) {
+        // Esc only reaches a running turn from an empty composer (a draft makes
+        // it a two-tap clear), but the user can start typing in the gap between
+        // the interrupt and the worker handing this back. Their new draft wins:
+        // leave the transcript and the composer alone rather than splicing the
+        // old text into what they are now writing.
+        if !self.composer.is_blank() {
+            return;
+        }
+        self.drop_input_echo(&text, images.len());
+        if !text.is_empty() {
+            self.composer.paste(&text);
+        }
+        for (label, block) in images {
+            self.composer.attach_image(label, block);
+        }
+    }
+
+    /// Drop the cells this input was echoed as — the text line plus one
+    /// placeholder per attachment, exactly what [`App::on_enter`] pushed.
+    /// Matched against the returned text rather than counted blindly: if the
+    /// tail is not that echo, the transcript keeps everything. A stale echo is
+    /// cosmetic; deleting a cell that belongs to something else is not.
+    fn drop_input_echo(&mut self, text: &str, images: usize) {
+        // The `Cell::User` line immediately before `cut`, when that is what is
+        // there. `cut == 0` (nothing left to inspect) reads as "no match".
+        fn tail(cells: &[Cell], cut: usize) -> Option<&str> {
+            match cells.get(cut.checked_sub(1)?)? {
+                Cell::User(line) => Some(line.as_str()),
+                _ => None,
+            }
+        }
+        let echo = text.trim();
+        let mut cut = self.cells.len();
+        for _ in 0..images {
+            if !tail(&self.cells, cut).is_some_and(|line| line.starts_with("[image: ")) {
+                return;
+            }
+            cut -= 1;
+        }
+        if !echo.is_empty() {
+            if tail(&self.cells, cut).is_none_or(|line| line != echo) {
+                return;
+            }
+            cut -= 1;
+        }
+        // Cutting to nothing while the head cell has a prefix in native
+        // scrollback would leave that prefix on screen with no cell behind it.
+        // Scrollback cannot be erased, so the echo stays.
+        if cut == 0 && self.head_frozen.is_some() {
+            return;
+        }
+        self.cells.truncate(cut);
     }
 
     /// A bracketed-paste of text (the event loop routes image-file pastes to
@@ -4269,5 +4328,71 @@ mod tests {
         }));
         assert_eq!(app.cwd, "/repo");
         assert_eq!(app.branch, None);
+    }
+
+    /// Interrupted before the model said anything, the turn is in neither
+    /// history nor the session file — so the transcript drops what it echoed
+    /// and the text comes back to be fixed.
+    #[test]
+    fn a_returned_input_undoes_its_echo_and_refills_the_composer() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "teh quick brown fox");
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit("teh quick brown fox".into())
+        );
+        assert_eq!(app.cells, vec![Cell::User("teh quick brown fox".into())]);
+
+        app.apply(AgentEvent::InputReturned {
+            text: "teh quick brown fox".into(),
+            images: Vec::new(),
+        });
+
+        assert!(app.cells.is_empty(), "the turn left no transcript behind");
+        assert_eq!(app.composer.text(), "teh quick brown fox");
+    }
+
+    /// The gap between the interrupt and the worker handing the input back is
+    /// long enough to start typing in. A new draft wins — splicing the old text
+    /// into it would be worse than losing it.
+    #[test]
+    fn a_returned_input_leaves_a_started_draft_alone() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "first try");
+        app.on_key(80, key(KeyCode::Enter));
+        type_str(&mut app, "second try");
+
+        app.apply(AgentEvent::InputReturned {
+            text: "first try".into(),
+            images: Vec::new(),
+        });
+
+        assert_eq!(app.composer.text(), "second try");
+        assert_eq!(app.cells, vec![Cell::User("first try".into())]);
+    }
+
+    /// Only the echo is dropped, and only when the tail still *is* the echo.
+    /// Anything the turn managed to print after it means the transcript is not
+    /// ours to rewrite.
+    #[test]
+    fn a_returned_input_keeps_an_echo_something_else_landed_on() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "a question");
+        app.on_key(80, key(KeyCode::Enter));
+        app.apply(AgentEvent::System("provider: switched".into()));
+
+        app.apply(AgentEvent::InputReturned {
+            text: "a question".into(),
+            images: Vec::new(),
+        });
+
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::User("a question".into()),
+                Cell::System("provider: switched".into()),
+            ]
+        );
+        assert_eq!(app.composer.text(), "a question");
     }
 }

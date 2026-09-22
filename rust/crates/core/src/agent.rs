@@ -168,6 +168,41 @@ pub async fn run_turn(
     .await
 }
 
+/// Run a turn on `input` — the message the user just sent — staging it instead
+/// of recording it. A turn the user interrupts before the model has produced
+/// anything never happened: `items` and the session file are left exactly as
+/// they were, no terminal line is written, and the input comes back as
+/// `Some(message)` for the front-end to put in front of the user again. That is
+/// what makes "I mistyped, esc" leave nothing behind to answer later.
+///
+/// Anything else — the model said a word, a tool ran, the provider failed, a
+/// hook blocked the turn — records the input on its way, and the second element
+/// is `None`.
+pub async fn run_turn_with_input(
+    cfg: &Arc<Config>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+    cancel: &CancellationToken,
+    depth: u8,
+    input: Message,
+) -> (TurnOutcome, Option<Message>) {
+    history.stage(input);
+    let outcome = run_turn_with_options(
+        cfg,
+        history,
+        ui,
+        cancel,
+        depth,
+        TurnOptions::default(),
+        None,
+    )
+    .await;
+    // The input is the first thing staged, so it is the first thing back. Hook
+    // context staged behind it is discarded with the turn that asked for it.
+    let returned = history.take_staged().into_iter().next();
+    (outcome, returned)
+}
+
 pub(crate) async fn run_turn_in_execution(
     cfg: &Arc<Config>,
     history: &mut History,
@@ -252,7 +287,10 @@ async fn run_turn_with_options(
         }
         crate::hooks::HookDecision::Allow { context } => {
             for text in context {
-                history.record(Message::user_text(text));
+                // Staged behind the turn's input, not recorded: context for a
+                // turn that never runs is context for nothing, and recording it
+                // here would also commit the input this turn may yet give back.
+                history.stage(Message::user_text(text));
             }
         }
     }
@@ -282,6 +320,18 @@ async fn run_turn_with_options(
             )
             .await
     };
+    // A turn the user interrupted before the model produced anything is a turn
+    // that did not happen. Its input is still staged — nothing has been written
+    // all turn, because every write commits the stage first — so the session
+    // file has no record of it, and writing a terminal (or the stop hook's
+    // context) here would both commit that input and leave an `aborted` line
+    // standing for a turn with no content. Two interrupts stay on the recorded
+    // path: an `Error` is worth keeping ("this one failed" is history), and an
+    // interrupt with steering queued behind it must keep the message that
+    // steering answers.
+    if outcome.reason == EndReason::Aborted && history.has_staged() && cfg.inbox.is_empty() {
+        return outcome;
+    }
     for text in stop_context {
         history.record(Message::user_text(text));
     }
@@ -627,8 +677,18 @@ impl Turn<'_> {
         match sampled {
             Sampled::Ok(ok) => Ok(ok),
             Sampled::Overflow => Err(self.recover_from_overflow(round).await),
-            Sampled::Cancelled { partial } => {
+            Sampled::Cancelled {
+                partial,
+                produced_nothing,
+            } => {
                 let final_text = text_content(&partial);
+                if !produced_nothing {
+                    // The round produced something even if none of it is
+                    // replayable, so the turn happened and this turn's input
+                    // belongs in the conversation. `record_provider_assistant`
+                    // below cannot do it: an empty partial records nothing.
+                    self.history.commit_staged();
+                }
                 record_provider_assistant(self.history, &self.active_attempt, partial);
                 Err(RoundStep::Stop(Ending {
                     reason: EndReason::Aborted,
@@ -659,6 +719,12 @@ impl Turn<'_> {
         outcome: &AssistantOutcome,
         round: usize,
     ) -> Result<(), Ending> {
+        // The round was accepted, so the turn is real and this turn's input
+        // joins the conversation ahead of everything the round produced — the
+        // usage line included, which records no place in the transcript and so
+        // commits nothing itself. Explicit because an accepted round can have
+        // nothing to record: an empty `blocks` appends no assistant message.
+        self.history.commit_staged();
         if let Err(error) = validate_assistant_result(outcome, blocks) {
             return Err(Ending {
                 reason: EndReason::Error(error.into()),

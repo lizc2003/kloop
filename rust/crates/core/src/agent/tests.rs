@@ -3977,3 +3977,309 @@ async fn subagent_does_not_drain_parent_steering() {
         "the parent delivers its own steer at its next boundary"
     );
 }
+
+/// A turn the user takes back before the model has produced anything.
+///
+/// The five tests below draw one line: "the model produced nothing" is the only
+/// thing that makes a turn retractable, and it is measured on the stream, not
+/// on what survives into history.
+mod a_turn_that_never_happened {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// Cancels the turn the first time the model streams anything at all. The
+    /// round has then produced output the user saw, whether or not any of it is
+    /// replayable.
+    struct CancelOnFirstDelta {
+        cancel: CancellationToken,
+        fired: AtomicBool,
+    }
+    impl Ui for CancelOnFirstDelta {
+        fn emit(&self, event: &Event) {
+            if matches!(event, Event::ItemDelta { .. }) && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                self.cancel.cancel();
+            }
+        }
+    }
+
+    fn session_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kloop-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// [`mock_assistant`] with the origin boundary spelled out: these turns
+    /// write to a real session file, so the boundary counts its lines.
+    fn assistant_at(boundary: u64, content: Vec<ContentBlock>) -> Message {
+        Message::assistant_from_provider(
+            content,
+            ProviderResponseProvenance {
+                route_revision: 1,
+                origin_boundary: boundary,
+                provider_id: "test".into(),
+                api_family: ProviderApiFamily::Mock,
+                endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
+                model: "mock".into(),
+            },
+        )
+    }
+
+    fn line_kinds(session: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(session)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The subject: interrupted before the first token, the turn is in neither
+    /// history nor the session file, and the input comes back to be retyped.
+    #[tokio::test]
+    async fn an_interrupt_before_the_first_token_leaves_no_trace() {
+        let dir = session_dir("vanish");
+        let session = dir.join("session.jsonl");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (provider, seen) = Provider::mock_recording(vec![MockTurn::Gate {
+            started: started_tx,
+            release: release_rx,
+            blocks: text("too late"),
+        }]);
+        let cfg = compaction_cfg(provider, 200_000, "vanish");
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let session_path = session.clone();
+        let handle = tokio::spawn(async move {
+            let ui: Arc<dyn Ui> = Arc::new(NullUi);
+            let mut history = History::new(cfg.offload_dir.clone());
+            history.attach_rollout(crate::rollout::Rollout::new(session_path));
+            let (outcome, returned) = run_turn_with_input(
+                &cfg,
+                &mut history,
+                &ui,
+                &child_cancel,
+                0,
+                Message::user_text("teh quick brown fox"),
+            )
+            .await;
+            (outcome, returned, history)
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("sampling did not start")
+            .expect("sampling gate dropped");
+        cancel.cancel();
+        let (outcome, returned, history) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the turn ignored cancellation")
+            .expect("the turn panicked");
+        drop(release_tx);
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(returned, Some(Message::user_text("teh quick brown fox")));
+        assert_eq!(history.messages(), &[]);
+        // The request went out — it is the *conversation* that is untouched,
+        // not the wire — so the model did see what it was asked.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            seen.lock().unwrap()[0].messages,
+            vec![Message::user_text("teh quick brown fox")]
+        );
+        // Only the opening route line: no message, and no `aborted` terminal
+        // for a turn that has nothing to stand for.
+        assert_eq!(line_kinds(&session), vec!["provider_route_initial"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One word from the model and the turn is real: both sides of it are kept,
+    /// and the terminal line says how it ended.
+    #[tokio::test]
+    async fn an_interrupt_after_the_model_speaks_keeps_the_turn() {
+        let dir = session_dir("spoke");
+        let session = dir.join("session.jsonl");
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![MockTurn::DeltasThenGate {
+            release: release_rx,
+            deltas: text("half an ans"),
+        }]);
+        let cfg = compaction_cfg(provider, 200_000, "spoke");
+        let cancel = CancellationToken::new();
+        let ui: Arc<dyn Ui> = Arc::new(CancelOnFirstDelta {
+            cancel: cancel.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+
+        let (outcome, returned) = run_turn_with_input(
+            &cfg,
+            &mut history,
+            &ui,
+            &cancel,
+            0,
+            Message::user_text("a real question"),
+        )
+        .await;
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(returned, None);
+        assert_eq!(
+            history.messages(),
+            &[
+                Message::user_text("a real question"),
+                assistant_at(
+                    3,
+                    vec![ContentBlock::Text {
+                        text: "half an ans".into()
+                    }]
+                ),
+            ]
+        );
+        assert_eq!(
+            line_kinds(&session),
+            vec![
+                "provider_route_initial",
+                "message",
+                "message",
+                "turn_terminal"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The distinction the whole feature turns on: unsigned reasoning is
+    /// dropped on the way into history, so nothing is recorded for the round —
+    /// but the user watched it think, and that is not "nothing happened". The
+    /// input stays.
+    #[tokio::test]
+    async fn an_interrupt_after_visible_reasoning_keeps_the_input() {
+        let dir = session_dir("pondered");
+        let session = dir.join("session.jsonl");
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![MockTurn::DeltasThenGate {
+            release: release_rx,
+            deltas: vec![AssistantBlock::Thinking {
+                thinking: "let me work through this".into(),
+                signature: String::new(),
+            }],
+        }]);
+        let cfg = compaction_cfg(provider, 200_000, "pondered");
+        let cancel = CancellationToken::new();
+        let ui: Arc<dyn Ui> = Arc::new(CancelOnFirstDelta {
+            cancel: cancel.clone(),
+            fired: AtomicBool::new(false),
+        });
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+
+        let (outcome, returned) = run_turn_with_input(
+            &cfg,
+            &mut history,
+            &ui,
+            &cancel,
+            0,
+            Message::user_text("think about it"),
+        )
+        .await;
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(returned, None);
+        // The reasoning itself is unreplayable and gone; the question it was
+        // answering is not.
+        assert_eq!(
+            history.messages(),
+            &[Message::user_text("think about it")],
+            "unsigned reasoning records nothing, but the turn still happened"
+        );
+        assert_eq!(
+            line_kinds(&session),
+            vec!["provider_route_initial", "message", "turn_terminal"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Only an interrupt retracts a turn. A failure is worth keeping: "I asked
+    /// this and it broke" is history, and the transcript would otherwise show
+    /// an error with nothing in front of it.
+    #[tokio::test]
+    async fn a_provider_failure_keeps_the_input_it_failed_on() {
+        let provider = Provider::mock_scripted(vec![MockTurn::Failure(ProviderFailure::protocol(
+            "malformed frame",
+        ))]);
+        let cfg = compaction_cfg(provider, 200_000, "failed");
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = History::new(cfg.offload_dir.clone());
+
+        let (outcome, returned) = run_turn_with_input(
+            &cfg,
+            &mut history,
+            &ui,
+            &CancellationToken::new(),
+            0,
+            Message::user_text("a question that breaks"),
+        )
+        .await;
+
+        assert!(matches!(outcome.reason, EndReason::Error(_)));
+        assert_eq!(returned, None);
+        assert_eq!(
+            history.messages(),
+            &[Message::user_text("a question that breaks")]
+        );
+    }
+
+    /// Steering typed during the turn answers the message being steered. Taking
+    /// that message back would leave the steer pointing at nothing, so an
+    /// interrupt with a queue behind it keeps the turn.
+    #[tokio::test]
+    async fn an_interrupt_with_steering_queued_keeps_the_input() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![MockTurn::Gate {
+            started: started_tx,
+            release: release_rx,
+            blocks: text("too late"),
+        }]);
+        let cfg = compaction_cfg(provider, 200_000, "steered");
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let inbox = Arc::clone(&cfg.inbox);
+        let handle = tokio::spawn(async move {
+            let ui: Arc<dyn Ui> = Arc::new(NullUi);
+            let mut history = History::new(cfg.offload_dir.clone());
+            let (outcome, returned) = run_turn_with_input(
+                &cfg,
+                &mut history,
+                &ui,
+                &child_cancel,
+                0,
+                Message::user_text("do the thing"),
+            )
+            .await;
+            (outcome, returned, history)
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("sampling did not start")
+            .expect("sampling gate dropped");
+        inbox.push(InboxItem::Steer("actually, the other thing".into()));
+        cancel.cancel();
+        let (outcome, returned, history) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the turn ignored cancellation")
+            .expect("the turn panicked");
+        drop(release_tx);
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(returned, None);
+        assert_eq!(history.messages(), &[Message::user_text("do the thing")]);
+    }
+}

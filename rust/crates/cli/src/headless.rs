@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use kloop_core::Config;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agent::run_turn;
+use kloop_core::agent::run_turn_with_input;
 use kloop_core::event::Event;
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
@@ -159,8 +159,9 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
     } else {
         Message::user_with_blocks(prompt, pending_images)
     };
-    history.record(msg);
-
+    // Staged, not recorded: interrupted before the model produces anything, the
+    // prompt leaves no trace in the session file. Nothing to hand back here —
+    // headless has one prompt and no one to give it to.
     if json {
         let ui = Arc::new(JsonUi {
             thread_id: session_id,
@@ -171,7 +172,8 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             kloop_server::turn_started_params(HEADLESS_TURN_ID),
         );
         let dyn_ui: Arc<dyn Ui> = ui.clone();
-        let outcome = run_turn(&cfg, &mut history, &dyn_ui, &cancel, 0).await;
+        let (outcome, _returned) =
+            run_turn_with_input(&cfg, &mut history, &dyn_ui, &cancel, 0, msg).await;
         // Report the post-turn context size, then close the bracket (server parity).
         ui.emit(&Event::Usage(history.estimated_tokens()));
         ui.notify(
@@ -184,7 +186,8 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
         }
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
-        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+        let (outcome, _returned) =
+            run_turn_with_input(&cfg, &mut history, &ui, &cancel, 0, msg).await;
         if !outcome.final_text.is_empty()
             && let Ok(mut w) = out.lock()
         {

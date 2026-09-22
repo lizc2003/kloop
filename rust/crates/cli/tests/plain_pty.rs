@@ -65,11 +65,13 @@ async fn idle_ctrl_c_exits_once_without_advertising_ctrl_d() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn running_ctrl_c_patches_history_then_exits() -> Result<()> {
+async fn running_ctrl_c_before_any_output_discards_the_turn() -> Result<()> {
     let _guard = PTY_TEST_LOCK.lock().await;
-    // Delay a valid response long enough that the turn is definitely active.
-    // Ctrl+C must cancel it, let run_turn append the interrupted repair, then
-    // leave cleanly without waiting for the delayed body.
+    // Delay a valid response long enough that the turn is definitely active but
+    // has produced nothing. Ctrl+C must cancel it and leave cleanly without
+    // waiting for the delayed body — and because not one token arrived, the
+    // turn never happened: the message is not recorded, so there is no history
+    // to patch and the plain REPL says as much.
     let fixture =
         ChatFixture::start_delayed(vec![sse_text("too late")], Duration::from_secs(30)).await;
     let mut harness = spawn(&fixture)?;
@@ -85,7 +87,7 @@ async fn running_ctrl_c_patches_history_then_exits() -> Result<()> {
     assert!(!harness.emergency_killed());
     assert!(contains_bytes(
         &harness.raw(),
-        b"[interrupted \xe2\x80\x94 history patched; exiting]"
+        "[interrupted before the model replied — that message was not recorded]".as_bytes()
     ));
     Ok(())
 }

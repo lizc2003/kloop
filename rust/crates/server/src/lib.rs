@@ -48,6 +48,7 @@ use kloop_core::Config;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::agent::run_turn;
+use kloop_core::agent::run_turn_with_input;
 use kloop_core::commands;
 use kloop_core::event::Event;
 use kloop_core::history::History;
@@ -1954,10 +1955,18 @@ async fn run_turn_or_command(
     } else {
         Message::user_with_blocks(turn.text.clone(), turn.images.clone())
     };
-    history.record(msg);
     let dyn_ui: Arc<dyn Ui> = ui.clone();
-    let reason = run_turn(cfg, history, &dyn_ui, &turn.cancel, 0).await;
-    reason.reason
+    let (outcome, returned) =
+        run_turn_with_input(cfg, history, &dyn_ui, &turn.cancel, 0, msg).await;
+    if returned.is_some() {
+        // Interrupted before the model produced anything: the turn reached
+        // neither history nor the session file, so the thread snapshot must not
+        // keep its input either. The client still learns it aborted, from
+        // `turn/completed` like any other ending, and owns what it does with
+        // the text it sent.
+        ui.projection.discard_turn(turn.id);
+    }
+    outcome.reason
 }
 
 /// Per-thread `Ui` + `Approver`: events become thread-tagged notifications,

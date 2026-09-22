@@ -49,6 +49,13 @@ pub enum AgentEvent {
     /// UI loop opens the fork picker with them. Empty means nothing to rewind
     /// to, surfaced as a System note instead.
     ForkPoints(Vec<ForkPoint>),
+    /// The turn was interrupted before the model produced anything, so it never
+    /// entered history or the session file. The transcript drops the cells it
+    /// echoed and the composer gets the input back to be edited and resent.
+    InputReturned {
+        text: String,
+        images: Vec<(String, kloop_protocol::ContentBlock)>,
+    },
     /// A rewind completed: History now holds this forked branch, so the loop
     /// rebuilds the transcript from `messages` and adopts the new `session_id`.
     Forked {
