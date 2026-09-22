@@ -3974,8 +3974,15 @@ crates/server/      kloop-server — native agent protocol frontend (JSON-RPC 2.
   src/lib.rs        serve loop, handshake, per-thread workers, approval routing
 
 crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAuth (protocol + reqwest)
-  src/lib.rs        newline-delimited JSON-RPC over child stdio: handshake,
-                    tools/list pagination, tools/call, content rendering
+  src/lib.rs        wire types, the Transport trait, and McpClient: handshake,
+                    tools/list + resources pagination, tools/call validation
+  src/stdio.rs      newline-delimited JSON-RPC over a child's stdio: reader
+                    task, responses routed to pending requests by id
+  src/http.rs       streamable HTTP transport: one POST per request,
+                    Mcp-Session-Id sessions, re-handshake on 404
+  src/sse.rs        incremental text/event-stream frame parser
+  src/oauth.rs      OAuth 2.1 — PKCE, discovery, registration, token refresh
+  src/render.rs     MCP content array → tool_result text / ContentBlocks
 
 crates/web/         kloop-web — web_fetch/web_search network operations (owns reqwest)
   src/lib.rs        fetch/search operation API + configured backend discovery

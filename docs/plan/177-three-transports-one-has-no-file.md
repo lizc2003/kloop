@@ -52,3 +52,36 @@ content 数组渲染给人看/转成 `ContentBlock`。
 - `mcp/src/lib.rs` 降到 ≈480
   (低于阈值的行会被摘掉),这一步要写进提交信息。
 - crate 的 `pub` 符号表一个不少不多。
+
+## ✅ 完成(2026-09-22)
+
+一次提交(SHA 即本条所在提交),`make check`(fmt + clippy -D warnings + 全量测试)全绿,
+`crates/mcp/tests/client.rs` 的 14 条集成测试一行没改、全过。
+
+**切完的落点**(第二节的三块,行数与预估基本吻合):
+
+| 文件 | code 行 | 是什么 |
+|---|---|---|
+| `lib.rs` | 884 → **481** | 线类型与错误 + `Transport` trait + `McpClient`(握手、分页、tools/call 校验) |
+| `stdio.rs` | — → **434** | stdio 传输本体,连同它的 `#[cfg(test)] mod wire_tests` |
+| `render.rs` | — → **90** | content 数组 → tool_result 文本 / `ContentBlock` |
+
+`Pending` / `SharedWriter` 跟着 stdio 走;`mod stdio;` / `mod render;` 都是私有 mod,
+`render_result` 与 `content_blocks` 用 `pub use` 原样再导出——对外符号表前后逐条核对过,
+**一个不少不多**(`http.rs` 测试里的 `crate::render_result` 也因此一个字没改)。
+
+**第三节四个坑的实际答案**:
+
+1. `wire_tests` 确实跟着搬(它现在叫 `stdio::wire_tests`)。它 `use super::X` 够到的
+   `McpTransportFailure` / `McpTransportState` 这些,现在是 `stdio.rs` 顶上的 `use crate::X`
+   ——私有 `use` 对子模块可见,所以一行没改。
+2. 集成测试一行没改,全绿。
+3. `supported_image_mime` 在 CLI 那份**没动**,按 plan 记一笔:跨 crate 去重等 184 之后另算。
+4. **可见性只提了三个符号**:`StdioTransport` 与它的 `spawn` / `over` 提到 `pub(crate)`
+   ——因为调用方 `McpClient` 在父模块。`publish_transport_state` / `fail_pending` /
+   `write_line` / `read_bounded_line` 确认只有 stdio 用,全部保持模块私有;反方向
+   (stdio 够根上的 `MAX_WIRE_MESSAGE_BYTES`、`Transport`、`McpTransportHealth::healthy` 等
+   七八个私有项)**一个都不用提**——见教训 165。
+
+**第四节第二条已失效**:体积棘轮(`architecture-baseline.toml` + 门禁)已于 2026-09-21
+整体删除,没有"低于阈值的行会被摘掉"这回事了,提交信息里只写降到了多少。
