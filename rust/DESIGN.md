@@ -4000,8 +4000,13 @@ crates/cli/         kloop — the binary
                     session selection (--continue, --resume, --list-sessions
                     [--all])
   src/user_config.rs one global TOML read and strict root schema
-  src/private_store.rs descriptor/handle-relative private I/O, atomic replace,
-                    directory durability, reparse/symlink rejection, file locks
+  src/private_store.rs private I/O: atomic replace, directory durability,
+                    reparse/symlink rejection, file locks. This file holds only
+                    the four exported symbols and the checks every platform
+                    shares; the OS lives entirely in the three files below
+  src/private_store/unix.rs openat/NOFOLLOW below a directory descriptor
+  src/private_store/windows.rs NtCreateFile + OBJ_DONT_REPARSE below a handle
+  src/private_store/fallback.rs path-based walk; locking refused outright
   src/project_store.rs per-ProjectId allow-only policy schema and RMW
   src/startup.rs    typed runtime policy + frozen ShellPrograms snapshot and
                     cwd-bound Project/Session/Workspace wiring
