@@ -476,11 +476,11 @@ impl PtyHarness {
         // Workspace trust (plan 193) is answered on a TTY before a front-end
         // boots, and every scenario here is about what happens after boot — so
         // the sandbox starts out already trusted, the way a returning session
-        // does. The id comes from the real resolver rather than a second copy
-        // of the hashing rule.
-        if let Some(project_id) =
-            kloop_core::project::WorkspaceIdentity::resolve(&workspace).project_id()
-        {
+        // does: its partition directory exists, holding the label a first run
+        // would have written. The id comes from the real resolver rather than a
+        // second copy of the hashing rule.
+        let identity = kloop_core::project::WorkspaceIdentity::resolve(&workspace);
+        if let Some(project_id) = identity.project_id() {
             let mut project = kloop_home.clone();
             for component in ["projects", "v1", project_id.as_str()] {
                 project.push(component);
@@ -493,20 +493,20 @@ impl PtyHarness {
                         .with_context(|| format!("chmod {}", project.display()))?;
                 }
             }
-            let trust = project.join("trust.json");
-            std::fs::write(
-                &trust,
-                format!(
-                    "{{\n  \"version\": 1,\n  \"project_id\": \"{project_id}\",\n  \
-                     \"granted_at\": \"2026-09-22T00:00:00Z\"\n}}\n"
-                ),
-            )
-            .context("write PTY trust.json")?;
+            let label = project.join("project.json");
+            let mut body = serde_json::json!({
+                "version": 1,
+                "project_id": project_id.as_str(),
+                "anchor": identity.partition_anchor().to_string_lossy(),
+            })
+            .to_string();
+            body.push('\n');
+            std::fs::write(&label, body).context("write PTY project.json")?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&trust, std::fs::Permissions::from_mode(0o600))
-                    .context("chmod PTY trust.json")?;
+                std::fs::set_permissions(&label, std::fs::Permissions::from_mode(0o600))
+                    .context("chmod PTY project.json")?;
             }
         }
         let redactions = Arc::new(redaction_table(base_url, sandbox.path(), &root));

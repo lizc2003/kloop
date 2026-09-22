@@ -24,7 +24,10 @@ const PROJECTS: &str = "projects";
 const LAYOUT_VERSION: &str = "v1";
 const SESSIONS: &str = "sessions";
 const OFFLOAD: &str = "offload";
-const PROJECT_META: &str = "project.json";
+/// The partition's label file. The CLI's project store writes it too — adding
+/// the record of a trust grant — so its shape lives here, in
+/// [`project_label_bytes`], rather than being spelled twice.
+pub const PROJECT_LABEL: &str = "project.json";
 
 /// One project's session storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,7 +104,7 @@ impl SessionStore {
                 let partition = identity.session_partition();
                 let dir = partition_dir(root, &partition);
                 create_private_dir_all(&dir)?;
-                write_project_meta(&dir, &partition, identity.partition_anchor())?;
+                write_project_label(&dir, &partition, identity.partition_anchor())?;
                 dirs_under(&dir)
             }
         };
@@ -188,27 +191,50 @@ fn create_private_dir_all(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The bytes of one partition's label: the single definition of that file's
+/// shape, shared with the CLI store that adds the trust grant to it.
+///
+/// `granted_at` is absent when nobody was asked — a project this machine's
+/// owner only ever ran `--headless` in is labelled, not granted.
+pub fn project_label_bytes(
+    project_id: &ProjectId,
+    anchor: &Path,
+    granted_at: Option<&str>,
+) -> Vec<u8> {
+    let mut label = serde_json::json!({
+        "version": 1,
+        "project_id": project_id.as_str(),
+        "anchor": anchor.to_string_lossy(),
+    });
+    if let Some(granted_at) = granted_at {
+        label["granted_at"] = serde_json::Value::String(granted_at.to_string());
+    }
+    format!("{label}\n").into_bytes()
+}
+
 /// Label the partition with the path it was named after, so a cross-project
-/// listing can print real directories instead of digests. Rewritten only when
-/// it would change, so an ordinary start does not churn the file.
-fn write_project_meta(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io::Result<()> {
-    let path = dir.join(PROJECT_META);
-    let body = format!(
-        "{}\n",
-        serde_json::json!({
-            "version": 1,
-            "project_id": project_id.as_str(),
-            "anchor": anchor.to_string_lossy(),
+/// listing can print real directories instead of digests.
+///
+/// Written once. A file that already names this project is left byte for byte
+/// as it is, which is what lets the CLI record a trust grant in the same file
+/// without this write erasing it; the anchor cannot go stale, because it is the
+/// hash input the `ProjectId` was derived from. A label that is absent,
+/// unreadable, or names a different project is replaced, so a damaged one
+/// repairs itself instead of staying wrong forever.
+fn write_project_label(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io::Result<()> {
+    let path = dir.join(PROJECT_LABEL);
+    if let Ok(existing) = std::fs::read_to_string(&path)
+        && serde_json::from_str::<serde_json::Value>(&existing).is_ok_and(|value| {
+            value.get("project_id").and_then(serde_json::Value::as_str) == Some(project_id.as_str())
         })
-    );
-    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == body) {
+    {
         return Ok(());
     }
-    std::fs::write(&path, body)
+    std::fs::write(&path, project_label_bytes(project_id, anchor, None))
 }
 
 fn read_project_anchor(dir: &Path) -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(dir.join(PROJECT_META)).ok()?;
+    let raw = std::fs::read_to_string(dir.join(PROJECT_LABEL)).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("anchor")
@@ -359,6 +385,68 @@ mod tests {
         let dirs: Vec<SessionDirs> = buckets.into_iter().map(|b| b.dirs).collect();
         assert!(dirs.contains(&repo_dirs));
         assert!(dirs.contains(&plain_dirs));
+    }
+
+    /// The merge's load-bearing property: the CLI writes a trust grant into
+    /// this same file, and an ordinary start must not erase it. A label that
+    /// already names this project is left byte for byte alone.
+    #[test]
+    fn a_label_that_already_names_the_project_is_left_alone() {
+        let repo = init_repository("label-kept");
+        let root = temp_dir("label-kept-root");
+        let store = SessionStore::global(root);
+        let dirs = store.ensure(&repo).unwrap();
+        let partition = dirs.sessions.parent().unwrap().to_path_buf();
+        let identity = WorkspaceIdentity::resolve(&repo);
+        let granted = project_label_bytes(
+            &identity.session_partition(),
+            identity.partition_anchor(),
+            Some("2026-09-22T07:46:15Z"),
+        );
+        std::fs::write(partition.join(PROJECT_LABEL), &granted).unwrap();
+
+        store.ensure(&repo).unwrap();
+
+        assert_eq!(
+            std::fs::read(partition.join(PROJECT_LABEL)).unwrap(),
+            granted
+        );
+    }
+
+    /// Self-healing survives that: a label naming another project, or one that
+    /// is not JSON at all, is rewritten instead of staying wrong forever.
+    #[test]
+    fn a_foreign_or_unreadable_label_is_repaired() {
+        let repo = init_repository("label-repair");
+        let root = temp_dir("label-repair-root");
+        let store = SessionStore::global(root);
+        let dirs = store.ensure(&repo).unwrap();
+        let partition = dirs.sessions.parent().unwrap().to_path_buf();
+        let identity = WorkspaceIdentity::resolve(&repo);
+        let expected = project_label_bytes(
+            &identity.session_partition(),
+            identity.partition_anchor(),
+            None,
+        );
+
+        for damaged in [
+            String::new(),
+            "{".to_string(),
+            serde_json::json!({"version": 1, "project_id": "p1_elsewhere", "anchor": "/elsewhere"})
+                .to_string(),
+        ] {
+            std::fs::write(partition.join(PROJECT_LABEL), &damaged).unwrap();
+            store.ensure(&repo).unwrap();
+            assert_eq!(
+                std::fs::read(partition.join(PROJECT_LABEL)).unwrap(),
+                expected,
+                "damaged label {damaged:?}"
+            );
+        }
+        assert_eq!(
+            read_project_anchor(&partition),
+            Some(identity.partition_anchor().to_path_buf())
+        );
     }
 
     #[test]

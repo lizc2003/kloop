@@ -1,7 +1,9 @@
 //! User-private, project-scoped durable state: the allow rules a human
 //! granted for this project, and whether this project is trusted at all
-//! (plan 193). The two live in separate files under the same private
-//! directory: trust is not a rule, it is whether the rules get to start.
+//! (plan 193). Trust is not a rule — it is whether the rules get to start — so
+//! it is not a row in the rule table. It is a note on the partition's own
+//! label file (`project.json`), written once, at the moment the directory is
+//! created; the decision itself is that directory existing.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -21,6 +23,8 @@ use kloop_core::permissions::ProjectPermissionWriter;
 use kloop_core::permissions::ProjectPolicySnapshot;
 use kloop_core::permissions::ProjectPolicyStoreError;
 use kloop_core::project::ProjectId;
+use kloop_core::session_store::PROJECT_LABEL;
+use kloop_core::session_store::project_label_bytes;
 
 use crate::private_store::PrivateDir;
 
@@ -29,9 +33,7 @@ const VERSION: &str = "v1";
 const POLICY_FILE: &str = "permissions.json";
 const LOCK_FILE: &str = "permissions.lock";
 const POLICY_LABEL: &str = "project permission policy";
-const TRUST_FILE: &str = "trust.json";
-const TRUST_LOCK_FILE: &str = "trust.lock";
-const TRUST_LABEL: &str = "project trust";
+const LABEL_LABEL: &str = "project label";
 
 #[derive(Clone)]
 pub(crate) struct ProjectStore {
@@ -124,27 +126,30 @@ impl ProjectStore {
     /// Whether this project is one kloop has state for. The directory under
     /// the private state root is the whole answer: nothing but kloop creates
     /// it, so its existence means this machine's owner has already run here —
-    /// whether it holds a trust record, transcripts, or durable approvals.
+    /// whether it holds a grant record, transcripts, or durable approvals.
     /// That is also why the grant below writes a file at all: creating this
     /// directory is its job, the contents are for a human to read.
     pub(crate) fn trusted_blocking(&self, project_id: &ProjectId) -> bool {
         self.project_dir(project_id).is_dir()
     }
 
-    /// Record the human's "yes" — which creates the project directory. A
-    /// failure to persist is reported: the session still runs on the answer
-    /// just given, but the next one asks again.
-    pub(crate) fn grant_trust_blocking(&self, project_id: &ProjectId) -> Result<()> {
+    /// Record the human's "yes" — which creates the project directory and
+    /// writes the partition's label with the grant in it. A failure to persist
+    /// is reported: the session still runs on the answer just given, but the
+    /// next one asks again.
+    ///
+    /// No lock, because there is nothing to read back and modify: this runs
+    /// only when the directory is absent, so the file it writes is one no
+    /// other writer has touched, and two launches answering at once only
+    /// decide whose timestamp wins.
+    pub(crate) fn grant_trust_blocking(&self, project_id: &ProjectId, anchor: &Path) -> Result<()> {
         let dir = self.ensure_project(project_id)?;
-        let _lock = dir.open_lock(OsStr::new(TRUST_LOCK_FILE), TRUST_LABEL)?;
-        let file = TrustFile {
-            version: 1,
-            project_id: project_id.as_str().to_string(),
-            granted_at: kloop_core::context::utc_now_timestamp(),
-        };
-        let mut encoded = serde_json::to_vec_pretty(&file)?;
-        encoded.push(b'\n');
-        dir.write_atomic(OsStr::new(TRUST_FILE), TRUST_LABEL, &encoded)
+        let label = project_label_bytes(
+            project_id,
+            anchor,
+            Some(&kloop_core::context::utc_now_timestamp()),
+        );
+        dir.write_atomic(OsStr::new(PROJECT_LABEL), LABEL_LABEL, &label)
     }
 
     fn project_lock(&self, project_id: &ProjectId) -> Arc<tokio::sync::Mutex<()>> {
@@ -178,8 +183,8 @@ impl ProjectStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn trust_path(&self, project_id: &ProjectId) -> PathBuf {
-        self.project_dir(project_id).join(TRUST_FILE)
+    pub(crate) fn label_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.project_dir(project_id).join(PROJECT_LABEL)
     }
 
     fn project_dir(&self, project_id: &ProjectId) -> PathBuf {
@@ -205,18 +210,6 @@ impl ProjectPermissionWriter for ProjectStore {
     > {
         Box::pin(self.append(project_id, additions))
     }
-}
-
-/// The trust record — write-only: nothing reads it back, because the decision
-/// is the directory it lands in. It is what a human finds when they open that
-/// directory and wonder where the grant came from, so it says which project it
-/// belongs to and when the answer was given. Revoking is deleting the
-/// directory, not editing this.
-#[derive(Debug, Serialize)]
-struct TrustFile {
-    version: u32,
-    project_id: String,
-    granted_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -297,10 +290,11 @@ mod tests {
 
     /// The decision is the directory: absent before anything ran here, present
     /// once the grant lands, and equally present for a project that only ever
-    /// held transcripts or durable approvals. The record beside the rules is
-    /// what a human reads, and granting twice is idempotent.
+    /// held transcripts or durable approvals. The grant itself rides in the
+    /// partition's label — one file, no lock beside it, and the rules in
+    /// `permissions.json` untouched.
     #[test]
-    fn the_project_directory_is_the_answer_and_the_record_is_for_humans() {
+    fn the_project_directory_is_the_answer_and_the_label_carries_the_grant() {
         let (base, store, id) = fixture("trust");
         assert!(!store.trusted_blocking(&id), "nothing has run here");
         assert!(
@@ -308,17 +302,20 @@ mod tests {
             "asking must not create state"
         );
 
-        store.grant_trust_blocking(&id).unwrap();
+        store
+            .grant_trust_blocking(&id, Path::new("/work/here"))
+            .unwrap();
         assert!(store.trusted_blocking(&id));
         assert!(!store.policy_path(&id).exists(), "rules are untouched");
         let mut written: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(store.trust_path(&id)).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(store.label_path(&id)).unwrap()).unwrap();
         let granted_at = written["granted_at"].take();
         assert_eq!(
             written,
             serde_json::json!({
                 "version": 1,
                 "project_id": id.as_str(),
+                "anchor": "/work/here",
                 "granted_at": null,
             })
         );
@@ -326,8 +323,23 @@ mod tests {
         assert_eq!(granted_at.len(), 20, "{granted_at}");
         assert!(granted_at.ends_with('Z'), "{granted_at}");
 
-        store.grant_trust_blocking(&id).unwrap();
+        // The grant is one write, not a read-modify-write, so the partition
+        // holds that one file and no lock.
+        let names: Vec<String> = std::fs::read_dir(store.project_dir(&id))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [PROJECT_LABEL]);
+
+        // Answering the same question again is the same answer.
+        store
+            .grant_trust_blocking(&id, Path::new("/work/here"))
+            .unwrap();
         assert!(store.trusted_blocking(&id));
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(store.label_path(&id)).unwrap()).unwrap();
+        assert_eq!(again["project_id"], id.as_str());
+        assert!(again["granted_at"].is_string());
 
         // A project that predates the question — sessions but no record — is
         // answered for all the same, and one project says nothing about another.

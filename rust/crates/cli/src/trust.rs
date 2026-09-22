@@ -54,7 +54,7 @@ pub(crate) fn asks_for_trust(serve: bool, headless: bool, mock: bool, stdin_is_t
 }
 
 /// Ask unless this project is already answered for — which the project's own
-/// directory under the private state root answers, whether it holds a trust
+/// directory under the private state root answers, whether it holds a grant
 /// record, transcripts, or durable approvals (see `ProjectStore`). `false` means the human
 /// declined and the caller should exit without starting anything.
 pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> bool {
@@ -69,7 +69,7 @@ pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> b
         return false;
     }
     if let Some((project_id, store)) = project
-        && let Err(error) = store.grant_trust_blocking(project_id)
+        && let Err(error) = store.grant_trust_blocking(project_id, identity.partition_anchor())
     {
         eprintln!("\x1b[2m[trust was not saved ({error}); this directory will ask again]\x1b[0m");
     }
