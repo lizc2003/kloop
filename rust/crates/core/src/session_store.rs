@@ -12,6 +12,7 @@
 //! policy store rejects a partition any group or other can reach.
 
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -200,7 +201,7 @@ pub fn project_label_bytes(
     project_id: &ProjectId,
     anchor: &Path,
     granted_at: Option<&str>,
-) -> Vec<u8> {
+) -> io::Result<Vec<u8>> {
     let mut label = serde_json::json!({
         "version": 1,
         "project_id": project_id.as_str(),
@@ -209,28 +210,53 @@ pub fn project_label_bytes(
     if let Some(granted_at) = granted_at {
         label["granted_at"] = serde_json::Value::String(granted_at.to_string());
     }
-    format!("{label}\n").into_bytes()
+    // Pretty, like the rule table beside it: this is the one file in the
+    // partition a human is meant to open.
+    let mut encoded = serde_json::to_string_pretty(&label).map_err(io::Error::other)?;
+    encoded.push('\n');
+    Ok(encoded.into_bytes())
+}
+
+/// Whether a label on disk is still the one this writer owns: the identity and
+/// the anchor it names, and nothing more. `granted_at` is not this writer's to
+/// judge, which is what lets the CLI's grant ride in the same file.
+fn label_names(value: &serde_json::Value, project_id: &ProjectId, anchor: &Path) -> bool {
+    let project = value.get("project_id").and_then(serde_json::Value::as_str);
+    let named = value.get("anchor").and_then(serde_json::Value::as_str);
+    project == Some(project_id.as_str()) && named == Some(anchor.to_string_lossy().as_ref())
 }
 
 /// Label the partition with the path it was named after, so a cross-project
 /// listing can print real directories instead of digests.
 ///
-/// Written once. A file that already names this project is left byte for byte
-/// as it is, which is what lets the CLI record a trust grant in the same file
-/// without this write erasing it; the anchor cannot go stale, because it is the
-/// hash input the `ProjectId` was derived from. A label that is absent,
-/// unreadable, or names a different project is replaced, so a damaged one
-/// repairs itself instead of staying wrong forever.
+/// Written once: a label that already names this project *and* this anchor is
+/// left byte for byte as it is, which is what lets the CLI record a trust grant
+/// in the same file without this write erasing it. Anything else — absent,
+/// unreadable, another project, another anchor — is replaced, so a damaged
+/// label repairs itself instead of staying wrong forever. The anchor is in that
+/// list because it is the field a listing actually reads: a wrong one written
+/// once and never corrected would be the expensive kind.
 fn write_project_label(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io::Result<()> {
     let path = dir.join(PROJECT_LABEL);
     if let Ok(existing) = std::fs::read_to_string(&path)
-        && serde_json::from_str::<serde_json::Value>(&existing).is_ok_and(|value| {
-            value.get("project_id").and_then(serde_json::Value::as_str) == Some(project_id.as_str())
-        })
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing)
+        && label_names(&value, project_id, anchor)
     {
         return Ok(());
     }
-    std::fs::write(&path, project_label_bytes(project_id, anchor, None))
+    let bytes = project_label_bytes(project_id, anchor, None)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Owner-only, like everything else in this directory — and load-bearing
+    // rather than tidy: the CLI's project store opens the label through a
+    // reader that refuses a file any group or other can reach, so a
+    // world-readable label would make it reject the very grant it is writing.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(&path)?.write_all(&bytes)
 }
 
 fn read_project_anchor(dir: &Path) -> Option<PathBuf> {
@@ -329,12 +355,15 @@ mod tests {
         assert_eq!(store.dirs(Path::new("/somewhere/else")), dirs);
     }
 
-    /// The partition directory is shared with the durable permission store,
-    /// which refuses to open one that group or other can reach. Creating it
-    /// with the default mode would silently break project approvals.
+    /// The partition is shared with the durable permission store, which refuses
+    /// to open one that group or other can reach. Creating it with the default
+    /// mode would silently break project approvals. The label is a file inside
+    /// it, and the CLI's project store opens *that* through a reader with the
+    /// same rule before writing a grant into it — so a world-readable label
+    /// would make the grant fail, not just look untidy.
     #[cfg(unix)]
     #[test]
-    fn created_directories_are_owner_only() {
+    fn created_state_is_owner_only() {
         let repo = init_repository("mode");
         let root = temp_dir("mode-root");
         let dirs = SessionStore::global(root.clone()).ensure(&repo).unwrap();
@@ -348,6 +377,8 @@ mod tests {
         ] {
             assert_eq!(mode(&path), 0o700, "{}", path.display());
         }
+        let label = dirs.sessions.parent().unwrap().join(PROJECT_LABEL);
+        assert_eq!(mode(&label), 0o600, "{}", label.display());
     }
 
     /// The hermetic root is a real project's `.kloop/`, which also holds rules
@@ -402,7 +433,8 @@ mod tests {
             &identity.session_partition(),
             identity.partition_anchor(),
             Some("2026-09-22T07:46:15Z"),
-        );
+        )
+        .unwrap();
         std::fs::write(partition.join(PROJECT_LABEL), &granted).unwrap();
 
         store.ensure(&repo).unwrap();
@@ -413,8 +445,10 @@ mod tests {
         );
     }
 
-    /// Self-healing survives that: a label naming another project, or one that
-    /// is not JSON at all, is rewritten instead of staying wrong forever.
+    /// Self-healing survives that: a label naming another project, one naming
+    /// the wrong anchor for this project, or one that is not JSON at all, is
+    /// rewritten instead of staying wrong forever. The wrong anchor is the case
+    /// worth naming — it is the field a cross-project listing prints.
     #[test]
     fn a_foreign_or_unreadable_label_is_repaired() {
         let repo = init_repository("label-repair");
@@ -423,17 +457,21 @@ mod tests {
         let dirs = store.ensure(&repo).unwrap();
         let partition = dirs.sessions.parent().unwrap().to_path_buf();
         let identity = WorkspaceIdentity::resolve(&repo);
-        let expected = project_label_bytes(
-            &identity.session_partition(),
-            identity.partition_anchor(),
-            None,
-        );
+        let project_id = identity.session_partition();
+        let expected = project_label_bytes(&project_id, identity.partition_anchor(), None).unwrap();
+        let elsewhere = project_label_bytes(
+            &project_id,
+            Path::new("/elsewhere"),
+            Some("2026-09-22T07:46:15Z"),
+        )
+        .unwrap();
 
         for damaged in [
             String::new(),
             "{".to_string(),
             serde_json::json!({"version": 1, "project_id": "p1_elsewhere", "anchor": "/elsewhere"})
                 .to_string(),
+            String::from_utf8(elsewhere).unwrap(),
         ] {
             std::fs::write(partition.join(PROJECT_LABEL), &damaged).unwrap();
             store.ensure(&repo).unwrap();

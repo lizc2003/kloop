@@ -301,9 +301,9 @@ directory (`crates/core/src/session_store.rs`):
 ```
 ~/.kloop/projects/v1/{project-id}/
     permissions.json      durable project approvals
-    project.json          the partition's label, written once:
-                          {"version":1,"project_id":…,"anchor":"/abs/path"}
-                          plus "granted_at" when a human answered yes here
+    project.json          the partition's label, written once and pretty:
+                          version, project_id, anchor — plus granted_at when
+                          a human answered yes here
     sessions/{id}.jsonl   transcripts, including `{parent}-{agent-N}` sub-agents
     offload/              off-NNNN.txt and background shell bg-N.out
     program-runs/         run_program artifacts (RunStore anchors on offload's
@@ -319,20 +319,24 @@ from the exact directory that wrote it. `project.json` labels the partition
 with the path it was named after, so cross-project listings print real
 directories rather than digests.
 
-That label is **written once and never rewritten**, and the anchor is why it
-can be: the `ProjectId` is a hash *of* the anchor, so while the id holds still
-the anchor cannot go stale. The rule is "leave a label that already names this
-project alone, byte for byte" — absent, unreadable, or naming another project
-is replaced, so a damaged one repairs itself. This is what lets the trust grant
-live in the same file as the label (see Workspace trust below) without either
-writer erasing the other, and it is why there is no lock beside it: a
-read-modify-write needs one, a single write of a file nobody reads back does
-not.
+That label is **written once and never rewritten while it still agrees with the
+project it names**, and the anchor is why that is safe: the `ProjectId` is a
+hash *of* the anchor, so the anchor a launch resolves is the same one an earlier
+launch wrote, and there is nothing to update. The rule is "leave a label that
+already names this project and this anchor alone, byte for byte" — absent,
+unreadable, another project, or another anchor is replaced, so a damaged label
+repairs itself. This is what lets the trust grant live in the same file as the
+label (see Workspace trust below) without either writer erasing the other, and
+it is why there is no lock beside it: a read-modify-write needs one, a single
+write whose one variable field no reader acts on does not.
 
 Consequences worth knowing:
 
 - the partition directory is shared with the permission store, which refuses to
-  open one that group or other can reach, so every level is created `0700`;
+  open one that group or other can reach, so every level is created `0700`; the
+  label file is `0600` for a sharper reason than tidiness — the CLI's grant
+  reads that file through the same permission check before writing into it, so a
+  world-readable label would make the grant fail;
 - `~/.kloop` is denied read and write inside the sandbox — it holds the provider
   credential and every project's transcript — **except** for spilled tool output
   (`offload/off-NNNN.txt`, `offload/bg-N.out`), which is carved back out as
@@ -625,13 +629,14 @@ question a one-time event instead of something every project predating it would
 meet, and it is why answering yes writes the partition's own label
 (`project.json`) with `granted_at` in it: creating the directory is the point,
 and the record is what a human finds later when they wonder where the grant
-came from. Nothing reads it back — the label is written once, and an ordinary
-start leaves a file that already names its project alone (plan 196), which is
-what lets the grant and the anchor share one file with no lock between them. A
-label without `granted_at` is a project nobody was ever asked about: a
-`--headless` or `--serve` run created it, and those are trusted by whoever
-launched them. Revoking is deleting the directory. Trust is not a rule, which
-is why it does not live in the rule table beside it.
+came from. No reader acts on that record — the anchor beside it is read back
+(for cross-project listings), the grant is not — and the label is written once,
+so an ordinary start leaves a file that already names its project alone (plan
+196). That is what lets the grant and the anchor share one file with no lock
+between them. A label without `granted_at` is a project nobody was ever asked
+about: a `--headless` or `--serve` run created it, and those are trusted by
+whoever launched them. Revoking is deleting the directory. Trust is not a rule,
+which is why it does not live in the rule table beside it.
 
 The question exists because kloop's *policy* surface is closed to the
 repository but its *instruction* surface is not. Permissions, hooks, MCP

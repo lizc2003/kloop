@@ -494,12 +494,12 @@ impl PtyHarness {
                 }
             }
             let label = project.join("project.json");
-            let mut body = serde_json::json!({
+            let mut body = serde_json::to_string_pretty(&serde_json::json!({
                 "version": 1,
                 "project_id": project_id.as_str(),
                 "anchor": identity.partition_anchor().to_string_lossy(),
-            })
-            .to_string();
+            }))
+            .context("encode PTY project.json")?;
             body.push('\n');
             std::fs::write(&label, body).context("write PTY project.json")?;
             #[cfg(unix)]

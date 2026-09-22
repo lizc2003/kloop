@@ -71,7 +71,15 @@ pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> b
     if let Some((project_id, store)) = project
         && let Err(error) = store.grant_trust_blocking(project_id, identity.partition_anchor())
     {
-        eprintln!("\x1b[2m[trust was not saved ({error}); this directory will ask again]\x1b[0m");
+        // The grant creates the directory before it writes the record, so the
+        // answer usually stands even when the record does not — only a failure
+        // that left no directory behind brings the question back.
+        let again = if store.trusted_blocking(project_id) {
+            ""
+        } else {
+            "; this directory will ask again"
+        };
+        eprintln!("\x1b[2m[the trust grant was not recorded ({error}){again}]\x1b[0m");
     }
     true
 }

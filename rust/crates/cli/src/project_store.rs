@@ -148,7 +148,7 @@ impl ProjectStore {
             project_id,
             anchor,
             Some(&kloop_core::context::utc_now_timestamp()),
-        );
+        )?;
         dir.write_atomic(OsStr::new(PROJECT_LABEL), LABEL_LABEL, &label)
     }
 
@@ -254,6 +254,9 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
+    use kloop_core::project::WorkspaceIdentity;
+    use kloop_core::session_store::SessionStore;
+
     use super::*;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -352,6 +355,75 @@ mod tests {
             "a different project"
         );
         let _ = std::fs::remove_dir_all(other_base);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The wiring, not just the shape: the anchor the CLI hands the store is the
+    /// one a cross-project listing reads back out of the label, and the
+    /// `ensure()` that follows the grant in the same launch leaves the grant in
+    /// place. A real repository is what makes this sharp — there the anchor is
+    /// the Git common directory, not the cwd, so passing the wrong one of the
+    /// two shows up as a listing that prints the wrong path.
+    #[test]
+    fn the_grant_writes_the_anchor_a_cross_project_listing_reads_back() {
+        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "kloop-project-store-wiring-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let identity = WorkspaceIdentity::resolve(&repo);
+        let project_id = identity.project_id().expect("a repository has an identity");
+        let root = base.join(".kloop");
+        let sessions = SessionStore::global(root.clone());
+        let store = ProjectStore::new(root);
+
+        // The interleaving a concurrent `--headless` or `--serve` run in the
+        // same repository produces: the session store creates the partition and
+        // its label first, and the grant then writes into a file it did not
+        // create. The CLI's private-store reader rejects a label any group or
+        // other can reach, so a label written world-readable would make this
+        // fail rather than merely look untidy.
+        sessions.ensure(&repo).unwrap();
+        store
+            .grant_trust_blocking(project_id, identity.partition_anchor())
+            .unwrap();
+
+        // And the reverse order, which is every ordinary interactive launch: the
+        // `ensure()` behind the grant must leave the grant in place.
+        sessions.ensure(&repo).unwrap();
+
+        let bucket = sessions
+            .buckets()
+            .into_iter()
+            .next()
+            .expect("one partition");
+        assert_eq!(bucket.anchor.as_deref(), Some(identity.partition_anchor()));
+        let label: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bucket.dirs.sessions.parent().unwrap().join(PROJECT_LABEL))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            label["granted_at"].is_string(),
+            "the launch after the grant erased it: {label}"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

@@ -76,8 +76,31 @@
 | 测试 | 锁住什么 |
 |---|---|
 | `project_store::tests::the_project_directory_is_the_answer_and_the_label_carries_the_grant` | 授权前不创建任何状态;授权后 `project.json` 整对象断言(含 anchor 与 granted_at);`permissions.json` 不受影响;**分区里只有这一个文件、没有 `.lock`**;重复授权仍是同一个答案 |
+| `project_store::tests::the_grant_writes_the_anchor_a_cross_project_listing_reads_back` | 真实接线与两种交错顺序:core 先建标签、grant 再写进去(0644 会红),以及 grant 之后那次 `ensure()` 不抹掉 `granted_at`;anchor 经 `buckets()` 读回来等于 `partition_anchor()`(传 cwd 会红) |
 | `session_store::tests::a_label_that_already_names_the_project_is_left_alone` | 合并的承重点:带 `granted_at` 的标签被随后的 `ensure()` 一字不改地留下 |
-| `session_store::tests::a_foreign_or_unreadable_label_is_repaired` | 自愈仍在:别人的 id / 不是 JSON / 空文件都会被重写成自己的标签 |
+| `session_store::tests::a_foreign_or_unreadable_label_is_repaired` | 自愈仍在:别人的 id / **别的 anchor** / 不是 JSON / 空文件都会被重写成自己的标签 |
+| `session_store::tests::created_state_is_owner_only` | 标签是 `0600`——不是整洁问题,CLI 的 grant 经同一个读路径打开它,0644 会让 grant 直接失败 |
 
 真二进制验过(见提交信息):临时 `$HOME` 下交互式起一次、答 yes,`projects/v1/<id>/` 里只有
-`project.json` 且含 `granted_at`;第二次启动不再问,且该文件的 `granted_at` 与首次逐字相同。
+`project.json`(0600)且含 `granted_at`;第二次启动不再问,且该文件的 `granted_at` 与首次逐字相同。
+
+## 六、复审后的修正(第二次提交)
+
+用户复审提了四条,逐条核过**全部成立**,一个 `fix(plan196)` 提交:
+
+1. **同一个文件两套模式,而其中一个写者拒绝非 0600。** core 用 `std::fs::write` 创建标签(0644),
+   CLI 的 grant 经 `PrivateDir::write_atomic` 写入,而那个写路径第一步就读回来做
+   `validate_private_permissions`——`mode & 0o077 != 0` 直接 bail。触发窗口正是"人盯着提示"的那段:
+   并发的 `--headless`/`--serve` 建好 0644 标签后,答 yes 会失败。改:`OpenOptions::mode(0o600)`。
+   这条用"先把测试弄红一次"验过——把 `0o600` 改回 `0o644`,新测试红在
+   `project label contains credentials; restrict it to mode 0600`。
+2. **anchor 失去了自愈。** 新规则只比 `project_id`,而 anchor 恰恰是 `buckets()` 唯一读的字段;
+   旧代码比整段 body,写错下次会被修回。改:跳过条件是 `project_id` **且** `anchor` 都相同
+   (`granted_at` 仍不在比较项里,承重点不受影响)。
+3. **DESIGN.md 自相矛盾。** 我写的"a single write of a file nobody reads back"与上一段的
+   `read_project_anchor` 冲突——准确说法是"没有任何读点拿 `granted_at` 做判断"。两处都改了。
+4. 标签改回 pretty:旧 `trust.json` 就是 `to_vec_pretty`,而这是分区里唯一给人看的文件。
+
+顺带:grant 的 anchor 接线补了测试(单测原本只喂编造的 `/work/here`);失败提示改成实话——
+`ensure_project` 已经把目录建出来了,所以只有"连目录都没建成"的失败才会再问,提示不再一律声称会再问。
+
