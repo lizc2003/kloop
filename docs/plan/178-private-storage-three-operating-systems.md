@@ -1,4 +1,6 @@
-# Plan 178 — 私有存储:一个文件里住着三套系统调用
+# Plan 178 ✅ — 私有存储:一个文件里住着三套系统调用
+
+> 已完成 2026-09-22,提交 `03e891f`。落地读数见文末「五、结果」。
 
 > 本批判据与统一纪律见 `HANDOFF.md` 第〇节。
 
@@ -55,3 +57,36 @@ facade 留在 `private_store.rs`,三套实现各自成文件:
   所以这条 plan 的提交必须等 CI 三平台绿了才算完(本批唯一有这个要求的两条之一,另一条是 179)。
 - facade 里 `#[cfg]` 归零。
 - `private_store.rs` 降到 ≈150。
+
+## 五、结果(2026-09-22,提交 `03e891f`)
+
+`private_store.rs` **1291 code → 78 code + 200 行测试**,三套实现各自成文件:
+`unix.rs` 342 / `windows.rs` 485 / `fallback.rs` 184。开工时文件已经比 plan 里
+记的 1088 涨到 1291(总行 1164 → 1398),切法不受影响。
+
+facade 里 `#[cfg]` 归零达成,只剩 `mod platform` 那三处声明——用
+`#[cfg(...)] #[path = "private_store/<os>.rs"] mod platform;`,和 `tools/fs.rs`
+的 `#[path]` 同形。为此多了两件 plan 没预见的事,都是"最后一个 cfg"逼出来的:
+
+- **`PrivateDir` 成了 `platform::Dir` 的 newtype**。它的字段本身是 cfg 的
+  (`file: File` / `path: PathBuf`),留在 facade 就留着 cfg。
+- **`validate_private_file` 里那段 `#[cfg(unix)]` 权限检查变成契约的一员**
+  `validate_private_permissions(&Metadata, &str)`,unix 查 0o077,另两家 `Ok(())`
+  并各带一句"为什么没得查"。共用的那半截(必须是普通文件)还在 facade。
+- 同理 `private_file_name` 在 `unix.rs`/`windows.rs` 各留一份:一个
+  `cfg(any(unix, windows))` 的 helper 在"不带 cfg 的 facade"里没有位置。
+
+**可见性一处都没提**:`validate_component` 等三个共用项在 facade 里仍是私有 `fn`——
+Rust 的私有项对后代模块可见,子模块 `use super::x` 直接够得到。反方向(facade 用
+platform 的东西)才需要 `pub(super)`。
+
+平台契约表(三个文件签名逐字相同):`read_private_string`、`write_private_atomic`、
+`validate_private_permissions`、`Dir{open,ensure,read_string,write_atomic,open_lock_file}`、
+`lock_file`、`unlock_file`。
+
+验证:`make check` + `make mock` 全绿。**windows/fallback 分支在本机也核过了**——
+整 crate 交叉编译走不通(`ring` 的 C 构建没有 windows target),但搭一个只含这四个
+文件的 scratch crate 就能 `cargo check/clippy --target x86_64-pc-windows-msvc` 和
+`--target wasm32-unknown-unknown`(既非 unix 也非 windows,正好走 fallback),两边
+零 error 零 warning;往两个文件里各塞一个故意的类型错误,确认这套 harness 先红。
+CI 三平台绿仍是这条的收工条件。

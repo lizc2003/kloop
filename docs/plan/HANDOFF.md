@@ -16,6 +16,9 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
   (原先还有一处是 `architecture-baseline.toml`,**体积棘轮已于 2026-09-21 整体删除**,
   见教训 172 的后记。)
 - **178 和 179 一个会话闭不了环**:windows 分支本机跑不到,提交后要等 CI 三平台绿才算完。
+  (**178 做完后这条松了一半**:整 crate 交叉编译确实走不通,但把目标模块单独提进一个
+  scratch crate 就能 `--target x86_64-pc-windows-msvc` 编过——见教训 166,179 照抄即可。
+  CI 三平台绿仍是收工条件,只是不再是**唯一**的反馈。)
 - **177 与 184 都会碰到 `supported_image_mime` 在两个 crate 各有一份**。两条 plan 都写了
   "记一笔、不合并"——**先做的那条不要顺手去重**,跨 crate 去重是两条都做完之后的另一件事。
   (**177 已做,wire crate 那份原样搬进 `render.rs`,没碰 CLI 那份**;去重的账等 184。)
@@ -35,7 +38,7 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 | plan | 文件(code 行)| 拆出什么 | 规模 |
 |---|---|---|---|
 | **177 ✅** 三个传输里,只有 stdio 没有自己的文件 | `mcp/src/lib.rs` 884 → **481** | `stdio.rs` 434 + `render.rs` 90 | 小,已做(2026-09-22) |
-| **178** 私有存储:一个文件里住着三套系统调用 | `cli/src/private_store.rs` 1088 | `private_store/{unix,windows,fallback}.rs` | 中 |
+| **178 ✅** 私有存储:一个文件里住着三套系统调用 | `cli/src/private_store.rs` 1291 → **78 + 测试** | `unix.rs` 342 + `windows.rs` 485 + `fallback.rs` 184 | 中,已做(2026-09-22) |
 | **179** 平台分支已经盖好半间房子了 | `core/src/tools/fs.rs` 1551 | `fs/{unix,fallback}.rs` + 扩充已有的 `fs/windows.rs` | 中 |
 | **180** 前台跑完就结束,后台要活一整个会话 | `core/src/tools/bash.rs` 958 | `bash/background.rs` | 中 |
 | **181** 一个 cron 解析器、一把文件锁、一个调度器 | `core/src/scheduler.rs` 1187 | `scheduler/{cron,store}.rs` | 中 |
@@ -45,7 +48,7 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 | **185** 二十二个方法排成一张表,表在一个 impl 里 | `server/src/lib.rs` 1910 | `{dto,params,worker,thread_ui}.rs` + `methods/{threads,query,turn}.rs` | 大 |
 | **186** 管线才是本体,另外四样只是邻居 | `core/src/permissions.rs` 1632 | `permissions/{rule,policy,facts,describe}.rs` | 大,**建议放最后** |
 
-顺序建议:177 ✅ → 178/179(同一个形状做两遍)→ 180/181/183 → 182/184/185 → 186。
+顺序建议:177 ✅ → 178 ✅/179(同一个形状做两遍)→ 180/181/183 → 182/184/185 → 186。
 177 最小,做完一次就知道这批的节奏对不对;186 语义风险最高,前面九条做完手感最好。
 
 **177 做完的节奏读数(2026-09-22)**:整条是纯搬运,`use` 之外的改动只有三处可见性
@@ -53,6 +56,15 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 落地时很好用:`stdio.rs` = 一个传输,`render.rs` = content 数组的两种呈现,lib.rs 剩下
 "线协议本身"。plan 文件里的行号在做的时候略有漂移(stdio 段实际到 957 不是 960),
 **按顶层项的边界切,不要按 plan 里的行号切**。
+
+**178 做完的节奏读数(2026-09-22)**:这条的验收里有一句"facade 里 `#[cfg]` 归零",
+它比"搬走三套实现"要求高——**最后一个 cfg 从来不在显眼处**。搬完三个平台文件之后
+facade 里还剩两个:一个藏在共用函数 `validate_private_file` 的**函数体内**
+(`#[cfg(unix)]` 的 0600 检查),一个挂在 helper 的**属性上**
+(`#[cfg(any(unix, windows))] fn private_file_name`)。前者变成契约的第七项
+`validate_private_permissions`,后者在两个平台文件各留一份。判据见教训 167。
+另外开工时文件已从 plan 记的 1088 code 涨到 1291——**plan 里的行数是当时的读数,
+开工先自己量一遍**,切法不受影响。
 
 ### 这一批的统一纪律
 
@@ -1746,4 +1758,9 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
 
 164. **判断"什么都没发生"要看流上来过什么,不要看历史里留下了什么——两者之间隔着一层筛子。** plan 191 要区分"esc 打断时模型一个字都没回"(整轮作废)和"思考了两分钟但一个字都留不下"(不能作废)。最顺手的判据是 `partial.is_empty()`,**错的**:`replayable_partial` 会筛掉未签名 thinking 和未派发的 tool_use,所以两种情况下 partial 都是空的。正确的量在 `sample_once` 本地——`blocks` / `text_accum` / `think_accum` 三个全空才是"流上一个字节都没来过"。推广:**凡是要判断"这一步有没有产生效果",先确认你手上那个量是原始产出还是过滤后的残留**;中间隔着筛子、归一化或投影时,两者的空集含义不同,而且通常是**过滤后的那个更容易拿到**,所以更容易选错。顺带一条测试设施上的推论:为此给 mock 加了 `DeltasThenGate`(流完 delta 再挂住)——现有的 `Gate` 只能造"一个字都没说"那一档,**造不出来的那一档恰恰是判据的分界线**,不补这个档位,这条判据就只有一半有测试。
 
-165. **把一块代码搬进子模块,要提可见性的是"父模块伸手够它"的那几个符号,不是"它伸手够父模块"的那一堆。** Rust 的私有项对**定义它的模块及其后代**可见,反过来不成立——这条不对称在搬代码时会被反复忘掉,于是顺手把一片私有项都提成 `pub(crate)`,把内部形状变成 crate 的 API(本批纪律第 4 条正是防这个)。plan 177 把 stdio 传输从 `mcp/src/lib.rs` 搬进 `stdio.rs`:子模块要用根上的 `MAX_WIRE_MESSAGE_BYTES`、`Transport`、`McpTransportHealth::healthy`、`McpNotification::from_message` 等七八个私有项,**一个都不用改**(`use crate::X` 直接够到,连搬过去的 `#[cfg(test)] mod wire_tests` 里的 `use super::X` 也照样够,因为私有 `use` 声明对子模块可见);真要提的只有三个——`StdioTransport` 和它的 `spawn` / `over`,因为调用方 `McpClient` 留在父模块。**判据**:搬完把 diff 里每一处可见性改动挑出来,逐条问"是谁在够它"——答案是父模块或兄弟模块才留下,答案是"它自己的子模块"就是多改的,删掉重编译。同族的收尾动作是把 crate 的 `pub` 符号表搬前搬后各导一份对拉(`grep -rhoE '^\s*pub (fn|struct|enum|trait|const|type|mod|use) ...' | sort`),差异应当只有新加的 `pub use` 再导出行。
+165. **把一块代码搬进子模块,要提可见性的是"父模块伸手够它"的那几个符号,不是"它伸手够父模块"的那一堆。** Rust 的私有项对**定义它的模块及其后代**可见,反过来不成立——这条不对称在搬代码时会被反复忘掉,于是顺手把一片私有项都提成 `pub(crate)`,把内部形状变成 crate 的 API(本批纪律第 4 条正是防这个)。plan 177 把 stdio 传输从 `mcp/src/lib.rs` 搬进 `stdio.rs`:子模块要用根上的 `MAX_WIRE_MESSAGE_BYTES`、`Transport`、`McpTransportHealth::healthy`、`McpNotification::from_message` 等七八个私有项,**一个都不用改**(`use crate::X` 直接够到,连搬过去的 `#[cfg(test)] mod wire_tests` 里的 `use super::X` 也照样够,因为私有 `use` 声明对子模块可见);真要提的只有三个——`StdioTransport` 和它的 `spawn` / `over`,因为调用方 `McpClient` 留在父模块。**判据**:搬完把 diff 里每一处可见性改动挑出来,逐条问"是谁在够它"——答案是父模块或兄弟模块才留下,答案是"它自己的子模块"就是多改的,删掉重编译。同族的收尾动作是把 crate 的 `pub` 符号表搬前搬后各导一份对拉(`grep -rhoE '^\s*pub (fn|struct|enum|trait|const|type|mod|use) ...' | sort`),差异应当只有新加的 `pub use` 再导出行。**plan 178 是第二个数据点,结果更干净:三个共用校验(`validate_component` / `validate_private_file` / `read_opened_private_file`)留在父模块,一个都不用提——三个平台子模块 `use super::X` 直接够到;真提的只有子模块那一侧的契约符号(`pub(super)`)。搬完 diff 里可见性改动为零,就是这条判据落地的样子。**
+
+166. **整个 crate 交叉编译不过,不等于这个模块的那个平台分支没法在本机验。** plan 178 要动 `cli/src/private_store.rs` 的 windows 与 fallback 两个分支,plan 写的是"windows 分支只能靠 CI"。实际拦路的不是 Rust:`cargo check -p <bin crate> --target x86_64-pc-windows-msvc` 挂在 `ring` 的 C 构建上(本机 cc 没有 windows 的 `assert.h`),和被改的那个模块毫无关系。那个模块自己的依赖只有 `anyhow` / `rustix` / `windows-sys`,**全是纯 Rust**。于是:在 scratch 目录里建一个 20 行的 crate,`Cargo.toml` 只抄那几个依赖(`windows-sys` 的 features 从 workspace 复制),`src/lib.rs` 就一句 `#[path = "<绝对路径>/private_store.rs"] mod private_store;`,`cargo check/clippy --target x86_64-pc-windows-msvc` 立刻跑通;fallback 分支(`not(any(unix, windows))`)用 `--target wasm32-unknown-unknown`,它既不是 unix 也不是 windows,正好落在那一支。两边零 error 零 warning——**unused import 这类只有交叉编译才看得见的错,CI 上就是红**,这一步不做等于把它留给 CI。三条配套:(1) `rust-toolchain.toml` 钉死了 channel,`rustup target add` 要带 `--toolchain <那个版本>`,否则加到了 stable 上、`cargo` 仍然报 "can't find crate for `core`";(2) **先把 harness 弄红一次**——往被测文件里塞一个故意的类型错误,确认它报出来,否则"全绿"可能只是根本没编到那个文件;(3) cargo 会缓存,重跑前 `cargo clean -p <scratch crate> --target <t>`,`touch` 是不够的。判据:**一个模块能不能单独交叉编译,取决于它自己的依赖树,不取决于它所在 crate 的依赖树**;平台相关的模块通常依赖极少,这条经常成立。
+
+167. **"这个文件里一个 `#[cfg]` 都不许剩"是个比"把三套实现搬走"强得多的要求,因为最后一个 cfg 总藏在你没当它是平台代码的地方。** plan 178 的 facade 搬空三套实现之后还剩两处:(a) 共用函数 `validate_private_file` 的**函数体内部**有一段 `#[cfg(unix)]` 的 0600 权限检查——它看起来是"共用校验的一部分",实际是"什么叫私有"在三个平台上答案不同;(b) 一个 `#[cfg(any(unix, windows))]` 的四行 helper `private_file_name`,它不属于任何一个平台,而属于**两个**。还有第三处更隐蔽的:`PrivateDir` 的**字段**是 cfg 的(`file: File` / `path: PathBuf`),所以这个类型整个都留不下,只能退化成 `platform::Dir` 的 newtype。处理办法各不相同,但判据是同一条:**函数体里的 cfg = 契约里有一项还没被命名**(把它提成平台契约的一员,这里是 `validate_private_permissions`),**属性上的 `cfg(any(A, B))` = 这段代码在 A 和 B 各自都该有一份**(复制,四行的东西不值得为它在 facade 里破例),**字段上的 cfg = 这个类型本身是平台的**(facade 只能包一层)。反过来看,如果允许 facade 留一两个 cfg,这三处都会原地不动——**归零这个硬要求的价值不在"好看",在于它逼着你把没说清的平台差异一条条说出来**。
+
