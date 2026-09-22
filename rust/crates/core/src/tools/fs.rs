@@ -3051,6 +3051,51 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A wrong parameter name used to be answered with the right name and nothing
+    /// else, leaving the model to work out that the key it did send went nowhere:
+    /// these three tools take no allow-list, so an unknown key is dropped in
+    /// silence and no other message mentions it. kloop translates no synonyms —
+    /// a measured session of 50 `edit_file` calls got the names wrong zero times —
+    /// so the refusal itself has to be what makes a wrong name visible.
+    #[tokio::test]
+    async fn a_wrong_parameter_name_names_itself() {
+        let path = temp_file("edit-wrong-arg", "alpha\n");
+        let ctx = test_ctx(0, "edit-wrong-arg");
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "alpha",
+                "new_string": "ALPHA"
+            }),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                "edit_file: missing required string argument 'path' \
+                 (got: file_path, new_string, old_string)"
+                    .to_string(),
+                true
+            )
+        );
+
+        // An argument that is present but not a string has nothing to point at,
+        // and the refusal already names it: the message stays as it was.
+        let (out, is_error) = run_tool("edit_file", json!({"path": 5}), &ctx).await;
+        assert_eq!(
+            (out, is_error),
+            (
+                "edit_file: missing required string argument 'path'".to_string(),
+                true
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\n");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The line plan 195 does not cross, half one. `write_file` replaces every
     /// byte, so it has no anchor to be right about: overwriting a file that
     /// changed since the read discards whatever the change was, and no remark

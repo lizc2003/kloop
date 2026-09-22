@@ -1652,10 +1652,54 @@ pub(crate) fn optional_display_description(input: &Value, tool: &str) -> Result<
     Ok(Some(description.to_string()))
 }
 
+/// How many other keys a missing-argument refusal lists, and how much of each.
+const MAX_LISTED_KEYS: usize = 8;
+const MAX_LISTED_KEY_BYTES: usize = 40;
+
+/// What a missing-argument refusal can add: the other keys the call did carry.
+///
+/// The canonical name alone leaves a model that reached for another harness's
+/// spelling — `file_path` for `path`, `old_str` for `old_string` — to work out on
+/// its own that the key it sent went nowhere, and the tools reached through
+/// [`str_arg`] take no allow-list, so an unknown key is dropped in silence and
+/// nothing else mentions it. Naming both sides turns a blind retry into an
+/// informed one, and it does so without teaching a second spelling: kloop
+/// translates no synonyms. A measured session of 50 `edit_file` calls got the
+/// parameter names wrong zero times, so a tolerance layer would be answering a
+/// question nobody asked — and it would still owe an answer for two conflicting
+/// keys. What this does buy unconditionally is that the *next* wrong name says so
+/// in the transcript, which is what would make that measurement possible on a
+/// model whose prior differs.
+///
+/// Silent when the missing key is the only one: an argument that is present but
+/// not a string has nothing to point at, and the refusal already names it.
+/// Keys are model-supplied, so they are sanitized and capped like any other
+/// echoed input.
+fn provided_keys(input: &Value, key: &str) -> String {
+    let Some(object) = input.as_object() else {
+        return String::new();
+    };
+    let mut listed: Vec<String> = object
+        .keys()
+        .filter(|name| name.as_str() != key)
+        .take(MAX_LISTED_KEYS + 1)
+        .map(|name| agent_message::bounded_diagnostic(name, MAX_LISTED_KEY_BYTES))
+        .collect();
+    if listed.is_empty() {
+        return String::new();
+    }
+    let elided = listed.len() > MAX_LISTED_KEYS;
+    listed.truncate(MAX_LISTED_KEYS);
+    let names = listed.join(", ");
+    let ellipsis = if elided { ", …" } else { "" };
+    format!(" (got: {names}{ellipsis})")
+}
+
 pub(crate) fn str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
-    input[key]
-        .as_str()
-        .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
+    input[key].as_str().ok_or_else(|| {
+        let got = provided_keys(input, key);
+        anyhow!("{tool}: missing required string argument '{key}'{got}")
+    })
 }
 
 pub(crate) fn strict_str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {

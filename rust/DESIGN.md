@@ -106,7 +106,15 @@ the five architectural bets below; it is now ten crates, and every bet held.
    invalid call — recorded as an ordinary `tool_use` with empty input, never
    dispatched, and answered with a failed `tool_result` carrying the parser's
    complaint and the model's own text, so the turn keeps its other calls and
-   the model rewrites that one next round. Responses
+   the model rewrites that one next round. A *well-formed* call naming the wrong
+   argument is the same judgment one level up, answered the same way and no
+   further: a missing required argument names the canonical key **and the other
+   keys the call did carry**, so a model that reached for another harness's
+   spelling (`file_path` for `path`) can see where its key went. Synonyms are not
+   translated — a measured session of 50 `edit_file` calls got the names wrong
+   zero times, and tolerance would still owe an answer for two conflicting keys —
+   but the refusal now makes a wrong name visible in the transcript, which is what
+   would let that rate be measured again on a model whose prior differs. Responses
    requests also carry `prompt_cache_key` — the session id, shared by this
    session's sampling and compaction — so the growing prefix keeps landing on a
    backend that already holds it; a sub-agent sends its own `{parent}-{agent-N}`

@@ -221,7 +221,7 @@ fn is_unicode_line_separator(ch: char) -> bool {
     matches!(ch, '\u{2028}' | '\u{2029}')
 }
 
-fn bounded_diagnostic(value: &str, max_bytes: usize) -> String {
+pub(super) fn bounded_diagnostic(value: &str, max_bytes: usize) -> String {
     let mut output = String::new();
     let mut truncated = false;
     for ch in value.chars() {
