@@ -535,7 +535,7 @@ impl Server {
             "provider/catalog/read" => self.provider_catalog_read(&params),
             "config/read" => self.config_read(&params),
             "skills/list" => self.skills_list(&params),
-            "mcpServerStatus/list" => self.mcp_server_status_list(&params),
+            "mcp_server_status/list" => self.mcp_server_status_list(&params),
             "turn/start" => self.turn_start(&params),
             "turn/steer" => self.turn_steer(&params),
             "turn/interrupt" => self.turn_interrupt(&params),
@@ -1079,7 +1079,7 @@ impl Server {
     }
 
     fn mcp_server_status_list(&self, params: &Value) -> MethodResult {
-        ensure_empty_params(params, "mcpServerStatus/list")?;
+        ensure_empty_params(params, "mcp_server_status/list")?;
         Ok(json!({"servers": &self.mcp_servers}))
     }
 

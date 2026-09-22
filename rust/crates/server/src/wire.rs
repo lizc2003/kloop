@@ -226,7 +226,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             if let Some(run_id) = &task.run_id {
                 task_json["run_id"] = Value::String(run_id.clone());
             }
-            Some(("thread/backgroundTask/updated", json!({"task": task_json})))
+            Some(("thread/background_task/updated", json!({"task": task_json})))
         }
         Event::AgentMessageUpdated(message) => {
             let status = match message.status {
@@ -235,7 +235,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
                 kloop_core::event::AgentMessageStatus::Undeliverable => "undeliverable",
             };
             Some((
-                "thread/agentMessage/updated",
+                "thread/agent_message/updated",
                 json!({
                     "message_id": message.id.as_str(),
                     "from": message.from.as_str(),
@@ -270,7 +270,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
         }
         // Token usage, cwd and scheduler updates are thread-scoped, not turn-scoped: no turnId.
         Event::Usage(n) => Some((
-            "thread/tokenUsage/updated",
+            "thread/token_usage/updated",
             json!({"token_usage": {"total": n}}),
         )),
         Event::CwdChanged { cwd, branch } => {
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(
             project_event(&Event::Usage(1234), 2),
             Some((
-                "thread/tokenUsage/updated",
+                "thread/token_usage/updated",
                 json!({"token_usage": {"total": 1234}})
             ))
         );
@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(
             project_event(&update, 99),
             Some((
-                "thread/backgroundTask/updated",
+                "thread/background_task/updated",
                 json!({"task": {
                     "id": "bg-7",
                     "kind": "shell",
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(
             projected,
             Some((
-                "thread/agentMessage/updated",
+                "thread/agent_message/updated",
                 json!({
                     "message_id": "message-7",
                     "from": "agent-3",
@@ -565,7 +565,7 @@ mod tests {
             assert_eq!(
                 project_event(&event, 99),
                 Some((
-                    "thread/backgroundTask/updated",
+                    "thread/background_task/updated",
                     json!({"task": {
                         "id": "program-4",
                         "run_id": "run-44",
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(
             project_event(&update, 123),
             Some((
-                "thread/backgroundTask/updated",
+                "thread/background_task/updated",
                 json!({"task": {
                     "id": "agent-6",
                     "kind": "agent",
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(
             project_event(&update, 99),
             Some((
-                "thread/backgroundTask/updated",
+                "thread/background_task/updated",
                 json!({"task": {
                     "id": "workflow-7",
                     "kind": "workflow",

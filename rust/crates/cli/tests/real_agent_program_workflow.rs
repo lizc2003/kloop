@@ -331,7 +331,7 @@ impl NativeClient {
         let deadline = Instant::now() + real_evaluator_timeout();
         loop {
             let terminal_index = messages.iter().position(|message| {
-                message["method"] == "thread/backgroundTask/updated"
+                message["method"] == "thread/background_task/updated"
                     && message["params"]["task"]["kind"] == kind
                     && matches!(
                         message["params"]["task"]["status"].as_str(),
@@ -460,7 +460,7 @@ fn assert_background_lifecycle(
     let updates: Vec<&Value> = messages
         .iter()
         .filter(|message| {
-            message["method"] == "thread/backgroundTask/updated"
+            message["method"] == "thread/background_task/updated"
                 && message["params"]["task"]["kind"] == kind
         })
         .collect();
@@ -858,7 +858,7 @@ fn real_agent_program_workflow_contract() {
     let terminals: Vec<&Value> = workflow_messages
         .iter()
         .filter(|message| {
-            message["method"] == "thread/backgroundTask/updated"
+            message["method"] == "thread/background_task/updated"
                 && message["params"]["task"]["kind"] == "workflow"
                 && message["params"]["task"]["status"] != "running"
         })
@@ -962,7 +962,7 @@ fn real_local_agent_mailbox_contract() {
         let terminal_agents = messages
             .iter()
             .filter(|message| {
-                message["method"] == "thread/backgroundTask/updated"
+                message["method"] == "thread/background_task/updated"
                     && message["params"]["task"]["kind"] == "agent"
                     && matches!(
                         message["params"]["task"]["status"].as_str(),
@@ -973,12 +973,12 @@ fn real_local_agent_mailbox_contract() {
         let delivered = messages
             .iter()
             .filter(|message| {
-                message["method"] == "thread/agentMessage/updated"
+                message["method"] == "thread/agent_message/updated"
                     && message["params"]["status"] == "delivered"
             })
             .count();
         let last_terminal = messages.iter().rposition(|message| {
-            message["method"] == "thread/backgroundTask/updated"
+            message["method"] == "thread/background_task/updated"
                 && message["params"]["task"]["kind"] == "agent"
                 && matches!(
                     message["params"]["task"]["status"].as_str(),
@@ -1008,7 +1008,7 @@ fn real_local_agent_mailbox_contract() {
         messages
             .iter()
             .find(|message| {
-                message["method"] == "thread/backgroundTask/updated"
+                message["method"] == "thread/background_task/updated"
                     && message["params"]["task"]["kind"] == "agent"
                     && message["params"]["task"]["description"] == description
             })
@@ -1024,7 +1024,7 @@ fn real_local_agent_mailbox_contract() {
         let updates = messages
             .iter()
             .filter(|message| {
-                message["method"] == "thread/backgroundTask/updated"
+                message["method"] == "thread/background_task/updated"
                     && message["params"]["task"]["id"] == *id
             })
             .collect::<Vec<_>>();
@@ -1048,7 +1048,7 @@ fn real_local_agent_mailbox_contract() {
     ];
     let updates = messages
         .iter()
-        .filter(|message| message["method"] == "thread/agentMessage/updated")
+        .filter(|message| message["method"] == "thread/agent_message/updated")
         .collect::<Vec<_>>();
     assert_eq!(updates.len(), 6, "each of three messages needs two states");
     assert!(updates.iter().all(|message| {

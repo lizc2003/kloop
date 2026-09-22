@@ -544,7 +544,7 @@ mod tests {
             .collect::<Vec<_>>();
         let updates = events
             .iter()
-            .filter(|event| event["method"] == "thread/agentMessage/updated")
+            .filter(|event| event["method"] == "thread/agent_message/updated")
             .collect::<Vec<_>>();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[0]["params"]["status"], "queued");
@@ -592,8 +592,8 @@ mod tests {
                 // Twice: the agent loop publishes the context size at the end
                 // of every round (a long turn's gauge must move while it runs),
                 // then the headless bracket repeats the post-turn total.
-                "thread/tokenUsage/updated",
-                "thread/tokenUsage/updated",
+                "thread/token_usage/updated",
+                "thread/token_usage/updated",
                 "turn/completed",
             ]
         );

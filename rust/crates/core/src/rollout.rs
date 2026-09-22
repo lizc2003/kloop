@@ -47,6 +47,14 @@ use kloop_provider::ProviderFailure;
 use kloop_provider::ProviderFailureKind;
 use kloop_provider::TimeoutStage;
 
+/// The session file format this kloop writes, and the only one it reads. A
+/// file opens with its version, so a reader meets an unknown format at the
+/// first line instead of misreading a field whose meaning moved under it.
+/// Bump this when a change would make an older file parse into the wrong
+/// meaning; purely additive fields do not need it, because unknown fields are
+/// ignored on read.
+pub const SESSION_FORMAT_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntime {
     pub cwd: String,
@@ -310,6 +318,11 @@ struct LineMeta {
     /// default resume picker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_of: Option<String>,
+    /// Set only on a file's FIRST line: which format the whole file is written
+    /// in. A reader meets an unknown version at the first line it parses,
+    /// instead of reading later fields under a meaning that has moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format_version: Option<u32>,
     /// Unix milliseconds at append time.
     ts: u64,
 }
@@ -682,6 +695,10 @@ impl Rollout {
             } else {
                 None
             },
+            // Likewise the format version: stamping it here rather than in
+            // each constructor is what makes it impossible for a new
+            // construction path to forget it.
+            format_version: (self.next_seq == 1).then_some(SESSION_FORMAT_VERSION),
             ts: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -783,6 +800,36 @@ fn checked_seq_of(meta: &LineMeta) -> io::Result<u64> {
 
 fn seq_of(meta: &LineMeta) -> u64 {
     checked_seq_of(meta).unwrap_or(0)
+}
+
+/// A file says which format it is written in before it says anything else.
+/// An unknown version is refused here rather than parsed under this kloop's
+/// meaning of the fields, and the line may not appear anywhere but first —
+/// one file is written in one format.
+fn validate_format(lines: &[RolloutLine]) -> io::Result<()> {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidData, message);
+    let Some(first) = lines.first() else {
+        return Ok(());
+    };
+    let Some(version) = first.meta().format_version else {
+        return Err(invalid(
+            "session file does not open with its format version".into(),
+        ));
+    };
+    if version != SESSION_FORMAT_VERSION {
+        return Err(invalid(format!(
+            "unsupported session format version {version} (this kloop reads {SESSION_FORMAT_VERSION})"
+        )));
+    }
+    if lines[1..]
+        .iter()
+        .any(|line| line.meta().format_version.is_some())
+    {
+        return Err(invalid(
+            "session format version belongs on the first line only".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_envelope(lines: &[RolloutLine]) -> io::Result<()> {
@@ -966,6 +1013,7 @@ fn validate_provider_message(
 
 fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
     let (lines, intact_end) = intact_lines(raw)?;
+    validate_format(&lines)?;
     validate_provider_routes(&lines)?;
     validate_envelope(&lines)?;
     let mut parsed = ParsedSession {
@@ -1204,6 +1252,9 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
                 // independent branch, never a sub-agent, so drop any
                 // subagent_of the copied source line may have carried.
                 subagent_of: None,
+                // The copied prefix is renumbered, so the version rides
+                // whichever line became this file's first one.
+                format_version: (n == 0).then_some(SESSION_FORMAT_VERSION),
                 ts: meta.ts,
             }
         };
@@ -2010,6 +2061,98 @@ mod tests {
     }
 
     #[test]
+    fn a_file_states_its_format_version_on_its_first_line_only() {
+        let path = temp_file("format-version");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        rollout.append_message(&Message::user_text("two")).unwrap();
+
+        let lines = raw_lines(&path);
+        assert_eq!(lines[0]["format_version"], SESSION_FORMAT_VERSION);
+        for line in &lines[1..] {
+            assert_eq!(line.get("format_version"), None, "{line}");
+        }
+        // A resumed writer appends to a file that already opened with its
+        // version, and must not stamp a second one.
+        let mut resumed = resume_session(&path).unwrap().rollout;
+        resumed
+            .append_message(&Message::user_text("three"))
+            .unwrap();
+        let lines = raw_lines(&path);
+        assert_eq!(lines[0]["format_version"], SESSION_FORMAT_VERSION);
+        for line in &lines[1..] {
+            assert_eq!(line.get("format_version"), None, "{line}");
+        }
+        cleanup(&path);
+    }
+
+    /// One way a file can misstate its format: a name for the case, the
+    /// corruption to apply, and the refusal it has to produce.
+    type FormatCase = (&'static str, fn(&mut Vec<Value>), &'static str);
+
+    #[test]
+    fn a_file_whose_format_version_is_missing_wrong_or_misplaced_is_refused() {
+        let path = temp_file("format-version-source");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        rollout.append_message(&Message::user_text("two")).unwrap();
+        drop(rollout);
+        let original = raw_lines(&path);
+
+        let cases: [FormatCase; 4] = [
+            (
+                "missing",
+                |lines: &mut Vec<Value>| {
+                    lines[0].as_object_mut().unwrap().remove("format_version");
+                },
+                "does not open with its format version",
+            ),
+            (
+                "unknown-version",
+                |lines: &mut Vec<Value>| {
+                    lines[0]["format_version"] = json!(SESSION_FORMAT_VERSION + 1);
+                },
+                "unsupported session format version",
+            ),
+            (
+                "misplaced",
+                |lines: &mut Vec<Value>| {
+                    lines[1]["format_version"] = json!(SESSION_FORMAT_VERSION);
+                },
+                "belongs on the first line only",
+            ),
+            (
+                "on-a-later-line-instead",
+                |lines: &mut Vec<Value>| {
+                    lines[0].as_object_mut().unwrap().remove("format_version");
+                    lines[1]["format_version"] = json!(SESSION_FORMAT_VERSION);
+                },
+                "does not open with its format version",
+            ),
+        ];
+        for (tag, mutate, expected) in cases {
+            let case_path = temp_file(tag);
+            let mut lines = original.clone();
+            mutate(&mut lines);
+            let raw = lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            std::fs::create_dir_all(case_path.parent().unwrap()).unwrap();
+            std::fs::write(&case_path, raw).unwrap();
+            let before = std::fs::read(&case_path).unwrap();
+            let Err(error) = inspect_session(&case_path) else {
+                panic!("{tag}: a file that misstates its format must be refused");
+            };
+            assert!(error.to_string().contains(expected), "{tag}: {error}");
+            // A refused file is never rewritten on the way out.
+            assert_eq!(std::fs::read(&case_path).unwrap(), before, "{tag}");
+            cleanup(&case_path);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn resume_continues_the_id_chain() {
         let path = temp_file("chain");
         let mut rollout = Rollout::new(path.clone());
@@ -2308,6 +2451,12 @@ mod tests {
         let src_lines = raw_lines(&path);
         let lines = raw_lines(&fork_path);
         assert_eq!(lines.len(), 5);
+        // The renumbered prefix carries the version on the fork's own first
+        // line, not on whichever copied line happened to hold it.
+        assert_eq!(lines[0]["format_version"], SESSION_FORMAT_VERSION);
+        for line in &lines[1..] {
+            assert_eq!(line.get("format_version"), None, "{line}");
+        }
         assert_eq!(lines[0]["id"], format!("{fork_stem}#1"));
         assert_eq!(lines[0]["parent"], "session#5");
         assert_eq!(lines[1]["id"], format!("{fork_stem}#2"));

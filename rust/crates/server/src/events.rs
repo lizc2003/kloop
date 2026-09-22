@@ -613,12 +613,12 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
                 text: text.to_string(),
             });
         }
-        "thread/backgroundTask/updated" => {
+        "thread/background_task/updated" => {
             if let Some(task) = params.get("task") {
                 upsert_value(&mut state.snapshot.tail.background_tasks, task, "id");
             }
         }
-        "thread/agentMessage/updated" => {
+        "thread/agent_message/updated" => {
             let mut message = params.clone();
             if let Some(object) = message.as_object_mut() {
                 object.remove("thread_id");
@@ -636,7 +636,7 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
                 upsert_value(&mut state.snapshot.tail.scheduled_tasks, task, "id");
             }
         }
-        "thread/tokenUsage/updated" => {
+        "thread/token_usage/updated" => {
             state.snapshot.tail.token_usage = params.get("token_usage").cloned();
         }
         "thread/cwd/updated" => {
@@ -969,17 +969,17 @@ mod tests {
         );
         publish(
             &projection,
-            "thread/backgroundTask/updated",
+            "thread/background_task/updated",
             json!({"task": {"id": "bg-1", "status": "running"}}),
         );
         publish(
             &projection,
-            "thread/backgroundTask/updated",
+            "thread/background_task/updated",
             json!({"task": {"id": "bg-1", "status": "completed"}}),
         );
         publish(
             &projection,
-            "thread/agentMessage/updated",
+            "thread/agent_message/updated",
             json!({
                 "message_id": "mail-1",
                 "from": "agent-a",

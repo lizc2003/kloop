@@ -1004,7 +1004,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         })
     );
 
-    let id = client.request("mcpServerStatus/list", json!({})).await;
+    let id = client.request("mcp_server_status/list", json!({})).await;
     assert_eq!(
         client.recv().await,
         json!({
@@ -1077,7 +1077,7 @@ async fn read_surface_params_fail_closed() {
 
     for (method, params) in [
         ("provider/catalog/read", json!({"unexpected": true})),
-        ("mcpServerStatus/list", json!([])),
+        ("mcp_server_status/list", json!([])),
         ("config/read", json!({"thread_id": "x", "cwd": "."})),
         ("config/read", json!({"threadId": "x"})),
         ("skills/list", json!({"force_reload": "yes"})),
@@ -1917,10 +1917,17 @@ async fn legacy_session_without_route_timeline_is_rejected_without_migration() {
         .append_message(&Message::user_text("old question"))
         .unwrap();
     drop(rollout);
-    let legacy = std::fs::read_to_string(&path)
+    // Drop the provider route line and nothing else: the file still says which
+    // format it is written in, so the only thing missing is the route timeline.
+    let mut lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
         .unwrap()
         .lines()
-        .skip(1)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines.remove(0);
+    lines[0]["format_version"] = json!(1);
+    let legacy = lines
+        .iter()
         .map(|line| format!("{line}\n"))
         .collect::<String>();
     std::fs::write(&path, legacy).unwrap();
@@ -2253,8 +2260,8 @@ async fn turn_streams_item_events_and_completes() {
             "item/completed",
             // Twice: the agent loop publishes the context size at every round
             // boundary, then the turn bracket repeats the post-turn total.
-            "thread/tokenUsage/updated",
-            "thread/tokenUsage/updated",
+            "thread/token_usage/updated",
+            "thread/token_usage/updated",
             "turn/completed",
         ]
     );
@@ -3111,8 +3118,8 @@ async fn parallel_threads_do_not_cross_streams() {
                 "item/started",
                 "item/delta",
                 "item/completed",
-                "thread/tokenUsage/updated",
-                "thread/tokenUsage/updated",
+                "thread/token_usage/updated",
+                "thread/token_usage/updated",
                 "turn/completed",
             ],
             "thread {tid} event stream is broken: {log:?}"
@@ -3449,7 +3456,7 @@ async fn slash_commands_surface_as_system_notifications() {
         vec![
             "turn/started",
             "system",
-            "thread/tokenUsage/updated",
+            "thread/token_usage/updated",
             "turn/completed",
         ]
     );
@@ -3529,7 +3536,7 @@ async fn clear_command_empties_history_and_notifies() {
             "turn/started",
             "thread/cleared",
             "system",
-            "thread/tokenUsage/updated",
+            "thread/token_usage/updated",
             "turn/completed",
         ]
     );

@@ -382,7 +382,19 @@ Every line carries an envelope — `id` (`{session}#{seq}`, no rand
 dependency), `parent` (previous line's id, linked across resumed runs), `ts`
 (unix ms). Within one file the chain is purely sequential; a forked file's
 first line carries a cross-file parent (see Fork below). Unknown fields are
-ignored on read (locked by test), so the format grows additively.
+ignored on read (locked by test), so the format grows additively without a
+version bump.
+
+The case additive growth cannot cover is a change that makes an older file parse
+into the *wrong* meaning, so a file's first line also carries `format_version`
+(`SESSION_FORMAT_VERSION`, currently 1). It takes the same first-line-only shape
+as `subagent_of` and is stamped in `next_meta` rather than by each constructor,
+which is what makes it impossible for a new construction path to forget; a fork
+renumbers its copied prefix, so the version is re-stamped onto whichever line
+became that file's first one. A reader validates it before anything else and
+refuses three cases distinctly — no version, a version it does not know, and a
+version on any line but the first — without rewriting the file on the way out.
+Old sessions are not migrated, the same stance the route timeline already takes.
 
 **Field names are snake_case wherever kloop owns the name** — the envelope, every
 line payload, the JSON-RPC surface, and the on-disk trust and policy records.
@@ -1149,7 +1161,7 @@ be used unescaped as a filename, an HTTP header value, and a log field.
 `input` is a string or an array of content parts
 (`{type:"text",text}` / `{type:"image",source:{…}}`).
 
-**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
+**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcp_server_status/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 
 Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, fallback, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable route change — an explicit switch, or the `reopened` revision a session writes when it opens on a different route than it was written on — may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. `thread/resume` and `thread/fork` take no provider/model of their own and carry none into the config factory: a reopened thread is built on the configured default and adopts it, advancing the recorded timeline instead of rebuilding it as a fresh initial route (which would refuse every session that had switched providers). Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
 **Events** stream per active thread. Every public notification carries
