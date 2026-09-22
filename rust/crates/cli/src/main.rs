@@ -14,6 +14,7 @@ mod private_store;
 mod project_store;
 mod provider_config;
 mod startup;
+mod trust;
 mod ui;
 mod user_config;
 mod web;
@@ -336,6 +337,14 @@ async fn run_front_end(
     session_store: SessionStore,
     cwd: std::path::PathBuf,
 ) -> Result<ExitCode> {
+    // Workspace trust (plan 193) comes before everything a front-end does —
+    // before a session file exists, before the directory is read. A declined
+    // directory is not an error: the human chose to leave.
+    if trust::asks_for_trust(args.serve, args.headless, args.mock, trust::stdin_is_tty())
+        && !trust::ensure_trusted(process.runtime.project_store(), &cwd)
+    {
+        return Ok(ExitCode::SUCCESS);
+    }
     if args.serve {
         return run_serve(args, process, session_store).await;
     }

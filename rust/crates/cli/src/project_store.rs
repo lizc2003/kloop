@@ -1,4 +1,7 @@
-//! User-private, project-scoped durable allow rules.
+//! User-private, project-scoped durable state: the allow rules a human
+//! granted for this project, and whether this project is trusted at all
+//! (plan 193). The two live in separate files under the same private
+//! directory: trust is not a rule, it is whether the rules get to start.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -26,6 +29,9 @@ const VERSION: &str = "v1";
 const POLICY_FILE: &str = "permissions.json";
 const LOCK_FILE: &str = "permissions.lock";
 const POLICY_LABEL: &str = "project permission policy";
+const TRUST_FILE: &str = "trust.json";
+const TRUST_LOCK_FILE: &str = "trust.lock";
+const TRUST_LABEL: &str = "project trust";
 
 #[derive(Clone)]
 pub(crate) struct ProjectStore {
@@ -115,6 +121,37 @@ impl ProjectStore {
         })
     }
 
+    /// Whether this project was trusted in an earlier session. Anything that
+    /// is not an intact "yes" — no file, unreadable, unparseable, a different
+    /// project's record — reads as untrusted and the human is asked again.
+    pub(crate) fn trusted_blocking(&self, project_id: &ProjectId) -> bool {
+        let Ok(Some(dir)) = self.open_project(project_id) else {
+            return false;
+        };
+        let Ok(Some(raw)) = dir.read_string(OsStr::new(TRUST_FILE), TRUST_LABEL) else {
+            return false;
+        };
+        let Ok(file) = serde_json::from_str::<TrustFile>(&raw) else {
+            return false;
+        };
+        file.version == 1 && file.project_id == project_id.as_str() && file.trusted
+    }
+
+    /// Record the human's "yes". A failure to persist is reported: the session
+    /// still runs on the answer just given, but the next one asks again.
+    pub(crate) fn grant_trust_blocking(&self, project_id: &ProjectId) -> Result<()> {
+        let dir = self.ensure_project(project_id)?;
+        let _lock = dir.open_lock(OsStr::new(TRUST_LOCK_FILE), TRUST_LABEL)?;
+        let file = TrustFile {
+            version: 1,
+            project_id: project_id.as_str().to_string(),
+            trusted: true,
+        };
+        let mut encoded = serde_json::to_vec_pretty(&file)?;
+        encoded.push(b'\n');
+        dir.write_atomic(OsStr::new(TRUST_FILE), TRUST_LABEL, &encoded)
+    }
+
     fn project_lock(&self, project_id: &ProjectId) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.locks.lock().unwrap();
         Arc::clone(
@@ -142,11 +179,20 @@ impl ProjectStore {
 
     #[cfg(test)]
     pub(crate) fn policy_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.project_dir(project_id).join(POLICY_FILE)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trust_path(&self, project_id: &ProjectId) -> PathBuf {
+        self.project_dir(project_id).join(TRUST_FILE)
+    }
+
+    #[cfg(test)]
+    fn project_dir(&self, project_id: &ProjectId) -> PathBuf {
         self.root
             .join(PROJECTS)
             .join(VERSION)
             .join(project_id.as_str())
-            .join(POLICY_FILE)
     }
 }
 
@@ -165,6 +211,16 @@ impl ProjectPermissionWriter for ProjectStore {
     > {
         Box::pin(self.append(project_id, additions))
     }
+}
+
+/// The trust record. `trusted` is spelled out rather than implied by the
+/// file's existence so a half-written or hand-edited file reads as "no".
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrustFile {
+    version: u32,
+    project_id: String,
+    trusted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,6 +296,62 @@ mod tests {
             ProjectPolicySnapshot::empty()
         );
         assert!(!base.join(".kloop").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Trust is a separate file with a separate lock: granting it must not
+    /// disturb the rule table, and an empty store is untrusted without
+    /// creating anything.
+    #[test]
+    fn trust_round_trips_beside_the_rules_without_touching_them() {
+        let (base, store, id) = fixture("trust");
+        assert!(!store.trusted_blocking(&id), "nothing granted yet");
+        assert!(
+            !base.join(".kloop").exists(),
+            "asking must not create state"
+        );
+
+        store.grant_trust_blocking(&id).unwrap();
+        assert!(store.trusted_blocking(&id));
+        assert!(!store.policy_path(&id).exists(), "rules are untouched");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(store.trust_path(&id)).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({
+                "version": 1,
+                "projectId": id.as_str(),
+                "trusted": true,
+            })
+        );
+
+        // Granting twice is the same state, not an error.
+        store.grant_trust_blocking(&id).unwrap();
+        assert!(store.trusted_blocking(&id));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Anything that is not an intact yes reads as untrusted — the human is
+    /// asked again rather than let through on a damaged record.
+    #[test]
+    fn a_damaged_or_foreign_trust_record_reads_as_untrusted() {
+        let (base, store, id) = fixture("trust-damaged");
+        store.grant_trust_blocking(&id).unwrap();
+        let path = store.trust_path(&id);
+        let other = ProjectId::from_str(&format!("p1_{}", "b".repeat(64))).unwrap();
+        for damaged in [
+            serde_json::json!({"version": 1, "projectId": id.as_str(), "trusted": false}),
+            serde_json::json!({"version": 2, "projectId": id.as_str(), "trusted": true}),
+            serde_json::json!({"version": 1, "projectId": other.as_str(), "trusted": true}),
+            serde_json::json!({"version": 1, "projectId": id.as_str()}),
+            serde_json::json!("yes"),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&damaged).unwrap()).unwrap();
+            assert!(!store.trusted_blocking(&id), "{damaged}");
+        }
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(!store.trusted_blocking(&id), "unparseable");
         let _ = std::fs::remove_dir_all(base);
     }
 

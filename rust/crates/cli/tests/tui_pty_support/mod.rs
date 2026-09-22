@@ -473,6 +473,41 @@ impl PtyHarness {
             std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
                 .context("chmod PTY config.toml")?;
         }
+        // Workspace trust (plan 193) is answered on a TTY before a front-end
+        // boots, and every scenario here is about what happens after boot — so
+        // the sandbox starts out already trusted, the way a returning session
+        // does. The id comes from the real resolver rather than a second copy
+        // of the hashing rule.
+        if let Some(project_id) =
+            kloop_core::project::WorkspaceIdentity::resolve(&workspace).project_id()
+        {
+            let mut project = kloop_home.clone();
+            for component in ["projects", "v1", project_id.as_str()] {
+                project.push(component);
+                std::fs::create_dir_all(&project)
+                    .with_context(|| format!("create {}", project.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("chmod {}", project.display()))?;
+                }
+            }
+            let trust = project.join("trust.json");
+            std::fs::write(
+                &trust,
+                format!(
+                    "{{\n  \"version\": 1,\n  \"projectId\": \"{project_id}\",\n  \"trusted\": true\n}}\n"
+                ),
+            )
+            .context("write PTY trust.json")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&trust, std::fs::Permissions::from_mode(0o600))
+                    .context("chmod PTY trust.json")?;
+            }
+        }
         let redactions = Arc::new(redaction_table(base_url, sandbox.path(), &root));
 
         let pair = native_pty_system()

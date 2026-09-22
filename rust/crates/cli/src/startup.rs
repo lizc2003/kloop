@@ -117,6 +117,12 @@ impl RuntimeSettings {
         })
     }
 
+    /// The durable project store, absent under `--mock` (hermetic: nothing
+    /// on the user's disk is read or written).
+    pub(crate) fn project_store(&self) -> Option<&Arc<ProjectStore>> {
+        self.project_store.as_ref()
+    }
+
     pub(crate) fn defer_threshold(&self) -> usize {
         self.defer_threshold
     }

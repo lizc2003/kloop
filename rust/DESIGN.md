@@ -561,6 +561,37 @@ nested dirs or codex's SQLite `thread_spawn_edges`:
   a human reading the parent transcript can jump to it. A parent with no
   session (`--mock`, tests) leaves the sub-agent in memory, as before.
 
+## Workspace trust
+
+Before any front-end reads the working directory, an interactive launch asks
+once per project whether this directory is trusted (`crates/cli/src/trust.rs`,
+plan 193). Answering no exits with status 0; answering yes is recorded in
+`~/.kloop/projects/v1/<ProjectId>/trust.json`, beside the permission policy and
+under its own lock — trust is not a rule, it is whether the rules get to start.
+
+The question exists because kloop's *policy* surface is closed to the
+repository but its *instruction* surface is not. Permissions, hooks, MCP
+servers and the sandbox come only from the one private `~/.kloop/config.toml`
+(plan 46 deleted cwd config), so a hostile checkout cannot move the gate. It
+can still steer the model: `AGENTS.md` / `CLAUDE.md` / `.kloop/rules` ride into
+the system prompt, the project's own skills are model-activatable, and a skill
+body's `` !`cmd` `` inline really executes. Since the contained-writes layer
+below, an in-cwd file write does not stop for a human either.
+
+The answer is keyed by `ProjectId`, so a Git project is trusted once for every
+subdirectory and linked worktree, and a plain directory is trusted as itself
+(`WorkspaceIdentity::resolve` gives a directory-domain id when there is no Git
+repository). A record that is missing, unreadable, unparseable, version-bumped
+or stamped with another project reads as untrusted and the question comes back.
+When the identity itself is unavailable (a broken Git probe), the question is
+asked every time and the prompt says the answer cannot be remembered.
+
+`--headless` and `--serve` never ask: they are started by something that
+already made that call, and whoever launches them owns it. `--mock` is
+hermetic and never touches the durable store, and a non-TTY stdin has nobody
+behind it. Switching cwd mid-session through the worktree tool does not re-ask
+— that call is a `[existing worktree]` hazard and is approved on its own.
+
 ## Permissions (Phase 2, third slice)
 
 Every tool call passes a layered gate before executing
