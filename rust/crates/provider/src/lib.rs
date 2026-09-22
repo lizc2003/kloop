@@ -487,7 +487,7 @@ impl Provider {
         let attempt = self.attempt_identity("test", 1, model);
         ProviderResponseProvenance {
             route_revision: attempt.route_revision,
-            origin_boundary: 1,
+            route_boundary: 1,
             provider_id: attempt.provider_id,
             api_family: attempt.api_family,
             endpoint_fingerprint: attempt.endpoint_fingerprint,
@@ -1015,7 +1015,7 @@ mod tests {
             }],
             ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: 2,
+                route_boundary: 2,
                 provider_id: "responses".into(),
                 api_family: ProviderApiFamily::OpenAiResponses,
                 endpoint_fingerprint: "responses-fingerprint".into(),

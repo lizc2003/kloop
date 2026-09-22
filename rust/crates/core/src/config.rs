@@ -550,7 +550,7 @@ impl Config {
             ContextBudgetSource::Pinned => self.context_window,
             ContextBudgetSource::Catalog { fallback } => self
                 .provider_catalog
-                .effective_window(provider_route.provider_id(), provider_route.primary_model())
+                .effective_window(provider_route.provider_id(), provider_route.model())
                 .or(fallback),
         };
         Self {
@@ -571,7 +571,7 @@ impl Config {
 
     #[cfg(test)]
     pub(crate) fn set_test_provider(&mut self, provider: kloop_provider::Provider) {
-        let model = self.provider_route.primary_model().to_string();
+        let model = self.provider_route.model().to_string();
         let models = self.provider_route.allowed_models().to_vec();
         let (catalog, route) =
             crate::provider_route::ProviderCatalog::from_provider("test", provider, model, models)
@@ -771,7 +771,7 @@ mod subagent_contract_tests {
             workspace.sandbox.as_ref().map(Arc::as_ptr)
         );
         // Its route is its own child route, not the parent's frozen one.
-        assert_eq!(child.provider_route.primary_model(), "mock");
+        assert_eq!(child.provider_route.model(), "mock");
     }
 
     /// An ephemeral parent has no session file, so its child gets no derived id

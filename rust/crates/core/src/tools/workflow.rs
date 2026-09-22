@@ -234,7 +234,7 @@ fn persist_inputs(
         "manifest.json",
         &serde_json::to_vec_pretty(&json!({
             "version": 1,
-            "runId": run_dir.id().as_str(),
+            "run_id": run_dir.id().as_str(),
             "meta": prepared.meta,
         }))?,
     )?;
@@ -504,9 +504,7 @@ impl HostBridge for WorkflowBridge {
             let schema = opts.get("schema").cloned();
             let mut input = json!({"prompt": prompt.clone()});
             copy_option(&opts, &mut input, "agent_type", "agent_type");
-            copy_option(&opts, &mut input, "agentType", "agent_type");
             copy_option(&opts, &mut input, "max_rounds", "max_rounds");
-            copy_option(&opts, &mut input, "maxRounds", "max_rounds");
             copy_option(&opts, &mut input, "isolation", "isolation");
             copy_option(&opts, &mut input, "model", "model");
             let workspace = ctx.cfg.effective_workspace();
@@ -775,7 +773,7 @@ mod tests {
         let manifest: Value =
             serde_json::from_slice(&std::fs::read(run_dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["version"], 1);
-        assert_eq!(manifest["runId"], launched_run_id);
+        assert_eq!(manifest["run_id"], launched_run_id);
         assert_eq!(manifest["meta"]["name"], "minimal");
         assert_eq!(manifest["meta"]["description"], "return marker");
         assert!(!manifest.to_string().contains("ignored top-level"));

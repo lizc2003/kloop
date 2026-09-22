@@ -88,7 +88,7 @@ pub(super) fn event_input(name: &str, input: &Value) -> Value {
         );
     }
     if let Some(message) = input.get("message").and_then(Value::as_str) {
-        projected.insert("messageBytes".into(), json!(message.len()));
+        projected.insert("message_bytes".into(), json!(message.len()));
         let summary = input
             .get("summary")
             .and_then(Value::as_str)
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(projected["to"], "agent-1");
         assert_eq!(projected["summary"], "safe preview");
         assert_eq!(
-            projected["messageBytes"],
+            projected["message_bytes"],
             "safe preview\n".len() + secret.len()
         );
         assert!(projected.get("message").is_none());

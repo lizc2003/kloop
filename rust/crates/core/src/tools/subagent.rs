@@ -1902,7 +1902,7 @@ mod tests {
         assert!(!is_error, "{output}");
         assert_eq!(output, "child result");
         assert_eq!(ctx.cfg.provider_route.revision(), 1);
-        assert_eq!(ctx.cfg.provider_route.primary_model(), "parent-model");
+        assert_eq!(ctx.cfg.provider_route.model(), "parent-model");
         assert_eq!(seen.lock().unwrap()[0].model, "child-model");
 
         for model in [json!("unknown-model"), json!(" \t "), json!(7)] {
@@ -2465,7 +2465,7 @@ mod tests {
                     }],
                     kloop_protocol::ProviderResponseProvenance {
                         route_revision: 1,
-                        origin_boundary: 3,
+                        route_boundary: 3,
                         provider_id: "test".into(),
                         api_family: kloop_protocol::ProviderApiFamily::Mock,
                         endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),

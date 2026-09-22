@@ -333,7 +333,7 @@ fn partial_factory(offload: PathBuf) -> ConfigFactory {
                     MockTurn::PartialError(vec![text("half answer")], "stream dropped".into()),
                     MockTurn::Blocks(vec![text(" and the rest")]),
                 ]),
-                cfg.provider_route.primary_model(),
+                cfg.provider_route.model(),
                 cfg.provider_route.allowed_models().to_vec(),
             )
             .map_err(anyhow::Error::msg)?;
@@ -481,7 +481,7 @@ async fn run_real_provider_turn(client: &mut TestClient, thread_id: &str, prompt
     let request_id = client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": prompt}),
+            json!({"thread_id": thread_id, "input": prompt}),
         )
         .await;
     let mut accepted = false;
@@ -551,7 +551,7 @@ async fn try_real_provider_turn(
     let request_id = client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": prompt}),
+            json!({"thread_id": thread_id, "input": prompt}),
         )
         .await;
     loop {
@@ -582,10 +582,10 @@ async fn switch_real_provider(
         .request(
             "thread/provider/switch",
             json!({
-                "threadId": thread_id,
-                "providerId": provider_id,
+                "thread_id": thread_id,
+                "provider_id": provider_id,
                 "model": model,
-                "expectedRouteRevision": expected_revision,
+                "expected_route_revision": expected_revision,
             }),
         )
         .await;
@@ -593,7 +593,7 @@ async fn switch_real_provider(
     loop {
         let message = client.recv_with_timeout(Duration::from_secs(60)).await;
         if message["method"] == "thread/provider/changed"
-            && message["params"]["route"]["providerId"] == provider_id
+            && message["params"]["route"]["provider_id"] == provider_id
         {
             changed = Some(message["params"]["route"].clone());
         }
@@ -603,7 +603,7 @@ async fn switch_real_provider(
                 "real provider switch was rejected"
             );
             let route = message["result"]["route"].clone();
-            assert_eq!(route["providerId"], provider_id);
+            assert_eq!(route["provider_id"], provider_id);
             assert_eq!(route["revision"], expected_revision + 1);
             assert_eq!(changed.as_ref(), Some(&route));
             return route;
@@ -616,7 +616,7 @@ async fn switch_real_provider(
 /// it ran — unlike `thread/provider/switch`, which has its own transaction.
 async fn run_real_command(client: &mut TestClient, thread_id: &str, line: &str) -> String {
     let request_id = client
-        .request("turn/start", json!({"threadId": thread_id, "input": line}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": line}))
         .await;
     let mut text = None;
     let mut accepted = false;
@@ -749,7 +749,7 @@ fn worktree_factory(
 
 fn methods_for_thread<'a>(log: &'a [Value], thread_id: &str) -> Vec<&'a str> {
     log.iter()
-        .filter(|m| m["params"]["threadId"] == thread_id)
+        .filter(|m| m["params"]["thread_id"] == thread_id)
         .filter_map(|m| m["method"].as_str())
         .collect()
 }
@@ -795,7 +795,7 @@ async fn handshake_gates_and_negotiates() {
     assert_eq!(caps["streaming"], true);
     assert_eq!(
         caps["approvals"],
-        json!({"scopes": ["once", "workspaceSession", "project"]})
+        json!({"scopes": ["once", "workspace_session", "project"]})
     );
     assert_eq!(caps["providers"], json!({"catalog": true, "switch": true}));
     assert_eq!(caps["config"], json!({"read": true}));
@@ -916,7 +916,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
     assert_eq!(
         caps,
         json!({
-            "approvals": {"scopes": ["once", "workspaceSession", "project"]},
+            "approvals": {"scopes": ["once", "workspace_session", "project"]},
             "config": {"read": true},
             "events": {"sequence": true, "snapshot": true, "sync": true},
             "images": true,
@@ -939,8 +939,8 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
             "id": id,
             "result": {"providers": [{
                 "id": "mock",
-                "apiFamily": "mock",
-                "defaultModel": "model-default",
+                "api_family": "mock",
+                "default_model": "model-default",
                 "models": ["model-default", "thread-model"],
                 "availability": "ready",
             }]},
@@ -959,21 +959,21 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                 "cwd": project_text,
                 "route": {
                     "revision": 1,
-                    "providerId": "mock",
-                    "apiFamily": "mock",
+                    "provider_id": "mock",
+                    "api_family": "mock",
                     "model": "model-default",
                     "continuity": "preserved",
                 },
-                "permissionMode": "manual",
-                "contextWindow": 200_000,
-                "deferThreshold": 30,
+                "permission_mode": "manual",
+                "context_window": 200_000,
+                "defer_threshold": 30,
                 "sandbox": {
                     "enabled": true,
-                    "allowNetwork": false,
-                    "autoAllow": true,
+                    "allow_network": false,
+                    "auto_allow": true,
                     "escalate": true,
                 },
-                "worktreeEnabled": true,
+                "worktree_enabled": true,
             }},
         })
     );
@@ -981,7 +981,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
     let id = client
         .request(
             "skills/list",
-            json!({"cwd": project_text, "forceReload": true}),
+            json!({"cwd": project_text, "force_reload": true}),
         )
         .await;
     assert_eq!(
@@ -1042,7 +1042,7 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
         .unwrap()
         .to_string();
     let id = client
-        .request("config/read", json!({"threadId": thread_id}))
+        .request("config/read", json!({"thread_id": thread_id}))
         .await;
     let response = client.recv().await;
     assert_eq!(response["id"], id);
@@ -1078,9 +1078,9 @@ async fn read_surface_params_fail_closed() {
     for (method, params) in [
         ("provider/catalog/read", json!({"unexpected": true})),
         ("mcpServerStatus/list", json!([])),
-        ("config/read", json!({"threadId": "x", "cwd": "."})),
-        ("config/read", json!({"threadID": "x"})),
-        ("skills/list", json!({"forceReload": "yes"})),
+        ("config/read", json!({"thread_id": "x", "cwd": "."})),
+        ("config/read", json!({"threadId": "x"})),
+        ("skills/list", json!({"force_reload": "yes"})),
         ("skills/list", json!({"cwd": ".", "unexpected": true})),
     ] {
         let id = client.request(method, params).await;
@@ -1208,7 +1208,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
     let start_id = client
         .request(
             "thread/start",
-            json!({"providerId": "a", "model": "shared"}),
+            json!({"provider_id": "a", "model": "shared"}),
         )
         .await;
     let started = client.recv().await;
@@ -1217,7 +1217,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(started["result"]["thread"]["route"]["providerId"], "a");
+    assert_eq!(started["result"]["thread"]["route"]["provider_id"], "a");
     assert_eq!(
         started["result"]["thread"]["route"]["continuity"],
         "preserved"
@@ -1227,10 +1227,10 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
         .request(
             "thread/provider/switch",
             json!({
-                "threadId": thread_id,
-                "providerId": "b",
+                "thread_id": thread_id,
+                "provider_id": "b",
                 "model": "shared",
-                "expectedRouteRevision": 1,
+                "expected_route_revision": 1,
             }),
         )
         .await;
@@ -1240,7 +1240,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
     assert!(
         switch_messages.iter().any(|message| {
             message["method"] == "thread/provider/changed"
-                && message["params"]["route"]["providerId"] == "b"
+                && message["params"]["route"]["provider_id"] == "b"
                 && message["params"]["route"]["revision"] == 2
                 && message["params"]["continuity"] == "preserved"
                 && message["params"]["route"]["continuity"] == "preserved"
@@ -1260,7 +1260,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "after switch"}),
+            json!({"thread_id": thread_id, "input": "after switch"}),
         )
         .await;
     let turn_messages = client
@@ -1270,23 +1270,23 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
     assert_eq!(seen_b.lock().unwrap().len(), 1, "{turn_messages:?}");
 
     client
-        .request("thread/read", json!({"threadId": thread_id}))
+        .request("thread/read", json!({"thread_id": thread_id}))
         .await;
     let read = client.recv().await;
-    assert_eq!(read["result"]["thread"]["route"]["providerId"], "b");
+    assert_eq!(read["result"]["thread"]["route"]["provider_id"], "b");
     assert_eq!(read["result"]["thread"]["route"]["revision"], 2);
     assert_eq!(read["result"]["thread"]["route"]["continuity"], "preserved");
 
     client
-        .request("thread/events/sync", json!({"threadId": thread_id}))
+        .request("thread/events/sync", json!({"thread_id": thread_id}))
         .await;
     let snapshot = client.recv().await;
     assert_eq!(
         snapshot["result"]["snapshot"]["thread"]["route"],
         json!({
             "revision": 2,
-            "providerId": "b",
-            "apiFamily": "mock",
+            "provider_id": "b",
+            "api_family": "mock",
             "model": "shared",
             "continuity": "preserved",
         })
@@ -1418,7 +1418,7 @@ async fn real_three_rail_route_switch_contract() {
             "thread/start",
             json!({
                 "cwd": cwd,
-                "providerId": "anthropic-real",
+                "provider_id": "anthropic-real",
                 "model": anthropic_model,
             }),
         )
@@ -1431,7 +1431,7 @@ async fn real_three_rail_route_switch_contract() {
         .unwrap()
         .to_string();
     assert_eq!(
-        started["result"]["thread"]["route"]["providerId"],
+        started["result"]["thread"]["route"]["provider_id"],
         "anthropic-real"
     );
     assert_eq!(started["result"]["thread"]["route"]["revision"], 1);
@@ -1480,7 +1480,7 @@ async fn real_three_rail_route_switch_contract() {
     .await;
 
     let read_id = client
-        .request("thread/read", json!({"threadId": thread_id}))
+        .request("thread/read", json!({"thread_id": thread_id}))
         .await;
     let read = loop {
         let message = client.recv().await;
@@ -1502,8 +1502,8 @@ async fn real_three_rail_route_switch_contract() {
         anthropic_base.as_str(),
         responses_key.as_str(),
         responses_base.as_str(),
-        "providerProvenance",
-        "endpointFingerprint",
+        "provider_provenance",
+        "endpoint_fingerprint",
     ] {
         assert!(
             !public.contains(private),
@@ -1519,7 +1519,7 @@ async fn real_three_rail_route_switch_contract() {
         snapshot
             .provider_routes
             .iter()
-            .map(|route| (route.revision, route.provider_id.as_str()))
+            .map(|route| (route.route_revision, route.provider_id.as_str()))
             .collect::<Vec<_>>(),
         [
             (1, "anthropic-real"),
@@ -1627,7 +1627,7 @@ async fn reopening_a_thread_starts_on_the_configured_default() {
     let mut client = start_server(Arc::clone(&build), &dirs);
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "q1"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "q1"}))
         .await;
     client
         .recv_until(|message| message["method"] == "turn/completed")
@@ -1636,9 +1636,9 @@ async fn reopening_a_thread_starts_on_the_configured_default() {
         .request(
             "thread/provider/switch",
             json!({
-                "threadId": thread_id,
-                "providerId": "b",
-                "expectedRouteRevision": 1,
+                "thread_id": thread_id,
+                "provider_id": "b",
+                "expected_route_revision": 1,
             }),
         )
         .await;
@@ -1655,16 +1655,16 @@ async fn reopening_a_thread_starts_on_the_configured_default() {
     let mut client = start_server(Arc::clone(&build), &dirs);
     client.initialize().await;
     let resume = client
-        .request("thread/resume", json!({"threadId": thread_id}))
+        .request("thread/resume", json!({"thread_id": thread_id}))
         .await;
     let messages = client.recv_until(|message| message["id"] == resume).await;
     let resumed = messages
         .iter()
         .find(|message| message["id"] == resume)
         .unwrap();
-    assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "a");
+    assert_eq!(resumed["result"]["thread"]["route"]["provider_id"], "a");
     assert_eq!(resumed["result"]["thread"]["route"]["revision"], 3);
-    assert_eq!(resumed["result"]["messageCount"], 2);
+    assert_eq!(resumed["result"]["message_count"], 2);
     let note = messages
         .iter()
         .find(|message| message["method"] == "note")
@@ -1680,14 +1680,14 @@ async fn reopening_a_thread_starts_on_the_configured_default() {
     let mut client = start_server(build, &dirs);
     client.initialize().await;
     let resume = client
-        .request("thread/resume", json!({"threadId": thread_id}))
+        .request("thread/resume", json!({"thread_id": thread_id}))
         .await;
     let messages = client.recv_until(|message| message["id"] == resume).await;
     let resumed = messages
         .iter()
         .find(|message| message["id"] == resume)
         .unwrap();
-    assert_eq!(resumed["result"]["thread"]["route"]["providerId"], "c");
+    assert_eq!(resumed["result"]["thread"]["route"]["provider_id"], "c");
     assert_eq!(resumed["result"]["thread"]["route"]["revision"], 4);
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
@@ -1712,9 +1712,9 @@ async fn provider_switch_errors_have_stable_kinds() {
         .request(
             "thread/provider/switch",
             json!({
-                "threadId": thread_id,
-                "providerId": "not-configured",
-                "expectedRouteRevision": 1,
+                "thread_id": thread_id,
+                "provider_id": "not-configured",
+                "expected_route_revision": 1,
             }),
         )
         .await;
@@ -1757,14 +1757,14 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
         .unwrap()
         .to_string();
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "q1"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "q1"}))
         .await;
     client
         .recv_until(|message| message["method"] == "turn/completed")
         .await;
 
     client
-        .request("thread/read", json!({"threadId": thread_id}))
+        .request("thread/read", json!({"thread_id": thread_id}))
         .await;
     let read = client.recv().await;
     assert_eq!(read["result"]["thread"]["cwd"], project_text.as_str());
@@ -1801,7 +1801,7 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
     );
     client.initialize().await;
     let resume = client
-        .request("thread/resume", json!({"threadId": thread_id}))
+        .request("thread/resume", json!({"thread_id": thread_id}))
         .await;
     let messages = client.recv_until(|message| message["id"] == resume).await;
     let resumed = messages
@@ -1825,7 +1825,7 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
     );
 
     client
-        .request("thread/fork", json!({"threadId": thread_id}))
+        .request("thread/fork", json!({"thread_id": thread_id}))
         .await;
     let forked = client.recv().await;
     let fork_id = forked["result"]["thread"]["id"]
@@ -1838,11 +1838,11 @@ async fn thread_read_list_resume_and_fork_preserve_runtime() {
     assert_eq!(forked["result"]["thread"]["route"]["model"], "mock");
     assert_eq!(forked["result"]["thread"]["route"]["revision"], 2);
     client
-        .request("thread/read", json!({"threadId": fork_id}))
+        .request("thread/read", json!({"thread_id": fork_id}))
         .await;
     let fork_read = client.recv().await;
     assert_eq!(
-        fork_read["result"]["thread"]["forkedFrom"]["threadId"],
+        fork_read["result"]["thread"]["forked_from"]["thread_id"],
         thread_id
     );
     assert_eq!(fork_read["result"]["thread"]["cwd"], project_text.as_str());
@@ -1873,7 +1873,7 @@ async fn thread_read_strips_reasoning_replay_secrets() {
             ],
             kloop_protocol::ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: 3,
+                route_boundary: 3,
                 provider_id: "test".into(),
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
@@ -1889,7 +1889,7 @@ async fn thread_read_strips_reasoning_replay_secrets() {
     );
     client.initialize().await;
     client
-        .request("thread/read", json!({"threadId": "reasoning"}))
+        .request("thread/read", json!({"thread_id": "reasoning"}))
         .await;
     let read = client.recv().await;
     let assistant = &read["result"]["thread"]["messages"][1];
@@ -1931,8 +1931,8 @@ async fn legacy_session_without_route_timeline_is_rejected_without_migration() {
     );
     client.initialize().await;
     for request in [
-        json!({"threadId": thread_id}),
-        json!({"threadId": thread_id, "cwd": dirs.root}),
+        json!({"thread_id": thread_id}),
+        json!({"thread_id": thread_id, "cwd": dirs.root}),
     ] {
         client.request("thread/resume", request).await;
         let error = client.recv().await;
@@ -1973,7 +1973,7 @@ async fn read_methods_do_not_repair_torn_tail() {
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
     client
-        .request("thread/read", json!({"threadId": "torn"}))
+        .request("thread/read", json!({"thread_id": "torn"}))
         .await;
     let read = client.recv().await;
     assert!(read["error"].is_null());
@@ -1983,7 +1983,7 @@ async fn read_methods_do_not_repair_torn_tail() {
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
     client
-        .request("thread/resume", json!({"threadId": "torn"}))
+        .request("thread/resume", json!({"thread_id": "torn"}))
         .await;
     let resumed = client.recv().await;
     assert!(resumed["error"].is_null(), "resume failed: {resumed}");
@@ -2003,13 +2003,13 @@ async fn client_thread_ids_cannot_escape_sessions_dir() {
     client.initialize().await;
 
     for (method, params) in [
-        ("thread/read", json!({"threadId": "../outside"})),
-        ("thread/resume", json!({"threadId": "../outside"})),
-        ("thread/fork", json!({"threadId": "../outside"})),
-        ("config/read", json!({"threadId": "../outside"})),
-        ("thread/read", json!({"threadId": absolute})),
-        ("thread/read", json!({"threadId": "a/b"})),
-        ("thread/read", json!({"threadId": ".."})),
+        ("thread/read", json!({"thread_id": "../outside"})),
+        ("thread/resume", json!({"thread_id": "../outside"})),
+        ("thread/fork", json!({"thread_id": "../outside"})),
+        ("config/read", json!({"thread_id": "../outside"})),
+        ("thread/read", json!({"thread_id": absolute})),
+        ("thread/read", json!({"thread_id": "a/b"})),
+        ("thread/read", json!({"thread_id": ".."})),
     ] {
         client.request(method, params).await;
         let response = client.recv().await;
@@ -2046,7 +2046,7 @@ async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
     client
-        .request("thread/read", json!({"threadId": "repair"}))
+        .request("thread/read", json!({"thread_id": "repair"}))
         .await;
     let read = client.recv().await;
     assert_eq!(
@@ -2062,7 +2062,7 @@ async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
     client
-        .request("thread/resume", json!({"threadId": "repair"}))
+        .request("thread/resume", json!({"thread_id": "repair"}))
         .await;
     assert!(client.recv().await["error"].is_null());
     let marker_bytes = std::fs::read(&path).unwrap();
@@ -2072,7 +2072,7 @@ async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
     client
-        .request("thread/resume", json!({"threadId": "repair"}))
+        .request("thread/resume", json!({"thread_id": "repair"}))
         .await;
     assert!(client.recv().await["error"].is_null());
     assert_eq!(std::fs::read(&path).unwrap(), marker_bytes);
@@ -2117,7 +2117,7 @@ async fn early_prefix_fork_restores_route_and_runtime_at_the_cut() {
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
     let request = client
-        .request("thread/fork", json!({"threadId": source_id, "cut": cut}))
+        .request("thread/fork", json!({"thread_id": source_id, "cut": cut}))
         .await;
     let response = client.recv_until(|message| message["id"] == request).await;
     let fork_id = response
@@ -2163,7 +2163,7 @@ async fn worktree_enter_write_exit_notifies_and_isolates() {
 
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "go"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
 
@@ -2203,7 +2203,7 @@ async fn unexited_worktree_is_retained_on_shutdown() {
     );
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "go"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
     assert!(
@@ -2231,7 +2231,7 @@ async fn turn_streams_item_events_and_completes() {
 
     let thread_id = client.init_and_start().await;
     let turn_id = client
-        .request("turn/start", json!({"threadId": thread_id, "input": "hi"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "hi"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
 
@@ -2260,20 +2260,20 @@ async fn turn_streams_item_events_and_completes() {
     );
     let sequenced = log
         .iter()
-        .filter(|message| message["params"]["threadId"] == thread_id)
+        .filter(|message| message["params"]["thread_id"] == thread_id)
         .collect::<Vec<_>>();
-    let generation = sequenced[0]["params"]["eventGeneration"]
+    let generation = sequenced[0]["params"]["event_generation"]
         .as_str()
         .expect("event generation")
         .to_string();
     assert!(!generation.is_empty());
     for (index, message) in sequenced.iter().enumerate() {
-        assert_eq!(message["params"]["eventGeneration"], generation);
+        assert_eq!(message["params"]["event_generation"], generation);
         assert_eq!(message["params"]["seq"], (index + 1).to_string());
     }
     // Every item event carries the turn id.
     for m in &log {
-        if let Some(t) = m["params"]["turnId"].as_u64() {
+        if let Some(t) = m["params"]["turn_id"].as_u64() {
             assert_eq!(t, allocated);
         }
     }
@@ -2289,7 +2289,7 @@ async fn turn_streams_item_events_and_completes() {
         .iter()
         .find(|m| m["method"] == "item/completed")
         .unwrap();
-    assert_eq!(completed["params"]["item"]["type"], "assistantMessage");
+    assert_eq!(completed["params"]["item"]["type"], "assistant_message");
     assert_eq!(completed["params"]["item"]["text"], "hello there");
     assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "completed");
 
@@ -2316,25 +2316,25 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     let thread_id = client.init_and_start().await;
 
     let sync_id = client
-        .request("thread/events/sync", json!({"threadId": thread_id}))
+        .request("thread/events/sync", json!({"thread_id": thread_id}))
         .await;
     let initial = client.recv().await;
     assert_eq!(initial["id"], sync_id);
     assert_eq!(initial["result"]["mode"], "snapshot");
     assert_eq!(initial["result"]["reason"], "initial");
-    assert_eq!(initial["result"]["highWaterSeq"], "0");
-    assert_eq!(initial["result"]["snapshot"]["schemaVersion"], 1);
+    assert_eq!(initial["result"]["high_water_seq"], "0");
+    assert_eq!(initial["result"]["snapshot"]["schema_version"], 1);
     assert_eq!(
         initial["result"]["snapshot"]["recovery"],
-        json!({"source": "fresh", "volatileState": "live"})
+        json!({"source": "fresh", "volatile_state": "live"})
     );
-    let initial_cursor = initial["result"]["eventCursor"].clone();
+    let initial_cursor = initial["result"]["event_cursor"].clone();
     let generation = initial_cursor["generation"].as_str().unwrap().to_string();
 
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "first input"}),
+            json!({"thread_id": thread_id, "input": "first input"}),
         )
         .await;
     let live = client
@@ -2342,7 +2342,7 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
         .await;
     let live_events = live
         .iter()
-        .filter(|message| message["params"]["threadId"] == thread_id)
+        .filter(|message| message["params"]["thread_id"] == thread_id)
         .map(|message| {
             json!({
                 "method": message["method"].clone(),
@@ -2355,7 +2355,7 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     let replay_id = client
         .request(
             "thread/events/sync",
-            json!({"threadId": thread_id, "eventCursor": initial_cursor}),
+            json!({"thread_id": thread_id, "event_cursor": initial_cursor}),
         )
         .await;
     let replay = client.recv().await;
@@ -2363,12 +2363,12 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     assert_eq!(replay["result"]["mode"], "replay");
     assert_eq!(replay["result"]["generation"], generation);
     assert_eq!(replay["result"]["events"], json!(live_events));
-    let high_water_cursor = replay["result"]["eventCursor"].clone();
+    let high_water_cursor = replay["result"]["event_cursor"].clone();
 
     let current_id = client
         .request(
             "thread/events/sync",
-            json!({"threadId": thread_id, "eventCursor": high_water_cursor.clone()}),
+            json!({"thread_id": thread_id, "event_cursor": high_water_cursor.clone()}),
         )
         .await;
     let current = client.recv().await;
@@ -2377,7 +2377,7 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     assert_eq!(current["result"]["events"], json!([]));
 
     let snapshot_id = client
-        .request("thread/events/sync", json!({"threadId": thread_id}))
+        .request("thread/events/sync", json!({"thread_id": thread_id}))
         .await;
     let snapshot = client.recv().await;
     assert_eq!(snapshot["id"], snapshot_id);
@@ -2393,7 +2393,7 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "second input"}),
+            json!({"thread_id": thread_id, "input": "second input"}),
         )
         .await;
     let second_live = client
@@ -2413,15 +2413,15 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     assert_eq!(first_second_seq, first_high_water + 1);
 
     for bad_cursor in [
-        json!({"threadId": thread_id, "generation": generation, "seq": 1}),
-        json!({"threadId": "other", "generation": generation, "seq": "0"}),
-        json!({"threadId": thread_id, "generation": generation, "seq": "18446744073709551616"}),
-        json!({"threadId": thread_id, "generation": generation, "seq": "999999"}),
+        json!({"thread_id": thread_id, "generation": generation, "seq": 1}),
+        json!({"thread_id": "other", "generation": generation, "seq": "0"}),
+        json!({"thread_id": thread_id, "generation": generation, "seq": "18446744073709551616"}),
+        json!({"thread_id": thread_id, "generation": generation, "seq": "999999"}),
     ] {
         let id = client
             .request(
                 "thread/events/sync",
-                json!({"threadId": thread_id, "eventCursor": bad_cursor}),
+                json!({"thread_id": thread_id, "event_cursor": bad_cursor}),
             )
             .await;
         let error = client.recv().await;
@@ -2437,23 +2437,23 @@ async fn event_sync_replays_then_resume_changes_generation_and_snapshots_history
     );
     resumed.initialize().await;
     let resume_id = resumed
-        .request("thread/resume", json!({"threadId": thread_id}))
+        .request("thread/resume", json!({"thread_id": thread_id}))
         .await;
     assert_eq!(resumed.recv().await["id"], resume_id);
     let changed_id = resumed
         .request(
             "thread/events/sync",
-            json!({"threadId": thread_id, "eventCursor": high_water_cursor}),
+            json!({"thread_id": thread_id, "event_cursor": high_water_cursor}),
         )
         .await;
     let changed = resumed.recv().await;
     assert_eq!(changed["id"], changed_id);
     assert_eq!(changed["result"]["mode"], "snapshot");
-    assert_eq!(changed["result"]["reason"], "generationChanged");
+    assert_eq!(changed["result"]["reason"], "generation_changed");
     assert_ne!(changed["result"]["generation"], generation);
     assert_eq!(
         changed["result"]["snapshot"]["recovery"],
-        json!({"source": "resumed", "volatileState": "reset"})
+        json!({"source": "resumed", "volatile_state": "reset"})
     );
     assert_eq!(
         changed["result"]["snapshot"]["history"]["messages"]
@@ -2493,7 +2493,7 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     let request_id = client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "start timer"}),
+            json!({"thread_id": thread_id, "input": "start timer"}),
         )
         .await;
     let first_log = client
@@ -2507,7 +2507,7 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
         .unwrap();
     assert!(first_log.iter().any(|message| {
         message["method"] == "thread/scheduler/updated"
-            && message["params"]["task"]["origin"] == "loopWakeup"
+            && message["params"]["task"]["origin"] == "loop_wakeup"
             && message["params"]["task"]["status"] == "scheduled"
     }));
 
@@ -2523,16 +2523,16 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     assert_eq!(delivery_turn_id, first_turn_id + 1);
     assert!(delivery.iter().any(|message| {
         message["method"] == "thread/scheduler/updated"
-            && message["params"]["task"]["origin"] == "loopWakeup"
+            && message["params"]["task"]["origin"] == "loop_wakeup"
             && message["params"]["task"]["status"] == "fired"
-            && message["params"].get("turnId").is_none()
+            && message["params"].get("turn_id").is_none()
     }));
     for message in &delivery {
         if matches!(
             message["method"].as_str(),
             Some("item/started" | "item/delta" | "item/completed")
         ) {
-            assert_eq!(message["params"]["turnId"], delivery_turn_id);
+            assert_eq!(message["params"]["turn_id"], delivery_turn_id);
         }
     }
     let completed = delivery.last().unwrap();
@@ -2565,7 +2565,7 @@ async fn todo_write_surfaces_as_an_ordinary_tool_call() {
 
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "go"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
 
@@ -2581,7 +2581,7 @@ async fn todo_write_surfaces_as_an_ordinary_tool_call() {
                 .is_some_and(|method| method.to_ascii_lowercase().contains("taskgraph"))
                 || matches!(
                     message["params"]["item"]["type"].as_str(),
-                    Some("task" | "taskGraph")
+                    Some("task" | "task_graph")
                 )
         }),
         "the internal todo snapshot must not become public wire: {log:?}"
@@ -2589,7 +2589,7 @@ async fn todo_write_surfaces_as_an_ordinary_tool_call() {
     let calls = log
         .iter()
         .filter(|message| {
-            message["params"]["item"]["type"] == "toolCall"
+            message["params"]["item"]["type"] == "tool_call"
                 && message["params"]["item"]["name"] == "todo_write"
         })
         .collect::<Vec<_>>();
@@ -2615,7 +2615,7 @@ async fn partial_stream_is_sealed_then_continued_and_stays_recoverable() {
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "answer"}),
+            json!({"thread_id": thread_id, "input": "answer"}),
         )
         .await;
     let log = client
@@ -2643,7 +2643,7 @@ async fn partial_stream_is_sealed_then_continued_and_stays_recoverable() {
     );
 
     client
-        .request("thread/read", json!({"threadId": thread_id}))
+        .request("thread/read", json!({"thread_id": thread_id}))
         .await;
     let read = client.recv().await;
     let thread = &read["result"]["thread"];
@@ -2655,7 +2655,7 @@ async fn partial_stream_is_sealed_then_continued_and_stays_recoverable() {
     assert_eq!(
         thread["terminals"],
         json!([{
-            "afterMessage": 4,
+            "after_message": 4,
             "status": "completed",
         }])
     );
@@ -2685,14 +2685,14 @@ async fn subagent_items_carry_the_agent_label() {
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "delegate"}),
+            json!({"thread_id": thread_id, "input": "delegate"}),
         )
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
 
     let started = log
         .iter()
-        .find(|m| m["method"] == "item/started" && m["params"]["item"]["type"] == "subAgent")
+        .find(|m| m["method"] == "item/started" && m["params"]["item"]["type"] == "sub_agent")
         .expect("subAgent started item");
     let label = started["params"]["item"]["label"]
         .as_str()
@@ -2706,19 +2706,19 @@ async fn subagent_items_carry_the_agent_label() {
     let task_row = log
         .iter()
         .find(|m| {
-            m["params"]["item"]["type"] == "toolCall" && m["params"]["item"]["name"] == "run_agent"
+            m["params"]["item"]["type"] == "tool_call" && m["params"]["item"]["name"] == "run_agent"
         })
         .unwrap();
     assert!(task_row["params"]["item"].get("agent").is_none());
     let bash_row = log
         .iter()
         .find(|m| {
-            m["params"]["item"]["type"] == "toolCall" && m["params"]["item"]["name"] == "bash"
+            m["params"]["item"]["type"] == "tool_call" && m["params"]["item"]["name"] == "bash"
         })
         .unwrap();
     assert_eq!(bash_row["params"]["item"]["agent"], label.as_str());
     assert!(log.iter().any(|m| m["method"] == "item/completed"
-        && m["params"]["item"]["type"] == "subAgent"
+        && m["params"]["item"]["type"] == "sub_agent"
         && m["params"]["item"]["label"] == label.as_str()
         && m["params"]["item"]["status"] == "completed"));
 
@@ -2750,7 +2750,7 @@ async fn approval_declined_then_accepted() {
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "write it"}),
+            json!({"thread_id": thread_id, "input": "write it"}),
         )
         .await;
     let log = client
@@ -2758,9 +2758,9 @@ async fn approval_declined_then_accepted() {
         .await;
     let request = log.last().unwrap();
     let srv_id = request["id"].as_i64().unwrap();
-    assert!(request["params"].get("eventGeneration").is_none());
+    assert!(request["params"].get("event_generation").is_none());
     assert!(request["params"].get("seq").is_none());
-    assert_eq!(request["params"]["kind"], "fileChange");
+    assert_eq!(request["params"]["kind"], "file_change");
     assert!(
         request["params"]["description"]
             .as_str()
@@ -2768,10 +2768,10 @@ async fn approval_declined_then_accepted() {
             .contains("write_file")
     );
     assert_eq!(
-        request["params"]["approvalScopes"],
-        json!(["once", "workspaceSession"])
+        request["params"]["approval_scopes"],
+        json!(["once", "workspace_session"])
     );
-    assert!(request["params"]["rememberRules"].is_array());
+    assert!(request["params"]["remember_rules"].is_array());
     // The change preview reaches the client (a fresh path is a new file).
     assert_eq!(request["params"]["preview"], "(new file)\n+1  x");
 
@@ -2783,10 +2783,10 @@ async fn approval_declined_then_accepted() {
         .iter()
         .find(|thread| thread["id"] == thread_id)
         .unwrap();
-    assert_eq!(active["inProgress"], true);
+    assert_eq!(active["in_progress"], true);
     let files_before = std::fs::read_dir(&dirs.sessions).unwrap().count();
     client
-        .request("thread/fork", json!({"threadId": thread_id}))
+        .request("thread/fork", json!({"thread_id": thread_id}))
         .await;
     let fork_error = client.recv().await;
     assert!(
@@ -2807,7 +2807,7 @@ async fn approval_declined_then_accepted() {
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert!(
         log.iter().any(|m| m["method"] == "item/completed"
-            && m["params"]["item"]["type"] == "toolCall"
+            && m["params"]["item"]["type"] == "tool_call"
             && m["params"]["item"]["status"] == "failed"),
         "declined call must surface as a failed tool item: {log:?}"
     );
@@ -2817,7 +2817,7 @@ async fn approval_declined_then_accepted() {
     client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "again"}),
+            json!({"thread_id": thread_id, "input": "again"}),
         )
         .await;
     let log = client
@@ -2829,7 +2829,7 @@ async fn approval_declined_then_accepted() {
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert!(log.iter().any(|m| m["method"] == "item/completed"
-        && m["params"]["item"]["type"] == "toolCall"
+        && m["params"]["item"]["type"] == "tool_call"
         && m["params"]["item"]["status"] == "completed"));
     assert!(target.exists(), "accept must let the write through");
 
@@ -2852,7 +2852,7 @@ async fn negotiated_questions_round_trip_multiple_answers() {
                         {"label": "A", "description": "first", "preview": "preview A"},
                         {"label": "B", "description": "second"}
                     ],
-                    "multiSelect": false
+                    "multi_select": false
                 },
                 {
                     "question": "Choose several",
@@ -2861,7 +2861,7 @@ async fn negotiated_questions_round_trip_multiple_answers() {
                         {"label": "X", "description": "x"},
                         {"label": "Y", "description": "y"}
                     ],
-                    "multiSelect": true
+                    "multi_select": true
                 }
             ]
         }),
@@ -2876,16 +2876,19 @@ async fn negotiated_questions_round_trip_multiple_answers() {
     );
     let thread_id = client.init_questions_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "ask"}))
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "ask"}),
+        )
         .await;
 
     let log = client
         .recv_until(|message| message["method"] == "question/request")
         .await;
     let first = log.last().unwrap();
-    assert_eq!(first["params"]["threadId"], thread_id);
-    assert_eq!(first["params"]["turnId"], 1);
-    assert_eq!(first["params"]["questionIndex"], 0);
+    assert_eq!(first["params"]["thread_id"], thread_id);
+    assert_eq!(first["params"]["turn_id"], 1);
+    assert_eq!(first["params"]["question_index"], 0);
     assert_eq!(first["params"]["question"]["header"], "Single");
     assert_eq!(
         first["params"]["question"]["options"][0]["preview"],
@@ -2905,8 +2908,8 @@ async fn negotiated_questions_round_trip_multiple_answers() {
         .await
         .pop()
         .unwrap();
-    assert_eq!(second["params"]["questionIndex"], 1);
-    assert_eq!(second["params"]["question"]["multiSelect"], true);
+    assert_eq!(second["params"]["question_index"], 1);
+    assert_eq!(second["params"]["question"]["multi_select"], true);
     let second_id = second["id"].as_i64().unwrap();
     client
         .send(json!({
@@ -2940,7 +2943,7 @@ async fn missing_question_capability_fails_closed_without_reverse_request() {
                     {"label": "A", "description": "first"},
                     {"label": "B", "description": "second"}
                 ],
-                "multiSelect": false
+                "multi_select": false
             }]
         }),
     );
@@ -2954,7 +2957,10 @@ async fn missing_question_capability_fails_closed_without_reverse_request() {
     );
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "ask"}))
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "ask"}),
+        )
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert!(!log.iter().any(|m| m["method"] == "question/request"));
@@ -2990,7 +2996,7 @@ async fn steer_folds_into_a_running_turn() {
 
     let thread_id = client.init_and_start().await;
     let start_id = client
-        .request("turn/start", json!({"threadId": thread_id, "input": "go"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
         .await;
     let log = client
         .recv_until(|m| m["method"] == "approval/request")
@@ -3005,12 +3011,12 @@ async fn steer_folds_into_a_running_turn() {
     let steer_id = client
         .request(
             "turn/steer",
-            json!({"threadId": thread_id, "input": "also check the logs"}),
+            json!({"thread_id": thread_id, "input": "also check the logs"}),
         )
         .await;
     let log = client.recv_until(|m| m["id"] == steer_id).await;
     assert_eq!(
-        log.iter().find(|m| m["id"] == steer_id).unwrap()["result"]["turnId"],
+        log.iter().find(|m| m["id"] == steer_id).unwrap()["result"]["turn_id"],
         turn_id
     );
 
@@ -3049,7 +3055,7 @@ async fn steer_to_a_missing_thread_errors() {
     );
     client.initialize().await;
     let id = client
-        .request("turn/steer", json!({"threadId": "ghost", "input": "hi"}))
+        .request("turn/steer", json!({"thread_id": "ghost", "input": "hi"}))
         .await;
     let err = client.recv().await;
     assert_eq!(err["id"], id);
@@ -3081,10 +3087,10 @@ async fn parallel_threads_do_not_cross_streams() {
     assert_ne!(t1, t2, "same-second thread ids must not collide");
 
     client
-        .request("turn/start", json!({"threadId": t1, "input": "a"}))
+        .request("turn/start", json!({"thread_id": t1, "input": "a"}))
         .await;
     client
-        .request("turn/start", json!({"threadId": t2, "input": "b"}))
+        .request("turn/start", json!({"thread_id": t2, "input": "b"}))
         .await;
 
     let mut completed = 0;
@@ -3129,7 +3135,7 @@ async fn second_turn_while_running_is_rejected_and_interrupt_aborts() {
 
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "go"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
         .await;
     client
         .recv_until(|m| m["method"] == "approval/request")
@@ -3139,7 +3145,7 @@ async fn second_turn_while_running_is_rejected_and_interrupt_aborts() {
     let busy_id = client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "more"}),
+            json!({"thread_id": thread_id, "input": "more"}),
         )
         .await;
     let log = client.recv_until(|m| m["id"] == busy_id).await;
@@ -3152,7 +3158,7 @@ async fn second_turn_while_running_is_rejected_and_interrupt_aborts() {
 
     // Interrupt instead of answering the approval.
     client
-        .request("turn/interrupt", json!({"threadId": thread_id}))
+        .request("turn/interrupt", json!({"thread_id": thread_id}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "aborted");
@@ -3162,7 +3168,7 @@ async fn second_turn_while_running_is_rejected_and_interrupt_aborts() {
     let next_id = client
         .request(
             "turn/start",
-            json!({"threadId": thread_id, "input": "next"}),
+            json!({"thread_id": thread_id, "input": "next"}),
         )
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
@@ -3195,13 +3201,13 @@ async fn protocol_errors_do_not_kill_the_server() {
     assert_eq!(err["error"]["code"], -32601);
 
     client
-        .request("turn/start", json!({"threadId": "ghost", "input": "x"}))
+        .request("turn/start", json!({"thread_id": "ghost", "input": "x"}))
         .await;
     let err = client.recv().await;
     assert_eq!(err["error"]["code"], -32000);
 
     client
-        .request("thread/resume", json!({"threadId": "ghost"}))
+        .request("thread/resume", json!({"thread_id": "ghost"}))
         .await;
     let err = client.recv().await;
     assert!(
@@ -3231,7 +3237,7 @@ async fn protocol_errors_do_not_kill_the_server() {
         resp["result"]["thread"]["id"].as_str().unwrap().to_string()
     };
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "x"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "x"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "completed");
@@ -3249,7 +3255,7 @@ async fn sessions_survive_a_server_restart() {
     let mut client = start_server(factory(script.clone(), dirs.offload.clone(), false), &dirs);
     let thread_id = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "q1"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "q1"}))
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
     client.shutdown().await;
@@ -3268,15 +3274,15 @@ async fn sessions_survive_a_server_restart() {
     assert_eq!(entry["snippet"], "q1");
 
     client
-        .request("thread/resume", json!({"threadId": thread_id}))
+        .request("thread/resume", json!({"thread_id": thread_id}))
         .await;
     let resumed = client.recv().await;
     assert_eq!(resumed["result"]["thread"]["id"], thread_id.as_str());
-    assert_eq!(resumed["result"]["messageCount"], 2);
+    assert_eq!(resumed["result"]["message_count"], 2);
 
     // Resuming twice is an error (already active).
     client
-        .request("thread/resume", json!({"threadId": thread_id}))
+        .request("thread/resume", json!({"thread_id": thread_id}))
         .await;
     let err = client.recv().await;
     assert!(
@@ -3287,7 +3293,7 @@ async fn sessions_survive_a_server_restart() {
     );
 
     client
-        .request("turn/start", json!({"threadId": thread_id, "input": "q2"}))
+        .request("turn/start", json!({"thread_id": thread_id, "input": "q2"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "completed");
@@ -3312,19 +3318,19 @@ async fn thread_fork_branches_a_session_into_a_live_thread() {
     // Source thread with one complete user/assistant exchange.
     let src = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": src, "input": "q1"}))
+        .request("turn/start", json!({"thread_id": src, "input": "q1"}))
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
 
     // Fork at the end (no cut) into a new live thread.
     let fork_req = client
-        .request("thread/fork", json!({"threadId": src}))
+        .request("thread/fork", json!({"thread_id": src}))
         .await;
     let log = client.recv_until(|m| m["id"] == fork_req).await;
     let resp = log.iter().find(|m| m["id"] == fork_req).unwrap();
     let fork_id = resp["result"]["thread"]["id"].as_str().unwrap().to_string();
     assert_ne!(fork_id, src, "the fork gets its own thread id");
-    assert_eq!(resp["result"]["messageCount"], 2);
+    assert_eq!(resp["result"]["message_count"], 2);
 
     // Lineage: the fork's first line carries a cross-file parent at the cut.
     let fork_path = dirs.sessions.join(format!("{fork_id}.jsonl"));
@@ -3335,7 +3341,7 @@ async fn thread_fork_branches_a_session_into_a_live_thread() {
 
     // The fork is live: a turn runs on it and completes.
     client
-        .request("turn/start", json!({"threadId": fork_id, "input": "q2"}))
+        .request("turn/start", json!({"thread_id": fork_id, "input": "q2"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "completed");
@@ -3365,13 +3371,13 @@ async fn thread_fork_rejects_an_illegal_cut() {
     );
     let src = client.init_and_start().await;
     client
-        .request("turn/start", json!({"threadId": src, "input": "q"}))
+        .request("turn/start", json!({"thread_id": src, "input": "q"}))
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
 
     // Cut #1 lands between the user message and its assistant reply — illegal.
     let bad = client
-        .request("thread/fork", json!({"threadId": src, "cut": 1}))
+        .request("thread/fork", json!({"thread_id": src, "cut": 1}))
         .await;
     let log = client.recv_until(|m| m["id"] == bad).await;
     let msg = log.iter().find(|m| m["id"] == bad).unwrap()["error"]["message"]
@@ -3385,7 +3391,7 @@ async fn thread_fork_rejects_an_illegal_cut() {
 
     // Forking a session that does not exist is a clean error too.
     client
-        .request("thread/fork", json!({"threadId": "ghost"}))
+        .request("thread/fork", json!({"thread_id": "ghost"}))
         .await;
     let err = client.recv().await;
     assert!(
@@ -3415,7 +3421,10 @@ async fn slash_commands_surface_as_system_notifications() {
     // Provider control commands use the idle switch transaction directly: they
     // emit one bounded system result, not a turn bracket or usage event.
     client
-        .request("turn/start", json!({"threadId": tid, "input": "/provider"}))
+        .request(
+            "turn/start",
+            json!({"thread_id": tid, "input": "/provider"}),
+        )
         .await;
     let provider_log = client.recv_until(|m| m["method"] == "system").await;
     assert_eq!(methods_for_thread(&provider_log, &tid), vec!["system"]);
@@ -3432,7 +3441,7 @@ async fn slash_commands_surface_as_system_notifications() {
 
     // /help lists the builtins as a system note; no item events appear.
     client
-        .request("turn/start", json!({"threadId": tid, "input": "/help"}))
+        .request("turn/start", json!({"thread_id": tid, "input": "/help"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(
@@ -3458,7 +3467,7 @@ async fn slash_commands_surface_as_system_notifications() {
     client
         .request(
             "turn/start",
-            json!({"threadId": tid, "input": "/frobnicate"}),
+            json!({"thread_id": tid, "input": "/frobnicate"}),
         )
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
@@ -3506,12 +3515,12 @@ async fn clear_command_empties_history_and_notifies() {
 
     // A real turn populates history first.
     client
-        .request("turn/start", json!({"threadId": tid, "input": "hello"}))
+        .request("turn/start", json!({"thread_id": tid, "input": "hello"}))
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
 
     client
-        .request("turn/start", json!({"threadId": tid, "input": "/clear"}))
+        .request("turn/start", json!({"thread_id": tid, "input": "/clear"}))
         .await;
     let log = client.recv_until(|m| m["method"] == "turn/completed").await;
     assert_eq!(
@@ -3651,7 +3660,7 @@ async fn real_effort_sweep_contract() {
     let start_id = client
         .request(
             "thread/start",
-            json!({"cwd": cwd, "providerId": provider_id, "model": model}),
+            json!({"cwd": cwd, "provider_id": provider_id, "model": model}),
         )
         .await;
     let started = client.recv_with_timeout(Duration::from_secs(60)).await;

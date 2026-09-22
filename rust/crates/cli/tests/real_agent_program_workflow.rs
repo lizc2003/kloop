@@ -302,7 +302,7 @@ impl NativeClient {
     fn run_turn(&mut self, thread_id: &str, prompt: &str) -> Vec<Value> {
         let request_id = self.send(
             "turn/start",
-            json!({"threadId": thread_id, "input": prompt}),
+            json!({"thread_id": thread_id, "input": prompt}),
         );
         let deadline = Instant::now() + real_evaluator_timeout();
         let mut messages = Vec::new();
@@ -361,7 +361,7 @@ fn tool_items<'a>(messages: &'a [Value], method: &str, name: &str) -> Vec<&'a Va
         .iter()
         .filter(|message| {
             message["method"] == method
-                && message["params"]["item"]["type"] == "toolCall"
+                && message["params"]["item"]["type"] == "tool_call"
                 && message["params"]["item"]["name"] == name
         })
         .collect()
@@ -466,7 +466,7 @@ fn assert_background_lifecycle(
         .collect();
     assert!(!updates.is_empty(), "missing {kind} lifecycle events");
     assert!(updates.iter().all(|message| {
-        message["params"].get("turnId").is_none()
+        message["params"].get("turn_id").is_none()
             && message["params"]["task"]["description"] == description
     }));
 
@@ -502,7 +502,7 @@ fn assert_background_lifecycle(
 
     let run_id = match run_prefix {
         Some(prefix) => {
-            let run_id = updates[0]["params"]["task"]["runId"]
+            let run_id = updates[0]["params"]["task"]["run_id"]
                 .as_str()
                 .expect("durable background work omitted runId")
                 .to_string();
@@ -510,7 +510,7 @@ fn assert_background_lifecycle(
             assert!(
                 updates
                     .iter()
-                    .all(|message| message["params"]["task"]["runId"] == run_id)
+                    .all(|message| message["params"]["task"]["run_id"] == run_id)
             );
             Some(run_id)
         }
@@ -518,7 +518,7 @@ fn assert_background_lifecycle(
             assert!(
                 updates
                     .iter()
-                    .all(|message| message["params"]["task"].get("runId").is_none())
+                    .all(|message| message["params"]["task"].get("run_id").is_none())
             );
             None
         }
@@ -709,7 +709,7 @@ fn real_agent_program_workflow_contract() {
         .iter()
         .filter(|message| {
             message["method"] == "item/started"
-                && message["params"]["item"]["type"] == "subAgent"
+                && message["params"]["item"]["type"] == "sub_agent"
                 && message["params"]["item"]["task"]
                     .as_str()
                     .is_some_and(|task| task.contains(PROGRAM_CHILD_SENTINEL))
@@ -872,7 +872,7 @@ fn real_agent_program_workflow_contract() {
         terminals[0]["params"]["task"]["status"], "completed",
         "Workflow did not complete"
     );
-    let output_path = terminals[0]["params"]["task"]["outputPath"]
+    let output_path = terminals[0]["params"]["task"]["output_path"]
         .as_str()
         .expect("Workflow terminal omitted result path");
     let output_path = assert_path_within(Path::new(output_path), &root.workspace());
@@ -1053,12 +1053,12 @@ fn real_local_agent_mailbox_contract() {
     assert_eq!(updates.len(), 6, "each of three messages needs two states");
     assert!(updates.iter().all(|message| {
         let params = &message["params"];
-        params.get("turnId").is_none()
+        params.get("turn_id").is_none()
             && params.get("message").is_none()
             && params.get("body").is_none()
-            && params.get("contextId").is_none()
-            && params.get("taskId").is_none()
-            && params.get("threadId").is_some()
+            && params.get("context_id").is_none()
+            && params.get("task_id").is_none()
+            && params.get("thread_id").is_some()
     }));
     assert!(
         updates
@@ -1075,10 +1075,10 @@ fn real_local_agent_mailbox_contract() {
         assert_eq!(route.len(), 2, "route {from}->{to} did not have two states");
         assert_eq!(route[0]["params"]["status"], "queued");
         assert_eq!(route[1]["params"]["status"], "delivered");
-        let id = route[0]["params"]["messageId"]
+        let id = route[0]["params"]["message_id"]
             .as_str()
             .expect("message update omitted id");
-        assert_eq!(route[1]["params"]["messageId"], id);
+        assert_eq!(route[1]["params"]["message_id"], id);
         route_ids.push(id.to_string());
     }
     assert_eq!(route_ids.iter().collect::<HashSet<_>>().len(), 3);
@@ -1093,7 +1093,7 @@ fn real_local_agent_mailbox_contract() {
         let input = &message["params"]["item"]["input"];
         input.get("to").is_some()
             && input.get("summary").is_some()
-            && input.get("messageBytes").is_some()
+            && input.get("message_bytes").is_some()
             && input.get("message").is_none()
     }));
     let senders = send_starts

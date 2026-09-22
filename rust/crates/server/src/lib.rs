@@ -117,7 +117,6 @@ pub type ConfigFactory = Arc<
 /// Provider credentials, MCP headers/env, hook commands, and permission-rule
 /// bodies are intentionally absent from this allowlist DTO.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConfigSnapshot {
     pub cwd: String,
     pub route: Option<ActiveProviderRoute>,
@@ -129,7 +128,6 @@ pub struct ConfigSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SandboxConfigInfo {
     pub enabled: bool,
     pub allow_network: bool,
@@ -138,7 +136,7 @@ pub struct SandboxConfigInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum SkillScope {
     Project,
     User,
@@ -147,7 +145,7 @@ pub enum SkillScope {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum SkillContext {
     Inline,
     Fork,
@@ -156,7 +154,6 @@ pub enum SkillContext {
 /// Metadata only: a skill body and its allowed-tools list stay private until
 /// the normal skill invocation path loads them into a model turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
@@ -167,7 +164,6 @@ pub struct SkillInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SkillsSnapshot {
     pub cwd: String,
     pub skills: Vec<SkillInfo>,
@@ -175,21 +171,20 @@ pub struct SkillsSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum McpTransportKind {
     Stdio,
     Http,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum McpServerState {
     Connected,
     Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpToolInfo {
     pub name: String,
     pub description: String,
@@ -198,7 +193,6 @@ pub struct McpToolInfo {
 /// Startup discovery status, not a live health probe. Request handling returns
 /// this immutable snapshot and never reconnects or performs network IO.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct McpServerStatus {
     pub name: String,
     pub transport: McpTransportKind,
@@ -587,7 +581,7 @@ impl Server {
                 "mcp": true,
                 "images": true,
                 "approvals": {
-                    "scopes": ["once", "workspaceSession", "project"]
+                    "scopes": ["once", "workspace_session", "project"]
                 },
                 "questions": true,
                 "providers": {"catalog": true, "switch": true},
@@ -714,7 +708,7 @@ impl Server {
     }
 
     fn thread_resume(&mut self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "threadId")?;
+        let thread_id = str_param(params, "thread_id")?;
         if self.threads.contains_key(thread_id) {
             return Err((
                 wire::SERVER_ERROR,
@@ -748,7 +742,7 @@ impl Server {
             .clone();
         Ok(json!({
             "thread": thread_runtime_json(thread_id, &options, &route),
-            "messageCount": count,
+            "message_count": count,
         }))
     }
     /// Fork a session at a cut point into a fresh thread, then spawn it live
@@ -757,7 +751,7 @@ impl Server {
     /// read directly from disk; an active source is rejected so its in-flight
     /// turn cannot be copied before the terminal record makes the prefix complete.
     fn thread_fork(&mut self, params: &Value) -> MethodResult {
-        let src_id = str_param(params, "threadId")?;
+        let src_id = str_param(params, "thread_id")?;
         if self
             .threads
             .get(src_id)
@@ -813,7 +807,7 @@ impl Server {
             .clone();
         Ok(json!({
             "thread": thread_runtime_json(&new_id, &options, &route),
-            "messageCount": count,
+            "message_count": count,
         }))
     }
 
@@ -874,11 +868,11 @@ impl Server {
                 .provider_routes
                 .last()
                 .map(|route| ActiveProviderRoute {
-                    revision: route.revision,
+                    revision: route.route_revision,
                     effort: self.provider_catalog.default_effort(&route.provider_id),
                     provider_id: route.provider_id.clone(),
                     api_family: route.api_family,
-                    model: route.primary_model.clone(),
+                    model: route.model.clone(),
                     continuity: route.continuity,
                 });
             threads.push(json!({
@@ -888,9 +882,9 @@ impl Server {
                 "cwd": runtime.map(|runtime| runtime.cwd.as_str()),
                 "route": route,
                 "resumable": runtime.is_some(),
-                "inProgress": in_progress,
-                "forkedFrom": fork_origin_json(path),
-                "updatedAtMs": updated_at_ms,
+                "in_progress": in_progress,
+                "forked_from": fork_origin_json(path),
+                "updated_at_ms": updated_at_ms,
             }));
         }
         let consumed = offset.saturating_add(limit).min(paths.len());
@@ -899,7 +893,7 @@ impl Server {
     }
 
     fn thread_read(&self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "threadId")?;
+        let thread_id = str_param(params, "thread_id")?;
         let (path, _) = self.locate_thread(thread_id)?;
         let snapshot = events::into_public_session_snapshot(
             rollout::load_session_snapshot(&path)
@@ -909,13 +903,13 @@ impl Server {
             .provider_routes
             .last()
             .map(|route| ActiveProviderRoute {
-                revision: route.revision,
+                revision: route.route_revision,
                 // Effort never enters the durable timeline, so a route read off
                 // disk reports the effort a session there would start at.
                 effort: self.provider_catalog.default_effort(&route.provider_id),
                 provider_id: route.provider_id.clone(),
                 api_family: route.api_family,
-                model: route.primary_model.clone(),
+                model: route.model.clone(),
                 continuity: route.continuity,
             });
         Ok(json!({
@@ -924,7 +918,7 @@ impl Server {
                 "cwd": snapshot.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
                 "route": route,
                 "resumable": snapshot.runtime.is_some(),
-                "forkedFrom": fork_origin_json(&path),
+                "forked_from": fork_origin_json(&path),
                 "messages": snapshot.messages,
                 "terminals": snapshot.terminals,
             }
@@ -968,12 +962,17 @@ impl Server {
         ensure_known_params(
             params,
             "thread/provider/switch",
-            &["threadId", "providerId", "model", "expectedRouteRevision"],
+            &[
+                "thread_id",
+                "provider_id",
+                "model",
+                "expected_route_revision",
+            ],
         )
         .map_err(|(_, message)| SwitchRequestError::InvalidParams(message))?;
-        let thread_id = str_param(params, "threadId")
+        let thread_id = str_param(params, "thread_id")
             .map_err(|(_, message)| SwitchRequestError::InvalidParams(message))?;
-        let provider_id = str_param(params, "providerId")
+        let provider_id = str_param(params, "provider_id")
             .map_err(|(_, message)| SwitchRequestError::InvalidParams(message))?
             .to_string();
         let model = match params.get("model") {
@@ -990,14 +989,14 @@ impl Server {
                 ));
             }
         };
-        let expected_revision = params["expectedRouteRevision"].as_u64().ok_or_else(|| {
+        let expected_revision = params["expected_route_revision"].as_u64().ok_or_else(|| {
             SwitchRequestError::InvalidParams(
-                "'expectedRouteRevision' must be a positive integer".into(),
+                "'expected_route_revision' must be a positive integer".into(),
             )
         })?;
         if expected_revision == 0 {
             return Err(SwitchRequestError::InvalidParams(
-                "'expectedRouteRevision' must be a positive integer".into(),
+                "'expected_route_revision' must be a positive integer".into(),
             ));
         }
         let handle = self.threads.get(thread_id).ok_or_else(|| {
@@ -1048,7 +1047,7 @@ impl Server {
         Ok(())
     }
     fn config_read(&self, params: &Value) -> MethodResult {
-        ensure_known_params(params, "config/read", &["threadId", "cwd"])?;
+        ensure_known_params(params, "config/read", &["thread_id", "cwd"])?;
         let (cwd, pinned_route) = self.read_scope(params)?;
         let mut snapshot = (self.config_reader)(&cwd)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read config: {e:#}")))?;
@@ -1060,13 +1059,13 @@ impl Server {
     }
 
     fn skills_list(&self, params: &Value) -> MethodResult {
-        ensure_known_params(params, "skills/list", &["threadId", "cwd", "forceReload"])?;
-        match params.get("forceReload") {
+        ensure_known_params(params, "skills/list", &["thread_id", "cwd", "force_reload"])?;
+        match params.get("force_reload") {
             None | Some(Value::Null) | Some(Value::Bool(_)) => {}
             Some(_) => {
                 return Err((
                     wire::INVALID_PARAMS,
-                    "'forceReload' must be a boolean".into(),
+                    "'force_reload' must be a boolean".into(),
                 ));
             }
         }
@@ -1092,21 +1091,21 @@ impl Server {
         params: &Value,
     ) -> Result<(PathBuf, Option<ActiveProviderRoute>), (i64, String)> {
         object_params(params, "read method")?;
-        let thread_id = params.get("threadId").filter(|value| !value.is_null());
+        let thread_id = params.get("thread_id").filter(|value| !value.is_null());
         let cwd = params.get("cwd").filter(|value| !value.is_null());
         if thread_id.is_some() && cwd.is_some() {
             return Err((
                 wire::INVALID_PARAMS,
-                "supply at most one of 'threadId' or 'cwd'".into(),
+                "supply at most one of 'thread_id' or 'cwd'".into(),
             ));
         }
         if let Some(value) = thread_id {
             let thread_id = value.as_str().ok_or((
                 wire::INVALID_PARAMS,
-                "'threadId' must be a string".to_string(),
+                "'thread_id' must be a string".to_string(),
             ))?;
             if thread_id.trim().is_empty() {
-                return Err((wire::INVALID_PARAMS, "'threadId' must not be empty".into()));
+                return Err((wire::INVALID_PARAMS, "'thread_id' must not be empty".into()));
             }
             if let Some(handle) = self.threads.get(thread_id) {
                 return Ok((
@@ -1122,11 +1121,11 @@ impl Server {
                 format!("session '{thread_id}' has no provider route timeline"),
             ))?;
             let public_route = ActiveProviderRoute {
-                revision: route.revision,
+                revision: route.route_revision,
                 effort: self.provider_catalog.default_effort(&route.provider_id),
                 provider_id: route.provider_id.clone(),
                 api_family: route.api_family,
-                model: route.primary_model.clone(),
+                model: route.model.clone(),
                 continuity: route.continuity,
             };
             let runtime = snapshot.runtime.ok_or((
@@ -1139,7 +1138,7 @@ impl Server {
         Ok((resolve_cwd(cwd, &self.default_cwd)?, None))
     }
     fn turn_start(&mut self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "threadId")?;
+        let thread_id = str_param(params, "thread_id")?;
         let (text, images) = parse_input(params)?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             (
@@ -1191,7 +1190,7 @@ impl Server {
     /// Returns the running turn's id, or null when idle. (`expectedTurnId`, if
     /// the client sends it, is accepted and ignored for now.)
     fn turn_steer(&mut self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "threadId")?;
+        let thread_id = str_param(params, "thread_id")?;
         let (text, _images) = parse_input(params)?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             (
@@ -1203,11 +1202,11 @@ impl Server {
         handle.inbox.push(InboxItem::Steer(text));
         let turn_id = *handle.turn.lock().unwrap();
         handle.projection.record_input(turn_id, &input);
-        Ok(json!({"turnId": turn_id}))
+        Ok(json!({"turn_id": turn_id}))
     }
 
     fn turn_interrupt(&mut self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "threadId")?;
+        let thread_id = str_param(params, "thread_id")?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             (
                 wire::SERVER_ERROR,
@@ -1562,7 +1561,7 @@ fn fork_origin_json(path: &Path) -> Value {
         return Value::Null;
     };
     json!({
-        "threadId": thread_id,
+        "thread_id": thread_id,
         "cut": cut.parse::<u64>().ok(),
     })
 }
@@ -1582,16 +1581,21 @@ fn parse_thread_start_options(
         Some(_) => return Err((wire::INVALID_PARAMS, "'model' must be a string".into())),
     };
 
-    let provider_id = match params.get("providerId") {
+    let provider_id = match params.get("provider_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(raw)) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
         Some(Value::String(_)) => {
             return Err((
                 wire::INVALID_PARAMS,
-                "'providerId' must not be empty".into(),
+                "'provider_id' must not be empty".into(),
             ));
         }
-        Some(_) => return Err((wire::INVALID_PARAMS, "'providerId' must be a string".into())),
+        Some(_) => {
+            return Err((
+                wire::INVALID_PARAMS,
+                "'provider_id' must be a string".into(),
+            ));
+        }
     };
 
     Ok(ThreadStartOptions {
@@ -1860,13 +1864,13 @@ fn run_provider_command(
         Ok(kloop_core::provider_route::SwitchOutcome::NoOp(route)) => format!(
             "provider unchanged: {} {} (revision {})",
             route.provider_id(),
-            route.primary_model(),
+            route.model(),
             route.revision()
         ),
         Ok(kloop_core::provider_route::SwitchOutcome::Changed { route, continuity }) => {
             let public_route = route.public_route();
             let provider_name = route.provider_id().to_string();
-            let model_name = route.primary_model().to_string();
+            let model_name = route.model().to_string();
             let revision = route.revision();
             let effort_label = kloop_protocol::ReasoningEffort::choice_str(route.effort());
             *cfg = Arc::new(cfg.clone_with_provider_route(route));
@@ -2012,8 +2016,8 @@ impl Ui for ThreadUi {
 fn approval_decision(result: &Value) -> Decision {
     match result["decision"].as_str() {
         Some("accept") => Decision::Allow(ApprovalScope::Once),
-        Some("acceptForSession") => Decision::Allow(ApprovalScope::WorkspaceSession),
-        Some("acceptForProject") => Decision::Allow(ApprovalScope::Project),
+        Some("accept_for_session") => Decision::Allow(ApprovalScope::WorkspaceSession),
+        Some("accept_for_project") => Decision::Allow(ApprovalScope::Project),
         // decline, cancel, the removed acceptAlways token, anything unknown, or
         // a missing decision all fail closed.
         _ => Decision::Deny,
@@ -2023,7 +2027,7 @@ fn approval_decision(result: &Value) -> Decision {
 fn approval_scope_name(scope: ApprovalScope) -> &'static str {
     match scope {
         ApprovalScope::Once => "once",
-        ApprovalScope::WorkspaceSession => "workspaceSession",
+        ApprovalScope::WorkspaceSession => "workspace_session",
         ApprovalScope::Project => "project",
     }
 }
@@ -2044,7 +2048,7 @@ impl Approver for ThreadUi {
         // A file change carries a diff preview; nothing else does — so the
         // preview's presence is exactly the command/fileChange discriminant.
         let kind = if req.preview.is_some() {
-            "fileChange"
+            "file_change"
         } else {
             "command"
         };
@@ -2055,18 +2059,18 @@ impl Approver for ThreadUi {
             .map(approval_scope_name)
             .collect::<Vec<_>>();
         let mut params = json!({
-            "turnId": self.turn_id(),
+            "turn_id": self.turn_id(),
             "kind": kind,
             "description": req.description,
-            "approvalScopes": approval_scopes,
+            "approval_scopes": approval_scopes,
         });
         if let Some(rules) = &req.remember_rules {
-            params["rememberRules"] = json!(rules);
+            params["remember_rules"] = json!(rules);
         }
         if let Some(preview) = &req.preview {
             params["preview"] = Value::String(preview.clone());
         }
-        params["threadId"] = Value::String(self.thread_id.clone());
+        params["thread_id"] = Value::String(self.thread_id.clone());
         let sent = self
             .out
             .send(
@@ -2121,9 +2125,9 @@ impl Questioner for ThreadUi {
                     pending: self.pending.clone(),
                 };
                 let params = json!({
-                    "threadId": self.thread_id,
-                    "turnId": turn_id,
-                    "questionIndex": question_index,
+                    "thread_id": self.thread_id,
+                    "turn_id": turn_id,
+                    "question_index": question_index,
                     "question": question,
                 });
                 if self
@@ -2182,17 +2186,17 @@ mod approval_response_tests {
             Decision::Allow(ApprovalScope::Once)
         );
         assert_eq!(
-            approval_decision(&json!({"decision": "acceptForSession"})),
+            approval_decision(&json!({"decision": "accept_for_session"})),
             Decision::Allow(ApprovalScope::WorkspaceSession)
         );
         assert_eq!(
-            approval_decision(&json!({"decision": "acceptForProject"})),
+            approval_decision(&json!({"decision": "accept_for_project"})),
             Decision::Allow(ApprovalScope::Project)
         );
         for result in [
             json!({"decision": "decline"}),
             json!({"decision": "cancel"}),
-            json!({"decision": "acceptAlways"}),
+            json!({"decision": "accept_always"}),
             json!({"decision": "unknown"}),
             json!({}),
         ] {

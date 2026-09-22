@@ -80,7 +80,7 @@ pub enum Outgoing {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum QuestionResponse {
     Answered {
         #[serde(default)]
@@ -129,7 +129,7 @@ impl Outgoing {
 /// The wire status token for an item status.
 fn status_str(s: ItemStatus) -> &'static str {
     match s {
-        ItemStatus::InProgress => "inProgress",
+        ItemStatus::InProgress => "in_progress",
         ItemStatus::Completed => "completed",
         ItemStatus::Failed => "failed",
     }
@@ -142,7 +142,7 @@ fn status_str(s: ItemStatus) -> &'static str {
 fn item_json(id: &str, item: &Item) -> Value {
     match item {
         Item::AssistantMessage { text, status } => {
-            json!({"id": id, "type": "assistantMessage", "status": status_str(*status), "text": text})
+            json!({"id": id, "type": "assistant_message", "status": status_str(*status), "text": text})
         }
         Item::Reasoning { text, status } => {
             json!({"id": id, "type": "reasoning", "status": status_str(*status), "text": text})
@@ -155,7 +155,7 @@ fn item_json(id: &str, item: &Item) -> Value {
             output,
         } => {
             let mut o = json!({
-                "id": id, "type": "toolCall", "name": name,
+                "id": id, "type": "tool_call", "name": name,
                 "input": input, "status": status_str(*status),
             });
             if !agent.is_empty() {
@@ -171,7 +171,7 @@ fn item_json(id: &str, item: &Item) -> Value {
             task,
             status,
         } => json!({
-            "id": id, "type": "subAgent", "label": label, "task": task,
+            "id": id, "type": "sub_agent", "label": label, "task": task,
             "status": status_str(*status),
         }),
     }
@@ -185,7 +185,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
     match ev {
         Event::ItemStarted { id, item } => Some((
             "item/started",
-            json!({"turnId": turn_id, "item": item_json(id, item)}),
+            json!({"turn_id": turn_id, "item": item_json(id, item)}),
         )),
         Event::ItemDelta { id, delta } => {
             let (channel, text) = match delta {
@@ -195,12 +195,12 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             };
             Some((
                 "item/delta",
-                json!({"turnId": turn_id, "itemId": id, "channel": channel, "text": text}),
+                json!({"turn_id": turn_id, "item_id": id, "channel": channel, "text": text}),
             ))
         }
         Event::ItemCompleted { id, item } => Some((
             "item/completed",
-            json!({"turnId": turn_id, "item": item_json(id, item)}),
+            json!({"turn_id": turn_id, "item": item_json(id, item)}),
         )),
         Event::BackgroundTaskUpdated(task) => {
             let kind = match task.kind {
@@ -220,11 +220,11 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
                 "kind": kind,
                 "description": task.description,
                 "status": status,
-                "outputPath": task.output_path,
+                "output_path": task.output_path,
                 "detail": task.detail,
             });
             if let Some(run_id) = &task.run_id {
-                task_json["runId"] = Value::String(run_id.clone());
+                task_json["run_id"] = Value::String(run_id.clone());
             }
             Some(("thread/backgroundTask/updated", json!({"task": task_json})))
         }
@@ -237,7 +237,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             Some((
                 "thread/agentMessage/updated",
                 json!({
-                    "messageId": message.id.as_str(),
+                    "message_id": message.id.as_str(),
                     "from": message.from.as_str(),
                     "to": message.to.as_str(),
                     "summary": message.summary,
@@ -248,7 +248,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
         Event::ScheduledTaskUpdated(task) => {
             let origin = match task.origin {
                 kloop_core::event::ScheduledTaskOrigin::Cron => "cron",
-                kloop_core::event::ScheduledTaskOrigin::LoopWakeup => "loopWakeup",
+                kloop_core::event::ScheduledTaskOrigin::LoopWakeup => "loop_wakeup",
             };
             let status = match task.status {
                 kloop_core::event::ScheduledTaskStatus::Scheduled => "scheduled",
@@ -262,7 +262,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
                     "id": task.id,
                     "origin": origin,
                     "status": status,
-                    "scheduledForMs": task.scheduled_for_ms,
+                    "scheduled_for_ms": task.scheduled_for_ms,
                     "reason": task.reason,
                     "detail": task.detail,
                 }}),
@@ -271,7 +271,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
         // Token usage, cwd and scheduler updates are thread-scoped, not turn-scoped: no turnId.
         Event::Usage(n) => Some((
             "thread/tokenUsage/updated",
-            json!({"tokenUsage": {"total": n}}),
+            json!({"token_usage": {"total": n}}),
         )),
         Event::CwdChanged { cwd, branch } => {
             Some(("thread/cwd/updated", json!({"cwd": cwd, "branch": branch})))
@@ -363,17 +363,17 @@ mod tests {
             (
                 Outgoing::Notification {
                     method: "item/delta",
-                    params: json!({"threadId": "t", "itemId": "msg-0"}),
+                    params: json!({"thread_id": "t", "item_id": "msg-0"}),
                 },
-                r#"{"jsonrpc":"2.0","method":"item/delta","params":{"itemId":"msg-0","threadId":"t"}}"#,
+                r#"{"jsonrpc":"2.0","method":"item/delta","params":{"item_id":"msg-0","thread_id":"t"}}"#,
             ),
             (
                 Outgoing::ServerRequest {
                     id: RequestId::Num(1),
                     method: "approval/request",
-                    params: json!({"threadId": "t", "description": "bash: rm x"}),
+                    params: json!({"thread_id": "t", "description": "bash: rm x"}),
                 },
-                r#"{"id":1,"jsonrpc":"2.0","method":"approval/request","params":{"description":"bash: rm x","threadId":"t"}}"#,
+                r#"{"id":1,"jsonrpc":"2.0","method":"approval/request","params":{"description":"bash: rm x","thread_id":"t"}}"#,
             ),
         ];
         for (outgoing, expected) in cases {
@@ -402,10 +402,10 @@ mod tests {
             Some((
                 "item/started",
                 json!({
-                    "turnId": 5,
+                    "turn_id": 5,
                     "item": {
-                        "id": "t1", "type": "toolCall", "name": "bash",
-                        "input": {"command": "ls"}, "status": "inProgress",
+                        "id": "t1", "type": "tool_call", "name": "bash",
+                        "input": {"command": "ls"}, "status": "in_progress",
                     },
                 }),
             ))
@@ -426,9 +426,9 @@ mod tests {
             Some((
                 "item/completed",
                 json!({
-                    "turnId": 5,
+                    "turn_id": 5,
                     "item": {
-                        "id": "t1", "type": "toolCall", "name": "bash",
+                        "id": "t1", "type": "tool_call", "name": "bash",
                         "input": {"command": "ls"}, "status": "completed",
                         "agent": "agent-1", "output": "file.txt",
                     },
@@ -447,7 +447,7 @@ mod tests {
             project_event(&delta, 2),
             Some((
                 "item/delta",
-                json!({"turnId": 2, "itemId": "reasoning-0", "channel": "reasoning", "text": "hmm"}),
+                json!({"turn_id": 2, "item_id": "reasoning-0", "channel": "reasoning", "text": "hmm"}),
             ))
         );
 
@@ -455,7 +455,7 @@ mod tests {
             project_event(&Event::Usage(1234), 2),
             Some((
                 "thread/tokenUsage/updated",
-                json!({"tokenUsage": {"total": 1234}})
+                json!({"token_usage": {"total": 1234}})
             ))
         );
 
@@ -495,7 +495,7 @@ mod tests {
                     "kind": "shell",
                     "description": "make test",
                     "status": "failed",
-                    "outputPath": "/tmp/bg-7.out",
+                    "output_path": "/tmp/bg-7.out",
                     "detail": "exit 2",
                 }})
             ))
@@ -517,7 +517,7 @@ mod tests {
             Some((
                 "thread/agentMessage/updated",
                 json!({
-                    "messageId": "message-7",
+                    "message_id": "message-7",
                     "from": "agent-3",
                     "to": "main",
                     "summary": "review close race",
@@ -526,11 +526,11 @@ mod tests {
             ))
         );
         let (_, params) = projected.unwrap();
-        assert!(params.get("turnId").is_none());
+        assert!(params.get("turn_id").is_none());
         assert!(params.get("message").is_none());
         assert!(params.get("body").is_none());
-        assert!(params.get("contextId").is_none());
-        assert!(params.get("taskId").is_none());
+        assert!(params.get("context_id").is_none());
+        assert!(params.get("task_id").is_none());
     }
 
     #[test]
@@ -568,11 +568,11 @@ mod tests {
                     "thread/backgroundTask/updated",
                     json!({"task": {
                         "id": "program-4",
-                        "runId": "run-44",
+                        "run_id": "run-44",
                         "kind": "program",
                         "description": "compile assets",
                         "status": status,
-                        "outputPath": output_path,
+                        "output_path": output_path,
                         "detail": null,
                     }})
                 ))
@@ -600,7 +600,7 @@ mod tests {
                     "kind": "agent",
                     "description": "inspect logs",
                     "status": "running",
-                    "outputPath": null,
+                    "output_path": null,
                     "detail": null,
                 }})
             ))
@@ -627,9 +627,9 @@ mod tests {
                     "kind": "workflow",
                     "description": "scan repository",
                     "status": "running",
-                    "outputPath": null,
+                    "output_path": null,
                     "detail": "Scan",
-                    "runId": "wf_123-7",
+                    "run_id": "wf_123-7",
                 }})
             ))
         );

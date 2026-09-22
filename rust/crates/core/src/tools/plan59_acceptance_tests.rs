@@ -935,7 +935,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
                 {"label": "No", "description": "stop"},
                 {"label": "Yes", "description": "continue"}
             ],
-            "multiSelect": false
+            "multi_select": false
         }]
     });
     let (answer, answer_error) =

@@ -96,7 +96,7 @@ impl ResolvedProviderSettings {
 
     #[cfg(test)]
     pub(crate) fn model(&self) -> &str {
-        self.initial_route.primary_model()
+        self.initial_route.model()
     }
 }
 

@@ -94,7 +94,7 @@ struct JsonUi<W: Write + Send> {
 
 impl<W: Write + Send> JsonUi<W> {
     fn notify(&self, method: &str, mut params: Value) {
-        params["threadId"] = Value::String(self.thread_id.clone());
+        params["thread_id"] = Value::String(self.thread_id.clone());
         let line = json!({"method": method, "params": params});
         if let Ok(mut w) = self.out.lock() {
             let _ = writeln!(w, "{line}");
@@ -296,10 +296,10 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                r#"{"method":"turn/started","params":{"threadId":"t","turn":{"id":1}}}"#,
-                r#"{"method":"item/delta","params":{"channel":"text","itemId":"msg-0","text":"hi","threadId":"t","turnId":1}}"#,
-                r#"{"method":"item/completed","params":{"item":{"id":"c1","input":{"command":"ls"},"name":"bash","output":"ok","status":"completed","type":"toolCall"},"threadId":"t","turnId":1}}"#,
-                r#"{"method":"turn/completed","params":{"threadId":"t","turn":{"id":1,"status":"completed"}}}"#,
+                r#"{"method":"turn/started","params":{"thread_id":"t","turn":{"id":1}}}"#,
+                r#"{"method":"item/delta","params":{"channel":"text","item_id":"msg-0","text":"hi","thread_id":"t","turn_id":1}}"#,
+                r#"{"method":"item/completed","params":{"item":{"id":"c1","input":{"command":"ls"},"name":"bash","output":"ok","status":"completed","type":"tool_call"},"thread_id":"t","turn_id":1}}"#,
+                r#"{"method":"turn/completed","params":{"thread_id":"t","turn":{"id":1,"status":"completed"}}}"#,
             ]
         );
     }
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(updates[0]["params"]["status"], "queued");
         assert_eq!(updates[1]["params"]["status"], "undeliverable");
         assert!(updates.iter().all(|event| {
-            event["params"]["threadId"] == "hl"
+            event["params"]["thread_id"] == "hl"
                 && event["params"].get("message").is_none()
                 && event["params"].get("body").is_none()
         }));
@@ -598,7 +598,7 @@ mod tests {
             ]
         );
         // Every event is thread-tagged with the session id (server parity).
-        assert!(events.iter().all(|e| e["params"]["threadId"] == "hl"));
+        assert!(events.iter().all(|e| e["params"]["thread_id"] == "hl"));
         let deltas: String = events
             .iter()
             .filter(|e| e["method"] == "item/delta")

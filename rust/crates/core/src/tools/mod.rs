@@ -1730,7 +1730,7 @@ pub(crate) mod testutil {
     pub(crate) struct TestConfig {
         tag: String,
         provider: Provider,
-        primary_model: String,
+        model: String,
         allowed_models: Vec<String>,
         max_rounds: Option<usize>,
         context_window: Option<u64>,
@@ -1748,7 +1748,7 @@ pub(crate) mod testutil {
             Self {
                 tag: tag.to_string(),
                 provider: Provider::mock(vec![]),
-                primary_model: "mock".into(),
+                model: "mock".into(),
                 allowed_models: vec!["mock".into()],
                 max_rounds: Some(5),
                 context_window: None,
@@ -1778,7 +1778,7 @@ pub(crate) mod testutil {
         /// Override the route's model names — for tests that read a model name
         /// back out, or that switch the route to a second allowed model.
         pub(crate) fn models(mut self, primary: &str, allowed: &[&str]) -> Self {
-            self.primary_model = primary.to_string();
+            self.model = primary.to_string();
             self.allowed_models = allowed.iter().map(|m| (*m).to_string()).collect();
             self
         }
@@ -1810,7 +1810,7 @@ pub(crate) mod testutil {
                 crate::provider_route::ProviderCatalog::from_provider(
                     "test",
                     self.provider,
-                    self.primary_model,
+                    self.model,
                     self.allowed_models,
                 )
                 .expect("test provider route is valid");

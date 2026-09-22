@@ -147,7 +147,7 @@ fn question_input() -> Value {
                 {"label": "Rows", "description": "stack", "preview": "ROW"},
                 {"label": "Columns", "description": "split", "preview": "COL"}
             ],
-            "multiSelect": false
+            "multi_select": false
         }]
     })
 }
@@ -306,7 +306,7 @@ async fn question_report() -> Value {
     let mut options_null = question_input();
     options_null["questions"][0]["options"] = Value::Null;
     let mut multi_select_null = question_input();
-    multi_select_null["questions"][0]["multiSelect"] = Value::Null;
+    multi_select_null["questions"][0]["multi_select"] = Value::Null;
     let mut option_label_null = question_input();
     option_label_null["questions"][0]["options"][0]["label"] = Value::Null;
     let mut option_description_null = question_input();

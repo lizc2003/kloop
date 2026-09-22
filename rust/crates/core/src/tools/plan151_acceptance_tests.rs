@@ -172,7 +172,7 @@ async fn compaction_clears_what_the_model_is_held_to() {
     history.record(kloop_protocol::Message::user_text("current request"));
     crate::compact::run_compaction(
         &cfg,
-        cfg.provider_route.primary_model(),
+        cfg.provider_route.model(),
         &mut history,
         &CancellationToken::new(),
     )

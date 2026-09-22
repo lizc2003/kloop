@@ -213,7 +213,6 @@ impl ProjectPermissionWriter for ProjectStore {
 /// belongs to and when the answer was given. Revoking is deleting the
 /// directory, not editing this.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct TrustFile {
     version: u32,
     project_id: String,
@@ -221,7 +220,7 @@ struct TrustFile {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct StoreFile {
     version: u32,
     project_id: String,
@@ -314,13 +313,13 @@ mod tests {
         assert!(!store.policy_path(&id).exists(), "rules are untouched");
         let mut written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(store.trust_path(&id)).unwrap()).unwrap();
-        let granted_at = written["grantedAt"].take();
+        let granted_at = written["granted_at"].take();
         assert_eq!(
             written,
             serde_json::json!({
                 "version": 1,
-                "projectId": id.as_str(),
-                "grantedAt": null,
+                "project_id": id.as_str(),
+                "granted_at": null,
             })
         );
         let granted_at = granted_at.as_str().expect("grantedAt is a string");
@@ -430,11 +429,11 @@ mod tests {
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
 
         value.as_object_mut().unwrap().remove("unknown");
-        value["projectId"] = serde_json::json!(format!("p1_{}", "b".repeat(64)));
+        value["project_id"] = serde_json::json!(format!("p1_{}", "b".repeat(64)));
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
 
-        value["projectId"] = serde_json::json!(id.as_str());
+        value["project_id"] = serde_json::json!(id.as_str());
         value["allow"] = serde_json::json!(["sentinel-secret("]);
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         let error = store.load_blocking(&id).unwrap_err().to_string();

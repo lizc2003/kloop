@@ -50,7 +50,7 @@ impl EndReason {
     pub fn terminal_status(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
-            Self::MaxRounds => "maxRounds",
+            Self::MaxRounds => "max_rounds",
             Self::Aborted => "aborted",
             Self::Error(_) => "error",
         }

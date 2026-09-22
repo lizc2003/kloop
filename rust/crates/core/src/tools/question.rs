@@ -45,9 +45,9 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                                     "additionalProperties": false
                                 }
                             },
-                            "multiSelect": {"type": "boolean", "default": false}
+                            "multi_select": {"type": "boolean", "default": false}
                         },
-                        "required": ["question", "header", "options", "multiSelect"],
+                        "required": ["question", "header", "options", "multi_select"],
                         "additionalProperties": false
                     }
                 },
@@ -79,7 +79,7 @@ pub(super) fn ask_user_question_def() -> ToolDef {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct QuestionToolInput {
     questions: Vec<crate::interaction::Question>,
     #[serde(default)]
@@ -224,7 +224,7 @@ mod tests {
                     {"label": "Rows", "description": "stack", "preview": "ROW"},
                     {"label": "Columns", "description": "split", "preview": "COL"}
                 ],
-                "multiSelect": false
+                "multi_select": false
             }]
         })
     }

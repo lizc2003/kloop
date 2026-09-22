@@ -830,7 +830,7 @@ mod tests {
 
         let stats = run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )
@@ -968,7 +968,7 @@ mod tests {
 
         run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )
@@ -1009,7 +1009,7 @@ mod tests {
             assert!(
                 run_compaction(
                     &cfg,
-                    cfg.provider_route.primary_model(),
+                    cfg.provider_route.model(),
                     &mut history,
                     &CancellationToken::new()
                 )
@@ -1032,7 +1032,7 @@ mod tests {
             }]),
         ]);
         let cfg = compact_test_cfg(provider, "model-arg");
-        assert_eq!(cfg.provider_route.primary_model(), "mock");
+        assert_eq!(cfg.provider_route.model(), "mock");
         let mut history = seeded_history(cfg.offload_dir.clone());
 
         run_compaction(
@@ -1072,7 +1072,7 @@ mod tests {
 
         run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )
@@ -1097,7 +1097,7 @@ mod tests {
 
         let result = run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )
@@ -1117,7 +1117,7 @@ mod tests {
 
         let result = run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )
@@ -1192,7 +1192,7 @@ mod tests {
 
         let stats = run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )
@@ -1222,7 +1222,7 @@ mod tests {
 
         let result = run_compaction(
             &cfg,
-            cfg.provider_route.primary_model(),
+            cfg.provider_route.model(),
             &mut history,
             &CancellationToken::new(),
         )

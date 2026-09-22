@@ -59,7 +59,7 @@ pub fn run(
             format!(
                 "provider unchanged: {} {} (revision {})",
                 route.provider_id(),
-                route.primary_model(),
+                route.model(),
                 route.revision()
             ),
             /*changed*/ false,
@@ -72,7 +72,7 @@ pub fn run(
             format!(
                 "provider switched: {} {} (revision {}, reasoning continuity: {continuity:?}, effort: {})",
                 route.provider_id(),
-                route.primary_model(),
+                route.model(),
                 route.revision(),
                 ReasoningEffort::choice_str(route.effort()),
             ),

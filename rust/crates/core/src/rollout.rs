@@ -48,7 +48,6 @@ use kloop_provider::ProviderFailureKind;
 use kloop_provider::TimeoutStage;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionRuntime {
     pub cwd: String,
 }
@@ -84,7 +83,6 @@ mod provider_failure_serde {
     }
 
     #[derive(Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct RecordedFailure {
         kind: RecordedKind,
         message: String,
@@ -255,7 +253,6 @@ impl std::fmt::Display for TurnError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TurnTerminal {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,7 +262,6 @@ pub struct TurnTerminal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SnapshotTerminal {
     pub after_message: usize,
     pub status: String,
@@ -274,7 +270,6 @@ pub struct SnapshotTerminal {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
     pub messages: Vec<Message>,
     pub runtime: Option<SessionRuntime>,
@@ -284,12 +279,11 @@ pub struct SessionSnapshot {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct PairingRepairStats {
     pub messages_before: usize,
     pub messages_after: usize,
     pub dropped_tool_results: usize,
-    pub duplicate_results: usize,
+    pub duplicate_tool_results: usize,
     pub dropped_messages: usize,
     pub inserted_tool_results: usize,
     pub changed_messages: usize,
@@ -559,8 +553,8 @@ impl Rollout {
 
     fn append_fixture_initial_route(&mut self) -> io::Result<ProviderRouteReceipt> {
         let receipt = ProviderRouteReceipt {
-            revision: 1,
-            boundary: self.next_seq,
+            route_revision: 1,
+            route_boundary: self.next_seq,
             source: ProviderRouteSource::Initial,
             provider_id: "test".into(),
             api_family: kloop_protocol::ProviderApiFamily::Mock,
@@ -568,7 +562,7 @@ impl Rollout {
                 kloop_protocol::ProviderApiFamily::Mock,
                 "mock",
             ),
-            primary_model: "mock".into(),
+            model: "mock".into(),
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         };
@@ -621,7 +615,7 @@ impl Rollout {
                 "provider route timeline is missing",
             )
         })?;
-        if route.revision() != previous.revision.saturating_add(1) {
+        if route.revision() != previous.route_revision.saturating_add(1) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "provider route revision must advance by exactly one",
@@ -850,7 +844,7 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
             _ => continue,
         };
         let boundary = checked_seq_of(meta)?;
-        if receipt.boundary != boundary || !source_matches_line {
+        if receipt.route_boundary != boundary || !source_matches_line {
             return Err(invalid(
                 "provider route receipt boundary/source does not match its line".into(),
             ));
@@ -863,7 +857,7 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
         RolloutLine::Message { meta, .. } => Some(seq_of(meta)),
         _ => None,
     });
-    if first_message.is_some_and(|boundary| routes[0].boundary >= boundary) {
+    if first_message.is_some_and(|boundary| routes[0].route_boundary >= boundary) {
         return Err(invalid(
             "initial provider route must precede the first history message".into(),
         ));
@@ -875,10 +869,10 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
             let route = routes
                 .iter()
                 .rev()
-                .find(|route| route.boundary < boundary)
+                .find(|route| route.route_boundary < boundary)
                 .ok_or_else(|| invalid("provider usage precedes the initial route".into()))?;
-            let model_matches = record.model == route.primary_model;
-            if record.route_revision != route.revision
+            let model_matches = record.model == route.model;
+            if record.route_revision != route.route_revision
                 || record.provider_id != route.provider_id
                 || record.api_family != route.api_family
                 || !model_matches
@@ -896,7 +890,7 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
             let boundary = checked_seq_of(meta)?;
             validate_provider_message(message, boundary, &routes, true)?;
             if let Some(source) = &message.provider_provenance {
-                original_origins.insert((source.origin_boundary, source.route_revision));
+                original_origins.insert((source.route_boundary, source.route_revision));
             }
         }
     }
@@ -909,7 +903,7 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
         for message in replacement {
             validate_provider_message(message, 0, &routes, false)?;
             if let Some(source) = &message.provider_provenance
-                && !original_origins.contains(&(source.origin_boundary, source.route_revision))
+                && !original_origins.contains(&(source.route_boundary, source.route_revision))
             {
                 return Err(invalid(
                     "replacement history contains provider provenance with no original message"
@@ -1512,7 +1506,7 @@ fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> Pair
     // original message index for terminal boundary remapping.
     let mut repaired: Vec<Entry> = Vec::with_capacity(items.len());
     let mut dropped_tool_results = 0;
-    let mut duplicate_results = 0;
+    let mut duplicate_tool_results = 0;
     let mut dropped_messages = 0;
     for (index, mut msg) in items.into_iter().enumerate() {
         let prev_uses = repaired
@@ -1527,7 +1521,7 @@ fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> Pair
                     if answered_ids.insert(tool_use_id.clone()) {
                         true
                     } else {
-                        duplicate_results += 1;
+                        duplicate_tool_results += 1;
                         false
                     }
                 } else {
@@ -1622,7 +1616,7 @@ fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> Pair
         messages_before,
         messages_after: messages.len(),
         dropped_tool_results,
-        duplicate_results,
+        duplicate_tool_results,
         dropped_messages,
         inserted_tool_results,
         changed_messages,
@@ -1855,10 +1849,10 @@ mod tests {
         }
     }
 
-    fn fixture_route(boundary: u64) -> ProviderRouteReceipt {
+    fn fixture_route(route_boundary: u64) -> ProviderRouteReceipt {
         ProviderRouteReceipt {
-            revision: 1,
-            boundary,
+            route_revision: 1,
+            route_boundary,
             source: ProviderRouteSource::Initial,
             provider_id: "test".into(),
             api_family: kloop_protocol::ProviderApiFamily::Mock,
@@ -1866,7 +1860,7 @@ mod tests {
                 kloop_protocol::ProviderApiFamily::Mock,
                 "mock",
             ),
-            primary_model: "mock".into(),
+            model: "mock".into(),
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         }
@@ -1903,7 +1897,7 @@ mod tests {
                 ],
                 kloop_protocol::ProviderResponseProvenance {
                     route_revision: 1,
-                    origin_boundary: 3,
+                    route_boundary: 3,
                     provider_id: "test".into(),
                     api_family: kloop_protocol::ProviderApiFamily::Mock,
                     endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
@@ -1947,9 +1941,9 @@ mod tests {
                 "id": "session#3",
                 "parent": "session#2",
                 "ts": lines[2]["ts"],
-                "providerId": "test",
-                "apiFamily": "mock",
-                "routeRevision": 1,
+                "provider_id": "test",
+                "api_family": "mock",
+                "route_revision": 1,
                 "model": "mock",
                 "operation": "sampling",
                 "usage": {
@@ -2898,7 +2892,7 @@ mod tests {
         let dir = path.parent().unwrap().to_path_buf();
         let provenance = kloop_protocol::ProviderResponseProvenance {
             route_revision: 1,
-            origin_boundary: 3,
+            route_boundary: 3,
             provider_id: "test".into(),
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
@@ -2935,8 +2929,8 @@ mod tests {
             Some(provenance.clone())
         );
         let raw = raw_lines(&path);
-        assert_eq!(raw[3]["typedError"]["kind"], "provider_outcome");
-        assert_eq!(raw[3]["typedError"]["value"]["type"], "incomplete");
+        assert_eq!(raw[3]["typed_error"]["kind"], "provider_outcome");
+        assert_eq!(raw[3]["typed_error"]["value"]["type"], "incomplete");
         let failure = ProviderFailure::transport("stream dropped").with_semantic_output(true);
         let encoded = serde_json::to_value(TurnError::ProviderFailure(failure.clone())).unwrap();
         assert_eq!(
@@ -2948,7 +2942,7 @@ mod tests {
         assert_eq!(resumed.messages[1].provider_provenance, Some(provenance));
         let fork = fork_session(&path, None, &dir).unwrap();
         assert_eq!(load_session_snapshot(&fork).unwrap().messages[1], assistant);
-        assert_eq!(raw_lines(&fork)[3]["typedError"], raw[3]["typedError"]);
+        assert_eq!(raw_lines(&fork)[3]["typed_error"], raw[3]["typed_error"]);
         cleanup(&path);
     }
 
@@ -3214,7 +3208,7 @@ mod tests {
             ]))
             .unwrap();
         let inspected = inspect_session(&path).unwrap();
-        assert_eq!(inspected.repair_stats().duplicate_results, 1);
+        assert_eq!(inspected.repair_stats().duplicate_tool_results, 1);
         assert_eq!(inspected.snapshot().messages[1].content.len(), 1);
         cleanup(&path);
     }
@@ -3256,7 +3250,7 @@ mod tests {
         duplicate["type"] = json!("provider_route_changed");
         duplicate["id"] = json!("session#2");
         duplicate["parent"] = json!("session#1");
-        duplicate["boundary"] = json!(2);
+        duplicate["route_boundary"] = json!(2);
         duplicate["source"] = json!("explicit_switch");
         lines.insert(1, duplicate);
         let raw = lines
@@ -3309,7 +3303,7 @@ mod tests {
         let mut rollout = Rollout::new(path.clone());
         rollout.append_message(&Message::user_text("one")).unwrap();
         let mut first_switch = fixture_route(3);
-        first_switch.revision = 2;
+        first_switch.route_revision = 2;
         first_switch.source = ProviderRouteSource::ExplicitSwitch;
         rollout
             .append_line(RolloutLine::ProviderRouteChanged {
@@ -3319,7 +3313,7 @@ mod tests {
             .unwrap();
         rollout.append_message(&Message::user_text("two")).unwrap();
         let mut second_switch = fixture_route(5);
-        second_switch.revision = 3;
+        second_switch.route_revision = 3;
         second_switch.source = ProviderRouteSource::ExplicitSwitch;
         rollout
             .append_line(RolloutLine::ProviderRouteChanged {
@@ -3334,9 +3328,9 @@ mod tests {
 
         let original = raw_lines(&path);
         let cases = [
-            ("duplicate-boundary", "boundary", json!(3)),
-            ("regressed-boundary", "boundary", json!(2)),
-            ("revision-gap", "revision", json!(4)),
+            ("duplicate-boundary", "route_boundary", json!(3)),
+            ("regressed-boundary", "route_boundary", json!(2)),
+            ("revision-gap", "route_revision", json!(4)),
         ];
         for (tag, field, value) in cases {
             let case_path = temp_file(tag);
@@ -3365,7 +3359,7 @@ mod tests {
             .unwrap();
         let mut provenance = kloop_protocol::ProviderResponseProvenance {
             route_revision: 2,
-            origin_boundary: 3,
+            route_boundary: 3,
             provider_id: "test".into(),
             api_family: kloop_protocol::ProviderApiFamily::Mock,
             endpoint_fingerprint: kloop_provider::Provider::endpoint_fingerprint_for(
@@ -3385,7 +3379,7 @@ mod tests {
             .unwrap();
         assert!(inspect_session(&path).is_err());
         provenance.route_revision = 1;
-        provenance.origin_boundary = 99;
+        provenance.route_boundary = 99;
         let raw = std::fs::read_to_string(&path).unwrap().replace(
             "\"routeRevision\":2,\"originBoundary\":3",
             "\"routeRevision\":1,\"originBoundary\":99",

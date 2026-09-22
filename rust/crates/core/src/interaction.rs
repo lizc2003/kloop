@@ -18,7 +18,7 @@ const MAX_PREVIEW_CHARS: usize = 10_000;
 const MAX_FREE_TEXT_CHARS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
@@ -27,7 +27,7 @@ pub struct QuestionOption {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct Question {
     pub question: String,
     pub header: String,
@@ -192,7 +192,7 @@ fn validate_text(value: &str, max: usize, field: &str) -> Result<(), String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct QuestionAnswer {
     pub question_index: usize,
     #[serde(default)]

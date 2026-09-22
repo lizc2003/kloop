@@ -115,7 +115,7 @@ const MAX_WORKFLOW_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_WORKFLOW_ARGS_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowPhase {
     pub title: String,
     #[serde(default)]
@@ -125,7 +125,7 @@ pub struct WorkflowPhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowMeta {
     pub name: String,
     pub description: String,

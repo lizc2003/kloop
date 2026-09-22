@@ -175,7 +175,7 @@ pub async fn run(
         .with_commands(slash_catalog(&cfg))
         .with_working_directory(display_cwd(&effective_cwd), effective_branch.clone())
         .with_context(
-            cfg.provider_route.primary_model().to_string(),
+            cfg.provider_route.model().to_string(),
             cfg.context_window,
             history.estimated_tokens(),
         )
@@ -188,7 +188,7 @@ pub async fn run(
         0,
         Cell::SessionHeader {
             version: version.to_string(),
-            model: cfg.provider_route.primary_model().to_string(),
+            model: cfg.provider_route.model().to_string(),
             cwd: display_cwd(&effective_cwd),
             branch: effective_branch,
             mode: permissions.mode().label().to_string(),

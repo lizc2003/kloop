@@ -46,7 +46,7 @@ fn mock_assistant(content: Vec<ContentBlock>, model: &str) -> Message {
         content,
         ProviderResponseProvenance {
             route_revision: 1,
-            origin_boundary: 2,
+            route_boundary: 2,
             provider_id: "test".into(),
             api_family: ProviderApiFamily::Mock,
             endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
@@ -2232,7 +2232,7 @@ async fn subagent_internal_delta_seals_then_continues_in_its_own_history() {
                     text: " and the rest".into(),
                 }],
                 ProviderResponseProvenance {
-                    origin_boundary: 4,
+                    route_boundary: 4,
                     ..mock_assistant(Vec::new(), "mock")
                         .provider_provenance
                         .unwrap()
@@ -2815,7 +2815,7 @@ async fn every_exit_records_why_the_turn_stopped() {
     assert_eq!(lines.len(), 1, "exactly one terminal per turn");
     assert_eq!(lines[0]["status"], "error");
     assert_eq!(
-        lines[0]["typedError"]["kind"], "provider_outcome",
+        lines[0]["typed_error"]["kind"], "provider_outcome",
         "the typed reason survives, not just its rendered text"
     );
 
@@ -4018,7 +4018,7 @@ mod a_turn_that_never_happened {
             content,
             ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: boundary,
+                route_boundary: boundary,
                 provider_id: "test".into(),
                 api_family: ProviderApiFamily::Mock,
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),

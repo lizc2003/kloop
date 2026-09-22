@@ -84,7 +84,7 @@ struct RunProgramInput {
 const PROGRAM_MANIFEST_VERSION: u8 = 1;
 
 #[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct ProgramManifest {
     version: u8,
     run_id: String,

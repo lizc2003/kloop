@@ -13,7 +13,6 @@ pub enum UsageOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderUsageRecord {
     pub provider_id: String,
     pub api_family: ProviderApiFamily,

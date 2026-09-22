@@ -75,12 +75,12 @@ fn mock_headless_json_is_ndjson_only() {
     assert!(!events.is_empty());
     assert_eq!(events.first().unwrap()["method"], "turn/started");
     assert_eq!(events.last().unwrap()["method"], "turn/completed");
-    let thread_id = events[0]["params"]["threadId"].as_str().unwrap();
+    let thread_id = events[0]["params"]["thread_id"].as_str().unwrap();
     assert!(!thread_id.is_empty());
     assert!(
         events
             .iter()
-            .all(|event| { event["params"]["threadId"].as_str() == Some(thread_id) })
+            .all(|event| { event["params"]["thread_id"].as_str() == Some(thread_id) })
     );
     assert!(
         stderr.is_empty(),

@@ -19,14 +19,14 @@ const MAX_RETAINED_EVENTS: usize = 4_096;
 const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RecoverySource {
     Fresh,
     Resumed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EventCursor {
     pub thread_id: String,
     pub generation: String,
@@ -54,7 +54,7 @@ impl EventCursor {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EventsSyncParams {
     pub thread_id: String,
     #[serde(default)]
@@ -79,14 +79,13 @@ impl EventsSyncParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct PublicEventEnvelope {
     pub method: String,
     pub params: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SnapshotReason {
     Initial,
     GenerationChanged,
@@ -94,11 +93,7 @@ pub(crate) enum SnapshotReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(
-    tag = "mode",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub(crate) enum ProjectionSync {
     Replay {
         generation: String,
@@ -118,7 +113,6 @@ pub(crate) enum ProjectionSync {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct PublicSnapshot {
     schema_version: u8,
     thread: SnapshotThread,
@@ -128,7 +122,6 @@ pub(crate) struct PublicSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotThread {
     id: String,
     cwd: String,
@@ -137,7 +130,6 @@ struct SnapshotThread {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotHistory {
     messages: Vec<Message>,
     runtime: Option<SessionRuntime>,
@@ -154,7 +146,6 @@ pub(crate) fn into_public_session_snapshot(mut snapshot: SessionSnapshot) -> Ses
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotTail {
     turns: Vec<SnapshotTurn>,
     notices: Vec<SnapshotNotice>,
@@ -166,7 +157,6 @@ struct SnapshotTail {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotTurn {
     id: u64,
     status: String,
@@ -176,7 +166,6 @@ struct SnapshotTurn {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotNotice {
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_id: Option<u64>,
@@ -185,28 +174,26 @@ struct SnapshotNotice {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 enum SnapshotNoticeKind {
     Note,
     System,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotCwd {
     path: String,
     branch: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotRecovery {
     source: RecoverySource,
     volatile_state: VolatileState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 enum VolatileState {
     Live,
     Reset,
@@ -394,9 +381,9 @@ impl ThreadProjection {
             state.unavailable = true;
             return Err(ProjectionError::SequenceExhausted);
         };
-        params_object.insert("threadId".into(), Value::String(self.thread_id.clone()));
+        params_object.insert("thread_id".into(), Value::String(self.thread_id.clone()));
         params_object.insert(
-            "eventGeneration".into(),
+            "event_generation".into(),
             Value::String(self.generation.clone()),
         );
         params_object.insert("seq".into(), Value::String(seq.to_string()));
@@ -549,7 +536,7 @@ fn ensure_turn(turns: &mut Vec<SnapshotTurn>, turn_id: u64) -> &mut SnapshotTurn
     }
     turns.push(SnapshotTurn {
         id: turn_id,
-        status: "inProgress".into(),
+        status: "in_progress".into(),
         input: Vec::new(),
         items: Vec::new(),
         error: None,
@@ -565,7 +552,7 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
             };
             let pending = std::mem::take(&mut state.pending_inputs);
             let turn = ensure_turn(&mut state.snapshot.tail.turns, turn_id);
-            turn.status = "inProgress".into();
+            turn.status = "in_progress".into();
             turn.error = None;
             turn.input.extend(pending);
         }
@@ -591,7 +578,7 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
                 .map(str::to_string);
         }
         "item/started" | "item/completed" => {
-            let Some(turn_id) = params.get("turnId").and_then(Value::as_u64) else {
+            let Some(turn_id) = params.get("turn_id").and_then(Value::as_u64) else {
                 return;
             };
             let Some(item) = params.get("item").cloned() else {
@@ -617,7 +604,7 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
                 return;
             };
             state.snapshot.tail.notices.push(SnapshotNotice {
-                turn_id: params.get("turnId").and_then(Value::as_u64),
+                turn_id: params.get("turn_id").and_then(Value::as_u64),
                 kind: if method == "note" {
                     SnapshotNoticeKind::Note
                 } else {
@@ -634,14 +621,14 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
         "thread/agentMessage/updated" => {
             let mut message = params.clone();
             if let Some(object) = message.as_object_mut() {
-                object.remove("threadId");
-                object.remove("eventGeneration");
+                object.remove("thread_id");
+                object.remove("event_generation");
                 object.remove("seq");
             }
             upsert_value(
                 &mut state.snapshot.tail.agent_messages,
                 &message,
-                "messageId",
+                "message_id",
             );
         }
         "thread/scheduler/updated" => {
@@ -650,7 +637,7 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
             }
         }
         "thread/tokenUsage/updated" => {
-            state.snapshot.tail.token_usage = params.get("tokenUsage").cloned();
+            state.snapshot.tail.token_usage = params.get("token_usage").cloned();
         }
         "thread/cwd/updated" => {
             if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
@@ -673,10 +660,10 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
 }
 
 fn apply_item_delta(turns: &mut [SnapshotTurn], params: &Value) {
-    let Some(turn_id) = params.get("turnId").and_then(Value::as_u64) else {
+    let Some(turn_id) = params.get("turn_id").and_then(Value::as_u64) else {
         return;
     };
-    let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
+    let Some(item_id) = params.get("item_id").and_then(Value::as_str) else {
         return;
     };
     let Some(text) = params.get("text").and_then(Value::as_str) else {
@@ -797,7 +784,7 @@ mod tests {
             ],
             kloop_protocol::ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: 2,
+                route_boundary: 2,
                 provider_id: "anthropic".into(),
                 api_family: kloop_protocol::ProviderApiFamily::AnthropicMessages,
                 endpoint_fingerprint: "endpoint-sha256".into(),
@@ -839,19 +826,19 @@ mod tests {
     #[test]
     fn cursor_requires_strict_string_sequence_and_matching_thread() {
         let valid = EventsSyncParams::parse(&json!({
-            "threadId": "thread-a",
-            "eventCursor": {"threadId": "thread-a", "generation": "g", "seq": "0"}
+            "thread_id": "thread-a",
+            "event_cursor": {"thread_id": "thread-a", "generation": "g", "seq": "0"}
         }))
         .unwrap();
         assert_eq!(valid.event_cursor.unwrap().seq, 0);
 
         for invalid in [
-            json!({"threadId": "thread-a", "eventCursor": {"threadId": "thread-a", "generation": "g", "seq": 0}}),
-            json!({"threadId": "thread-a", "eventCursor": {"threadId": "thread-a", "generation": "g", "seq": "-1"}}),
-            json!({"threadId": "thread-a", "eventCursor": {"threadId": "thread-a", "generation": "g", "seq": "18446744073709551616"}}),
-            json!({"threadId": "thread-a", "eventCursor": {"threadId": "other", "generation": "g", "seq": "0"}}),
-            json!({"threadId": "thread-a", "eventCursor": {"threadId": "thread-a", "generation": "", "seq": "0"}}),
-            json!({"threadId": "thread-a", "unknown": true}),
+            json!({"thread_id": "thread-a", "event_cursor": {"thread_id": "thread-a", "generation": "g", "seq": 0}}),
+            json!({"thread_id": "thread-a", "event_cursor": {"thread_id": "thread-a", "generation": "g", "seq": "-1"}}),
+            json!({"thread_id": "thread-a", "event_cursor": {"thread_id": "thread-a", "generation": "g", "seq": "18446744073709551616"}}),
+            json!({"thread_id": "thread-a", "event_cursor": {"thread_id": "other", "generation": "g", "seq": "0"}}),
+            json!({"thread_id": "thread-a", "event_cursor": {"thread_id": "thread-a", "generation": "", "seq": "0"}}),
+            json!({"thread_id": "thread-a", "unknown": true}),
         ] {
             assert!(EventsSyncParams::parse(&invalid).is_err(), "{invalid}");
         }
@@ -862,8 +849,8 @@ mod tests {
         let projection = projection(8, usize::MAX);
         let first = publish(&projection, "turn/started", json!({"turn": {"id": 1}}));
         let second = publish(&projection, "unknown/future", json!({"value": 7}));
-        assert_eq!(first["threadId"], "thread-a");
-        assert_eq!(first["eventGeneration"], "generation-a");
+        assert_eq!(first["thread_id"], "thread-a");
+        assert_eq!(first["event_generation"], "generation-a");
         assert_eq!(first["seq"], "1");
         assert_eq!(second["seq"], "2");
 
@@ -880,17 +867,17 @@ mod tests {
             json!({
                 "mode": "replay",
                 "generation": "generation-a",
-                "highWaterSeq": "2",
+                "high_water_seq": "2",
                 "events": [{
                     "method": "unknown/future",
                     "params": {
-                        "threadId": "thread-a",
-                        "eventGeneration": "generation-a",
+                        "thread_id": "thread-a",
+                        "event_generation": "generation-a",
                         "seq": "2",
                         "value": 7
                     }
                 }],
-                "eventCursor": {"threadId": "thread-a", "generation": "generation-a", "seq": "2"}
+                "event_cursor": {"thread_id": "thread-a", "generation": "generation-a", "seq": "2"}
             })
         );
     }
@@ -909,7 +896,7 @@ mod tests {
         let value = serde_json::to_value(sync).unwrap();
         assert_eq!(value["mode"], "replay");
         assert_eq!(value["events"], json!([]));
-        assert_eq!(value["highWaterSeq"], "1");
+        assert_eq!(value["high_water_seq"], "1");
     }
 
     #[test]
@@ -932,7 +919,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(changed["reason"], "generationChanged");
+        assert_eq!(changed["reason"], "generation_changed");
 
         let expired = serde_json::to_value(
             projection
@@ -944,7 +931,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(expired["reason"], "cursorExpired");
+        assert_eq!(expired["reason"], "cursor_expired");
     }
 
     #[test]
@@ -968,17 +955,17 @@ mod tests {
         publish(
             &projection,
             "item/started",
-            json!({"turnId": 3, "item": {"id": "msg-0", "type": "assistantMessage", "status": "inProgress", "text": ""}}),
+            json!({"turn_id": 3, "item": {"id": "msg-0", "type": "assistant_message", "status": "in_progress", "text": ""}}),
         );
         publish(
             &projection,
             "item/delta",
-            json!({"turnId": 3, "itemId": "msg-0", "channel": "text", "text": "hi"}),
+            json!({"turn_id": 3, "item_id": "msg-0", "channel": "text", "text": "hi"}),
         );
         publish(
             &projection,
             "item/completed",
-            json!({"turnId": 3, "item": {"id": "msg-0", "type": "assistantMessage", "status": "completed", "text": "hi"}}),
+            json!({"turn_id": 3, "item": {"id": "msg-0", "type": "assistant_message", "status": "completed", "text": "hi"}}),
         );
         publish(
             &projection,
@@ -994,14 +981,14 @@ mod tests {
             &projection,
             "thread/agentMessage/updated",
             json!({
-                "messageId": "mail-1",
+                "message_id": "mail-1",
                 "from": "agent-a",
                 "to": "agent-b",
                 "summary": "ready",
                 "status": "delivered",
             }),
         );
-        publish(&projection, "note", json!({"turnId": 3, "text": "n"}));
+        publish(&projection, "note", json!({"turn_id": 3, "text": "n"}));
         publish(
             &projection,
             "turn/completed",
@@ -1022,13 +1009,13 @@ mod tests {
             "completed"
         );
         assert_eq!(
-            snapshot["snapshot"]["tail"]["backgroundTasks"],
+            snapshot["snapshot"]["tail"]["background_tasks"],
             json!([{"id": "bg-1", "status": "completed"}])
         );
         assert_eq!(
-            snapshot["snapshot"]["tail"]["agentMessages"],
+            snapshot["snapshot"]["tail"]["agent_messages"],
             json!([{
-                "messageId": "mail-1",
+                "message_id": "mail-1",
                 "from": "agent-a",
                 "to": "agent-b",
                 "summary": "ready",
@@ -1043,7 +1030,7 @@ mod tests {
         assert_eq!(cleared["snapshot"]["tail"]["turns"], json!([]));
         assert_eq!(cleared["snapshot"]["tail"]["notices"], json!([]));
         assert_eq!(
-            cleared["snapshot"]["tail"]["backgroundTasks"],
+            cleared["snapshot"]["tail"]["background_tasks"],
             json!([{"id": "bg-1", "status": "completed"}])
         );
     }
@@ -1066,7 +1053,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(sync["reason"], "cursorExpired");
+        assert_eq!(sync["reason"], "cursor_expired");
         assert_eq!(
             sync["snapshot"]["tail"]["notices"][0]["text"],
             "this event is larger than one byte"
@@ -1120,7 +1107,7 @@ mod tests {
         syncer.join().unwrap();
 
         let sync = serde_json::to_value(sync_rx.recv().unwrap()).unwrap();
-        assert_eq!(sync["highWaterSeq"], "1");
+        assert_eq!(sync["high_water_seq"], "1");
         assert_eq!(sync["snapshot"]["tail"]["notices"][0]["text"], "atomic");
     }
 
@@ -1141,8 +1128,8 @@ mod tests {
                 "cwd": "/tmp/new-project",
                 "route": {
                     "revision": 1,
-                    "providerId": "test",
-                    "apiFamily": "mock",
+                    "provider_id": "test",
+                    "api_family": "mock",
                     "model": "model-b",
                     "continuity": "preserved",
                 },
@@ -1170,7 +1157,7 @@ mod tests {
         let snapshot = serde_json::to_value(projection.sync(None).unwrap()).unwrap();
         assert_eq!(
             snapshot["snapshot"]["recovery"],
-            json!({"source": "resumed", "volatileState": "reset"})
+            json!({"source": "resumed", "volatile_state": "reset"})
         );
         assert_eq!(
             snapshot["snapshot"]["history"]["messages"]
@@ -1179,6 +1166,6 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(snapshot["snapshot"]["tail"]["backgroundTasks"], json!([]));
+        assert_eq!(snapshot["snapshot"]["tail"]["background_tasks"], json!([]));
     }
 }

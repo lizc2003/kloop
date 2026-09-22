@@ -215,15 +215,15 @@ impl History {
         attempt: &FrozenProviderAttempt,
     ) {
         self.commit_staged();
-        let origin_boundary = self
+        let route_boundary = self
             .rollout
             .as_ref()
             .map(Rollout::next_boundary)
             .unwrap_or(self.next_memory_boundary);
-        let message = Message::assistant_from_provider(blocks, attempt.provenance(origin_boundary));
+        let message = Message::assistant_from_provider(blocks, attempt.provenance(route_boundary));
         self.persist(|rollout| rollout.append_message(&message));
         self.items.push(message);
-        self.next_memory_boundary = origin_boundary.saturating_add(1);
+        self.next_memory_boundary = route_boundary.saturating_add(1);
     }
 
     /// Whether this session's route timeline has been opened yet. A revision can
@@ -238,11 +238,11 @@ impl History {
         route: &FrozenProviderRoute,
     ) -> std::io::Result<()> {
         if let Some(existing) = self.provider_routes.last() {
-            if existing.revision != route.revision()
+            if existing.route_revision != route.revision()
                 || existing.provider_id != route.provider_id()
                 || existing.api_family != route.api_family()
                 || existing.endpoint_fingerprint != route.endpoint_fingerprint()
-                || existing.primary_model != route.primary_model()
+                || existing.model != route.model()
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -276,7 +276,7 @@ impl History {
                 "history provider route timeline is missing",
             )
         })?;
-        if route.revision() != previous.revision.saturating_add(1) {
+        if route.revision() != previous.route_revision.saturating_add(1) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "provider route revision must advance by exactly one",
@@ -384,23 +384,23 @@ impl History {
         // continuity is a consequence of a hop, and effort is session-local and
         // re-seeds from configuration on every open.
         let candidate = ProviderRouteReceipt {
-            revision: last.revision,
+            route_revision: last.route_revision,
             effort: last.effort,
-            ..opening.receipt(last.boundary, last.source, last.continuity)
+            ..opening.receipt(last.route_boundary, last.source, last.continuity)
         };
         if candidate == *last {
             // Reopening on what the session already recorded: nothing to write,
             // and the receipt resolves by construction because `opening` came
             // from the running catalog.
             let route = opening
-                .at_revision_with_continuity(last.revision, last.continuity)
+                .at_revision_with_continuity(last.route_revision, last.continuity)
                 .map_err(ProviderSwitchError::Route)?;
             return Ok((route, None));
         }
         let from_provider = last.provider_id.clone();
-        let from_model = last.primary_model.clone();
+        let from_model = last.model.clone();
         let revision = last
-            .revision
+            .route_revision
             .checked_add(1)
             .ok_or(ProviderSwitchError::Route(SwitchError::RevisionExhausted))?;
         let tentative = opening
@@ -418,7 +418,7 @@ impl History {
             from_provider,
             from_model,
             to_provider: next.provider_id().to_string(),
-            to_model: next.primary_model().to_string(),
+            to_model: next.model().to_string(),
             continuity,
         };
         Ok((next, Some(reopened)))
@@ -766,7 +766,7 @@ fn provider_request_view(
     let active = routes.last().ok_or_else(|| {
         kloop_provider::ProviderFailure::protocol("provider route timeline is missing")
     })?;
-    if active.revision != attempt.identity().route_revision
+    if active.route_revision != attempt.identity().route_revision
         || active.provider_id != attempt.identity().provider_id
         || active.api_family != attempt.identity().api_family
         || active.endpoint_fingerprint != attempt.identity().endpoint_fingerprint
@@ -829,7 +829,7 @@ fn provider_request_view(
         // different route. Both are recorded, both are visible in the
         // transcript, and refusing the second would leave a reopened session
         // able to open but unable to take a turn.
-        let sanctioned_switch = source.route_revision < active.revision
+        let sanctioned_switch = source.route_revision < active.route_revision
             && routes[source_index + 1..].iter().any(|route| {
                 matches!(
                     route.source,
@@ -1201,7 +1201,7 @@ mod tests {
             content,
             kloop_protocol::ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: 2,
+                route_boundary: 2,
                 provider_id: "responses".into(),
                 api_family: kloop_protocol::ProviderApiFamily::OpenAiResponses,
                 endpoint_fingerprint: "endpoint-sha256".into(),

@@ -72,7 +72,7 @@ pub fn run(
         Ok(SwitchOutcome::NoOp(route)) => SlashResult::route(
             format!(
                 "model unchanged: {} (provider {}, revision {})",
-                route.primary_model(),
+                route.model(),
                 route.provider_id(),
                 route.revision()
             ),
@@ -82,7 +82,7 @@ pub fn run(
         Ok(SwitchOutcome::Changed { route, continuity }) => SlashResult::route(
             format!(
                 "model switched: {} (provider {}, revision {}, reasoning continuity: {continuity:?}, effort: {})",
-                route.primary_model(),
+                route.model(),
                 route.provider_id(),
                 route.revision(),
                 ReasoningEffort::choice_str(route.effort()),

@@ -1187,7 +1187,7 @@ mod tests {
             history
                 .provider_routes()
                 .iter()
-                .map(|receipt| (receipt.revision, receipt.effort))
+                .map(|receipt| (receipt.route_revision, receipt.effort))
                 .collect::<Vec<_>>(),
             vec![
                 (1, None),
@@ -1272,9 +1272,9 @@ mod tests {
             .iter()
             .map(|receipt| {
                 (
-                    receipt.revision,
+                    receipt.route_revision,
                     receipt.provider_id.clone(),
-                    receipt.primary_model.clone(),
+                    receipt.model.clone(),
                     receipt.effort,
                 )
             })

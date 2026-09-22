@@ -439,7 +439,7 @@ fn serve_config_factory(
             &session_dirs,
         )?;
         let current_provider = cfg.provider_route.provider_id().to_string();
-        let current_model = cfg.provider_route.primary_model().to_string();
+        let current_model = cfg.provider_route.model().to_string();
         cfg.provider_catalog = Arc::clone(&catalog);
         if options.provider_id.is_some() || options.model.is_some() {
             let provider_id = options

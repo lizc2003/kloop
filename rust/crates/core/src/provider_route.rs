@@ -253,7 +253,7 @@ impl ProviderCatalog {
                 .descriptor
                 .models
                 .iter()
-                .any(|model| model == &receipt.primary_model)
+                .any(|model| model == &receipt.model)
         {
             return Err(SwitchError::RouteDrift(receipt.provider_id.clone()));
         }
@@ -264,15 +264,15 @@ impl ProviderCatalog {
         self: &Arc<Self>,
         receipt: &kloop_protocol::ProviderRouteReceipt,
     ) -> Result<FrozenProviderRoute, SwitchError> {
-        if receipt.revision == 0 {
+        if receipt.route_revision == 0 {
             return Err(SwitchError::InvalidRevision);
         }
         self.validate_receipt(receipt)?;
-        let resolved = self.resolve(&receipt.provider_id, &receipt.primary_model)?;
+        let resolved = self.resolve(&receipt.provider_id, &receipt.model)?;
         // Effort is session-local and absent from the durable timeline, so a
         // restored route re-seeds it from configuration (plan 102).
         Ok(FrozenProviderRoute::with_continuity(
-            receipt.revision,
+            receipt.route_revision,
             resolved,
             receipt.continuity,
             self.default_effort(&receipt.provider_id),
@@ -329,7 +329,7 @@ impl ProviderCatalog {
             provider_id: provider_id.to_string(),
             api_family: entry.descriptor.api_family,
             endpoint_fingerprint: entry.endpoint_fingerprint.clone(),
-            primary_model: model.to_string(),
+            model: model.to_string(),
             allowed_models: entry.descriptor.models.clone(),
             provider,
             thinking: ThinkingRouting {
@@ -372,16 +372,16 @@ pub(crate) fn validate_timeline(
 ) -> Result<(), SwitchError> {
     let mut previous: Option<&kloop_protocol::ProviderRouteReceipt> = None;
     for receipt in timeline {
-        if receipt.revision == 0
-            || receipt.boundary == 0
+        if receipt.route_revision == 0
+            || receipt.route_boundary == 0
             || receipt.provider_id.trim().is_empty()
             || receipt.endpoint_fingerprint.trim().is_empty()
-            || receipt.primary_model.trim().is_empty()
+            || receipt.model.trim().is_empty()
         {
             return Err(SwitchError::InvalidTimeline);
         }
         match previous {
-            None if receipt.revision == 1
+            None if receipt.route_revision == 1
                 && receipt.source == kloop_protocol::ProviderRouteSource::Initial => {}
             Some(previous)
                 if matches!(
@@ -389,10 +389,10 @@ pub(crate) fn validate_timeline(
                     kloop_protocol::ProviderRouteSource::ExplicitSwitch
                         | kloop_protocol::ProviderRouteSource::Reopened
                 ) && previous
-                    .revision
+                    .route_revision
                     .checked_add(1)
-                    .is_some_and(|revision| revision == receipt.revision)
-                    && receipt.boundary > previous.boundary => {}
+                    .is_some_and(|revision| revision == receipt.route_revision)
+                    && receipt.route_boundary > previous.route_boundary => {}
             _ => return Err(SwitchError::InvalidTimeline),
         }
         previous = Some(receipt);
@@ -461,17 +461,19 @@ pub fn validate_provenance(
 ) -> Result<usize, ProvenanceMismatch> {
     let index = routes
         .iter()
-        .position(|route| route.revision == source.route_revision)
+        .position(|route| route.route_revision == source.route_revision)
         .ok_or(ProvenanceMismatch::UnknownRevision)?;
     let route = &routes[index];
-    let interval_end = routes.get(index + 1).map_or(u64::MAX, |next| next.boundary);
-    if source.origin_boundary <= route.boundary || source.origin_boundary >= interval_end {
+    let interval_end = routes
+        .get(index + 1)
+        .map_or(u64::MAX, |next| next.route_boundary);
+    if source.route_boundary <= route.route_boundary || source.route_boundary >= interval_end {
         return Err(ProvenanceMismatch::OriginOutsideInterval);
     }
-    if origin_line_boundary.is_some_and(|boundary| source.origin_boundary != boundary) {
+    if origin_line_boundary.is_some_and(|boundary| source.route_boundary != boundary) {
         return Err(ProvenanceMismatch::OriginNotOnItsLine);
     }
-    let model_matches = source.model == route.primary_model;
+    let model_matches = source.model == route.model;
     if source.provider_id != route.provider_id
         || source.api_family != route.api_family
         || source.endpoint_fingerprint != route.endpoint_fingerprint
@@ -531,7 +533,7 @@ struct ResolvedRoute {
     provider_id: String,
     api_family: ProviderApiFamily,
     endpoint_fingerprint: String,
-    primary_model: String,
+    model: String,
     allowed_models: Vec<String>,
     provider: Arc<Provider>,
     /// Everything needed to turn (model, effort) into a `thinking` field without
@@ -628,7 +630,7 @@ impl SessionProviderState {
         let route = catalog.restore_route(latest)?;
         let remembered_models = timeline
             .iter()
-            .map(|receipt| (receipt.provider_id.clone(), receipt.primary_model.clone()))
+            .map(|receipt| (receipt.provider_id.clone(), receipt.model.clone()))
             .collect();
         Ok(Self {
             catalog,
@@ -643,10 +645,8 @@ impl SessionProviderState {
         })
     }
     pub fn from_route(catalog: Arc<ProviderCatalog>, route: FrozenProviderRoute) -> Self {
-        let remembered_models = BTreeMap::from([(
-            route.provider_id().to_string(),
-            route.primary_model().to_string(),
-        )]);
+        let remembered_models =
+            BTreeMap::from([(route.provider_id().to_string(), route.model().to_string())]);
         Self {
             catalog,
             state: Mutex::new(SessionState {
@@ -767,7 +767,7 @@ impl SessionProviderState {
             }));
         }
         let same_route = state.active.provider_id == target.provider_id
-            && state.active.primary_model == target.primary_model
+            && state.active.model == target.model
             && state.active.api_family == target.api_family
             && state.active.endpoint_fingerprint == target.endpoint_fingerprint;
         // A named level wins outright. Otherwise: staying on the same route
@@ -881,7 +881,7 @@ impl fmt::Debug for FrozenProviderRoute {
             .field("revision", &self.revision)
             .field("provider_id", &self.route.provider_id)
             .field("api_family", &self.route.api_family)
-            .field("primary_model", &self.route.primary_model)
+            .field("model", &self.route.model)
             .finish()
     }
 }
@@ -920,7 +920,7 @@ impl FrozenProviderRoute {
     /// effort change from a switch.
     pub fn same_route(&self, other: &Self) -> bool {
         self.route.provider_id == other.route.provider_id
-            && self.route.primary_model == other.route.primary_model
+            && self.route.model == other.route.model
             && self.route.api_family == other.route.api_family
             && self.route.endpoint_fingerprint == other.route.endpoint_fingerprint
     }
@@ -964,8 +964,8 @@ impl FrozenProviderRoute {
         &self.route.endpoint_fingerprint
     }
 
-    pub fn primary_model(&self) -> &str {
-        &self.route.primary_model
+    pub fn model(&self) -> &str {
+        &self.route.model
     }
 
     pub fn allowed_models(&self) -> &[String] {
@@ -973,7 +973,7 @@ impl FrozenProviderRoute {
     }
 
     pub fn primary_attempt(&self) -> FrozenProviderAttempt {
-        self.attempt(self.route.primary_model.clone())
+        self.attempt(self.route.model.clone())
     }
 
     fn attempt(&self, model: String) -> FrozenProviderAttempt {
@@ -999,7 +999,7 @@ impl FrozenProviderRoute {
     #[cfg(test)]
     pub(crate) fn with_test_models(&self, models: &[&str]) -> Self {
         let mut route = self.route.clone();
-        route.primary_model = models[0].to_string();
+        route.model = models[0].to_string();
         route.allowed_models = models.iter().map(|model| model.to_string()).collect();
         Self::new(self.revision, route, self.effort)
     }
@@ -1010,7 +1010,7 @@ impl FrozenProviderRoute {
     ) -> Result<Self, SwitchError> {
         let model = model
             .map(InheritedProviderModelOverride::as_str)
-            .unwrap_or(&self.route.primary_model);
+            .unwrap_or(&self.route.model);
         if !self
             .route
             .allowed_models
@@ -1023,7 +1023,7 @@ impl FrozenProviderRoute {
             });
         }
         let mut route = self.route.clone();
-        route.primary_model = model.to_string();
+        route.model = model.to_string();
         // A child inherits the session effort: the same rail, so always accepted.
         Ok(Self::with_continuity(
             1,
@@ -1035,18 +1035,18 @@ impl FrozenProviderRoute {
 
     pub fn receipt(
         &self,
-        boundary: u64,
+        route_boundary: u64,
         source: kloop_protocol::ProviderRouteSource,
         continuity: ReasoningContinuity,
     ) -> kloop_protocol::ProviderRouteReceipt {
         kloop_protocol::ProviderRouteReceipt {
-            revision: self.revision,
-            boundary,
+            route_revision: self.revision,
+            route_boundary,
             source,
             provider_id: self.route.provider_id.clone(),
             api_family: self.route.api_family,
             endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
-            primary_model: self.route.primary_model.clone(),
+            model: self.route.model.clone(),
             effort: self.effort,
             continuity,
         }
@@ -1061,7 +1061,7 @@ impl FrozenProviderRoute {
             revision: self.revision,
             provider_id: self.route.provider_id.clone(),
             api_family: self.route.api_family,
-            model: self.route.primary_model.clone(),
+            model: self.route.model.clone(),
             continuity: self.continuity,
             effort: self.effort,
         }
@@ -1114,10 +1114,10 @@ impl FrozenProviderAttempt {
         self.reasoning
     }
 
-    pub fn provenance(&self, origin_boundary: u64) -> ProviderResponseProvenance {
+    pub fn provenance(&self, route_boundary: u64) -> ProviderResponseProvenance {
         ProviderResponseProvenance {
             route_revision: self.identity.route_revision,
-            origin_boundary,
+            route_boundary,
             provider_id: self.identity.provider_id.clone(),
             api_family: self.identity.api_family,
             endpoint_fingerprint: self.identity.endpoint_fingerprint.clone(),
@@ -1382,20 +1382,20 @@ mod tests {
     }
 
     fn receipt(
-        revision: u64,
-        boundary: u64,
+        route_revision: u64,
+        route_boundary: u64,
         source: kloop_protocol::ProviderRouteSource,
         provider_id: &str,
         model: &str,
     ) -> kloop_protocol::ProviderRouteReceipt {
         kloop_protocol::ProviderRouteReceipt {
-            revision,
-            boundary,
+            route_revision,
+            route_boundary,
             source,
             provider_id: provider_id.into(),
             api_family: ProviderApiFamily::Mock,
             endpoint_fingerprint: format!("mock:{provider_id}"),
-            primary_model: model.into(),
+            model: model.into(),
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         }
@@ -1618,8 +1618,8 @@ mod tests {
             .child_route(Some(&InheritedProviderModelOverride::parse("m2").unwrap()))
             .unwrap();
         assert_eq!(child.revision(), 1);
-        assert_eq!(child.primary_model(), "m2");
-        assert_eq!(route.primary_model(), "m1");
+        assert_eq!(child.model(), "m2");
+        assert_eq!(route.model(), "m1");
 
         let error = route
             .child_route(Some(
@@ -1656,7 +1656,7 @@ mod tests {
                 Some("b2"),
                 EffortRequest::Inherit,
                 |previous, next| {
-                    assert_eq!(previous.primary_model(), "a1");
+                    assert_eq!(previous.model(), "a1");
                     assert_eq!(next.revision(), 2);
                     Ok::<_, ()>(ReasoningContinuity::Filtered)
                 },

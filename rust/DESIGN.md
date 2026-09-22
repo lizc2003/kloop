@@ -301,7 +301,7 @@ directory (`crates/core/src/session_store.rs`):
 ```
 ~/.kloop/projects/v1/{project-id}/
     permissions.json      durable project approvals
-    project.json          {"version":1,"projectId":…,"anchor":"/abs/path"}
+    project.json          {"version":1,"project_id":…,"anchor":"/abs/path"}
     sessions/{id}.jsonl   transcripts, including `{parent}-{agent-N}` sub-agents
     offload/              off-NNNN.txt and background shell bg-N.out
     program-runs/         run_program artifacts (RunStore anchors on offload's
@@ -362,7 +362,7 @@ input). It is historical transcript data, separate from the resettable context
 estimate and never enters provider replay, public display events, or snapshots.
 The same append-only chain also carries recovery-only `session`
 records (the canonical cwd and resolved model) and display `turn_terminal`
-records (completed/maxRounds/aborted/error, positioned after a message index).
+records (completed/max_rounds/aborted/error, positioned after a message index).
 Every turn that happened writes exactly one, from the agent loop's own exits
 rather than from a front end — including the two that end a turn before its
 first sampling request — so a transcript always says why the turn stopped; a
@@ -383,6 +383,28 @@ dependency), `parent` (previous line's id, linked across resumed runs), `ts`
 (unix ms). Within one file the chain is purely sequential; a forked file's
 first line carries a cross-file parent (see Fork below). Unknown fields are
 ignored on read (locked by test), so the format grows additively.
+
+**Field names are snake_case wherever kloop owns the name** — the envelope, every
+line payload, the JSON-RPC surface, and the on-disk trust and policy records.
+Rust field names already are, so this is the serde default and not an
+annotation: a struct that serializes to JSON carries no `rename_all` at all, and
+only an enum needs an explicit `#[serde(rename_all = "snake_case")]`, to bring
+its variant tags down from PascalCase. The rule follows what every reference
+harness does rather than a house style — codex, grok-build and CodeWhale all
+write snake_case rollouts because Rust field names are snake_case, and the two
+TypeScript agents write camelCase for the same reason; translating a field name
+across that boundary is the thing nobody does, and doing it is how one file ends
+up holding both spellings. Three kinds of key are exempt because kloop does not
+own them: JSON Schema keywords inside tool definitions (`additionalProperties`,
+`minItems`), MCP wire fields (`protocolVersion`, `mimeType`, `inputSchema`), and
+provider-reported payloads echoed verbatim (the four `Usage` token counts). A
+flattened payload has to carry its own context in the name, because flattening
+drops the object that would otherwise supply it: a route receipt lands beside
+`type`/`id`/`parent`/`ts` at the line's top level, so its revision is
+`route_revision` and its boundary `route_boundary` — while the same revision
+nested under a snapshot's `route` object stays `revision`, and a provenance
+stamp that refers to that route spells it the same way rather than inventing
+`origin_boundary`.
 
 Resume replays the file, then makes the history legal and consistent again. Read-only inspection (`thread/read`, `thread/list`, session pickers and event seeds) performs the same normalization only in memory and never changes the JSONL file:
 
@@ -513,10 +535,10 @@ codex's `thread/fork` both copy, neither replays across files):
   records after the cut remain only on the source; the branches then accumulate
   independently. Context anchors still reset and re-anchor after the fork.
 
-Server mode exposes the same mechanism as `thread/fork {threadId, cut?}`
+Server mode exposes the same mechanism as `thread/fork {thread_id, cut?}`
 (omit `cut` to fork at the end): it copies the prefix, restores the source's
 pinned cwd/model, spawns the fork as a live thread, and returns
-`{thread:{id,cwd,model,resumable}, messageCount}` so the client can
+`{thread:{id,cwd,model,resumable}, message_count}` so the client can
 `turn/start` on it right away. The source may be dormant or active-and-idle;
 a fork is rejected while its turn is running so an in-flight exchange cannot
 be copied before its terminal record closes the prefix.
@@ -577,7 +599,7 @@ existence means this machine's owner has already run here — whether it holds a
 trust record, transcripts, or durable approvals. That is what keeps the
 question a one-time event instead of something every project predating it would
 meet, and it is why answering yes writes `trust.json` there: creating the
-directory is the point, and the file (`{version, projectId, grantedAt}`,
+directory is the point, and the file (`{version, project_id, granted_at}`,
 write-only — nothing reads it back) is what a human finds later when they
 wonder where the grant came from. Revoking is deleting the directory. Trust is
 not a rule, which is why it does not live in the rule table beside it.
@@ -1096,7 +1118,7 @@ text behind it.
 
 `kloop app-server` (alias `kloop --serve`) speaks the provider-aware native agent protocol over stdio. The breaking native wire version is `2.0`; model-only `2.0` clients are rejected without downgrade. The core still emits one shared Event stream for every front-end.
 
-**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, providerId?, model?}` selects the initial route. `thread/provider/switch {threadId, providerId, model?, expectedRouteRevision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
+**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
 
 
 **Handshake.** `initialize {clientInfo, protocolVersion, capabilities}` →
@@ -1105,71 +1127,71 @@ and gates every other method until it succeeds. Plan 63 changes the scoped
 approval schema in place because the native protocol had no external users; it
 does not add a compatibility adapter, fallback, alias, or silent downgrade.
 Capabilities are structured: `{streaming, subagents, mcp,
-images, approvals:{scopes:["once","workspaceSession","project"]}, questions,
+images, approvals:{scopes:["once","workspace_session","project"]}, questions,
 events:{sequence:true,sync:true,snapshot:true}, threads:{list,
 read,resume,fork}, providers:{catalog:true,switch:true}, config:{read}, skills:{list},
 mcpServers:{status}}`. Event recovery is part of the only current protocol contract,
 not an opt-in compatibility switch; the Desktop adapter rejects a server that does
 not advertise all three event capabilities.
 
-**Methods:** `thread/start {cwd?, providerId?, model?}` → `{thread:{id,route}}`;
+**Methods:** `thread/start {cwd?, provider_id?, model?}` → `{thread:{id,route}}`;
 `thread/list {limit?, cursor?}` → `{threads, nextCursor}` (newest first,
-sub-agent sidechains hidden, `limit` capped at 500); `thread/read {threadId}` →
-`{thread:{id,cwd,route,resumable,forkedFrom,messages,terminals}}`;
-`thread/resume {threadId}` and `thread/fork {threadId, cut?}` →
-`{thread:{id,cwd,route,resumable}, messageCount}`; `turn/start {threadId,
-input}` → `{turn:{id}}`, `turn/steer {threadId, input}` → `{turnId}`,
-`turn/interrupt {threadId}`. Old rollouts without route timelines are rejected,
-not migrated. A `threadId` the client supplies must be ASCII letters, digits,
+sub-agent sidechains hidden, `limit` capped at 500); `thread/read {thread_id}` →
+`{thread:{id,cwd,route,resumable,forked_from,messages,terminals}}`;
+`thread/resume {thread_id}` and `thread/fork {thread_id, cut?}` →
+`{thread:{id,cwd,route,resumable}, message_count}`; `turn/start {thread_id,
+input}` → `{turn:{id}}`, `turn/steer {thread_id, input}` → `{turn_id}`,
+`turn/interrupt {thread_id}`. Old rollouts without route timelines are rejected,
+not migrated. A `thread_id` the client supplies must be ASCII letters, digits,
 `.`, `-` or `_` and cannot start with `.` — server-minted ids
 (`YYYYMMDD-HHMMSS[-N]`) always are, and the constraint is what lets a thread id
 be used unescaped as a filename, an HTTP header value, and a log field.
 `input` is a string or an array of content parts
 (`{type:"text",text}` / `{type:"image",source:{…}}`).
 
-**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | threadId?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | threadId?, forceReload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
+**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcpServerStatus/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 
 Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, fallback, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable route change — an explicit switch, or the `reopened` revision a session writes when it opens on a different route than it was written on — may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. `thread/resume` and `thread/fork` take no provider/model of their own and carry none into the config factory: a reopened thread is built on the configured default and adopts it, advancing the recorded timeline instead of rebuilding it as a fresh initial route (which would refuse every session that had switched providers). Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
 **Events** stream per active thread. Every public notification carries
-`threadId`, one opaque `eventGeneration`, and a decimal-string `seq`; `seq`
+`thread_id`, one opaque `event_generation`, and a decimal-string `seq`; `seq`
 starts at `"1"`, increases strictly across turns in that generation, and never
-uses a JavaScript number. Turn-scoped notifications also carry `turnId` where
+uses a JavaScript number. Turn-scoped notifications also carry `turn_id` where
 applicable. JSON-RPC responses/errors and the `approval/request` /
 `question/request` reverse requests are outside this sequence and use the
 independent request-id space. The public methods are: `turn/started {turn:{id}}`;
 then the turn's items as
-`item/started` / `item/delta {itemId, channel, text}` (channel ∈
+`item/started` / `item/delta {item_id, channel, text}` (channel ∈
 `text`/`reasoning`/`output`) / `item/completed`, where `item.type` ∈
-`assistantMessage` / `reasoning` / `toolCall` / `subAgent` (a tool call
+`assistant_message` / `reasoning` / `tool_call` / `sub_agent` (a tool call
 carries its full `input`, and `output` + `agent` label when present); plus
-`thread/backgroundTask/updated {task:{id, kind, description, status,
-outputPath?, detail?, runId?}}` for session-scoped shell/agent/program/workflow work (`runId` is present for Program `run-*` and Workflow `wf_*`; **no
-`turnId`**, because completion may arrive after the launching turn),
-`thread/agentMessage/updated {messageId,from,to,summary,status}`
+`thread/background_task/updated {task:{id, kind, description, status,
+output_path?, detail?, run_id?}}` for session-scoped shell/agent/program/workflow work (`run_id` is present for Program `run-*` and Workflow `wf_*`; **no
+`turn_id`**, because completion may arrive after the launching turn),
+`thread/agent_message/updated {message_id,from,to,summary,status}`
 for the separate Local Agent Mailbox lifecycle (`status` ∈ `queued` / `delivered` /
-`undeliverable`; **no `turnId` and no message body, context ID, or Task ID**),
-`thread/scheduler/updated {task:{id, origin:"cron"|"loopWakeup",
-status:"scheduled"|"fired"|"cancelled"|"failed", scheduledForMs?, reason?, detail?}}`
-for owner-scoped scheduler lifecycle (**no `turnId`**),
-`thread/tokenUsage/updated {tokenUsage:{total}}`, `note {text}`,
+`undeliverable`; **no `turn_id` and no message body, context ID, or Task ID**),
+`thread/scheduler/updated {task:{id, origin:"cron"|"loop_wakeup",
+status:"scheduled"|"fired"|"cancelled"|"failed", scheduled_for_ms?, reason?, detail?}}`
+for owner-scoped scheduler lifecycle (**no `turn_id`**),
+`thread/token_usage/updated {token_usage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
 error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
 
-**Event recovery.** `thread/events/sync {threadId, eventCursor?}` is the one
+**Event recovery.** `thread/events/sync {thread_id, event_cursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is
-`{threadId,generation,seq}` and is unrelated to the `thread/list` pagination
+`{thread_id,generation,seq}` and is unrelated to the `thread/list` pagination
 cursor. Its thread/generation strings must be non-empty and `seq` must be a
 base-10 `u64` string; a foreign thread, malformed/overflow value, or a
 same-generation future sequence is `INVALID_PARAMS`. Dormant threads must first
 be resumed.
 
 With a retained same-generation cursor, sync returns
-`{mode:"replay",generation,highWaterSeq,events,eventCursor}`. `events` is the
-continuous interval `(cursor.seq, highWaterSeq]` using the exact live
+`{mode:"replay",generation,high_water_seq,events,event_cursor}`. `events` is the
+continuous interval `(cursor.seq, high_water_seq]` using the exact live
 `{method,params}` envelopes; a cursor already at high water produces an empty
 replay. With no cursor, an old generation, or a cursor older than retention, it
-returns `{mode:"snapshot",reason:"initial"|"generationChanged"|"cursorExpired",
-generation,highWaterSeq,snapshot,eventCursor}`. Snapshot schema v1 contains the
+returns `{mode:"snapshot",reason:"initial"|"generation_changed"|"cursor_expired",
+generation,high_water_seq,snapshot,event_cursor}`. Snapshot schema v1 contains the
 rollout-seeded persisted messages/runtime/terminals plus the current
 generation's materialized turns/items/notices and latest thread-scoped state.
 It is a read-only display projection, never an instruction to redispatch a tool,
@@ -1181,7 +1203,7 @@ materialized snapshot remains complete. The generation, ring, and snapshot tail
 are process memory, not a durable public-event journal. Resume or server restart
 creates a new generation, seeds persisted history from the rollout, resets
 volatile execution state, and resolves an old cursor with a
-`generationChanged` full snapshot. Sequence/cursor/envelope data is never
+`generation_changed` full snapshot. Sequence/cursor/envelope data is never
 written into rollout history or provider replay.
 
 The client starts sync as soon as `thread/start`, `thread/resume`, or
@@ -1194,16 +1216,16 @@ business adapter ignores them. A missing or malformed generation/sequence is a
 hard protocol failure—there is no direct-ingest fallback.
 
 **Interactions use two independent reverse requests.** Permission decisions use
-`approval/request {threadId, turnId, kind:"command"|"fileChange",
-description, preview?, rememberRules?, approvalScopes}` (server ids are integers
+`approval/request {thread_id, turn_id, kind:"command"|"file_change",
+description, preview?, remember_rules?, approval_scopes}` (server ids are integers
 in the server's own counter space), answered `{"decision": "accept" |
-"acceptForSession" | "acceptForProject" | "decline"}`. The request is
+"accept_for_session" | "accept_for_project" | "decline"}`. The request is
 authoritative: the client must offer only its advertised scopes, and core rejects
-a response outside that set. `acceptAlways`, cancel, unknown, missing, late, and
+a response outside that set. `accept_always`, cancel, unknown, missing, late, and
 EOF/disconnect replies all fail closed to deny. Approval payloads never contain
 the ProjectId, raw identity anchor, state path, policy body, or revision.
 General model questions use
-`question/request {threadId, turnId, questionIndex, question}` only when the
+`question/request {thread_id, turn_id, question_index, question}` only when the
 client advertised `capabilities.questions: true`; each question is answered
 `{"outcome":"answered","selected":[...],"other"?,"notes"?}` or
 `{"outcome":"cancelled"}`. Unknown, malformed, mismatched, disconnected, or
@@ -1213,17 +1235,17 @@ turn is interrupted.
 ```jsonc
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2.0","capabilities":{"events":{"sequence":true,"sync":true,"snapshot":true},"providers":{"catalog":true,"switch":true}}}}
 ← {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"kloop","version":"0.1.0"},"protocolVersion":"2.0","capabilities":{"streaming":true,"subagents":true,"mcp":true,"images":true,"providers":{"catalog":true,"switch":true},"events":{"sequence":true,"sync":true,"snapshot":true},"threads":{"list":true,"read":true,"resume":true,"fork":true},"config":{"read":true},"skills":{"list":true},"mcpServers":{"status":true}}}}
-→ {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"providerId":"anthropic","model":"claude-sonnet-5"}}
-← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146","route":{"revision":1,"providerId":"anthropic","apiFamily":"anthropic_messages","model":"claude-sonnet-5"}}}}
-→ {"jsonrpc":"2.0","id":3,"method":"thread/events/sync","params":{"threadId":"20260721-135146"}}
-← {"jsonrpc":"2.0","id":3,"result":{"mode":"snapshot","reason":"initial","generation":"g","highWaterSeq":"0","snapshot":{"schemaVersion":1,"thread":{"id":"20260721-135146","cwd":"…","route":{"revision":1,"providerId":"anthropic","apiFamily":"anthropic_messages","model":"claude-sonnet-5"},"resumable":true},"history":{"messages":[],"runtime":{"cwd":"…"},"terminals":[]},"tail":{"turns":[],"notices":[],"backgroundTasks":[],"agentMessages":[],"scheduledTasks":[],"tokenUsage":null,"cwd":{"path":"…","branch":null}},"recovery":{"source":"fresh","volatileState":"live"}},"eventCursor":{"threadId":"20260721-135146","generation":"g","seq":"0"}}}
-→ {"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"threadId":"20260721-135146","input":"create s2.txt"}}
+→ {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"provider_id":"anthropic","model":"claude-sonnet-5"}}
+← {"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"20260721-135146","route":{"revision":1,"provider_id":"anthropic","api_family":"anthropic_messages","model":"claude-sonnet-5"}}}}
+→ {"jsonrpc":"2.0","id":3,"method":"thread/events/sync","params":{"thread_id":"20260721-135146"}}
+← {"jsonrpc":"2.0","id":3,"result":{"mode":"snapshot","reason":"initial","generation":"g","high_water_seq":"0","snapshot":{"schema_version":1,"thread":{"id":"20260721-135146","cwd":"…","route":{"revision":1,"provider_id":"anthropic","api_family":"anthropic_messages","model":"claude-sonnet-5"},"resumable":true},"history":{"messages":[],"runtime":{"cwd":"…"},"terminals":[]},"tail":{"turns":[],"notices":[],"background_tasks":[],"agent_messages":[],"scheduled_tasks":[],"token_usage":null,"cwd":{"path":"…","branch":null}},"recovery":{"source":"fresh","volatile_state":"live"}},"event_cursor":{"thread_id":"20260721-135146","generation":"g","seq":"0"}}}
+→ {"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"thread_id":"20260721-135146","input":"create s2.txt"}}
 ← {"jsonrpc":"2.0","id":4,"result":{"turn":{"id":1}}}
-← {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"…","eventGeneration":"g","seq":"1","turn":{"id":1}}}
-← {"jsonrpc":"2.0","id":1,"method":"approval/request","params":{"threadId":"…","turnId":1,"kind":"fileChange","description":"write_file: s2.txt","rememberRules":["write_file(*)"],"approvalScopes":["once","workspaceSession","project"],"preview":"(new file)\n+1  hello"}}
-→ {"jsonrpc":"2.0","id":1,"result":{"decision":"acceptForProject"}}
-← {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"…","eventGeneration":"g","seq":"7","turnId":1,"item":{"id":"…","type":"toolCall","name":"write_file","status":"completed"}}}
-← {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"…","eventGeneration":"g","seq":"8","turn":{"id":1,"status":"completed"}}}
+← {"jsonrpc":"2.0","method":"turn/started","params":{"thread_id":"…","event_generation":"g","seq":"1","turn":{"id":1}}}
+← {"jsonrpc":"2.0","id":1,"method":"approval/request","params":{"thread_id":"…","turn_id":1,"kind":"file_change","description":"write_file: s2.txt","remember_rules":["write_file(*)"],"approval_scopes":["once","workspace_session","project"],"preview":"(new file)\n+1  hello"}}
+→ {"jsonrpc":"2.0","id":1,"result":{"decision":"accept_for_project"}}
+← {"jsonrpc":"2.0","method":"item/completed","params":{"thread_id":"…","event_generation":"g","seq":"7","turn_id":1,"item":{"id":"…","type":"tool_call","name":"write_file","status":"completed"}}}
+← {"jsonrpc":"2.0","method":"turn/completed","params":{"thread_id":"…","event_generation":"g","seq":"8","turn":{"id":1,"status":"completed"}}}
 ```
 
 ## MCP client (Phase 2, sixth slice)
@@ -2099,8 +2121,8 @@ Presentation per frontend:
   `✓ agent-1 <task> (3 tool uses)` when it ends. A row still Running when
   the turn dies (interrupt drops the task future) is patched to failed.
 - **plain**: dim notes, `agent-1 · bash {...}` per call.
-- **server**: a `subAgent` item brackets the sub-agent (`item/started` →
-  `item/completed`); its own `toolCall` items carry an `"agent"` field
+- **server**: a `sub_agent` item brackets the sub-agent (`item/started` →
+  `item/completed`); its own `tool_call` items carry an `"agent"` field
   (main-agent calls omit it).
 
 ### Custom agent types
@@ -2500,7 +2522,7 @@ own**, and only the updates after it ride along with the work. That half is
 session-stable and costs no cache; the reminder exists for the rounds after it,
 where the model has the list but has stopped looking at it.
 
-`todo_write` uses the ordinary `toolCall` lifecycle. A successful list-changing
+`todo_write` uses the ordinary `tool_call` lifecycle. A successful list-changing
 write additionally emits internal `TodoUpdated`; only the TUI projects it
 as a read-only live list immediately above the composer. `Ctrl+T` toggles that
 projection without mutating the registry. When a turn ends the panel
@@ -2548,7 +2570,7 @@ out.
 
 Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on the
 cloned Config), so a running sub-agent never drains the parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
-a User cell); server mode enqueues via `turn/steer {threadId, input}` (while a
+a User cell); server mode enqueues via `turn/steer {thread_id, input}` (while a
 turn runs it folds in at the next round boundary; while idle the thread worker's
 inbox-activity branch allocates a delivery turn). The plain REPL cannot accept a
 second stdin line while `run_turn` owns the foreground, so it still has no
@@ -2803,7 +2825,7 @@ user message. Background Program shares `BackgroundExecutions`, inbox activity,
 `wait_for_activity`, and idle autodelivery with background Agent and Workflow.
 Both Program Running and its unique terminal `BackgroundTaskUpdated` carry the
 same durable `run-*`; native wire projects it through the existing optional
-`runId` field without adding a turn owner or changing protocol version. The shell registry stays separate because a shell has its own output file and
+`run_id` field without adding a turn owner or changing protocol version. The shell registry stays separate because a shell has its own output file and
 reinjects only a terminal pointer. Deliberately **not** copied from codex: its
 cell/observation-frontier machinery (incremental pull-based output streamed to
 the model between `yield`s) — kloop is push-based on completion and `log()`
@@ -3049,7 +3071,7 @@ Agent's `BackgroundTask` terminal or completion delivery.
 
 The TUI upserts one body-free row per message ID; plain output uses the same
 bounded lifecycle note; native server/headless JSON emits the independent
-`thread/agentMessage/updated` notification documented above. The sender's tool
+`thread/agent_message/updated` notification documented above. The sender's tool
 event input also contains only target, summary, and byte count, while its
 canonical audited tool input and the recipient's framed history retain the body.
 Program/Workflow JavaScript bridges cannot call either tool directly, although
@@ -3435,10 +3457,10 @@ kloop --mock --headless --json
   **stdout**, progress notes go to **stderr**, so `result=$(kloop --headless "…")`
   captures a clean result. `--json` (machine): every event is one NDJSON line on
   stdout — `turn/started`, `item/started|delta|completed`,
-  `thread/backgroundTask/updated`, `thread/scheduler/updated`,
-  `thread/tokenUsage/updated`, `note`,
+  `thread/background_task/updated`, `thread/scheduler/updated`,
+  `thread/token_usage/updated`, `note`,
   `turn/completed` — the **exact same item vocabulary the native protocol server
-  emits** (via one shared `project_event`), `threadId` and all. One event
+  emits** (via one shared `project_event`), `thread_id` and all. One event
   vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
@@ -3831,7 +3853,7 @@ Every session is saved and resumable — see Session persistence above.
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
   plus duplex-driven exact native protocol 2.0 tests against the real serve loop:
-  structured approval scopes, `acceptForProject`, protocol 2.0/`acceptAlways` rejection,
+  structured approval scopes, `accept_for_project`, protocol 2.0/`accept_always` rejection,
   delta streaming and completion, approval deny/allow
   round-trips (file provably not/created, the change `preview` reaching the
   client), parallel threads with no event

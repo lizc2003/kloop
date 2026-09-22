@@ -564,7 +564,6 @@ pub enum ProviderAvailabilityCode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderDescriptor {
     pub id: String,
     pub api_family: ProviderApiFamily,
@@ -592,7 +591,6 @@ pub enum RoutePickerStage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderAttemptIdentity {
     pub route_revision: u64,
     pub provider_id: String,
@@ -623,15 +621,14 @@ pub enum ReasoningContinuity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderRouteReceipt {
-    pub revision: u64,
-    pub boundary: u64,
+    pub route_revision: u64,
+    pub route_boundary: u64,
     pub source: ProviderRouteSource,
     pub provider_id: String,
     pub api_family: ProviderApiFamily,
     pub endpoint_fingerprint: String,
-    pub primary_model: String,
+    pub model: String,
     /// The reasoning effort this route samples at. Absent means no effort field
     /// is sent at all, which is a different state from any named level — and the
     /// one that makes a transcript readable months later, because effort decides
@@ -643,7 +640,6 @@ pub struct ProviderRouteReceipt {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ActiveProviderRoute {
     pub revision: u64,
     pub provider_id: String,
@@ -661,10 +657,9 @@ pub struct ActiveProviderRoute {
 /// Private replay identity bound by the History owner when a provider-produced
 /// assistant message is appended. It is never part of a public projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderResponseProvenance {
     pub route_revision: u64,
-    pub origin_boundary: u64,
+    pub route_boundary: u64,
     pub provider_id: String,
     pub api_family: ProviderApiFamily,
     pub endpoint_fingerprint: String,
@@ -1252,7 +1247,7 @@ mod tests {
             ],
             provider_provenance: Some(ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: 2,
+                route_boundary: 2,
                 provider_id: "anthropic".into(),
                 api_family: ProviderApiFamily::AnthropicMessages,
                 endpoint_fingerprint: "endpoint-sha256".into(),
@@ -1361,7 +1356,7 @@ mod tests {
             ],
             ProviderResponseProvenance {
                 route_revision: 1,
-                origin_boundary: 2,
+                route_boundary: 2,
                 provider_id: "anthropic".into(),
                 api_family: ProviderApiFamily::AnthropicMessages,
                 endpoint_fingerprint: "endpoint-sha256".into(),
@@ -1529,15 +1524,15 @@ mod tests {
         // metadata and a local message id is not a Task id.
         let a2a_message = json!({
             "kind": "message",
-            "messageId": message.message_id.as_str(),
-            "contextId": message.context_id.as_str(),
+            "message_id": message.message_id.as_str(),
+            "context_id": message.context_id.as_str(),
             "role": "user",
             "parts": [{"kind": "text", "text": message.text_body()}],
         });
         assert!(a2a_message.get("to").is_none());
         assert!(a2a_message.get("from").is_none());
         assert!(a2a_message.get("summary").is_none());
-        assert!(a2a_message.get("taskId").is_none());
+        assert!(a2a_message.get("task_id").is_none());
         assert!(a2a_message.get("url").is_none());
     }
 

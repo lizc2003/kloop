@@ -197,7 +197,7 @@ fn write_project_meta(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io::
         "{}\n",
         serde_json::json!({
             "version": 1,
-            "projectId": project_id.as_str(),
+            "project_id": project_id.as_str(),
             "anchor": anchor.to_string_lossy(),
         })
     );
