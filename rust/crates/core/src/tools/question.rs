@@ -16,7 +16,7 @@ use kloop_protocol::ToolDef;
 pub(super) fn ask_user_question_def() -> ToolDef {
     ToolDef {
         name: "ask_user_question".into(),
-        description: "Ask the user one to four concrete decision questions only when their answer is genuinely required. Each question has two to four options and always permits an Other free-text answer. Use multiSelect for non-exclusive choices and preview only when a visual/code comparison helps. Do not use this for permission approval or to ask whether an implementation plan is ready.".into(),
+        description: "Ask the user one to four concrete decision questions only when their answer is genuinely required. Each question has two to four options and always permits an Other free-text answer. Use multi_select for non-exclusive choices and preview only when a visual/code comparison helps. Do not use this for permission approval or to ask whether an implementation plan is ready.".into(),
         schema: json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",

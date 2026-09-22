@@ -504,7 +504,7 @@ fn assert_background_lifecycle(
         Some(prefix) => {
             let run_id = updates[0]["params"]["task"]["run_id"]
                 .as_str()
-                .expect("durable background work omitted runId")
+                .expect("durable background work omitted run_id")
                 .to_string();
             assert!(run_id.starts_with(prefix), "unexpected run id shape");
             assert!(

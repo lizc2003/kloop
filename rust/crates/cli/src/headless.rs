@@ -11,7 +11,7 @@
 //!   current-project allows, which act at earlier gate layers and never reach
 //!   the approver.
 //! - **`--json` reuses the server's wire shapes** verbatim (method + params,
-//!   `threadId` and all) — one event vocabulary, two front-ends.
+//!   `thread_id` and all) — one event vocabulary, two front-ends.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -84,7 +84,7 @@ impl Approver for DenyApprover {
 }
 
 /// The `--json` front-end: every UI event becomes one NDJSON line reusing the
-/// server's notification method names and param shapes, `threadId` injected. A
+/// server's notification method names and param shapes, `thread_id` injected. A
 /// `Mutex` around the writer keeps concurrent sub-agent events from interleaving
 /// mid-line.
 struct JsonUi<W: Write + Send> {
@@ -254,9 +254,9 @@ mod tests {
     }
 
     /// The `--json` stream is the item vocabulary the server projects (shared
-    /// `kloop_server::project_event`), with `threadId` injected. The exact item
+    /// `kloop_server::project_event`), with `thread_id` injected. The exact item
     /// shapes are locked in the server's wire unit tests; here we check the
-    /// front-end wiring: the projection is used and `threadId` rides every line.
+    /// front-end wiring: the projection is used and `thread_id` rides every line.
     #[test]
     fn json_ui_projects_the_item_vocabulary_with_thread_id() {
         use kloop_core::event::Delta;

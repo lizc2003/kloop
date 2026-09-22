@@ -2552,7 +2552,7 @@ async fn scheduled_idle_delivery_allocates_the_next_turn_id() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// `todo_write` uses the ordinary toolCall lifecycle; the native wire has no
+/// `todo_write` uses the ordinary tool_call lifecycle; the native wire has no
 /// task-board or retired todo item type.
 ///
 /// Per-thread registry isolation was pinned here while a write returned a
@@ -2600,7 +2600,7 @@ async fn todo_write_surfaces_as_an_ordinary_tool_call() {
                 && message["params"]["item"]["name"] == "todo_write"
         })
         .collect::<Vec<_>>();
-    assert_eq!(calls.len(), 2, "started and completed toolCall: {log:?}");
+    assert_eq!(calls.len(), 2, "started and completed tool_call: {log:?}");
     assert_eq!(calls[0]["method"], "item/started");
     assert_eq!(calls[0]["params"]["item"]["input"], input);
     assert_eq!(calls[1]["method"], "item/completed");
@@ -2671,7 +2671,7 @@ async fn partial_stream_is_sealed_then_continued_and_stays_recoverable() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// A run_agent call surfaces the sub-agent lifecycle on the wire: a `subAgent`
+/// A run_agent call surfaces the sub-agent lifecycle on the wire: a `sub_agent`
 /// brackets it, and the sub-agent's own tool calls carry an "agent" field while
 /// the main agent's calls stay unadorned.
 #[tokio::test]
@@ -2700,7 +2700,7 @@ async fn subagent_items_carry_the_agent_label() {
     let started = log
         .iter()
         .find(|m| m["method"] == "item/started" && m["params"]["item"]["type"] == "sub_agent")
-        .expect("subAgent started item");
+        .expect("sub_agent started item");
     let label = started["params"]["item"]["label"]
         .as_str()
         .unwrap()
@@ -2753,7 +2753,7 @@ async fn approval_declined_then_accepted() {
     let thread_id = client.init_and_start().await;
 
     // Turn 1: the write_file call must come back as a server reverse request
-    // with a fileChange kind (it carries a diff preview).
+    // with a file_change kind (it carries a diff preview).
     client
         .request(
             "turn/start",

@@ -6,7 +6,7 @@ use kloop_protocol::Usage;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum UsageOperation {
     Sampling,
     Compaction,

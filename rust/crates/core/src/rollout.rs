@@ -3506,7 +3506,7 @@ mod tests {
         rollout
             .append_message(&Message::user_text("question"))
             .unwrap();
-        let mut provenance = kloop_protocol::ProviderResponseProvenance {
+        let provenance = kloop_protocol::ProviderResponseProvenance {
             route_revision: 2,
             route_boundary: 3,
             provider_id: "test".into(),
@@ -3523,16 +3523,21 @@ mod tests {
                     thinking: "summary".into(),
                     signature: "opaque".into(),
                 }],
-                provenance.clone(),
+                provenance,
             ))
             .unwrap();
         assert!(inspect_session(&path).is_err());
-        provenance.route_revision = 1;
-        provenance.route_boundary = 99;
-        let raw = std::fs::read_to_string(&path).unwrap().replace(
-            "\"routeRevision\":2,\"originBoundary\":3",
-            "\"routeRevision\":1,\"originBoundary\":99",
+
+        // A revision the timeline does have, pinned to a boundary it never
+        // had, is refused just the same. The rewrite is asserted to have
+        // matched: a renamed field would otherwise turn this into a second
+        // run of the assertion above, silently and still green.
+        let original = std::fs::read_to_string(&path).unwrap();
+        let raw = original.replace(
+            "\"route_revision\":2,\"route_boundary\":3",
+            "\"route_revision\":1,\"route_boundary\":99",
         );
+        assert_ne!(raw, original, "provenance rewrite matched nothing");
         std::fs::write(&path, raw).unwrap();
         assert!(inspect_session(&path).is_err());
         cleanup(&path);

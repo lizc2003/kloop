@@ -135,7 +135,7 @@ fn status_str(s: ItemStatus) -> &'static str {
     }
 }
 
-/// Serialize a core [`Item`] to its wire object: a camelCase `type` tag plus
+/// Serialize a core [`Item`] to its wire object: a snake_case `type` tag plus
 /// `id`, `status`, and the type's own fields. A tool call carries the full
 /// `input` both times (the wire no longer sends a summary); `output` and the
 /// sub-agent `agent` label appear only when present.
@@ -178,7 +178,7 @@ fn item_json(id: &str, item: &Item) -> Value {
 }
 
 /// Project a core [`Event`] onto a wire notification `(method, params)`, minus
-/// the `threadId` each sink injects. `turn_id` tags item events with their
+/// the `thread_id` each sink injects. `turn_id` tags item events with their
 /// turn. Returns `None` for the turn bracket (worker-constructed, since it owns
 /// the turn id) and events with no wire form.
 pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> {
@@ -268,7 +268,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
                 }}),
             ))
         }
-        // Token usage, cwd and scheduler updates are thread-scoped, not turn-scoped: no turnId.
+        // Token usage, cwd and scheduler updates are thread-scoped, not turn-scoped: no turn_id.
         Event::Usage(n) => Some((
             "thread/token_usage/updated",
             json!({"token_usage": {"total": n}}),
@@ -277,7 +277,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
             Some(("thread/cwd/updated", json!({"cwd": cwd, "branch": branch})))
         }
         // The todo snapshot is an internal TUI projection. todo_write keeps
-        // their ordinary toolCall lifecycle, with no public list notification.
+        // their ordinary tool_call lifecycle, with no public list notification.
         Event::TodoUpdated(_) => None,
         // A mode change has no dedicated wire in slice 1 (config/model is a
         // slice-4 read surface); it and plain notes surface as a `note`.

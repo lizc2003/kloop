@@ -28,7 +28,7 @@ pub type ItemId = String;
 /// Session-scoped background work is not owned by the turn that launched it.
 /// Shells use their own registry while Agents, Programs, and Workflows share an
 /// execution registry; this read-only projection lets every frontend render one
-/// lifecycle without inventing a late `turnId`.
+/// lifecycle without inventing a late `turn_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundTaskKind {
     Shell,

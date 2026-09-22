@@ -1070,7 +1070,7 @@ impl Server {
             }
         }
         let (cwd, _) = self.read_scope(params)?;
-        // Discovery is deliberately uncached today, so forceReload and a normal
+        // Discovery is deliberately uncached today, so force_reload and a normal
         // call are both one fresh bounded filesystem scan.
         let mut snapshot = (self.skills_reader)(&cwd)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot list skills: {e:#}")))?;
@@ -1187,7 +1187,7 @@ impl Server {
     /// pushed during a running turn folds into it, and one pushed while idle is
     /// delivered at the top of the next `turn/start`. There is no autowake in
     /// client-driven server mode, so an idle steer waits for that next turn.
-    /// Returns the running turn's id, or null when idle. (`expectedTurnId`, if
+    /// Returns the running turn's id, or null when idle. (`expected_turn_id`, if
     /// the client sends it, is accepted and ignored for now.)
     fn turn_steer(&mut self, params: &Value) -> MethodResult {
         let thread_id = str_param(params, "thread_id")?;
@@ -2018,7 +2018,7 @@ fn approval_decision(result: &Value) -> Decision {
         Some("accept") => Decision::Allow(ApprovalScope::Once),
         Some("accept_for_session") => Decision::Allow(ApprovalScope::WorkspaceSession),
         Some("accept_for_project") => Decision::Allow(ApprovalScope::Project),
-        // decline, cancel, the removed acceptAlways token, anything unknown, or
+        // decline, cancel, the removed accept_always token, anything unknown, or
         // a missing decision all fail closed.
         _ => Decision::Deny,
     }
@@ -2046,7 +2046,7 @@ impl Approver for ThreadUi {
             .unwrap()
             .insert(id.clone(), PendingInteraction::Approval(reply));
         // A file change carries a diff preview; nothing else does — so the
-        // preview's presence is exactly the command/fileChange discriminant.
+        // preview's presence is exactly the command/file_change discriminant.
         let kind = if req.preview.is_some() {
             "file_change"
         } else {

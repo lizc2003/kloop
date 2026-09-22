@@ -930,7 +930,7 @@ mod tests {
             std::fs::create_dir_all(partition.join("sessions")).unwrap();
             std::fs::write(
                 partition.join("project.json"),
-                format!("{{\"version\":1,\"projectId\":\"{id}\",\"anchor\":\"{anchor}\"}}"),
+                format!("{{\"version\":1,\"project_id\":\"{id}\",\"anchor\":\"{anchor}\"}}"),
             )
             .unwrap();
             std::fs::write(

@@ -12,7 +12,7 @@ use std::fmt;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,

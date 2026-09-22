@@ -41,12 +41,12 @@ impl EventCursor {
     fn validate(&self) -> Result<(), CursorError> {
         if self.thread_id.trim().is_empty() {
             return Err(CursorError::Invalid(
-                "eventCursor.threadId must not be empty",
+                "event_cursor.thread_id must not be empty",
             ));
         }
         if self.generation.trim().is_empty() {
             return Err(CursorError::Invalid(
-                "eventCursor.generation must not be empty",
+                "event_cursor.generation must not be empty",
             ));
         }
         Ok(())
@@ -71,7 +71,7 @@ impl EventsSyncParams {
         if let Some(cursor) = &parsed.event_cursor {
             cursor.validate().map_err(|error| error.to_string())?;
             if cursor.thread_id != parsed.thread_id {
-                return Err("eventCursor belongs to a different thread".into());
+                return Err("event_cursor belongs to a different thread".into());
             }
         }
         Ok(parsed)
@@ -236,9 +236,11 @@ impl std::fmt::Display for CursorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
-            Self::ForeignThread => formatter.write_str("eventCursor belongs to a different thread"),
+            Self::ForeignThread => {
+                formatter.write_str("event_cursor belongs to a different thread")
+            }
             Self::FutureSequence => {
-                formatter.write_str("eventCursor sequence is ahead of this generation")
+                formatter.write_str("event_cursor sequence is ahead of this generation")
             }
             Self::ProjectionUnavailable => {
                 formatter.write_str("public event projection is unavailable")

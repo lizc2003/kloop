@@ -99,7 +99,7 @@ impl QuestionRequest {
                     )?;
                     if question.multi_select {
                         return Err(format!(
-                            "questions[{question_index}] cannot use previews with multiSelect"
+                            "questions[{question_index}] cannot use previews with multi_select"
                         ));
                     }
                     total = total.saturating_add(preview.chars().count());

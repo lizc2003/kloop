@@ -220,8 +220,8 @@ Agent/Program 成功结果复用 History offload，Workflow 继续 bounded summa
 worktree/run store/registry/spawn 前完成，且 Program description 不进入 `source.js`、manifest、byte-identical
 resume 或 journal key。Workflow 继续只认 `meta.description`，顶层 `description/title` 保持
 accepted-but-ignored。Agent/Shell 无 durable ID；Program Running/唯一 terminal 使用同一 `run-*`，Workflow
-使用同一 `wf_*`；native `thread/backgroundTask/updated` 继续无 `turnId`、协议仍为 1.0，只 additive 使用
-既有 optional `runId`。Inbox framing 固定为 `[Agent agent-N]`、`[Program program-N] run run-*`、
+使用同一 `wf_*`；native `thread/background_task/updated` 继续无 `turn_id`、协议仍为 1.0，只 additive 使用
+既有 optional `run_id`。Inbox framing 固定为 `[Agent agent-N]`、`[Program program-N] run run-*`、
 `[Workflow workflow-N] run wf_*`，超大 Agent/Program 仍只 offload result body。
 
 TUI 将后台更新从无关联 Note 改为 session-owned typed row：live tail 按 execution ID 原位 upsert；Running

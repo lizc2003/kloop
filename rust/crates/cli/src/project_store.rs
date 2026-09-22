@@ -322,7 +322,7 @@ mod tests {
                 "granted_at": null,
             })
         );
-        let granted_at = granted_at.as_str().expect("grantedAt is a string");
+        let granted_at = granted_at.as_str().expect("granted_at is a string");
         assert_eq!(granted_at.len(), 20, "{granted_at}");
         assert!(granted_at.ends_with('Z'), "{granted_at}");
 
