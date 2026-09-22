@@ -61,10 +61,12 @@ pub(crate) struct CliArgs {
     /// future verbose flag, which is what the lowercase letter reads as.
     pub(crate) version: bool,
     /// `--permission-mode <mode>`: the gating mode for this session. `manual`
-    /// (the default when the flag is omitted — ask for anything unvouched-for),
-    /// `accept-edits` (auto-approve cwd file writes), `bypass` (approve all but
-    /// deny rules + safety checks), `plan` (read-only until the model's plan is
-    /// approved via exit_plan_mode). `--mock` ignores it (no gate at all).
+    /// (the default when the flag is omitted — ask for anything the gate
+    /// cannot vouch for; a file write landing inside the cwd is contained and
+    /// never asks, which is why there is no `accept-edits` mode), `bypass`
+    /// (approve all but deny rules + safety checks), `plan` (read-only until
+    /// the model's plan is approved via exit_plan_mode). `--mock` ignores it
+    /// (no gate at all).
     pub(crate) permission_mode: Mode,
     pub(crate) list_sessions: bool,
     /// `--all` (`--list-sessions` only): list every project's sessions, not
@@ -126,19 +128,16 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             "--permission-mode" => {
                 let raw = match args.get(i + 1) {
                     Some(mode) if !mode.starts_with('-') => mode,
-                    _ => bail!(
-                        "--permission-mode needs a mode (manual | accept-edits | bypass | plan)"
-                    ),
+                    _ => bail!("--permission-mode needs a mode (manual | bypass | plan)"),
                 };
                 i += 1;
                 parsed.permission_mode = match raw.as_str() {
                     "manual" => Mode::Manual,
-                    "accept-edits" => Mode::AcceptEdits,
                     "bypass" => Mode::Bypass,
                     "plan" => Mode::Plan,
-                    other => bail!(
-                        "unknown permission mode '{other}' (manual | accept-edits | bypass | plan)"
-                    ),
+                    other => {
+                        bail!("unknown permission mode '{other}' (manual | bypass | plan)")
+                    }
                 };
             }
             "--list-sessions" => parsed.list_sessions = true,
@@ -269,7 +268,7 @@ pub(crate) fn help_text() -> &'static str {
      \x20       --all             (with --list-sessions) list every project's sessions\n\
      \n\
      PERMISSIONS:\n\
-     \x20       --permission-mode <mode>   manual (default) | accept-edits | bypass | plan\n\
+     \x20       --permission-mode <mode>   manual (default) | bypass | plan\n\
      \n\
      INPUT:\n\
      \x20       --image <path>    attach a local image (repeatable)\n\
@@ -703,18 +702,12 @@ mod tests {
                 ..base()
             }
         );
-        // --permission-mode is the unified gate control: one flag, four modes.
+        // --permission-mode is the unified gate control: one flag, three modes.
         assert_eq!(
             parse_args(&strings(&["--permission-mode", "bypass"]))
                 .unwrap()
                 .permission_mode,
             Mode::Bypass
-        );
-        assert_eq!(
-            parse_args(&strings(&["--permission-mode", "accept-edits"]))
-                .unwrap()
-                .permission_mode,
-            Mode::AcceptEdits
         );
         assert_eq!(
             parse_args(&strings(&["--permission-mode", "manual"]))
@@ -724,8 +717,9 @@ mod tests {
         );
         // No flag at all is manual (the omit-the-flag default).
         assert_eq!(parse_args(&[]).unwrap().permission_mode, Mode::Manual);
-        // `default` is gone — it is no longer an accepted value.
+        // `default` and `accept-edits` are gone — neither is an accepted value.
         assert!(parse_args(&strings(&["--permission-mode", "default"])).is_err());
+        assert!(parse_args(&strings(&["--permission-mode", "accept-edits"])).is_err());
         assert_eq!(
             parse_args(&strings(&["--permission-mode", "plan"]))
                 .unwrap()

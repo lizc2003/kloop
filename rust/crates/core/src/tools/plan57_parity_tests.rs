@@ -520,10 +520,16 @@ async fn permission_report() -> Value {
     let path = write_notebook(root.path(), "fixture.ipynb");
     let approver =
         ScriptedApprover::new([Decision::Allow(crate::permissions::ApprovalScope::Once)]);
+    // The notebook lives inside the gate's cwd, so it is a contained write
+    // that never asks; the ask rule is what a user writes to review every
+    // edit, and what puts this contract back in front of the approver.
     let permissions = Arc::new(
         Permissions::new(
             Mode::Manual,
-            &PermissionRules::default(),
+            &PermissionRules {
+                ask: vec!["notebook_edit(**)".into()],
+                ..Default::default()
+            },
             root.path().to_path_buf(),
             Some(approver.clone()),
         )
@@ -567,15 +573,15 @@ async fn permission_report() -> Value {
             .is_some_and(|preview| preview.starts_with("(replace notebook cell code-002)"))
     );
 
-    let accept = Permissions::new(
-        Mode::AcceptEdits,
+    let contained = Permissions::new(
+        Mode::Manual,
         &PermissionRules::default(),
         root.path().to_path_buf(),
         None,
     )
     .unwrap();
     assert!(
-        accept
+        contained
             .check(
                 "notebook_edit",
                 &json!({"notebook_path": absolute, "cell_id": "code-002", "new_source": "x"}),
@@ -600,7 +606,7 @@ async fn permission_report() -> Value {
         .await
         .unwrap_err();
     let deny = Permissions::new(
-        Mode::AcceptEdits,
+        Mode::Manual,
         &PermissionRules {
             deny: vec!["notebook_edit(**/*.ipynb)".into()],
             ..Default::default()

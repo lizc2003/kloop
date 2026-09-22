@@ -310,7 +310,7 @@ async fn file_search_bash_worktree_report() -> Value {
     config.cwd = root.path().to_path_buf();
     config.permissions = Arc::new(
         Permissions::new(
-            Mode::AcceptEdits,
+            Mode::Manual,
             &PermissionRules::default(),
             root.path().to_path_buf(),
             Some(Arc::new(AllowApprover)),
@@ -905,7 +905,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
         notes: Some("accepted locally".into()),
     });
     let permissions = Permissions::new(
-        Mode::AcceptEdits,
+        Mode::Manual,
         &PermissionRules::default(),
         root.path().to_path_buf(),
         Some(Arc::new(AllowApprover)),
@@ -982,7 +982,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     let plan = "1. ask\n2. run local workflow\n3. exit";
     let (exited, exited_error) = run_tool("exit_plan_mode", json!({"plan": plan}), &context).await;
     assert!(!exited_error && exited.contains("approved"));
-    assert_eq!(context.cfg.permissions.mode(), Mode::AcceptEdits);
+    assert_eq!(context.cfg.permissions.mode(), Mode::Manual);
 
     let mut cancelled_context = context.clone();
     let mut cancelled_config = cancelled_context.cfg.test_clone();
@@ -1087,7 +1087,7 @@ async fn notebook_lsp_file_report() -> Value {
     config.cwd = root.path().to_path_buf();
     config.permissions = Arc::new(
         Permissions::new(
-            Mode::AcceptEdits,
+            Mode::Manual,
             &PermissionRules::default(),
             root.path().to_path_buf(),
             None,

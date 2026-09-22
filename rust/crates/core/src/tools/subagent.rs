@@ -393,7 +393,7 @@ pub(crate) async fn structured_agent_admitted(
 }
 
 /// Point a sub-agent's cwd anchors at its worktree: cwd, the permission gate
-/// (so acceptEdits allows writes inside the tree), the OS sandbox (so its bash
+/// (so contained writes are the ones inside the tree), the OS sandbox (so its bash
 /// may write the tree), and the working-directory line the model reads in the
 /// system prompt — without that last rewrite the model builds ABSOLUTE paths
 /// from the parent's cwd and writes straight past the worktree (found the hard

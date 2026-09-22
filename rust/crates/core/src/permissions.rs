@@ -3,8 +3,8 @@
 //!
 //! deny rules → sensitive-read hard block → plan-mode read-only gate →
 //! safety checks → ask rules → session scheduler controls → sandbox
-//! auto-allow → bypass → read-only self-verdict → acceptEdits → allow rules
-//! → session cache → ask the user.
+//! auto-allow → bypass → read-only self-verdict → contained writes → allow
+//! rules → session cache → ask the user.
 //!
 //! Two invariants carried over from cc: **deny always beats allow**, and
 //! **safety checks (destructive commands, sensitive paths) are immune to
@@ -28,6 +28,19 @@
 //! only what is irreversible and outside git's reach, so on a host with no
 //! sandbox that short list is the whole command-level net. Containment is the
 //! real one.
+//!
+//! The contained-writes layer is the file-tool counterpart of sandbox
+//! auto-allow, and the reason kloop has no `acceptEdits` mode. `write_file` /
+//! `edit_file` / `notebook_edit` resolve and open their target before the gate
+//! runs, so a path landing inside the working directory is contained by
+//! construction — the same argument that lets a sandboxed bash call skip the
+//! human. Containment is a property of the call, not a trust level, so the
+//! layer is unconditional instead of a mode. Everything above it keeps its
+//! say: deny rules; the safety layer, under which `.git`, `.kloop`, `.ssh`,
+//! `.env*` and friends ask every time even in-cwd; and explicit ask rules —
+//! one `ask = ["edit_file(**)"]` restores review-every-edit exactly, which is
+//! why that behavior never needed a mode of its own. A write that
+//! escapes the working directory is not contained and keeps asking.
 //!
 //! The sandbox auto-allow layer (cc's `autoAllowBashIfSandboxed`) is the
 //! sandbox/approval coupling: a bash call the OS sandbox will contain needs
@@ -132,14 +145,16 @@ pub trait Approver: Send + Sync {
 /// Gating mode, after cc's permission modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
-    /// Ask before any unvouched-for call — the gate with the most oversight, and
-    /// the mode in effect when no `--permission-mode` is given. cc's `default`
-    /// mode, which it surfaces to the user as "Manual"; kloop uses `manual` as
-    /// the one name, value and label alike.
+    /// Ask before any call the gate cannot vouch for on its own — the mode
+    /// with the most oversight, and the one in effect when no
+    /// `--permission-mode` is given. cc's `default` mode, which it surfaces to
+    /// the user as "Manual"; kloop uses `manual` as the one name, value and
+    /// label alike. cc's second mode, `acceptEdits`, has no counterpart: its
+    /// only effect was auto-approving file writes inside the working
+    /// directory, which the contained-writes layer now does unconditionally,
+    /// leaving nothing for a mode to hold.
     #[default]
     Manual,
-    /// File writes inside the working directory are auto-approved.
-    AcceptEdits,
     /// Everything is approved except deny rules and safety checks (cc
     /// `bypassPermissions` semantics — those two layers are immune).
     Bypass,
@@ -154,19 +169,18 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Mode::Manual => "manual",
-            Mode::AcceptEdits => "accept-edits",
             Mode::Bypass => "bypass",
             Mode::Plan => "plan",
         }
     }
 
-    /// The next mode in the shift+Tab cycle. Bypass is deliberately NOT reached
-    /// by cycling — it is the dangerous one, opted into explicitly with
-    /// `--permission-mode bypass`; stepping out of it lands on manual.
+    /// The next mode in the shift+Tab cycle — manual ⇄ plan. Bypass is
+    /// deliberately NOT reached by cycling — it is the dangerous one, opted
+    /// into explicitly with `--permission-mode bypass`; stepping out of it
+    /// lands on manual.
     pub fn cycled(self) -> Mode {
         match self {
-            Mode::Manual => Mode::AcceptEdits,
-            Mode::AcceptEdits => Mode::Plan,
+            Mode::Manual => Mode::Plan,
             Mode::Plan => Mode::Manual,
             Mode::Bypass => Mode::Manual,
         }
@@ -1001,9 +1015,15 @@ impl Permissions {
             return Ok(None);
         }
 
-        // 9. acceptEdits: file writes inside the working directory.
-        if self.mode() == Mode::AcceptEdits
-            && matches!(name, "write_file" | "edit_file" | "notebook_edit")
+        // 9. Contained writes: a structured file write whose target lands
+        // inside the working directory. Dispatch resolved and froze that target
+        // before the gate ran, so the call is contained the way a sandboxed
+        // bash call is — and containment, not a trust level, is what replaces
+        // the human. Everything above already had its say: sensitive paths
+        // (`.git`, `.kloop`, `.env*`…) ask from the safety layer even in-cwd,
+        // and an `ask = ["edit_file(**)"]` rule restores review-every-edit.
+        // A path escaping the cwd is not contained and falls through.
+        if matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
         {
             return Ok(None);
@@ -2447,7 +2467,7 @@ mod tests {
         json!({"path": path, "content": "x"})
     }
 
-    // ── layer 5: read-only self-verdict ────────────────────────────────
+    // ── layer 8: read-only self-verdict ────────────────────────────────
 
     #[tokio::test]
     async fn read_only_calls_skip_the_approver() {
@@ -2610,7 +2630,7 @@ mod tests {
         assert!(!ok(&p, "run_agent", json!({"prompt": "x"})).await);
     }
 
-    // ── layer 2: safety checks are bypass-immune ───────────────────────
+    // ── layer 4: safety checks are bypass-immune ───────────────────────
 
     #[tokio::test]
     async fn destructive_commands_ask_even_in_bypass_and_over_allowlist() {
@@ -2716,7 +2736,7 @@ mod tests {
             Decision::Allow(ApprovalScope::Once),
         ]);
         let p = gate(
-            Mode::AcceptEdits,
+            Mode::Manual,
             rules(&["write_file"], &[], &[]),
             approver.clone(),
         );
@@ -2894,7 +2914,7 @@ mod tests {
 
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
         let permissions = Permissions::new(
-            Mode::AcceptEdits,
+            Mode::Manual,
             &rules(&[], &[], &[]),
             root.clone(),
             Some(approver.clone()),
@@ -2912,7 +2932,7 @@ mod tests {
         assert!(asked[0].description.contains(".git/hooks/pre-commit"));
 
         let denied = Permissions::new(
-            Mode::AcceptEdits,
+            Mode::Manual,
             &rules(&[], &["write_file(.git/**)"], &[]),
             root.clone(),
             None,
@@ -2985,7 +3005,7 @@ mod tests {
         assert_eq!(approver.ask_count(), 1);
     }
 
-    // ── layer 3: ask rules ──────────────────────────────────────────────
+    // ── layer 5: ask rules ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn ask_rules_override_allow_and_are_not_cached() {
@@ -3008,12 +3028,16 @@ mod tests {
         assert!(approver.asked().iter().all(|r| r.remember_rules.is_none()));
     }
 
-    // ── layers 6/7: acceptEdits and allow rules ─────────────────────────
+    // ── layers 9/10: contained writes and allow rules ───────────────────
 
+    /// The contained-writes layer is not a mode: plain `manual` runs a
+    /// structured write that lands inside the cwd without asking, because
+    /// dispatch already froze that target. Nothing else rides along — an
+    /// escaping path and bash both still ask.
     #[tokio::test]
-    async fn accept_edits_auto_allows_writes_inside_cwd_only() {
+    async fn manual_auto_allows_contained_writes_inside_cwd_only() {
         let approver = ScriptedApprover::new(vec![]);
-        let p = gate(Mode::AcceptEdits, rules(&[], &[], &[]), approver.clone());
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(ok(&p, "write_file", file("src/main.rs")).await);
         assert!(
             ok(
@@ -3033,19 +3057,49 @@ mod tests {
         );
         assert!(
             !ok(&p, "bash", bash("make build")).await,
-            "acceptEdits is files-only"
+            "bash is not a contained write"
         );
         assert_eq!(approver.ask_count(), 3);
     }
 
-    /// A `rebased` gate re-anchors acceptEdits: relative and in-tree writes for
-    /// the NEW cwd (a worktree) auto-allow, while a path that was inside the
-    /// OLD cwd now falls outside and asks — the sub-agent can't silently write
-    /// the main tree just because its parent could.
+    /// The one layer above containment a user is expected to reach for: an
+    /// `ask` rule puts every edit back in front of the human, every time, with
+    /// nothing remembered. It is the whole of what a separate accept-edits
+    /// mode was ever worth, in one config line — which is why there is no such
+    /// mode.
     #[tokio::test]
-    async fn rebased_reanchors_accept_edits_onto_the_new_cwd() {
+    async fn an_ask_rule_outranks_containment_and_never_caches() {
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
+        let p = gate(
+            Mode::Manual,
+            rules(&[], &[], &["edit_file(**)"]),
+            approver.clone(),
+        );
+        let edit = json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"});
+        assert!(ok(&p, "edit_file", edit.clone()).await);
+        assert!(ok(&p, "edit_file", edit).await, "and again the next time");
+        assert_eq!(approver.ask_count(), 2);
+        assert!(
+            approver.asked().iter().all(|r| r.remember_rules.is_none()),
+            "an ask rule offers nothing to remember"
+        );
+        // Scoped like any other rule: the write tool it does not name stays
+        // contained.
+        assert!(ok(&p, "write_file", file("src/main.rs")).await);
+        assert_eq!(approver.ask_count(), 2);
+    }
+
+    /// A `rebased` gate re-anchors containment: relative and in-tree writes
+    /// for the NEW cwd (a worktree) auto-allow, while a path that was inside
+    /// the OLD cwd now falls outside and asks — the sub-agent can't silently
+    /// write the main tree just because its parent could.
+    #[tokio::test]
+    async fn rebased_reanchors_contained_writes_onto_the_new_cwd() {
         let approver = ScriptedApprover::new(vec![]);
-        let parent = gate(Mode::AcceptEdits, rules(&[], &[], &[]), approver.clone());
+        let parent = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let worktree = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let sub = parent.for_workspace(crate::project::WorkspaceIdentity::resolve(&worktree));
         assert!(
@@ -3082,7 +3136,7 @@ mod tests {
                 &[
                     "edit_file",
                     "bash(cargo *)",
-                    "write_file(src/**)",
+                    "write_file(/elsewhere/src/**)",
                     "bash(make)",
                 ],
                 &[],
@@ -3107,7 +3161,9 @@ mod tests {
             ok(&p, "bash", bash("make")).await,
             "exact rule matches bare command"
         );
-        assert!(ok(&p, "write_file", file("src/deep/mod.rs")).await);
+        // A path glob only has anything left to say outside the cwd: an
+        // in-cwd write is contained and never reaches the allow layer.
+        assert!(ok(&p, "write_file", file("/elsewhere/src/deep/mod.rs")).await);
         assert_eq!(approver.ask_count(), 0);
 
         assert!(
@@ -3119,7 +3175,7 @@ mod tests {
             "one uncovered segment asks"
         );
         assert!(
-            !ok(&p, "write_file", file("docs/x.md")).await,
+            !ok(&p, "write_file", file("/elsewhere/docs/x.md")).await,
             "glob scope holds"
         );
         assert!(
@@ -3129,7 +3185,7 @@ mod tests {
         assert_eq!(approver.ask_count(), 4);
     }
 
-    // ── layers 8/9: session cache and remember payloads ────────────────
+    // ── layer 11: session cache and remember payloads ──────────────────
 
     #[tokio::test]
     async fn allow_session_caches_two_word_prefix() {
@@ -3377,19 +3433,19 @@ mod tests {
         let approver =
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(ok(&p, "write_file", file("src/a.rs")).await);
+        assert!(ok(&p, "write_file", file("/elsewhere/src/a.rs")).await);
         assert!(
-            ok(&p, "write_file", file("src/b.rs")).await,
+            ok(&p, "write_file", file("/elsewhere/src/b.rs")).await,
             "same directory cached"
         );
         assert!(
-            !ok(&p, "write_file", file("src/deep/c.rs")).await,
+            !ok(&p, "write_file", file("/elsewhere/src/deep/c.rs")).await,
             "subdirectory asks"
         );
         assert_eq!(approver.ask_count(), 2);
         assert_eq!(
             approver.asked()[0].remember_rules,
-            Some(vec!["write_file(src/**)".to_string()])
+            Some(vec!["write_file(/elsewhere/src/**)".to_string()])
         );
     }
 
@@ -3399,7 +3455,10 @@ mod tests {
     async fn user_denial_message_guides_the_model() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        let err = p.check("write_file", &file("x.txt"), 0).await.unwrap_err();
+        let err = p
+            .check("write_file", &file("/elsewhere/x.txt"), 0)
+            .await
+            .unwrap_err();
         assert!(err.contains("declined"), "{err}");
         assert!(err.contains("different approach"), "{err}");
     }
@@ -3413,10 +3472,18 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(p.check("write_file", &file("x"), 0).await.is_err());
+        assert!(
+            p.check("write_file", &file("/elsewhere/x"), 0)
+                .await
+                .is_err()
+        );
         assert!(
             p.check("bash", &bash("ls"), 0).await.is_ok(),
             "read-only still passes"
+        );
+        assert!(
+            p.check("write_file", &file("x"), 0).await.is_ok(),
+            "a contained write needs no approver either"
         );
     }
 
@@ -3425,17 +3492,13 @@ mod tests {
         let approver = ScriptedApprover::new(vec![Decision::Deny, Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let _ = p.check("bash", &bash("rm -rf x"), 1).await;
-        let _ = p.check("write_file", &file("a.txt"), 0).await;
+        let _ = p.check("write_file", &file("/elsewhere/a.txt"), 0).await;
         let asked = approver.asked();
         assert_eq!(
             asked[0].description,
             "[sub-agent] [destructive] bash: rm -rf x"
         );
-        let path = std::fs::canonicalize(test_cwd()).unwrap().join("a.txt");
-        assert_eq!(
-            asked[1].description,
-            format!("write_file: {}", path.display())
-        );
+        assert_eq!(asked[1].description, "write_file: /elsewhere/a.txt");
     }
 
     /// The approval request carries a file-change diff for edit/write so the
@@ -3447,7 +3510,7 @@ mod tests {
         let _ = p
             .check(
                 "edit_file",
-                &json!({"path": "f.rs", "old_string": "foo", "new_string": "bar"}),
+                &json!({"path": "/elsewhere/f.rs", "old_string": "foo", "new_string": "bar"}),
                 0,
             )
             .await;
@@ -3461,7 +3524,7 @@ mod tests {
             .await;
         let _ = p.check("bash", &bash("rm -rf x"), 0).await;
         let asked = approver.asked();
-        // f.rs cannot be read here, so the edit degrades to a two-string diff.
+        // The file cannot be read here, so the edit degrades to a two-string diff.
         assert_eq!(asked[0].preview.as_deref(), Some("-1  foo\n+1  bar"));
         assert_eq!(asked[1].preview.as_deref(), Some("(new file)\n+1  hi"));
         assert_eq!(asked[2].preview, None, "non-file calls carry no preview");
@@ -3823,16 +3886,16 @@ mod tests {
         let approver =
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once), Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        // Enter plan from accept-edits: that becomes the restore target.
-        p.set_mode(Mode::AcceptEdits);
+        // Enter plan from bypass: that becomes the restore target.
+        p.set_mode(Mode::Bypass);
         p.set_mode(Mode::Plan);
         assert_eq!(p.mode(), Mode::Plan);
 
         assert_eq!(
             p.confirm_exit_plan("the plan", 0).await,
-            PlanExitOutcome::Approved(Mode::AcceptEdits)
+            PlanExitOutcome::Approved(Mode::Bypass)
         );
-        assert_eq!(p.mode(), Mode::AcceptEdits, "restored the pre-plan mode");
+        assert_eq!(p.mode(), Mode::Bypass, "restored the pre-plan mode");
         // The approver saw the plan text as the popup preview.
         assert_eq!(approver.asked()[0].preview.as_deref(), Some("the plan"));
 
@@ -3934,7 +3997,7 @@ mod tests {
         assert!(error.contains("plan mode"), "{error}");
         assert_eq!(approver.ask_count(), 0);
 
-        for mode in [Mode::Manual, Mode::AcceptEdits, Mode::Bypass] {
+        for mode in [Mode::Manual, Mode::Bypass] {
             let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
             let permissions = gate(mode, rules(&[], &[], &[]), approver.clone());
             assert!(permissions.check("powershell", &input, 0).await.is_ok());

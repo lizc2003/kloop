@@ -650,7 +650,7 @@ impl Config {
     }
 
     /// The permission gate in effect now — re-anchored at the active worktree
-    /// when in one (so acceptEdits keys off the tree), else the base gate.
+    /// when in one (so contained writes key off the tree), else the base gate.
     pub fn effective_permissions(&self) -> Arc<Permissions> {
         self.effective_field(
             |active| Arc::clone(&active.permissions),

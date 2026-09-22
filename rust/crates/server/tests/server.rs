@@ -217,13 +217,20 @@ fn mock_route() -> kloop_core::provider_route::FrozenProviderRoute {
 /// the script. `gated` = a real Manual-mode permission gate wired to the
 /// server's approver (approvals go out as approval/request); otherwise the
 /// gate is wide open.
+///
+/// The gate's cwd is deliberately a directory no test writes into: a file
+/// write landing inside the cwd is contained and runs without asking, while
+/// every `gated` test here is built on "the call hangs at the approval gate".
 fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
     Arc::new(move |options, _catalog, approver, questioner, _notify| {
         let permissions = if gated {
+            let gate_cwd =
+                std::env::temp_dir().join(format!("kloop-server-gate-{}", std::process::id()));
+            std::fs::create_dir_all(&gate_cwd)?;
             Permissions::new(
                 Mode::Manual,
                 &PermissionRules::default(),
-                std::env::temp_dir(),
+                gate_cwd,
                 Some(approver),
             )?
         } else {

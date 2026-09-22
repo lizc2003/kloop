@@ -7,7 +7,7 @@
 //! `exec` crate:
 //! - **No approver is installed** ([`DenyApprover`]): any permission ask is
 //!   auto-denied (fail-safe, like server mode's "reply lost = deny"). Loosen
-//!   with `--permission-mode accept-edits|bypass` or previously persisted
+//!   with `--permission-mode bypass` or previously persisted
 //!   current-project allows, which act at earlier gate layers and never reach
 //!   the approver.
 //! - **`--json` reuses the server's wire shapes** verbatim (method + params,

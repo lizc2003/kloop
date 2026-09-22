@@ -1851,6 +1851,12 @@ mod tests {
         }
     }
 
+    /// A gate that asks for every write, so the tests below can exercise the
+    /// approval seam (the frozen target, the pinned workspace generation) on
+    /// ordinary in-cwd paths. Those are *contained* writes, which the gate
+    /// runs without asking in every mode; `ask` rules are the layer above
+    /// containment, and the same one line a user writes to get a confirmation
+    /// back for every edit.
     fn approval_ctx(
         tag: &str,
         cwd: &std::path::Path,
@@ -1861,7 +1867,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let permissions = crate::permissions::Permissions::new(
             crate::permissions::Mode::Manual,
-            &crate::permissions::PermissionRules::default(),
+            &crate::permissions::PermissionRules {
+                ask: vec!["write_file(**)".into(), "edit_file(**)".into()],
+                ..Default::default()
+            },
             cwd.to_path_buf(),
             Some(Arc::new(ChannelApprover { tx })),
         )

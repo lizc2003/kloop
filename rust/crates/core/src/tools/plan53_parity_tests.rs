@@ -362,7 +362,7 @@ async fn question_report() -> Value {
 async fn plan_control_report() -> Value {
     let approver =
         ScriptedApprover::new([Decision::Allow(crate::permissions::ApprovalScope::Once)]);
-    let (context, ui) = context_with_permissions("plan", Mode::AcceptEdits, approver.clone());
+    let (context, ui) = context_with_permissions("plan", Mode::Bypass, approver.clone());
     let names_before: Vec<String> =
         all_tool_defs(0, &[], 30, context.cfg.surface, &context.cfg.shell_programs)
             .into_iter()
@@ -379,7 +379,7 @@ async fn plan_control_report() -> Value {
     let plan = "1. inspect\n2. implement";
     let (exited, exited_error) = run_tool("exit_plan_mode", json!({"plan": plan}), &context).await;
     assert!(!exited_error && exited.contains("approved"));
-    assert_eq!(context.cfg.permissions.mode(), Mode::AcceptEdits);
+    assert_eq!(context.cfg.permissions.mode(), Mode::Bypass);
     assert_eq!(
         approver.previews.lock().unwrap().as_slice(),
         &[Some(plan.to_string())]
@@ -401,12 +401,12 @@ async fn plan_control_report() -> Value {
         .into_iter()
         .filter_map(|event| match event {
             Event::ModeChanged(Mode::Plan) => Some("plan"),
-            Event::ModeChanged(Mode::AcceptEdits) => Some("accept_edits"),
+            Event::ModeChanged(Mode::Bypass) => Some("bypass"),
             Event::ModeChanged(_) => Some("other"),
             _ => None,
         })
         .collect();
-    assert_eq!(modes, ["plan", "accept_edits"]);
+    assert_eq!(modes, ["plan", "bypass"]);
 
     let rejected_approver = ScriptedApprover::new([Decision::Deny]);
     let (rejected_context, _) =

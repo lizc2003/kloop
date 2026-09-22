@@ -186,7 +186,7 @@ impl Drop for NativeClient {
 
 impl NativeClient {
     fn spawn(root: &TestRoot) -> Self {
-        Self::spawn_with_permission_mode(root, "accept-edits")
+        Self::spawn_with_permission_mode(root, "manual")
     }
 
     fn spawn_with_permission_mode(root: &TestRoot, permission_mode: &str) -> Self {

@@ -191,7 +191,7 @@ mod tests {
         let approver = PlanApprover::new(vec![Decision::Allow(
             crate::permissions::ApprovalScope::Once,
         )]);
-        let ctx = mode_ctx(test_ctx(0, "planenter"), Mode::AcceptEdits, approver);
+        let ctx = mode_ctx(test_ctx(0, "planenter"), Mode::Bypass, approver);
 
         let (first, first_error) = run_tool("enter_plan_mode", json!({}), &ctx).await;
         assert!(!first_error, "{first}");
@@ -205,7 +205,7 @@ mod tests {
         let (exit, exit_error) =
             run_tool("exit_plan_mode", json!({"plan": "implement it"}), &ctx).await;
         assert!(!exit_error, "{exit}");
-        assert_eq!(ctx.cfg.permissions.mode(), Mode::AcceptEdits);
+        assert_eq!(ctx.cfg.permissions.mode(), Mode::Bypass);
     }
 
     /// The depth guard below is reached only off the dispatch path now: a
@@ -241,14 +241,16 @@ mod tests {
 
         // The loop closes: a write that was hard-blocked in plan mode now
         // reaches the ordinary ask path (manual mode) — the block message is
-        // gone, so the switch actually took effect. (The approver's script is
-        // spent, so the ask resolves to deny, but with the "declined" wording.)
+        // gone, so the switch actually took effect. The path is outside the
+        // gate's cwd on purpose: an in-cwd write is contained and would never
+        // reach the approver, which would prove nothing here. (The approver's
+        // script is spent, so the ask resolves to deny, with "declined".)
         let err = ctx
             .cfg
             .permissions
             .check(
                 "write_file",
-                &json!({"path": "src/x.rs", "content": "y"}),
+                &json!({"path": "/elsewhere/x.rs", "content": "y"}),
                 0,
             )
             .await

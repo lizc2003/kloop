@@ -1474,7 +1474,7 @@ mod tests {
 
         ctx.cfg
             .permissions
-            .set_mode(crate::permissions::Mode::AcceptEdits);
+            .set_mode(crate::permissions::Mode::Bypass);
         let (out, is_error) = run_tool("srv__approval", json!({}), &ctx).await;
         assert!(is_error, "{out}");
         assert!(out.contains("deferred and not loaded yet"), "{out}");

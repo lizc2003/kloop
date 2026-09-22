@@ -570,7 +570,7 @@ pipeline, with the bash analysis ported from codex's `shell-command` crate:
 ```
 global deny → sensitive-read hard block → plan-mode read-only gate → safety checks →
 global ask → session scheduler controls → sandbox auto-allow → bypass →
-read-only self-verdict → acceptEdits → project allow → WorkspaceId-scoped session
+read-only self-verdict → contained writes → project allow → WorkspaceId-scoped session
 cache → ask the user
 ```
 
@@ -648,8 +648,8 @@ their cwd-relative form), with `**` globs.
 
 **File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
 directories, shell/git rc files, and `.env*` are sensitive — confirmed every
-time, immune to allow rules, acceptEdits, and bypass. Writes escaping the
-working directory never auto-pass in acceptEdits.
+time, immune to allow rules, the contained-writes layer, and bypass. A write
+escaping the working directory is not contained and never auto-passes.
 
 **Asking**: `y` allows once. `a` allows for this session in the current
 workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
@@ -705,16 +705,32 @@ print, the request carries `title` / `detail` / `notice` — the same facts pull
 apart for a frontend that lays a prompt out over several lines.
 
 **Modes**: one flag `--permission-mode <mode>` picks the gate mode — `manual`
-(the default when the flag is omitted — ask for anything unvouched-for),
-`accept-edits` (file writes inside the working directory auto-pass), `bypass`
-(everything passes *except* deny rules, safety checks, and a bash call that
-asked to leave the OS sandbox — see below), or `plan` (read-only
-until the plan is approved, below). `--mock` disables the gate entirely — nobody
-is at the keyboard. In the TUI, **shift+Tab** cycles the mode live (manual →
-accept-edits → plan → manual; the status bar shows the current one), while bypass
-stays opt-in via the flag. (cc calls the ask-first mode `default` internally but
+(the default when the flag is omitted — ask for anything the gate cannot vouch
+for on its own), `bypass` (everything passes *except* deny rules, safety
+checks, and a bash call that asked to leave the OS sandbox — see below), or
+`plan` (read-only until the plan is approved, below). `--mock` disables the gate
+entirely — nobody is at the keyboard. In the TUI, **shift+Tab** cycles the mode
+live (manual ⇄ plan; the status bar shows the current one), while bypass stays
+opt-in via the flag. (cc calls the ask-first mode `default` internally but
 labels it "Manual"; kloop drops the `default` name entirely — `manual` is the one
 name, value and label alike.)
+
+**There is no `accept-edits` mode**, and the layer that replaced it is the
+file-tool counterpart of sandbox auto-allow. `write_file` / `edit_file` /
+`notebook_edit` resolve and open their target *before* the gate runs, so a path
+landing inside the working directory is contained by construction — the same
+argument that lets a sandboxed bash call skip the human, and a property of the
+call rather than a trust level the user dials. Holding that behind a mode also
+left `manual` incoherent: with sandbox auto-allow on (the default), `bash: sed
+-i src/x.rs` already ran unasked while `edit_file src/x.rs` stopped to ask, so
+the confirmation was gating the *tool*, not the write. Merging costs the
+blocking diff review, and that has an exact replacement one layer above:
+`[permissions].ask = ["edit_file(**)"]` confirms every edit, is never cached or
+remembered, and can be narrowed to a single directory. A mode one config line
+restores is not worth a mode. Everything above the layer is untouched — deny
+rules, the sensitive-path safety check (`.git`, `.kloop`, `.env*` ask even
+in-cwd), plan mode, explicit ask rules — and a write that escapes the cwd still
+asks, including a worktree sub-agent reaching back into the main tree.
 
 **Plan mode** (`--permission-mode plan`, cc's `plan`) is read-only exploration
 until you sign off on a plan. The gate sits just below deny: every write or
@@ -725,7 +741,7 @@ enforcement is the hard gate, not a prompt the model may ignore — codex's
 Plan is a soft prompt; kloop takes cc's hard form). Reads, searches, read-only
 bash, and sub-agents (each re-gated per call) still run. A plan-mode reminder
 rides every request so the model knows to plan, not act. The top-level model can
-call **`enter_plan_mode {}`** from manual, accept-edits, or bypass; entering is
+call **`enter_plan_mode {}`** from manual or bypass; entering is
 idempotent and remembers the exact previous mode. When ready, it calls
 **`exit_plan_mode`** with the plan text; that rides the approval panel a
 change-diff does (the plan is the scrollable `preview`). Approve restores the
@@ -1877,7 +1893,7 @@ post-tool hooks and is never held around `run_program`, `run_agent`, `skill`,
 
 Permissions treat every PowerShell script as `PowerShellOpaque`; the Bash AST
 and read-only classifier are never applied. Plan mode rejects it without asking;
-manual, accept-edits, and bypass ask every time unless the current project policy
+manual and bypass ask every time unless the current project policy
 already contains a whole-tool `powershell` allow rule. `deny` and `ask` whole-tool rules
 retain their usual precedence, `powershell(...)` prefix rules are rejected, and
 interactive approvals authorize only that one call — no opaque script is cached or
@@ -3377,8 +3393,10 @@ kloop --mock --headless --json
   vocabulary, two front-ends.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
-  deny"). Existing project grants, `--permission-mode accept-edits`/`bypass`,
-  and sandbox trust still act before the approver.
+  deny"). What never reaches the approver still runs: existing project grants,
+  `--permission-mode bypass`, sandbox trust, and contained in-cwd file writes —
+  a headless run edits its own working directory without a flag, the same way
+  it already ran sandboxed bash.
 - **Interactive control surfaces are absent.** Headless installs neither a
   `Questioner` nor detached Workflow lifecycle, so `ask_user_question`,
   `enter_plan_mode`, and `workflow` are not advertised. It never reads stdin
@@ -3655,7 +3673,8 @@ cargo run -- --fork <id>       # branch off a session at its end
 
 # permissions: global constraints come from [permissions] in that same file;
 # project approvals persist in ~/.kloop/projects/v1/<ProjectId>/permissions.json
-cargo run -- --permission-mode accept-edits        # auto-allow cwd file writes
+# in-cwd file writes are contained and never ask; [permissions].ask =
+# ["edit_file(**)"] brings a confirmation back for every edit
 cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
 
 # OS sandbox (macOS Seatbelt; see OS sandbox above): [sandbox] enabled = false
@@ -3702,7 +3721,7 @@ Every session is saved and resumable — see Session persistence above.
   vetting, git option-injection, dangerous-through-wrappers); permission
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
   safety checks, sensitive paths never cached, ask-rules-over-allow,
-  acceptEdits cwd boundary, glob rules, WorkspaceId-partitioned session cache,
+  contained-writes cwd boundary, glob rules, WorkspaceId-partitioned session cache,
   ProjectId identity and durable ProjectStore publication/RMW, legacy
   `[permissions].allow` rejection, opaque scripts cacheable for the
   session but never durable, `ConfirmRequest.preview` carrying an
