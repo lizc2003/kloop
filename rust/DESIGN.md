@@ -156,7 +156,7 @@ reports `usage` more than once — a gateway attaching its own copy to the
 `finish_reason` frame on top of the trailing empty-choices frame
 `include_usage` promises — keeps the last report rather than failing. Core retains provider
 outcomes and failures inside typed turn errors;
-string rendering happens only at CLI/TUI/native protocol 2.0 boundaries.
+string rendering happens only at CLI/TUI/native protocol 1.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and
 orphan patching still keeps history legal after interruption.
 
@@ -421,7 +421,7 @@ first sampling request — so a transcript always says why the turn stopped; a
 slash-command line is not a model turn and records none. Neither does a turn
 interrupted before the model produced anything: it writes no line at all, not
 even `aborted` (see **A turn that never happened** below). Error terminals add an internal typed
-provider outcome/failure while preserving the protocol 2.0 status/error
+provider outcome/failure while preserving the protocol 1.0 status/error
 projection; terminals never enter provider replay or token accounting. If a stream fails or is cancelled after visible text, that
 partial assistant block and its provider provenance are recorded before the
 terminal, so restart/fork keeps the replay boundary without generating a second
@@ -1209,10 +1209,13 @@ text behind it.
 
 
 **Handshake.** `initialize {client_info, protocol_version, capabilities}` →
-`{server_info, protocol_version, capabilities}` accepts exactly protocol `"2.0"`
+`{server_info, protocol_version, capabilities}` accepts exactly protocol `"1.0"`
 and gates every other method until it succeeds. Plan 63 changes the scoped
 approval schema in place because the native protocol had no external users; it
 does not add a compatibility adapter, fallback, alias, or silent downgrade.
+The same rule covers the number itself: the wire evolves in place and the
+version does not move with it (plan 92 had bumped it to `"2.0"`; it went back
+to `"1.0"` on 2026-09-23).
 Capabilities are structured: `{streaming, subagents, mcp,
 images, approvals:{scopes:["once","workspace_session","project"]}, questions,
 events:{sequence:true,sync:true,snapshot:true}, threads:{list,
@@ -3888,7 +3891,7 @@ cargo run -- --mock
 # bidirectionally with unique, valid tool blocks. A valid empty EndTurn creates
 # no assistant history placeholder. Display items with partial text close as
 # failed on stream error, while completed blocks stay
-# completed; native protocol 2.0 keeps the existing item/completed method and
+# completed; native protocol 1.0 keeps the existing item/completed method and
 # carries that distinction in the item's status field. Core turn errors retain
 # AssistantOutcome or ProviderFailure rather than recovering either from text.
 # Assistant history binds reasoning to provider endpoint identity + API family +
@@ -4053,7 +4056,7 @@ Every session is saved and resumable — see Session persistence above.
   scrollback; it does not prove real terminal input or native scrollback retention.
 - **kloop-server** — wire envelope contract (request/response/notification
   shapes, string-or-int ids, request-vs-approval-response disambiguation),
-  plus duplex-driven exact native protocol 2.0 tests against the real serve loop:
+  plus duplex-driven exact native protocol 1.0 tests against the real serve loop:
   structured approval scopes, `accept_for_project`, protocol 2.0/`accept_always` rejection,
   delta streaming and completion, approval deny/allow
   round-trips (file provably not/created, the change `preview` reaching the
@@ -4148,7 +4151,7 @@ this repository.
 
 Beyond the suite: `cargo run -p kloop -- --mock` exercises six scripted
 rounds. Plan 63 acceptance also runs the real stdio binary for an exact native
-protocol 2.0 handshake and protocol 1.0 refusal, plus the Desktop companion's Bun,
+protocol 1.0 handshake and protocol 2.0 refusal, plus the Desktop companion's Bun,
 production-build, Rust test/clippy/fmt gates. Those deterministic gates cover
 Once/WorkspaceSession/Project wire decisions and persistence-failure behavior;
 they do not claim a manual GUI click-through or native Windows runtime where it

@@ -26,10 +26,12 @@ use kloop_core::event::Event;
 use kloop_core::event::Item;
 use kloop_core::event::ItemStatus;
 
-/// The protocol version kloop's engine speaks. Bumped only on a breaking wire
-/// change; the handshake rejects a client asking for anything else rather than
+/// The protocol version kloop's engine speaks. The wire changes in place and
+/// this is not bumped for it: there are no clients to stay compatible with, so
+/// a version would only fence off a client built from the same repository. The
+/// handshake still rejects a client asking for anything else rather than
 /// silently downgrading.
-pub const PROTOCOL_VERSION: &str = "2.0";
+pub const PROTOCOL_VERSION: &str = "1.0";
 
 /// JSON-RPC request ids may be integers or strings; both are preserved
 /// verbatim so responses match whatever the client sent. The server's own

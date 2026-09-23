@@ -778,7 +778,7 @@ async fn handshake_gates_and_negotiates() {
     client
         .request(
             "initialize",
-            json!({"protocol_version": "1.0", "capabilities": {}}),
+            json!({"protocol_version": "2.0", "capabilities": {}}),
         )
         .await;
     let err = client.recv().await;
