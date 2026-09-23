@@ -245,3 +245,36 @@ plan 57 第 77 行写的"validation/parse/target/serialize/commit 失败……**
 - **`ExpectedTarget` 的 CAS 一个字没动**(只加了一条测试去打它)。
 - **`edit_file` 的参数面一个字没动**。调研顺带发现的两处(`path` vs 对照产品的 `file_path`
   没有别名、没有批量 edit)是另一件事,记进 HANDOFF。
+
+### 真实 API 实测(2026-09-23)
+
+`make check` 之外又在真实 provider 上跑了三个 headless 场景(responses 轨、deepseek 系模型
+——**正好是别名那条最该验的那一脉**;网关名与用量不进仓库)。工具返回逐字如下:
+
+| 场景 | 模型发出的调用 | 工具返回 | 状态 |
+|---|---|---|---|
+| 读 → `sed -i` 改第 1 行 → 编辑第 3 行 | `{path, old_string:"beta", new_string:"BETA"}` | `edited sample.txt (1 replacement(s)); the file changed since you read it` | **completed,第一发** |
+| 同上,但 `old_string` 用了一个不存在的词 | `{path, old_string:"purple", …}` | `edit_file: old_string not found in fail.txt; the file changed since you read it` | failed(带上那句话) |
+| **紧接上一格的失败之后**,换一个有效锚 | `{path, old_string:"green", …}` | `edited fail.txt (1 replacement(s)); the file changed since you read it` | **completed** |
+| 逼模型逐字用另一家的拼写 | `{file_path, old_str, new_str}` | `edited syn.txt (1 replacement(s))` | completed |
+
+四格各自钉住一件事:第一格是真实会话那两次失败的形状,**改前是拒绝 + 一次白读 + 重发**;
+第二格是本条把诊断搬到锚之后才拿到的那句话;**第三格是"失败不清读戳"的证明**——改前它会
+报 "must read fail.txt before modifying the existing file",一个根因两种诊断;第四格证明别名
+在真实调用上通了。
+
+两条额外读数:
+
+- **描述改写被模型读懂了。** 第一格的 reasoning 原文:"edit_file requires the file to have been
+  read in this session, and if changed since read, the edit still applies (per description)"。
+  它是照着新描述规划的,不是撞上去的。
+- **别名那格的落盘印证了归一化的位置。** 会话 history 记的是模型原文
+  `{"file_path": …, "new_str": …, "old_str": …}`,而 dispatch 之后的事件是
+  `{"path", "old_string", "new_string"}`——**原文留在历史里,门/preview/执行器看见的是归一化后
+  的一个形状**,正是 `normalize_tool_uses` 那道缝要的效果。模型自己的 thinking 还写着
+  "the tool will likely reject it — the schema validation fails … Let me try",它预期被拒;
+  省下的就是那一个往返。
+
+真实 API 验不到的两条,仍然只有单测:`write_file`/`notebook_edit` 对同一场景仍然拒绝,以及
+写入 CAS 的提交窗口(**定义上**就没有外部办法在 kloop 读完字节到 rename 之间插进去,只能靠
+注入的 `CommitFault`)。
