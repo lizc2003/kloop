@@ -75,7 +75,7 @@ kloop 的 `cron_create` 只有 `prompt`,每次到点都是一次完整的模型�
 
 ## 七、完成记录
 
-✅ 2026-09-23,用户选**做法甲**(每次触发都走完整 bash 门)。提交号见本条所在提交。
+✅ 2026-09-23,`9956eac`。用户选**做法甲**(每次触发都走完整 bash 门)。
 
 - **bash 工具拆出带状态的前台运行**:`bash_tool` 原来只返回文本,成败只靠文本末尾的
   `[exit …]` 表达。拆出 `run_foreground_bash` → `ForegroundRun { text, success }`
