@@ -3051,21 +3051,58 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// A wrong parameter name used to be answered with the right name and nothing
-    /// else, leaving the model to work out that the key it did send went nowhere:
-    /// these three tools take no allow-list, so an unknown key is dropped in
-    /// silence and no other message mentions it. kloop translates no synonyms —
-    /// a measured session of 50 `edit_file` calls got the names wrong zero times —
-    /// so the refusal itself has to be what makes a wrong name visible.
+    /// Another harness's spelling reaches the same edit. `file_path` is
+    /// claude-code's and grok-build's name for `path`; `old_str`/`new_str` are the
+    /// Anthropic text-editor lineage's, which deepseek-harness follows. A model
+    /// carries whichever its training saw most, and the edit it asked for is the
+    /// edit that happens.
     #[tokio::test]
-    async fn a_wrong_parameter_name_names_itself() {
+    async fn another_harnesses_spelling_reaches_the_same_edit() {
+        let path = temp_file("edit-synonyms", "alpha\nbeta\n");
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-synonyms");
+        observe_whole(&path, &ctx).await;
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"file_path": target, "old_str": "beta", "new_str": "BETA"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (format!("edited {target} (1 replacement(s))"), false)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nBETA\n");
+
+        // `file_text` is the same lineage's name for write_file's `content`.
+        let (out, is_error) = run_tool(
+            "write_file",
+            json!({"file_path": target, "file_text": "rewritten\n"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (format!("wrote 10 bytes to {target}"), false)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rewritten\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A name that is nobody's spelling is still a refusal, and it names both the
+    /// argument the tool wanted and the keys the call did carry: these three tools
+    /// take no allow-list, so an unknown key is dropped in silence and no other
+    /// message would mention it.
+    #[tokio::test]
+    async fn an_unknown_argument_name_names_itself() {
         let path = temp_file("edit-wrong-arg", "alpha\n");
         let ctx = test_ctx(0, "edit-wrong-arg");
 
         let (out, is_error) = run_tool(
             "edit_file",
             json!({
-                "file_path": path.to_str().unwrap(),
+                "filepath": path.to_str().unwrap(),
                 "old_string": "alpha",
                 "new_string": "ALPHA"
             }),
@@ -3076,7 +3113,7 @@ mod tests {
             (out, is_error),
             (
                 "edit_file: missing required string argument 'path' \
-                 (got: file_path, new_string, old_string)"
+                 (got: filepath, new_string, old_string)"
                     .to_string(),
                 true
             )
@@ -3094,6 +3131,51 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\n");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The reason the rename happens at the dispatch seam and not inside the tool:
+    /// a path that arrived as `file_path` has to be the path the gate matches its
+    /// rules against. Renaming after the gate would hand it a call with no path in
+    /// it at all.
+    #[tokio::test]
+    async fn a_synonym_path_still_faces_the_permission_rules() {
+        let root = std::env::temp_dir().join(format!("kloop-synonym-deny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        std::fs::write(root.join("guarded.txt"), "original\n").unwrap();
+
+        let deny = crate::permissions::PermissionRules {
+            deny: vec!["edit_file(guarded.txt)".into()],
+            ..Default::default()
+        };
+        let permissions = crate::permissions::Permissions::new(
+            crate::permissions::Mode::Bypass,
+            &deny,
+            root.clone(),
+            None,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(0, "synonym-deny");
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.cwd = root.clone();
+        cfg.permissions = Arc::new(permissions);
+        ctx.cfg = Arc::new(cfg);
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"file_path": "guarded.txt", "old_string": "original", "new_string": "DENIED"}),
+            &ctx,
+        )
+        .await;
+
+        assert!(is_error, "{out}");
+        assert!(out.contains("blocked by a deny"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("guarded.txt")).unwrap(),
+            "original\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The line plan 195 does not cross, half one. `write_file` replaces every

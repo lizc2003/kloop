@@ -107,14 +107,26 @@ the five architectural bets below; it is now ten crates, and every bet held.
    dispatched, and answered with a failed `tool_result` carrying the parser's
    complaint and the model's own text, so the turn keeps its other calls and
    the model rewrites that one next round. A *well-formed* call naming the wrong
-   argument is the same judgment one level up, answered the same way and no
-   further: a missing required argument names the canonical key **and the other
-   keys the call did carry**, so a model that reached for another harness's
-   spelling (`file_path` for `path`) can see where its key went. Synonyms are not
-   translated — a measured session of 50 `edit_file` calls got the names wrong
-   zero times, and tolerance would still owe an answer for two conflicting keys —
-   but the refusal now makes a wrong name visible in the transcript, which is what
-   would let that rate be measured again on a model whose prior differs. Responses
+   argument is the same judgment one level up. Every mainstream harness spells the
+   same file arguments differently and a model carries whichever spelling its
+   training saw most, so `normalize_tool_uses` renames the known ones onto the
+   names kloop implements — `file_path` for `path`, `old_str`/`new_str`/`file_text`
+   for `old_string`/`new_string`/`content`, and `path`/`file_path` for the
+   `notebook_path` kloop inflicts on itself — for the four file builtins only,
+   never for an external tool whose argument names are its own. It happens at the
+   same seam that unwraps a `call_tool` envelope and for the same reason:
+   concurrency batching, hooks, the permission gate, the approval preview and the
+   executor must all read one shape, and a path that arrived as `file_path` has to
+   be the path the gate matches its rules against. The rename only ever fills a
+   gap — a canonical key that is present is left alone whatever its type, so a call
+   that used the real name is never second-guessed, and synonyms carrying different
+   values pass through untouched rather than being resolved by a guess. Every
+   consumed synonym is removed, so an allow-list tool is not tripped by the
+   spelling it was just forgiven. The schema still advertises exactly one name per
+   argument, so nothing new is taught; a name that is nobody's spelling still
+   refuses, and that refusal names the canonical key **and the other keys the call
+   did carry**, since the file tools take no allow-list and would otherwise drop an
+   unknown key in silence. Responses
    requests also carry `prompt_cache_key` — the session id, shared by this
    session's sampling and compaction — so the growing prefix keeps landing on a
    backend that already holds it; a sub-agent sends its own `{parent}-{agent-N}`

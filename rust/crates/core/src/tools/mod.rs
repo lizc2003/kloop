@@ -754,16 +754,89 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
     }
 }
 
+/// The argument names other harnesses use for the same thing, and the one name
+/// kloop implements.
+///
+/// Every mainstream harness spells the same file arguments differently, and a
+/// model carries whichever spelling its training saw most: `file_path` for `path`
+/// (claude-code, grok-build), and `old_str`/`new_str`/`file_text` for
+/// `old_string`/`new_string`/`content` (the Anthropic text-editor lineage that
+/// deepseek-harness follows — its path argument is already `path`). The fourth
+/// case is the one kloop inflicts on itself: three file tools say `path` and
+/// `notebook_edit` says `notebook_path`.
+///
+/// Translating a synonym is strictly better than refusing it — the edit the model
+/// asked for is the edit that happens — and it advertises nothing new, because the
+/// schema still carries exactly one name per argument. Only builtins with a fixed
+/// schema appear here; an external tool's argument names are its own.
+const ARGUMENT_SYNONYMS: &[(&str, &str, &[&str])] = &[
+    ("read_file", "path", &["file_path"]),
+    ("write_file", "path", &["file_path"]),
+    ("write_file", "content", &["file_text"]),
+    ("edit_file", "path", &["file_path"]),
+    ("edit_file", "old_string", &["old_str"]),
+    ("edit_file", "new_string", &["new_str"]),
+    ("notebook_edit", "notebook_path", &["path", "file_path"]),
+];
+
+/// Rename a call's known synonyms onto the names the tool implements.
+///
+/// Only ever fills a gap, and never guesses:
+/// - a canonical key that is present is left alone whatever its type, so a call
+///   that sent the real name is never second-guessed by a stray synonym;
+/// - synonyms that disagree are **not** resolved. The call passes through
+///   untouched and the tool's own refusal explains it, naming both the argument it
+///   wanted and the keys the call did carry — which is what that refusal is for.
+///
+/// Every consumed synonym is removed, so the object the gate, the preview and the
+/// executor see matches the schema exactly, and an allow-list tool is not tripped
+/// by the spelling it was just forgiven.
+fn rename_argument_synonyms(tool: &str, input: &mut Value) {
+    let Some(object) = input.as_object_mut() else {
+        return;
+    };
+    for (owner, canonical, synonyms) in ARGUMENT_SYNONYMS {
+        if *owner != tool || object.contains_key(*canonical) {
+            continue;
+        }
+        let present: Vec<&str> = synonyms
+            .iter()
+            .copied()
+            .filter(|synonym| object.contains_key(*synonym))
+            .collect();
+        let (Some(first), true) = (
+            present.first(),
+            present
+                .windows(2)
+                .all(|pair| object[pair[0]] == object[pair[1]]),
+        ) else {
+            continue;
+        };
+        let value = object[*first].clone();
+        for synonym in &present {
+            object.remove(*synonym);
+        }
+        object.insert((*canonical).to_string(), value);
+    }
+}
+
 /// Normalize compatibility envelopes before any caller classifies a tool use.
 /// Structured turns share this with the ordinary dispatcher so a deferred-mode
 /// `call_tool` wrapper around the synthetic terminal tool is still intercepted.
+///
+/// Argument synonyms are renamed here for the same reason the wrapper is unwrapped
+/// here: concurrency batching, hooks, the permission gate, the approval preview
+/// and the executor must all read one shape. A path that arrived as `file_path`
+/// has to be the path the gate matches its rules against — normalizing after the
+/// gate would hand it a call with no path at all.
 pub(crate) fn normalize_tool_uses(
     tool_uses: Vec<(String, String, Value)>,
 ) -> Vec<(String, String, Value)> {
     tool_uses
         .into_iter()
         .map(|(id, name, input)| {
-            let (name, input) = tool_search::unwrap_call_tool(name, input);
+            let (name, mut input) = tool_search::unwrap_call_tool(name, input);
+            rename_argument_synonyms(&name, &mut input);
             (id, name, input)
         })
         .collect()
@@ -2141,6 +2214,64 @@ mod tests {
 
     use super::testutil::*;
     use super::*;
+
+    /// The two things the synonym rename must never do. It fills a gap and it
+    /// does not guess: a canonical key that is present stays, whatever its type
+    /// and whatever else the call carried, and synonyms that disagree are left
+    /// alone for the tool's own refusal to explain — naming both the argument it
+    /// wanted and the keys it got is exactly what that refusal is for.
+    #[test]
+    fn renaming_a_synonym_fills_a_gap_and_never_guesses() {
+        let renamed = |tool: &str, input: Value| {
+            let mut input = input;
+            rename_argument_synonyms(tool, &mut input);
+            input
+        };
+
+        assert_eq!(
+            renamed(
+                "edit_file",
+                json!({"file_path": "a", "old_str": "b", "new_str": "c"})
+            ),
+            json!({"path": "a", "old_string": "b", "new_string": "c"})
+        );
+        // Present canonical wins, and the stray synonym is not merged in: a call
+        // that used the real name is never second-guessed.
+        assert_eq!(
+            renamed("edit_file", json!({"path": "real", "file_path": "other"})),
+            json!({"path": "real", "file_path": "other"})
+        );
+        assert_eq!(
+            renamed("edit_file", json!({"path": 5, "file_path": "other"})),
+            json!({"path": 5, "file_path": "other"})
+        );
+        // Two synonyms for one argument: consumed when they agree, untouched when
+        // they do not.
+        assert_eq!(
+            renamed(
+                "notebook_edit",
+                json!({"path": "same", "file_path": "same"})
+            ),
+            json!({"notebook_path": "same"})
+        );
+        assert_eq!(
+            renamed("notebook_edit", json!({"path": "a", "file_path": "b"})),
+            json!({"path": "a", "file_path": "b"})
+        );
+        // Only the tools listed, and only their own arguments.
+        assert_eq!(
+            renamed("read_file", json!({"old_str": "x", "file_path": "a"})),
+            json!({"old_str": "x", "path": "a"})
+        );
+        assert_eq!(
+            renamed("srv__external", json!({"file_path": "a"})),
+            json!({"file_path": "a"})
+        );
+        assert_eq!(
+            renamed("edit_file", json!("not an object")),
+            json!("not an object")
+        );
+    }
 
     /// Definitions as sent when the `program` surface is on — the branch that
     /// still ships `run_program`. Its own tests keep exercising it; plan 113 only
