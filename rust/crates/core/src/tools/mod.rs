@@ -441,6 +441,32 @@ pub struct ToolCtx {
     pub program_result: Option<ProgramResultSink>,
 }
 
+impl ToolCtx {
+    /// A top-level context for a command the harness runs on its own — a
+    /// `/name` `!cmd` injection, a scheduled `check` — rather than one the
+    /// model called. It streams nothing: the permission prompt, which rides the
+    /// approver inside `cfg.permissions`, is its only surface.
+    pub(crate) fn harness(cfg: Arc<Config>, cancel: CancellationToken) -> Self {
+        Self {
+            cfg,
+            ui: Arc::new(SilentHarnessUi),
+            cancel,
+            depth: 0,
+            enclosing_execution: None,
+            hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
+            from_program: false,
+            program_tool_manifest: None,
+            parent_rollout_id: None,
+            program_result: None,
+        }
+    }
+}
+
+struct SilentHarnessUi;
+impl Ui for SilentHarnessUi {
+    fn emit(&self, _ev: &crate::event::Event) {}
+}
+
 /// Built-ins plus external sources, in registration order. A name collision
 /// (with a built-in or an earlier source) drops the later definition; the
 /// CLI surfaces the same collisions as startup warnings via

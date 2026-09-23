@@ -2108,6 +2108,26 @@ and `prompt`; it rounds, clamps to 60–3600 seconds, aligns to the next minute,
 atomically replaces the owner's previous dynamic wakeup. `stop:true` clears only that
 dynamic slot, never fixed recurring cron jobs.
 
+**`cron_create.check` (plan 199)** is an optional shell command run at each fire,
+before anything is delivered: exit 0 skips the fire (the job still rearms; nothing
+enters the Inbox, no delivery turn starts), a non-zero exit delivers the prompt with
+`[scheduled check `…` failed]` and the check's output appended, and a check with no
+verdict — refused by the gate, failed to spawn, or no runner bound — delivers too, with
+`could not run: <reason>`. A broken check that went silent would be a job that silently
+stopped firing, so uncertainty always wakes the model. The check faces the **full bash
+gate on every fire** (`check_call`, then the same foreground run with sandbox and
+escalation) — the `/name` `` !`cmd` `` injection path's shape, through a shared
+`ToolCtx::harness` — so an unapproved check prompts when it fires, and a remembered
+approval is what makes it quiet; there is no create-time pass that later fires run on.
+The scheduler owns *when* and a `CheckRunner` owns *how*; the tools bind one holding the
+session Config on the first scheduler tool call, and because that Config holds the
+scheduler, `Scheduler::shutdown` takes the runner out and aborts running checks to
+break the cycle. A check runs off the worker loop, one per job: a fire that finds its
+job's previous check still running is skipped, not queued. A durable job's check is
+stored with it (absent in older files, which read unchanged) and runs in, and under the
+gate of, whichever runtime claims the fire. `schedule_wakeup` has no check: it is the
+model's own next step, not unattended polling.
+
 These names are intentionally native. kloop exposes `schedule_wakeup.delay_seconds`,
 not Claude Code's `ScheduleWakeup.delaySeconds`, and provides no PascalCase compatibility
 aliases. The tools appear only on a scheduler-capable depth-zero owner surface; they are

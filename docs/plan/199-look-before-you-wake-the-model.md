@@ -75,4 +75,30 @@ kloop 的 `cron_create` 只有 `prompt`,每次到点都是一次完整的模型�
 
 ## 七、完成记录
 
-(未开工)
+✅ 2026-09-23,用户选**做法甲**(每次触发都走完整 bash 门)。提交号见本条所在提交。
+
+- **bash 工具拆出带状态的前台运行**:`bash_tool` 原来只返回文本,成败只靠文本末尾的
+  `[exit …]` 表达。拆出 `run_foreground_bash` → `ForegroundRun { text, success }`
+  (escalation 重跑时取重跑那次的状态),`bash_tool` 取 `.text`,行为不变。check 拿
+  `success`,**不解析文本**。
+- **调度器**:`ScheduledJob.check`(`serde(default)`,旧 store 照读);`CheckRunner` trait +
+  `CheckOutcome::{Passed, Failed, Unavailable}`;worker 对带 check 的到点任务 `start_check`
+  单独 spawn,`checks_running` 按 job id 去重(锁跨 spawn 持有,任务自己的 remove 不会先于
+  insert);`shutdown` 取走 runner 并 abort 在跑的 check——**这是打断
+  `Config → Scheduler → runner → Config` 引用环的唯一一处**,有测试钉 `strong_count`。
+- **runner**:`tools/scheduler.rs` 的 `GatedCheck`,在第一次调度工具调用的 `bind` 里装上
+  (`bind_check_runner` 只装一次)。`inject.rs` 原来内联构造的最小 `ToolCtx` 提成
+  `ToolCtx::harness`,两处共用。
+- **第四节"runner 持 `Weak`"没有照做**:前端在 `/model`、`/provider` 之后会重新冻结出一个新的
+  `Arc<Config>`,旧的那个随即被丢掉,持 `Weak` 的 runner 会在一次换模型之后悄悄失效(每次
+  触发都变成 "could not run")。改为持强引用、由 `shutdown` 断环。持的是绑定那一刻的 Config
+  也没关系:bash 用到的权限、沙箱、shell、worktree 状态都是 clone 间共享的 `Arc`。
+- 超时:bash 默认 60 秒,超时是 `bail!` → `Unavailable`,与第二节一致,未另写。
+- **第四节"CLI plain 也要接"是错的**:`main.rs` 那处 `bind_owner` 在测试里,生产里 worker
+  只由工具的 `bind` 启动,runner 装在同一处就够了。
+- 测试:调度器 6 条(通过即跳过并重排、失败带输出投递、被拒/无 runner 也投递、上次未完成
+  则跳过、shutdown 释放 runner、持久 store 往返 + 空 check 拒绝),工具层 3 条(真 bash
+  退出码 → Passed/Failed、deny 规则 → Unavailable、`cron_create` 端到端:真 bash 失败 →
+  inbox 里一条逐字断言的 prompt、`cron_list` 显示 check)。`make check` 全绿。
+- 没做真实 provider 下的交互验证(触发时审批弹窗在 TUI 里的样子);门的行为由 deny 规则
+  那条测试钉住。

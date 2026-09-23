@@ -23,7 +23,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -32,7 +31,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
 use super::bash;
-use crate::agent::Ui;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
 
@@ -49,11 +47,10 @@ fn has_injections(body: &str) -> bool {
 }
 
 /// Expand injections for a `/name` invocation. Returns `body` unchanged when it
-/// has no markers. On markers, builds a minimal top-level [`ToolCtx`] with a
-/// silent UI — the only user-visible interaction is the bash permission prompt,
-/// which rides the approver inside `cfg.permissions`, not the UI — and runs the
-/// expansion. An error (denied / failed `!cmd`) propagates so the caller can
-/// show it rather than start a turn.
+/// has no markers. On markers, builds a [`ToolCtx::harness`] context (an
+/// injected `!cmd` shows no tool row, as in cc; the bash permission prompt is
+/// the only surface) and runs the expansion. An error (denied / failed `!cmd`)
+/// propagates so the caller can show it rather than start a turn.
 pub(crate) async fn expand_slash_injections(
     body: &str,
     cfg: &Arc<Config>,
@@ -62,29 +59,10 @@ pub(crate) async fn expand_slash_injections(
     if !has_injections(body) {
         return Ok(body.to_string());
     }
-    let ctx = ToolCtx {
-        cfg: cfg.clone(),
-        ui: Arc::new(SilentUi),
-        cancel: cancel.clone(),
-        depth: 0,
-        enclosing_execution: None,
-        hook_context: Arc::new(Mutex::new(Vec::new())),
-        from_program: false,
-        program_tool_manifest: None,
-        parent_rollout_id: None,
-        program_result: None,
-    };
+    let ctx = ToolCtx::harness(cfg.clone(), cancel.clone());
     let workspace = cfg.effective_workspace();
 
     expand(body, &ctx, &workspace).await
-}
-
-/// A UI that swallows everything: an injected `!cmd` streams nothing and shows
-/// no tool row (cc likewise creates no visible bash row for prompt injection);
-/// the permission prompt is the only surface, and it goes through the approver.
-struct SilentUi;
-impl Ui for SilentUi {
-    fn emit(&self, _ev: &crate::event::Event) {}
 }
 
 /// Run `!cmd` (inline output in place) then append `@file` contents. `@file`

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read as _, Write as _};
@@ -414,6 +414,11 @@ pub struct ScheduledJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub generation: u64,
+    /// A shell command run at fire time, before the prompt is delivered: exit
+    /// 0 skips this fire, anything else (including a check that could not run)
+    /// delivers the prompt with the check's output attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 impl ScheduledJob {
@@ -431,6 +436,41 @@ pub struct WakeupResult {
     pub was_clamped: bool,
     pub stopped: bool,
     pub cancelled_wakeups: usize,
+}
+
+/// Runs a job's `check` at fire time. The scheduler owns *when*; the runner
+/// owns *how* — the bash permission gate and the sandbox live with the tools,
+/// and a check faces them on every fire exactly as a model bash call would.
+pub trait CheckRunner: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        command: &'a str,
+    ) -> Pin<Box<dyn Future<Output = CheckOutcome> + Send + 'a>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// Exit 0: nothing to wake the model for.
+    Passed,
+    /// The command ran and did not succeed; its model-facing output.
+    Failed(String),
+    /// No verdict at all: refused by the gate, failed to spawn, or no runner.
+    /// Delivered like a failure — a check that silently stops running would
+    /// otherwise be a job that silently stopped firing.
+    Unavailable(String),
+}
+
+impl CheckOutcome {
+    /// The note appended to the delivered prompt; `None` means do not deliver.
+    fn note(&self, command: &str) -> Option<String> {
+        match self {
+            Self::Passed => None,
+            Self::Failed(output) => Some(format!("[scheduled check `{command}` failed]\n{output}")),
+            Self::Unavailable(reason) => Some(format!(
+                "[scheduled check `{command}` could not run: {reason}]"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -721,6 +761,12 @@ struct SchedulerState {
     missed_confirmation_available: bool,
     closed: bool,
     worker: Option<tokio::task::JoinHandle<()>>,
+    /// Holds the session's Config (for the bash gate), and the Config holds this
+    /// scheduler: [`Scheduler::shutdown`] takes it out to break that cycle.
+    check_runner: Option<Arc<dyn CheckRunner>>,
+    /// One running check per job id; a fire that finds its job's check still
+    /// running is skipped rather than queued or run twice.
+    checks_running: HashMap<String, tokio::task::AbortHandle>,
 }
 
 pub struct Scheduler {
@@ -773,6 +819,8 @@ impl Scheduler {
                 missed_confirmation_available: true,
                 closed: false,
                 worker: None,
+                check_runner: None,
+                checks_running: HashMap::new(),
             }),
             inbox,
             store,
@@ -785,6 +833,15 @@ impl Scheduler {
     pub fn set_missed_confirmation_available(&self, available: bool) {
         self.state.lock().unwrap().missed_confirmation_available = available;
         self.notify_change();
+    }
+
+    /// Install the runner for `check` commands unless one is already bound. A
+    /// fire before any runner exists delivers with a "could not run" note.
+    pub fn bind_check_runner(&self, runner: impl FnOnce() -> Arc<dyn CheckRunner>) {
+        let mut state = self.state.lock().unwrap();
+        if state.check_runner.is_none() && !state.closed {
+            state.check_runner = Some(runner());
+        }
     }
 
     pub fn bind_owner(self: &Arc<Self>, owner: impl Into<String>) -> Result<()> {
@@ -823,10 +880,14 @@ impl Scheduler {
         prompt: &str,
         recurring: bool,
         durable: bool,
+        check: Option<&str>,
     ) -> Result<ScheduledJob> {
         let owner = self.owner()?;
         if prompt.is_empty() {
             bail!("cron_create: prompt must not be empty");
+        }
+        if check.is_some_and(|check| check.trim().is_empty()) {
+            bail!("cron_create: check must not be empty when given");
         }
         let spec = CronSpec::parse(cron)?;
         let now = self.clock.now_ms();
@@ -856,6 +917,7 @@ impl Scheduler {
             kind: ScheduledKind::Cron,
             reason: None,
             generation: 1,
+            check: check.map(str::to_string),
         };
         if durable {
             self.store.as_ref().unwrap().transaction(|jobs| {
@@ -964,6 +1026,7 @@ impl Scheduler {
             kind: ScheduledKind::LoopWakeup,
             reason: Some(reason.to_string()),
             generation: 1,
+            check: None,
         };
         let existing = self.list()?;
         let replacing_existing = existing
@@ -1020,6 +1083,10 @@ impl Scheduler {
             let mut state = self.state.lock().unwrap();
             state.closed = true;
             state.session_jobs.clear();
+            state.check_runner = None;
+            for (_, check) in state.checks_running.drain() {
+                check.abort();
+            }
             state.worker.take()
         };
         self.notify_change();
@@ -1080,17 +1147,10 @@ impl Scheduler {
             };
             for job in due {
                 let missed = requires_missed_confirmation(&job, now);
-                self.inbox.push(InboxItem::ScheduledPrompt {
-                    id: job.id,
-                    origin: match job.kind {
-                        ScheduledKind::Cron => ScheduledOrigin::Cron,
-                        ScheduledKind::LoopWakeup => ScheduledOrigin::LoopWakeup,
-                    },
-                    scheduled_for_ms: job.next_fire_at_ms,
-                    reason: job.reason,
-                    prompt: job.prompt,
-                    missed,
-                });
+                match job.check.clone() {
+                    None => self.deliver(job, missed, None),
+                    Some(command) => self.start_check(job, missed, command),
+                }
             }
             let horizon = match self.horizon(now) {
                 Ok(horizon) => horizon,
@@ -1142,6 +1202,59 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    fn deliver(&self, job: ScheduledJob, missed: bool, note: Option<String>) {
+        let prompt = match note {
+            Some(note) => format!("{}\n\n{note}", job.prompt),
+            None => job.prompt,
+        };
+        self.inbox.push(InboxItem::ScheduledPrompt {
+            id: job.id,
+            origin: match job.kind {
+                ScheduledKind::Cron => ScheduledOrigin::Cron,
+                ScheduledKind::LoopWakeup => ScheduledOrigin::LoopWakeup,
+            },
+            scheduled_for_ms: job.next_fire_at_ms,
+            reason: job.reason,
+            prompt,
+            missed,
+        });
+    }
+
+    /// Run the job's check off the worker loop (a check can take its whole
+    /// timeout, and the loop still owns every other job's fire), then deliver
+    /// or not on its outcome.
+    fn start_check(self: &Arc<Self>, job: ScheduledJob, missed: bool, command: String) {
+        // The lock is held across the spawn so the task's own removal of its
+        // entry cannot run before the entry is inserted.
+        let mut state = self.state.lock().unwrap();
+        if state.checks_running.contains_key(&job.id) {
+            return;
+        }
+        let Some(runner) = state.check_runner.clone() else {
+            drop(state);
+            let note = CheckOutcome::Unavailable("no check runner is bound to this session".into())
+                .note(&command);
+            self.deliver(job, missed, note);
+            return;
+        };
+        let id = job.id.clone();
+        let scheduler = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let outcome = runner.run(&command).await;
+            let closed = {
+                let mut state = scheduler.state.lock().unwrap();
+                state.checks_running.remove(&job.id);
+                state.closed
+            };
+            if let Some(note) = outcome.note(&command)
+                && !closed
+            {
+                scheduler.deliver(job, missed, Some(note));
+            }
+        });
+        state.checks_running.insert(id, task.abort_handle());
     }
 
     fn horizon(&self, now: i64) -> Result<Horizon> {
@@ -1303,6 +1416,7 @@ fn id_fraction(id: &str) -> f64 {
 mod tests {
     use super::*;
     use chrono::{NaiveDate, TimeZone};
+    use std::sync::atomic::AtomicUsize;
 
     fn utc_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
@@ -1451,7 +1565,7 @@ mod tests {
         for recurring in [false, true] {
             let started = std::time::Instant::now();
             let error = scheduler
-                .create("0 0 30 2 *", "never", recurring, false)
+                .create("0 0 30 2 *", "never", recurring, false, None)
                 .unwrap_err()
                 .to_string();
             let elapsed = started.elapsed();
@@ -1498,7 +1612,7 @@ mod tests {
         // One durable job later, the same corrupt store is read within a poll.
         fs::remove_file(&path).unwrap();
         scheduler
-            .create("0 13 * * *", "durable", true, true)
+            .create("0 13 * * *", "durable", true, true, None)
             .unwrap();
         for _ in 0..4 {
             tokio::task::yield_now().await;
@@ -1548,10 +1662,10 @@ mod tests {
         );
         scheduler.bind_owner("owner-a").unwrap();
         let one_shot = scheduler
-            .create("1 12 * * *", "once", false, false)
+            .create("1 12 * * *", "once", false, false, None)
             .unwrap();
         let recurring = scheduler
-            .create("*/5 * * * *", "again", true, false)
+            .create("*/5 * * * *", "again", true, false, None)
             .unwrap();
         clock.set(one_shot.next_fire_at_ms.max(recurring.next_fire_at_ms));
         tokio::task::yield_now().await;
@@ -1564,6 +1678,223 @@ mod tests {
         scheduler.shutdown().await;
     }
 
+    /// A check that answers `outcome` every time, counting its runs; with a
+    /// gate it parks each run until the gate is notified.
+    struct ScriptedCheck {
+        outcome: CheckOutcome,
+        calls: AtomicUsize,
+        gate: Option<tokio::sync::Notify>,
+    }
+
+    impl ScriptedCheck {
+        fn new(outcome: CheckOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                calls: AtomicUsize::new(0),
+                gate: None,
+            })
+        }
+
+        fn gated(outcome: CheckOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                calls: AtomicUsize::new(0),
+                gate: Some(tokio::sync::Notify::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CheckRunner for ScriptedCheck {
+        fn run<'a>(
+            &'a self,
+            _command: &'a str,
+        ) -> Pin<Box<dyn Future<Output = CheckOutcome> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(gate) = &self.gate {
+                    gate.notified().await;
+                }
+                self.outcome.clone()
+            })
+        }
+    }
+
+    async fn settle() {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A bound scheduler with one recurring `check` job; the runner, when
+    /// given, is bound before anything fires.
+    fn checked_scheduler(
+        runner: Option<Arc<ScriptedCheck>>,
+    ) -> (Arc<Scheduler>, Arc<Inbox>, Arc<ManualClock>, ScheduledJob) {
+        let clock = ManualClock::new(utc_ms(2026, 8, 3, 12, 0));
+        let inbox = Arc::new(Inbox::default());
+        let scheduler = Scheduler::with_clock(
+            Arc::clone(&inbox),
+            None,
+            clock.clone(),
+            SchedulerTimeZone::Named(Tz::UTC),
+        );
+        scheduler.bind_owner("owner-a").unwrap();
+        if let Some(runner) = runner {
+            scheduler.bind_check_runner(|| runner);
+        }
+        let job = scheduler
+            .create("*/5 * * * *", "watch CI", true, false, Some("probe"))
+            .unwrap();
+        (scheduler, inbox, clock, job)
+    }
+
+    fn delivered(job: &ScheduledJob, prompt: &str) -> InboxItem {
+        InboxItem::ScheduledPrompt {
+            id: job.id.clone(),
+            origin: ScheduledOrigin::Cron,
+            scheduled_for_ms: job.next_fire_at_ms,
+            reason: None,
+            prompt: prompt.into(),
+            missed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_passing_check_skips_the_fire_and_rearms_the_job() {
+        let runner = ScriptedCheck::new(CheckOutcome::Passed);
+        let (scheduler, inbox, clock, job) = checked_scheduler(Some(Arc::clone(&runner)));
+        clock.set(job.next_fire_at_ms);
+        settle().await;
+        assert_eq!(runner.calls(), 1);
+        assert!(inbox.drain().is_empty());
+        let jobs = scheduler.list().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].next_fire_at_ms > job.next_fire_at_ms);
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failing_check_delivers_the_prompt_with_its_output() {
+        let runner = ScriptedCheck::new(CheckOutcome::Failed("red\n[exit status 1]".into()));
+        let (scheduler, inbox, clock, job) = checked_scheduler(Some(runner));
+        clock.set(job.next_fire_at_ms);
+        settle().await;
+        assert_eq!(
+            inbox.drain(),
+            vec![delivered(
+                &job,
+                "watch CI\n\n[scheduled check `probe` failed]\nred\n[exit status 1]"
+            )]
+        );
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_run_still_delivers() {
+        let runner = ScriptedCheck::new(CheckOutcome::Unavailable("blocked: denied".into()));
+        let (scheduler, inbox, clock, job) = checked_scheduler(Some(runner));
+        clock.set(job.next_fire_at_ms);
+        settle().await;
+        assert_eq!(
+            inbox.drain(),
+            vec![delivered(
+                &job,
+                "watch CI\n\n[scheduled check `probe` could not run: blocked: denied]"
+            )]
+        );
+        scheduler.shutdown().await;
+
+        // No runner bound at all is the same kind of "no verdict".
+        let (scheduler, inbox, clock, job) = checked_scheduler(None);
+        clock.set(job.next_fire_at_ms);
+        settle().await;
+        assert_eq!(
+            inbox.drain(),
+            vec![delivered(
+                &job,
+                "watch CI\n\n[scheduled check `probe` could not run: no check runner is bound to this session]"
+            )]
+        );
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_fire_that_finds_its_check_still_running_is_skipped() {
+        let runner = ScriptedCheck::gated(CheckOutcome::Passed);
+        let (scheduler, inbox, clock, job) = checked_scheduler(Some(Arc::clone(&runner)));
+        clock.set(job.next_fire_at_ms);
+        settle().await;
+        assert_eq!(runner.calls(), 1);
+
+        let second = scheduler.list().unwrap()[0].next_fire_at_ms;
+        clock.set(second);
+        settle().await;
+        assert_eq!(
+            runner.calls(),
+            1,
+            "the second fire must not start a second run"
+        );
+
+        runner.gate.as_ref().unwrap().notify_one();
+        settle().await;
+        let third = scheduler.list().unwrap()[0].next_fire_at_ms;
+        assert!(third > second, "the skipped fire still rearms the job");
+        clock.set(third);
+        settle().await;
+        assert_eq!(runner.calls(), 2);
+        assert!(inbox.drain().is_empty());
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_the_runner_and_aborts_a_running_check() {
+        let runner = ScriptedCheck::gated(CheckOutcome::Failed("late".into()));
+        let (scheduler, inbox, clock, job) = checked_scheduler(Some(Arc::clone(&runner)));
+        clock.set(job.next_fire_at_ms);
+        settle().await;
+        assert_eq!(runner.calls(), 1);
+        // Held by the test, the scheduler, and the parked check task.
+        assert_eq!(Arc::strong_count(&runner), 3);
+
+        scheduler.shutdown().await;
+        settle().await;
+        // The runner holds the session Config in production, and the Config
+        // holds the scheduler: only this release breaks that cycle.
+        assert_eq!(Arc::strong_count(&runner), 1);
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn a_durable_check_round_trips_through_the_store() {
+        let root = std::env::temp_dir().join(format!(
+            "kloop-scheduler-check-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = DurableStore::new(root.join("scheduled_tasks.json"), "project-a".into());
+        let first = Scheduler::with_clock(
+            Arc::new(Inbox::default()),
+            Some(store.clone()),
+            ManualClock::new(utc_ms(2026, 8, 3, 12, 0)),
+            SchedulerTimeZone::Named(Tz::UTC),
+        );
+        first.bind_owner("owner-a").unwrap();
+        let job = first
+            .create("0 13 * * *", "watch CI", true, true, Some("gh run list"))
+            .unwrap();
+        assert_eq!(store.load().unwrap(), vec![job]);
+        assert!(
+            first
+                .create("0 13 * * *", "x", true, true, Some("  "))
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn dynamic_wakeup_replaces_and_stop_only_cancels_loop_job() {
         let start = utc_ms(2026, 8, 3, 12, 0);
@@ -1573,7 +1904,7 @@ mod tests {
             Scheduler::with_clock(inbox, None, clock, SchedulerTimeZone::Named(Tz::UTC));
         scheduler.bind_owner("owner-a").unwrap();
         scheduler
-            .create("0 13 * * *", "fixed", true, false)
+            .create("0 13 * * *", "fixed", true, false, None)
             .unwrap();
         let first = scheduler
             .schedule_wakeup(1.0, "first", "/loop work")
@@ -1614,6 +1945,7 @@ mod tests {
                     kind: ScheduledKind::Cron,
                     reason: None,
                     generation: 1,
+                    check: None,
                 });
                 Ok(())
             })
@@ -1673,13 +2005,13 @@ mod tests {
         );
         scheduler.bind_owner("owner-a").unwrap();
         let durable = scheduler
-            .create("1 12 * * *", "durable once", false, true)
+            .create("1 12 * * *", "durable once", false, true, None)
             .unwrap();
         let session = scheduler
-            .create("1 12 * * *", "session once", false, false)
+            .create("1 12 * * *", "session once", false, false, None)
             .unwrap();
         let recurring = scheduler
-            .create("1 12 * * *", "recurring", true, false)
+            .create("1 12 * * *", "recurring", true, false, None)
             .unwrap();
         let latest = durable
             .next_fire_at_ms
@@ -1749,7 +2081,9 @@ mod tests {
         a1.bind_owner("owner-a").unwrap();
         a2.bind_owner("owner-a").unwrap();
         b.bind_owner("owner-b").unwrap();
-        let job = a1.create("1 12 * * *", "claim once", false, true).unwrap();
+        let job = a1
+            .create("1 12 * * *", "claim once", false, true, None)
+            .unwrap();
 
         clock.set(job.next_fire_at_ms);
         for _ in 0..8 {
@@ -1783,8 +2117,12 @@ mod tests {
             SchedulerTimeZone::Named(Tz::UTC),
         );
         first.bind_owner("owner-a").unwrap();
-        first.create("0 13 * * *", "session", true, false).unwrap();
-        first.create("0 13 * * *", "durable", true, true).unwrap();
+        first
+            .create("0 13 * * *", "session", true, false, None)
+            .unwrap();
+        first
+            .create("0 13 * * *", "durable", true, true, None)
+            .unwrap();
         first.shutdown().await;
 
         let resumed = Scheduler::with_clock(
@@ -1819,10 +2157,10 @@ mod tests {
         );
         scheduler.bind_owner("owner-a").unwrap();
         let session = scheduler
-            .create("1 12 * * *", "session survives", false, false)
+            .create("1 12 * * *", "session survives", false, false, None)
             .unwrap();
         scheduler
-            .create("0 13 * * *", "durable future", true, true)
+            .create("0 13 * * *", "durable future", true, true, None)
             .unwrap();
         fs::write(&path, b"{bad json").unwrap();
 

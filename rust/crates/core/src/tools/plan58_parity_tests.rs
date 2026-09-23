@@ -297,11 +297,17 @@ async fn lifecycle_report() -> Value {
 
     for index in 0..50 {
         scheduler
-            .create("1 12 * * *", &format!("limit-{index:02}"), true, false)
+            .create(
+                "1 12 * * *",
+                &format!("limit-{index:02}"),
+                true,
+                false,
+                None,
+            )
             .unwrap();
     }
     let cap_error = scheduler
-        .create("1 12 * * *", "over limit", true, false)
+        .create("1 12 * * *", "over limit", true, false, None)
         .unwrap_err()
         .to_string();
     assert!(cap_error.contains("max 50"));
@@ -342,7 +348,9 @@ async fn lifecycle_report() -> Value {
 async fn wakeup_report() -> Value {
     let clock = ManualClock::new(0);
     let (context, scheduler, _inbox, ui) = scheduler_context("wakeup", "owner-a", clock, None);
-    scheduler.create("0 1 * * *", "fixed", true, false).unwrap();
+    scheduler
+        .create("0 1 * * *", "fixed", true, false, None)
+        .unwrap();
     let (missing, missing_error) = run_tool(
         "schedule_wakeup",
         json!({"delay_seconds": 60, "prompt": "loop"}),

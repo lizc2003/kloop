@@ -232,10 +232,39 @@ pub(super) async fn bash_tool(
             workspace,
         );
     }
+    run_foreground_bash(command, parsed.timeout_ms, sandbox, ctx, workspace)
+        .await
+        .map(|run| run.text)
+}
+
+/// What one foreground run left behind: the model-facing text, and whether the
+/// command that produced it (the escalated re-run, when there was one)
+/// succeeded. A scheduled check needs the second without parsing the first.
+pub(crate) struct ForegroundRun {
+    pub(crate) text: String,
+    pub(crate) success: bool,
+}
+
+/// The foreground half of [`bash_tool`], after input parsing and the sandbox
+/// choice: run, then handle a sandbox denial (escalate or annotate).
+pub(crate) async fn run_foreground_bash(
+    command: &str,
+    timeout_ms: Option<u64>,
+    sandbox: Option<Arc<SandboxPolicy>>,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<ForegroundRun> {
+    let cwd = workspace.cwd.clone();
+    let bash = ctx
+        .cfg
+        .shell_programs
+        .bash
+        .as_ref()
+        .context("bash: Git for Windows Bash is unavailable in this session")?;
     if ctx.cancel.is_cancelled() {
         bail!("interrupted");
     }
-    let timeout_ms = parsed.timeout_ms.unwrap_or(DEFAULT_FOREGROUND_TIMEOUT_MS);
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_FOREGROUND_TIMEOUT_MS);
     // A remembered escalation is consent to run this command uncontained, so
     // the contained attempt is skipped rather than run and thrown away. It is
     // the expensive half — the run that compiles the test binary, binds the
@@ -258,8 +287,12 @@ pub(super) async fn bash_tool(
     )
     .await?;
     let mut text = format_output(&output);
+    let success = output.status.success();
     if remembered_escalation {
-        return Ok(format!("{}{text}", sandbox::REMEMBERED_ESCALATION_PREFIX));
+        return Ok(ForegroundRun {
+            text: format!("{}{text}", sandbox::REMEMBERED_ESCALATION_PREFIX),
+            success,
+        });
     }
 
     // Sandbox denial handling applies only to an actually-sandboxed run;
@@ -285,11 +318,14 @@ pub(super) async fn bash_tool(
                     // ran uncontained, and the sandboxed output is about to be
                     // dropped for the unsandboxed one. Carrying the line keeps
                     // the escalation attributable after the fact.
-                    return Ok(format!(
-                        "{}{}",
-                        sandbox::escalated_prefix(&denial),
-                        format_output(&raw)
-                    ));
+                    return Ok(ForegroundRun {
+                        text: format!(
+                            "{}{}",
+                            sandbox::escalated_prefix(&denial),
+                            format_output(&raw)
+                        ),
+                        success: raw.status.success(),
+                    });
                 }
                 EscalationOutcome::Declined => text.push_str(sandbox::ESCALATION_DECLINED),
                 EscalationOutcome::NotAttempted => text.push_str(sandbox::DENIAL_HINT),
@@ -298,7 +334,7 @@ pub(super) async fn bash_tool(
             text.push_str(sandbox::DENIAL_HINT);
         }
     }
-    Ok(text)
+    Ok(ForegroundRun { text, success })
 }
 
 /// One foreground shell run. The root is awaited independently from pipe EOF:
