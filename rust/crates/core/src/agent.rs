@@ -1008,6 +1008,7 @@ async fn turn_rounds(
         drain_inbox(&cfg.inbox, turn.history, ui);
         drain_local_mailbox(cfg, turn.history, ui);
         remind_todos(cfg, turn.history, depth);
+        remind_changed_reads(cfg, turn.history);
         // The injected context is outside history and a dynamic MCP refresh may
         // replace its deferred-tool notice between rounds, so account for the
         // current version rather than pinning the turn's first estimate.
@@ -1354,6 +1355,24 @@ fn remind_todos(cfg: &Config, history: &mut History, depth: u8) -> bool {
         return false;
     }
     let Some(reminder) = cfg.todos.round_boundary_reminder() else {
+        return false;
+    };
+    let reminder = history.offload_text(reminder);
+    history.record(Message::user_text(reminder));
+    true
+}
+
+/// Name the files the model read that changed on disk since (plan 197), as a
+/// message of its own at the end of history — the same place and shape as
+/// [`remind_todos`], and for the same reason: after the cache prefix, and in
+/// the rollout so a replay or resume shows it where the model saw it.
+///
+/// Every depth: a sub-agent reads files too, into a `FileState` of its own.
+fn remind_changed_reads(cfg: &Config, history: &mut History) -> bool {
+    let workspace = cfg.effective_workspace();
+    let Some(reminder) =
+        crate::tools::changed_reads_reminder(&workspace.file_state, &workspace.cwd)
+    else {
         return false;
     };
     let reminder = history.offload_text(reminder);

@@ -218,6 +218,96 @@ async fn the_reminder_arrives_between_rounds_of_a_real_turn() {
     assert_eq!(messages[reminders[0] + 1].role, Role::Assistant);
 }
 
+/// Plan 197 from the loop: a read, then a `bash` round that rewrites the file
+/// read, then an answer. The changed-reads reminder has to land as a user
+/// message of its own between the `bash` round's `tool_result` and the answer,
+/// and — being a history entry rather than part of a tool result — it has to be
+/// in the rollout at that same place, for a replay and for a resume alike.
+#[tokio::test]
+async fn a_changed_read_is_named_between_rounds_and_replays_in_place() {
+    let dir = std::env::temp_dir().join(format!("kloop-plan197-loop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(dir).unwrap();
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "first draft\n").unwrap();
+
+    let script = vec![
+        vec![tool_use_named(
+            "r0",
+            "read_file",
+            json!({"path": file.to_str().unwrap()}),
+        )],
+        vec![tool_use("b1", "printf 'second draft\\n' > notes.txt")],
+        vec![AssistantBlock::Text {
+            text: "done".into(),
+        }],
+    ];
+    let mut cfg = crate::tools::testutil::TestConfig::new("agent-changed-reads")
+        .provider(Provider::mock(script))
+        .max_rounds(Some(6))
+        .build()
+        .test_clone();
+    cfg.cwd = dir.clone();
+    let cfg = Arc::new(cfg);
+    let session = dir.join("session.jsonl");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("revise the notes"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+
+    let messages = history.messages();
+    let reminders: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.role == Role::User
+                && matches!(&message.content[0], ContentBlock::Text { text } if text
+                    .starts_with("<system-reminder>"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(reminders.len(), 1, "{messages:?}");
+    let at = reminders[0];
+    assert_eq!(
+        messages[at].content,
+        vec![ContentBlock::Text {
+            text: "<system-reminder>\nFiles you read have changed on disk since, whether by a \
+                   command you ran or by someone else. What you saw of them is out of date; read \
+                   again before relying on it:\n- notes.txt\n</system-reminder>"
+                .into(),
+        }]
+    );
+    assert!(
+        matches!(
+            messages[at - 1].content.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "b1"
+        ),
+        "{:?}",
+        messages[at - 1]
+    );
+    assert_eq!(messages[at + 1].role, Role::Assistant);
+
+    assert_eq!(
+        crate::rollout::load_session_snapshot(&session)
+            .unwrap()
+            .messages,
+        messages,
+        "replay"
+    );
+    assert_eq!(
+        crate::rollout::resume_session(&session).unwrap().messages,
+        messages,
+        "resume"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn drain_inbox_offloads_only_large_machine_results() {
     let dir = std::env::temp_dir().join(format!("kloop-inbox-offload-{}", std::process::id()));

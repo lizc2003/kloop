@@ -34,6 +34,38 @@ struct Inner {
 struct Entry {
     observation: FileObservation,
     last_updated: u64,
+    disk: DiskCheck,
+}
+
+/// What the round boundary last concluded about one observation's path (plan
+/// 197). Lives on the entry, not the observation, so that every read or write
+/// that replaces the observation re-arms it: the new observation is a new
+/// impression the model holds, and a later change is news about that one.
+#[derive(Clone, Default)]
+enum DiskCheck {
+    #[default]
+    Unchecked,
+    /// Metadata moved but the bytes are still the ones that were read — a
+    /// `touch`, a `chmod`. Kept so the next boundary skips the hash while the
+    /// metadata stays where this one found it.
+    SameContent(FileVersion),
+    /// Already named. Saying it again would add nothing: what the model holds
+    /// is still the same out-of-date read until it reads or writes the path.
+    Named,
+}
+
+/// A path the model read whose bytes have since changed under it, as the round
+/// boundary found it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChangedRead {
+    pub path: PathBuf,
+    pub drift: ReadDrift,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadDrift {
+    Rewritten,
+    Removed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +201,7 @@ impl FileState {
                     Entry {
                         observation,
                         last_updated: sequence,
+                        disk: DiskCheck::default(),
                     },
                 );
             }
@@ -178,6 +211,7 @@ impl FileState {
                     Entry {
                         observation,
                         last_updated: sequence,
+                        disk: DiskCheck::default(),
                     },
                 );
             }
@@ -213,6 +247,7 @@ impl FileState {
             Entry {
                 observation,
                 last_updated,
+                disk: DiskCheck::default(),
             },
         );
         self.evict_to_limits(&mut inner);
@@ -287,6 +322,53 @@ impl FileState {
         }
     }
 
+    /// Every read path whose bytes changed since the read, each named once
+    /// (plan 197).
+    ///
+    /// Content is the whole criterion, through the same
+    /// [`FileVersion::same_content`] `edit_file`'s note uses, so a `touch` or a
+    /// `chmod` stays silent here exactly as it does there. A stat per path is
+    /// the common cost; the file is hashed only when its metadata moved, and a
+    /// path already named is not even stat'ed until a read or write re-arms it.
+    ///
+    /// The IO runs outside the lock. A path whose observation was replaced in
+    /// the meantime is left alone — the replacement is the newer impression and
+    /// was never checked.
+    pub(crate) fn changed_since_read(&self) -> Vec<ChangedRead> {
+        let candidates: Vec<(PathBuf, FileObservation, DiskCheck)> = self
+            .inner
+            .lock()
+            .unwrap()
+            .observations
+            .iter()
+            .filter(|(_, entry)| !matches!(entry.disk, DiskCheck::Named))
+            .map(|(path, entry)| (path.clone(), entry.observation.clone(), entry.disk.clone()))
+            .collect();
+        let checked: Vec<(PathBuf, FileObservation, DiskCheck, Option<ReadDrift>)> = candidates
+            .into_iter()
+            .filter_map(|(path, observation, disk)| {
+                let (disk, drift) = check_disk(&path, &observation, disk)?;
+                Some((path, observation, disk, drift))
+            })
+            .collect();
+
+        let mut inner = self.inner.lock().unwrap();
+        let mut changed = Vec::new();
+        for (path, observation, disk, drift) in checked {
+            let Some(entry) = inner.observations.get_mut(&path) else {
+                continue;
+            };
+            if entry.observation != observation {
+                continue;
+            }
+            entry.disk = disk;
+            if let Some(drift) = drift {
+                changed.push(ChangedRead { path, drift });
+            }
+        }
+        changed
+    }
+
     pub(crate) fn observation(&self, path: &Path) -> Option<FileObservation> {
         self.inner
             .lock()
@@ -337,6 +419,40 @@ impl FileState {
     fn len(&self) -> usize {
         self.inner.lock().unwrap().observations.len()
     }
+}
+
+/// One path's boundary check: `None` when there is nothing new to record,
+/// otherwise the entry's next [`DiskCheck`] and, when it is news, the drift.
+///
+/// An error other than "not found" says nothing — a permission change or a
+/// file caught mid-write is not evidence of new bytes, and the next boundary
+/// looks again.
+fn check_disk(
+    path: &Path,
+    observation: &FileObservation,
+    disk: DiskCheck,
+) -> Option<(DiskCheck, Option<ReadDrift>)> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some((DiskCheck::Named, Some(ReadDrift::Removed)));
+        }
+        Err(_) => return None,
+    };
+    let unmoved = match &disk {
+        DiskCheck::Unchecked => observation.version.metadata_matches(&metadata),
+        DiskCheck::SameContent(seen) => seen.metadata_matches(&metadata),
+        DiskCheck::Named => true,
+    };
+    if unmoved {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let current = crate::file_io::fingerprint_file(&mut file).ok()?.version;
+    Some(match observation.version.same_content(&current) {
+        true => (DiskCheck::SameContent(current), None),
+        false => (DiskCheck::Named, Some(ReadDrift::Rewritten)),
+    })
 }
 
 impl FileObservation {
@@ -575,7 +691,12 @@ fn observation_memory_bytes(observations: &BTreeMap<PathBuf, Entry>) -> usize {
     observations
         .iter()
         .map(|(path, entry)| {
+            let checked = match entry.disk {
+                DiskCheck::SameContent(_) => std::mem::size_of::<FileVersion>(),
+                DiskCheck::Unchecked | DiskCheck::Named => 0,
+            };
             ENTRY_OVERHEAD_BYTES
+                + checked
                 + path.as_os_str().as_encoded_bytes().len()
                 + entry.observation.coverage.ranges.len() * std::mem::size_of::<Range<u64>>()
         })

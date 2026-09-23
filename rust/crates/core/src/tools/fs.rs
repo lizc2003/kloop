@@ -42,6 +42,7 @@ use crate::file_state::FileObservation;
 use crate::file_state::FileState;
 use crate::file_state::FileStateUpdate;
 use crate::file_state::FileVersion;
+use crate::file_state::ReadDrift;
 use crate::file_state::normalize_absolute_path;
 use kloop_protocol::ContentBlock;
 
@@ -86,6 +87,67 @@ pub(super) fn reread_advisory(state: &FileState, update: &FileStateUpdate) -> Op
          else.</system-reminder>",
         path.display()
     ))
+}
+
+/// How many paths one changed-reads reminder names before it says "and N more".
+///
+/// Measured rather than picked: replaying 191 real sessions round by round
+/// (each path named once per read), the reminder would fire 68 times, and 66 of
+/// those named 8 paths or fewer — median 1, p90 4. The other two named 21 and 23:
+/// a whole-tree formatter over everything read, where the list is the noise and
+/// the count is the news. Any cap from 8 to 20 cuts exactly those two. The
+/// corpus is an upper bound (it guesses writes from `bash` command text) and
+/// mostly one project; `scripts/tool-usage.py bash --changed-reads` recomputes it.
+const CHANGED_READS_NAMED_MAX: usize = 10;
+
+/// Tell the model which files it read have changed on disk since, if any did
+/// (plan 197). Names only, never content: after plan 195 a stale read costs an
+/// edit nothing, so the reminder buys information and is priced like it — a
+/// line per path, and the model decides whether to read again.
+///
+/// It names changes the model made itself through `bash` too. It knows it ran
+/// the formatter; it does not know which of the files it read the formatter
+/// touched.
+///
+/// Unlike [`reread_advisory`], this belongs to no tool result — it is about
+/// what happened between two rounds — so the caller records it as a message of
+/// its own at the round boundary, where a replayed rollout has it too.
+pub(crate) fn changed_reads_reminder(state: &FileState, cwd: &Path) -> Option<String> {
+    let changed = state.changed_since_read();
+    if changed.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "<system-reminder>\nFiles you read have changed on disk since, whether by a command you \
+         ran or by someone else. What you saw of them is out of date; read again before relying \
+         on it:\n",
+    );
+    for read in changed.iter().take(CHANGED_READS_NAMED_MAX) {
+        let path = display_under(cwd, &read.path);
+        let suffix = match read.drift {
+            ReadDrift::Rewritten => "",
+            ReadDrift::Removed => " (deleted)",
+        };
+        out.push_str(&format!("- {path}{suffix}\n"));
+    }
+    if let Some(more) = changed.len().checked_sub(CHANGED_READS_NAMED_MAX)
+        && more > 0
+    {
+        out.push_str(&format!("- and {more} more\n"));
+    }
+    out.push_str("</system-reminder>");
+    Some(out)
+}
+
+/// A path relative to the workspace when it lies under it. Observation keys are
+/// canonical, so the cwd is tried canonicalized too (`/tmp` vs `/private/tmp`).
+fn display_under(cwd: &Path, path: &Path) -> String {
+    let canonical = std::fs::canonicalize(cwd).ok();
+    let relative = path
+        .strip_prefix(cwd)
+        .ok()
+        .or_else(|| path.strip_prefix(canonical.as_deref()?).ok());
+    relative.unwrap_or(path).display().to_string()
 }
 
 pub(super) struct ReadFileOutput {

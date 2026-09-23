@@ -218,6 +218,96 @@ def report_advisory(runs: list[int]) -> None:
     print(f"  每条序列的长度: {spread}")
 
 
+# 一条 bash 命令"可能写了哪些已读文件"——只能从命令文本猜，所以是上界。
+# 点名式的写（sed -i a.rs）按 basename 认；整棵树的写（cargo fmt、git stash）
+# 不点名，按扩展名/全部已读文件认。`2>&1`、`>/dev/null`、awk 的 `NR>=1` 不算
+# 重定向写——最后那个在第一版里把两个只读 `git show | awk` 的会话算成了响 60 次。
+NAMED_WRITE = re.compile(
+    r"sed -i|gofmt -w|prettier --write|ruff format|\bblack\b|\btee\b|\bmv\b|\bcp\b|"
+    r"\bpatch\b|git apply|git checkout|git restore|(?<![0-9&<>=-])>>?(?![=&>])(?!\s*/dev/null)"
+)
+TREE_WRITES = [
+    (re.compile(r"cargo fmt|make (check|fmt)"), (".rs",)),
+    (re.compile(r"gofmt -w \.|go fmt"), (".go",)),
+    (re.compile(r"git (stash|reset --hard|checkout \.|restore \.)"), None),
+]
+
+
+def touched_reads(command: str, observed: set[str]) -> set[str]:
+    touched: set[str] = set()
+    for pattern, exts in TREE_WRITES:
+        if pattern.search(command):
+            touched |= {p for p in observed if exts is None or p.endswith(exts)}
+    if NAMED_WRITE.search(command):
+        touched |= {p for p in observed if pathlib.PurePath(p).name in command}
+    return touched
+
+
+def report_changed_reads(since: str | None) -> None:
+    """plan 197：轮次边界上"你读过的这些文件变了"会响几次、每次点几个名。
+
+    按会话回放：`read_file` 记一个已读路径；`edit_file`/`write_file` 刷新它
+    （那是 Replace，模型自己的写不算"在背后变了"）；bash 按 [`touched_reads`]
+    标脏；每条 assistant 消息之前是一个轮次边界，脏集非空就响一次、清空。
+    一个路径点过名之后，模型重读或自己写它之前不再点第二次——它手里那份印象
+    没变，再说一遍不添信息（plan 197 的"每读一次最多说一次"）。
+    读戳表不随压缩清空（它是 `ReadCoverage` 那一侧），所以这里也不清。
+    **命令文本只能猜写了什么，所以两栏都是上界**；在背后改文件的另一个进程、
+    用户的编辑器不留痕迹，这里一次也量不到。
+    """
+    sessions = fired_sessions = 0
+    fires_per_session: list[int] = []
+    names_per_fire: list[int] = []
+    for path in sorted(ROLLOUTS.glob("*/sessions/*.jsonl")):
+        if since and path.stem[:8] <= since:
+            continue
+        sessions += 1
+        observed: set[str] = set()
+        dirty: set[str] = set()
+        named: set[str] = set()
+        fires = 0
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if item.get("type") != "message":
+                continue
+            if item.get("role") == "assistant" and dirty:
+                fires += 1
+                names_per_fire.append(len(dirty))
+                named |= dirty
+                dirty.clear()
+            for block in item.get("content") or []:
+                if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                    continue
+                args = block.get("input") or {}
+                name = block.get("name")
+                target = args.get("path")
+                if name in ("read_file", "edit_file", "write_file") and isinstance(target, str):
+                    observed.add(target)
+                    dirty.discard(target)
+                    named.discard(target)
+                elif name == "bash" and isinstance(args.get("command"), str):
+                    dirty |= touched_reads(args["command"], observed) - named
+        fires_per_session.append(fires)
+        fired_sessions += fires > 0
+    if not sessions:
+        print("\n轮次边界点名: 这个切片里没有会话")
+        return
+    print(f"\n轮次边界点名（上界）: {sessions} 个会话，{fired_sessions} 个至少响一次")
+    print(f"  共响 {sum(fires_per_session)} 次，每会话 {sum(fires_per_session) / sessions:.2f} 次")
+    if names_per_fire:
+        print(f"  每会话响几次（响过的）: {percentiles([n for n in fires_per_session if n])}")
+        print(f"  每次点几个名        : {percentiles(names_per_fire)}")
+        dist = collections.Counter(names_per_fire)
+        print("  点名数分布: " + "  ".join(f"{k}:{dist[k]}" for k in sorted(dist)))
+
+
 def count_lines(text: str) -> int:
     return sum(1 for line in text.split("\n") if NUMBERED_LINE.match(line))
 
@@ -241,6 +331,11 @@ def main() -> None:
         "--overlap",
         action="store_true",
         help="按 offset/limit 算行区间，统计重读已读区间的比例（压缩边界清零）",
+    )
+    parser.add_argument(
+        "--changed-reads",
+        action="store_true",
+        help="plan 197：回放轮次边界，统计'已读文件变了'的提醒会响几次、每次点几个名",
     )
     args = parser.parse_args()
 
@@ -294,6 +389,9 @@ def main() -> None:
 
     if args.overlap:
         report_overlap(args.tool, args.since)
+
+    if args.changed_reads:
+        report_changed_reads(args.since)
 
     if args.marker:
         hit = [r for r in ok if args.marker in r[3]]

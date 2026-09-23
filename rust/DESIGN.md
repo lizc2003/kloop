@@ -1716,6 +1716,30 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   the rule, the hint had to point at the first *unread* line instead. An `old_string`
   that is nowhere in the file adds nothing to the message: that is a different failure
   with its own.
+- **A read that went stale is named at the next round boundary (Plan 197).** Plan
+  195's note only speaks when the model edits; a model that answers from a read a
+  `cargo fmt`, a `sed -i` or the user's editor has since rewritten gets no signal at
+  all. So at every round boundary, at every depth (a sub-agent has a `FileState` of
+  its own), the observations are checked against disk and the paths whose bytes
+  changed are named in a `<system-reminder>` — **names only, never content**. After
+  Plan 195 a stale read costs an edit nothing, so feeding the new bytes in ahead
+  would save no round trip; it would only buy information, priced as a whole file. A
+  line per path is what information costs, and the model decides whether to read
+  again. The criterion is `FileVersion::same_content`, the one `edit_file`'s note
+  uses, and a test asks both about the same `touch`/`chmod` so they cannot drift.
+  Cost: one stat per observation, a hash only when metadata moved (a metadata-only
+  result is remembered so the next boundary does not hash again). Each change is
+  named **once per read**: a named path is skipped until a read or a write replaces
+  its observation, because saying it twice adds nothing to what the model holds —
+  and a log file something keeps appending to would otherwise be named every
+  round. Changes the model made itself through `bash` are named too; its own
+  `edit_file`/`write_file` refresh the observation and are not. A deleted path is
+  named as deleted. Past 10 names the list becomes a count — measured, see
+  `CHANGED_READS_NAMED_MAX`. The reminder is recorded as a user message of its own
+  at the end of history, the same place and shape as Plan 190's todo reminder. It
+  cannot ride a tool result the way the reread advisory does, because it belongs to
+  none: it is about what happened between two rounds. As a plain message it needs no
+  new rollout item, and replay and resume show it where the model saw it.
 - Mutation preflight binds either the existing direct parent or the nearest existing
   ancestor after pre-hooks but before permission. Original spelling and the frozen
   effective target both reach the gate; approval itself has no directory side

@@ -107,3 +107,64 @@
 
 1. **形状 1/2/3 选哪个**(第三节)。这是唯一挡住开工的点——它决定要不要动 rollout。
 2. 点不点名"模型自己造成的改动"(第四节第一条)。倾向点名。
+
+## 七、开工时定的两个点(2026-09-23,问过用户)
+
+1. **形状 2**,用户「可以,按 2」。问之前先查到一条 plan 里没写的事实,它把这个问题改小了:
+   **形状 2 在仓库里已经有先例,而且不改 rollout 格式**——plan 190 的 todo 提醒
+   (`agent.rs` 的 `remind_todos`)就是在轮次边界 `history.record(Message::user_text(..))`,
+   rollout 里它只是一条普通 message,replay/resume 原样复现。第三节说的"改 rollout 的内容、
+   有兼容面"不成立:不需要新的条目类型。
+2. **点名模型自己造成的改动**,用户「可以,点名」。区分"谁改的"要给每条 bash 命令记它碰过
+   哪些路径,做不准;而它知道自己跑了 fmt,不知道自己读过的哪些文件被动了。
+
+## 八、✅ 完成(2026-09-23)
+
+`make check` 全绿(fmt + clippy + 全部测试)。
+
+### 重切的数(第一节要求的"开工第一件事")
+
+`scripts/tool-usage.py` 加了 `--changed-reads`:按会话回放,`read_file` 记已读、
+`edit_file`/`write_file` 刷新(模型自己的写不算在背后变)、bash 按命令文本标脏,每条 assistant
+消息前是一个轮次边界。**按 plan 195 落地日切**(`--since 20260922`):只剩 **9 个会话**,响 4 次、
+每次点 1 个名——**样本太薄,定不了常量**,所以常量用全量语料定,并照实写明它横跨 195 前后。
+这个回放测的是"提醒会响几次",不依赖 stale 是拒绝还是提示,所以跨 195 的语料对它没有第一节
+担心的那种污染(那种污染咬的是"stale 拒绝 7 次"那一栏)。
+
+| 口径(全量 191 会话) | 响几次 | 每会话 | 每次点几个名 |
+|---|---|---|---|
+| 第一版正则 | 162 | 0.85 | 中位 1,p90 9,max 30 |
+| 修掉 awk `NR>=1` 被当成重定向 | 91 | 0.48 | 中位 2,p90 9,max 30 |
+| **加"每读一次最多说一次"(落地规则)** | **68** | **0.36** | **中位 1,p90 4,max 23** |
+
+- 第一版有两个会话各"响" 30–60 次,全是只读的 `git show X:path | awk 'NR>=1 …'`——
+  **看分布之前先看最大的那几个会话**,这次一眼就是假阳性。
+- 第一节的"245"是**事件数**,这里的 68 是**提醒数**(同一轮多个事件合成一次、点过名的不再点),
+  两个数不是一回事,和 plan 151 的"234 次重叠 → 15 次提醒"同形。
+- **每次点名上限 `CHANGED_READS_NAMED_MAX = 10`**:68 次里 66 次 ≤ 8 个名,另两次 21/23 个
+  (整棵树格式化),8–20 之间任取一个值切掉的都恰好是这两次。**不设每会话上限**:最坏的会话
+  11 次、每次一两行,总共几百 token。
+
+### 与第三节的形状差异
+
+- **"每读一次最多说一次"是落地时加的**,第三节没写。点过名的路径在模型重读或自己写它之前
+  **连 stat 都不做**;否则一个被持续追加的日志文件每轮都会被点名,而模型手里那份印象根本没变。
+  实现是 `FileState` 的每个条目挂一个 `DiskCheck`(`Unchecked` / `SameContent(version)` /
+  `Named`),**挂在条目上而不是 observation 上**,于是任何替换 observation 的读或写自动重新武装它。
+- `SameContent` 记下 `touch`/`chmod` 之后那次 hash 的 metadata,下一轮 metadata 不动就不再 hash。
+  **没有去改 observation 自己的 version**——那会改掉 `edit_file` 提交前 CAS 比的东西(plan 195 的
+  唯一新鲜度守卫)。
+- 文件被删了也点名,标 `(deleted)`;其他 IO 错误(权限、写到一半)不说话,下一轮再看。
+- IO 在锁外做;回写前核对 observation 没被替换过,被替换了就不动(新的那份是更新的印象,没被查过)。
+- **每个 depth 都做**:子 agent 有自己的 `FileState` 和自己的 history。
+- 路径按 workspace cwd 显示相对路径(observation 的键是 canonical 的,cwd 两种形式都试)。
+
+### 测试
+
+| 测试 | 锁住什么 |
+|---|---|
+| `names_the_changed_read_alone_without_its_content_and_only_once_per_read` | **第五节第一条**:读 A、B → 外部改 A → 提示整串等于"只点名 A",不含 A 的新旧内容;下一轮安静;再改 A 仍安静;重读 A 之后再改才再点名 |
+| `a_metadata_bump_is_silent_at_the_boundary_and_on_edit_file_alike` | **第五节第二条**:同一次 `chmod` + 改 mtime,轮次边界与 `edit_file` 都一个字不多;随后真改内容,两处都说话。把边界处的比较临时换成整个 version 相等,这条测试会挂(已验证) |
+| `a_bash_write_is_named_an_edit_is_not_and_a_deletion_says_so` | 模型自己的 bash 写点名、自己的 `edit_file` 不点名、删除标 `(deleted)` |
+| `a_long_list_is_cut_to_the_measured_cap_and_counted` | **第五节第三条**:12 个文件变了 → 前 10 个 + `and 2 more` |
+| `a_changed_read_is_named_between_rounds_and_replays_in_place` | **第五节第四条**:真实 `run_turn`(读 → bash 改 → 回答),提示是一条独立 user 消息,夹在 bash 那轮的 tool_result 与回答之间;`load_session_snapshot` 与 `resume_session` 读回的 messages 与内存 history 整体相等 |
