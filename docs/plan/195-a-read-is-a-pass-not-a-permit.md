@@ -275,6 +275,24 @@ plan 57 第 77 行写的"validation/parse/target/serialize/commit 失败……**
   "the tool will likely reject it — the schema validation fails … Let me try",它预期被拒;
   省下的就是那一个往返。
 
-真实 API 验不到的两条,仍然只有单测:`write_file`/`notebook_edit` 对同一场景仍然拒绝,以及
-写入 CAS 的提交窗口(**定义上**就没有外部办法在 kloop 读完字节到 rename 之间插进去,只能靠
-注入的 `CommitFault`)。
+第二轮补了"本条不跨的那条线"(同一个 provider,2026-09-23):
+
+| 场景 | 工具返回 | 状态 |
+|---|---|---|
+| 读全文 → `sed` 改第 1 行 → `write_file` 整体覆写 | `write_file: w.txt changed since it was read; read it again before modifying it` | failed |
+| **原封不动再试一次** | 同上,**逐字一致** | failed |
+| 读 notebook → `notebook_edit` 用不存在的 `cell_id` | `Cell with ID "nope" not found in notebook.` | failed |
+| **紧接上一格**,换成真实的 `cell_id` | `Updated cell c1 with x = 42` | **completed** |
+| `sed` 改另一个 cell → 再编辑原来那个 cell | `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.` | failed |
+
+第一、二格是守卫的上半:`write_file` 照旧拒绝,而**第二次的措辞与第一次逐字相同**——读戳要是
+被第一次失败清掉了,第二次会退化成 `must read the entire file`。第四格是 plan 57 那条"失败
+保守清除旧资格"被翻掉的实证:改之前它会报 `File has not been read yet`,一个写错的 `cell_id`
+连带损失整张 notebook 资格。第五格是守卫的下半。
+
+于是真实 API 验不到的只剩一条,仍然只有单测:写入 CAS 的提交窗口——**定义上**就没有外部办法
+在 kloop 读完字节到 rename 之间插进去,只能靠注入的 `CommitFault`。
+
+**过程中撞到一个与本条无关的 kloop 缺陷**,见 HANDOFF 教训 182:`--headless` 在 stdin 是
+"打开着但永不 EOF 的非 tty"(这里是一个 unix socket)时会无限阻塞,吊死在第一次采样之前,
+没有超时也没有任何诊断输出。这一轮最初卡了 2 小时 25 分才发现,`< /dev/null` 一加就通。
