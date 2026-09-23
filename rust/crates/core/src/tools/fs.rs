@@ -3133,6 +3133,39 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The mirror of the missing-argument refusal: an allow-list already names the
+    /// key it refused, which left the model to guess the one it should have used.
+    /// `path` never reaches here any more — the synonym rename turns it into
+    /// `notebook_path` first — so what does reach it is a name nobody uses, and
+    /// that is exactly when the accepted set is worth printing.
+    #[tokio::test]
+    async fn an_unexpected_notebook_field_names_what_is_accepted() {
+        let notebook = r#"{"cells":[{"cell_type":"code","id":"c1","source":["x = 1"],"metadata":{},"outputs":[],"execution_count":null}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
+        let path = temp_file("notebook-field.ipynb", notebook);
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "notebook-field");
+        observe_whole(&path, &ctx).await;
+
+        let (out, is_error) = run_tool(
+            "notebook_edit",
+            json!({"notebook_path": target, "cell_id": "c1", "source": "x = 2"}),
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            (out, is_error),
+            (
+                "notebook_edit: unexpected input field \"source\"; accepted: \
+                 notebook_path, cell_id, new_source, cell_type, edit_mode"
+                    .to_string(),
+                true
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), notebook);
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The reason the rename happens at the dispatch seam and not inside the tool:
     /// a path that arrived as `file_path` has to be the path the gate matches its
     /// rules against. Renaming after the gate would hand it a call with no path in

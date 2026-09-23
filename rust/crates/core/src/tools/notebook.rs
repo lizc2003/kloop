@@ -224,6 +224,9 @@ fn bound_text_blocks(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, bool) {
     (visible, truncated)
 }
 
+/// How much of a refused field name the message echoes back.
+const MAX_FIELD_DIAGNOSTIC_BYTES: usize = 40;
+
 pub(super) fn request_from_input(input: &Value) -> Result<NotebookEditRequest> {
     let object = input
         .as_object()
@@ -236,7 +239,14 @@ pub(super) fn request_from_input(input: &Value) -> Result<NotebookEditRequest> {
         "edit_mode",
     ];
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        bail!("notebook_edit: unexpected input field {key:?}");
+        // Name what is accepted, not just what was refused. An allow-list already
+        // points at the offending key, which leaves the model to guess the one it
+        // should have used — the mirror image of the gap a missing-argument
+        // refusal had, where the wanted name was there and the sent one was not.
+        // Keys are model-supplied, so the echo is sanitized and capped.
+        let key = super::agent_message::bounded_diagnostic(key, MAX_FIELD_DIAGNOSTIC_BYTES);
+        let accepted = allowed.join(", ");
+        bail!("notebook_edit: unexpected input field \"{key}\"; accepted: {accepted}");
     }
     let new_source = input["new_source"]
         .as_str()
