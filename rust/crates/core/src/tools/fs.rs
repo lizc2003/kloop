@@ -13,9 +13,21 @@ use anyhow::bail;
 use kloop_protocol::ToolResultContent;
 use serde_json::Value;
 
+// One interface, three implementations, selected here and nowhere else: past this
+// point the file has no `#[cfg]` left. `platform` holds descriptor-relative opens,
+// the identity and hard-link probes, and the temp/rename primitives; everything
+// below is what the tools mean.
+#[cfg(unix)]
+#[path = "fs/unix.rs"]
+mod platform;
 #[cfg(windows)]
 #[path = "fs/windows.rs"]
-mod windows;
+mod platform;
+#[cfg(not(any(unix, windows)))]
+#[path = "fs/fallback.rs"]
+mod platform;
+
+use platform::*;
 
 use super::ToolCtx;
 use super::notebook;
@@ -257,55 +269,6 @@ impl PreparedRead {
     pub(super) fn into_parts(self) -> (PathBuf, std::fs::File) {
         (self.path, self.file)
     }
-}
-
-#[cfg(unix)]
-fn open_read_target(
-    parent: &std::fs::File,
-    _parent_path: &Path,
-    leaf: &OsStr,
-    display_path: &str,
-) -> Result<std::fs::File> {
-    use rustix::fs::Mode;
-    use rustix::fs::OFlags;
-
-    let fd = rustix::fs::openat(
-        parent,
-        leaf,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .with_context(|| format!("read_file: cannot read {display_path}"))?;
-    let file = std::fs::File::from(fd);
-    if !file
-        .metadata()
-        .with_context(|| format!("read_file: cannot inspect {display_path}"))?
-        .is_file()
-    {
-        bail!("read_file: cannot read {display_path}: not a regular file");
-    }
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn open_read_target(
-    parent: &std::fs::File,
-    _parent_path: &Path,
-    leaf: &OsStr,
-    display_path: &str,
-) -> Result<std::fs::File> {
-    windows::open_child_regular_file(parent, leaf)?
-        .with_context(|| format!("read_file: cannot read {display_path}"))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_read_target(
-    _parent: &std::fs::File,
-    _parent_path: &Path,
-    _leaf: &OsStr,
-    _display_path: &str,
-) -> Result<std::fs::File> {
-    bail!("safe file reads are unsupported on this platform")
 }
 
 /// read_file reads any file the model points at — text or image (cc's Read is
@@ -880,15 +843,7 @@ fn validate_component_name(component: &OsStr, tool: &str, display_path: &str) ->
     {
         bail!("{tool}: invalid path component in {display_path}");
     }
-    #[cfg(windows)]
-    {
-        let value = component.to_str().with_context(|| {
-            format!("{tool}: path component is not valid Unicode in {display_path}")
-        })?;
-        if value.contains(['/', '\\', ':']) || value.ends_with(['.', ' ']) {
-            bail!("{tool}: unsafe Windows path component in {display_path}");
-        }
-    }
+    reject_unsafe_component(component, tool, display_path)?;
     Ok(component.to_os_string())
 }
 
@@ -1009,181 +964,6 @@ fn materialize_parent(
         parent = child;
     }
     Ok((parent, created))
-}
-
-#[cfg(windows)]
-fn cleanup_created_directories(mut created: Vec<CreatedDirectory>) {
-    while let Some(created) = created.pop() {
-        let _ = remove_created_directory(created);
-    }
-}
-
-#[cfg(not(windows))]
-fn cleanup_created_directories(created: Vec<CreatedDirectory>) {
-    // POSIX has no portable handle-bound rmdir: checking the retained inode and
-    // then unlinking a name leaves a swap window that could delete a replacement.
-    // Conservatively retain the empty directories rather than touch an unbound name.
-    for CreatedDirectory {
-        parent,
-        name,
-        directory,
-        identity,
-    } in created
-    {
-        drop((parent, name, directory, identity));
-    }
-}
-
-#[cfg(unix)]
-fn open_or_create_child_directory(
-    parent: &std::fs::File,
-    name: &OsStr,
-    tool: &str,
-    display_path: &str,
-) -> Result<(std::fs::File, bool)> {
-    use rustix::fs::Mode;
-
-    let mode = Mode::RUSR
-        | Mode::WUSR
-        | Mode::XUSR
-        | Mode::RGRP
-        | Mode::WGRP
-        | Mode::XGRP
-        | Mode::ROTH
-        | Mode::WOTH
-        | Mode::XOTH;
-    let created = match rustix::fs::mkdirat(parent, name, mode) {
-        Ok(()) => true,
-        Err(rustix::io::Errno::EXIST) => false,
-        Err(error) => {
-            return Err(std::io::Error::from_raw_os_error(error.raw_os_error())).with_context(
-                || format!("{tool}: cannot create parent directory for {display_path}"),
-            );
-        }
-    };
-    let child = open_child_directory(parent, name, tool, display_path)?;
-    Ok((child, created))
-}
-
-#[cfg(unix)]
-fn open_child_directory(
-    parent: &std::fs::File,
-    name: &OsStr,
-    tool: &str,
-    display_path: &str,
-) -> Result<std::fs::File> {
-    use rustix::fs::Mode;
-    use rustix::fs::OFlags;
-
-    let fd = rustix::fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .with_context(|| {
-        format!("{tool}: parent component is not a safe directory for {display_path}")
-    })?;
-    Ok(std::fs::File::from(fd))
-}
-
-#[cfg(windows)]
-fn open_or_create_child_directory(
-    parent: &std::fs::File,
-    name: &OsStr,
-    tool: &str,
-    display_path: &str,
-) -> Result<(std::fs::File, bool)> {
-    windows::open_or_create_child_directory(parent, name)
-        .with_context(|| format!("{tool}: cannot create parent directory for {display_path}"))
-}
-
-#[cfg(windows)]
-fn remove_created_directory(created: CreatedDirectory) -> Result<()> {
-    let CreatedDirectory {
-        parent,
-        name,
-        directory,
-        identity,
-    } = created;
-    if file_identity(&directory)? != identity {
-        bail!("created directory identity changed before cleanup");
-    }
-    drop(directory);
-    windows::remove_created_directory(&parent, &name, identity)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_or_create_child_directory(
-    _parent: &std::fs::File,
-    _name: &OsStr,
-    _tool: &str,
-    _display_path: &str,
-) -> Result<(std::fs::File, bool)> {
-    bail!("safe recursive file mutation is unsupported on this platform")
-}
-
-#[cfg(unix)]
-fn open_parent_directory(path: &Path, tool: &str, display_path: &str) -> Result<std::fs::File> {
-    use rustix::fs::Mode;
-    use rustix::fs::OFlags;
-
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .with_context(|| format!("{tool}: cannot open parent directory for {display_path}"))?;
-    Ok(std::fs::File::from(fd))
-}
-
-#[cfg(windows)]
-fn open_parent_directory(path: &Path, tool: &str, display_path: &str) -> Result<std::fs::File> {
-    windows::open_directory_absolute(path)
-        .with_context(|| format!("{tool}: cannot open parent directory for {display_path}"))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_parent_directory(_path: &Path, _tool: &str, _display_path: &str) -> Result<std::fs::File> {
-    bail!("safe file mutation is unsupported on this platform")
-}
-
-#[cfg(unix)]
-fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    Ok(file.metadata()?.nlink() > 1)
-}
-
-#[cfg(windows)]
-fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
-    windows::has_multiple_hard_links(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn has_multiple_hard_links(_file: &std::fs::File) -> Result<bool> {
-    Ok(false)
-}
-
-#[cfg(unix)]
-fn file_identity(file: &std::fs::File) -> Result<FileIdentity> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = file.metadata()?;
-    Ok(FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn file_identity(file: &std::fs::File) -> Result<FileIdentity> {
-    windows::file_identity(file)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn file_identity(_file: &std::fs::File) -> Result<FileIdentity> {
-    bail!("safe file mutation is unsupported on this platform")
 }
 
 /// Whether the path still holds a file the session's read can describe.
@@ -1562,73 +1342,6 @@ fn validate_observation_version(
     Ok(())
 }
 
-#[cfg(unix)]
-fn open_regular_target(
-    parent: &std::fs::File,
-    _parent_path: &Path,
-    leaf: &OsStr,
-    tool: &str,
-    display_path: &str,
-) -> Result<Option<TargetFile>> {
-    use rustix::fs::Mode;
-    use rustix::fs::OFlags;
-
-    let fd = match rustix::fs::openat(
-        parent,
-        leaf,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(rustix::io::Errno::LOOP) => {
-            bail!("{tool}: refuses to replace symbolic link {display_path}")
-        }
-        Err(error) => {
-            return Err(std::io::Error::from_raw_os_error(error.raw_os_error()))
-                .with_context(|| format!("{tool}: cannot inspect {display_path}"));
-        }
-    };
-    let file = std::fs::File::from(fd);
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
-    if !metadata.is_file() {
-        bail!("{tool}: {display_path} is not a regular file");
-    }
-    Ok(Some(TargetFile { file, metadata }))
-}
-
-#[cfg(windows)]
-fn open_regular_target(
-    parent: &std::fs::File,
-    _parent_path: &Path,
-    leaf: &OsStr,
-    tool: &str,
-    display_path: &str,
-) -> Result<Option<TargetFile>> {
-    let file = windows::open_child_regular_file(parent, leaf)
-        .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
-    file.map(|file| {
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
-        Ok(TargetFile { file, metadata })
-    })
-    .transpose()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_regular_target(
-    _parent: &std::fs::File,
-    _parent_path: &Path,
-    _leaf: &OsStr,
-    _tool: &str,
-    _display_path: &str,
-) -> Result<Option<TargetFile>> {
-    bail!("safe file mutation is unsupported on this platform")
-}
-
 /// One unused `.kloop-write-*` name in the target directory. The pid keeps two
 /// kloop processes apart; the counter keeps two threads of one process apart.
 fn temp_name() -> OsString {
@@ -1639,77 +1352,13 @@ fn temp_name() -> OsString {
     ))
 }
 
-/// Create `name` under `parent`, failing if it already exists. The caller
-/// retries on [`std::io::ErrorKind::AlreadyExists`] and on nothing else, so the
-/// error has to survive the round trip as an `io::Error`.
-#[cfg(unix)]
-fn create_temp(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
-    use rustix::fs::Mode;
-    use rustix::fs::OFlags;
-
-    let fd = rustix::fs::openat(
-        parent,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
-    )
-    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-    Ok(std::fs::File::from(fd))
-}
-
-#[cfg(windows)]
-fn create_temp(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
-    windows::create_temp_file(parent, name)
-}
-
-/// Move the temp file onto `leaf`, both relative to `parent`.
-///
-/// `replace_existing` is the one genuine difference between the platforms:
-/// Windows has to be told, while `renameat` always replaces — there is no
-/// portable non-replacing rename, so unix answers the question by ignoring it.
-#[cfg(unix)]
-fn commit_rename(
-    _temp: &std::fs::File,
-    parent: &std::fs::File,
-    name: &OsStr,
-    leaf: &OsStr,
-    _replace_existing: bool,
-) -> Result<()> {
-    rustix::fs::renameat(parent, name, parent, leaf)
-        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()).into())
-}
-
-#[cfg(windows)]
-fn commit_rename(
-    temp: &std::fs::File,
-    parent: &std::fs::File,
-    _name: &OsStr,
-    leaf: &OsStr,
-    replace_existing: bool,
-) -> Result<()> {
-    windows::rename_file_relative(temp, parent, leaf, replace_existing)
-}
-
-/// Best effort removal of a temp file a failed commit left behind. unix drops
-/// the name, Windows drops the open handle; both are unreachable from anywhere
-/// else, so a failure here has nothing left to report to.
-#[cfg(unix)]
-fn discard_temp(_temp: &std::fs::File, parent: &std::fs::File, name: &OsStr) {
-    let _ = rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty());
-}
-
-#[cfg(windows)]
-fn discard_temp(temp: &std::fs::File, _parent: &std::fs::File, _name: &OsStr) {
-    let _ = windows::delete_file_handle(temp);
-}
-
 /// Rebind `name` to a different file while the caller's handle stays open on
 /// the original — the race `verify_temp_binding` exists to catch. Staged with a
 /// rename rather than unlink + create because Windows cannot unlink a name
 /// whose file is still open, and the check being exercised has one copy now, so
 /// the injection that exercises it has to reach both platforms. The new file
 /// comes back so the failure path can drop it the same way on both.
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(test)]
 fn rebind_temp_name(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
     let decoy_name = temp_name();
     let mut decoy = create_temp(parent, &decoy_name)?;
@@ -1726,14 +1375,12 @@ fn rebind_temp_name(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::Fil
 
 /// Did the platform refuse because that temp name is already taken? The retry
 /// loop turns on this and nothing else.
-#[cfg(any(unix, windows))]
 fn is_name_collision(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
 }
 
-#[cfg(any(unix, windows))]
 fn atomic_replace(
     target: CommitTarget<'_>,
     bytes: &[u8],
@@ -1838,17 +1485,6 @@ fn atomic_replace(
     .with_context(|| format!("{tool}: cannot create temporary file for {display_path}"))
 }
 
-#[cfg(not(any(unix, windows)))]
-fn atomic_replace(
-    _target: CommitTarget<'_>,
-    _bytes: &[u8],
-    _permissions: Option<std::fs::Permissions>,
-    _expected_target: Option<&ExpectedTarget>,
-    _fault: CommitFault,
-) -> Result<()> {
-    bail!("safe file mutation is unsupported on this platform")
-}
-
 /// What [`CommitFault::ChangeTargetBeforeRename`] leaves at the target, so a
 /// test can tell an injected change apart from the edit it interrupted.
 #[cfg(test)]
@@ -1908,24 +1544,6 @@ fn verify_temp_binding(
         bail!("{tool}: temporary file changed before replacing {display_path}; retry the call");
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn sync_parent(parent: &std::fs::File, tool: &str, display_path: &str) -> Result<()> {
-    parent
-        .sync_all()
-        .with_context(|| format!("{tool}: cannot sync parent directory for {display_path}"))
-}
-
-#[cfg(windows)]
-fn sync_parent(parent: &std::fs::File, _tool: &str, _display_path: &str) -> Result<()> {
-    let _ = parent.sync_all();
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_parent(_parent: &std::fs::File, _tool: &str, _display_path: &str) -> Result<()> {
-    bail!("safe file mutation is unsupported on this platform")
 }
 
 #[cfg(test)]

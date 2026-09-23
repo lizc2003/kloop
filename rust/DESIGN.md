@@ -4135,7 +4135,14 @@ crates/core/        kloop-core — the agent, network-free
     bash.rs         foreground + background Bash execution, the
                     BackgroundShells registry, bash_output/stop_bash
     powershell.rs   foreground-only fixed EncodedCommand PowerShell executor
-    fs.rs           read/write/edit file
+    fs.rs           read/write/edit file: what the tools mean — input parsing,
+                    the mutation/commit pipeline, read qualification, paging.
+                    Its only `#[cfg]` is the platform `mod` below
+    fs/unix.rs      openat/NOFOLLOW opens, dev+inode identity, nlink, renameat
+    fs/windows.rs   NtCreateFile below a retained handle, volume+128-bit file id,
+                    FileRenameInformationEx, and the name rules only Windows has
+    fs/fallback.rs  every platform primitive refused, so the pipeline above needs
+                    no branch of its own
     web.rs          web_fetch/web_search agent contracts: names, descriptions,
                     input schemas (network execution stays in kloop-web)
     search.rs       grep/glob on the ripgrep crate family (gitignore-aware

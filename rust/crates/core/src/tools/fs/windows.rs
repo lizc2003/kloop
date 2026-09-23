@@ -3,6 +3,7 @@ use std::mem::offset_of;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::os::windows::io::FromRawHandle as _;
+use std::path::Path;
 use std::ptr;
 
 use anyhow::Context as _;
@@ -54,6 +55,7 @@ use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 
+use super::*;
 use crate::file_state::FileIdentity;
 
 const FILE_OPENED_RESULT: usize = 1;
@@ -113,7 +115,7 @@ pub(super) fn open_child_regular_file(
     Ok(Some(opened.0))
 }
 
-pub(super) fn open_or_create_child_directory(
+pub(super) fn create_or_open_directory_handle(
     parent: &std::fs::File,
     name: &OsStr,
 ) -> Result<(std::fs::File, bool)> {
@@ -230,7 +232,7 @@ pub(super) fn delete_file_handle(file: &std::fs::File) -> Result<()> {
     set_delete_disposition(file)
 }
 
-pub(super) fn remove_created_directory(
+pub(super) fn remove_directory_by_identity(
     parent: &std::fs::File,
     name: &OsStr,
     expected: FileIdentity,
@@ -402,6 +404,114 @@ unsafe fn file_from_handle(handle: HANDLE) -> std::fs::File {
     unsafe { std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void) }
 }
 
+pub(super) fn open_read_target(
+    parent: &std::fs::File,
+    _parent_path: &Path,
+    leaf: &OsStr,
+    display_path: &str,
+) -> Result<std::fs::File> {
+    open_child_regular_file(parent, leaf)?
+        .with_context(|| format!("read_file: cannot read {display_path}"))
+}
+
+pub(super) fn cleanup_created_directories(mut created: Vec<CreatedDirectory>) {
+    while let Some(created) = created.pop() {
+        let _ = remove_created_directory(created);
+    }
+}
+
+pub(super) fn open_or_create_child_directory(
+    parent: &std::fs::File,
+    name: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<(std::fs::File, bool)> {
+    create_or_open_directory_handle(parent, name)
+        .with_context(|| format!("{tool}: cannot create parent directory for {display_path}"))
+}
+
+pub(super) fn remove_created_directory(created: CreatedDirectory) -> Result<()> {
+    let CreatedDirectory {
+        parent,
+        name,
+        directory,
+        identity,
+    } = created;
+    if file_identity(&directory)? != identity {
+        bail!("created directory identity changed before cleanup");
+    }
+    drop(directory);
+    remove_directory_by_identity(&parent, &name, identity)
+}
+
+pub(super) fn open_parent_directory(
+    path: &Path,
+    tool: &str,
+    display_path: &str,
+) -> Result<std::fs::File> {
+    open_directory_absolute(path)
+        .with_context(|| format!("{tool}: cannot open parent directory for {display_path}"))
+}
+
+pub(super) fn open_regular_target(
+    parent: &std::fs::File,
+    _parent_path: &Path,
+    leaf: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<Option<TargetFile>> {
+    let file = open_child_regular_file(parent, leaf)
+        .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
+    file.map(|file| {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("{tool}: cannot inspect {display_path}"))?;
+        Ok(TargetFile { file, metadata })
+    })
+    .transpose()
+}
+
+pub(super) fn create_temp(parent: &std::fs::File, name: &OsStr) -> Result<std::fs::File> {
+    create_temp_file(parent, name)
+}
+
+pub(super) fn commit_rename(
+    temp: &std::fs::File,
+    parent: &std::fs::File,
+    _name: &OsStr,
+    leaf: &OsStr,
+    replace_existing: bool,
+) -> Result<()> {
+    rename_file_relative(temp, parent, leaf, replace_existing)
+}
+
+pub(super) fn discard_temp(temp: &std::fs::File, _parent: &std::fs::File, _name: &OsStr) {
+    let _ = delete_file_handle(temp);
+}
+
+pub(super) fn sync_parent(parent: &std::fs::File, _tool: &str, _display_path: &str) -> Result<()> {
+    let _ = parent.sync_all();
+    Ok(())
+}
+
+/// The name rules only Windows has: a component must be Unicode, must not smuggle
+/// a separator or a drive marker, and must not end in a dot or a space — a
+/// trailing one is silently trimmed by the filesystem, so it would resolve to a
+/// name other than the one that was checked.
+pub(super) fn reject_unsafe_component(
+    component: &OsStr,
+    tool: &str,
+    display_path: &str,
+) -> Result<()> {
+    let value = component.to_str().with_context(|| {
+        format!("{tool}: path component is not valid Unicode in {display_path}")
+    })?;
+    if value.contains(['/', '\\', ':']) || value.ends_with(['.', ' ']) {
+        bail!("{tool}: unsafe Windows path component in {display_path}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,14 +530,14 @@ mod tests {
         let root = temp_root("relative");
         let root_handle = open_directory_absolute(&root).unwrap();
         let (directory, created) =
-            open_or_create_child_directory(&root_handle, OsStr::new("nested")).unwrap();
+            create_or_open_directory_handle(&root_handle, OsStr::new("nested")).unwrap();
         assert!(created);
         let first_identity = file_identity(&directory).unwrap();
         let root_identity = file_identity(&root_handle).unwrap();
         assert_eq!(first_identity.volume, root_identity.volume);
         assert_ne!(first_identity.file_id, root_identity.file_id);
         let (reopened, created) =
-            open_or_create_child_directory(&root_handle, OsStr::new("NESTED")).unwrap();
+            create_or_open_directory_handle(&root_handle, OsStr::new("NESTED")).unwrap();
         assert!(!created);
         assert_eq!(file_identity(&reopened).unwrap(), first_identity);
         drop(reopened);
@@ -501,7 +611,7 @@ mod tests {
         let root = temp_root("retarget");
         let root_handle = open_directory_absolute(&root).unwrap();
         let (directory, created) =
-            open_or_create_child_directory(&root_handle, OsStr::new("nested")).unwrap();
+            create_or_open_directory_handle(&root_handle, OsStr::new("nested")).unwrap();
         assert!(created);
         let nested = std::fs::canonicalize(root.join("nested")).unwrap();
         let identity = file_identity(&directory).unwrap();
@@ -530,7 +640,7 @@ mod tests {
         let root = temp_root("cleanup-replacement");
         let root_handle = open_directory_absolute(&root).unwrap();
         let (directory, created) =
-            open_or_create_child_directory(&root_handle, OsStr::new("nested")).unwrap();
+            create_or_open_directory_handle(&root_handle, OsStr::new("nested")).unwrap();
         assert!(created);
         let identity = file_identity(&directory).unwrap();
         drop(directory);
@@ -538,13 +648,13 @@ mod tests {
         std::fs::rename(root.join("nested"), root.join("moved")).unwrap();
         std::fs::create_dir(root.join("nested")).unwrap();
         let error =
-            remove_created_directory(&root_handle, OsStr::new("nested"), identity).unwrap_err();
+            remove_directory_by_identity(&root_handle, OsStr::new("nested"), identity).unwrap_err();
         assert!(error.to_string().contains("name changed"), "{error:#}");
         assert!(root.join("nested").is_dir());
         assert!(root.join("moved").is_dir());
 
         std::fs::remove_dir(root.join("nested")).unwrap();
-        remove_created_directory(&root_handle, OsStr::new("moved"), identity).unwrap();
+        remove_directory_by_identity(&root_handle, OsStr::new("moved"), identity).unwrap();
         assert!(!root.join("moved").exists());
         drop(root_handle);
         let _ = std::fs::remove_dir_all(root);
@@ -555,15 +665,17 @@ mod tests {
         let root = temp_root("cleanup");
         let root_handle = open_directory_absolute(&root).unwrap();
         let (directory, created) =
-            open_or_create_child_directory(&root_handle, OsStr::new("nested")).unwrap();
+            create_or_open_directory_handle(&root_handle, OsStr::new("nested")).unwrap();
         assert!(created);
         let identity = file_identity(&directory).unwrap();
         std::fs::write(root.join("nested/blocker"), b"keep").unwrap();
         drop(directory);
-        assert!(remove_created_directory(&root_handle, OsStr::new("nested"), identity).is_err());
+        assert!(
+            remove_directory_by_identity(&root_handle, OsStr::new("nested"), identity).is_err()
+        );
         assert!(root.join("nested/blocker").exists());
         std::fs::remove_file(root.join("nested/blocker")).unwrap();
-        remove_created_directory(&root_handle, OsStr::new("nested"), identity).unwrap();
+        remove_directory_by_identity(&root_handle, OsStr::new("nested"), identity).unwrap();
         assert!(!root.join("nested").exists());
         drop(root_handle);
         let _ = std::fs::remove_dir_all(root);
@@ -574,11 +686,11 @@ mod tests {
         let root = temp_root("nested-cleanup");
         let root_handle = open_directory_absolute(&root).unwrap();
         let (first, created) =
-            open_or_create_child_directory(&root_handle, OsStr::new("a")).unwrap();
+            create_or_open_directory_handle(&root_handle, OsStr::new("a")).unwrap();
         assert!(created);
         let first_identity = file_identity(&first).unwrap();
         let first_cleanup = first.try_clone().unwrap();
-        let (second, created) = open_or_create_child_directory(&first, OsStr::new("b")).unwrap();
+        let (second, created) = create_or_open_directory_handle(&first, OsStr::new("b")).unwrap();
         assert!(created);
         let second_identity = file_identity(&second).unwrap();
         let second_cleanup = second.try_clone().unwrap();
@@ -586,11 +698,11 @@ mod tests {
         drop(second);
         assert_eq!(file_identity(&second_cleanup).unwrap(), second_identity);
         drop(second_cleanup);
-        remove_created_directory(&first, OsStr::new("b"), second_identity).unwrap();
+        remove_directory_by_identity(&first, OsStr::new("b"), second_identity).unwrap();
         drop(first);
         assert_eq!(file_identity(&first_cleanup).unwrap(), first_identity);
         drop(first_cleanup);
-        remove_created_directory(&root_handle, OsStr::new("a"), first_identity).unwrap();
+        remove_directory_by_identity(&root_handle, OsStr::new("a"), first_identity).unwrap();
         assert!(!root.join("a").exists());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -616,7 +728,7 @@ mod tests {
         assert!(error.to_string().contains("reparse"), "{error:#}");
         let root_handle = open_directory_absolute(&root).unwrap();
         let error =
-            open_or_create_child_directory(&root_handle, OsStr::new("junction")).unwrap_err();
+            create_or_open_directory_handle(&root_handle, OsStr::new("junction")).unwrap_err();
         assert!(error.to_string().contains("reparse"), "{error:#}");
         drop(root_handle);
         let _ = std::fs::remove_dir_all(junction);
