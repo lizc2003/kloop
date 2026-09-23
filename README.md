@@ -87,7 +87,3 @@ that same file; the full field reference is
 
 `make help` lists every build target (`make check` = fmt + clippy + test, the three
 commands to run before every commit).
-
-## License
-
-[Apache-2.0](LICENSE), Copyright 2026 lizc2003@gmail.com.
