@@ -30,12 +30,17 @@ fn main() {
     }
 }
 
-/// The files that change when HEAD moves. Missing paths are dropped: Cargo
-/// treats a path it cannot stat as always-dirty, which would re-run this script
-/// on every build. Dropping them is safe because the two states swap together —
-/// `git gc` packs `refs/heads/main` away, and that file's disappearance is
-/// itself a change to a path we are watching, so the next run picks up
-/// `packed-refs` instead.
+/// The paths that change when HEAD moves. A path Cargo cannot stat counts as
+/// always dirty, which would re-run this script on every build, so a missing
+/// one is never handed over as is.
+///
+/// The branch ref flips between two states and both directions must be seen.
+/// Loose → packed (`git gc`): the file we watch disappears, which is a change.
+/// Packed → loose (the next commit after a pack): a file appears that nobody
+/// was watching, and `packed-refs` does not move. Dropping the missing ref here
+/// once froze the stamp for 63 commits. So a missing ref is watched through its
+/// nearest existing directory instead — Cargo scans a directory for anything
+/// newer, and the file being created is exactly that.
 fn head_inputs() -> Vec<PathBuf> {
     let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from) else {
         return Vec::new();
@@ -47,11 +52,15 @@ fn head_inputs() -> Vec<PathBuf> {
         .unwrap_or_else(|| git_dir.clone());
     let mut inputs = vec![git_dir.join("HEAD")];
     if let Some(head_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
-        inputs.push(common.join(head_ref));
         inputs.push(common.join("packed-refs"));
+        inputs.extend(existing_or_ancestor(&common.join(head_ref)));
     }
     inputs.retain(|p| p.exists());
     inputs
+}
+
+fn existing_or_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors().find(|p| p.exists()).map(Path::to_path_buf)
 }
 
 /// `--git-common-dir` answers relative to the invocation directory, which for a

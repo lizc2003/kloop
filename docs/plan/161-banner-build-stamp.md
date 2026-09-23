@@ -64,6 +64,12 @@ build script。剔掉是安全的:`refs/heads/main` 与 `packed-refs` 这两种�
 自然改挂 `packed-refs`。linked worktree 里 `HEAD` 在自己的 gitdir、refs 在 common dir,
 所以 ref 用 `--git-common-dir` 解析。
 
+> **更正(2026-09-23)**:上面"剔掉是安全的"只论证了一个方向。松散 → 打包(`gc`)确实会被
+> 看见;**打包 → 松散**看不见:打包之后的第一次提交会重新生成 `refs/heads/main`,可这条路径
+> 当初因为不存在已经被剔掉了,而 `packed-refs` 并不跟着变。于是戳在 `959ecc2` 卡了 63 个提交。
+> 现在 ref 不存在时改挂它**最近的存在的祖先目录**(Cargo 对目录递归比 mtime,新建的文件就是
+> 变化),两个方向都会触发重跑,每次重跑重新决定挂哪条。
+
 ### 七、`-V`/`--version`(用户追加)
 
 横幅之外再给一个不用起会话就能问的入口,输出与横幅同一条串:`kloop v0.1.0 (2319ea3)`。
