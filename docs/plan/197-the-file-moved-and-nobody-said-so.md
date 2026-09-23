@@ -168,3 +168,30 @@
 | `a_bash_write_is_named_an_edit_is_not_and_a_deletion_says_so` | 模型自己的 bash 写点名、自己的 `edit_file` 不点名、删除标 `(deleted)` |
 | `a_long_list_is_cut_to_the_measured_cap_and_counted` | **第五节第三条**:12 个文件变了 → 前 10 个 + `and 2 more` |
 | `a_changed_read_is_named_between_rounds_and_replays_in_place` | **第五节第四条**:真实 `run_turn`(读 → bash 改 → 回答),提示是一条独立 user 消息,夹在 bash 那轮的 tool_result 与回答之间;`load_session_snapshot` 与 `resume_session` 读回的 messages 与内存 history 整体相等 |
+
+### 真实 API 实测(2026-09-23)
+
+`make check` 之外在真实 provider 上跑了四个 headless 场景(responses 轨、deepseek 系模型,
+与 plan 195 实测同一条;网关名与用量不进仓库)。`--permission-mode bypass`,每个场景一个
+独立 scratch 目录。rollout 里的消息序列逐条核过:
+
+| 场景 | 发生了什么 | 轮次边界的提示 | 模型接下来 |
+|---|---|---|---|
+| **A** 读 `status.txt` → `sleep 23`;sleep 期间**进程外**把 `green` 改成 `red` | 别人改的,模型没动手 | `- status.txt`,夹在 sleep 那轮的 tool_result 与下一条 assistant 之间 | reasoning 原文 "The file changed. Re-read it." → 重读 → 报 **red** |
+| **A0** 同一句 prompt,文件不动 | — | **无** | 读和 sleep 并行发,**不重读**,直接报 green,自己注明"读在等待之前" |
+| **B** 读 `a.rs`、`b.rs` → 模型自己跑 `rustfmt a.rs b.rs` | a.rs 被重排,b.rs 本来就是格式化好的 | **只有** `- a.rs`,不点 b.rs | 重读 a.rs → 正确报出新的第一行,并说明 b.rs 没变 |
+| **C** 读 `settings.txt` → `touch && chmod 600` | 只动了元数据 | **无** | 直接答,自己说"touch 只更新了时间戳" |
+
+读数:
+
+- **A 对 A0 是这条的价值所在。** 没有提示时模型不会主动重读——A0 里它明确知道读发生在等待
+  之前,仍然拿那份印象作答。A 里它唯一能知道"文件变了"的来源就是那句提示。(A 的第一句话里
+  它自己说过"check it again in case it changed",但决定重读时的 reasoning 引的是提示本身。)
+- **B 就是用户拍板"自己造成的也点名"的那个形状**:模型知道自己跑了 rustfmt,不知道两个文件里
+  哪个被动了;提示只点了真变了的那个。
+- A 的第一次跑是**作废**的:守护脚本 `pgrep -f 'sleep 23'` 命中了 kloop 自己的命令行(prompt
+  里就有这串字),在模型读之前就改了文件。换成 `pgrep -xf` 精确匹配才对。**进程外注入改动的
+  实测,触发条件要匹配子进程本身,不要匹配一个可能出现在父进程参数里的字符串。**
+
+真实 API 验不到的:子 agent 那一层(同一个函数、depth 无关,只有单测),以及点名上限(要一次
+让十几个已读文件同时变,单测覆盖)。
