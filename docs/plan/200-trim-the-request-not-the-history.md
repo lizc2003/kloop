@@ -1,8 +1,8 @@
 # Plan 200 — 裁的是请求,不是历史
 
 > 来源:2026-09-23,读 `refs/chord`(`keakon/chord@cce05db`,MIT)后用户同意「给请求级裁剪立个 plan」。
-> 出处与取值见 `refs/README.md`「chord 固定源码调研(2026-09-23)」一节。本 plan 做完,
-> `refs/chord` 的本地 clone 即退休(见第八节)。
+> 出处与取值见 `refs/README.md`「chord 固定源码调研(2026-09-23)」一节。plan 200–204 全部做完后,
+> `refs/chord` 的本地 clone 退休(见第八节)。
 
 ## 一、为什么
 
@@ -181,8 +181,9 @@ Chat 轨靠后端自动前缀缓存。**请求视图里任何一个位置的字�
   (裁剪不改历史),但"offload at record time"那一段之后要**补上请求时这一层**,讲清两者的分工、
   永远裁与摊销门、为什么不持久化状态。先读那段现在还成不成立,再决定改写还是追加。
 - `docs/capability-report.md`:microcompaction 行销账,写本 plan 号与提交号。
-- `refs/README.md`:chord 那一行从"待退休"改为"已退休",注明本地 clone 已删、回源重新 clone 即可;
-  删除本地 `refs/chord`(删除前确认 HEAD 仍是 `cce05db`、工作树干净)。
+- **若 plan 201–204 也都已完成**(本条是最后一条):`refs/README.md` 里 chord 那一行从"待退休"
+  改为"已退休",注明本地 clone 已删、回源重新 clone 即可;删除本地 `refs/chord`(删除前确认 HEAD
+  仍是 `cce05db`、工作树干净)。否则留给最后完成的那一条。
 - HANDOFF.md 记新教训(如果有)。
 
 ## 九、完成记录

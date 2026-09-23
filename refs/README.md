@@ -13,7 +13,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **grok-build** | `refs/grok-build`(xAI 官方,固定 `37949780c144e37df692e3d669051a21fec24f20`;其 `SOURCE_REV` 指向上游 monorepo `c4ea71cf`) | **同语言同形态的第二个生产参考**(175 万行 Rust,与 codex 同量级)。重点看 PTY harness 分层(`xai-grok-pager-pty-harness`,4 万行:真 PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务)、`xai-codebase-graph`(tree-sitter 符号索引 + 增量重建 + mmap)、`xai-hunk-tracker`(agent/外部改动归因)、`xai-fast-worktree`(CoW + BTRFS O(1) 快照)、hooks 的 16 事件 macro 表驱动、permission 的 `bash_command_splitting`/`exec_risk`/`managed_policy`、`xai-sqlite-journal` 的 NFS 教训;不抄 hub/computer-hub 远程 workspace 面、plugin-marketplace、voice/announcements/mixpanel 遥测 |
 | **deepseek-harness** | `refs/deepseek-harness`(DeepSeek 官方,固定 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`) | **唯一非 Rust 参考**(79 万行 TS),代码不可移植,价值全在边界语义:沙箱 fail-closed(`SANDBOX_UNAVAILABLE` / full-partial 强制等级 / 被拒后申请更宽一档)、spill 三层(失败退回内联)、guard(重复调用 advisory、cooperative 超时)、session-query(cwd 完全相同才允许跨会话)、session 格式迁移链。**不抄 Cordis「万物皆插件」+ profile/bundle/patch 组合**——kloop 是单体 Rust,那会把编译期检查换成运行期装配 |
 | **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留两条:① 文件体积棘轮的机制(→ plan 176);② microcompact 的一份具体取值。它的项目级 hook 信任模型**读过、判不做**(有便宜十倍的替代)。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
-| **chord（待退休）** | `refs/chord`(`keakon/chord`,MIT,Go,固定 `cce05db7151f12a50a1e3334edb5e53caa81e54e`) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。**clone 留到请求级裁剪 plan 做完即退休,不跟 HEAD**,见本文 2026-09-23 节 |
+| **chord（待退休）** | `refs/chord`(`keakon/chord`,MIT,Go,固定 `cce05db7151f12a50a1e3334edb5e53caa81e54e`) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。**clone 留到 plan 200–204 全部做完即退休(最后完成的那条负责删),不跟 HEAD**,见本文 2026-09-23 节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -616,7 +616,7 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
 把请求级上下文裁剪和 prompt cache 经济学做到这个程度——这是它唯一的独有价值,而且是机制与
 取值,能一次提炼完。其余面(沙箱、协议、hooks、TUI、工具面)codex/grok-build 更扎实,Go 代码
 也不可移植。**不跟 HEAD**:它一天几个提交,文档已和代码对不上(见下文提前执行一条),往后跟
-看到的多是它自己的内部债。**本地 clone 留到 kloop 的请求级裁剪 plan 做完,做完即退休**;
+看到的多是它自己的内部债。**本地 clone 留到从它提炼的 plan 200–204 全部做完,最后完成的那条负责退休**;
 想看它有没有新的省 token 手段,翻 CHANGELOG 即可,不回源。README 里那张六家耗时/花费对比
 只有一个任务、一个模型、作者自测,只当方向信号。
 

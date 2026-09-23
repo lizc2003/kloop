@@ -92,6 +92,8 @@ chord 的做法(`internal/agent/compaction_failure_policy.go:14-16, 134-151`):**
 - `rust/DESIGN.md` 压缩一节:先读现在怎么描述预测性失败的("not fatal"那段),改写成
   "不致命,但连续失败会暂停",并写明被动与手动不受影响。
 - HANDOFF.md 若有新教训则记。
+- **若 plan 200–204 中其余几条都已完成**(本条是最后一条):按 `refs/README.md` chord 一节退休本地 clone——
+  那一行改为"已退休",确认 HEAD 仍是 `cce05db`、工作树干净后删除 `refs/chord`。
 
 ## 七、完成记录
 

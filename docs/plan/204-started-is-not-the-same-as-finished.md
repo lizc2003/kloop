@@ -113,6 +113,8 @@ kloop 的意图屏障已经有了:带 `tool_use` 的 assistant 消息在派发�
 
 - `rust/DESIGN.md` 会话持久化 / 配对修复那段:先读现在怎么描述 `interrupted` 的,改写成三种结果与判据。
 - `refs/README.md` chord 一节第 5 条"可以对照的小件"里的意图屏障与 started journal,标注已由本 plan 吸收。
+- **若 plan 200–204 中其余几条都已完成**(本条是最后一条):按 `refs/README.md` chord 一节退休本地 clone——
+  那一行改为"已退休",确认 HEAD 仍是 `cce05db`、工作树干净后删除 `refs/chord`。
 
 ## 九、完成记录
 

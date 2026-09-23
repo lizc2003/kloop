@@ -148,6 +148,8 @@ Later messages (oldest first):
   与"持久化而不是每次注入"的理由。
 - `docs/capability-report.md`:"压缩后重注入最近读过的 ≤5 文件"一行销账。
 - `refs/README.md` chord 一节第 2 条标注已由本 plan 吸收。
+- **若 plan 200–204 中其余几条都已完成**(本条是最后一条):按 `refs/README.md` chord 一节退休本地 clone——
+  那一行改为"已退休",确认 HEAD 仍是 `cce05db`、工作树干净后删除 `refs/chord`。
 
 ## 八、完成记录
 

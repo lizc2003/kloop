@@ -110,6 +110,8 @@
 
 - `rust/DESIGN.md` 里 `edit_file` 匹配规则那段:先读现在怎么写的,再改写成三层 + 失败诊断。
 - `refs/README.md` chord 一节"可以对照的小件"里那条 edit 诊断,标注已由本 plan 吸收。
+- **若 plan 200–204 中其余几条都已完成**(本条是最后一条):按 `refs/README.md` chord 一节退休本地 clone——
+  那一行改为"已退休",确认 HEAD 仍是 `cce05db`、工作树干净后删除 `refs/chord`。
 
 ## 八、完成记录
 
