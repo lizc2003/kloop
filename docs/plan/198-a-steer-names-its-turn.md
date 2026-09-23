@@ -83,7 +83,7 @@
 
 ## 七、完成记录
 
-✅ 2026-09-23,用户选**做法甲**(动 core 的 `Inbox`)。提交号见本条所在提交。
+✅ 2026-09-23,`2fc207d`。用户选**做法甲**(动 core 的 `Inbox`)。
 
 - **第一节的钉子先确认了**:空闲插话当场起 delivery turn,代码注释与 HANDOFF 两条写的
   "等下一次 `turn/start`"是错的。现在由 `steer_expecting_a_finished_turn_is_refused_and_starts_nothing`
