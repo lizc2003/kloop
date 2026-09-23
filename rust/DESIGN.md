@@ -256,10 +256,24 @@ Two complementary defenses keep long sessions inside the context window
 (`src/compact.rs`), both validated first in a dry run on a production codex
 fork:
 
-- **Predictive**: before each sampling round, estimate the current context
-  (provider-reported usage anchors a ~4 chars/token heuristic for anything
-  recorded after it) plus one round of growth (output cap bounded at 20k +
-  15k tool-result reserve); compact BEFORE the request when it would overflow.
+- **Predictive**: before each sampling round, estimate the next request plus
+  one round of growth (output cap bounded at 20k + 15k tool-result reserve);
+  compact BEFORE the request when it would overflow. The estimate is
+  `estimate_request`: once a provider response has reported usage, that count
+  is the whole previous request — system prompt, tool array and injected first
+  message included — and only history recorded since is added on top; before
+  one exists (a fresh session, or right after a compaction drops the anchor)
+  history's estimate covers history alone, so the system prompt, this round's
+  tools and the injected context are estimated and added. Adding them on top of
+  an anchor counted them twice (the injected context was, until 2026-09-23);
+  leaving them out before one missed ~10k tokens in this repository. The same
+  function feeds the in-turn gauge, and `context_estimate` gives every front
+  end's between-turn gauge and `/cost` the same number. The text estimate is
+  one function (`history::estimate_text_tokens` and its message/tool siblings):
+  an ASCII byte is a quarter token and any other character one token, so ASCII
+  (code, English, JSON, base64) estimates exactly as bytes/4 did while a CJK
+  character, three UTF-8 bytes, is no longer three quarters of a token. This
+  repository's mixed Chinese/English `AGENTS.md` moved from ~937 to ~1149.
   Windows at or below the growth reserve skip prediction — a non-positive
   threshold would mean "always compact".
 - **Reactive**: a request rejected as too large (`prompt is too long` /
@@ -2774,7 +2788,7 @@ the model. The set is small and lives one-file-per-command under
   and belong on one route revision. Arguments still work and skip the picker
   entirely; `/effort unset` sends no effort field at all.
 - `/cost` — the current model and context-window estimate (`~used / window
-  tokens (pct%)`, from the resettable usage anchor + char/4 tail estimate), plus
+  tokens (pct%)`, the same `context_estimate` the gauge shows), plus
   durable provider-reported usage across all models in the current transcript:
   input, output, cache-read input, cache-creation input, and reported-response
   count. An empty ledger is `unavailable`; a reported all-zero response remains
@@ -2794,11 +2808,10 @@ the model. The set is small and lives one-file-per-command under
   block kind (user text, **injected text** — steering, scheduled prompts,
   reminders, compaction summaries, which can dwarf what the user typed —
   assistant text, reasoning, images, tool calls, tool results). Every row is the
-  same bytes/4 heuristic so rows compare with each other; the total is the sum
-  of the top-level rows, and once a provider response exists its measured size
-  is printed beside it rather than mixed in. **Bytes/4 undercounts CJK about
-  2–3×** (a Chinese character is three UTF-8 bytes and close to one token), so
-  a Chinese `AGENTS.md` looks smaller here than it is.
+  session's one text estimate (see **Predictive** compaction) so rows compare
+  with each other; the total is the sum of the top-level rows, and once a
+  provider response exists its measured size is printed beside it rather than
+  mixed in.
 - `/compact` — summarize and shrink the conversation now, instead of waiting
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an

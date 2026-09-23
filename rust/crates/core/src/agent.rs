@@ -521,13 +521,13 @@ impl Turn<'_> {
     /// would overflow the window — don't wait to be rejected.
     async fn compact_predictively(
         &mut self,
-        instructions_tokens: u64,
+        estimated_tokens: u64,
         round: usize,
     ) -> Option<Ending> {
         let window = self.cfg.context_window?;
         if self.history.messages().len() < 2
             || !compact::predicted_overflow(
-                self.history.estimated_tokens() + instructions_tokens,
+                estimated_tokens,
                 self.growth,
                 // A configured window is a claim; a rejection already observed
                 // this session is a measurement, and it wins.
@@ -755,7 +755,15 @@ impl Turn<'_> {
         // whole time). A sub-agent's History is its own, so only the main
         // loop's estimate describes the session.
         if self.depth == 0 {
-            self.ui.emit(&Event::Usage(self.history.estimated_tokens()));
+            let estimated = estimate_request(self.history, || {
+                let workspace = self.cfg.effective_workspace();
+                request_overhead_tokens(
+                    &workspace.system,
+                    &self.tools,
+                    injected_context(self.cfg, &workspace, self.depth).as_deref(),
+                )
+            });
+            self.ui.emit(&Event::Usage(estimated));
         }
         Ok(())
     }
@@ -1015,13 +1023,18 @@ async fn turn_rounds(
         drain_local_mailbox(cfg, turn.history, ui);
         remind_todos(cfg, turn.history, depth);
         remind_changed_reads(cfg, turn.history);
-        // The injected context is outside history and a dynamic MCP refresh may
-        // replace its deferred-tool notice between rounds, so account for the
-        // current version rather than pinning the turn's first estimate.
+        // Without an anchor the system prompt, this round's tools and the
+        // injected context are estimated here; a dynamic MCP refresh may have
+        // replaced the tools or the deferred-tool notice since last round.
         let workspace = cfg.effective_workspace();
-        let instructions_tokens =
-            injected_context(cfg, &workspace, depth).map_or(0, |s| s.len() as u64 / 4);
-        if let Some(ending) = turn.compact_predictively(instructions_tokens, round).await {
+        let estimated = estimate_request(turn.history, || {
+            request_overhead_tokens(
+                &workspace.system,
+                &turn.tools,
+                injected_context(cfg, &workspace, depth).as_deref(),
+            )
+        });
+        if let Some(ending) = turn.compact_predictively(estimated, round).await {
             break 'turn ending;
         }
         let sampled = sample_with_retry(
@@ -1455,6 +1468,49 @@ pub(crate) fn injected_segments(
     .into_iter()
     .filter_map(|(label, text)| text.map(|text| (label, text)))
     .collect()
+}
+
+/// What the next request is estimated to cost. A provider-reported anchor is
+/// the whole previous request — system prompt, tool array and injected first
+/// message included — so only what history added since is on top of it.
+/// Without one, history's estimate covers history alone and `overhead` supplies
+/// the other three; adding them on top of an anchor would count them twice.
+fn estimate_request(history: &History, overhead: impl FnOnce() -> u64) -> u64 {
+    match history.has_usage_anchor() {
+        true => history.estimated_tokens(),
+        false => history.estimated_tokens() + overhead(),
+    }
+}
+
+/// The part of a request that is not history.
+fn request_overhead_tokens(
+    system: &str,
+    tools: &[kloop_protocol::ToolDef],
+    injected: Option<&str>,
+) -> u64 {
+    let tools: u64 = tools
+        .iter()
+        .map(crate::history::estimate_tool_def_tokens)
+        .sum();
+    crate::history::estimate_text_tokens(system)
+        + tools
+        + injected.map_or(0, crate::history::estimate_text_tokens)
+}
+
+/// The context size a front end shows between turns (`/cost`, the gauge): the
+/// next depth-0 request, estimated as [`estimate_request`] does inside a turn.
+pub fn context_estimate(cfg: &Arc<Config>, history: &History) -> u64 {
+    estimate_request(history, || {
+        let workspace = cfg.effective_workspace();
+        // A catalog that will not hold still long enough to build is left out
+        // rather than failing a display number; the turn itself will say so.
+        let tools = top_level_tool_defs(cfg).unwrap_or_default();
+        request_overhead_tokens(
+            &workspace.system,
+            &tools,
+            injected_context(cfg, &workspace, 0).as_deref(),
+        )
+    })
 }
 
 /// The depth-0 tool array a turn started now would send. `/context` sizes it.

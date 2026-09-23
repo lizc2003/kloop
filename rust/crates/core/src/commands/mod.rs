@@ -388,6 +388,9 @@ mod tests {
 
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
+        // Anchored at zero so the context line stays fixed; this test is about
+        // the usage lines below it.
+        history.note_usage(0);
         assert!(
             run(
                 "/cost",

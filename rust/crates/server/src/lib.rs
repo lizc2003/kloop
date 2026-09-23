@@ -1836,7 +1836,9 @@ async fn thread_worker(
             &turn,
         )
         .await;
-        ui.emit(&Event::Usage(history.estimated_tokens()));
+        ui.emit(&Event::Usage(kloop_core::agent::context_estimate(
+            &cfg, &history,
+        )));
         ui.notify(
             "turn/completed",
             wire::turn_completed_params(turn.id, &reason),

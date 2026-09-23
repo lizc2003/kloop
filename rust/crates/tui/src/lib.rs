@@ -177,7 +177,7 @@ pub async fn run(
         .with_context(
             cfg.provider_route.model().to_string(),
             cfg.context_window,
-            history.estimated_tokens(),
+            kloop_core::agent::context_estimate(&cfg, &history),
         )
         .with_route(cfg.provider_route.public_route());
     app.cells = app::cells_from_history(history.messages());
@@ -393,7 +393,7 @@ async fn agent_worker(
                     let _ = events.send(AgentEvent::InputReturned { text, images });
                 }
                 let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
-                    history.estimated_tokens(),
+                    kloop_core::agent::context_estimate(&cfg, &history),
                 )));
                 if events
                     .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
@@ -418,7 +418,7 @@ async fn agent_worker(
                 }
                 let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
                 let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
-                    history.estimated_tokens(),
+                    kloop_core::agent::context_estimate(&cfg, &history),
                 )));
                 if events
                     .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
@@ -445,7 +445,11 @@ async fn agent_worker(
                 }
                 // Clear first (drops the old cells), then apply the exact empty
                 // list fence, then show the result on the now-blank transcript.
-                if !send_command_result_events(&events, &result, history.estimated_tokens()) {
+                if !send_command_result_events(
+                    &events,
+                    &result,
+                    kloop_core::agent::context_estimate(&cfg, &history),
+                ) {
                     return;
                 }
                 if let Some(stage) = result.open_picker
@@ -469,7 +473,7 @@ async fn agent_worker(
                     history.record(Message::user_text(prompt));
                     let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
                     let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
-                        history.estimated_tokens(),
+                        kloop_core::agent::context_estimate(&cfg, &history),
                     )));
                     if events
                         .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))

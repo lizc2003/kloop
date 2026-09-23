@@ -175,7 +175,9 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
         let (outcome, _returned) =
             run_turn_with_input(&cfg, &mut history, &dyn_ui, &cancel, 0, msg).await;
         // Report the post-turn context size, then close the bracket (server parity).
-        ui.emit(&Event::Usage(history.estimated_tokens()));
+        ui.emit(&Event::Usage(kloop_core::agent::context_estimate(
+            &cfg, &history,
+        )));
         ui.notify(
             "turn/completed",
             kloop_server::turn_completed_params(HEADLESS_TURN_ID, &outcome.reason),

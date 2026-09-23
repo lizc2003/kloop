@@ -1167,6 +1167,112 @@ async fn predictive_compaction_fires_before_sampling() {
     );
 }
 
+/// Notes a turn emitted, for asserting whether predictive compaction fired.
+#[derive(Default)]
+struct NotesUi(std::sync::Mutex<Vec<String>>);
+
+impl Ui for NotesUi {
+    fn emit(&self, ev: &Event) {
+        if let Event::Note(note) = ev {
+            self.0.lock().unwrap().push(note.clone());
+        }
+    }
+}
+
+const PREDICTED_NOTE: &str = "predicted context overflow; compacting history";
+
+fn growth(cfg: &Config) -> u64 {
+    crate::compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens())
+}
+
+fn short_history(cfg: &Config) -> History {
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("earlier"));
+    history.record(Message::assistant(vec![ContentBlock::Text {
+        text: "earlier reply".into(),
+    }]));
+    history.record(Message::user_text("now answer briefly"));
+    history
+}
+
+#[test]
+fn the_request_overhead_is_added_only_without_an_anchor() {
+    let cfg = compaction_cfg(Provider::mock(vec![]), 200_000, "overhead-anchor");
+    let mut history = short_history(&cfg);
+    let bare = history.estimated_tokens();
+    assert_eq!(estimate_request(&history, || 100), bare + 100);
+    history.note_usage(5_000);
+    assert_eq!(
+        estimate_request(&history, || panic!("an anchor already holds the overhead")),
+        5_000
+    );
+}
+
+/// Before any response, the system prompt and the tool array are part of the
+/// request and nobody has measured them yet: history alone fits the window
+/// here, history plus the tools does not, and the turn must compact.
+#[tokio::test]
+async fn predictive_compaction_counts_the_tools_before_the_first_response() {
+    let provider = Provider::mock(vec![
+        vec![AssistantBlock::Text {
+            text: "summary".into(),
+        }],
+        vec![AssistantBlock::Text {
+            text: "final answer".into(),
+        }],
+    ]);
+    let probe = compaction_cfg(Provider::mock(vec![]), 200_000, "overhead-probe");
+    let history = short_history(&probe);
+    let overhead = crate::agent::context_estimate(&probe, &history) - history.estimated_tokens();
+    assert!(
+        overhead > 1_000,
+        "the tool array alone is thousands: {overhead}"
+    );
+    let window = growth(&probe) + history.estimated_tokens() + overhead / 2;
+
+    let cfg = compaction_cfg(provider, window, "overhead-pre-anchor");
+    let mut history = short_history(&cfg);
+    let notes = Arc::new(NotesUi::default());
+    let ui: Arc<dyn Ui> = notes.clone();
+    run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert!(
+        notes.0.lock().unwrap().iter().any(|n| n == PREDICTED_NOTE),
+        "{:?}",
+        notes.0.lock().unwrap()
+    );
+}
+
+/// After a response, the anchor is the provider's count of the whole request,
+/// injected instructions included. Counting them again on top used to push
+/// this turn over a window it fits in.
+#[tokio::test]
+async fn predictive_compaction_does_not_count_the_injected_context_twice() {
+    let provider = Provider::mock(vec![vec![AssistantBlock::Text {
+        text: "final answer".into(),
+    }]]);
+    let base = compaction_cfg(provider, 200_000, "overhead-anchored");
+    let mut cfg = (*base).clone();
+    // ~10k tokens of instructions, all of them inside the anchor below.
+    cfg.project_instructions = Some("p".repeat(40_000));
+    let anchored = 1_000;
+    cfg.context_window = Some(growth(&cfg) + anchored + 5_000);
+    let cfg = Arc::new(cfg);
+    let mut history = short_history(&cfg);
+    history.note_usage(anchored);
+    let notes = Arc::new(NotesUi::default());
+    let ui: Arc<dyn Ui> = notes.clone();
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.final_text, "final answer");
+    assert!(
+        !notes.0.lock().unwrap().iter().any(|n| n == PREDICTED_NOTE),
+        "{:?}",
+        notes.0.lock().unwrap()
+    );
+}
+
 /// Reactive: the first sampling request is rejected as too large; the
 /// loop compacts once (mock turn 2 = summary) and retries successfully
 /// (turn 3), with no user-visible error.
@@ -1892,7 +1998,7 @@ async fn completed_block_without_delta_still_has_one_item_lifecycle() {
             },
             // Every round closes by publishing the context size (plan: the
             // footer gauge must move during a turn, not only at its end).
-            Event::Usage(history.estimated_tokens()),
+            Event::Usage(crate::agent::context_estimate(&cfg, &history)),
         ]
     );
 }
@@ -1923,7 +2029,7 @@ async fn signed_empty_thinking_is_semantic_history_without_display_item() {
     // is semantic history, never a display item.
     assert_eq!(
         *event_ui.0.lock().unwrap(),
-        vec![Event::Usage(history.estimated_tokens())]
+        vec![Event::Usage(crate::agent::context_estimate(&cfg, &history))]
     );
     assert_eq!(
         history.messages()[1],

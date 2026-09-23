@@ -883,9 +883,62 @@ pub fn sync_offload_counter(offload_dir: &Path) {
     NEXT_OFFLOAD_ID.fetch_max(max_seen + 1, Ordering::Relaxed);
 }
 
-/// ~4 chars/token heuristic over the provider-visible message form, ceiling
-/// division. Internal replay provenance is persisted with history but never
-/// enters the provider prompt, so it must not inflate context estimates.
+/// The token estimate every context number in the session is built from: an
+/// ASCII byte is a quarter token (the ~4 chars/token rule for English, code and
+/// JSON), and every other character is one token. Counting bytes alone put a
+/// CJK character — three UTF-8 bytes — at three quarters of a token, where
+/// tokenizers spend one or more. Bytes are classified one at a time (ASCII, or
+/// the lead byte of a multi-byte character), so a counter can be fed in chunks
+/// that split a character without miscounting it.
+#[derive(Default)]
+struct TokenCounter {
+    ascii: u64,
+    other_chars: u64,
+}
+
+impl TokenCounter {
+    fn tokens(&self) -> u64 {
+        self.ascii.div_ceil(4) + self.other_chars
+    }
+}
+
+impl std::io::Write for TokenCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for &byte in buf {
+            match byte {
+                0x00..=0x7f => self.ascii += 1,
+                // Continuation bytes belong to the character already counted.
+                0x80..=0xbf => {}
+                0xc0..=0xff => self.other_chars += 1,
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// [`TokenCounter`] over plain text: a system prompt, an injected message.
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    let mut counter = TokenCounter::default();
+    let _ = std::io::Write::write(&mut counter, text.as_bytes());
+    counter.tokens()
+}
+
+/// [`TokenCounter`] over one tool definition as the provider reads it: name,
+/// description, and the serialized schema.
+pub fn estimate_tool_def_tokens(tool: &kloop_protocol::ToolDef) -> u64 {
+    let mut counter = TokenCounter::default();
+    let _ = std::io::Write::write(&mut counter, tool.name.as_bytes());
+    let _ = std::io::Write::write(&mut counter, tool.description.as_bytes());
+    let _ = serde_json::to_writer(&mut counter, &tool.schema);
+    counter.tokens()
+}
+
+/// [`TokenCounter`] over the provider-visible message form. Internal replay
+/// provenance is persisted with history but never enters the provider prompt,
+/// so it must not inflate context estimates.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
     #[derive(serde::Serialize)]
     struct ProviderMessage<'a> {
@@ -893,31 +946,61 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
         content: &'a [ContentBlock],
     }
 
-    // Count the serialized bytes without materializing the string — this runs
+    // Count while serializing, without materializing the string — this runs
     // per message on every predictive-overflow check and every compaction
-    // candidate, and only the length feeds the heuristic.
-    struct ByteCounter(u64);
-    impl std::io::Write for ByteCounter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len() as u64;
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    // candidate.
     let provider_message = ProviderMessage {
         role: message.role,
         content: &message.content,
     };
-    let mut counter = ByteCounter(0);
-    let bytes = serde_json::to_writer(&mut counter, &provider_message).map_or(0, |()| counter.0);
-    bytes.div_ceil(4)
+    let mut counter = TokenCounter::default();
+    serde_json::to_writer(&mut counter, &provider_message).map_or(0, |()| counter.tokens())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_estimate_counts_ascii_by_the_quarter_and_other_characters_whole() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(estimate_text_tokens("abcd"), 1);
+        assert_eq!(estimate_text_tokens("abcde"), 2);
+        // Three bytes each: bytes/4 would have said 2 for these three.
+        assert_eq!(estimate_text_tokens("看一眼"), 3);
+        assert_eq!(estimate_text_tokens("ls 看一眼"), 1 + 3);
+        assert_eq!(estimate_text_tokens("🙂"), 1);
+    }
+
+    /// serde_json hands the writer arbitrary chunks; a character split across
+    /// two of them is still one character.
+    #[test]
+    fn a_character_split_across_writes_is_counted_once() {
+        use std::io::Write as _;
+        let bytes = "看".as_bytes();
+        let mut counter = TokenCounter::default();
+        counter.write_all(&bytes[..1]).unwrap();
+        counter.write_all(&bytes[1..]).unwrap();
+        assert_eq!(counter.tokens(), 1);
+    }
+
+    /// ASCII-only content — code, English, base64 image data — is estimated
+    /// exactly as the old bytes/4 rule did, so only non-ASCII text moves.
+    #[test]
+    fn ascii_messages_keep_the_bytes_over_four_estimate() {
+        let message = Message::user_with_blocks(
+            "look at this",
+            vec![ContentBlock::Image {
+                source: kloop_protocol::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo".repeat(100),
+                },
+            }],
+        );
+        let json = serde_json::json!({"role": message.role, "content": message.content});
+        let bytes = serde_json::to_string(&json).unwrap().len() as u64;
+        assert_eq!(estimate_message_tokens(&message), bytes.div_ceil(4));
+    }
     use kloop_protocol::Role;
 
     fn temp_dir(tag: &str) -> PathBuf {

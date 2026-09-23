@@ -10,7 +10,7 @@ use crate::usage::{UsageAggregate, UsageOverflow};
 pub const SUMMARY: &str = "show provider route, context, and provider-reported usage";
 
 pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
-    let used = history.estimated_tokens();
+    let used = crate::agent::context_estimate(cfg, history);
     let route = cfg.provider_route.public_route();
     let mut output = match cfg.context_window {
         Some(window) => {

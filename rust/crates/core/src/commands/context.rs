@@ -2,9 +2,10 @@
 //! "how full"; this answers "full of what": the system prompt, each injected
 //! part, the tool array, and history split by block kind.
 //!
-//! Every number is the ~4 chars/token heuristic, so the segments are
-//! comparable with each other but not with the provider's count. When a
-//! provider-measured size exists it is shown beside the sum, not mixed in.
+//! Every number is the session's one estimate ([`estimate_text_tokens`] and
+//! its siblings), so the segments compare with each other but not with the
+//! provider's count. When a provider-measured size exists it is shown beside
+//! the sum, not mixed in.
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use kloop_protocol::{ContentBlock, Role, ToolDef};
 
 use super::SlashResult;
 use crate::config::Config;
-use crate::history::History;
+use crate::history::{History, estimate_text_tokens, estimate_tool_def_tokens};
 
 pub const SUMMARY: &str = "show which parts of the prompt the context goes to";
 
@@ -23,10 +24,10 @@ pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
     let workspace = cfg.effective_workspace();
     let mut rows = vec![Row::top(
         "system prompt",
-        approx_tokens(workspace.system.len()),
+        estimate_text_tokens(&workspace.system),
     )];
     for (label, text) in crate::agent::injected_segments(cfg, &workspace, 0) {
-        rows.push(Row::top(label, approx_tokens(text.len())));
+        rows.push(Row::top(label, estimate_text_tokens(&text)));
     }
     let tools = crate::agent::top_level_tool_defs(cfg);
     if let Ok(tools) = &tools {
@@ -52,7 +53,7 @@ pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
         .filter(|row| !row.nested)
         .map(|row| row.tokens)
         .sum();
-    let mut output = String::from("context by segment (estimated, ~4 chars/token):");
+    let mut output = String::from("context by segment (estimated):");
     for row in &rows {
         output.push_str(&row.render());
     }
@@ -106,7 +107,7 @@ impl Row {
 fn tool_row(tools: &[ToolDef]) -> Row {
     let mut sized: Vec<(&str, u64)> = tools
         .iter()
-        .map(|tool| (tool.name.as_str(), tool_def_tokens(tool)))
+        .map(|tool| (tool.name.as_str(), estimate_tool_def_tokens(tool)))
         .collect();
     let tokens = sized.iter().map(|(_, tokens)| tokens).sum();
     // Largest first; ties by name so the line is stable across runs.
@@ -126,10 +127,6 @@ fn tool_row(tools: &[ToolDef]) -> Row {
         detail,
         nested: false,
     }
-}
-
-fn tool_def_tokens(tool: &ToolDef) -> u64 {
-    approx_tokens(tool.name.len() + tool.description.len() + tool.schema.to_string().len())
 }
 
 /// History by block kind, zero rows left out. These are per-block estimates,
@@ -179,11 +176,7 @@ fn history_rows(messages: &[kloop_protocol::Message]) -> Vec<Row> {
 }
 
 fn block_tokens(block: &ContentBlock) -> u64 {
-    serde_json::to_vec(block).map_or(0, |bytes| approx_tokens(bytes.len()))
-}
-
-fn approx_tokens(bytes: usize) -> u64 {
-    (bytes as u64).div_ceil(4)
+    serde_json::to_string(block).map_or(0, |json| estimate_text_tokens(&json))
 }
 
 #[cfg(test)]
@@ -285,7 +278,7 @@ mod tests {
         assert_eq!(
             lines[..3],
             [
-                "context by segment (estimated, ~4 chars/token):",
+                "context by segment (estimated):",
                 Row::top("system prompt", 1)
                     .render()
                     .trim_start_matches('\n'),
