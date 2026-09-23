@@ -635,22 +635,85 @@ async fn run_tui(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Read all of stdin when it is a pipe/redirect, or None when it is an
-/// interactive terminal (reading would block waiting for the user). The
-/// blocking read runs off the async runtime.
-async fn read_stdin_if_piped() -> Result<Option<String>> {
+/// How long the stdin read may take before it says so on stderr.
+///
+/// A redirect or a pipe that already holds the prompt returns at once. Anything
+/// slower is a producer that has not written yet — legitimate, so the read goes
+/// on waiting — but from outside, a run blocked here is indistinguishable from a
+/// slow first sampling request. That ambiguity cost a 2h25m stall once; one line
+/// ends it (lesson 182).
+const STDIN_WAIT_NOTE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether stdin is a source a prompt can actually be piped from, which is
+/// narrower than "not a terminal".
+///
+/// `is_terminal()` answers "would reading block on a human", and using it as
+/// "is there piped input" gets two of three cases right: a terminal is skipped,
+/// a pipe or a redirect is read to EOF. The third is an open non-tty that never
+/// reaches EOF — a socket on fd 0, which is what a parent process that keeps its
+/// end open leaves behind. `read_to_string` on that never returns, and the run
+/// dies before its first sampling request with nothing written and no timeout.
+///
+/// So the test is the file type, not the terminal-ness: a FIFO or a regular file
+/// is piped input, and anything else is treated as absent. Ignoring a prompt that
+/// was genuinely sent through a socket costs a clear "no prompt" refusal, which
+/// is a trade the silent hang does not offer.
+#[cfg(unix)]
+fn stdin_is_pipeable() -> bool {
     use std::io::IsTerminal as _;
+    use std::os::fd::AsFd as _;
+
+    !std::io::stdin().is_terminal() && fd_is_pipeable(std::io::stdin().as_fd())
+}
+
+/// The file-type half of [`stdin_is_pipeable`], over any descriptor so it can be
+/// tested against the real kinds rather than whatever fd 0 happens to be.
+#[cfg(unix)]
+fn fd_is_pipeable(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    // `st_mode`'s width differs by platform, so the classification goes through
+    // rustix rather than masking the raw bits here.
+    rustix::fs::fstat(fd).is_ok_and(|stat| {
+        matches!(
+            rustix::fs::FileType::from_raw_mode(stat.st_mode),
+            rustix::fs::FileType::Fifo | rustix::fs::FileType::RegularFile
+        )
+    })
+}
+
+/// Windows keeps the terminal test. The hazard above is a Unix socket on fd 0;
+/// nothing here has shown the equivalent, and `GetFileType` draws its line in a
+/// different place, so this stays as it was until something argues otherwise.
+#[cfg(not(unix))]
+fn stdin_is_pipeable() -> bool {
+    use std::io::IsTerminal as _;
+
+    !std::io::stdin().is_terminal()
+}
+
+/// Read all of stdin when a prompt can be piped from it, or None when it is a
+/// terminal or a source that would never end. The blocking read runs off the
+/// async runtime.
+async fn read_stdin_if_piped() -> Result<Option<String>> {
     use std::io::Read as _;
-    if std::io::stdin().is_terminal() {
+    if !stdin_is_pipeable() {
         return Ok(None);
     }
-    let text = tokio::task::spawn_blocking(|| {
+    let mut reader = tokio::task::spawn_blocking(|| {
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf).map(|_| buf)
-    })
-    .await
-    .context("stdin reader panicked")?
-    .context("cannot read stdin")?;
+    });
+    let joined = match tokio::time::timeout(STDIN_WAIT_NOTE_AFTER, &mut reader).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            eprintln!(
+                "\x1b[2m[still reading the prompt from stdin; close it, or pass the prompt as an argument]\x1b[0m"
+            );
+            reader.await
+        }
+    };
+    let text = joined
+        .context("stdin reader panicked")?
+        .context("cannot read stdin")?;
     Ok(Some(text))
 }
 
@@ -1026,6 +1089,38 @@ async fn plain_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What counts as "a prompt could be piped from this". The terminal test
+    /// alone got the socket wrong, and getting it wrong meant an unbounded read
+    /// that never returns: the run died before its first sampling request with
+    /// nothing written and no timeout (lesson 182). Every kind fd 0 can actually
+    /// be, asserted against the real thing.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_pipe_or_a_file_counts_as_piped_stdin() {
+        use std::os::fd::AsFd as _;
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        assert!(fd_is_pipeable(reader.as_fd()), "a pipe is piped input");
+        assert!(fd_is_pipeable(writer.as_fd()));
+
+        let path = std::env::temp_dir().join(format!("kloop-stdin-kind-{}", std::process::id()));
+        std::fs::write(&path, "prompt\n").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(fd_is_pipeable(file.as_fd()), "a redirect is piped input");
+        let _ = std::fs::remove_file(&path);
+
+        // The kind that hung: a parent that keeps its end open never sends EOF.
+        let (near, far) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!fd_is_pipeable(near.as_fd()), "a socket is not piped input");
+        assert!(!fd_is_pipeable(far.as_fd()));
+
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            !fd_is_pipeable(null.as_fd()),
+            "a character device is not piped input"
+        );
+    }
 
     #[tokio::test]
     async fn scheduled_due_interrupts_an_idle_plain_input_read() {

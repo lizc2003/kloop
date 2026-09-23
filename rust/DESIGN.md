@@ -3535,7 +3535,13 @@ path).
 kloop --headless "summarize what CHANGELOG.md says" > summary.txt
 
 # or pipe it on stdin (both sources combine: positional first, then a newline,
-# then stdin)
+# then stdin). "Piped" is the file type, not the absence of a terminal: a pipe or
+# a redirect is read to EOF, while a socket or a character device on fd 0 counts
+# as no stdin at all. A parent that keeps its end of a socket open never sends
+# EOF, and reading it blocked whole runs before their first sampling request; a
+# prompt genuinely sent that way now costs a "no prompt" refusal instead. A read
+# that has not finished in two seconds says so on stderr, so a slow producer can
+# never again look like a slow model.
 git diff | kloop --headless "review this diff"
 
 # machine-readable event stream (reuses the native protocol's item events)
