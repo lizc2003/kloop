@@ -15,12 +15,14 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 - **本文件是十条共用的**,每条做完都会改——并行开两个 worktree 会在这里冲突。
   (原先还有一处是 `architecture-baseline.toml`,**体积棘轮已于 2026-09-21 整体删除**,
   见教训 172 的后记。)
-- **179 一个会话闭不了环**:windows 分支本机跑不到。(**178 做完后这条松了一半**:整 crate
-  交叉编译确实走不通,但把目标模块单独提进一个 scratch crate 就能
-  `--target x86_64-pc-windows-msvc` 编过——见教训 166,179 照抄即可。**⚠️ 2026-09-22 CI 整个
-  删掉了**(用户:「目前不需要 CI」,见教训 175),于是"三平台绿"不再是收工条件,也不再是
-  一条可用的反馈:那个 scratch crate 是 Windows 唯一的证据,而**编过不等于跑过**,179 收工
-  时要照实写成"交叉编译通过,未在 Windows 上执行"。)
+- ~~**179 一个会话闭不了环**:windows 分支本机跑不到。~~ **179 已于 2026-09-23 一个会话闭环**
+  (见 plan 179 §五 与教训 183)。结论留给后面同类的条目:scratch crate 那条路**真的走得通**
+  ——`[workspace]` 独立小 crate + `anyhow` + 照抄 workspace feature 的 `windows-sys` + 一个把
+  `super` 提供的东西做成 stub 的 `lib.rs`,`cargo check --target x86_64-pc-windows-msvc
+  --all-targets`;整 crate 交叉编译仍然走不通(`ring` 要 MSVC)。**⚠️ CI 已于 2026-09-22 删除**
+  (教训 175),所以"三平台绿"不是收工条件,收工要照实写成"交叉编译通过,未在 Windows 上
+  执行"——179 就是这么写的。**并且:本机 `cargo build` 绿对一个 `#[cfg(windows)]` 文件是零
+  信息**,179 那次它一次就过,而文件里有 7 处坏掉的模块路径(教训 183)。
 - **177 与 184 都会碰到 `supported_image_mime` 在两个 crate 各有一份**。两条 plan 都写了
   "记一笔、不合并"——**先做的那条不要顺手去重**,跨 crate 去重是两条都做完之后的另一件事。
   (**177 已做,wire crate 那份原样搬进 `render.rs`,没碰 CLI 那份**;去重的账等 184。)

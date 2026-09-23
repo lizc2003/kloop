@@ -7,7 +7,12 @@
 
 ## 一、量出来的东西
 
-本机 191 个会话的 rollout,结构统计(不看内容):
+本机 191 个会话的 rollout,结构统计(不看内容)。口径:遍历
+`~/.kloop/projects/v1/*/sessions/*.jsonl`,按 `content[]` 里 `type == "tool_use"` 数调用、
+`type == "tool_result"` 的文本匹配那三句拒绝/提示;"bash 既写又提到已读文件"= 同一会话内
+先出现过的 `read_file` 路径 basename 出现在一条 bash `command` 里,且该命令匹配
+`sed -i|gofmt -w|cargo fmt|prettier|ruff format|black|tee|>|>>|mv|cp|patch|apply`。
+**这是一次性脚本量的,`>`/`cp`/`mv` 会误命中,所以上界偏高。**
 
 | | 次数 |
 |---|---|
@@ -56,7 +61,8 @@
 现成的地基两样:
 
 - `FileObservation` 存整文件 sha256(`core/src/file_state.rs`),所以"变了没有"是一次 stat +
-  (元数据动了才)一次 hash,不必存内容快照。
+  (元数据动了才)一次 hash,不必存内容快照。比较用 `FileVersion::same_content`
+  (`file_state.rs:492`,plan 195 加的),**本条复用它,不要再造一个**。
 - **已经有一个同类的提示机制**:`reread_advisory`(`core/src/tools/fs.rs:73`,挂在
   `tools/mod.rs:1516`)——一句 `<system-reminder>`,**骑在 tool result 上**,而不是自己占一条
   history。它的 doc 写明了为什么:*"so that a replayed rollout reproduces it in the same place"*。
@@ -84,7 +90,7 @@
 - **提示的频率要量,不要拍。** `REREAD_ADVISORY_EVERY = 3` 是 replay 了 1691 次真实
   `read_file` 量出来的(见 `fs.rs:53` 那段 doc),本条的"每会话/每轮最多说几次"照同样的规矩办,
   **用 `scripts/tool-usage.py`,别拍一个 3**。
-- **`ContextReads` 与 `ReadCoverage` 是两件事**(`file_state.rs:79` 的 doc 写了),别拿错:
+- **`ContextReads` 与 `ReadCoverage` 是两件事**(`file_state.rs:80` 的 doc 写了),别拿错:
   前者是"这些行还在对话里"(压缩就死),后者是"模型看过足够多的当前字节"(字节变就死)。
   本条要的是**后者的版本比较**,不是前者。
 - **不要在这里重新收紧 plan 195。** 点名之后仍然不拒绝任何编辑;这条只增加信息,不增加门。
