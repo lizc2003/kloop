@@ -14,6 +14,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **deepseek-harness** | `refs/deepseek-harness`(DeepSeek 官方,固定 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`) | **唯一非 Rust 参考**(79 万行 TS),代码不可移植,价值全在边界语义:沙箱 fail-closed(`SANDBOX_UNAVAILABLE` / full-partial 强制等级 / 被拒后申请更宽一档)、spill 三层(失败退回内联)、guard(重复调用 advisory、cooperative 超时)、session-query(cwd 完全相同才允许跨会话)、session 格式迁移链。**不抄 Cordis「万物皆插件」+ profile/bundle/patch 组合**——kloop 是单体 Rust,那会把编译期检查换成运行期装配 |
 | **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留两条:① 文件体积棘轮的机制(→ plan 176);② microcompact 的一份具体取值。它的项目级 hook 信任模型**读过、判不做**(有便宜十倍的替代)。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
 | **chord（待退休）** | `refs/chord`(`keakon/chord`,MIT,Go,固定 `cce05db7151f12a50a1e3334edb5e53caa81e54e`) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。**clone 留到 plan 200–204 全部做完即退休(最后完成的那条负责删),不跟 HEAD**,见本文 2026-09-23 节 |
+| **crush（已退休）** | `charmbracelet/crush@72654940d9e46961a7d804d536c45761e7084a08`(FSL-1.1-MIT:公开可读、两年后转 MIT,只借判据不搬代码;本地 clone 可删) | **调研即退休**。LLM 层与 step 循环在外部库 `charm.land/fantasy`,不在仓库里。强项是工程运维面(C/S 自动拉起、取消序号、流空闲超时),kloop 已有对应物。只留两条:① edit 缩进容错,与 chord 方向相反(→ plan 201 第二个开工问题);② 重复调用守卫第三家实现,**本地复算仍零打转,不做**。"安全命令"免审批是反例。见本文 2026-09-23 crush 节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -677,6 +678,71 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
   2369 行且默认关闭;`internal/llm/client_retry.go` 1700 行,注释大半在解释修过的 bug。
   大头来自"后台压缩与前台回合并行、再在 barrier 处应用"引出的一致性问题。
 - 默认把 `.env*` 复制进 worktree;ACP 模式不桥接权限请求,只能等本地超时失败。
+
+## crush 固定源码调研与即刻退休(2026-09-23)
+
+基线固定为 `charmbracelet/crush@72654940d9e46961a7d804d536c45761e7084a08`(Go,4215 个提交)。
+**许可证是 FSL-1.1-MIT**:源码公开可读、两年后转 MIT,期内不得用于竞品——所以照常写 `file:line`
+(任何人都能打开核对),但**只借判据,不搬代码**。非测试约 10.1 万行,测试约 6 万行;其中 TUI
+4.2 万行,agent 内核只有 1.6 万行。**LLM 层与 step 循环都不在这个仓库里**:provider 抽象、工具调度、
+重试、StopWhen 求值全在 Charm 的外部库 `charm.land/fantasy`(`go.mod:10`),crush 只用回调接入
+(`internal/agent/agent.go:685-1064`)。最该对照的那一半看不见,这是它参考价值低的首要原因。
+
+来由:chord 的 README 说设计借鉴过 Crush。实查 chord 源码只有两处引用——一个 TUI 动画渐变
+(chord `internal/tui/anim.go:96`)和一个 LSP 初始化时序(chord `internal/lsp/manager.go:462`),
+借的是 Bubble Tea 生态与 TUI 手感,不是 agent 设计。
+
+**读完即退休**:本地 clone 可删,要回源重新 clone 即可。
+
+**它强在工程运维面,kloop 大多已有对应物或暂不需要:**
+
+- 可选 client/server:TUI 只依赖 `Workspace` 接口,背后有进程内与 HTTP 两种实现
+  (`internal/workspace/workspace.go`);**但 C/S 至今要 `CRUSH_CLIENT_SERVER=1` 才开**
+  (`internal/cmd/root.go:233`),两条路径长期并存。server 由 client 自动拉起,spawn 锁、
+  版本不符时请 server 空闲自退、三段宽限期(`internal/backend/backend.go:47-72`)——
+  kloop 若将来做常驻 server,这一段是现成的踩坑清单。
+- 取消/排队用单调序号:`Cancel` 把 cancelMark 抬到当前最大 accept 序号,之后才进来的 prompt
+  不会被这次取消误杀(`internal/agent/agent.go:1979-2033`)。kloop 的 steer window(plan 198)
+  已解决同类问题。
+- 流空闲超时:每收到一个 part 就 `Reset` 的 `time.AfterFunc`,用 `context.Cause` 与用户取消区分
+  (`internal/agent/request_timeout.go:73-123`)。kloop provider 已有 idle/wall 守卫。
+- 测试:LLM 调用用 VCR 录制回放(`internal/agent/testdata/TestCoderAgent/`);kloop 的 mock SSE +
+  request capture 覆盖同一需求。
+
+**判为反例的:**
+
+- **"安全命令"免审批**(`internal/agent/tools/safe.go:9-75`):前缀匹配,串联检测只看
+  `; | && $(` 与反引号,**不看换行、单个 `&`、`>` 重定向**;白名单还含 `timeout`/`env`/`nice`/
+  `kill`,于是 `timeout 9 rm -rf ~` 免审批。bash 的会话级授权只按目录记、不按命令记;写类工具把
+  工作区内路径归到根目录,一次"本会话允许"覆盖整个工作区。没有 OS 沙箱;hooks 只有 `PreToolUse`。
+- 每轮在 history 开头插"todo list is currently empty",不管实际有没有 todo(`agent.go:1534-1543`)。
+- SSE 无序号、不可续传,断线期间的事件注释自认 "lost for good";流式期间推整条消息快照,
+  客户端按字节偏移去重。非交互模式只有纯文本输出。主配置格式是**可执行的 Bash**(`crushrc`)。
+- 文档与代码不一致:AGENTS.md 把 catwalk(模型目录服务)说成快照测试;超时默认值 schema 写 60、
+  代码是 2 分钟。
+
+**留下的两条:**
+
+1. **edit 的缩进容错,与 chord 方向相反 → 记进 plan 201 开工时的第二个问题。** crush 在精确匹配
+   失败后,按"每行压缩空白后整行比较"再找一次,唯一命中时按文件原有缩进重排 `new_string`
+   (`internal/agent/tools/edit_whitespace.go:24-80`);chord 容的是标点,并明确把缩进错判为真错。
+2. **重复调用守卫:第三家实现,仍然不做。** crush 的循环检测是"最近 10 步里同一签名出现 >5 次就
+   静默停止",签名 = 该步所有 (工具名, 输入, **输出**) 的 SHA-256(`internal/agent/loop_detection.go:11-71`)。
+   加上 deepseek-harness(同参数第 3/5/8 次提醒)与 chord(loop 模式同一调用连续 3 次拦截),
+   三家都有。**但 plan 151 当初按 (工具, 参数) 重放本机语料,结论是零触发,只做了 read_file 的
+   区间重叠提醒。** 2026-09-23 用更大的语料复算(203 个会话、14271 次调用):
+
+   ```
+   单会话内同一 (工具, 参数) 的最大重复:1 次 148 个会话 / 2 次 14 / 3 次 1 / 4 次 2 / 5 次 2 / 8 次 1
+   deepseek 3/5/8 会响 12 次 · chord 连续 3 次会响 1 次 · crush 窗口判定会响 0 次
+   ```
+
+   逐条看,**没有一次是打转**:8 次那个是 8 段**各不相同**的坏 JSON——kloop 把非法调用记成空输入
+   的 `bash{}`,于是看起来一样(那条路径已经把解析错误和原文回给模型);其余是修完再跑同一个验证
+   脚本、`git status`、`wait_for_activity` 轮询,都是正当的重复。**三家收敛也推不翻本地实测**:
+   这个守卫在 kloop 的负载上仍是死代码或误报,判据与 plan 151 一致。复算脚本当时放在会话 scratchpad,
+   逻辑是按 `compacted` 行清零、(name, sort_keys 后的 input) 计数;若将来语料换了负载再量一次。
+   **顺带记一笔**:crush 的检测触发时静默结束这一轮,不告诉模型也不告诉用户——就算要做,也不该学这个。
 
 ## 调研结论(三轮调研的浓缩)
 
