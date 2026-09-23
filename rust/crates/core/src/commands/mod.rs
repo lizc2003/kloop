@@ -24,6 +24,7 @@ use crate::tools::TodoSnapshot;
 
 mod clear;
 mod compact;
+mod context;
 mod cost;
 mod effort;
 mod exit;
@@ -162,6 +163,10 @@ pub const BUILTINS: &[Builtin] = &[
         summary: cost::SUMMARY,
     },
     Builtin {
+        name: "context",
+        summary: context::SUMMARY,
+    },
+    Builtin {
         name: "compact",
         summary: compact::SUMMARY,
     },
@@ -230,6 +235,7 @@ pub async fn run_with_provider_state(
         "model" => model::run(args, history, cfg, provider_state),
         "effort" => effort::run(args, history, cfg, provider_state),
         "cost" => cost::run(history, cfg),
+        "context" => context::run(history, cfg),
         "compact" => compact::run(history, cfg, ui, cancel).await,
         "clear" => clear::run(history, cfg),
         "loop" => loop_command::run(args),
@@ -699,7 +705,7 @@ mod tests {
         assert_eq!(
             result,
             SlashResult::message(
-                "unknown command '/frobnicate' (available: /help, /provider, /model, /effort, /cost, /compact, /clear, /loop, /skills, /exit)"
+                "unknown command '/frobnicate' (available: /help, /provider, /model, /effort, /cost, /context, /compact, /clear, /loop, /skills, /exit)"
             )
         );
     }
@@ -745,7 +751,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /model, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /greet)"
+                "unknown command '/nope' (available: /help, /provider, /model, /effort, /cost, /context, /compact, /clear, /loop, /skills, /exit, /greet)"
             )
         );
     }
@@ -905,7 +911,7 @@ mod tests {
         assert_eq!(
             unknown,
             SlashResult::message(
-                "unknown command '/nope' (available: /help, /provider, /model, /effort, /cost, /compact, /clear, /loop, /skills, /exit, /deploy)"
+                "unknown command '/nope' (available: /help, /provider, /model, /effort, /cost, /context, /compact, /clear, /loop, /skills, /exit, /deploy)"
             )
         );
     }

@@ -560,6 +560,13 @@ impl History {
         self.usage_anchor = Some((self.items.len(), total_tokens));
     }
 
+    /// Whether [`Self::estimated_tokens`] starts from a provider-reported
+    /// prompt size (which already covers system, tools and injected context)
+    /// rather than from the char heuristic over history alone.
+    pub fn has_usage_anchor(&self) -> bool {
+        self.usage_anchor.is_some()
+    }
+
     /// The window to plan against: the configured value, lowered to anything the
     /// provider has actually rejected. Never raised — a rejection at N proves
     /// only that N is too big, never that anything is safe.

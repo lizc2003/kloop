@@ -1248,7 +1248,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduled_for_ms?, reason?, det
 for owner-scoped scheduler lifecycle (**no `turn_id`**),
 `thread/token_usage/updated {token_usage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/context`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
 
 **Event recovery.** `thread/events/sync {thread_id, event_cursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is
@@ -2741,6 +2741,19 @@ the model. The set is small and lives one-file-per-command under
   can watch it mid-session rather than recompute it from a rollout afterwards.
   The command reports no prices, billable total, quota, or budget, and it does
   not aggregate child-agent transcripts.
+- `/context` — `/cost` says how full, this says full of what: the system
+  prompt, each part of the injected first message (plan-mode reminder, project
+  instructions, skills catalog, deferred-tool notice — read from the same
+  labeled list the request is built from, so the breakdown cannot drift), the
+  depth-0 tool array with its three largest tools named, and history split by
+  block kind (user text, **injected text** — steering, scheduled prompts,
+  reminders, compaction summaries, which can dwarf what the user typed —
+  assistant text, reasoning, images, tool calls, tool results). Every row is the
+  same bytes/4 heuristic so rows compare with each other; the total is the sum
+  of the top-level rows, and once a provider response exists its measured size
+  is printed beside it rather than mixed in. **Bytes/4 undercounts CJK about
+  2–3×** (a Chinese character is three UTF-8 bytes and close to one token), so
+  a Chinese `AGENTS.md` looks smaller here than it is.
 - `/compact` — summarize and shrink the conversation now, instead of waiting
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an

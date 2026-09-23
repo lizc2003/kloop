@@ -1413,21 +1413,41 @@ fn injected_context(
     workspace: &crate::config::EffectiveWorkspace,
     depth: u8,
 ) -> Option<String> {
+    let parts: Vec<String> = injected_segments(cfg, workspace, depth)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The parts of [`injected_context`], labeled, in request order. `/context`
+/// reads the same list, so the breakdown cannot drift from what is sent.
+pub(crate) fn injected_segments(
+    cfg: &Config,
+    workspace: &crate::config::EffectiveWorkspace,
+    depth: u8,
+) -> Vec<(&'static str, String)> {
     let plan_reminder = (workspace.permissions.mode() == crate::permissions::Mode::Plan)
         .then(|| PLAN_MODE_REMINDER.to_string());
     let skills_catalog = (depth == 0)
         .then(|| crate::skills::skills_catalog(&cfg.skills))
         .flatten();
-    let parts: Vec<String> = [
-        plan_reminder,
-        cfg.project_instructions.clone(),
-        skills_catalog,
-        crate::tools::deferred_notice(cfg),
+    [
+        ("plan-mode reminder", plan_reminder),
+        ("project instructions", cfg.project_instructions.clone()),
+        ("skills catalog", skills_catalog),
+        ("deferred-tool notice", crate::tools::deferred_notice(cfg)),
     ]
     .into_iter()
-    .flatten()
-    .collect();
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
+    .filter_map(|(label, text)| text.map(|text| (label, text)))
+    .collect()
+}
+
+/// The depth-0 tool array a turn started now would send. `/context` sizes it.
+pub(crate) fn top_level_tool_defs(
+    cfg: &Arc<Config>,
+) -> std::result::Result<Vec<kloop_protocol::ToolDef>, String> {
+    build_tools(cfg, 0, &TurnOptions::default()).map(|(tools, _)| tools)
 }
 
 #[cfg(test)]
