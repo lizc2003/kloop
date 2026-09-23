@@ -3985,6 +3985,61 @@ async fn late_steering_keeps_the_turn_going() {
     assert!(cfg.inbox.is_empty(), "the queue was drained");
 }
 
+/// A steer admitted into a turn's window during its final sampling is the
+/// turn's to answer; once the turn has taken its last look at the queue, the
+/// same turn's window is shut, so a steer naming it is refused instead of
+/// being acknowledged and left for a later turn.
+#[tokio::test]
+async fn the_turn_that_admits_a_steer_answers_it_and_then_closes_its_window() {
+    use crate::inbox::SteerRefused;
+    use kloop_provider::MockTurn;
+    use std::sync::Mutex;
+
+    struct SteerForTurnUi {
+        inbox: Arc<Inbox>,
+        admitted: Mutex<Option<Result<Option<u64>, SteerRefused>>>,
+    }
+    impl Ui for SteerForTurnUi {
+        fn emit(&self, ev: &Event) {
+            let mut admitted = self.admitted.lock().unwrap();
+            if matches!(
+                ev,
+                Event::ItemDelta {
+                    delta: Delta::Text(_),
+                    ..
+                }
+            ) && admitted.is_none()
+            {
+                *admitted = Some(self.inbox.push_steer("wait, also do Y".into(), Some(1)));
+            }
+        }
+    }
+
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Blocks(text("first attempt")),
+        MockTurn::Blocks(text("addressed the steer")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "steer-window");
+    cfg.inbox.open_steer_window(1);
+    let recorder = Arc::new(SteerForTurnUi {
+        inbox: cfg.inbox.clone(),
+        admitted: Mutex::new(None),
+    });
+    let ui: Arc<dyn Ui> = recorder.clone();
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("start"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(*recorder.admitted.lock().unwrap(), Some(Ok(Some(1))));
+    assert_eq!(outcome.final_text, "addressed the steer");
+    assert_eq!(outcome.rounds, 2);
+    assert_eq!(
+        cfg.inbox.push_steer("too late".into(), Some(1)),
+        Err(SteerRefused::NoActiveTurn)
+    );
+}
+
 /// A running sub-agent must not drain the PARENT's steering queue: each
 /// agent gets its own inbox (run_agent resets it on the cloned Config).
 /// A steer pushed to the parent while the sub-agent works is invisible to

@@ -1213,7 +1213,8 @@ sub-agent sidechains hidden, `limit` capped at 500); `thread/read {thread_id}` �
 `{thread:{id,cwd,route,resumable,forked_from,messages,terminals}}`;
 `thread/resume {thread_id}` and `thread/fork {thread_id, cut?}` →
 `{thread:{id,cwd,route,resumable}, message_count}`; `turn/start {thread_id,
-input}` → `{turn:{id}}`, `turn/steer {thread_id, input}` → `{turn_id}`,
+input}` → `{turn:{id}}`, `turn/steer {thread_id, input, expected_turn_id?}` →
+`{turn_id}` (see **Steering** for the window it is admitted against),
 `turn/interrupt {thread_id}`. Old rollouts without route timelines are rejected,
 not migrated. A `thread_id` the client supplies must be ASCII letters, digits,
 `.`, `-` or `_` and cannot start with `.` — server-minted ids
@@ -2715,7 +2716,31 @@ Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on t
 cloned Config), so a running sub-agent never drains the parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
 a User cell); server mode enqueues via `turn/steer {thread_id, input}` (while a
 turn runs it folds in at the next round boundary; while idle the thread worker's
-inbox-activity branch allocates a delivery turn). The plain REPL cannot accept a
+inbox-activity branch allocates a delivery turn).
+
+**The steer window (plan 198).** A steer that arrives just as a turn is ending
+has a gap to fall into: after the turn's last drain (the end guard above) and
+before the server clears the running turn id, a steer used to be acknowledged
+as `{turn_id: N}` and then consumed by delivery turn N+1 — the answer was a lie,
+and a client amending turn N got a new turn opening with its amendment. The
+fix is a **steer window** kept inside the `Inbox`, under the same lock as the
+queue: the server opens it with its turn id when a turn (or delivery turn)
+starts; the end guard takes the queue with `drain_or_close_steer_window`, which
+closes the window in the same critical section when it finds nothing (finding
+something keeps the turn going, and the window open); the server also closes it
+at `turn/interrupt` and at every turn end, for the endings that never reach the
+guard. The guard checks "a local agent may not finish yet" first, so it never
+closes the window and then keeps the turn going. `turn/steer` pushes through
+`push_steer`, which reads the window in the same critical section: the returned
+`turn_id` is the window's (null when closed), so it is never a turn that has
+stopped looking. With `expected_turn_id`, the steer is enqueued only if that
+turn's window is open; otherwise nothing is enqueued and the error carries
+`data.kind` `no_active_turn` (idle, or past the last drain) or `turn_mismatch`
+(with `active_turn_id`). Whether to re-send as a plain steer is the client's
+call; the server never retries. Without `expected_turn_id` the behavior is
+unchanged. The TUI and plain frontends never open a window — the Enter-while-
+running steer is not conditional — so the guard's close is a no-op for them,
+and a sub-agent's fresh inbox never has one. The plain REPL cannot accept a
 second stdin line while `run_turn` owns the foreground, so it still has no
 mid-turn steering input; its idle loop does select inbox activity for background
 result/scheduler delivery. All three share the same boundary-safe drain path.

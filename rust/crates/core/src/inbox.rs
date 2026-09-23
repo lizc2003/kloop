@@ -272,16 +272,62 @@ impl InboxItem {
 /// a background sub-agent reinjects into a *clone of the parent's* inbox held
 /// separately from its own.
 pub struct Inbox {
-    items: Mutex<Vec<InboxItem>>,
+    pending: Mutex<Pending>,
     local_pending: AtomicUsize,
     activity: watch::Sender<u64>,
+}
+
+/// The queue and the steer window share one lock: a steer is admitted against
+/// the window and pushed in the same critical section in which the final drain
+/// takes the queue and closes the window, so no steer can be told "turn N" and
+/// then miss turn N's last drain.
+#[derive(Default)]
+struct Pending {
+    items: Vec<InboxItem>,
+    /// The turn a steer pushed now is guaranteed to reach, if any. Only the
+    /// native server opens it (with its own turn ids); the agent loop closes it
+    /// at the final drain, where the turn stops looking at the queue.
+    steer_window: Option<u64>,
+}
+
+/// Why a steer that named its turn was not enqueued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerRefused {
+    /// No turn is taking steers: idle, or the turn already passed its last
+    /// drain and is only winding down.
+    NoActiveTurn,
+    /// A different turn is taking steers.
+    TurnMismatch { active: u64 },
+}
+
+impl SteerRefused {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::NoActiveTurn => "no_active_turn",
+            Self::TurnMismatch { .. } => "turn_mismatch",
+        }
+    }
+}
+
+impl std::fmt::Display for SteerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveTurn => f.write_str("no turn is taking steering input"),
+            Self::TurnMismatch { active } => {
+                write!(
+                    f,
+                    "turn {active} is taking steering input, not the expected turn"
+                )
+            }
+        }
+    }
 }
 
 impl Default for Inbox {
     fn default() -> Self {
         let (activity, _) = watch::channel(0);
         Self {
-            items: Mutex::new(Vec::new()),
+            pending: Mutex::new(Pending::default()),
             local_pending: AtomicUsize::new(0),
             activity,
         }
@@ -298,8 +344,45 @@ impl Inbox {
     /// before checking the queue, so a racing push is observed without retaining
     /// a stale permit after another consumer drains the item.
     pub fn push(&self, item: InboxItem) {
-        self.items.lock().unwrap().push(item);
+        self.pending.lock().unwrap().items.push(item);
         self.advance_activity();
+    }
+
+    /// Enqueue steering text, admitted against the steer window. With
+    /// `expected`, the steer is enqueued only if that turn's window is open;
+    /// without it, it is always enqueued. Either way the answer is the turn the
+    /// steer will reach, or `None` when it will instead start (or wait for) a
+    /// later turn.
+    pub fn push_steer(
+        &self,
+        text: String,
+        expected: Option<u64>,
+    ) -> Result<Option<u64>, SteerRefused> {
+        let window = {
+            let mut pending = self.pending.lock().unwrap();
+            let window = pending.steer_window;
+            match (expected, window) {
+                (None, _) => {}
+                (Some(expected), Some(active)) if expected == active => {}
+                (Some(_), None) => return Err(SteerRefused::NoActiveTurn),
+                (Some(_), Some(active)) => return Err(SteerRefused::TurnMismatch { active }),
+            }
+            pending.items.push(InboxItem::Steer(text));
+            window
+        };
+        self.advance_activity();
+        Ok(window)
+    }
+
+    /// A turn has started and will drain this queue before it ends.
+    pub fn open_steer_window(&self, turn: u64) {
+        self.pending.lock().unwrap().steer_window = Some(turn);
+    }
+
+    /// The turn will not drain this queue again (it ended, or was interrupted).
+    /// Idempotent; the final drain usually got here first.
+    pub fn close_steer_window(&self) {
+        self.pending.lock().unwrap().steer_window = None;
     }
 
     /// Wake a waiter without enqueuing anything. Used when a sub-agent reaches a
@@ -311,11 +394,24 @@ impl Inbox {
 
     /// Take everything pending, leaving the queue empty.
     pub fn drain(&self) -> Vec<InboxItem> {
-        std::mem::take(&mut *self.items.lock().unwrap())
+        std::mem::take(&mut self.pending.lock().unwrap().items)
+    }
+
+    /// The last drain of a turn that is about to end: take everything, and if
+    /// there was nothing, close the steer window in the same critical section.
+    /// Anything taken keeps the turn going, so the window stays open.
+    pub(crate) fn drain_or_close_steer_window(&self) -> Vec<InboxItem> {
+        let mut pending = self.pending.lock().unwrap();
+        let items = std::mem::take(&mut pending.items);
+        if items.is_empty() {
+            pending.steer_window = None;
+        }
+        items
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.lock().unwrap().is_empty() && self.local_pending.load(Ordering::Acquire) == 0
+        self.pending.lock().unwrap().items.is_empty()
+            && self.local_pending.load(Ordering::Acquire) == 0
     }
 
     pub(crate) fn add_local_pending(&self, count: usize) {
@@ -355,6 +451,59 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steer_naming_its_turn_is_admitted_only_by_that_turns_window() {
+        let inbox = Inbox::default();
+        // Idle: a conditional steer is refused, an unconditional one is taken
+        // and reported as reaching no particular turn.
+        assert_eq!(
+            inbox.push_steer("late".into(), Some(3)),
+            Err(SteerRefused::NoActiveTurn)
+        );
+        assert!(inbox.is_empty(), "a refused steer enqueues nothing");
+        assert_eq!(inbox.push_steer("idle".into(), None), Ok(None));
+        assert_eq!(inbox.drain(), vec![InboxItem::Steer("idle".into())]);
+
+        inbox.open_steer_window(4);
+        assert_eq!(
+            inbox.push_steer("stale".into(), Some(3)),
+            Err(SteerRefused::TurnMismatch { active: 4 })
+        );
+        assert_eq!(inbox.push_steer("amend".into(), Some(4)), Ok(Some(4)));
+        assert_eq!(inbox.push_steer("also".into(), None), Ok(Some(4)));
+        assert_eq!(
+            inbox.drain(),
+            vec![
+                InboxItem::Steer("amend".into()),
+                InboxItem::Steer("also".into())
+            ]
+        );
+    }
+
+    /// The window closes in the same critical section as the drain that found
+    /// nothing, so a steer after it is refused instead of being acknowledged
+    /// for a turn that will not look again. A drain that finds something keeps
+    /// the turn going, and the window with it.
+    #[test]
+    fn the_final_drain_closes_the_window_only_when_it_ends_the_turn() {
+        let inbox = Inbox::default();
+        inbox.open_steer_window(7);
+        inbox.push(InboxItem::Steer("keep going".into()));
+        assert_eq!(
+            inbox.drain_or_close_steer_window(),
+            vec![InboxItem::Steer("keep going".into())]
+        );
+        assert_eq!(inbox.push_steer("still 7".into(), Some(7)), Ok(Some(7)));
+        assert_eq!(inbox.drain().len(), 1);
+
+        assert_eq!(inbox.drain_or_close_steer_window(), Vec::new());
+        assert_eq!(
+            inbox.push_steer("too late".into(), Some(7)),
+            Err(SteerRefused::NoActiveTurn)
+        );
+        assert_eq!(inbox.push_steer("next turn".into(), None), Ok(None));
+    }
 
     /// An over-release used to wrap the counter, and a wrapped counter leaves
     /// `is_empty()` false forever — the TUI's idle autowake then starts a

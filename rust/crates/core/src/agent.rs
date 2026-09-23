@@ -830,11 +830,17 @@ impl Turn<'_> {
 
     /// A steer that landed during this round, or a local agent that is not
     /// allowed to finish on its own, both mean the turn is not over.
+    ///
+    /// The inbox drain goes last and closes the steer window when it finds
+    /// nothing: past it the turn only winds down, so a steer naming this turn
+    /// must be refused rather than acknowledged and left for the next one.
     fn keep_going_for_late_work(&mut self) -> Option<RoundStep> {
-        if drain_inbox(&self.cfg.inbox, self.history, self.ui) {
+        if !self.cfg.local_agent.can_finish_naturally() {
+            drain_inbox(&self.cfg.inbox, self.history, self.ui);
             return Some(RoundStep::Retry);
         }
-        if !self.cfg.local_agent.can_finish_naturally() {
+        let pending = self.cfg.inbox.drain_or_close_steer_window();
+        if inject_pending(pending, self.history, self.ui) {
             return Some(RoundStep::Retry);
         }
         None
@@ -1279,7 +1285,15 @@ limit. Continue exactly where you left off; break the remaining work into smalle
 /// never mid-request, so an in-flight sampling never sees a partial write and
 /// tool_result blocks are never interleaved with the injected user message.
 fn drain_inbox(inbox: &Inbox, history: &mut History, ui: &Arc<dyn Ui>) -> bool {
-    let pending = inbox.drain();
+    inject_pending(inbox.drain(), history, ui)
+}
+
+/// The body of [`drain_inbox`], for a drain that has already taken the items.
+fn inject_pending(
+    pending: Vec<crate::inbox::InboxItem>,
+    history: &mut History,
+    ui: &Arc<dyn Ui>,
+) -> bool {
     if pending.is_empty() {
         return false;
     }

@@ -83,4 +83,29 @@
 
 ## 七、完成记录
 
-(未开工)
+✅ 2026-09-23,用户选**做法甲**(动 core 的 `Inbox`)。提交号见本条所在提交。
+
+- **第一节的钉子先确认了**:空闲插话当场起 delivery turn,代码注释与 HANDOFF 两条写的
+  "等下一次 `turn/start`"是错的。现在由 `steer_expecting_a_finished_turn_is_refused_and_starts_nothing`
+  钉住(无条件插话 → `turn_id: null` → 下一个 turn id 被 delivery turn 用掉)。
+- **core**:`Inbox` 的队列与 `steer_window: Option<u64>` 同锁(`Pending`)。`push_steer(text,
+  expected)` 在同一临界区准入并入队,返回窗口值;`drain_or_close_steer_window` 取空时同锁关窗;
+  `open/close_steer_window`。`SteerRefused::{NoActiveTurn, TurnMismatch{active}}` 带 `kind()`。
+- **收尾 guard 改了顺序**:`keep_going_for_late_work` 原来先 drain 再问"本地 agent 能不能结束";
+  现在先问后者(不能结束就普通 drain + Retry,不关窗),最后一次 drain 才用关窗版本。
+  两种顺序对原有行为等价,但旧顺序会"关了窗又续跑"。
+- **server**:`turn/start` 与 delivery turn 开窗;`turn/interrupt` 立刻关窗;worker 在每个回合
+  结束时再关一次(错误、max rounds、中断这些走不到 guard 的结束方式)。`turn/steer` 与
+  provider switch 一样在分发里单独处理,拒绝时 `-32000` + `data.kind`(`turn_mismatch` 另带
+  `active_turn_id`)。
+- **第三节第 3 点(不带参数时返回值说实话)**:返回的 `turn_id` 就是准入时的窗口值,关窗之后
+  返回 null。旧客户端原来在空闲时本来就拿到 null,只是那个空档里的回答从 N 变成了 null。
+- **"不做"照旧**:不重试、`turn/interrupt` 不加 `expected_turn_id`、TUI/plain 路径不动
+  (它们从不开窗,guard 的关窗对它们是 no-op)。
+- 测试:core 3 条(`push_steer` 准入矩阵、最后一次 drain 只在结束回合时关窗、agent 层"准入的
+  插话由该轮回答、之后该轮拒绝")+ server 3 条(运行中:错号拒绝整对象断言、对号折入;结束后:
+  带号拒绝且不起回合、不带号 → null + delivery turn;中断后带号拒绝,对完成通知与拒绝的先后
+  不做假设)。`make check` 全绿。
+- **一个测试坑**:中断那条第一版在 `recv_until` 里等 `turn/completed`,但它可能先于插话的
+  响应到达、被前一次 `recv_until` 吃掉,于是超时。两个事件的先后本来就不确定(两处关窗都能
+  让插话被拒),测试改成两者都收到为止、不假设顺序。

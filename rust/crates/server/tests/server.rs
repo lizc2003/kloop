@@ -3099,6 +3099,201 @@ async fn steer_folds_into_a_running_turn() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// The steering texts a session's rollout ended up with, in order.
+fn steered_texts(dirs: &TestDirs, thread_id: &str) -> Vec<String> {
+    let messages =
+        kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
+            .unwrap();
+    messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } if text.contains(kloop_core::inbox::STEERING_PREFIX) => {
+                Some(kloop_core::inbox::steering_body(text).to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn steer(client: &mut TestClient, params: Value) -> Value {
+    let id = client.request("turn/steer", params).await;
+    let log = client.recv_until(|m| m["id"] == id).await;
+    let mut response = log.last().unwrap().clone();
+    response.as_object_mut().unwrap().remove("id");
+    response
+}
+
+/// A steer that names the running turn folds into it; one that names any
+/// other turn is refused with the active turn's id and enqueues nothing.
+#[tokio::test]
+async fn steer_expecting_a_turn_is_admitted_only_by_that_turn() {
+    let dirs = test_dirs("steer-expected");
+    let target = dirs.root.join("steer-expected.txt");
+    let script = vec![
+        vec![tool_use(
+            "t1",
+            "write_file",
+            json!({"path": target.to_str().unwrap(), "content": "x"}),
+        )],
+        vec![text("done")],
+    ];
+    let mut client = start_server(factory(script, dirs.offload.clone(), true), &dirs);
+    let thread_id = client.init_and_start().await;
+    let start_id = client
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
+        .await;
+    let log = client
+        .recv_until(|m| m["method"] == "approval/request")
+        .await;
+    let turn_id = log.iter().find(|m| m["id"] == start_id).unwrap()["result"]["turn"]["id"]
+        .as_u64()
+        .unwrap();
+    let srv_id = log.last().unwrap()["id"].as_i64().unwrap();
+
+    assert_eq!(
+        steer(
+            &mut client,
+            json!({"thread_id": thread_id, "input": "stale", "expected_turn_id": turn_id + 1}),
+        )
+        .await,
+        json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": format!("turn {turn_id} is taking steering input, not the expected turn"),
+                "data": {"kind": "turn_mismatch", "active_turn_id": turn_id},
+            },
+        })
+    );
+    assert_eq!(
+        steer(
+            &mut client,
+            json!({"thread_id": thread_id, "input": "amend", "expected_turn_id": turn_id}),
+        )
+        .await,
+        json!({"jsonrpc": "2.0", "result": {"turn_id": turn_id}})
+    );
+
+    client
+        .send(json!({"jsonrpc": "2.0", "id": srv_id, "result": {"decision": "accept"}}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert_eq!(log.last().unwrap()["params"]["turn"]["id"], turn_id);
+    client.shutdown().await;
+    assert_eq!(steered_texts(&dirs, &thread_id), ["amend"]);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// After a turn ends, a steer naming it is refused and starts nothing; a
+/// steer naming no turn is answered with null and delivered by a fresh
+/// delivery turn, which is what `expected_turn_id` exists to let a client
+/// avoid.
+#[tokio::test]
+async fn steer_expecting_a_finished_turn_is_refused_and_starts_nothing() {
+    let dirs = test_dirs("steer-finished");
+    let script = vec![vec![text("done")], vec![text("took the idle steer")]];
+    let mut client = start_server(factory(script, dirs.offload.clone(), false), &dirs);
+    let thread_id = client.init_and_start().await;
+    let start_id = client
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    let turn_id = log.iter().find(|m| m["id"] == start_id).unwrap()["result"]["turn"]["id"]
+        .as_u64()
+        .unwrap();
+
+    assert_eq!(
+        steer(
+            &mut client,
+            json!({"thread_id": thread_id, "input": "amend", "expected_turn_id": turn_id}),
+        )
+        .await,
+        json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": "no turn is taking steering input",
+                "data": {"kind": "no_active_turn"},
+            },
+        })
+    );
+    assert_eq!(
+        steer(
+            &mut client,
+            json!({"thread_id": thread_id, "input": "idle"})
+        )
+        .await,
+        json!({"jsonrpc": "2.0", "result": {"turn_id": null}})
+    );
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    let started: Vec<&Value> = log
+        .iter()
+        .filter(|m| m["method"] == "turn/started")
+        .collect();
+    assert_eq!(
+        started.len(),
+        1,
+        "only the idle steer starts a turn: {log:?}"
+    );
+    assert_eq!(started[0]["params"]["turn"]["id"], turn_id + 1);
+    client.shutdown().await;
+    assert_eq!(steered_texts(&dirs, &thread_id), ["idle"]);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// An interrupt closes the turn's window at once, before the turn has
+/// finished unwinding.
+#[tokio::test]
+async fn steer_expecting_an_interrupted_turn_is_refused() {
+    let dirs = test_dirs("steer-interrupted");
+    let target = dirs.root.join("steer-interrupted.txt");
+    let script = vec![vec![tool_use(
+        "t1",
+        "write_file",
+        json!({"path": target.to_str().unwrap(), "content": "x"}),
+    )]];
+    let mut client = start_server(factory(script, dirs.offload.clone(), true), &dirs);
+    let thread_id = client.init_and_start().await;
+    let start_id = client
+        .request("turn/start", json!({"thread_id": thread_id, "input": "go"}))
+        .await;
+    let log = client
+        .recv_until(|m| m["method"] == "approval/request")
+        .await;
+    let turn_id = log.iter().find(|m| m["id"] == start_id).unwrap()["result"]["turn"]["id"]
+        .as_u64()
+        .unwrap();
+    client
+        .request("turn/interrupt", json!({"thread_id": thread_id}))
+        .await;
+    let steer_id = client
+        .request(
+            "turn/steer",
+            json!({"thread_id": thread_id, "input": "amend", "expected_turn_id": turn_id}),
+        )
+        .await;
+    // Whether the turn finishes unwinding before or after the steer is read,
+    // its window is already shut: collect both, in whatever order they come.
+    let (mut refused, mut completed) = (None, None);
+    while refused.is_none() || completed.is_none() {
+        let message = client.recv().await;
+        if message["id"] == steer_id {
+            refused = Some(message);
+        } else if message["method"] == "turn/completed" {
+            completed = Some(message);
+        }
+    }
+    assert_eq!(
+        refused.unwrap()["error"]["data"],
+        json!({"kind": "no_active_turn"})
+    );
+    assert_eq!(completed.unwrap()["params"]["turn"]["status"], "aborted");
+    client.shutdown().await;
+    assert!(steered_texts(&dirs, &thread_id).is_empty());
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 /// `turn/steer` to a nonexistent thread is a clean error, not a panic.
 #[tokio::test]
 async fn steer_to_a_missing_thread_errors() {

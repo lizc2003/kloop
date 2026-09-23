@@ -54,7 +54,6 @@ use kloop_core::event::Event;
 use kloop_core::history::History;
 use kloop_core::history::ProviderSwitchError;
 use kloop_core::inbox::Inbox;
-use kloop_core::inbox::InboxItem;
 use kloop_core::interaction::QuestionAnswer;
 use kloop_core::interaction::QuestionOutcome;
 use kloop_core::interaction::QuestionRequest;
@@ -384,8 +383,9 @@ struct ThreadHandle {
     current_cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// The thread's step-boundary injection queue (a clone of `Config.inbox`,
     /// which the worker's turns drain). `turn/steer` pushes here; the text is
-    /// delivered as a user message at the next round boundary — during a
-    /// running turn, or at the start of the next `turn/start` if idle.
+    /// delivered as a user message at the next round boundary of the running
+    /// turn, or, when idle, by a delivery turn the worker starts for it. The
+    /// server opens its steer window for each turn it runs.
     inbox: Arc<Inbox>,
     /// Allocates monotonic turn ids for this thread (from 1).
     turn_seq: Arc<AtomicU64>,
@@ -514,6 +514,24 @@ impl Server {
                 data: None,
             });
         }
+        if method == "turn/steer" {
+            let outgoing = match self.turn_steer(&params) {
+                Ok(result) => Outgoing::Response { id, result },
+                Err(SteerError::Request((code, message))) => Outgoing::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                    data: None,
+                },
+                Err(SteerError::Refused(refused)) => Outgoing::Error {
+                    id: Some(id),
+                    code: wire::SERVER_ERROR,
+                    message: refused.to_string(),
+                    data: Some(steer_refused_data(refused)),
+                },
+            };
+            return self.send(outgoing);
+        }
         if method == "thread/provider/switch" {
             if let Err(error) = self.queue_thread_provider_switch(id.clone(), &params) {
                 self.send(Outgoing::Error {
@@ -538,7 +556,6 @@ impl Server {
             "skills/list" => self.skills_list(&params),
             "mcp_server_status/list" => self.mcp_server_status_list(&params),
             "turn/start" => self.turn_start(&params),
-            "turn/steer" => self.turn_steer(&params),
             "turn/interrupt" => self.turn_interrupt(&params),
             _ => Err((wire::METHOD_NOT_FOUND, format!("unknown method '{method}'"))),
         };
@@ -1157,6 +1174,7 @@ impl Server {
         // turn, so a `turn/steer` racing in sees the running turn's id.
         let turn_id = handle.turn_seq.fetch_add(1, Ordering::SeqCst);
         *handle.turn.lock().unwrap() = Some(turn_id);
+        handle.inbox.open_steer_window(turn_id);
         let cancel = CancellationToken::new();
         *handle.current_cancel.lock().unwrap() = Some(cancel.clone());
         handle
@@ -1173,6 +1191,7 @@ impl Server {
             }))
             .is_err()
         {
+            handle.inbox.close_steer_window();
             handle.running.store(false, Ordering::SeqCst);
             *handle.current_cancel.lock().unwrap() = None;
             *handle.turn.lock().unwrap() = None;
@@ -1183,25 +1202,41 @@ impl Server {
     }
 
     /// Enqueue steering text typed while a turn runs (or between turns). Unlike
-    /// `turn/start` this never starts a turn and never checks the running flag:
-    /// the worker's turn loop drains the inbox at round boundaries, so a steer
-    /// pushed during a running turn folds into it, and one pushed while idle is
-    /// delivered at the top of the next `turn/start`. There is no autowake in
-    /// client-driven server mode, so an idle steer waits for that next turn.
-    /// Returns the running turn's id, or null when idle. (`expected_turn_id`, if
-    /// the client sends it, is accepted and ignored for now.)
-    fn turn_steer(&mut self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "thread_id")?;
-        let (text, _images) = parse_input(params)?;
+    /// `turn/start` this never starts a turn itself and never checks the
+    /// running flag: a steer admitted into a running turn's window folds in at
+    /// its next round boundary, and one pushed while idle wakes the worker's
+    /// inbox branch, which starts a delivery turn for it.
+    ///
+    /// `expected_turn_id` makes the steer conditional: it is enqueued only while
+    /// that turn is still taking steers, and otherwise refused with nothing
+    /// enqueued — so a steer meant to amend a turn that has already finished is
+    /// never delivered as the start of a new one. Returns the turn the steer
+    /// will reach, or null when a later turn will deliver it; the answer is
+    /// read under the same lock the turn's final drain closes the window with,
+    /// so it is never a turn that has already stopped looking.
+    fn turn_steer(&mut self, params: &Value) -> Result<Value, SteerError> {
+        let thread_id = str_param(params, "thread_id").map_err(SteerError::Request)?;
+        let expected = match params.get("expected_turn_id") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                SteerError::Request((
+                    wire::INVALID_PARAMS,
+                    "expected_turn_id must be a non-negative integer".into(),
+                ))
+            })?),
+        };
+        let (text, _images) = parse_input(params).map_err(SteerError::Request)?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
-            (
+            SteerError::Request((
                 wire::SERVER_ERROR,
                 format!("no active thread '{thread_id}'"),
-            )
+            ))
         })?;
         let input = Value::String(text.clone());
-        handle.inbox.push(InboxItem::Steer(text));
-        let turn_id = *handle.turn.lock().unwrap();
+        let turn_id = handle
+            .inbox
+            .push_steer(text, expected)
+            .map_err(SteerError::Refused)?;
         handle.projection.record_input(turn_id, &input);
         Ok(json!({"turn_id": turn_id}))
     }
@@ -1214,6 +1249,9 @@ impl Server {
                 format!("no active thread '{thread_id}'"),
             )
         })?;
+        // An interrupted turn stops draining before it stops running; a steer
+        // naming it from here on must not be acknowledged as reaching it.
+        handle.inbox.close_steer_window();
         if let Some(cancel) = handle.current_cancel.lock().unwrap().as_ref() {
             cancel.cancel();
         }
@@ -1367,6 +1405,22 @@ impl Server {
 }
 
 type MethodResult = Result<Value, (i64, String)>;
+
+/// `turn/steer` is the one method besides the provider switch whose refusal
+/// carries a machine-readable `data.kind`, so it has its own error type.
+enum SteerError {
+    Request((i64, String)),
+    Refused(kloop_core::inbox::SteerRefused),
+}
+
+fn steer_refused_data(refused: kloop_core::inbox::SteerRefused) -> Value {
+    match refused {
+        kloop_core::inbox::SteerRefused::NoActiveTurn => json!({"kind": refused.kind()}),
+        kloop_core::inbox::SteerRefused::TurnMismatch { active } => {
+            json!({"kind": refused.kind(), "active_turn_id": active})
+        }
+    }
+}
 
 #[derive(Debug)]
 enum SwitchRequestError {
@@ -1683,6 +1737,7 @@ async fn thread_worker(
                 }
                 let id = turn_seq.fetch_add(1, Ordering::SeqCst);
                 *ui.turn.lock().unwrap() = Some(id);
+                inbox.open_steer_window(id);
                 let cancel = CancellationToken::new();
                 *current_cancel.lock().unwrap() = Some(cancel.clone());
                 ThreadWorkerMsg::Turn(Turn {
@@ -1765,6 +1820,7 @@ async fn thread_worker(
                 &ui,
             );
             ui.notify("system", json!({"text": output}));
+            inbox.close_steer_window();
             *current_cancel.lock().unwrap() = None;
             running.store(false, Ordering::SeqCst);
             *ui.turn.lock().unwrap() = None;
@@ -1785,6 +1841,9 @@ async fn thread_worker(
             "turn/completed",
             wire::turn_completed_params(turn.id, &reason),
         );
+        // Usually already closed by the final drain; this covers the endings
+        // that never reach it (error, max rounds, interrupt).
+        inbox.close_steer_window();
         *current_cancel.lock().unwrap() = None;
         running.store(false, Ordering::SeqCst);
         *ui.turn.lock().unwrap() = None;
