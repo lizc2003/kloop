@@ -13,6 +13,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **grok-build** | `refs/grok-build`(xAI 官方,固定 `37949780c144e37df692e3d669051a21fec24f20`;其 `SOURCE_REV` 指向上游 monorepo `c4ea71cf`) | **同语言同形态的第二个生产参考**(175 万行 Rust,与 codex 同量级)。重点看 PTY harness 分层(`xai-grok-pager-pty-harness`,4 万行:真 PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务)、`xai-codebase-graph`(tree-sitter 符号索引 + 增量重建 + mmap)、`xai-hunk-tracker`(agent/外部改动归因)、`xai-fast-worktree`(CoW + BTRFS O(1) 快照)、hooks 的 16 事件 macro 表驱动、permission 的 `bash_command_splitting`/`exec_risk`/`managed_policy`、`xai-sqlite-journal` 的 NFS 教训;不抄 hub/computer-hub 远程 workspace 面、plugin-marketplace、voice/announcements/mixpanel 遥测 |
 | **deepseek-harness** | `refs/deepseek-harness`(DeepSeek 官方,固定 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`) | **唯一非 Rust 参考**(79 万行 TS),代码不可移植,价值全在边界语义:沙箱 fail-closed(`SANDBOX_UNAVAILABLE` / full-partial 强制等级 / 被拒后申请更宽一档)、spill 三层(失败退回内联)、guard(重复调用 advisory、cooperative 超时)、session-query(cwd 完全相同才允许跨会话)、session 格式迁移链。**不抄 Cordis「万物皆插件」+ profile/bundle/patch 组合**——kloop 是单体 Rust,那会把编译期检查换成运行期装配 |
 | **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留两条:① 文件体积棘轮的机制(→ plan 176);② microcompact 的一份具体取值。它的项目级 hook 信任模型**读过、判不做**(有便宜十倍的替代)。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
+| **chord（待退休）** | `refs/chord`(`keakon/chord`,MIT,Go,固定 `cce05db7151f12a50a1e3334edb5e53caa81e54e`) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。**clone 留到请求级裁剪 plan 做完即退休,不跟 HEAD**,见本文 2026-09-23 节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -604,6 +605,78 @@ kloop 执行命令。开这扇门(hook 声明随仓库分发)的收益对单用�
 因果图 / 控制流图 / hand-off 图与 mermaid。这条路线六个既有参考都没有,但整套建在 TS 编译器上,
 Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行期路线。作为"编排能否
 静态验证"的阅读材料可以,**不作补齐来源**。
+
+## chord 固定源码调研(2026-09-23,待退休)
+
+基线固定为 `keakon/chord@cce05db7151f12a50a1e3334edb5e53caa81e54e`(MIT 公开仓库,Go,个人主导,
+2026-04 起 1852 个提交)。非测试约 24 万行(agent 7.7 万 / tui 5.9 万 / tools 2.4 万 / llm 2.1 万),
+测试约 27 万行。公开仓库,照常写 `file:line`。
+
+**定位:它把力气花在"每次请求发什么、花多少钱"上,不在系统隔离上。** 六个既有参考里没有一家
+把请求级上下文裁剪和 prompt cache 经济学做到这个程度——这是它唯一的独有价值,而且是机制与
+取值,能一次提炼完。其余面(沙箱、协议、hooks、TUI、工具面)codex/grok-build 更扎实,Go 代码
+也不可移植。**不跟 HEAD**:它一天几个提交,文档已和代码对不上(见下文提前执行一条),往后跟
+看到的多是它自己的内部债。**本地 clone 留到 kloop 的请求级裁剪 plan 做完,做完即退休**;
+想看它有没有新的省 token 手段,翻 CHANGELOG 即可,不回源。README 里那张六家耗时/花费对比
+只有一个任务、一个模型、作者自测,只当方向信号。
+
+**留下的(按对 kloop 的价值排):**
+
+1. **请求级裁剪,且不破坏 prompt cache**——补 `docs/capability-report.md` microcompaction 行。
+   入口 `internal/agent/compaction_policy.go:147`(文件名有误导,裁剪逻辑住在这里)。
+   - 每次请求前按 工具类型 × 批龄 × 字节 把旧工具输出换成结构化 stub,持久化历史不改
+     (`context_reduction.go:443`、`:792`)。stub 按类有形状:read 留路径与行范围、
+     grep/glob 留 `path:line`、diff 留文件/hunk/计数、shell 留关键行与尾部。
+   - 默认阈值(`compaction.go:78-98`):shell 成功输出与 read 类 age≥2 且 >3000B;兜底
+     age≥3 且 >1500B 且工具结果 ≥6 条;失败/栈/权限类保护 4 批,diff 保护 12 批。
+     **age 的单位是主模型请求批次**,同一响应里的并行调用算一批。
+   - **cache 摊销门**:新裁剪若落在已发送前缀里先暂存,`pendingSaved × 30 ≥ 9 × tailTokens`
+     或缓存本已失效才 flush(`compaction_policy.go:640-669`);上次已裁的消息逐字节冻结复用。
+   - **仍有效的 read 永不裁**:被 edit 覆盖才标 stale、被新 read 覆盖才标 superseded
+     (`file_evidence.go:78-135`);外部改动用 hash/stat 惰性校验。
+   - **有损先落盘**:>2000B 的原文按内容寻址写 `reduced-artifacts/`,marker 带回读路径。
+   - **召回反馈**:模型重发一个结果已被裁掉的相同调用,就把它加进本会话豁免集
+     (`compaction_policy.go:535-600`)——把"裁过头"在线纠正回来。
+   - **kloop 只取 read / search / shell / diff 四类**;它的 go test 专用摘要、git 子命令识别
+     等分类器边际收益递减,不抄。
+2. **压缩里由 runtime 确定性写入的段落**。原始请求与用户约束作为 anchors 逐字从上一代
+   checkpoint 继承、不交摘要模型复述,防递归压缩逐代侵蚀(`compaction_anchors.go:13-50`);
+   todo/子代理/后台任务段由 runtime 渲染覆盖模型输出(`compaction_runner.go:316-352`);
+   摘要校验失败先 repair 一次→结构化 fallback→truncate-only,连续失败 2 次暂停自动压缩
+   3 个 turn(`compaction_failure_policy.go`)。压缩后每次请求临时注入 key files 头部
+   (单文件 12KB / 总 48KB / ≤ 剩余预算 1/4,带 revision 与 changed 标记,过当前 read 权限,
+   **不写进持久化历史**,`compaction_file_context.go:215-272`)——这正是 capability-report
+   里"压缩后重注入最近读过的文件"那行挂账的第二家做法。
+3. **token 估算的两套口径**:容量规划用最近 12 个样本 tokens/bytes 比值的中位数、钳到
+   [0.05, 1.0];**请求准入仍用 bytes/3**,因为校准比值会被裁剪拉低
+   (`internal/ctxmgr/manager.go:758-806`)。
+4. **流式只读工具提前执行**,放备选池。只限本地只读工具(`internal/tools/tool.go:121`),
+   权限须为 Allow、同流前面出现过非只读调用就停、有同步 hook 时整体关闭
+   (`internal/agent/streaming_tool_policy.go:27-86`);promote 时重评权限、此时才触发 hook、
+   比较参数哈希判漂移。**反面结论同样要留**:修改类工具的提前执行它做过、配了整套快照回滚,
+   又在 `e6d0681b` 关掉了,回滚代码现在休眠;`docs/performance.md` 仍写着修改工具可提前执行,
+   是过期文档。
+5. **可以对照的小件**:执行工具前先落盘带 tool_calls 的 assistant 消息 + 每个工具开始前 fsync
+   一条 started,恢复时缺结果的调用分 `not_started` / `outcome_unknown`
+   (`internal/agent/restore_normalize.go:94-195`);前台 shell 到 yield 时间(默认 90s)自动
+   转后台 job、按进程组归属且停止前做成员见证防 pgid 复用(`internal/tools/jobs_registry.go:498`);
+   edit 失败时给最近匹配块 + 差异行、漂移大就直接给 read offset/limit,容错不写进工具描述
+   (`internal/tools/replace_edit.go:232-313`);headless 状态快照带单调 `seq`、首条固定 `ready`。
+
+**读过、判为反例的:**
+
+- **没有 OS 沙箱**,文档自认。权限只是意图层门控:`echo *` 放行就等于放行
+  `echo x > ~/.bashrc`,web_fetch 不查 DNS 结果与重定向目标。
+- **YOLO 连 deny 一起跳过**,只留几个控制类工具照走规则(`internal/agent/main_yolo.go:13`);
+  **同步 hook fail-open**,报错/超时/坏 JSON 都按 continue(`internal/hook/engine.go:302`)。
+- **写盘不是崩溃原子的**:普通写文件 `O_TRUNC` 原地写;压缩后改写 `main.jsonl` 是先 rename
+  成 `main.pre-compress-N.jsonl` 再逐条追加、不 fsync,恢复也不自动回退备份
+  (`internal/agent/compaction_persistence.go:545-600`)。围绕它的两阶段 manifest + 指纹对账
+  盖的是次要窗口。kloop 的 append-only rollout 在这点上更稳,不学。
+- **复杂度失控**:压缩相关非测试文件 30 个约 2 万行,实验性模型驱动 checkpoint 单文件
+  2369 行且默认关闭;`internal/llm/client_retry.go` 1700 行,注释大半在解释修过的 bug。
+  大头来自"后台压缩与前台回合并行、再在 barrier 处应用"引出的一致性问题。
+- 默认把 `.env*` 复制进 worktree;ACP 模式不桥接权限请求,只能等本地超时失败。
 
 ## 调研结论(三轮调研的浓缩)
 

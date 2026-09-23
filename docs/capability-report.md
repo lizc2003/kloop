@@ -49,9 +49,9 @@ Plan 91 的 Plan 87–90 先行验收只增加 conformance evidence，不新增�
 
 | 差距项 | 收敛 | 补齐路径 | 触发条件 |
 |---|---|---|---|
-| 压缩后重注入最近读过的 ≤5 文件 | cc 单家 | 未立 | dogfood 出现"压缩后失忆"痛感 |
+| 压缩后重注入最近读过的 ≤5 文件 | cc + chord | 未立。chord 的做法:每次请求临时注入 key files 头部(单文件 12KB / 总 48KB / ≤ 剩余预算 1/4,带 revision 与 changed 标记,过 read 权限,不写进持久化历史),见 `refs/README.md` 2026-09-23 节 | dogfood 出现"压缩后失忆"痛感 |
 | 工具结果分档预算(200k/50k) | cc 单家 | **✅ Plan 154(2026-09-16)**:`ROUND_OFFLOAD_CAP_CHARS` = 4 × 单条 cap = 128000,一轮结果超预算按大小降序贪心 spill,落盘失败回退内联(cc 同款取舍) | 已完成 |
-| microcompaction | cc 单家 | 未立(offload + 轮预算已覆盖大头)。**取值已经有第二家**:ZCode 保留最近 5 条 tool result、阈值 ratio 0.9 + buffer 2000 token、闲置 60 分钟也触发、预计省不到 256 token 就不做、可压缩工具白名单、清掉的结果换成固定占位串(2026-09-21 调研,出处见 `refs/README.md` 同日节)。ZCode 大量对标 cc,不算独立双家 | 超长工具输出场景痛感 |
+| microcompaction | cc 单家 | 未立(offload + 轮预算已覆盖大头)。**取值已经有第二家**:ZCode 保留最近 5 条 tool result、阈值 ratio 0.9 + buffer 2000 token、闲置 60 分钟也触发、预计省不到 256 token 就不做、可压缩工具白名单、清掉的结果换成固定占位串(2026-09-21 调研,出处见 `refs/README.md` 同日节)。ZCode 大量对标 cc,不算独立双家。**真正独立的第二家是 chord**(2026-09-23):不是按条数清,而是每次请求按 工具类型×批龄×字节 换结构化 stub,配 cache 摊销门(`saved×30 ≥ 9×tail` 才动已发送前缀)、仍有效的 read 不裁、有损先落盘、召回反馈,阈值与出处见 `refs/README.md` 同日节 | 超长工具输出场景痛感 |
 | autocompact 警告带(剩 20k 提醒) | cc 单家 | 未立,小件 | 顺手做 |
 
 ### 2. 权限系统——✅ Project/Session/Workspace 归属已纠偏
