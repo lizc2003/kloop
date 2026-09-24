@@ -118,7 +118,7 @@ kloop 的意图屏障已经有了:带 `tool_use` 的 assistant 消息在派发�
 
 ## 九、完成记录
 
-✅ 2026-09-24,提交见下一行补记。开工问答两问:
+✅ 2026-09-24,`e2fb821`。开工问答两问:
 
 1. 第四节 fsync:**要**(用户「同意」)。`RolloutLine::needs_sync` 穷尽 match,只有 `ToolStarted` 为真,
    `append_line` 写完这一行才 `sync_data`。测试没做可注入写入器,改为直接断言 `needs_sync` 的分类
