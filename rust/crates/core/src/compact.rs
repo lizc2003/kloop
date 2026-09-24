@@ -56,12 +56,13 @@ context window]\n";
 pub const SUMMARY_PREFIX: &str =
     "[Context summary of the earlier part of this session — earlier messages were compacted]\n";
 
-/// The no-tools rule leads, and names the consequence, because this is a
-/// single-turn request that ships the session's full tool set (the tools are
-/// part of the cached prefix; dropping them would cost a full re-prefill). A
-/// model that reaches for a tool here spends the only turn it gets and returns
-/// no summary at all — cc hit this on adaptive-thinking models often enough to
-/// move the same instruction to the front of its prompt.
+/// The summary request carries this system prompt and no tools (see
+/// [`sample_summary`]), so it shares no cached prefix with the session and its
+/// input is billed in full. The no-tools rule still leads, and names the
+/// consequence: this is a single-turn request, and a model that tries to call a
+/// tool in text anyway spends the only turn it gets and returns no summary at
+/// all — cc hit this on adaptive-thinking models often enough to move the same
+/// instruction to the front of its prompt.
 const COMPACT_SYSTEM: &str = "You summarize an in-progress coding-agent session so it can \
 continue seamlessly in a fresh context window.
 
