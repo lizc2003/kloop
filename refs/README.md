@@ -15,7 +15,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留两条:① 文件体积棘轮的机制(→ plan 176);② microcompact 的一份具体取值。它的项目级 hook 信任模型**读过、判不做**(有便宜十倍的替代)。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
 | **chord（已退休）** | `keakon/chord@cce05db7151f12a50a1e3334edb5e53caa81e54e`(MIT,Go;本地 clone 已于 2026-09-24 随 plan 204 删除,要回源重新 clone 即可) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。plan 200–204 已全部吸收,不跟 HEAD,见本文 2026-09-23 节 |
 | **crush（已退休）** | `charmbracelet/crush@72654940d9e46961a7d804d536c45761e7084a08`(FSL-1.1-MIT:公开可读、两年后转 MIT,只借判据不搬代码;本地 clone 可删) | **调研即退休**。LLM 层与 step 循环在外部库 `charm.land/fantasy`,不在仓库里。强项是工程运维面(C/S 自动拉起、取消序号、流空闲超时),kloop 已有对应物。只留两条:① edit 缩进容错,与 chord 方向相反(→ plan 201 第二个开工问题);② 重复调用守卫第三家实现,**本地复算仍零打转,不做**。"安全命令"免审批是反例。见本文 2026-09-23 crush 节 |
-| **pi** | `refs/pi`(`earendil-works/pi@d5629e20489ccf770ed90b5a33941cb3b7ef24d0`,MIT,TS;plan 81 曾用 `2e4d239`) | **不作底座、不跟 HEAD**。价值在 provider 层的兼容知识(溢出模式表、429 配额排除、跨 rail tool id 规范化、模型元数据)与交互细节(多段编辑、分支摘要、follow-up 队列、composer 行编辑),外加一套成对 A/B 评测方法。核心循环/压缩/持久化 kloop 已有且更严;没有权限系统。见本文 2026-09-24 Pi 全面复查节 |
+| **pi** | `refs/pi`(`earendil-works/pi@d5629e20489ccf770ed90b5a33941cb3b7ef24d0`,MIT,TS;plan 81 曾用 `2e4d239`) | **不作底座、不跟 HEAD**。价值在 provider 层的兼容知识(溢出模式表、429 配额排除、跨 rail tool id 规范化)与交互细节(多段编辑、分支摘要、`/compact` 指令、composer 行编辑),外加一套成对 A/B 评测方法;已立 plan 206–212。核心循环/压缩/持久化 kloop 已有且更严;没有权限系统。见本文 2026-09-24 Pi 全面复查节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -96,33 +96,43 @@ server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看�
 **定位:不作底座,不跟 HEAD。** agent 核心(循环、压缩、持久化、mock provider)kloop 大多已有且
 更严;价值集中在 provider 层积累的兼容知识和几处交互细节。本地 clone 暂留,等下列候选定案后退休。
 
-**值得吸收(按收益排;均未立 plan,立之前逐条问用户):**
+**值得吸收(按收益排;2026-09-24 已立 plan 206–212,对应关系见各条;起草时核代码纠正了几处前提,已改在下面):**
 
-1. **溢出识别模式表**——`ai/src/utils/overflow.ts:37-79`,约 25 条正则覆盖各家兼容服务,另有
+1. **溢出识别模式表**(→ plan 206)——`ai/src/utils/overflow.ts:37-79`,约 25 条正则覆盖各家兼容服务,另有
    反向排除表防止把 "Too many tokens, please wait" 这类限流误判成溢出。kloop `is_overflow_message`
-   只有 3 个子串,第三方服务的溢出认不出来,reactive compaction 就不触发。注意:Anthropic 的
-   `request_too_large`(413)是请求体字节超限,不是 token 超限,别顺手改成触发压缩。
+   只有 3 个子串(其中 `maximum context length` 已覆盖 LiteLLM/OpenRouter),Gemini、xAI、Together、
+   llama.cpp、LM Studio、Kimi、Mistral、DashScope、Ollama 等的溢出认不出来,reactive compaction 就不触发。
+   **不要照抄 pi 把 `request_too_large` 算溢出**(`overflow.ts:39`):那是 Anthropic 的请求体字节超限,kloop
+   现在不重试也不压缩,是对的。pi 的排除表只认 Bedrock 前缀,裸 429 的 "Too many tokens" 仍会被它误判;
+   kloop 的 HTTP 溢出检查也不看状态码(`stream.rs:361`),plan 206 一并处理。
    `overflow.ts:151-180` 还有"请求成功但 input 超窗口"的静默溢出判定,低优先。
-2. **429 的配额/计费排除**——`ai/src/utils/retry.ts:7-24`、`provider-retry.ts:23-66`。kloop
+2. **429 的配额/计费排除**(→ plan 206)——`ai/src/utils/retry.ts:7-24`、`provider-retry.ts:23-66`。kloop
    `failure.rs` 的 HTTP 重试只看状态码,响应体带 `insufficient_quota` 的 429 会白重试;流内错误那条
    路径已拦。顺带支持 `x-should-retry` 与 `retry-after-ms`。
-3. **跨 rail 的 tool call id 规范化**——`ai/src/api/transform-messages.ts:59-63,136-142`。Anthropic
-   要 `^[a-zA-Z0-9_-]{1,64}$`,Responses 要 `fc_` 前缀;kloop 请求投影直接透传,Chat 兼容服务的
-   `functions.x:0` 形 id 切到 Anthropic 会 400。在投影层做确定性映射,不动历史。
-4. **小型内置模型元数据表**(窗口 / 最大输出 / 是否收图),替掉写死的 200k 默认;有了它才能做
-   `transform-messages.ts:12-57` 那种"目标模型不收图就换占位文本"。**不搬** `scripts/generate-models.ts`
-   那条 3500 行的目录生成管线。
-5. **多段编辑**——`coding-agent/src/core/tools/edit.ts:23-49`,`edits[]` 每段都对原文件匹配、不许
-   重叠,一次改多处。沿用 kloop `text_edit` 的三层匹配,逐段验唯一后原子写入。
-6. **被放弃分支的摘要**——`agent/src/harness/compaction/branch-summarization.ts`。kloop rewind/fork
-   后被放弃分支里学到的东西全丢;可复用 compact 的摘要链路。
-7. **follow-up 队列**——`agent/src/agent.ts:191-305`,steer(工具批次后注入)与 followUp(agent 本要
-   停时才投递)分开,运行中输入的 slash 命令也能排进 followUp。kloop 的 Enter 一律是 steer。
-8. **`/compact [instructions]`**,可带"重点保留什么"。改动很小。
-9. **composer 行编辑**——`tui/src/components/editor.ts`、`kill-ring.ts`、`undo-stack.ts`。kloop
+3. **跨 rail 的 tool call id 规范化**(→ plan 207)——`ai/src/api/transform-messages.ts:59-63,136-142`。
+   Anthropic 要 `^[a-zA-Z0-9_-]{1,64}$`;kloop 三条 rail 都直接透传,Chat 兼容服务的 `functions.x:0` 形 id
+   切到 Anthropic 会 400。`fc_` 前缀约束的是 Responses input item 的 `id`,kloop 只收发 `call_id`,不适用。
+   **pi 的映射不能照抄**:`a.b` 与 `a:b` 会撞成同一个,截断也会撞,映射表按原 id 键、后出现的覆盖先出现的。
+4. ~~**小型内置模型元数据表**~~ **与用户核过后不做**:kloop 已有 `models."<id>".context_window` 配置、
+   模型与网关取小,摘要被拒后还会把实测大小记成会话上限,内置表只省一行配置却多一份要跟版本的数据;
+   不收图的降级只对纯文本模型有用,目前发图过去是直接报错、用户看得见。
+5. **多段编辑**(→ plan 208)——`coding-agent/src/core/tools/edit.ts:23-49`,`edits[]` 每段都对原文件匹配、不许
+   重叠,一次改多处。沿用 kloop `text_edit` 的三层匹配,逐段验唯一后原子写入。**不省轮次**(同一回复里
+   的多个 `edit_file` 本来就在同一轮顺序执行);收益是原子性、一次审批一份 diff、都对原文件匹配。
+6. **被放弃分支的摘要**(→ plan 210)——`agent/src/harness/compaction/branch-summarization.ts`。kloop rewind/fork
+   后被放弃分支里学到的东西全丢;可复用 compact 的摘要链路。另:rewind 不回滚盘上的改动,新分支的
+   `FileState` 是新建的,所以被放弃分支改过哪些文件要由运行时确定性列出,不能只靠摘要模型。
+7. ~~**follow-up 队列**~~ **与用户核过后不做**——`agent/src/agent.ts:191-305`,steer(工具批次后注入)与 followUp(agent 本要
+   停时才投递)分开,运行中输入的 slash 命令也能排进 followUp。kloop 的 steering 有 end guard(模型本要
+   结束时迟到的消息被吸收、turn 继续),server 空闲时 steer 会开新 turn,差别只剩投递时机。唯一真缺口是
+   运行中输入的 `/xxx` 被当成 steering 文本发给模型——记为 HANDOFF 待办小修,不立 plan。
+8. **`/compact [instructions]`**(→ plan 209),可带"重点保留什么"。改动很小,只动 core(TUI、REPL、
+   server 都把整行交给 `commands::run_with_provider_state`)。
+9. **composer 行编辑**(→ plan 211)——`tui/src/components/editor.ts`、`kill-ring.ts`、`undo-stack.ts`。kloop
    `app.rs` 只处理方向键、Home/End、Backspace/Delete,没有 Ctrl+A/E/K/U/W、按词移动与撤销。
-10. **评测框架**——`evals/README.md`:(case, variant, model, run) 先展开成计划落盘;每臂全新容器、
-    降权 UID、看不到评分器;成对 A/B 算 lift;任一臂缺失/出错则整对作废、不计入结果但扣总分;按 run 号交替执行顺序。
+10. **评测框架**(→ plan 212,设计 plan)——`evals/README.md`:(case, variant, model, run) 先展开成计划落盘;每臂全新容器、
+    降权 UID、看不到评分器;成对 A/B 算 lift;任一臂缺失/出错则该对 blocked,整个评测集的通过率与 lift 不发布(withheld)
+    且进程非零退出;按 run 号交替执行顺序。
     kloop 没有真实模型行为评测,系统提示、工具描述、request reduction 的改动都无法量化。投入最大,长期
     价值最高;只借方法,不依赖 vitest-evals。
 
