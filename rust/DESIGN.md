@@ -384,11 +384,20 @@ changing it would rewrite a sent prefix). A repeated shell command is not such a
 signal (test suites are re-run all the time), and a repeated read is already
 handled by "superseded".
 
-Nothing is persisted. A resumed session uses its session file's mtime as the
-time of the last request — never earlier than the real one, so idleness is not
-overstated — and then re-derives its stubs, writing duplicate offload files;
-accepted. A rewind (`rebase`) keeps the state: the branch shares its prefix,
-and that prefix's cached bytes, with the conversation it came from. Sub-agents
+**Stubs are recorded before they are sent.** Each new stub is appended to the
+session file as a `request_stub` line first, and only a stub that reached the
+file is used — otherwise the result goes out whole this time (a write failure
+already stops the session file for good, so there is nothing to redo later).
+Without it, a session resumed inside the TTL would send originals where the
+provider holds stubs, and pay a cache write for the whole tail; with it, a
+resumed session sends the same bytes and writes no original twice. A resumed
+session uses its file's mtime as the time of the last request — never earlier
+than the real one, so idleness is not overstated. Recall exemptions are not
+recorded; they follow from the stubs and positions, and are worked out again.
+A rewind (`rebase`) keeps the in-memory stubs, since the branch shares its
+prefix and that prefix's cached bytes with the conversation it came from, and
+appends to the branch's file any stub frozen after the cut for a result before
+it — otherwise resuming the branch would lose it. Sub-agents
 have their own histories and therefore their own state. The token estimate
 needs no change — its anchor is the provider's count of the reduced request —
 and `/context` sizes history as sent. The summary request that compaction makes
@@ -499,6 +508,10 @@ answer. Compaction appends a `compacted` marker line carrying the
 full replacement history (the codex rollout pattern): the file stays
 append-only and auditable, replay swaps in the replacement and keeps reading,
 and superseded terminal indices are discarded with the replaced history.
+A `request_stub` line records a tool result that requests carry as a stub
+from then on (see **Request-time reduction**). Like `provider_usage` it is not
+part of the conversation — replay leaves the messages alone and collects the
+stubs beside them — and a `compacted` marker voids every stub before it.
 
 Every line carries an envelope — `id` (`{session}#{seq}`, no rand
 dependency), `parent` (previous line's id, linked across resumed runs), `ts`
@@ -625,10 +638,13 @@ loop commits explicitly when it accepts a round instead, which keeps a turn's
 usage line behind the message that paid for it.
 
 A turn that ends `Aborted` with its input still staged therefore did not
-happen: `items` and the session file are untouched, no terminal line is
-written, and the input goes back to the front end — the TUI drops the cells it
+happen: `items` are untouched, the session file gains no message and no
+terminal line, and the input goes back to the front end — the TUI drops the cells it
 echoed and refills the composer, the server discards the turn from its
-snapshot. Two interrupts stay on the recorded path. An `Error` is worth keeping
+snapshot. The one line it can leave is a `request_stub`: the request did go
+out, and the provider may hold its prefix, stub included — so that stub is
+recorded like any other, and it carries nothing of the input or of the turn.
+Two interrupts stay on the recorded path. An `Error` is worth keeping
 ("I asked this and it broke" is history, and a failure line with nothing in
 front of it reads as a failure from nowhere), and an interrupt with steering
 already queued keeps the message that steering answers.

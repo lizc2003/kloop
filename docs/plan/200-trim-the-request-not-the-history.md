@@ -231,3 +231,33 @@ Chat 轨靠后端自动前缀缓存。**请求视图里任何一个位置的字�
   与请求体无关,**不是本次引入,未处理**。
 - 没做真实 provider 下的 dogfood:阈值与"长无人值守任务可能一直不凉"的实际影响要靠后续观察。
 - chord clone 不退休:201–204 都还没做。
+
+### 后续:stub 写进会话文件(2026-09-24,同日)
+
+用户问"精简的内容存在哪",追问下去发现首版"不持久化裁剪状态"有两个代价，第一个我写进了
+DESIGN、第二个我自己没看出来:
+
+- 每次 resume 旧会话都重算一遍、重写一份 offload 原文(重复文件随 resume 次数累积);
+- **TTL 之内 resume 会破一次缓存**:旧进程发的是 stub,新进程不记得，判定缓存还热、不做新
+  裁剪，于是发原文——从第一个 stub 起整段 cache write。这正是用户定下的"不要破坏cache率"。
+
+用户同意改为持久化，并明确不考虑兼容。落地:
+
+- rollout 新增 `request_stub` 行(`FrozenStub`:`tool_use_id`、stub 原文、省下的 token、召回
+  信息)。replay 与 `provider_usage` 同形：不进消息，单独收集;`compacted` 清掉它之前的全部。
+  fork 照抄切点前的行。**格式版本号不变**(用户规矩：不升版本)。
+- **先记账、再冻结**:`StubStore::record` 写成功才冻结、才发;写失败这次发原文。写 rollout 失败
+  本来就会让 `persist` 摘掉整个 rollout,之后的会话不落盘，所以不存在"下次 resume 再补"的情况
+  ——这一点是用户追问"需要重做吗"时才核清的，我之前那句"下次 resume 会重做一次"说错了。
+- resume 把 stub 装回;TTL 内 resume 发出与之前逐字节相同的请求，不再写原文。
+- rebase 保留内存里的 stub,并把"切点前的结果、切点后才冻结"的 stub 补写进分支文件。
+- 召回豁免不存，由 stub 与位置在下次冷时重新推出(确定性)。
+- **改了一条已写明的不变式**:DESIGN "A turn that never happened" 原写"session file 不被触碰"。
+  现在一个被收回的 turn 可能留下一行 `request_stub`——请求确实发出去了、对方可能缓存了带 stub
+  的前缀，不记就回到上面那个 resume 破缓存。这行不含输入、不代表 turn,DESIGN 已改写该句。
+- 测试：纯函数层 +3(记账失败原样发、resume 装回后逐字节相同且不重写原文且召回规则随之恢复、
+  分支应补写的集合);rollout 层 +1(往返、`compacted` 清空、fork 照抄);集成层改 1 加 1(TTL 内
+  再 resume 发同一 stub 且 offload 文件数不变;rewind 后分支文件里有补写的 stub)。两处关键代码
+  各做变异检查(去掉 resume 装回、去掉 rebase 补写 → 对应测试变红)。`make check` 全绿,
+  `make mock` 输出不变。
+

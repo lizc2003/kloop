@@ -8,10 +8,11 @@ use crate::provider_route::FrozenProviderRoute;
 use crate::provider_route::ProvenanceMismatch;
 use crate::provider_route::RouteReopened;
 use crate::provider_route::SwitchError;
-use crate::request_reduction::OffloadSink;
+use crate::request_reduction::FrozenStub;
 use crate::request_reduction::ReductionState;
 use crate::request_reduction::ReductionStats;
 use crate::request_reduction::RequestReduction;
+use crate::request_reduction::StubStore;
 use crate::rollout::ResumedSession;
 use crate::rollout::Rollout;
 use crate::rollout::SessionRuntime;
@@ -90,7 +91,7 @@ pub struct History {
     /// happened after it.
     staged: Vec<Message>,
     /// Which results requests carry as stubs (`request_reduction`). Never in
-    /// `items`, never persisted.
+    /// `items`; the stubs themselves are `request_stub` lines in the rollout.
     reduction: ReductionState,
 }
 
@@ -139,7 +140,7 @@ impl History {
             next_memory_boundary: resumed.rollout.next_boundary(),
             rollout: Some(resumed.rollout),
             staged: Vec::new(),
-            reduction: ReductionState::resumed(quiet_since),
+            reduction: ReductionState::resumed(quiet_since, resumed.request_stubs),
         }
     }
 
@@ -150,16 +151,24 @@ impl History {
     /// unwritten — the branch it wrote already lives in its own file on disk.
     ///
     /// Request reduction state carries over: a branch shares its prefix — and
-    /// that prefix's cached bytes — with the conversation it was cut from, and
-    /// a stub is keyed by a `tool_use_id` the branch either still has or never
-    /// sends.
+    /// that prefix's cached bytes — with the conversation it was cut from. A
+    /// stub frozen after the cut, for a result from before it, is not in the
+    /// branch's file, so it is written there now: otherwise resuming the
+    /// branch would send that result whole where the cache holds its stub.
     pub fn rebase(&mut self, resumed: ResumedSession) {
+        let carried = self
+            .reduction
+            .unrecorded_for(&resumed.messages, &resumed.request_stubs);
+        self.reduction.adopt(resumed.request_stubs);
         self.items = resumed.messages;
         self.provider_usage = resumed.provider_usage;
         self.provider_routes = resumed.snapshot.provider_routes.clone();
         self.next_memory_boundary = resumed.rollout.next_boundary();
         self.rollout = Some(resumed.rollout);
         self.usage_anchor = None;
+        for stub in &carried {
+            self.persist(|rollout| rollout.append_request_stub(stub));
+        }
     }
 
     /// Hold this turn's input outside the conversation until the turn produces
@@ -345,8 +354,11 @@ impl History {
     ) -> Result<Vec<Message>, kloop_provider::ProviderFailure> {
         let mut view = self.provider_request_view(attempt)?;
         if let Some(request) = reduction {
-            let mut sink = OffloadDir(&self.offload_dir);
-            crate::request_reduction::reduce(&mut view, &mut self.reduction, request, &mut sink);
+            let mut store = SessionStubStore {
+                offload_dir: &self.offload_dir,
+                rollout: &mut self.rollout,
+            };
+            crate::request_reduction::reduce(&mut view, &mut self.reduction, request, &mut store);
         }
         Ok(view)
     }
@@ -558,13 +570,7 @@ impl History {
     /// Persistence must never take down the live session: a failed write
     /// drops the rollout and the session continues in memory only.
     fn persist(&mut self, write: impl FnOnce(&mut Rollout) -> std::io::Result<()>) {
-        let Some(rollout) = &mut self.rollout else {
-            return;
-        };
-        if let Err(e) = write(rollout) {
-            eprintln!("[session persistence failed ({e}); continuing without it]");
-            self.rollout = None;
-        }
+        persist_into(&mut self.rollout, write);
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -793,11 +799,38 @@ fn write_offload_file(dir: &Path, content: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-struct OffloadDir<'a>(&'a Path);
+/// Write through the session file; on failure stop persisting for the rest of
+/// the session and say so once. Returns whether the line reached the file —
+/// `true` too for a history that has no file, where nothing is ever lost.
+fn persist_into(
+    rollout: &mut Option<Rollout>,
+    write: impl FnOnce(&mut Rollout) -> std::io::Result<()>,
+) -> bool {
+    let Some(file) = rollout else {
+        return true;
+    };
+    match write(file) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[session persistence failed ({e}); continuing without it]");
+            *rollout = None;
+            false
+        }
+    }
+}
 
-impl OffloadSink for OffloadDir<'_> {
-    fn save(&mut self, content: &str) -> std::io::Result<PathBuf> {
-        write_offload_file(self.0, content)
+struct SessionStubStore<'a> {
+    offload_dir: &'a Path,
+    rollout: &'a mut Option<Rollout>,
+}
+
+impl StubStore for SessionStubStore<'_> {
+    fn save_original(&mut self, content: &str) -> std::io::Result<PathBuf> {
+        write_offload_file(self.offload_dir, content)
+    }
+
+    fn record(&mut self, stub: &FrozenStub) -> bool {
+        persist_into(self.rollout, |rollout| rollout.append_request_stub(stub))
     }
 }
 

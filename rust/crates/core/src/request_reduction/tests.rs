@@ -7,11 +7,29 @@ use super::*;
 #[derive(Default)]
 struct MemSink {
     saved: Vec<String>,
+    recorded: Vec<FrozenStub>,
     broken: bool,
+    unrecordable: bool,
 }
 
-impl OffloadSink for MemSink {
-    fn save(&mut self, content: &str) -> std::io::Result<PathBuf> {
+impl MemSink {
+    /// What a session file would hand back on resume: through serde, like
+    /// the real thing.
+    fn reread(&self) -> Vec<FrozenStub> {
+        serde_json::from_str(&serde_json::to_string(&self.recorded).unwrap()).unwrap()
+    }
+}
+
+impl StubStore for MemSink {
+    fn record(&mut self, stub: &FrozenStub) -> bool {
+        if self.unrecordable {
+            return false;
+        }
+        self.recorded.push(stub.clone());
+        true
+    }
+
+    fn save_original(&mut self, content: &str) -> std::io::Result<PathBuf> {
         if self.broken {
             return Err(std::io::Error::other("disk full"));
         }
@@ -627,13 +645,13 @@ fn a_resumed_session_is_warm_until_its_file_has_been_quiet_past_the_ttl() {
     let view = aged("b1", "bash", json!({"command": "make"}), &output, false, 2);
     let mut sink = MemSink::default();
 
-    let mut recent = ReductionState::resumed(Some(at(0)));
+    let mut recent = ReductionState::resumed(Some(at(0)), Vec::new());
     assert_eq!(
         text_of(&send(&view, &mut recent, &mut sink, &anthropic(), 3), "b1"),
         output
     );
 
-    let mut quiet = ReductionState::resumed(Some(at(0)));
+    let mut quiet = ReductionState::resumed(Some(at(0)), Vec::new());
     assert_ne!(
         text_of(&send(&view, &mut quiet, &mut sink, &anthropic(), 6), "b1"),
         output
@@ -682,6 +700,93 @@ fn a_result_whose_original_cannot_be_saved_goes_out_whole() {
         text_of(&send(&view, &mut state, &mut sink, &anthropic(), 30), "b1"),
         output
     );
+}
+
+#[test]
+fn a_stub_that_cannot_be_recorded_goes_out_whole() {
+    let output = big(4000);
+    let view = aged("b1", "bash", json!({"command": "make"}), &output, false, 2);
+    let mut state = ReductionState::default();
+    let mut unrecordable = MemSink {
+        unrecordable: true,
+        ..MemSink::default()
+    };
+
+    assert_eq!(
+        send(&view, &mut state, &mut unrecordable, &anthropic(), 0),
+        view
+    );
+    assert!(state.frozen.is_empty());
+}
+
+/// A resumed session inside the TTL is warm, and the provider holds the stubs
+/// the previous process sent — so those must go out again, byte for byte, and
+/// no original is written a second time.
+#[test]
+fn a_resumed_session_sends_the_stubs_its_file_recorded() {
+    let grep = json!({"pattern": "needle"});
+    let mut view = aged("g1", "grep", grep.clone(), &big(4000), false, 0);
+    view.extend(aged(
+        "b1",
+        "bash",
+        json!({"command": "make"}),
+        &big(4000),
+        false,
+        2,
+    ));
+    let mut sink = MemSink::default();
+    let before = send(
+        &view,
+        &mut ReductionState::default(),
+        &mut sink,
+        &anthropic(),
+        0,
+    );
+    assert_eq!(sink.recorded.len(), 2);
+
+    let mut resumed = ReductionState::resumed(Some(at(1)), sink.reread());
+    let mut after_sink = MemSink::default();
+    let after = send(&view, &mut resumed, &mut after_sink, &anthropic(), 2);
+
+    assert_eq!(after, before);
+    assert!(after_sink.saved.is_empty());
+    // The recall rule came back with them: the same search, asked again, is
+    // protected once the cache is cold.
+    view.extend(aged("g2", "grep", grep, &big(4000), false, 3));
+    let later = send(&view, &mut resumed, &mut after_sink, &anthropic(), 30);
+    assert_eq!(text_of(&later, "g2"), big(4000));
+}
+
+#[test]
+fn a_branch_is_owed_only_the_stubs_its_file_lacks_for_results_it_has() {
+    let mut view = aged(
+        "b1",
+        "bash",
+        json!({"command": "make"}),
+        &big(4000),
+        false,
+        2,
+    );
+    view.extend(aged(
+        "b2",
+        "bash",
+        json!({"command": "test"}),
+        &big(4000),
+        false,
+        2,
+    ));
+    let mut state = ReductionState::default();
+    let mut sink = MemSink::default();
+    send(&view, &mut state, &mut sink, &anthropic(), 0);
+    let [b1, b2] = [sink.recorded[0].clone(), sink.recorded[1].clone()];
+
+    // A branch holding both results whose file already knows b1.
+    assert_eq!(
+        state.unrecorded_for(&view, std::slice::from_ref(&b1)),
+        vec![b2]
+    );
+    // A branch cut before b2 was ever answered.
+    assert_eq!(state.unrecorded_for(&view[..2], &[]), vec![b1]);
 }
 
 #[test]

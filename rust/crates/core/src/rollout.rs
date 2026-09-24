@@ -33,6 +33,7 @@ use crate::provider_route::ProvenanceMismatch;
 use crate::provider_route::ReasoningShape;
 use crate::provider_route::validate_provenance;
 use crate::provider_route::validate_timeline;
+use crate::request_reduction::FrozenStub;
 use crate::tools::interrupted;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::AssistantOutcome;
@@ -378,6 +379,16 @@ enum RolloutLine {
         terminals: Vec<SnapshotTerminal>,
         stats: PairingRepairStats,
     },
+    /// A result requests carry as a stub from here on (plan 200). Not part of
+    /// the conversation — replay leaves `items` alone — but part of what was
+    /// sent, so a resumed session sends the same bytes. A compacted marker
+    /// voids every stub before it.
+    RequestStub {
+        #[serde(flatten)]
+        meta: LineMeta,
+        #[serde(flatten)]
+        stub: FrozenStub,
+    },
 }
 
 impl RolloutLine {
@@ -403,7 +414,8 @@ impl RolloutLine {
             | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
             | RolloutLine::TurnTerminal { meta, .. }
-            | RolloutLine::Repaired { meta, .. } => meta,
+            | RolloutLine::Repaired { meta, .. }
+            | RolloutLine::RequestStub { meta, .. } => meta,
         }
     }
 
@@ -417,7 +429,8 @@ impl RolloutLine {
             | RolloutLine::ProviderUsage { meta, .. }
             | RolloutLine::Compacted { meta, .. }
             | RolloutLine::TurnTerminal { meta, .. }
-            | RolloutLine::Repaired { meta, .. } => meta,
+            | RolloutLine::Repaired { meta, .. }
+            | RolloutLine::RequestStub { meta, .. } => meta,
         }
     }
 }
@@ -668,6 +681,13 @@ impl Rollout {
         })
     }
 
+    pub(crate) fn append_request_stub(&mut self, stub: &FrozenStub) -> io::Result<()> {
+        self.append_line(RolloutLine::RequestStub {
+            meta: self.next_meta(),
+            stub: stub.clone(),
+        })
+    }
+
     pub fn append_turn_terminal(&mut self, terminal: &TurnTerminal) -> io::Result<()> {
         self.append_line(RolloutLine::TurnTerminal {
             meta: self.next_meta(),
@@ -745,6 +765,7 @@ fn id_prefix(path: &Path) -> String {
 struct ParsedSession {
     items: Vec<Message>,
     provider_usage: UsageLedger,
+    request_stubs: Vec<FrozenStub>,
     runtime: Option<SessionRuntime>,
     terminals: Vec<SnapshotTerminal>,
     route_timeline: Vec<ProviderRouteReceipt>,
@@ -1019,6 +1040,7 @@ fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
     let mut parsed = ParsedSession {
         items: Vec::new(),
         provider_usage: UsageLedger::default(),
+        request_stubs: Vec::new(),
         runtime: None,
         terminals: Vec::new(),
         route_timeline: Vec::new(),
@@ -1051,6 +1073,11 @@ fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
             RolloutLine::Compacted { meta, replacement } => {
                 parsed.items = replacement;
                 parsed.terminals.clear();
+                parsed.request_stubs.clear();
+                meta
+            }
+            RolloutLine::RequestStub { meta, stub } => {
+                parsed.request_stubs.push(stub);
                 meta
             }
             RolloutLine::TurnTerminal { meta, terminal } => {
@@ -1085,6 +1112,7 @@ fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
 pub struct SessionRead {
     snapshot: SessionSnapshot,
     provider_usage: UsageLedger,
+    request_stubs: Vec<FrozenStub>,
     repair: PairingRepair,
     path: PathBuf,
     raw_len: usize,
@@ -1142,6 +1170,7 @@ impl SessionRead {
         Ok(ResumedSession {
             messages: self.snapshot.messages.clone(),
             provider_usage: self.provider_usage,
+            request_stubs: self.request_stubs,
             snapshot: self.snapshot,
             repair: self.repair.stats,
             rollout,
@@ -1162,6 +1191,7 @@ pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
     Ok(SessionRead {
         snapshot,
         provider_usage: parsed.provider_usage,
+        request_stubs: parsed.request_stubs,
         repair,
         path: path.to_path_buf(),
         raw_len: raw.len(),
@@ -1186,6 +1216,8 @@ pub fn load_session_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
 pub struct ResumedSession {
     pub messages: Vec<Message>,
     pub provider_usage: UsageLedger,
+    /// Stubs recorded since the last compaction (plan 200).
+    pub(crate) request_stubs: Vec<FrozenStub>,
     pub snapshot: SessionSnapshot,
     pub repair: PairingRepairStats,
     pub rollout: Rollout,
@@ -1304,6 +1336,10 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
                 terminals,
                 stats,
             },
+            RolloutLine::RequestStub { meta, stub } => RolloutLine::RequestStub {
+                meta: remeta(meta),
+                stub,
+            },
         };
         out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
         out.push('\n');
@@ -1338,7 +1374,8 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
         | RolloutLine::ProviderUsage { .. }
         | RolloutLine::Compacted { .. }
         | RolloutLine::TurnTerminal { .. }
-        | RolloutLine::Repaired { .. } => false,
+        | RolloutLine::Repaired { .. }
+        | RolloutLine::RequestStub { .. } => false,
     }
 }
 
@@ -2217,6 +2254,61 @@ mod tests {
             &[usage_record("before", 10), usage_record("after", 20)]
         );
         cleanup(&path);
+    }
+
+    /// Plan 200: stubs ride beside the conversation, never in it; a compacted
+    /// marker voids those before it, and a fork keeps those it copies.
+    #[test]
+    fn request_stubs_replay_beside_the_messages_until_a_compaction() {
+        let path = temp_file("request-stubs");
+        let stub = |id: &str| FrozenStub {
+            tool_use_id: id.into(),
+            stub: format!("[stub of {id}]"),
+            saved_tokens: 7,
+            recall: None,
+        };
+        let mut rollout = Rollout::new(path.clone());
+        let conversation = vec![
+            Message::user_text("go"),
+            Message::assistant(vec![tool_use("t1")]),
+            Message::tool_results(vec![tool_result("t1")]),
+        ];
+        for message in &conversation {
+            rollout.append_message(message).unwrap();
+        }
+        rollout.append_request_stub(&stub("t1")).unwrap();
+        rollout.append_message(&Message::user_text("next")).unwrap();
+        let stub_seq = raw_lines(&path)
+            .iter()
+            .find(|line| line["type"] == "request_stub")
+            .and_then(|line| line["id"].as_str()?.rsplit_once('#')?.1.parse().ok())
+            .unwrap();
+
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.request_stubs, vec![stub("t1")]);
+        let mut with_next = conversation.clone();
+        with_next.push(Message::user_text("next"));
+        assert_eq!(resumed.messages, with_next);
+        drop(resumed);
+
+        let sessions = path.with_extension("forks");
+        let fork = fork_session(&path, Some(stub_seq), &sessions).unwrap();
+        let forked = resume_session(&fork).unwrap();
+        assert_eq!(forked.request_stubs, vec![stub("t1")]);
+        assert_eq!(forked.messages, conversation);
+        drop(forked);
+
+        let mut rollout = resume_session(&path).unwrap().rollout;
+        rollout
+            .append_compacted(&[Message::user_text("[summary]")])
+            .unwrap();
+        rollout.append_request_stub(&stub("t2")).unwrap();
+        assert_eq!(
+            resume_session(&path).unwrap().request_stubs,
+            vec![stub("t2")]
+        );
+        cleanup(&path);
+        let _ = std::fs::remove_dir_all(sessions);
     }
 
     #[test]

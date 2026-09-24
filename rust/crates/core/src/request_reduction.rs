@@ -10,7 +10,8 @@
 //!
 //! - A stub, once sent, is sent byte for byte on every later request
 //!   ([`ReductionState`] keeps it by `tool_use_id`), even if the reason for it
-//!   no longer holds.
+//!   no longer holds. The session file records it before it is first sent,
+//!   so this holds across resume as well.
 //! - A *new* stub only ever lands when the cache is already cold — this model
 //!   has not been asked anything in this history, or has sat idle past its
 //!   cache TTL, or compaction just rewrote the history. A warm cache is never
@@ -32,6 +33,8 @@ use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
 use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::file_state::normalize_absolute_path;
@@ -93,21 +96,33 @@ impl CacheScope {
     }
 }
 
-#[derive(Clone, Debug)]
-struct Frozen {
-    stub: String,
-    saved_tokens: u64,
-    /// Present when an identical later call means the stub cut too deep: the
-    /// call, and the request length at which the model first saw the stub.
-    recall: Option<(String, Value, usize)>,
+/// One result that requests carry as a stub, as the session file records it.
+/// Written before the first request that sends it, so a resumed session sends
+/// exactly the bytes the provider already has cached.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FrozenStub {
+    pub(crate) tool_use_id: String,
+    pub(crate) stub: String,
+    pub(crate) saved_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recall: Option<Recall>,
 }
 
-/// What survives between requests. Lives as long as the history it reduces and
-/// is never persisted: a resumed session re-derives its stubs, at the price of
-/// a few duplicate offload files.
+/// An identical call issued after the model first saw the stub means the stub
+/// cut too deep.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Recall {
+    name: String,
+    input: Value,
+    /// The request length, in messages, when the stub was first sent.
+    seen_from: usize,
+}
+
+/// What survives between requests. Lives as long as the history it reduces;
+/// the stubs are also in the session file, the rest is re-derived.
 #[derive(Debug, Default)]
 pub(crate) struct ReductionState {
-    frozen: HashMap<String, Frozen>,
+    frozen: HashMap<String, FrozenStub>,
     /// Results never to stub: the model asked again for something a stub took.
     exempt: HashSet<String>,
     last_request: HashMap<CacheScope, SystemTime>,
@@ -118,11 +133,47 @@ pub(crate) struct ReductionState {
 }
 
 impl ReductionState {
-    pub(crate) fn resumed(quiet_since: Option<SystemTime>) -> Self {
-        Self {
+    pub(crate) fn resumed(quiet_since: Option<SystemTime>, stubs: Vec<FrozenStub>) -> Self {
+        let mut state = Self {
             quiet_since,
             ..Self::default()
+        };
+        state.adopt(stubs);
+        state
+    }
+
+    /// Take on stubs a session file recorded. A stub already held stays as it
+    /// is: both came from the same first freeze.
+    pub(crate) fn adopt(&mut self, stubs: Vec<FrozenStub>) {
+        for stub in stubs {
+            self.frozen.entry(stub.tool_use_id.clone()).or_insert(stub);
         }
+    }
+
+    /// Held stubs that are not among `recorded`, for results `messages` still
+    /// has: what a branch cut from this conversation keeps sending but its own
+    /// file does not know about yet.
+    pub(crate) fn unrecorded_for(
+        &self,
+        messages: &[Message],
+        recorded: &[FrozenStub],
+    ) -> Vec<FrozenStub> {
+        let recorded: HashSet<&str> = recorded
+            .iter()
+            .map(|stub| stub.tool_use_id.as_str())
+            .collect();
+        let mut missing: Vec<FrozenStub> = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .filter(|id| !recorded.contains(id))
+            .filter_map(|id| self.frozen.get(id).cloned())
+            .collect();
+        missing.sort_by(|a, b| a.tool_use_id.cmp(&b.tool_use_id));
+        missing
     }
 
     /// The history was rewritten: no stub describes it any more, and no cache
@@ -153,11 +204,16 @@ pub struct ReductionStats {
     pub saved_tokens: u64,
 }
 
-/// Where a stubbed result's original goes. The history implements it with its
-/// offload store, so the file name — and with it the permission and sandbox
-/// exemption for `off-NNNN.txt` — stays the one offload already uses.
-pub(crate) trait OffloadSink {
-    fn save(&mut self, content: &str) -> std::io::Result<PathBuf>;
+/// Where a stub's pieces go. The history implements it with its offload store
+/// — so the file name, and with it the permission and sandbox exemption for
+/// `off-NNNN.txt`, stays the one offload already uses — and its session file.
+pub(crate) trait StubStore {
+    /// Save a result's original where its stub will point.
+    fn save_original(&mut self, content: &str) -> std::io::Result<PathBuf>;
+    /// Make a stub durable before it is sent. `false` means it was not
+    /// recorded, and the result goes out whole instead: a stub a resumed
+    /// session cannot know about would change the bytes it sends.
+    fn record(&mut self, stub: &FrozenStub) -> bool;
 }
 
 /// The request being reduced: who it goes to, when, and the cwd relative
@@ -174,7 +230,7 @@ pub(crate) fn reduce(
     view: &mut [Message],
     state: &mut ReductionState,
     request: &RequestReduction<'_>,
-    sink: &mut dyn OffloadSink,
+    store: &mut dyn StubStore,
 ) -> ReductionStats {
     let scope = CacheScope::of(request.identity);
     let cold = state.cache_is_cold(&scope, request.now, cache_ttl(request.identity.api_family));
@@ -183,7 +239,7 @@ pub(crate) fn reduce(
         // by position, so working them out here is as good as every request.
         let calls = Calls::index(view);
         note_recalls(&calls, state);
-        freeze_proposals(view, &calls, state, request.cwd, sink);
+        freeze_proposals(view, &calls, state, request.cwd, store);
     }
     state.last_request.insert(scope, request.now);
     apply_frozen(view, state)
@@ -295,7 +351,7 @@ impl<'a> Calls<'a> {
 /// something still needed: that new result is never stubbed. The old stub
 /// stays — changing it would rewrite an already-sent prefix.
 fn note_recalls(calls: &Calls<'_>, state: &mut ReductionState) {
-    let recallable: Vec<&(String, Value, usize)> = state
+    let recallable: Vec<&Recall> = state
         .frozen
         .values()
         .filter_map(|frozen| frozen.recall.as_ref())
@@ -308,8 +364,10 @@ fn note_recalls(calls: &Calls<'_>, state: &mut ReductionState) {
         if state.frozen.contains_key(*id) || state.exempt.contains(*id) {
             continue;
         }
-        if recallable.iter().any(|(name, input, seen_from)| {
-            call.message >= *seen_from && name == call.name && input == call.input
+        if recallable.iter().any(|recall| {
+            call.message >= recall.seen_from
+                && recall.name == call.name
+                && &recall.input == call.input
         }) {
             recalled.push((*id).to_string());
         }
@@ -322,7 +380,7 @@ fn freeze_proposals(
     calls: &Calls<'_>,
     state: &mut ReductionState,
     cwd: &Path,
-    sink: &mut dyn OffloadSink,
+    store: &mut dyn StubStore,
 ) {
     for (message_index, message) in view.iter().enumerate() {
         for block in &message.content {
@@ -346,23 +404,24 @@ fn freeze_proposals(
             };
             // A stub points at the original; without it on disk the stub would
             // destroy content to save context, which is the worse trade.
-            let Ok(saved) = sink.save(text) else {
+            let Ok(saved) = store.save_original(text) else {
                 continue;
             };
             let stub = proposal.render(&saved.display().to_string());
-            let saved_tokens =
-                estimate_text_tokens(text).saturating_sub(estimate_text_tokens(&stub));
-            let recall = proposal
-                .recallable()
-                .then(|| (call.name.to_string(), call.input.clone(), view.len()));
-            state.frozen.insert(
-                tool_use_id.clone(),
-                Frozen {
-                    stub,
-                    saved_tokens,
-                    recall,
-                },
-            );
+            let frozen = FrozenStub {
+                tool_use_id: tool_use_id.clone(),
+                saved_tokens: estimate_text_tokens(text)
+                    .saturating_sub(estimate_text_tokens(&stub)),
+                stub,
+                recall: proposal.recallable().then(|| Recall {
+                    name: call.name.to_string(),
+                    input: call.input.clone(),
+                    seen_from: view.len(),
+                }),
+            };
+            if store.record(&frozen) {
+                state.frozen.insert(tool_use_id.clone(), frozen);
+            }
         }
     }
 }

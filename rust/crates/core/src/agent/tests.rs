@@ -4684,15 +4684,17 @@ async fn an_old_result_goes_out_as_a_stub_while_history_keeps_it_whole() {
     let _ = std::fs::remove_file(session);
 }
 
-/// Plan 200: nothing about reduction is persisted. A resumed session judges
-/// the cache by how long its file has been quiet: a moment ago is warm, past
-/// the TTL is cold and its first request carries the stubs.
+/// Plan 200: a resumed session judges the cache by how long its file has been
+/// quiet — a moment ago is warm, past the TTL is cold and its first request
+/// carries new stubs — and sends the stubs its file recorded exactly as they
+/// were sent before, without writing their originals again.
 #[tokio::test]
 async fn a_resumed_session_stubs_only_once_its_cache_can_have_expired() {
     let mut script = big_output_turn();
     script.extend([
         MockTurn::Blocks(text("fresh")),
         MockTurn::Blocks(text("quiet")),
+        MockTurn::Blocks(text("again")),
     ]);
     let (cfg, session, seen) = reduction_session("plan200-resume", script);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -4731,14 +4733,60 @@ async fn a_resumed_session_stubs_only_once_its_cache_can_have_expired() {
     let mut quiet = resume();
     quiet.record(Message::user_text("back"));
     run_turn(&cfg, &mut quiet, &ui, &CancellationToken::new(), 0).await;
-    let seen = seen.lock().unwrap();
-    assert!(
-        sent_result(&seen[5].messages, "b1").starts_with("[bash output trimmed"),
-        "{:?}",
-        seen[5].messages
-    );
+    let stub = sent_result(&seen.lock().unwrap()[5].messages, "b1").to_string();
+    assert!(stub.starts_with("[bash output trimmed"), "{stub}");
     assert_eq!(sent_result(quiet.messages(), "b1"), original);
+    drop(quiet);
+
+    // Straight back in: the cache still holds that stub, so it goes out again.
+    let offload_files = || std::fs::read_dir(&cfg.offload_dir).unwrap().count();
+    let files_before = offload_files();
+    let mut again = resume();
+    again.record(Message::user_text("once more"));
+    run_turn(&cfg, &mut again, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(sent_result(&seen.lock().unwrap()[6].messages, "b1"), stub);
+    assert_eq!(offload_files(), files_before);
     let _ = std::fs::remove_file(session);
+}
+
+/// Plan 200: rewinding onto a branch keeps sending what the cache holds, and
+/// writes into the branch's file any stub it would otherwise not know about.
+#[tokio::test]
+async fn a_rewound_branch_records_the_stubs_it_keeps_sending() {
+    let mut script = big_output_turn();
+    script.push(MockTurn::Blocks(text("later")));
+    let (cfg, session, seen) = reduction_session("plan200-rebase", script);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("build it"));
+    run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    // Branch off after the first turn: b1 is in it, no stub yet.
+    let sessions = cfg.offload_dir.join("plan200-rebase-forks");
+    let _ = std::fs::remove_dir_all(&sessions);
+    let fork = crate::rollout::fork_session(&session, None, &sessions).unwrap();
+    history.let_request_caches_expire();
+    history.record(Message::user_text("again"));
+    run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    let stub = sent_result(&seen.lock().unwrap()[4].messages, "b1").to_string();
+    assert!(stub.starts_with("[bash output trimmed"), "{stub}");
+
+    assert!(
+        crate::rollout::resume_session(&fork)
+            .unwrap()
+            .request_stubs
+            .is_empty()
+    );
+    history.rebase(crate::rollout::resume_session(&fork).unwrap());
+
+    let branch = crate::rollout::resume_session(&fork).unwrap();
+    assert_eq!(branch.request_stubs.len(), 1);
+    assert_eq!(branch.request_stubs[0].stub, stub);
+    let _ = std::fs::remove_file(session);
+    let _ = std::fs::remove_dir_all(sessions);
 }
 
 /// Plan 200: `[context] request_reduction = false` sends history as it is.
