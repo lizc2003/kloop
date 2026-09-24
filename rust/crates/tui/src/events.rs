@@ -63,12 +63,11 @@ pub enum AgentEvent {
         text: String,
         images: Vec<(String, kloop_protocol::ContentBlock)>,
     },
-    /// A rewind completed: History now holds this forked branch, so the loop
-    /// rebuilds the transcript from `messages` and adopts the new `session_id`.
+    /// A rewind completed: the worker is on a new session that holds this
+    /// forked branch, so the loop rebuilds the transcript from `messages`.
     Forked {
-        session_id: String,
+        session: SessionSwitch,
         messages: Vec<Message>,
-        route: kloop_protocol::ActiveProviderRoute,
     },
     /// A permission prompt. The decision travels back over `reply`; dropping
     /// the sender answers Deny (the agent side treats a closed channel as no).
@@ -83,8 +82,8 @@ pub enum AgentEvent {
     },
 }
 
-/// What the UI mirrors of a session the worker has just switched to by
-/// `/clear`. The new session's inbox and permission gate are not in here: the
+/// What the UI mirrors of a session the worker has just switched to (`/clear`,
+/// rewind). The new session's inbox and permission gate are not in here: the
 /// UI loop picks those up from the worker's current Config.
 #[derive(Debug)]
 pub struct SessionSwitch {

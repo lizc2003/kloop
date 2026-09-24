@@ -92,10 +92,6 @@ impl DeferredToolUnlocks {
         self.receipts.read().unwrap().get(&Self::key(receipt)) == Some(receipt)
     }
 
-    pub(crate) fn clear(&self) {
-        self.receipts.write().unwrap().clear();
-    }
-
     #[cfg(test)]
     fn tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
@@ -1753,7 +1749,11 @@ mod tests {
             ("ran srv__web_search".into(), false)
         );
 
-        ctx.cfg.reset_deferred_tool_capabilities();
+        // `/clear` and rewind start a new session; its receipts start empty.
+        let ctx = crate::tools::testutil::test_ctx_with_cfg(
+            0,
+            Arc::new(ctx.cfg.fresh_session(String::new()).unwrap()),
+        );
         let (output, is_error) = run_tool("srv__web_search", json!({}), &ctx).await;
         assert!(is_error, "{output}");
         assert!(output.contains("deferred and not loaded yet"), "{output}");

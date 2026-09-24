@@ -550,53 +550,93 @@ async fn agent_worker(
                 }
             }
             WorkerMsg::Fork { seq } => {
-                let event = match fork_here(&history, seq) {
-                    Ok((session_id, resumed)) => {
-                        let messages = resumed.messages.clone();
-                        history.rebase(resumed);
-                        // A rewind does not end the session, so the route it
-                        // is running on right now — `/provider` included —
-                        // carries onto the branch, and the cut's own route is
-                        // not restored. Unlike the `fork_here` failure below,
-                        // this runs after the rebase: adopting writes to the
-                        // forked rollout, so it needs the branch installed.
-                        let adopted = history.adopt_provider_route(&cfg.provider_route);
-                        match adopted {
-                            Ok((route, reopened)) => {
-                                cfg.reset_deferred_tool_capabilities();
-                                cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
-                                provider_state =
-                                    kloop_core::provider_route::SessionProviderState::from_timeline(
-                                        Arc::clone(&cfg.provider_catalog),
-                                        history.provider_routes(),
-                                    )
-                                    .expect("rewound provider timeline was validated on recovery");
-                                if let Some(reopened) = reopened {
-                                    let _ = events
-                                        .send(AgentEvent::System(format!("rewind: {reopened}")));
-                                }
-                                AgentEvent::Forked {
-                                    session_id,
-                                    messages,
-                                    route: route.public_route(),
-                                }
-                            }
-                            Err(error) => AgentEvent::System(format!(
-                                "rewind landed on the new branch but its provider route \
-                                 could not be adopted: {error}"
-                            )),
-                        }
-                    }
-                    // A failed rewind leaves History untouched; report and carry
-                    // on the original branch.
-                    Err(e) => AgentEvent::System(format!("rewind failed: {e}")),
-                };
-                if events.send(event).is_err() {
+                if !rewind(
+                    seq,
+                    &mut cfg,
+                    &mut history,
+                    &mut provider_state,
+                    &current,
+                    &ui,
+                    &events,
+                )
+                .await
+                {
                     return;
                 }
             }
         }
     }
+}
+
+/// Rewind onto the fork cut at `seq`. The branch is a new session file, so it
+/// runs as a new session — new id, new session state — exactly like `/clear`,
+/// except that History keeps the branch's messages. `false` means the UI loop
+/// is gone.
+async fn rewind(
+    seq: u64,
+    cfg: &mut Arc<Config>,
+    history: &mut History,
+    provider_state: &mut kloop_core::provider_route::SessionProviderState,
+    current: &std::sync::Mutex<Arc<Config>>,
+    ui: &Arc<dyn Ui>,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> bool {
+    // A failed rewind leaves History and the session untouched; report and
+    // carry on the original branch.
+    let (session_id, resumed) = match fork_here(history, seq) {
+        Ok(forked) => forked,
+        Err(e) => {
+            return events
+                .send(AgentEvent::System(format!("rewind failed: {e}")))
+                .is_ok();
+        }
+    };
+    let (fresh, report) = match kloop_core::commands::replace_session(cfg, session_id, ui).await {
+        Ok(replaced) => replaced,
+        Err(e) => {
+            return events
+                .send(AgentEvent::System(format!("rewind failed: {e:#}")))
+                .is_ok();
+        }
+    };
+    let messages = resumed.messages.clone();
+    history.rebase(resumed);
+    // A rewind does not change who is using the session, so the route it is
+    // running on right now — `/provider` included — carries onto the branch,
+    // and the cut's own route is not restored. Adopting writes to the forked
+    // rollout, so it runs after the rebase.
+    let mut notes = Vec::new();
+    *cfg = match history.adopt_provider_route(&cfg.provider_route) {
+        Ok((route, reopened)) => {
+            if let Some(reopened) = reopened {
+                notes.push(format!("rewind: {reopened}"));
+            }
+            Arc::new(fresh.clone_with_provider_route(route))
+        }
+        Err(error) => {
+            notes.push(format!(
+                "rewind landed on the new branch but its provider route \
+                 could not be adopted: {error}"
+            ));
+            Arc::new(fresh)
+        }
+    };
+    *provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
+        Arc::clone(&cfg.provider_catalog),
+        history.provider_routes(),
+    )
+    .expect("rewound provider timeline was validated on recovery");
+    *current.lock().unwrap() = Arc::clone(cfg);
+    let forked = AgentEvent::Forked {
+        session: session_switch(cfg, report),
+        messages,
+    };
+    if events.send(forked).is_err() {
+        return false;
+    }
+    notes
+        .into_iter()
+        .all(|note| events.send(AgentEvent::System(note)).is_ok())
 }
 
 /// Fork the live session at `seq` and load the branch: the new id, its messages,
@@ -1228,6 +1268,7 @@ impl UiState {
                 self.session_switched = true;
                 self.clear_terminal = true;
             }
+            AgentEvent::Forked { .. } => self.session_switched = true,
             _ => {}
         }
         if let Some(next_cwd) = event_cwd(&event) {

@@ -790,17 +790,11 @@ impl App {
                     self.fork_picker = Some(ForkPicker { points, cursor });
                 }
             }
-            AgentEvent::Forked {
-                session_id,
-                messages,
-                route,
-            } => {
-                // History was swapped to the fork; rebuild the view to match its
-                // truncated content, exactly like resuming into a session.
-                self.session_id = session_id;
-                self.accept_selected_route(route);
+            AgentEvent::Forked { session, messages } => {
+                let report = session.report.clone();
+                self.switch_session(session);
+                // The fork's content, rebuilt exactly like resuming into a session.
                 self.cells = cells_from_history(&messages);
-                self.head_frozen = None;
                 // cells_from_history tags the tail "resumed session"; relabel it
                 // so the transcript says a rewind happened, not a resume.
                 if matches!(self.cells.last(), Some(Cell::Note(_))) {
@@ -810,17 +804,9 @@ impl App {
                         messages.len()
                     )));
                 }
-                self.tool_cells.clear();
-                self.agent_cells.clear();
-                self.background_task_cells.clear();
-                self.frozen_background_tasks.clear();
-                self.agent_message_cells.clear();
-                self.frozen_agent_messages.clear();
-                self.assistant_cells.clear();
-                self.reasoning_cells.clear();
-                self.assistant_open = false;
-                self.thinking_open = false;
-                self.last_note = None;
+                if !report.is_empty() {
+                    self.cells.push(Cell::System(report.join("\n")));
+                }
                 self.fork_picker = None;
             }
             AgentEvent::Confirm { req, reply } => {
@@ -3515,31 +3501,23 @@ mod tests {
     }
 
     /// A completed rewind rebuilds the transcript from the fork's history and
-    /// adopts its session id.
+    /// mirrors the new session it runs in.
     #[test]
-    fn forked_rebuilds_transcript_and_adopts_session_id() {
+    fn forked_rebuilds_transcript_and_adopts_the_new_session() {
         let mut app = App::new("old".into());
         app.cells.push(Cell::User("stale".into()));
         app.background_task_cells.insert("agent-old".into(), 0);
         app.frozen_background_tasks.insert("program-old".into());
-        app.todos = Some(todo_snapshot(7, "Shared registry"));
+        app.todos = Some(todo_snapshot(7, "Old registry"));
         app.show_todos = false;
         app.apply(AgentEvent::Forked {
-            session_id: "new".into(),
+            session: switch("new", &["stopped 2 background task(s)"]),
             messages: vec![
                 Message::user_text("one"),
                 Message::assistant(vec![ContentBlock::Text {
                     text: "done".into(),
                 }]),
             ],
-            route: kloop_protocol::ActiveProviderRoute {
-                revision: 1,
-                provider_id: "mock".into(),
-                api_family: kloop_protocol::ProviderApiFamily::Mock,
-                model: "mock-model".into(),
-                continuity: kloop_protocol::ReasoningContinuity::Preserved,
-                effort: None,
-            },
         });
         assert_eq!(app.session_id, "new");
         assert_eq!(
@@ -3548,12 +3526,14 @@ mod tests {
                 Cell::User("one".into()),
                 Cell::Assistant("done".into()),
                 Cell::Note("rewound — 2 message(s) kept".into()),
+                Cell::System("stopped 2 background task(s)".into()),
             ]
         );
         assert!(app.fork_picker.is_none());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
-        assert_eq!(app.todos.as_ref().unwrap().revision, 7);
+        assert_eq!(app.mode, Mode::Bypass);
+        assert_eq!(app.todos.as_ref().unwrap().revision, 0);
         assert!(!app.show_todos);
     }
 

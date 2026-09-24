@@ -743,10 +743,16 @@ be copied before its terminal record closes the prefix.
 In the TUI, **Ctrl+R** (when idle) opens a rewind picker: it lists the turn
 boundaries the session can rewind to — each previewed by the user message it
 would drop — and Enter forks at the chosen point *in place*. Unlike `--fork`,
-you don't leave the session: History swaps onto the branch, the transcript
-rebuilds to the earlier state, clears non-durable deferred-tool capability
-receipts, and the next message continues the new branch (the old one stays on
-disk, forkable/resumable). Esc cancels. The picker's points are exactly the cuts
+you don't leave the process: History swaps onto the branch and the transcript
+rebuilds to the earlier state. The branch is a new session file, so it runs as
+a new session — the same seam as `/clear` (see **Slash commands**): new id,
+fresh session state, the old session's background work stopped. The id matters
+beyond the file name: the compaction summary's transcript pointer, the prompt
+cache key, sub-agent file names and the scheduler's owner all read it, and
+before plan 205 a rewind left them on the parent. The fresh file observations
+mean a file read before the cut must be read again before it is edited. The
+next message continues the new branch (the old one stays on disk,
+forkable/resumable). Esc cancels. The picker's points are exactly the cuts
 `fork_session` accepts, so a selection can never be rejected. Rewind is
 idle-only — a running turn owns History (Ctrl+C first).
 
@@ -1674,9 +1680,8 @@ mode or cached approval change, a policy refresh/invalidation, or a child
 authority boundary — the old receipt fails closed and the model must search
 again. Operations sharing the same live Config and authority share receipts;
 same-session compaction keeps them, while child agents and fresh resume/fork
-Configs start empty. In-place rewind explicitly clears receipts; `/clear`
-starts a new session, whose Config starts empty too; isolated worktrees never
-inherit them.
+Configs start empty. Rewind and `/clear` start a new session, whose Config
+starts empty too; isolated worktrees never inherit them.
 
 The schema and generation are taken from one atomic source snapshot. MCP calls
 hold a shared generation gate through the wire request; refresh takes the write
@@ -2771,9 +2776,9 @@ are reserved. A call to a name the catalog does not carry gets one answer,
 `unknown tool: <name>` — the same answer whether the name was retired or never
 existed.
 
-Independent CLI sessions/native server threads, a resumed process and a
-`/clear` get fresh empty registries. An in-process TUI fork keeps the same live
-registry; the list is not written to rollout or reconstructed from history. (Per-thread isolation
+Independent CLI sessions/native server threads, a resumed process, a `/clear`
+and a TUI rewind all get fresh empty registries; the list is not written to
+rollout or reconstructed from history. (Per-thread isolation
 is no longer observable from the tool surface — a whole-table write returns the
 table the caller just sent either way — so the core registry test is what pins
 it.) Every panel-visible mutation publishes a revisioned canonical full
@@ -3408,9 +3413,9 @@ sub-agent row or an uncorrelated Note. Running/phase/terminal updates with the
 same execution ID replace one mutable live-tail row. A Running row is normally
 kept out of native scrollback; if the hard tail cap forces it into immutable
 scrollback, later Running updates are ignored and the unique terminal update is
-appended as a linked row with the same typed ID. `/clear` stops the old
-session's work and resets the UI indices, fork rebuild resets only the UI
-indices; a late terminal still starts a fresh identifiable row. This
+appended as a linked row with the same typed ID. `/clear` and rewind stop the
+old session's work and reset the UI indices; a straggler's late terminal still
+starts a fresh identifiable row. This
 is an event projection, not a resource manager: there is no list/hydration,
 universal stop, status getter, or output panel.
 

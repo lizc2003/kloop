@@ -707,12 +707,6 @@ impl Config {
         (!self.session_id.is_empty()).then_some(self.session_id.as_str())
     }
 
-    /// Drop non-durable deferred-tool receipts when the conversation branches.
-    /// Same-session compaction deliberately does not call this method.
-    pub fn reset_deferred_tool_capabilities(&self) {
-        self.unlocked_tools.clear();
-    }
-
     /// Stop every session-scoped detached worker before its frontend/runtime is
     /// torn down. Returns the number that missed the bounded reap deadline.
     pub async fn shutdown_background_work(&self, ui: &Arc<dyn crate::agent::Ui>) -> usize {

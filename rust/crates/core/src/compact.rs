@@ -365,7 +365,7 @@ fn strip_analysis_and_unwrap(raw: &str) -> &str {
 /// look, an agent missing a detail can only redo the investigation that produced
 /// it. Absent for an in-memory history (mock, tests), where there is no file to
 /// point at. Borrowed from codex, which appends the same line.
-fn transcript_pointer(cfg: &Config) -> Option<String> {
+pub(crate) fn transcript_pointer(cfg: &Config) -> Option<String> {
     if cfg.session_id.is_empty() {
         return None;
     }

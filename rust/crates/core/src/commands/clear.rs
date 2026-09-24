@@ -213,6 +213,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A rewind hands `replace_session` the branch's id. Everything that reads
+    /// the session id must then name the branch: the cache key, the compaction
+    /// summary's transcript pointer, and the scheduler's owner.
+    #[tokio::test]
+    async fn a_replaced_session_answers_to_its_new_id_everywhere() {
+        let dir = temp_dir("replace");
+        let (cfg, _history) = old_session("clear-replace", &dir);
+        let branch = "20260101-000001";
+
+        let (fresh, report) = replace_session(&cfg, branch.into(), &ui()).await.unwrap();
+
+        assert_eq!(report, Vec::<String>::new());
+        assert_eq!(fresh.cache_key(), Some(branch));
+        let pointer = crate::compact::transcript_pointer(&fresh).unwrap();
+        assert!(
+            pointer.ends_with(&session_path(&dir, branch).display().to_string()),
+            "{pointer}"
+        );
+        // The new scheduler is bound (to the branch); the old one is closed.
+        assert_eq!(fresh.scheduler.list().unwrap(), Vec::new());
+        assert!(cfg.scheduler.list().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Without a sessions directory nothing was being saved, and the new
     /// session saves nothing either.
     #[tokio::test]
