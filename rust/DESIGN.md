@@ -3795,8 +3795,11 @@ snapshot is not a runtime dependency.
 ## Running
 
 From the repository root a `Makefile` wraps the commands below: `make` (release
-build), `make debug`, `make test`, `make check` (fmt + clippy + test — the three
-to run before a commit), `make mock`, `make parity`, `make help` for the rest. It shells
+build), `make debug`, `make test`, `make check` (fmt + clippy + test + parity — what
+to run before a commit; parity asserts kloop's own native reports against the
+local corpus, which is the one place a behavior change shows up red when every
+test is still green, and skips on a machine without the corpus), `make mock`,
+`make parity`, `make help` for the rest. It shells
 into `rust/`, which is where the workspace lives.
 
 `make install` puts the release binary in `$BINDIR` (default `~/.local/bin`;
