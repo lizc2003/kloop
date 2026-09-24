@@ -585,16 +585,15 @@ async fn permission_report() -> Value {
         None,
     )
     .unwrap();
-    assert!(
-        contained
-            .check(
-                "notebook_edit",
-                &json!({"notebook_path": absolute, "cell_id": "code-002", "new_source": "x"}),
-                0,
-            )
-            .await
-            .is_ok()
-    );
+    let contained_write_allowed = contained
+        .check(
+            "notebook_edit",
+            &json!({"notebook_path": absolute, "cell_id": "code-002", "new_source": "x"}),
+            0,
+        )
+        .await
+        .is_ok();
+    assert!(contained_write_allowed);
     let plan = Permissions::new(
         Mode::Plan,
         &PermissionRules::default(),
@@ -633,7 +632,9 @@ async fn permission_report() -> Value {
         "approval_count": requests.len(),
         "description": requests[0].description,
         "preview": requests[0].preview.as_ref().map(ConfirmPreview::text),
-        "accept_edits": true,
+        // Was `accept_edits`, a mode plan 192 deleted; what this proves now is
+        // the containment layer that replaced it.
+        "contained_write_allowed": contained_write_allowed,
         "plan_blocked": plan_error.contains("plan mode"),
         "deny_blocked": deny_error.contains("deny permission rule"),
     })

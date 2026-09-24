@@ -381,7 +381,8 @@ async fn plan_control_report() -> Value {
     let plan = "1. inspect\n2. implement";
     let (exited, exited_error) = run_tool("exit_plan_mode", json!({"plan": plan}), &context).await;
     assert!(!exited_error && exited.contains("approved"));
-    assert_eq!(context.cfg.permissions.mode(), Mode::Bypass);
+    let restored = context.cfg.permissions.mode();
+    assert_eq!(restored, Mode::Bypass);
     assert_eq!(
         approver.previews.lock().unwrap().as_slice(),
         &[Some(ConfirmPreview::Plan(plan.to_string()))]
@@ -402,9 +403,7 @@ async fn plan_control_report() -> Value {
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            Event::ModeChanged(Mode::Plan) => Some("plan"),
-            Event::ModeChanged(Mode::Bypass) => Some("bypass"),
-            Event::ModeChanged(_) => Some("other"),
+            Event::ModeChanged(mode) => Some(mode.label()),
             _ => None,
         })
         .collect();
@@ -426,7 +425,9 @@ async fn plan_control_report() -> Value {
         "entered": true,
         "repeat_idempotent": true,
         "enter_unknown_field_accepted": true,
-        "approved_restored": "accept_edits",
+        // Read back, never spelled: plan 192 deleted accept-edits and this
+        // literal went on reporting it.
+        "approved_restored": restored.label(),
         "rejected_stayed_plan": true,
         "inline_plan_preview": true,
         "serial": true,

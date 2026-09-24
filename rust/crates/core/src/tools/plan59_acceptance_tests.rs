@@ -941,9 +941,11 @@ async fn ask_plan_workflow_headless_report() -> Value {
     let (answer, answer_error) =
         run_tool("ask_user_question", question_input.clone(), &context).await;
     assert!(!answer_error && answer.contains("Yes") && answer.contains("accepted locally"));
+    let mut plan_modes = vec![context.cfg.permissions.mode().label()];
     let (entered, entered_error) = run_tool("enter_plan_mode", json!({}), &context).await;
     assert!(!entered_error && entered.contains("Entered plan mode"));
     assert_eq!(context.cfg.permissions.mode(), Mode::Plan);
+    plan_modes.push(context.cfg.permissions.mode().label());
 
     let mut workflow_activity = context.cfg.inbox.subscribe_activity();
     let (workflow, workflow_error) = run_tool(
@@ -983,6 +985,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     let (exited, exited_error) = run_tool("exit_plan_mode", json!({"plan": plan}), &context).await;
     assert!(!exited_error && exited.contains("approved"));
     assert_eq!(context.cfg.permissions.mode(), Mode::Manual);
+    plan_modes.push(context.cfg.permissions.mode().label());
 
     let mut cancelled_context = context.clone();
     let mut cancelled_config = cancelled_context.cfg.test_clone();
@@ -1054,7 +1057,9 @@ async fn ask_plan_workflow_headless_report() -> Value {
         "question_answered": "Yes",
         "question_cancelled": true,
         "plan_rejected": true,
-        "plan_modes": ["accept_edits", "plan", "accept_edits"],
+        // Read back, never spelled: plan 192 deleted accept-edits and a
+        // literal here went on reporting it.
+        "plan_modes": plan_modes,
         "workflow_delivery_count": workflow_delivery_count,
         "workflow_cancelled_on_shutdown": true,
         "registration_absent_when_disabled": true,
