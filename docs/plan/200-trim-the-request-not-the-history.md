@@ -261,3 +261,31 @@ DESIGN、第二个我自己没看出来:
   各做变异检查(去掉 resume 装回、去掉 rebase 补写 → 对应测试变红)。`make check` 全绿,
   `make mock` 输出不变。
 
+### 真实测试(2026-09-24,`56f8fdd` 构建的 debug 二进制)
+
+用本机 `~/.kloop/config.toml` 的 provider,放在临时 HOME 里跑 headless(不写进真实会话目录,
+测完连同复制的配置一起删除)。任务:三次串行 bash(`seq 1 4000` 约 1.9 万字符,再两个 echo)。
+
+**Anthropic 轨(TTL 5 分钟)**:
+
+| 步骤 | 预期 | 实测 |
+|---|---|---|
+| 1. 同一 turn 内，缓存一直热 | 不落 stub | 无 `request_stub`,大输出原样发 |
+| 2. 空闲 6 分钟后 `--continue` | 第一次请求即落 stub | 先写 `request_stub` 行再发;前缀约 22.6k → 11.9k token |
+| 3. 紧接着换进程再 `--continue`(TTL 内) | 发出同一 stub、命中缓存 | read 12282 / write 79;无新 stub 行，无新 offload 文件 |
+
+- 第 2 步问的是必须用到被裁输出的问题(第 2500 行、4000 行之和)。模型对 `off-0001.txt` 用
+  `sed -n`、`paste | bc` 就地查询，两个答案都对，没有重跑 `seq`,也没有整篇读回——stub 措辞与
+  offload 目录的权限豁免在真实模型下都工作。
+- 第 3 步正是首版(不持久化)会破缓存的场景：那一版在这里会发原文，多约 1 万 token 并整段重写缓存。
+
+**Responses 轨(TTL 按 1 小时)**:同样流程,1 小时内不落 stub;resume 后 read 19072,全命中。
+
+**测出来的两件事(都未修、未立 plan)**:
+
+1. **`saved_tokens` 估少一半多**:记录 4587,实测前缀少了约 1.07 万。原因是"ASCII 四字符一
+   token"对纯数字加换行的文本偏低。只影响 `/context` 那行显示，不影响裁剪判定。
+2. **Anthropic 轨同一 turn 内有与本 plan 无关的缓存不命中**:每轮第 2、3 次请求 cache read 为 0、
+   各写约 2.2 万 token,第 4 次才命中。关掉 `request_reduction` 做对照，模式完全相同，所以是网关
+   或上游行为(或 kloop 断点放置与该网关的交互),不是裁剪引起的。这是本次看到的最大一笔缓存浪费。
+
