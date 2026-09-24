@@ -1787,13 +1787,17 @@ fn repair_pairing(
 /// What a crash left a call that never reported back. The two texts differ
 /// in what they tell the model to do next: a call that never started can be
 /// repeated as is; one that started may have acted, fully or partly, and the
-/// state has to be checked before repeating it. Only calls that may have
+/// state has to be checked before repeating it. Both halves of that second
+/// instruction were measured against a real model (plan 204 §九): without
+/// "check" it reran blind, without "finish only what remains" it checked,
+/// saw the half-done work, and reran the whole call anyway. Only calls that may have
 /// side effects are ever recorded as started — a read that died midway is
 /// reported as not run, which is just as safe to act on.
 fn unfinished_result(tool_use_id: &str, started: bool) -> ContentBlock {
     let content = if started {
         "interrupted: the session ended while this call was running. It may have taken \
-         effect, fully or partly. Check the current state before repeating it."
+         effect, fully or partly. Check the current state before repeating it. If it took \
+         effect partly, finish only what remains instead of repeating it."
     } else {
         "not run: the session ended before this call started. Nothing happened; \
          calling it again is safe."
@@ -2546,7 +2550,8 @@ mod tests {
                 tool_use_id: "w1".into(),
                 content: "interrupted: the session ended while this call was running. It may \
                           have taken effect, fully or partly. Check the current state before \
-                          repeating it."
+                          repeating it. If it took effect partly, finish only what remains \
+                          instead of repeating it."
                     .into(),
                 is_error: true,
             }

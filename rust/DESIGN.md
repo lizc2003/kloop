@@ -591,8 +591,13 @@ Resume replays the file, then makes the history legal and consistent again. Read
   `tool_use` gets an `is_error` result that says which way the session died
   around it (plan 204). A call with a `tool_started` line anywhere in the file
   gets `interrupted: … It may have taken effect, fully or partly. Check the
-  current state before repeating it.`; any other gets `not run: … Nothing
-  happened; calling it again is safe.` A round's results are recorded as one
+  current state before repeating it. If it took effect partly, finish only
+  what remains instead of repeating it.`; any other gets `not run: … Nothing
+  happened; calling it again is safe.` Both sentences of the first text earn
+  their place in a real-model run (plan 204 §九): the old bare `interrupted`
+  was mostly rerun blind, "check" alone got it checked and then still rerun
+  whole half the time, and only with "finish only what remains" did it
+  complete just the missing part. A round's results are recorded as one
   message, so a crash on its third call leaves the first two unanswered too —
   they started, so they read "check first", which is what lets the model find
   out they already happened. A read that died midway reads "not run", which is

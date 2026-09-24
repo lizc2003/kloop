@@ -149,3 +149,17 @@ kloop 的意图屏障已经有了:带 `tool_use` 的 assistant 消息在派发�
 
 收尾:DESIGN.md 会话持久化两处(`tool_started` 行一段、配对修复条改写);`refs/README.md` chord 表行、
 节标题、第 5 条标注吸收;**`refs/chord` 已删除**(删前 HEAD `cce05db`、工作树干净);plan 182 补记新行类型。
+
+**真实测试(2026-09-24,用户「真实测试」「继续」)**:默认 provider(`deepseek-v4.1-flash`)在临时 git 仓库里
+跑 `--headless --permission-mode bypass`,命令 `echo step1 >> log.txt && sleep 40 && echo step2 >> log.txt`,
+`sleep` 期间 `kill -9`。落盘正确:tool_use 消息后一行 `tool_started`、无结果;resume 写出 `repaired` 标记,
+补的是 `interrupted…` 那句。随后复制这个崩溃会话、只换 `repaired` 里的结果文本做对照(每次重置 `log.txt` 为
+`step1`,同一句 "The previous session was cut off. Finish the original task."):
+
+| 措辞 | 先看现状 | 只补 step2(对) | 整条重跑(step1 重复) |
+|---|---|---|---|
+| A 旧的裸 `interrupted` | 1/3 | 1/3 | 2/3(都没看就重跑) |
+| B 本 plan 第二节原句 | 4/4 | 2/4 | 2/4 |
+| C B + "If it took effect partly, finish only what remains instead of repeating it." | 3/3 | 3/3 | 0 |
+
+样本小、单一模型,但分工清楚:"先核实"决定看不看,"只做剩下的"决定看完怎么做。代码改用 C。
