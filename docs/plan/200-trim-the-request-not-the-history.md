@@ -188,4 +188,46 @@ Chat 轨靠后端自动前缀缓存。**请求视图里任何一个位置的字�
 
 ## 九、完成记录
 
-(未开工)
+✅ 2026-09-24,提交号见下一条 `docs(plan200)` 提交。第六节问用户"默认开还是关",用户答
+**「不要破坏cache率」**——这把第三节的规则整个改了,不只是回答了开关:
+
+- **第三节的摊销门与"尾部直接生效"都没做,换成"只在缓存已凉时落新 stub"。** 摊销门保证的是
+  *省钱*(省下的 ≥ 要重写的尾巴的 30%),不是*命中率*——哪怕尾部裁剪,那一次请求从裁点往后也是
+  cache write。要命中率零损失,新 stub 只能在前缀本来就不在缓存里的时候落。待定集因此不必
+  存:提议是历史的纯函数,每次冷的时候重新算一遍即可。用户同意后**默认开**(它不碰缓存,
+  也就没有"默认关先观察"的理由)。
+- **"凉"的判定**:按 (provider, endpoint, model) 记上次请求时间(不含 route revision——切走
+  再切回是同一份后端缓存)。从没在这份历史里请求过 → 凉;空闲超过 TTL → 凉,Anthropic 5 分钟
+  (kloop 发的就是默认 ephemeral),两条 OpenAI 轨 1 小时(对方只说"最长一小时",过了一小时
+  才能确定没了,和用户确认过);`replace_all`(压缩、`/clear`)→ 状态清空即凉。
+- **resume 不是"一律凉"**(第三节原文如此):resume 在 TTL 之内时对方缓存还热着。改为用会话
+  文件的 mtime 当"上次请求时间"——文件最后一次写不早于最后一次请求,所以空闲只会被低估,
+  错也错在保守那边。测试钉了两边:刚写过 → 不裁;mtime 拨回 10 分钟 → 第一次请求带 stub。
+- **rebase 不清状态**(第五节原想清):分支与原对话共享前缀、也共享那段前缀的缓存字节;
+  清掉冻结集会把已发出的 stub 换回原文,正好破缓存。
+- **召回只对 grep/glob/外部工具生效**:重跑同一条 shell 命令(测试、构建)是常态,不是裁过头
+  的信号——若也算,反复跑的 `cargo test` 结果会永远豁免;read 的重读本来就是 superseded。
+  召回还要求新调用出现在模型**看到 stub 之后**(冻结时记下请求长度)。
+- **挂载**:状态是 `History` 的字段(与历史同寿命,`replace_all` 里 reset),裁剪在
+  `turn_rounds` 里做一次、裁好的视图传给 `sample_with_retry`(签名改为收 `&[Message]`),
+  三次重试发同一份字节。原文写盘复用 offload 的 `off-NNNN.txt`(抽出 `write_offload_file`);
+  "已 offload 过"的判定用指针固定结尾(`POINTER_END` 常量,两处共用)——外部工具阈值 1500
+  低于 offload 预览的约 2300,第二节"天然不会二次裁"对它不成立,必须显式判。
+- `/context` 的历史行改按**发出去的样子**算(`History::messages_as_sent`),有 stub 时多一行
+  `request reduction: N results stubbed, ~X tokens saved`。
+- `[context] request_reduction`(bool,默认 true),`validate_root` 加 `context`。
+- **测试**:纯函数层 19 条(`request_reduction/tests.rs`:四类 stub 整串断言、白名单外/小/
+  年轻/`Blocks`/offload 预览不动、stale/superseded/失败的编辑不算/部分重读不覆盖、并行同龄、
+  确定性、热缓存不动且冻结 stub 逐字节不变、OpenAI 一小时、别的模型即凉、reset 即凉、
+  resume 两边、召回、写盘失败原样发且下次再试、统计);集成层 3 条(mock 抓请求体:
+  第一轮热缓存里 b1 原样 → 冷了之后 stub、两次失败重试加成功三次请求逐字节相同、下一轮复用同一
+  stub、消息/块/id 骨架与历史一致、`History::items` 与 rollout 文件前缀一个字节没变、resume
+  两种 mtime、关掉开关后原样发——这条做过变异检查,开关打开即红);CLI 配置解析 1 条。
+- **第七节有两条没写,理由**:"Anthropic 移动断点仍在最后一个非 thinking block 上"——裁剪不增
+  减消息与块(骨架测试钉住),断点放置的输入形状不变,不另写;"裁剪生效后下一轮估算下降"——
+  锚点是 provider 报的 usage,mock 的 usage 是脚本写死的,那条测试只会测脚本。
+- `make check` 全绿;`make mock` 输出与改动前逐行相同(会话短,碰不到阈值,符合第七节预期)。
+  `make parity` 改动前后都红在同一处(`plan_control.mode_events[1]` 的 value/type drift),
+  与请求体无关,**不是本次引入,未处理**。
+- 没做真实 provider 下的 dogfood:阈值与"长无人值守任务可能一直不凉"的实际影响要靠后续观察。
+- chord clone 不退休:201–204 都还没做。

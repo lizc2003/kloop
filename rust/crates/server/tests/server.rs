@@ -282,6 +282,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
             program_limits: Default::default(),
+            request_reduction: true,
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(
                 kloop_core::worktree::ActiveWorktreeState::default(),
@@ -731,6 +732,7 @@ fn worktree_factory(
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
             program_limits: Default::default(),
+            request_reduction: true,
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(
                 kloop_core::worktree::ActiveWorktreeState::default(),

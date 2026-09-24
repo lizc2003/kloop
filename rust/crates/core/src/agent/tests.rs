@@ -12,6 +12,7 @@ use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderResponseProvenance;
 use kloop_protocol::Role;
 use kloop_protocol::ToolDef;
+use kloop_protocol::ToolResultContent;
 use kloop_protocol::Usage;
 use kloop_provider::MockTurn;
 
@@ -4533,4 +4534,236 @@ mod a_turn_that_never_happened {
         assert_eq!(returned, None);
         assert_eq!(history.messages(), &[Message::user_text("do the thing")]);
     }
+}
+
+/// Plan 200: what a request's messages look like with every text dropped —
+/// roles, block kinds and ids. Reduction may change text and nothing else.
+fn request_skeleton(messages: &[Message]) -> Vec<(Role, Vec<(&'static str, String)>)> {
+    messages
+        .iter()
+        .map(|message| {
+            let blocks = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { .. } => ("text", String::new()),
+                    ContentBlock::Thinking { .. } => ("thinking", String::new()),
+                    ContentBlock::RedactedThinking { .. } => ("redacted", String::new()),
+                    ContentBlock::Image { .. } => ("image", String::new()),
+                    ContentBlock::ToolUse { id, .. } => ("tool_use", id.clone()),
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        ..
+                    } => ("tool_result", format!("{tool_use_id}/{is_error}")),
+                })
+                .collect();
+            (message.role, blocks)
+        })
+        .collect()
+}
+
+fn sent_result<'a>(messages: &'a [Message], id: &str) -> &'a str {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content: ToolResultContent::Text(text),
+                ..
+            } if tool_use_id == id => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+const BIG_OUTPUT: &str = "head -c 5000 /dev/zero | tr '\\0' x";
+
+fn big_output_turn() -> Vec<MockTurn> {
+    vec![
+        MockTurn::Blocks(vec![tool_use("b1", BIG_OUTPUT)]),
+        MockTurn::Blocks(vec![tool_use("b2", "true")]),
+        MockTurn::Blocks(vec![tool_use("b3", "true")]),
+        MockTurn::Blocks(text("done")),
+    ]
+}
+
+fn reduction_session(
+    tag: &str,
+    script: Vec<MockTurn>,
+) -> (
+    Arc<Config>,
+    std::path::PathBuf,
+    Arc<std::sync::Mutex<Vec<kloop_provider::MockRequest>>>,
+) {
+    let (provider, seen) = Provider::mock_recording(script);
+    let cfg = crate::tools::testutil::TestConfig::new(tag)
+        .provider(provider)
+        .max_rounds(Some(10))
+        .build();
+    let session = cfg.offload_dir.join(format!("{tag}.jsonl"));
+    let _ = std::fs::remove_file(&session);
+    (cfg, session, seen)
+}
+
+/// Plan 200: a stub replaces an old result in what is sent, only once the cache
+/// is cold, and never in the history or the session file. Every retry sends
+/// the same bytes, and the request keeps its shape.
+#[tokio::test]
+async fn an_old_result_goes_out_as_a_stub_while_history_keeps_it_whole() {
+    let mut script = big_output_turn();
+    script.extend([
+        MockTurn::Error("blip one".into()),
+        MockTurn::Error("blip two".into()),
+        MockTurn::Blocks(vec![tool_use("b4", "true")]),
+        MockTurn::Blocks(text("done again")),
+    ]);
+    let (cfg, session, seen) = reduction_session("plan200-in-process", script);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("build it"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    let original = "x".repeat(5000);
+    // One warm turn: b1 is old enough by its last request, but that request's
+    // cache was a moment old.
+    for request in seen.lock().unwrap().iter().skip(1) {
+        assert_eq!(sent_result(&request.messages, "b1"), original);
+    }
+    let items_before = history.messages().to_vec();
+    let file_before = std::fs::read(&session).unwrap();
+
+    history.let_request_caches_expire();
+    history.record(Message::user_text("again"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+
+    let seen = seen.lock().unwrap();
+    let second_turn = &seen[4..];
+    let stub = sent_result(&second_turn[0].messages, "b1");
+    assert!(
+        stub.starts_with("[bash output trimmed from this request: 5000 chars"),
+        "{stub}"
+    );
+    let saved = stub
+        .split("saved to ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(saved).unwrap(), original);
+    // The two failed attempts and the one that answered sent the same bytes.
+    assert_eq!(second_turn[0].messages, second_turn[1].messages);
+    assert_eq!(second_turn[1].messages, second_turn[2].messages);
+    // The next round, now warm, repeats the stub exactly.
+    assert_eq!(sent_result(&second_turn[3].messages, "b1"), stub);
+    // Same messages, blocks and ids as history — only a text changed.
+    let sent = &second_turn[0].messages;
+    let n = items_before.len() + 1;
+    assert_eq!(
+        request_skeleton(&sent[sent.len() - n..]),
+        request_skeleton(&history.messages()[..n])
+    );
+
+    assert_eq!(history.messages()[..items_before.len()], items_before[..]);
+    assert_eq!(
+        sent_result(history.messages(), "b1"),
+        original,
+        "history is never reduced"
+    );
+    let file_after = std::fs::read(&session).unwrap();
+    assert_eq!(file_after[..file_before.len()], file_before[..]);
+    assert_eq!(
+        crate::rollout::resume_session(&session).unwrap().messages,
+        history.messages()
+    );
+    let _ = std::fs::remove_file(session);
+}
+
+/// Plan 200: nothing about reduction is persisted. A resumed session judges
+/// the cache by how long its file has been quiet: a moment ago is warm, past
+/// the TTL is cold and its first request carries the stubs.
+#[tokio::test]
+async fn a_resumed_session_stubs_only_once_its_cache_can_have_expired() {
+    let mut script = big_output_turn();
+    script.extend([
+        MockTurn::Blocks(text("fresh")),
+        MockTurn::Blocks(text("quiet")),
+    ]);
+    let (cfg, session, seen) = reduction_session("plan200-resume", script);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("build it"));
+    run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    drop(history);
+    let original = "x".repeat(5000);
+
+    let resume = || {
+        History::resume(
+            cfg.offload_dir.clone(),
+            crate::rollout::resume_session(&session).unwrap(),
+        )
+    };
+    let mut fresh = resume();
+    fresh.record(Message::user_text("still there?"));
+    run_turn(&cfg, &mut fresh, &ui, &CancellationToken::new(), 0).await;
+    drop(fresh);
+    assert_eq!(
+        sent_result(&seen.lock().unwrap()[4].messages, "b1"),
+        original
+    );
+
+    let ten_minutes_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    std::fs::File::options()
+        .write(true)
+        .open(&session)
+        .unwrap()
+        .set_modified(ten_minutes_ago)
+        .unwrap();
+    let mut quiet = resume();
+    quiet.record(Message::user_text("back"));
+    run_turn(&cfg, &mut quiet, &ui, &CancellationToken::new(), 0).await;
+    let seen = seen.lock().unwrap();
+    assert!(
+        sent_result(&seen[5].messages, "b1").starts_with("[bash output trimmed"),
+        "{:?}",
+        seen[5].messages
+    );
+    assert_eq!(sent_result(quiet.messages(), "b1"), original);
+    let _ = std::fs::remove_file(session);
+}
+
+/// Plan 200: `[context] request_reduction = false` sends history as it is.
+#[tokio::test]
+async fn reduction_switched_off_sends_every_result_whole() {
+    let mut script = big_output_turn();
+    script.push(MockTurn::Blocks(text("again")));
+    let (provider, seen) = Provider::mock_recording(script);
+    let mut cfg = crate::tools::testutil::TestConfig::new("plan200-off")
+        .provider(provider)
+        .max_rounds(Some(10))
+        .build()
+        .test_clone();
+    cfg.request_reduction = false;
+    let cfg = Arc::new(cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("build it"));
+    run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    // With reduction on, this request would carry b1 as a stub.
+    history.let_request_caches_expire();
+    history.record(Message::user_text("again"));
+    run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 5);
+    assert_eq!(sent_result(&seen[4].messages, "b1"), "x".repeat(5000));
 }

@@ -21,6 +21,7 @@ use kloop_protocol::Message;
 
 mod sampling;
 
+use crate::request_reduction::RequestReduction;
 pub use crate::rollout::TurnError;
 use crate::rollout::TurnTerminal;
 use sampling::SampleOk;
@@ -1037,19 +1038,32 @@ async fn turn_rounds(
         if let Some(ending) = turn.compact_predictively(estimated, round).await {
             break 'turn ending;
         }
-        let sampled = sample_with_retry(
-            cfg,
-            &turn.active_attempt,
-            turn.history,
-            &turn.tools,
-            ui,
-            cancel,
-            turn.stream_text,
-            depth,
-            &workspace,
-            &mut turn.item_seq,
-        )
-        .await;
+        let reduction = cfg.request_reduction.then(|| RequestReduction {
+            cwd: &workspace.cwd,
+            now: std::time::SystemTime::now(),
+            identity: turn.active_attempt.identity(),
+        });
+        let sampled = match turn
+            .history
+            .request_view(&turn.active_attempt, reduction.as_ref())
+        {
+            Ok(view) => {
+                sample_with_retry(
+                    cfg,
+                    &turn.active_attempt,
+                    &view,
+                    &turn.tools,
+                    ui,
+                    cancel,
+                    turn.stream_text,
+                    depth,
+                    &workspace,
+                    &mut turn.item_seq,
+                )
+                .await
+            }
+            Err(error) => Sampled::Terminal(error),
+        };
         let SampleOk {
             blocks,
             usage,

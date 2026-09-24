@@ -60,6 +60,7 @@ pub(crate) struct RuntimeSettings {
     sandbox: SandboxSettings,
     agent_types: Arc<Vec<AgentType>>,
     program_limits: kloop_core::ProgramLimits,
+    request_reduction: bool,
     defer_threshold: usize,
     shell_programs: Arc<ShellPrograms>,
     shell_warnings: Vec<String>,
@@ -78,6 +79,7 @@ impl RuntimeSettings {
                 sandbox: SandboxSettings::default(),
                 agent_types: Arc::new(Vec::new()),
                 program_limits: kloop_core::ProgramLimits::default(),
+                request_reduction: true,
                 defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
                 shell_programs: Arc::new(shell_programs),
                 shell_warnings,
@@ -111,6 +113,7 @@ impl RuntimeSettings {
             sandbox: load_sandbox_settings(table)?,
             agent_types: Arc::new(load_agent_types(table)?),
             program_limits: load_program_limits(table)?,
+            request_reduction: load_request_reduction(table)?,
             defer_threshold: crate::mcp::load_defer_threshold(table)?,
             shell_programs: Arc::new(shell_programs),
             shell_warnings,
@@ -712,6 +715,27 @@ fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> 
     Ok(limits)
 }
 
+/// `[context] request_reduction` (default true): whether requests carry older
+/// tool results as stubs. It never touches the history, so turning it off
+/// restores the full requests at once.
+fn load_request_reduction(root: &toml::Table) -> Result<bool> {
+    let mut enabled = true;
+    if let Some(section) = root.get("context") {
+        let section = section.as_table().context("[context] must be a table")?;
+        for (key, value) in section {
+            match key.as_str() {
+                "request_reduction" => {
+                    enabled = value
+                        .as_bool()
+                        .context("context.request_reduction must be a boolean")?;
+                }
+                other => bail!("[context] has unknown key '{other}' (request_reduction)"),
+            }
+        }
+    }
+    Ok(enabled)
+}
+
 /// The session sandbox policy, or None with a warning when unavailable —
 /// fail-open like hooks: the permission gate stays the enforcement layer. The
 /// global switches are process-stable; cwd is the per-session writable root.
@@ -927,6 +951,7 @@ pub(crate) fn config_from_settings(
         inbox,
         scheduler,
         program_limits: runtime.program_limits,
+        request_reduction: runtime.request_reduction,
         skills,
         active_worktree: Arc::new(kloop_core::worktree::ActiveWorktreeState::default()),
         surface: kloop_core::config::SurfaceCapabilities {
@@ -1638,6 +1663,25 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         ] {
             assert!(
                 load_sandbox_settings(&config(bad)).is_err(),
+                "accepted: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_reduction_defaults_on_and_only_a_boolean_turns_it_off() {
+        assert!(load_request_reduction(&config("")).unwrap());
+        assert!(load_request_reduction(&config("[context]\n")).unwrap());
+        assert!(
+            !load_request_reduction(&config("[context]\nrequest_reduction = false\n")).unwrap()
+        );
+        for bad in [
+            "context = false\n",
+            "[context]\nrequest_reduction = \"off\"\n",
+            "[context]\nwindow = 1\n",
+        ] {
+            assert!(
+                load_request_reduction(&config(bad)).is_err(),
                 "accepted: {bad}"
             );
         }

@@ -33,7 +33,9 @@ pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
     if let Ok(tools) = &tools {
         rows.push(tool_row(tools));
     }
-    let messages = history.messages();
+    // As sent: a stubbed result costs its stub, not what history holds.
+    let (messages, reduced) = history.messages_as_sent();
+    let messages = messages.as_slice();
     let history_tokens: u64 = messages
         .iter()
         .map(crate::history::estimate_message_tokens)
@@ -58,6 +60,12 @@ pub fn run(history: &History, cfg: &Arc<Config>) -> SlashResult {
         output.push_str(&row.render());
     }
     output.push_str(&Row::top("total", total).render());
+    if reduced.stubbed > 0 {
+        output.push_str(&format!(
+            "\nrequest reduction: {} results stubbed, ~{} tokens saved",
+            reduced.stubbed, reduced.saved_tokens
+        ));
+    }
     if let Err(error) = &tools {
         output.push_str(&format!("\ntools: unavailable ({error})"));
     }

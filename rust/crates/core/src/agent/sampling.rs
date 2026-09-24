@@ -20,7 +20,6 @@ use crate::event::Delta;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
-use crate::history::History;
 use crate::provider_route::FrozenProviderAttempt;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
@@ -86,7 +85,7 @@ const MAX_ATTEMPTS: u32 = 3;
 pub(super) async fn sample_with_retry(
     cfg: &Arc<Config>,
     provider_attempt: &FrozenProviderAttempt,
-    history: &History,
+    projected: &[Message],
     tools: &[ToolDef],
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
@@ -95,11 +94,9 @@ pub(super) async fn sample_with_retry(
     workspace: &EffectiveWorkspace,
     item_seq: &mut u64,
 ) -> Sampled {
-    let projected = match history.provider_request_view(provider_attempt) {
-        Ok(projected) => projected,
-        Err(error) => return Sampled::Terminal(error),
-    };
-    let messages = projected.as_slice();
+    // `projected` is the request view, reduced once by the caller: every retry
+    // below sends these exact bytes.
+    let messages = projected;
     // Project instructions, the (depth-0) skills catalog, and the deferred-tools
     // notice ride every request as a synthetic first user message. Never
     // recorded: resume rereads fresh files, and compaction cannot swallow it.

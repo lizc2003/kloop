@@ -159,6 +159,7 @@ fn validate_root(table: &toml::Table) -> Result<()> {
                 | "shells"
                 | "agents"
                 | "program"
+                | "context"
         ) {
             bail!("~/.kloop/config.toml has unknown top-level key '{key}'");
         }

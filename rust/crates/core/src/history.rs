@@ -8,6 +8,10 @@ use crate::provider_route::FrozenProviderRoute;
 use crate::provider_route::ProvenanceMismatch;
 use crate::provider_route::RouteReopened;
 use crate::provider_route::SwitchError;
+use crate::request_reduction::OffloadSink;
+use crate::request_reduction::ReductionState;
+use crate::request_reduction::ReductionStats;
+use crate::request_reduction::RequestReduction;
 use crate::rollout::ResumedSession;
 use crate::rollout::Rollout;
 use crate::rollout::SessionRuntime;
@@ -85,6 +89,9 @@ pub struct History {
     /// commits this first, so the input can never land behind something that
     /// happened after it.
     staged: Vec<Message>,
+    /// Which results requests carry as stubs (`request_reduction`). Never in
+    /// `items`, never persisted.
+    reduction: ReductionState,
 }
 
 impl History {
@@ -100,6 +107,7 @@ impl History {
             rollout: None,
             next_memory_boundary: 1,
             staged: Vec::new(),
+            reduction: ReductionState::default(),
         }
     }
 
@@ -115,6 +123,11 @@ impl History {
     pub fn resume(offload_dir: PathBuf, resumed: ResumedSession) -> Self {
         sync_offload_counter(&offload_dir);
         let provider_routes = resumed.snapshot.provider_routes.clone();
+        // The last write to the session file is no earlier than its last
+        // request, so idleness measured from it is never overstated.
+        let quiet_since = std::fs::metadata(resumed.rollout.path())
+            .and_then(|metadata| metadata.modified())
+            .ok();
         Self {
             items: resumed.messages,
             offload_dir,
@@ -126,6 +139,7 @@ impl History {
             next_memory_boundary: resumed.rollout.next_boundary(),
             rollout: Some(resumed.rollout),
             staged: Vec::new(),
+            reduction: ReductionState::resumed(quiet_since),
         }
     }
 
@@ -134,6 +148,11 @@ impl History {
     /// store (branches share it, like resume). The usage anchor resets so the
     /// next sampled response re-anchors the estimate. The old rollout is dropped
     /// unwritten — the branch it wrote already lives in its own file on disk.
+    ///
+    /// Request reduction state carries over: a branch shares its prefix — and
+    /// that prefix's cached bytes — with the conversation it was cut from, and
+    /// a stub is keyed by a `tool_use_id` the branch either still has or never
+    /// sends.
     pub fn rebase(&mut self, resumed: ResumedSession) {
         self.items = resumed.messages;
         self.provider_usage = resumed.provider_usage;
@@ -314,6 +333,35 @@ impl History {
             )?);
         }
         Ok(view)
+    }
+
+    /// [`Self::provider_request_view`] as it actually goes out: with request
+    /// reduction, older tool results are swapped for stubs (see
+    /// [`crate::request_reduction`]). `items` is never touched.
+    pub(crate) fn request_view(
+        &mut self,
+        attempt: &FrozenProviderAttempt,
+        reduction: Option<&RequestReduction<'_>>,
+    ) -> Result<Vec<Message>, kloop_provider::ProviderFailure> {
+        let mut view = self.provider_request_view(attempt)?;
+        if let Some(request) = reduction {
+            let mut sink = OffloadDir(&self.offload_dir);
+            crate::request_reduction::reduce(&mut view, &mut self.reduction, request, &mut sink);
+        }
+        Ok(view)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn let_request_caches_expire(&mut self) {
+        self.reduction.let_caches_expire();
+    }
+
+    /// The conversation as the last requests carried it — stubs in place — and
+    /// what the stubs saved. `/context` sizes history from this.
+    pub fn messages_as_sent(&self) -> (Vec<Message>, ReductionStats) {
+        let mut messages = self.items.clone();
+        let stats = crate::request_reduction::apply_frozen(&mut messages, &self.reduction);
+        (messages, stats)
     }
 
     pub(crate) fn provider_request_view_for(
@@ -613,6 +661,7 @@ impl History {
         self.persist(|rollout| rollout.append_compacted(&items));
         self.items = items;
         self.usage_anchor = None;
+        self.reduction.reset();
     }
 
     /// Bound one round's tool results *together*. Each result has already
@@ -705,9 +754,7 @@ impl History {
     /// file back out. `Err` means nothing was written and the caller still
     /// holds the only copy.
     fn spill_to_disk(&self, content: &str) -> std::io::Result<(String, PathBuf)> {
-        let id = format!("off-{:04}", NEXT_OFFLOAD_ID.fetch_add(1, Ordering::Relaxed));
-        let path = self.offload_dir.join(format!("{id}.txt"));
-        std::fs::create_dir_all(&self.offload_dir).and_then(|()| std::fs::write(&path, content))?;
+        let path = write_offload_file(&self.offload_dir, content)?;
         // cc's shape: hand over a path and let the general tools work on it, rather
         // than mint an opaque id for a reader that exists only to dereference it.
         // The advice is to extract *in place* — cc reads a 2 MB spec with
@@ -719,12 +766,38 @@ impl History {
         let pointer = format!(
             "{preview}\n[full output saved to {path} ({chars} chars). Query it in place instead \
              of reading it back: bash with `python3 -c '...'` over that path, printing only the \
-             fields you need, so only what you extract enters the context]",
+             fields you need, {POINTER_END}",
             preview = preview(content),
             chars = content.chars().count(),
             path = path.display(),
         );
         Ok((pointer, path))
+    }
+}
+
+/// How every offload pointer ends — which is how request reduction knows a
+/// result is already a preview and leaves it alone.
+const POINTER_END: &str = "so only what you extract enters the context]";
+
+pub(crate) fn is_offload_pointer(text: &str) -> bool {
+    text.ends_with(POINTER_END)
+}
+
+/// Write `content` to a fresh `off-NNNN.txt`. Every file the model is pointed
+/// at goes through here: the permission gate and the sandbox exempt offload
+/// files by that name, so a new name would mean a new hole in both.
+fn write_offload_file(dir: &Path, content: &str) -> std::io::Result<PathBuf> {
+    let id = format!("off-{:04}", NEXT_OFFLOAD_ID.fetch_add(1, Ordering::Relaxed));
+    let path = dir.join(format!("{id}.txt"));
+    std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, content))?;
+    Ok(path)
+}
+
+struct OffloadDir<'a>(&'a Path);
+
+impl OffloadSink for OffloadDir<'_> {
+    fn save(&mut self, content: &str) -> std::io::Result<PathBuf> {
+        write_offload_file(self.0, content)
     }
 }
 

@@ -2000,6 +2000,7 @@ pub(crate) mod testutil {
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),
                 program_limits: Default::default(),
+                request_reduction: true,
                 skills: Default::default(),
                 active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
                 surface: self.surface,

@@ -419,6 +419,10 @@ pub struct Config {
     /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`
     /// config or `KLOOP_PROGRAM_*` env. Sub-agents inherit it with the Config.
     pub program_limits: kloop_codemode::Limits,
+    /// `[context] request_reduction` (default on): send older tool results as
+    /// stubs once the prompt cache is cold anyway. See
+    /// [`crate::request_reduction`].
+    pub request_reduction: bool,
     /// Skills loaded from `<name>/SKILL.md` (plan 28): model-selected reusable
     /// prompt packs. The CLI discovers and parses them; core advertises just
     /// name+description in the injected context (progressive disclosure) and

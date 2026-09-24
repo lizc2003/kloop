@@ -359,6 +359,7 @@ mod tests {
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             program_limits: Default::default(),
+            request_reduction: true,
             skills: Default::default(),
             active_worktree: std::sync::Arc::new(
                 kloop_core::worktree::ActiveWorktreeState::default(),

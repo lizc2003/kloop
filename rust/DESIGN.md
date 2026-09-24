@@ -72,6 +72,11 @@ the five architectural bets below; it is now ten crates, and every bet held.
    flags a client-rendered shell (scripts present, markup far larger than the
    text it yields, text under 200 chars) instead of handing back
    "You need to enable JavaScript to run this app." as if it were the page.
+
+   Offload decides what *enters* the history; what a request keeps *carrying*
+   is a second layer that never writes history — see **Request-time reduction**
+   under Compaction. The sentence above still holds: nothing is rewritten
+   except by compaction.
 2. **Continuation signal = presence of `tool_use` blocks.** Never
    `stop_reason` — it is unreliable across providers.
 3. **Concurrency safety decided per call, by name AND input.**
@@ -324,6 +329,71 @@ field at all, so there is nothing for a model to accept or reject. The list has 
 second use: it is also what the route picker offers, so a level left out of the
 declaration stops being "one day `/effort xhigh` is mysteriously refused" and
 becomes a row visibly missing from a list.
+
+### Request-time reduction (plan 200)
+
+Offload only judges a result when it is recorded, and compaction only acts near
+the window, so between them a 25000-char `read_file` rode every request of a
+long task long after the model was done with it. `core/src/request_reduction.rs`
+closes that gap **in the request, never in the history**: before each sampling
+request `History::request_view` swaps some old `ToolResult` texts for stubs.
+`items`, the session file, resume and fork keep every byte; only result text
+changes, so ids, error flags and message/block order — and with them
+tool_use/tool_result pairing — cannot break. The view is built once per round,
+outside `sample_with_retry`, so all three attempts send identical bytes.
+
+**The prompt cache is a constraint, not a cost to weigh.** All three rails cache
+the request prefix, and any changed byte re-bills everything after it. chord,
+the design this follows, trades cache for size with an amortisation gate
+(`saved × 30 ≥ 9 × rewritten tail`); kloop does not trade at all (user decision,
+2026-09-24): **a new stub lands only when the cache is already cold**, and a
+stub once sent is sent byte for byte from then on (kept by `tool_use_id`, even
+if its reason stops holding). Cold means one of: this (provider, endpoint,
+model) has not been asked anything by this history; it has been idle past its
+TTL — 5 minutes on Anthropic (the ephemeral default kloop sends), an hour on
+the two OpenAI rails (their cache lasts "up to an hour", so only past that is it
+certainly gone); or compaction/`/clear` just rewrote the history
+(`replace_all` resets the state). Between those moments proposals simply wait.
+The cost is that a long unattended run may never go cold and leans on
+compaction as before; an interactive session goes cold whenever the user stops
+to think.
+
+What is stubbed (thresholds are chord's, bytes read as chars — tune from
+dogfood): `read_file` over 3000 chars once **stale** (a later successful
+`edit_file`/`write_file`/`notebook_edit` of the same normalized path) or
+**superseded** (a later successful read covering its lines) — a still-valid read
+is never stubbed; `grep`/`glob` and `bash`/`powershell`/`bash_output` over 3000
+chars at age ≥ 2; anything not built in (MCP, web) and `call_tool` over 1500
+chars at age ≥ 3; a failed call of any of these at age ≥ 4. Age is the number
+of assistant messages after the result, so parallel calls share it. Everything
+else — `skill`, sub-agent results, answers, edits' own results, image-bearing
+results, offload previews — is never touched. Validity is judged **from history
+alone**, never the disk, so resume re-derives the same answer; external changes
+are `remind_changed_reads`' job. Each stub keeps what lets the model continue
+without the original (read: path, line range, size, why; search: up to 20 file
+names and the line count; shell: the last 20 lines ≤ 1500 chars; external: the
+first 500 chars) and points at the original, written through the offload
+store's `off-NNNN.txt` naming so the permission/sandbox exemption above covers
+it. A stub is a pure function of the result and the call — nothing time-relative
+in it. If the original cannot be written the result goes out whole, as with the
+round budget.
+
+An identical `grep`/`glob`/external call issued after its stub was sent means
+the stub cut too deep: the new result is exempt for good (the old stub stays —
+changing it would rewrite a sent prefix). A repeated shell command is not such a
+signal (test suites are re-run all the time), and a repeated read is already
+handled by "superseded".
+
+Nothing is persisted. A resumed session uses its session file's mtime as the
+time of the last request — never earlier than the real one, so idleness is not
+overstated — and then re-derives its stubs, writing duplicate offload files;
+accepted. A rewind (`rebase`) keeps the state: the branch shares its prefix,
+and that prefix's cached bytes, with the conversation it came from. Sub-agents
+have their own histories and therefore their own state. The token estimate
+needs no change — its anchor is the provider's count of the reduced request —
+and `/context` sizes history as sent. The summary request that compaction makes
+still reads the unreduced history. `[context] request_reduction = false` turns it
+all off; since history is untouched, the next request is simply whole again.
 
 ## Session persistence (Phase 2, second slice)
 
@@ -2814,7 +2884,9 @@ the model. The set is small and lives one-file-per-command under
   session's one text estimate (see **Predictive** compaction) so rows compare
   with each other; the total is the sum of the top-level rows, and once a
   provider response exists its measured size is printed beside it rather than
-  mixed in.
+  mixed in. History is sized **as sent**: a result carried as a stub (see
+  **Request-time reduction**) counts as its stub, and a
+  `request reduction: N results stubbed, ~X tokens saved` line says so.
 - `/compact` — summarize and shrink the conversation now, instead of waiting
   for the predictive/reactive triggers.
 - `/clear` — empty the conversation and start fresh (cc/claw semantics: an
