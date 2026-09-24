@@ -366,8 +366,9 @@ if its reason stops holding). Cold means one of: this (provider, endpoint,
 model) has not been asked anything by this history; it has been idle past its
 TTL — 5 minutes on Anthropic (the ephemeral default kloop sends), an hour on
 the two OpenAI rails (their cache lasts "up to an hour", so only past that is it
-certainly gone); or compaction/`/clear` just rewrote the history
-(`replace_all` resets the state). Between those moments proposals simply wait.
+certainly gone); or compaction just rewrote the history
+(`replace_all` resets the state). A `/clear` is a new session and a new
+History, so it starts cold anyway. Between those moments proposals simply wait.
 The cost is that a long unattended run may never go cold and leans on
 compaction as before; an interactive session goes cold whenever the user stops
 to think.
@@ -1400,7 +1401,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduled_for_ms?, reason?, det
 for owner-scoped scheduler lifecycle (**no `turn_id`**),
 `thread/token_usage/updated {token_usage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/context`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` also emits `thread/cleared`, `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/context`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` is refused with a `system` note pointing at `thread/start` (a thread is one session addressed by its id; switching the session under that id is what `thread/start` exists to avoid), `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
 
 **Event recovery.** `thread/events/sync {thread_id, event_cursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is
@@ -1673,8 +1674,9 @@ mode or cached approval change, a policy refresh/invalidation, or a child
 authority boundary — the old receipt fails closed and the model must search
 again. Operations sharing the same live Config and authority share receipts;
 same-session compaction keeps them, while child agents and fresh resume/fork
-Configs start empty. In-place rewind and `/clear` explicitly clear receipts;
-isolated worktrees never inherit them.
+Configs start empty. In-place rewind explicitly clears receipts; `/clear`
+starts a new session, whose Config starts empty too; isolated worktrees never
+inherit them.
 
 The schema and generation are taken from one atomic source snapshot. MCP calls
 hold a shared generation gate through the wire request; refresh takes the write
@@ -2769,15 +2771,15 @@ are reserved. A call to a name the catalog does not carry gets one answer,
 `unknown tool: <name>` — the same answer whether the name was retired or never
 existed.
 
-Independent CLI sessions/native server threads and a resumed process get fresh
-empty registries. An in-process TUI fork keeps the same live registry; the list
-is not written to rollout or reconstructed from history. (Per-thread isolation
+Independent CLI sessions/native server threads, a resumed process and a
+`/clear` get fresh empty registries. An in-process TUI fork keeps the same live
+registry; the list is not written to rollout or reconstructed from history. (Per-thread isolation
 is no longer observable from the tool surface — a whole-table write returns the
 table the caller just sent either way — so the core registry test is what pins
 it.) Every panel-visible mutation publishes a revisioned canonical full
-snapshot. `/clear` is the other half of the registry: the model has no tool for
-it, and it unconditionally advances the revision and hands the TUI its exact
-empty snapshot as a reset fence against late older events. Task rows, activity,
+snapshot, and the TUI accepts only a newer revision — except across a session
+switch, where the new registry's revisions start over and its snapshot replaces
+the old list outright. Task rows, activity,
 the composer's canonical visual rows, and overflow commit all consume the same
 viewport-height budget; no independently counted string-line total can make live
 chrome freeze into scrollback.
@@ -2806,8 +2808,8 @@ Due means the list has stood still for 8 boundaries **and** this revision has
 not been announced yet — one rule, no second clock. A write resets the count,
 so a model that keeps its list current is never reminded; restating the same
 list does not reset it, because that advances no revision and nothing actually
-moved. `/clear` resets the throttle with the list it empties, and its new
-revision re-arms the notice. Depth > 0 is skipped outright: a sub-agent has no
+moved. A `/clear` is a new registry, so the throttle starts over with it.
+Depth > 0 is skipped outright: a sub-agent has no
 `todo_write` and no list, so a reminder there is pure noise, and its boundaries
 do not advance the root's count either.
 
@@ -2822,8 +2824,8 @@ nowhere else. A write replaces the whole list, so the only call worth making
 there is the new list itself — and that one is the call the base prompt says is
 worth a round of its own. Folding the empty list into the same branch also
 retires its separate once-per-conversation clock: an empty list leaves revision
-0 only through a write (which fills it) or `/clear` (which starts a new
-conversation), so once per revision already means once per conversation for it.
+0 only through a write (which fills it) — a new conversation is a new
+registry — so once per revision already means once per conversation for it.
 
 Eight is chosen to be a backstop rather than a metronome, and it is the one
 number here with no derivation. cc's equivalent nag waits ten assistant turns
@@ -2981,11 +2983,33 @@ the model. The set is small and lives one-file-per-command under
   `request reduction: N results stubbed, ~X tokens saved` line says so.
 - `/compact` — summarize and shrink the conversation now, instead of waiting
   for the predictive/reactive triggers.
-- `/clear` — empty the conversation and start fresh (cc/claw semantics: an
-  append-only compacted-to-nothing marker that resume replays to empty; it
-  does **not** fork a new session file). The same transcript's durable
-  provider-usage ledger remains cumulative. Process state (the root-owned task
-  graph, steering queue, and deferred-tool capability receipts) resets too.
+- `/clear` — end this session and start a new one (plan 205, codex's
+  semantics): a new id and a new rollout whose first line is the route in effect
+  right now (`/provider` included), and the TUI wipes the terminal *and its
+  scrollback* and opens on a new banner. The old file gets no further line — no
+  empty `compacted` marker — so `--resume` returns to it exactly as it was. A
+  new session that never gets a message removes its own file (the rollout's
+  preamble-only rule), so repeated `/clear`s leave no empty sessions behind.
+  **Why a new session rather than emptying this one:** emptying is a list of
+  things to reset, and that list falls behind every time `Config` grows — the
+  in-place version missed file observations (a file the model never saw stayed
+  editable), running background work (results landed in the emptied
+  conversation), the scheduler's owner and the session id itself (cache key,
+  transcript pointer). `Config::fresh_session` instead destructures `Config`
+  without `..`, so a new field does not compile until it is sorted into one of
+  two kinds. **Carried over** is what belongs to the process or to the user's
+  way of working: the provider catalog and current route, system prompt, cwd
+  and directories, context budget, hooks, tool sources, sandbox, agent types,
+  skills, surface, and the global and project permission layers. **New** is
+  everything the conversation accumulated: file observations, todo list,
+  deferred-tool receipts, inbox, local-agent root, background shells and
+  executions, scheduler (a scheduler never changes owner; durable tasks stay
+  under the old session's id and come back with it), the worktree slot, and the
+  permission session layer — the mode stays, remembered approvals do not, and
+  plan mode falls back to the mode it was entered from. The old session's
+  background work is stopped (reported by count), and a worktree it entered is
+  kept on disk while the new session starts back in `cwd`. The server refuses
+  `/clear` (see the native protocol); there, `thread/start` is the new session.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
   teardown as a two-tap Ctrl+C; plain also exits on one Ctrl+C); in server mode
   it is inert — quitting one thread must not stop a multi-session process, so it
@@ -3384,8 +3408,9 @@ sub-agent row or an uncorrelated Note. Running/phase/terminal updates with the
 same execution ID replace one mutable live-tail row. A Running row is normally
 kept out of native scrollback; if the hard tail cap forces it into immutable
 scrollback, later Running updates are ignored and the unique terminal update is
-appended as a linked row with the same typed ID. `/clear` and fork rebuild reset
-only the UI indices; a late terminal still starts a fresh identifiable row. This
+appended as a linked row with the same typed ID. `/clear` stops the old
+session's work and resets the UI indices, fork rebuild resets only the UI
+indices; a late terminal still starts a fresh identifiable row. This
 is an event projection, not a resource manager: there is no list/hydration,
 universal stop, status getter, or output panel.
 

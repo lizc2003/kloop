@@ -830,6 +830,28 @@ impl Scheduler {
         })
     }
 
+    /// The scheduler for a session that replaces this one (`/clear`, rewind):
+    /// same durable store, clock and time zone, delivering into the new
+    /// session's inbox, not yet bound to an owner. [`Scheduler::bind_owner`]
+    /// refuses to change owners, so a new session never reuses the old one;
+    /// the old session's durable tasks stay under its id.
+    pub fn successor(&self, inbox: Arc<Inbox>) -> Arc<Self> {
+        let missed_confirmation_available =
+            self.state.lock().unwrap().missed_confirmation_available;
+        let successor = Self::with_parts(
+            inbox,
+            self.store.clone(),
+            Arc::clone(&self.clock),
+            self.timezone,
+        );
+        successor
+            .state
+            .lock()
+            .unwrap()
+            .missed_confirmation_available = missed_confirmation_available;
+        successor
+    }
+
     pub fn set_missed_confirmation_available(&self, available: bool) {
         self.state.lock().unwrap().missed_confirmation_available = available;
         self.notify_change();

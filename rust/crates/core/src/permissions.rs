@@ -765,6 +765,28 @@ impl Permissions {
         &self.identity
     }
 
+    /// The gate a fresh session (`/clear`, rewind) starts with. The global and
+    /// project layers and the approver carry over; the session layer does not:
+    /// nothing it remembered is still granted. The mode is the user's way of
+    /// working and stays — except plan mode, which was entered for the old
+    /// conversation's task and falls back to the mode it was entered from.
+    pub fn fresh_session(&self) -> Self {
+        let mode = {
+            let state = self.session.mode.lock().unwrap();
+            match state.current {
+                Mode::Plan => state.pre_plan,
+                current => current,
+            }
+        };
+        Self {
+            allow_everything: self.allow_everything,
+            global: Arc::clone(&self.global),
+            project: Arc::clone(&self.project),
+            session: Arc::new(PermissionSession::new(mode, self.session.approver.clone())),
+            identity: self.identity.clone(),
+        }
+    }
+
     pub(crate) fn capability_epoch(&self) -> PermissionCapabilityEpoch {
         let project = self.project.capability_epoch();
         let mode = self.session.mode.lock().unwrap().capability_epoch;
@@ -3731,6 +3753,37 @@ mod tests {
         // exhausted, so a prompt would deny — which is what proves it asked).
         assert_eq!(
             p.escalate_sandbox("cargo build", None, 0).await,
+            EscalationOutcome::Declined
+        );
+        assert_eq!(approver.ask_count(), 2);
+    }
+
+    /// A fresh session keeps the approver and the mode but none of what the old
+    /// session remembered; plan mode falls back to the mode it was entered from.
+    #[tokio::test]
+    async fn a_fresh_session_forgets_session_approvals_and_leaves_plan_mode() {
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert_eq!(
+            p.escalate_sandbox("go test ./pkg", None, 0).await,
+            EscalationOutcome::Approved
+        );
+        assert!(p.sandbox_escalation_remembered("go test ./other"));
+        p.set_mode(Mode::Bypass);
+        assert!(p.enter_plan());
+
+        let fresh = p.fresh_session();
+        assert_eq!(fresh.mode(), Mode::Bypass);
+        assert!(!fresh.sandbox_escalation_remembered("go test ./other"));
+        // The old gate is untouched: the new session did not reach into it.
+        assert_eq!(p.mode(), Mode::Plan);
+        assert!(p.sandbox_escalation_remembered("go test ./other"));
+        // Same approver: back in manual, the fresh gate asks it (and, the
+        // script exhausted, gets a no).
+        fresh.set_mode(Mode::Manual);
+        assert_eq!(
+            fresh.escalate_sandbox("go test ./pkg", None, 0).await,
             EscalationOutcome::Declined
         );
         assert_eq!(approver.ask_count(), 2);

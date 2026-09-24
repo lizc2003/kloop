@@ -19,7 +19,7 @@ mod tests {
         let result = run();
         assert!(result.quit);
         assert_eq!(result.output, "bye");
-        assert!(!result.cleared);
+        assert!(!result.new_session);
         assert_eq!(result.run_turn, None);
     }
 }

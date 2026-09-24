@@ -151,16 +151,11 @@ pub async fn run(
             Err(e) => return Err(e),
         }
     }
-    // A shared handle to tear the worktree down after the session (the worker
-    // moves `cfg`, but both point at the same active-worktree slot).
-    let cfg_shutdown = cfg.clone();
-    // Shared with the worker's Config: the UI loop enqueues steering here while
-    // a turn runs, the agent loop drains it at round boundaries (plan 22).
-    let inbox = cfg.inbox.clone();
-    // The permission gate is shared (Arc) with the worker's Config, so the loop
-    // can apply shift+Tab mode changes to it and seed the status-bar badge from
-    // the real starting mode (--permission-mode). effective_permissions covers
-    // a session started in a worktree, whose gate shares the mode cell anyway.
+    // The worker's current Config. `/clear` and rewind replace it with a new
+    // session's, so everything outside the worker that acts on the session —
+    // the UI loop's steering inbox and mode switch, the teardown below — reads
+    // it from here instead of holding the first session's handles.
+    let current = Arc::new(std::sync::Mutex::new(Arc::clone(&cfg)));
     let workspace = cfg.effective_workspace();
     let permissions = Arc::clone(&workspace.permissions);
 
@@ -202,6 +197,7 @@ pub async fn run(
 
     let shutdown_ui: Arc<dyn Ui> = channel_ui.clone();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+    let current_cfg = || Arc::clone(&current.lock().unwrap());
 
     // Setup can fail AFTER raw mode is enabled (e.g. the inline viewport's CPR
     // probe times out on a PTY that never answers, or an intermediate write
@@ -212,11 +208,12 @@ pub async fn run(
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(e) => {
-            let remaining = cfg_shutdown.shutdown_background_work(&shutdown_ui).await;
+            let cfg = current_cfg();
+            let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
             if remaining > 0 {
                 eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
             }
-            if let Some(note) = kloop_core::worktree::finish_active(&cfg_shutdown).await {
+            if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
                 eprintln!("{}", note.trim());
             }
             return Err(e);
@@ -234,11 +231,15 @@ pub async fn run(
         panic_hook(info);
     }));
     let worker = tokio::spawn(agent_worker(
-        cfg,
+        Worker {
+            cfg,
+            current: Arc::clone(&current),
+            ui: channel_ui as Arc<dyn Ui>,
+            events: event_tx,
+            version: version.to_string(),
+        },
         history,
-        channel_ui as Arc<dyn Ui>,
         msg_rx,
-        event_tx,
         pending_images,
     ));
 
@@ -246,14 +247,15 @@ pub async fn run(
         &mut terminal.terminal,
         event_rx,
         msg_tx,
-        inbox,
+        Arc::clone(&current),
         permissions,
         app,
         cwd,
     )
     .await;
     terminal.restore();
-    let remaining = cfg_shutdown.shutdown_background_work(&shutdown_ui).await;
+    let cfg = current_cfg();
+    let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
     if remaining > 0 {
         eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
     }
@@ -262,7 +264,7 @@ pub async fn run(
     worker.abort();
     // Tear down the session worktree (dirty kept on its branch, clean removed);
     // the terminal is restored, so the kept-tree note prints to stderr.
-    if let Some(note) = kloop_core::worktree::finish_active(&cfg_shutdown).await {
+    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
         eprintln!("{}", note.trim());
     }
     result
@@ -323,16 +325,6 @@ fn send_command_result_events(
     result: &kloop_core::commands::SlashResult,
     context_used: u64,
 ) -> bool {
-    if result.cleared && events.send(AgentEvent::ClearTranscript).is_err() {
-        return false;
-    }
-    if let Some(snapshot) = &result.todos
-        && events
-            .send(AgentEvent::Core(CoreEvent::TodoUpdated(snapshot.clone())))
-            .is_err()
-    {
-        return false;
-    }
     if !result.output.is_empty()
         && events
             .send(AgentEvent::System(result.output.clone()))
@@ -341,7 +333,7 @@ fn send_command_result_events(
         return false;
     }
     // The footer's context gauge only moves on a Usage event, and those are
-    // sent around turns. `/compact` and `/clear` rewrite History without one,
+    // sent around turns. `/compact` rewrites History without one,
     // so the gauge kept quoting the size of a conversation that no longer
     // existed until the next turn ended.
     events
@@ -349,17 +341,49 @@ fn send_command_result_events(
         .is_ok()
 }
 
+/// The worker's session handles and the channels it talks through.
+struct Worker {
+    cfg: Arc<Config>,
+    /// Where the worker publishes each new session's Config (see `run`).
+    current: Arc<std::sync::Mutex<Arc<Config>>>,
+    ui: Arc<dyn Ui>,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    /// The build stamp, for the banner a `/clear` opens the new session with.
+    version: String,
+}
+
+/// What the UI mirrors of the session `cfg` now runs: its gate's mode and its
+/// working directory are the base ones, since a new session starts outside any
+/// worktree.
+fn session_switch(cfg: &Config, report: Vec<String>) -> events::SessionSwitch {
+    let workspace = cfg.effective_workspace();
+    events::SessionSwitch {
+        session_id: cfg.session_id.clone(),
+        route: cfg.provider_route.public_route(),
+        mode: workspace.permissions.mode(),
+        cwd: display_cwd(&workspace.cwd),
+        branch: git_branch(&workspace.cwd),
+        todos: cfg.todos.snapshot(),
+        report,
+    }
+}
+
 /// Owns History for its whole lifetime and runs turns strictly one at a time;
 /// the UI loop enforces single-flight by ignoring Enter while running.
 async fn agent_worker(
-    mut cfg: Arc<Config>,
+    worker: Worker,
     mut history: History,
-    ui: Arc<dyn Ui>,
     mut msgs: mpsc::UnboundedReceiver<WorkerMsg>,
-    events: mpsc::UnboundedSender<AgentEvent>,
     // `--image` blocks ride the first user turn; taken once, then empty.
     mut pending_images: Vec<ContentBlock>,
 ) {
+    let Worker {
+        mut cfg,
+        current,
+        ui,
+        events,
+        version,
+    } = worker;
     let mut provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
         Arc::clone(&cfg.provider_catalog),
         history.provider_routes(),
@@ -441,10 +465,34 @@ async fn agent_worker(
                 if result.route_changed {
                     let route = provider_state.active_route();
                     cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
+                    *current.lock().unwrap() = Arc::clone(&cfg);
                     let _ = events.send(AgentEvent::ProviderChanged(route));
                 }
-                // Clear first (drops the old cells), then apply the exact empty
-                // list fence, then show the result on the now-blank transcript.
+                if result.new_session {
+                    let event = match kloop_core::commands::start_fresh_session(&cfg, &ui).await {
+                        Ok(fresh) => {
+                            // The old History goes here; a session that never
+                            // got past its opening line removes its own file.
+                            history = fresh.history;
+                            cfg = Arc::new(fresh.cfg);
+                            provider_state =
+                                kloop_core::provider_route::SessionProviderState::from_timeline(
+                                    Arc::clone(&cfg.provider_catalog),
+                                    history.provider_routes(),
+                                )
+                                .expect("a new session's route timeline is its current route");
+                            *current.lock().unwrap() = Arc::clone(&cfg);
+                            AgentEvent::Cleared {
+                                session: session_switch(&cfg, fresh.report),
+                                version: version.clone(),
+                            }
+                        }
+                        Err(error) => AgentEvent::System(format!("clear failed: {error:#}")),
+                    };
+                    if events.send(event).is_err() {
+                        return;
+                    }
+                }
                 if !send_command_result_events(
                     &events,
                     &result,
@@ -990,8 +1038,15 @@ struct UiState {
     app: App,
     cwd: std::path::PathBuf,
     msgs: mpsc::UnboundedSender<WorkerMsg>,
+    /// The worker's current Config; `inbox` and `permissions` are re-read from
+    /// it whenever the worker switches sessions.
+    session: Arc<std::sync::Mutex<Arc<Config>>>,
     inbox: Arc<Inbox>,
     permissions: Arc<kloop_core::permissions::Permissions>,
+    /// The worker switched sessions since the loop last looked.
+    session_switched: bool,
+    /// `/clear` asked for a blank terminal before the next draw.
+    clear_terminal: bool,
     current_cancel: Option<CancellationToken>,
     turn_started: Option<Instant>,
     thinking_started: Option<Instant>,
@@ -1167,8 +1222,13 @@ impl UiState {
     /// marker, which ends the loop and is never applied — the caller restores
     /// the terminal.
     fn absorb(&mut self, event: AgentEvent) -> bool {
-        if matches!(event, AgentEvent::Quit) {
-            return true;
+        match &event {
+            AgentEvent::Quit => return true,
+            AgentEvent::Cleared { .. } => {
+                self.session_switched = true;
+                self.clear_terminal = true;
+            }
+            _ => {}
         }
         if let Some(next_cwd) = event_cwd(&event) {
             self.cwd = next_cwd;
@@ -1176,17 +1236,52 @@ impl UiState {
         self.app.apply(event);
         false
     }
+
+    /// Point the loop's handles at the session the worker now runs. `true`
+    /// when there was a switch, so the caller re-subscribes to the new inbox.
+    fn adopt_session(&mut self) -> bool {
+        if !std::mem::take(&mut self.session_switched) {
+            return false;
+        }
+        let cfg = Arc::clone(&self.session.lock().unwrap());
+        let workspace = cfg.effective_workspace();
+        self.inbox = Arc::clone(&cfg.inbox);
+        self.permissions = workspace.permissions;
+        self.cwd = workspace.cwd;
+        true
+    }
+}
+
+/// Start the terminal over for a new session: erase the screen and the
+/// scrollback above it, and make the next draw repaint the whole viewport.
+fn clear_terminal<B>(
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
+) -> std::result::Result<(), B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    use ratatui::backend::Backend as _;
+    let backend = terminal.backend_mut();
+    backend.clear_region(ratatui::backend::ClearType::All)?;
+    backend.purge_scrollback();
+    // `Terminal::clear` would otherwise query the cursor, which can block on
+    // the input thread's reader lock (see `PinnedBackend::begin_commit`).
+    backend.begin_commit();
+    let cleared = terminal.clear();
+    terminal.backend_mut().end_commit();
+    cleared
 }
 
 async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     msgs: mpsc::UnboundedSender<WorkerMsg>,
-    inbox: Arc<Inbox>,
+    session: Arc<std::sync::Mutex<Arc<Config>>>,
     permissions: Arc<kloop_core::permissions::Permissions>,
     mut app: App,
     cwd: std::path::PathBuf,
 ) -> Result<()> {
+    let inbox = Arc::clone(&session.lock().unwrap().inbox);
     // Seed the status-bar badge from the real starting mode (e.g. plan). The
     // App is built in `run` (transcript replay + `/` menu catalog); a resumed
     // session's cells start as the tail and scroll into scrollback on overflow.
@@ -1207,13 +1302,21 @@ async fn ui_loop(
         app,
         cwd,
         msgs,
+        session,
         inbox,
         permissions,
+        session_switched: false,
+        clear_terminal: false,
         current_cancel: None,
         turn_started: None,
         thinking_started: None,
     };
     let outcome = loop {
+        if std::mem::take(&mut state.clear_terminal)
+            && let Err(error) = clear_terminal(terminal)
+        {
+            break Err(error);
+        }
         let hud = state.hud(reduced_motion);
         // Ratatui's draw owns autoresize. Commit only from the viewport of that
         // completed frame; if a commit clears it, `draw_frame` immediately
@@ -1253,6 +1356,9 @@ async fn ui_loop(
         };
         if flow.is_break() {
             break Ok(());
+        }
+        if state.adopt_session() {
+            inbox_activity = state.inbox.subscribe_activity();
         }
     };
     // Stop the input thread (it wakes within one poll interval) before the
@@ -1427,13 +1533,12 @@ mod tests {
     }
 
     #[test]
-    fn clear_command_events_order_transcript_then_graph_fence_then_system_then_gauge() {
+    fn command_events_show_the_output_then_move_the_gauge() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let result = kloop_core::commands::SlashResult {
-            output: "cleared".into(),
-            cleared: true,
+            output: "compacted".into(),
+            new_session: false,
             run_turn: None,
-            todos: Some(snapshot(7, 0)),
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -1441,16 +1546,7 @@ mod tests {
         assert!(send_command_result_events(&tx, &result, 40_000));
         assert!(matches!(
             rx.try_recv().unwrap(),
-            AgentEvent::ClearTranscript
-        ));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            AgentEvent::Core(CoreEvent::TodoUpdated(snapshot))
-                if snapshot.revision == 7 && snapshot.todos.is_empty()
-        ));
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            AgentEvent::System(output) if output == "cleared"
+            AgentEvent::System(output) if output == "compacted"
         ));
         // Last, so the footer gauge stops quoting the history the command just
         // rewrote — no turn runs here to send a Usage of its own.
@@ -1459,6 +1555,44 @@ mod tests {
             AgentEvent::Core(CoreEvent::Usage(used)) if used == 40_000
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// `/clear` wipes the screen, and the next frame is a full repaint: a draw
+    /// identical to the one before the clear must still put the content back,
+    /// which a diff against the stale back buffer would skip.
+    #[test]
+    fn clear_terminal_blanks_the_screen_and_forces_a_full_repaint() {
+        let mut terminal = ratatui::Terminal::with_options(
+            PinnedBackend::new(TestBackend::new(12, 3)),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        let draw = |terminal: &mut ratatui::Terminal<PinnedBackend<TestBackend>>| {
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(ratatui::widgets::Paragraph::new("banner"), frame.area())
+                })
+                .unwrap();
+        };
+        draw(&mut terminal);
+        terminal
+            .backend()
+            .inner
+            .assert_buffer_lines(["banner      ", "", ""]);
+
+        clear_terminal(&mut terminal).unwrap();
+        terminal
+            .backend()
+            .inner
+            .assert_buffer_lines(["            ", "", ""]);
+
+        draw(&mut terminal);
+        terminal
+            .backend()
+            .inner
+            .assert_buffer_lines(["banner      ", "", ""]);
     }
 
     #[test]

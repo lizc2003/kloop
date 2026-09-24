@@ -791,7 +791,7 @@ impl BackgroundShells {
         ))
     }
 
-    pub(super) fn running_count(&self) -> usize {
+    pub fn running_count(&self) -> usize {
         self.state
             .lock()
             .unwrap()

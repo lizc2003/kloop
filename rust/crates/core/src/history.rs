@@ -681,8 +681,7 @@ impl History {
     /// was folded up.
     ///
     /// Every applied compaction lands here, whatever triggered it, so this is
-    /// also where the compaction breaker learns of a success. `/clear` lands
-    /// here too, and closing the breaker is right for it as well.
+    /// also where the compaction breaker learns of a success.
     pub fn replace_all(&mut self, items: Vec<Message>) {
         self.persist(|rollout| rollout.append_compacted(&items));
         self.items = items;

@@ -650,13 +650,6 @@ fn apply_event(state: &mut ProjectionState, method: &str, params: &Value) {
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
-        "thread/cleared" => {
-            state.snapshot.history.messages.clear();
-            state.snapshot.history.terminals.clear();
-            state.snapshot.tail.turns.clear();
-            state.snapshot.tail.notices.clear();
-            state.pending_inputs.clear();
-        }
         _ => {}
     }
 }
@@ -950,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn reducer_materializes_items_state_and_clear_boundary() {
+    fn reducer_materializes_items_and_state() {
         let projection = projection(32, usize::MAX);
         projection.record_input(Some(3), &json!("hello"));
         publish(&projection, "turn/started", json!({"turn": {"id": 3}}));
@@ -1025,16 +1018,6 @@ mod tests {
             }])
         );
         assert_eq!(snapshot["snapshot"]["tail"]["notices"][0]["kind"], "note");
-
-        publish(&projection, "thread/cleared", json!({}));
-        let cleared = serde_json::to_value(projection.sync(None).unwrap()).unwrap();
-        assert_eq!(cleared["snapshot"]["history"]["messages"], json!([]));
-        assert_eq!(cleared["snapshot"]["tail"]["turns"], json!([]));
-        assert_eq!(cleared["snapshot"]["tail"]["notices"], json!([]));
-        assert_eq!(
-            cleared["snapshot"]["tail"]["background_tasks"],
-            json!([{"id": "bg-1", "status": "completed"}])
-        );
     }
 
     #[test]

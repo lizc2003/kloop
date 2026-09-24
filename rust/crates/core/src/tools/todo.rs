@@ -88,8 +88,8 @@ struct ReminderState {
     /// Revision already announced; every state is announced once, not every
     /// `REMINDER_STALE_ROUNDS` rounds for as long as it stands. One rule
     /// covers the empty list too: it only leaves revision 0 through a write
-    /// (which fills it) or `/clear` (which starts a new conversation), so
-    /// "once per revision" is "once per conversation" for it.
+    /// (which fills it) — a new conversation (`/clear`) is a new registry —
+    /// so "once per revision" is "once per conversation" for it.
     announced_revision: Option<u64>,
 }
 
@@ -126,25 +126,6 @@ impl TodoRegistry {
 
     pub fn snapshot(&self) -> TodoSnapshot {
         graph_snapshot(&self.state.read().unwrap())
-    }
-
-    /// The user's half of the registry: `/clear` empties the table, and the
-    /// model has no tool that does. The revision advances unconditionally —
-    /// it is the fence the TUI uses to reject a late pre-clear snapshot.
-    pub fn clear(&self) -> Result<(usize, TodoSnapshot)> {
-        let mut state = self.state.write().unwrap();
-        let revision = next_revision(state.revision, "clear")?;
-        let cleared_count = state.todos.len();
-        state.todos.clear();
-        state.revision = revision;
-        // `/clear` starts a new conversation, so the reminder starts over with
-        // it: the new revision re-arms the notice, and the staleness count
-        // restarts from the empty list it just produced.
-        state.reminder = ReminderState {
-            seen_revision: revision,
-            ..ReminderState::default()
-        };
-        Ok((cleared_count, graph_snapshot(&state)))
     }
 
     /// One depth-0 round boundary: advance the staleness count and return the
@@ -334,8 +315,6 @@ mod tests {
     use super::*;
     use crate::agent::Ui;
     use crate::event::Item;
-    use crate::tools::background_executions::ExecutionKind;
-    use crate::tools::background_executions::ExecutionStatus;
     use crate::tools::testutil::run_tool;
     use crate::tools::testutil::test_ctx;
     use std::sync::Arc;
@@ -639,45 +618,6 @@ mod tests {
             registry.round_boundary_reminder().unwrap(),
             NO_LIVE_LIST_REMINDER
         );
-
-        registry.clear().unwrap();
-        for round in 0..REMINDER_STALE_ROUNDS - 1 {
-            assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
-        }
-        assert_eq!(
-            registry.round_boundary_reminder().unwrap(),
-            NO_LIVE_LIST_REMINDER
-        );
-    }
-
-    /// `/clear` advances the revision and empties the list; the throttle has to
-    /// come with it, or the first list of the new conversation is judged
-    /// against the old one's count.
-    #[test]
-    fn clear_resets_the_reminder_clock_with_the_list() {
-        let registry = TodoRegistry::default();
-        registry
-            .write(table(&[("From the old conversation", TodoStatus::Pending)]))
-            .unwrap();
-        for _ in 0..REMINDER_STALE_ROUNDS / 2 {
-            assert_eq!(registry.round_boundary_reminder(), None);
-        }
-        registry.clear().unwrap();
-        registry
-            .write(table(&[("From the new one", TodoStatus::InProgress)]))
-            .unwrap();
-
-        // The half-run count from before the clear buys the new list nothing:
-        // it waits the full stretch.
-        for round in 0..REMINDER_STALE_ROUNDS {
-            assert_eq!(registry.round_boundary_reminder(), None, "round {round}");
-        }
-        let reminder = registry.round_boundary_reminder().unwrap();
-        assert!(reminder.contains("From the new one"), "{reminder}");
-        assert!(
-            !reminder.contains("From the old conversation"),
-            "{reminder}"
-        );
     }
 
     #[test]
@@ -694,8 +634,6 @@ mod tests {
                 .write(table(&[("New", TodoStatus::Pending)]))
                 .is_err()
         );
-        assert_eq!(registry.snapshot(), before);
-        assert!(registry.clear().is_err());
         assert_eq!(registry.snapshot(), before);
 
         // An unchanged rewrite never needs a revision, so it still succeeds.
@@ -801,71 +739,6 @@ mod tests {
             assert!(is_error, "{output}");
             assert_eq!(ctx.cfg.todos.snapshot(), before);
             quiet(ui.take());
-        }
-    }
-
-    #[tokio::test]
-    async fn clear_changes_only_the_todo_registry() {
-        let ctx = test_ctx(0, "todo-clear-scope");
-        let executions = [
-            (ExecutionKind::Agent, "agent-201"),
-            (ExecutionKind::Program, "program-201"),
-            (ExecutionKind::Workflow, "workflow-201"),
-        ];
-        for (kind, id) in executions {
-            ctx.cfg
-                .background_executions
-                .register(
-                    kind,
-                    id,
-                    "must survive /clear",
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .unwrap();
-        }
-
-        #[cfg(unix)]
-        let bash_id = {
-            let (output, is_error) = run_tool(
-                "bash",
-                json!({"command":"sleep 30","background":true}),
-                &ctx,
-            )
-            .await;
-            assert!(!is_error, "{output}");
-            output
-                .strip_prefix("Command running in background with ID: ")
-                .and_then(|rest| rest.split('.').next())
-                .expect("background Bash result has an id")
-                .to_string()
-        };
-
-        write(&ctx, json!([{"subject": "Discarded", "status": "pending"}])).await;
-        let (cleared_count, snapshot) = ctx.cfg.todos.clear().unwrap();
-        assert_eq!(cleared_count, 1);
-        assert_eq!(
-            snapshot,
-            TodoSnapshot {
-                revision: 2,
-                todos: Vec::new(),
-            }
-        );
-        assert_eq!(ctx.cfg.background_executions.running_count(), 3);
-        #[cfg(unix)]
-        assert_eq!(ctx.cfg.background_shells.running_count(), 1);
-
-        #[cfg(unix)]
-        {
-            let (output, is_error) = run_tool("stop_bash", json!({"bash_id":bash_id}), &ctx).await;
-            assert!(!is_error, "{output}");
-        }
-        for (_, id) in executions {
-            assert_eq!(
-                ctx.cfg
-                    .background_executions
-                    .finish(id, ExecutionStatus::Completed, |_, _| {}),
-                Some(ExecutionStatus::Completed)
-            );
         }
     }
 

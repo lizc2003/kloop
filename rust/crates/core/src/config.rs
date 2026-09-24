@@ -546,6 +546,103 @@ impl Config {
         }
     }
 
+    /// The Config of a new session that replaces this one (`/clear`, rewind):
+    /// process-level services carry over, session-level state starts empty.
+    ///
+    /// The destructure below has no `..` on purpose. Clearing a session field
+    /// by field is a list that silently falls behind every time `Config` grows;
+    /// here a new field does not compile until someone decides which side it
+    /// is on. The route carries over as it stands right now, `/provider`
+    /// included — a new session is not a new user. Stopping the old session's
+    /// work is the caller's job ([`crate::commands::start_fresh_session`]).
+    pub fn fresh_session(&self, session_id: String) -> anyhow::Result<Self> {
+        let Self {
+            // Process-level: shared with the old session as they are.
+            provider_catalog,
+            provider_route,
+            system,
+            cwd,
+            project_instructions,
+            max_rounds,
+            offload_dir,
+            sessions_dir,
+            context_window,
+            context_budget,
+            questioner,
+            tool_sources,
+            hooks,
+            shell_programs,
+            // Serializes PowerShell across the process's sessions; a straggler
+            // from the old session that missed the shutdown deadline still
+            // queues behind it.
+            powershell_execution_gate,
+            sandbox,
+            agent_types,
+            tool_allowlist,
+            defer_threshold,
+            program_limits,
+            request_reduction,
+            skills,
+            surface,
+            // Session-level: rebuilt below.
+            permissions,
+            file_state: _,
+            session_id: _,
+            local_agent: _,
+            background_shells: _,
+            unlocked_tools: _,
+            todos: _,
+            inbox: _,
+            scheduler,
+            background_executions: _,
+            active_worktree: _,
+        } = self;
+        let inbox = Arc::new(Inbox::default());
+        let mut fresh = Self {
+            provider_catalog: Arc::clone(provider_catalog),
+            provider_route: provider_route.clone(),
+            system: system.clone(),
+            cwd: cwd.clone(),
+            project_instructions: project_instructions.clone(),
+            max_rounds: *max_rounds,
+            offload_dir: offload_dir.clone(),
+            sessions_dir: sessions_dir.clone(),
+            context_window: *context_window,
+            context_budget: *context_budget,
+            questioner: questioner.clone(),
+            tool_sources: tool_sources.clone(),
+            hooks: Arc::clone(hooks),
+            shell_programs: Arc::clone(shell_programs),
+            powershell_execution_gate: Arc::clone(powershell_execution_gate),
+            sandbox: sandbox.clone(),
+            agent_types: Arc::clone(agent_types),
+            tool_allowlist: tool_allowlist.clone(),
+            defer_threshold: *defer_threshold,
+            program_limits: *program_limits,
+            request_reduction: *request_reduction,
+            skills: Arc::clone(skills),
+            surface: *surface,
+            permissions: Arc::new(permissions.fresh_session()),
+            file_state: Arc::new(FileState::default()),
+            session_id: String::new(),
+            local_agent: LocalAgentContext::root(Arc::clone(&inbox)),
+            background_shells: BackgroundShells::new(),
+            unlocked_tools: Arc::new(DeferredToolUnlocks::default()),
+            todos: Arc::new(crate::tools::TodoRegistry::default()),
+            scheduler: scheduler.successor(Arc::clone(&inbox)),
+            inbox,
+            background_executions: BackgroundExecutions::new(),
+            // A worktree the old session entered belongs to the old session;
+            // the new one starts back in `cwd`.
+            active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
+        };
+        // An ephemeral session (mock, tests) has no id to bind a scheduler to.
+        if !session_id.is_empty() {
+            fresh.bind_session(session_id)?;
+        }
+        Ok(fresh)
+    }
+
     pub fn clone_with_provider_route(&self, provider_route: FrozenProviderRoute) -> Self {
         // The budget belongs to the (provider, model) pair, not to the session:
         // switching to a provider with a smaller window and keeping the old
@@ -610,8 +707,8 @@ impl Config {
         (!self.session_id.is_empty()).then_some(self.session_id.as_str())
     }
 
-    /// Drop non-durable deferred-tool receipts when the conversation branches or
-    /// resets. Same-session compaction deliberately does not call this method.
+    /// Drop non-durable deferred-tool receipts when the conversation branches.
+    /// Same-session compaction deliberately does not call this method.
     pub fn reset_deferred_tool_capabilities(&self) {
         self.unlocked_tools.clear();
     }
@@ -847,6 +944,115 @@ mod subagent_contract_tests {
 
     fn agent_id() -> kloop_protocol::LocalAgentId {
         "agent-7".parse().unwrap()
+    }
+}
+
+/// `fresh_session` sorts every field into "carried over" or "new"; these pin
+/// both halves, and what the new session's services actually do.
+#[cfg(test)]
+mod fresh_session_tests {
+    use super::*;
+
+    fn old_session(tag: &str) -> Config {
+        let mut cfg = crate::tools::testutil::TestConfig::new(tag)
+            .build()
+            .test_clone();
+        cfg.bind_session("old-session".into()).unwrap();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn session_state_is_new_and_process_services_are_shared() {
+        let old = old_session("config-fresh-session");
+        let fresh = old.fresh_session("new-session".into()).unwrap();
+
+        assert_eq!(fresh.session_id, "new-session");
+        assert_eq!(fresh.cache_key(), Some("new-session"));
+        assert!(!Arc::ptr_eq(&old.file_state, &fresh.file_state));
+        assert!(!Arc::ptr_eq(&old.todos, &fresh.todos));
+        assert!(!Arc::ptr_eq(&old.unlocked_tools, &fresh.unlocked_tools));
+        assert!(!Arc::ptr_eq(&old.inbox, &fresh.inbox));
+        assert!(!Arc::ptr_eq(&old.scheduler, &fresh.scheduler));
+        assert!(!Arc::ptr_eq(
+            &old.background_shells,
+            &fresh.background_shells
+        ));
+        assert!(!Arc::ptr_eq(
+            &old.background_executions,
+            &fresh.background_executions
+        ));
+        assert!(!Arc::ptr_eq(&old.permissions, &fresh.permissions));
+        assert!(!Arc::ptr_eq(&old.active_worktree, &fresh.active_worktree));
+        assert_ne!(old.local_agent.context_id(), fresh.local_agent.context_id());
+
+        assert!(Arc::ptr_eq(&old.provider_catalog, &fresh.provider_catalog));
+        assert_eq!(
+            fresh.provider_route.public_route(),
+            old.provider_route.public_route()
+        );
+        assert!(Arc::ptr_eq(&old.hooks, &fresh.hooks));
+        assert!(Arc::ptr_eq(&old.shell_programs, &fresh.shell_programs));
+        assert!(Arc::ptr_eq(
+            &old.powershell_execution_gate,
+            &fresh.powershell_execution_gate
+        ));
+        assert!(Arc::ptr_eq(&old.agent_types, &fresh.agent_types));
+        assert!(Arc::ptr_eq(&old.skills, &fresh.skills));
+        assert_eq!(fresh.system, old.system);
+        assert_eq!(fresh.cwd, old.cwd);
+        assert_eq!(fresh.offload_dir, old.offload_dir);
+        assert_eq!(fresh.sessions_dir, old.sessions_dir);
+        assert_eq!(fresh.surface, old.surface);
+    }
+
+    /// Durable scheduled tasks belong to the session that made them: the new
+    /// session does not see (or fire) them, and they are still there for the
+    /// old one when it is resumed.
+    #[tokio::test]
+    async fn durable_tasks_stay_with_the_session_that_made_them() {
+        let dir = std::env::temp_dir().join(format!(
+            "kloop-config-fresh-scheduler-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = || {
+            crate::scheduler::DurableStore::new(dir.join("scheduled_tasks.json"), "project".into())
+        };
+        let timezone = crate::scheduler::SchedulerTimeZone::named("UTC").unwrap();
+        let mut old = crate::tools::testutil::TestConfig::new("config-fresh-scheduler")
+            .build()
+            .test_clone();
+        old.scheduler =
+            crate::scheduler::Scheduler::persistent(Arc::clone(&old.inbox), store(), timezone);
+        old.bind_session("old-session".into()).unwrap();
+        let job = old
+            .scheduler
+            .create("0 9 * * *", "stand-up", true, true, None)
+            .unwrap();
+
+        let fresh = old.fresh_session("new-session".into()).unwrap();
+        assert_eq!(fresh.scheduler.list().unwrap(), Vec::new());
+
+        let resumed = crate::scheduler::Scheduler::persistent(
+            Arc::new(crate::inbox::Inbox::default()),
+            store(),
+            timezone,
+        );
+        resumed.bind_owner("old-session").unwrap();
+        assert_eq!(resumed.list().unwrap(), vec![job]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mock and test sessions have no id; the new one has none either, and
+    /// its scheduler is left unbound rather than bound to an empty owner.
+    #[tokio::test]
+    async fn an_ephemeral_session_stays_ephemeral() {
+        let old = crate::tools::testutil::TestConfig::new("config-fresh-ephemeral")
+            .build()
+            .test_clone();
+        let fresh = old.fresh_session(String::new()).unwrap();
+        assert_eq!(fresh.session_id, "");
+        assert_eq!(fresh.cache_key(), None);
     }
 }
 

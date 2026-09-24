@@ -64,6 +64,20 @@ impl<B> PinnedBackend<B> {
     pub(crate) fn end_commit(&mut self) {
         self.committing = false;
     }
+
+    /// Queue an erase of the terminal's scrollback (`ESC[3J`) into the pending
+    /// frame, after whatever the frame already holds. ratatui's `ClearType` has
+    /// no scrollback variant, so this goes around the inner backend. Test
+    /// backends have no scrollback to erase.
+    pub(crate) fn purge_scrollback(&mut self) {
+        if let Some(frames) = &mut self.frames {
+            // Appending to the pending frame cannot fail.
+            let _ = crossterm::queue!(
+                frames,
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::Purge)
+            );
+        }
+    }
 }
 
 impl<B: ratatui::backend::Backend> PinnedBackend<B> {

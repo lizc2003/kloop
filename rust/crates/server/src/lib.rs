@@ -1953,8 +1953,8 @@ fn run_provider_command(
 /// Run one turn's work and return its end reason, without touching the turn
 /// bracket (the caller owns that). A slash command line reads/rewrites History
 /// like a turn but is not a model turn: no user message is recorded and nothing
-/// is sampled — its output comes back as a `system` notification, and `/clear`
-/// also emits `thread/cleared` so the client resets its transcript. Images (or
+/// is sampled — its output comes back as a `system` notification. `/clear` is
+/// refused: a thread is one session, and a new one is `thread/start`. Images (or
 /// any non-command text) take the model path.
 async fn run_turn_or_command(
     cfg: &mut Arc<Config>,
@@ -1995,12 +1995,15 @@ async fn run_turn_or_command(
             );
             return EndReason::Completed;
         }
-        // Clear first, then show the output on the now-blank transcript —
-        // matching the TUI order (crates/tui/src/lib.rs). Reversed, a client
-        // that resets its transcript on `thread/cleared` would wipe the command
-        // output it just received.
-        if result.cleared {
-            ui.notify("thread/cleared", json!({}));
+        // `/clear` starts a new session, and here a session is a thread the
+        // client addressed by id: switching it underneath the client is what
+        // `thread/start` exists to avoid.
+        if result.new_session {
+            ui.notify(
+                "system",
+                json!({"text": "/clear is not available on the server — start a new thread with thread/start"}),
+            );
+            return EndReason::Completed;
         }
         if !result.output.is_empty() {
             ui.notify("system", json!({"text": result.output}));

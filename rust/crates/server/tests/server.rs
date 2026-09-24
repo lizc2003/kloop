@@ -3752,11 +3752,10 @@ async fn slash_commands_surface_as_system_notifications() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// `/clear` emits `thread/cleared` so the client resets its view, then reports
-/// via `system` on the now-blank transcript (order matches the TUI), and the
-/// cleared History persists (the session replays to empty).
+/// A thread is one session, so the server refuses `/clear` and points at
+/// `thread/start`; the thread's History is left exactly as it was.
 #[tokio::test]
-async fn clear_command_empties_history_and_notifies() {
+async fn clear_command_is_refused_and_leaves_the_thread_alone() {
     let dirs = test_dirs("slash-clear");
     let mut client = start_server(
         factory(vec![vec![text("an answer")]], dirs.offload.clone(), false),
@@ -3778,7 +3777,6 @@ async fn clear_command_empties_history_and_notifies() {
         methods_for_thread(&log, &tid),
         vec![
             "turn/started",
-            "thread/cleared",
             "system",
             "thread/token_usage/updated",
             "turn/completed",
@@ -3786,15 +3784,16 @@ async fn clear_command_empties_history_and_notifies() {
     );
     assert_eq!(
         log.iter().find(|m| m["method"] == "system").unwrap()["params"]["text"],
-        "conversation cleared"
+        "/clear is not available on the server — start a new thread with thread/start"
     );
 
     client.shutdown().await;
     let messages =
         kloop_core::rollout::load_session(&dirs.sessions.join(format!("{tid}.jsonl"))).unwrap();
-    assert!(
-        messages.is_empty(),
-        "after /clear the session must replay to empty: {messages:?}"
+    assert_eq!(
+        messages.len(),
+        2,
+        "the thread keeps its history: {messages:?}"
     );
     let _ = std::fs::remove_dir_all(&dirs.root);
 }

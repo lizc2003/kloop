@@ -41,7 +41,14 @@ pub enum AgentEvent {
     /// point the command named (`/provider`, `/model`, `/effort`), and Esc there
     /// closes the panel instead of descending a level that command never offered.
     ProviderPicker(kloop_core::provider_route::RoutePicker),
-    ClearTranscript,
+    /// `/clear` ended the session and the worker switched to a new, empty one.
+    /// The transcript starts over from `version`'s banner, and the UI loop
+    /// wipes the terminal and its scrollback before the next draw.
+    Cleared {
+        session: SessionSwitch,
+        /// The build stamp for the new session's banner.
+        version: String,
+    },
     /// `/exit` ran on the worker; the UI loop quits (same clean teardown as a
     /// two-tap Ctrl+C).
     Quit,
@@ -74,6 +81,22 @@ pub enum AgentEvent {
         req: QuestionRequest,
         reply: oneshot::Sender<QuestionOutcome>,
     },
+}
+
+/// What the UI mirrors of a session the worker has just switched to by
+/// `/clear`. The new session's inbox and permission gate are not in here: the
+/// UI loop picks those up from the worker's current Config.
+#[derive(Debug)]
+pub struct SessionSwitch {
+    pub session_id: String,
+    pub route: kloop_protocol::ActiveProviderRoute,
+    pub mode: kloop_core::permissions::Mode,
+    /// Display-ready working directory, and its branch if in a repository.
+    pub cwd: String,
+    pub branch: Option<String>,
+    pub todos: kloop_core::tools::TodoSnapshot,
+    /// What retiring the old session did, one line each.
+    pub report: Vec<String>,
 }
 
 /// `Ui` + `Approver` implementation that lives on the agent task and speaks

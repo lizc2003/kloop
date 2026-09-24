@@ -687,6 +687,47 @@ impl App {
         self.remembered_or_default_model(provider)
     }
 
+    /// Mirror a session the worker switched to, and drop every piece of view
+    /// state that belonged to the old one. The caller fills the transcript.
+    fn switch_session(&mut self, session: crate::events::SessionSwitch) {
+        let crate::events::SessionSwitch {
+            session_id,
+            route,
+            mode,
+            cwd,
+            branch,
+            todos,
+            report: _,
+        } = session;
+        self.session_id = session_id;
+        self.accept_selected_route(route);
+        self.mode = mode;
+        self.cwd = cwd;
+        self.branch = branch;
+        // A new registry restarts its revisions, so the old revision is no
+        // fence against it: the new session's list replaces outright.
+        self.todos = Some(todos);
+        self.todo_panel_retired = false;
+        // Commands and rewinds run only while idle, so any prompt still queued
+        // was raised by the old session's background work, which is stopped
+        // now. Dropping a reply answers it with a denial.
+        self.interactions.clear();
+        self.panel_scroll = 0;
+        self.cells.clear();
+        self.head_frozen = None;
+        self.tool_cells.clear();
+        self.agent_cells.clear();
+        self.background_task_cells.clear();
+        self.frozen_background_tasks.clear();
+        self.agent_message_cells.clear();
+        self.frozen_agent_messages.clear();
+        self.assistant_cells.clear();
+        self.reasoning_cells.clear();
+        self.assistant_open = false;
+        self.thinking_open = false;
+        self.last_note = None;
+    }
+
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
             // Agent output — the single core Event stream (plan 39).
@@ -718,24 +759,22 @@ impl App {
                         Some(ProviderPicker::open(catalog, &self.remembered_models));
                 }
             }
-            AgentEvent::ClearTranscript => {
-                // /clear emptied History on the worker; drop the uncommitted
-                // view state. Cells already in native scrollback stay visible
-                // (inline can't erase scrollback) but are out of the model's
-                // context — the System note that follows says so.
-                self.cells.clear();
-                self.head_frozen = None;
-                self.tool_cells.clear();
-                self.agent_cells.clear();
-                self.background_task_cells.clear();
-                self.frozen_background_tasks.clear();
-                self.agent_message_cells.clear();
-                self.frozen_agent_messages.clear();
-                self.assistant_cells.clear();
-                self.reasoning_cells.clear();
-                self.assistant_open = false;
-                self.thinking_open = false;
-                self.last_note = None;
+            AgentEvent::Cleared { session, version } => {
+                let header = Cell::SessionHeader {
+                    version,
+                    model: session.route.model.clone(),
+                    cwd: session.cwd.clone(),
+                    branch: session.branch.clone(),
+                    mode: session.mode.label().to_string(),
+                };
+                let mut note = format!("conversation cleared — new session {}", session.session_id);
+                for line in &session.report {
+                    note.push('\n');
+                    note.push_str(line);
+                }
+                self.switch_session(session);
+                self.cells = vec![header, Cell::System(note)];
+                self.context_used = 0;
             }
             // The UI loop intercepts Quit before apply; this arm only keeps the
             // match exhaustive.
@@ -2954,14 +2993,11 @@ mod tests {
         );
     }
 
-    /// A command's System output renders as its own cell; ClearTranscript wipes
-    /// the transcript view to match History being emptied on the worker.
+    /// A command's System output renders as its own cell.
     #[test]
-    fn system_output_and_clear_transcript() {
+    fn system_output_is_its_own_cell() {
         let mut app = App::new("s".into());
         app.cells.push(Cell::User("earlier".into()));
-        app.tool_cells.insert("t1".into(), 0);
-
         app.apply(AgentEvent::System(
             "model: x\ncontext: ~0 / 100 tokens (0%)".into(),
         ));
@@ -2971,35 +3007,107 @@ mod tests {
                 "model: x\ncontext: ~0 / 100 tokens (0%)".into()
             ))
         );
+    }
 
+    fn route(revision: u64) -> kloop_protocol::ActiveProviderRoute {
+        kloop_protocol::ActiveProviderRoute {
+            revision,
+            provider_id: "mock".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "mock-model".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
+        }
+    }
+
+    fn switch(session_id: &str, report: &[&str]) -> crate::events::SessionSwitch {
+        crate::events::SessionSwitch {
+            session_id: session_id.into(),
+            route: route(3),
+            mode: Mode::Bypass,
+            cwd: "~/repo".into(),
+            branch: Some("main".into()),
+            todos: TodoSnapshot {
+                revision: 0,
+                todos: Vec::new(),
+            },
+            report: report.iter().map(|line| (*line).to_string()).collect(),
+        }
+    }
+
+    /// `/clear` leaves nothing of the old session on screen: the transcript is
+    /// the new session's banner and one line saying what happened, and every
+    /// mirror (id, mode, cwd, todo list, gauge) is the new session's.
+    #[test]
+    fn cleared_starts_the_transcript_over_on_the_new_session() {
+        let mut app = App::new("old".into());
+        app.cells.push(Cell::User("earlier".into()));
+        app.tool_cells.insert("t1".into(), 0);
         app.background_task_cells.insert("agent-8".into(), 0);
         app.frozen_background_tasks.insert("program-8".into());
-        app.todos = Some(todo_snapshot(4, "Keep until fenced"));
+        app.todos = Some(todo_snapshot(4, "From the old session"));
         app.show_todos = false;
-        app.apply(AgentEvent::ClearTranscript);
-        assert!(app.cells.is_empty());
+        app.mode = Mode::Plan;
+        app.cwd = "~/repo/.kloop/worktrees/wt".into();
+        app.context_used = 50_000;
+        // A prompt raised by the old session's background work.
+        let (reply, answer) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "run a stale command?".into(),
+                ..Default::default()
+            },
+            reply,
+        });
+
+        app.apply(AgentEvent::Cleared {
+            session: switch("new", &["stopped 1 background task(s)"]),
+            version: "v0.1.0 (abc1234)".into(),
+        });
+
+        assert_eq!(app.session_id, "new");
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::SessionHeader {
+                    version: "v0.1.0 (abc1234)".into(),
+                    model: "mock-model".into(),
+                    cwd: "~/repo".into(),
+                    branch: Some("main".into()),
+                    mode: Mode::Bypass.label().to_string(),
+                },
+                Cell::System(
+                    "conversation cleared — new session new\nstopped 1 background task(s)".into()
+                ),
+            ]
+        );
         assert!(app.tool_cells.is_empty());
         assert!(app.background_task_cells.is_empty());
         assert!(app.frozen_background_tasks.is_empty());
-        assert_eq!(app.todos.as_ref().unwrap().revision, 4);
+        assert!(app.interactions.is_empty());
+        assert!(
+            answer.blocking_recv().is_err(),
+            "the stale prompt is dropped"
+        );
+        assert_eq!(app.mode, Mode::Bypass);
+        assert_eq!(app.cwd, "~/repo");
+        assert_eq!(app.context_used, 0);
+        assert_eq!(app.selected_route, Some(route(3)));
+        // The new registry starts at revision 0, below the old list's 4: it
+        // must replace it anyway, and later revisions of it must land too.
+        assert_eq!(
+            app.todos,
+            Some(TodoSnapshot {
+                revision: 0,
+                todos: Vec::new(),
+            })
+        );
+        app.apply(AgentEvent::Core(Event::TodoUpdated(todo_snapshot(
+            1, "New list",
+        ))));
+        assert_eq!(app.todos, Some(todo_snapshot(1, "New list")));
+        // Ctrl+T is a display preference, not session state.
         assert!(!app.show_todos);
-
-        // A terminal update arriving after clear has no stale row to mutate, so it
-        // starts a fresh linked lifecycle row rather than disappearing.
-        app.apply(background_update(
-            "program-8",
-            kloop_core::event::BackgroundTaskKind::Program,
-            Some("run-8"),
-            kloop_core::event::BackgroundTaskStatus::Cancelled,
-            Some("session shutdown"),
-            None,
-        ));
-        assert!(matches!(
-            app.cells.as_slice(),
-            [Cell::BackgroundTask(task)]
-                if task.id == "program-8"
-                    && task.status == BackgroundTaskStatus::Cancelled
-        ));
     }
 
     fn descriptor(

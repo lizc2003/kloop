@@ -20,7 +20,10 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::Ui;
 use crate::config::Config;
 use crate::history::History;
-use crate::tools::TodoSnapshot;
+
+pub use clear::FreshSession;
+pub use clear::replace_session;
+pub use clear::start_fresh_session;
 
 mod clear;
 mod compact;
@@ -35,18 +38,20 @@ mod model;
 mod provider;
 mod skills;
 
-/// What a command produced. `output` is shown to the user as-is; `cleared`
-/// tells the front-end to reset its own transcript view — only `/clear` sets
-/// it (it empties History here, but each front-end owns its own display).
+/// What a command produced. `output` is shown to the user as-is.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SlashResult {
     pub output: String,
-    pub cleared: bool,
+    /// `/clear`: the front-end ends this session and switches to the one
+    /// [`start_fresh_session`] builds. The front-end owns the Config and
+    /// History being replaced, so the command cannot do the swap itself; a
+    /// front-end that has its own way to start sessions (the server's
+    /// `thread/start`) refuses instead.
+    pub new_session: bool,
     /// When set, the front-end records this as a user message and runs a turn:
     /// a skill invoked as `/name args` expands to a prompt to act on, unlike
     /// the built-in commands which only produce `output` (`output` is empty).
     pub run_turn: Option<String>,
-    pub todos: Option<TodoSnapshot>,
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.
     pub quit: bool,
@@ -68,25 +73,19 @@ impl SlashResult {
     fn message(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
-            cleared: false,
+            new_session: false,
             run_turn: None,
-            todos: None,
             quit: false,
             route_changed: false,
             open_picker: None,
         }
     }
 
-    /// `/clear`: text plus a transcript reset.
-    fn cleared_message(output: impl Into<String>, todos: TodoSnapshot) -> Self {
+    /// `/clear`: no text of its own — the front-end reports the switch.
+    fn new_session() -> Self {
         Self {
-            output: output.into(),
-            cleared: true,
-            run_turn: None,
-            todos: Some(todos),
-            quit: false,
-            route_changed: false,
-            open_picker: None,
+            new_session: true,
+            ..Self::message("")
         }
     }
 
@@ -94,9 +93,8 @@ impl SlashResult {
     fn turn(prompt: String) -> Self {
         Self {
             output: String::new(),
-            cleared: false,
+            new_session: false,
             run_turn: Some(prompt),
-            todos: None,
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -110,9 +108,8 @@ impl SlashResult {
     ) -> Self {
         Self {
             output: output.into(),
-            cleared: false,
+            new_session: false,
             run_turn: None,
-            todos: None,
             quit: false,
             route_changed: changed,
             open_picker,
@@ -123,9 +120,8 @@ impl SlashResult {
     fn quit(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
-            cleared: false,
+            new_session: false,
             run_turn: None,
-            todos: None,
             quit: true,
             route_changed: false,
             open_picker: None,
@@ -237,7 +233,7 @@ pub async fn run_with_provider_state(
         "cost" => cost::run(history, cfg),
         "context" => context::run(history, cfg),
         "compact" => compact::run(history, cfg, ui, cancel).await,
-        "clear" => clear::run(history, cfg),
+        "clear" => clear::run(),
         "loop" => loop_command::run(args),
         "skills" => skills::run(args, cfg),
         "exit" => exit::run(),
@@ -332,7 +328,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .await;
-        assert!(!result.cleared);
+        assert!(!result.new_session);
         assert!(result.output.starts_with("commands:"));
         for b in BUILTINS {
             assert!(
@@ -523,48 +519,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_preserves_provider_usage_for_the_same_transcript() {
-        use crate::usage::{ProviderUsageRecord, UsageOperation};
-        use kloop_protocol::Usage;
-
-        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
-        let mut history = History::new(cfg.offload_dir.clone());
-        history.record(Message::user_text("some earlier work"));
-        history.record_provider_usage(ProviderUsageRecord {
-            provider_id: "test".into(),
-            api_family: kloop_protocol::ProviderApiFamily::Mock,
-            route_revision: 1,
-            model: "model".into(),
-            operation: UsageOperation::Sampling,
-            usage: Usage {
-                input_tokens: 1,
-                ..Usage::default()
-            },
-        });
-
-        let _ = run(
-            "/clear",
-            &mut history,
-            &cfg,
-            &SilentUi,
-            &CancellationToken::new(),
-        )
-        .await;
-        let cost = run(
-            "/cost",
-            &mut history,
-            &cfg,
-            &SilentUi,
-            &CancellationToken::new(),
-        )
-        .await;
-
-        assert!(history.messages().is_empty());
-        assert!(cost.output.contains("input=1"), "{}", cost.output);
-        assert!(cost.output.contains("responses=1"), "{}", cost.output);
-    }
-
-    #[tokio::test]
     async fn compact_summarizes_and_reports_counts() {
         let provider =
             kloop_provider::Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
@@ -666,22 +620,16 @@ mod tests {
         assert!(history.provider_usage().records().is_empty());
     }
 
+    /// `/clear` only asks for the switch: the session it runs in is left
+    /// exactly as it was — History and every piece of session state — for the
+    /// front-end to retire whole.
     #[tokio::test]
-    async fn clear_empties_history_and_process_state() {
+    async fn clear_asks_for_a_new_session_and_touches_nothing() {
         let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("some earlier work"));
-        let mut todo_ctx = crate::tools::testutil::test_ctx(0, "command-clear");
-        todo_ctx.cfg = Arc::clone(&cfg);
-        let (output, is_error) = crate::tools::testutil::run_tool(
-            "todo_write",
-            serde_json::json!({"todos":[{"subject":"leftover","status":"pending"}]}),
-            &todo_ctx,
-        )
-        .await;
-        assert!(!is_error, "{output}");
         cfg.inbox
-            .push(crate::inbox::InboxItem::Steer("stale steer".into()));
+            .push(crate::inbox::InboxItem::Steer("queued steer".into()));
 
         let result = run(
             "/clear",
@@ -691,19 +639,12 @@ mod tests {
             &CancellationToken::new(),
         )
         .await;
+        assert_eq!(result, SlashResult::new_session());
         assert_eq!(
-            result,
-            SlashResult::cleared_message(
-                "conversation cleared",
-                TodoSnapshot {
-                    revision: 2,
-                    todos: Vec::new(),
-                },
-            )
+            history.messages(),
+            [Message::user_text("some earlier work")]
         );
-        assert!(history.messages().is_empty());
-        assert!(todo_ctx.cfg.todos.snapshot().todos.is_empty());
-        assert!(cfg.inbox.is_empty());
+        assert!(!cfg.inbox.is_empty());
     }
 
     #[tokio::test]

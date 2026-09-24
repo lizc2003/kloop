@@ -909,7 +909,7 @@ async fn plain_main(
     };
     cfg.bind_session(session_id.clone())?;
     let mut cfg = Arc::new(cfg);
-    let provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
+    let mut provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
         Arc::clone(&cfg.provider_catalog),
         history.provider_routes(),
     )
@@ -1022,6 +1022,26 @@ async fn plain_main(
             }
             if result.route_changed {
                 cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
+            }
+            if result.new_session {
+                match kloop_core::commands::start_fresh_session(&cfg, &ui).await {
+                    Ok(fresh) => {
+                        history = fresh.history;
+                        cfg = Arc::new(fresh.cfg);
+                        provider_state =
+                            kloop_core::provider_route::SessionProviderState::from_timeline(
+                                Arc::clone(&cfg.provider_catalog),
+                                history.provider_routes(),
+                            )
+                            .map_err(anyhow::Error::new)?;
+                        inbox_activity = cfg.inbox.subscribe_activity();
+                        println!("conversation cleared — new session {}", cfg.session_id);
+                        for line in fresh.report {
+                            println!("{line}");
+                        }
+                    }
+                    Err(error) => println!("clear failed: {error:#}"),
+                }
             }
             // `/exit` quits the REPL, like the bare `exit` word above.
             if result.quit || exit_requested {
