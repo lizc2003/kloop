@@ -1808,18 +1808,46 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   saw. Freshness between kloop's own read and kloop's rename is unaffected — the
   commit's compare-and-swap is what stops a change landing inside that window, and it
   is now `edit_file`'s only freshness guard.
-  Raw exact matching wins. Only when raw matches are absent does LF input match CRLF
-  text; the helper maps logical offsets back to raw byte ranges, restores local (or
-  dominant) EOLs in replacement text, and leaves all unmatched bytes—including
-  mixed EOLs and isolated `\r`—unchanged. Executor and approval preview use this one
-  helper, so duplicate/`replace_all` decisions and shown bytes cannot drift.
+  Matching has three layers, each tried only when every earlier one found nothing, so
+  a looser layer never outvotes an exact match elsewhere. **Raw exact** wins. **LF
+  fallback**: LF input matches CRLF text; the helper maps logical offsets back to raw
+  byte ranges, restores local (or dominant) EOLs in replacement text, and leaves all
+  unmatched bytes—including mixed EOLs and isolated `\r`—unchanged. **Punctuation
+  tolerance** (Plan 201), over that same logical view: curly quotes, the three dashes
+  and full-width CJK separators fold to ASCII, and one space after `, ; : . ! ? ( )`
+  is optional. Nothing else about whitespace is forgiven — not after quotes or hyphens
+  (`" foo"`, `- foo` mean something), and never indentation, which is content in
+  Python, YAML and Makefiles; guessing the model's intended indentation and writing
+  the guess is dearer than one failed round. A tolerant match writes only the part of
+  `new_string` that differs from `old_string`; the shared prefix and suffix keep the
+  file's bytes, so renaming one word never straightens the quotes around it. The
+  result names the layer and line; ambiguity says the count was tolerant. The tool
+  description deliberately does not mention the layer (chord's call too): advertised,
+  "close enough" becomes the target and the fallback becomes the norm. The CRLF
+  sentence stays in it because that one is a promise about the file, not a tolerance.
+  Executor and approval preview use this one helper, so duplicate/`replace_all`
+  decisions and shown bytes cannot drift.
+  When all three miss, the refusal is built to stop the one reaction it used to
+  invite — retyping `old_string` from memory. It searches the file (line windows of
+  the block's height ±1, seeded by the block's rarest line that survives verbatim,
+  banded edit distance) for the nearest block at ≥ 60% similarity. Up to three
+  differing lines are listed as the file's line beside the model's, with the first
+  differing character after folding, plus any whole-line surplus on either side
+  (blank lines called out, since an extra blank line is the commonest drift). More
+  than that and a listing would only invite retyping the lines in between, so it
+  names one `read_file` over the window instead. Below 60%, or for an `old_string`
+  over 2 000 characters or a file over 10 000 lines, there is no guess: a plausible
+  wrong "closest match" is worse than none, and the message says to re-read and
+  rebuild rather than resend. The measurement that sized this was thin — one real
+  "not found" in 161 dogfood edits — so the layer is a floor under a rare failure,
+  not a fix for a common one.
   When it refuses an unread target (Plan 156), the message names the line `old_string`
-  lands on and one read that clears it — a 60-line window starting 20 lines ahead of
-  the match, which both qualifies the file and shows the model what it is about to
-  change. That window is only useful advice under Plan 155; while a complete read was
-  the rule, the hint had to point at the first *unread* line instead. An `old_string`
-  that is nowhere in the file adds nothing to the message: that is a different failure
-  with its own.
+  lands on (under the same three layers) and one read that clears it — a 60-line
+  window starting 20 lines ahead of the match, which both qualifies the file and shows
+  the model what it is about to change. That window is only useful advice under Plan
+  155; while a complete read was the rule, the hint had to point at the first *unread*
+  line instead. An `old_string` that no layer places adds nothing to that refusal:
+  the nearest-block diagnosis belongs to the read-and-missed failure, not this one.
 - **A read that went stale is named at the next round boundary (Plan 197).** Plan
   195's note only speaks when the model edits; a model that answers from a read a
   `cargo fmt`, a `sed -i` or the user's editor has since rewritten gets no signal at

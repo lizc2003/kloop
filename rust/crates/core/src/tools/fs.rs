@@ -49,6 +49,7 @@ use kloop_protocol::ContentBlock;
 use crate::image::MAX_IMAGE_BYTES;
 use crate::image::detect_media_type;
 use crate::image::prepare_image_from_bytes;
+use crate::text_edit::MatchLayer;
 use crate::text_edit::apply_text_edit;
 
 /// How many redundant rereads of one path pass between advisories.
@@ -1148,21 +1149,30 @@ fn commit_mutation(
             })?;
             let edit = apply_text_edit(&current, &old, &new, replace_all);
             if edit.match_count == 0 {
-                bail!("edit_file: old_string not found in {display_path}{note}");
+                bail!("{}", not_found_message(display_path, note, &current, &old));
             }
+            let tolerant = edit.layer == MatchLayer::PunctuationTolerant;
             if edit.match_count > 1 && !replace_all {
                 let count = edit.match_count;
+                let counted = if tolerant {
+                    " (counted with punctuation/whitespace tolerance)"
+                } else {
+                    ""
+                };
                 bail!(
-                    "edit_file: old_string matches {count} times in {display_path}{note}; add surrounding context to disambiguate or set replace_all"
+                    "edit_file: old_string matches {count} times in {display_path}{note}{counted}; add surrounding context to disambiguate or set replace_all"
                 );
             }
             let updated = edit
                 .updated
                 .expect("a unique or replace-all edit produces updated text");
-            let content = format!(
-                "edited {display_path} ({} replacement(s)){note}",
-                edit.replacement_count
-            );
+            let count = edit.replacement_count;
+            let content = match (tolerant, edit.first_line) {
+                (true, Some(line)) => format!(
+                    "edited {display_path} ({count} replacement(s), punctuation/whitespace-tolerant match at line {line}){note}"
+                ),
+                _ => format!("edited {display_path} ({count} replacement(s)){note}"),
+            };
             (
                 updated.into_bytes(),
                 Some(snapshot.metadata.permissions()),
@@ -1338,6 +1348,106 @@ fn unread_edit_hint(file: &mut std::fs::File, old: &str) -> Option<String> {
     Some(format!(
         "old_string is at line {line} of {total}; call read_file with offset={offset}, limit={UNREAD_HINT_LIMIT}"
     ))
+}
+
+/// The refusal for an `old_string` no layer could place. With a near match it
+/// shows the file's own lines to copy; drifted too far for that, it names the
+/// one read that shows the whole range; with nothing close, it says so rather
+/// than guess. Every branch ends in something to do other than resend the same
+/// `old_string`, which can only fail the same way.
+fn not_found_message(path: &str, note: &str, current: &str, old: &str) -> String {
+    use crate::text_edit::ClosestShape;
+    let head = format!("edit_file: old_string not found in {path}{note}");
+    let Some(closest) = crate::text_edit::closest_match(current, old) else {
+        return format!(
+            "{head}; nothing in the file is close enough to show. The text may have changed, or \
+             differ by more than punctuation: re-read the small range you meant to edit, rebuild \
+             old_string from that fresh text, and do not retry this old_string unchanged"
+        );
+    };
+    let start = closest.start_line;
+    let similar = closest.similarity_percent;
+    match closest.shape {
+        ClosestShape::Listed { lines, drift } => {
+            let mut message =
+                format!("{head}. The closest match starts at line {start} ({similar}% similar):");
+            for line in &lines {
+                let crate::text_edit::LineDifference {
+                    file_line,
+                    your_line,
+                    file_text,
+                    your_text,
+                    first_difference,
+                } = line;
+                let column = first_difference.column;
+                let yours = describe_char(first_difference.yours, column);
+                let file = describe_char(first_difference.file, column);
+                message.push_str(&format!(
+                    "\n  file line {file_line}: {file_text}\n  your line {your_line}: {your_text}\n    \
+                     first difference at column {column}: yours has {yours}, the file has {file}"
+                ));
+            }
+            if drift.lines() > 0 {
+                message.push_str(&format!(
+                    "\n  line count differs: {}",
+                    describe_drift(&drift)
+                ));
+            }
+            message.push_str("\nCopy the file's lines exactly into old_string and retry.");
+            message
+        }
+        ClosestShape::TooFar {
+            changed_lines,
+            drift,
+        } => {
+            let limit = closest.window_lines;
+            let mut differences = Vec::new();
+            if changed_lines > 0 {
+                differences.push(format!("{changed_lines} changed line(s)"));
+            }
+            if drift.lines() > 0 {
+                differences.push(describe_drift(&drift));
+            }
+            let differences = differences.join("; ");
+            format!(
+                "{head}. The closest match starts at line {start} ({similar}% similar), but differs \
+                 by more than a few lines ({differences}); call read_file with offset={start}, \
+                 limit={limit} and rebuild old_string from what it returns — do not retype the \
+                 block from memory"
+            )
+        }
+    }
+}
+
+fn describe_char(character: Option<char>, column: usize) -> String {
+    match character {
+        Some(character) => format!("{character:?} (U+{:04X})", u32::from(character)),
+        None if column == 1 => "nothing (the line is empty)".to_string(),
+        None => "nothing (the line ends there)".to_string(),
+    }
+}
+
+fn describe_drift(drift: &crate::text_edit::LineDrift) -> String {
+    let side = |extra: usize, all_blank: bool, whose: &str| {
+        let blank = if all_blank { ", all blank" } else { "" };
+        format!("{whose} has {extra} extra line(s){blank}")
+    };
+    let mut parts = Vec::new();
+    if drift.your_extra > 0 {
+        parts.push(side(
+            drift.your_extra,
+            drift.your_extra_all_blank,
+            "your old_string",
+        ));
+    }
+    if drift.file_extra > 0 {
+        parts.push(side(
+            drift.file_extra,
+            drift.file_extra_all_blank,
+            "the file",
+        ));
+    }
+    parts.join(", ")
 }
 
 /// `unread_hint` is consulted only on the never-read verdict. That is the one
@@ -2663,7 +2773,11 @@ mod tests {
             (out, is_error),
             (
                 format!(
-                    "edit_file: old_string not found in {target}; the file changed since you read it"
+                    "edit_file: old_string not found in {target}; the file changed since you read \
+                     it; nothing in the file is close enough to show. The text may have changed, or \
+                     differ by more than punctuation: re-read the small range you meant to edit, \
+                     rebuild old_string from that fresh text, and do not retry this old_string \
+                     unchanged"
                 ),
                 true
             )
@@ -2963,6 +3077,143 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The tolerant layer says it was used and where, so the model can check
+    /// the one line it did not spell exactly — and the file keeps its own
+    /// typography everywhere the edit did not reach.
+    #[tokio::test]
+    async fn a_punctuation_tolerant_edit_says_so_and_where() {
+        let path = temp_file("edit-tolerant", "intro\nlet s = “ok” — done;\n");
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-tolerant");
+        observe_whole(&path, &ctx).await;
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "let s = \"ok\" - done;", "new_string": "let t = \"ok\" - done;"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edited {target} (1 replacement(s), punctuation/whitespace-tolerant match at line 2)"
+                ),
+                false
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "intro\nlet t = “ok” — done;\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_duplicate_says_how_it_was_counted() {
+        let path = temp_file("edit-tolerant-dup", "“a”\n“a”\n");
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-tolerant-dup");
+        observe_whole(&path, &ctx).await;
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": "\"a\"", "new_string": "b"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edit_file: old_string matches 2 times in {target} (counted with \
+                     punctuation/whitespace tolerance); add surrounding context to disambiguate or \
+                     set replace_all"
+                ),
+                true
+            )
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A near miss shows the file's own line next to the model's, and the
+    /// first character where they part — the two things a retry needs.
+    #[tokio::test]
+    async fn a_near_miss_lists_the_differing_line() {
+        let body: String = (1..=12)
+            .map(|n| format!("let value_{n} = compute({n});\n"))
+            .collect();
+        let path = temp_file("edit-near-miss", &body);
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-near-miss");
+        observe_whole(&path, &ctx).await;
+
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({
+                "path": target,
+                "old_string": "let value_4 = compute(4);\n\nlet value_5 = compute(5)\nlet value_6 = compute(6);",
+                "new_string": "x",
+            }),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edit_file: old_string not found in {target}. The closest match starts at line 4 \
+                     (97% similar):\n  \
+                     file line 5: \"let value_5 = compute(5);\"\n  \
+                     your line 3: \"let value_5 = compute(5)\"\n    \
+                     first difference at column 25: yours has nothing (the line ends there), the file \
+                     has ';' (U+003B)\n  \
+                     line count differs: your old_string has 1 extra line(s), all blank\n\
+                     Copy the file's lines exactly into old_string and retry."
+                ),
+                true
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Past a few lines a listing would only invite retyping the block in
+    /// between from memory; the advice becomes the one read that shows it.
+    #[tokio::test]
+    async fn a_far_miss_names_the_read_instead_of_listing() {
+        let body: String = (1..=12)
+            .map(|n| format!("let value_{n} = compute({n});\n"))
+            .collect();
+        let path = temp_file("edit-far-miss", &body);
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "edit-far-miss");
+        observe_whole(&path, &ctx).await;
+
+        let old: String = (3..=8)
+            .map(|n| format!("let value_{n} = compute({n}0);\n"))
+            .collect();
+        let (out, is_error) = run_tool(
+            "edit_file",
+            json!({"path": target, "old_string": old, "new_string": "x"}),
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            (out, is_error),
+            (
+                format!(
+                    "edit_file: old_string not found in {target}. The closest match starts at line 3 \
+                     (96% similar), but differs by more than a few lines (6 changed line(s)); call \
+                     read_file with offset=3, limit=6 and rebuild old_string from what it returns — \
+                     do not retype the block from memory"
+                ),
+                true
+            )
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// One bad anchor must not poison the rest of the turn. The refusal left the
     /// file exactly as the read found it, so the qualification is still a true
     /// statement — and dropping it reported one root cause as two, the second
@@ -2983,7 +3234,15 @@ mod tests {
         .await;
         assert_eq!(
             (out, is_error),
-            (format!("edit_file: old_string not found in {target}"), true)
+            (
+                format!(
+                    "edit_file: old_string not found in {target}; nothing in the file is close enough to show. The text may have changed, or \
+                     differ by more than punctuation: re-read the small range you meant to edit, \
+                     rebuild old_string from that fresh text, and do not retry this old_string \
+                     unchanged"
+                ),
+                true
+            )
         );
         assert!(ctx.cfg.file_state.observation(&key).is_some());
 

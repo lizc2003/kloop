@@ -398,6 +398,12 @@ def main() -> None:
         print(f"\nmarker 命中: {len(hit)} / {len(ok)} = {len(hit) * 100 / len(ok):.2f}%")
         if hit:
             print(f"  命中那批的结果字符数: {percentiles([len(r[3]) for r in hit])}")
+        # 报错文案（"old_string not found"）只出现在 is_error 的结果里；plan 201
+        # 按上面那行量出 0 次，其实是 marker 只在成功的结果里找。
+        failed = [r for r in rows if r[4]]
+        failed_hit = [r for r in failed if args.marker in r[3]]
+        if failed:
+            print(f"marker 在报错里命中: {len(failed_hit)} / {len(failed)}")
 
 
 if __name__ == "__main__":

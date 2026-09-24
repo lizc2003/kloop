@@ -662,7 +662,7 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
    (`internal/agent/restore_normalize.go:94-195`);前台 shell 到 yield 时间(默认 90s)自动
    转后台 job、按进程组归属且停止前做成员见证防 pgid 复用(`internal/tools/jobs_registry.go:498`);
    edit 失败时给最近匹配块 + 差异行、漂移大就直接给 read offset/limit,容错不写进工具描述
-   (`internal/tools/replace_edit.go:232-313`);headless 状态快照带单调 `seq`、首条固定 `ready`。
+   (`internal/tools/replace_edit.go:232-313`;**已由 plan 201 吸收**,连同标点容错第三层);headless 状态快照带单调 `seq`、首条固定 `ready`。
 
 **读过、判为反例的:**
 
@@ -723,7 +723,7 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
 
 **留下的两条:**
 
-1. **edit 的缩进容错,与 chord 方向相反 → 记进 plan 201 开工时的第二个问题。** crush 在精确匹配
+1. **edit 的缩进容错,与 chord 方向相反 → 记进 plan 201 开工时的第二个问题**(2026-09-24 定:不做,照 chord)。 crush 在精确匹配
    失败后,按"每行压缩空白后整行比较"再找一次,唯一命中时按文件原有缩进重排 `new_string`
    (`internal/agent/tools/edit_whitespace.go:24-80`);chord 容的是标点,并明确把缩进错判为真错。
 2. **重复调用守卫:第三家实现,仍然不做。** crush 的循环检测是"最近 10 步里同一签名出现 >5 次就
