@@ -294,11 +294,11 @@ fn load_project_permission_policy(
         let writer: Arc<dyn kloop_core::permissions::ProjectPermissionWriter> = store.clone();
         registry.get_or_insert(project_id.clone(), snapshot, writer)
     };
-    let unavailable = || {
+    let unavailable = |err: anyhow::Error| {
         registry.invalidate(&project_id);
-        notify(
-            "project permission policy is unavailable or invalid; durable project approvals are disabled for this session",
-        );
+        notify(&format!(
+            "project permission policy is unavailable or invalid ({err:#}); durable project approvals are disabled for this session"
+        ));
         Arc::new(ProjectPermissionPolicy::unavailable())
     };
     match store.load_blocking(&project_id) {
@@ -309,11 +309,11 @@ fn load_project_permission_policy(
             registry.invalidate(&project_id);
             match store.load_blocking(&project_id) {
                 Ok(snapshot) => register(snapshot),
-                Err(_) => unavailable(),
+                Err(err) => unavailable(err),
             }
         }
         Ok(snapshot) => register(snapshot),
-        Err(_) => unavailable(),
+        Err(err) => unavailable(err),
     }
 }
 
@@ -1118,6 +1118,59 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         assert_eq!(
             reloaded.snapshot(),
             kloop_core::permissions::ProjectPolicySnapshot::empty()
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn unreadable_project_policy_names_why_in_the_warning() {
+        let base = std::env::temp_dir().join(format!(
+            "kloop-project-policy-invalid-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let cwd = base.join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let project_id = WorkspaceIdentity::resolve(&cwd)
+            .project_id()
+            .unwrap()
+            .clone();
+        let store = Arc::new(ProjectStore::new(base.join(".kloop")));
+        let additions =
+            kloop_core::permissions::ProjectAllowRules::parse(&["bash(cargo test *)".to_string()])
+                .unwrap();
+        kloop_core::permissions::ProjectPermissionWriter::append_allow(
+            store.as_ref(),
+            project_id.clone(),
+            additions,
+        )
+        .await
+        .unwrap();
+        // 键名改版前写下的文件:`projectId` 而不是 `project_id`。
+        let path = store.policy_path(&project_id);
+        let stale = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"project_id\"", "\"projectId\"");
+        std::fs::write(&path, stale).unwrap();
+
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notes);
+        let notify: kloop_tui::NoteFn = Arc::new(move |note| {
+            sink.lock().unwrap().push(note.to_string());
+        });
+        let registry = Arc::new(ProjectPolicyRegistry::default());
+        let policy = load_project_permission_policy(&store, &registry, project_id, &notify);
+
+        assert_eq!(
+            policy.snapshot(),
+            kloop_core::permissions::ProjectPolicySnapshot::empty()
+        );
+        let notes = notes.lock().unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("invalid project permission policy: unknown field `projectId`"),
+            "{}",
+            notes[0]
         );
         let _ = std::fs::remove_dir_all(base);
     }
