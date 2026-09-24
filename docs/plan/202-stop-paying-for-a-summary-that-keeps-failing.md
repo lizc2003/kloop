@@ -97,7 +97,7 @@ chord 的做法(`internal/agent/compaction_failure_policy.go:14-16, 134-151`):**
 
 ## 七、完成记录
 
-✅ 2026-09-24,提交号见下。开工问答:阈值照抄 2 / 3(用户「同意」)。
+✅ 2026-09-24,提交 `48d0d93`。开工问答:阈值照抄 2 / 3(用户「同意」)。
 
 - **断路器**:`compact::CompactionBreaker`,挂在 `History` 上(`compaction_breaker()`),
   不进 rollout;`History::new`/`resume` 从闭合开始,`rebase` 重置,`replace_all` 即成功——
