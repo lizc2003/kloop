@@ -15,6 +15,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留两条:① 文件体积棘轮的机制(→ plan 176);② microcompact 的一份具体取值。它的项目级 hook 信任模型**读过、判不做**(有便宜十倍的替代)。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
 | **chord（已退休）** | `keakon/chord@cce05db7151f12a50a1e3334edb5e53caa81e54e`(MIT,Go;本地 clone 已于 2026-09-24 随 plan 204 删除,要回源重新 clone 即可) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。plan 200–204 已全部吸收,不跟 HEAD,见本文 2026-09-23 节 |
 | **crush（已退休）** | `charmbracelet/crush@72654940d9e46961a7d804d536c45761e7084a08`(FSL-1.1-MIT:公开可读、两年后转 MIT,只借判据不搬代码;本地 clone 可删) | **调研即退休**。LLM 层与 step 循环在外部库 `charm.land/fantasy`,不在仓库里。强项是工程运维面(C/S 自动拉起、取消序号、流空闲超时),kloop 已有对应物。只留两条:① edit 缩进容错,与 chord 方向相反(→ plan 201 第二个开工问题);② 重复调用守卫第三家实现,**本地复算仍零打转,不做**。"安全命令"免审批是反例。见本文 2026-09-23 crush 节 |
+| **pi** | `refs/pi`(`earendil-works/pi@d5629e20489ccf770ed90b5a33941cb3b7ef24d0`,MIT,TS;plan 81 曾用 `2e4d239`) | **不作底座、不跟 HEAD**。价值在 provider 层的兼容知识(溢出模式表、429 配额排除、跨 rail tool id 规范化、模型元数据)与交互细节(多段编辑、分支摘要、follow-up 队列、composer 行编辑),外加一套成对 A/B 评测方法。核心循环/压缩/持久化 kloop 已有且更严;没有权限系统。见本文 2026-09-24 Pi 全面复查节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
 
@@ -83,6 +84,64 @@ Task graph 和各 execution registry 为各自唯一真值。
 Plan 81 的参考基线固定为 `earendil-works/pi@2e4d23959485279aa2da1a45103de2ea22d46395`。Pi 将逐响应 usage record、append-only log、reducer 与 session storage 分层，证明“provider 返回的一次 usage 是历史事实，而当前 context estimate 是可失效预测状态”这一切法可独立落地。kloop 只重实现这个机制：沿既有 canonical `Usage`、rollout replay/fork/torn-tail 与 `History` owner，记录 validated sampling 和 accepted compaction 的实际 model/operation，并让 `/cost` 聚合当前 transcript 四个 token 分类。
 
 Pi 不成为依赖或架构上游；未复制源码、第三方资产、extension 信任模型、remote runtime、失败 attempt 推测、价格表、全局归因或 parent 汇总 child。kloop 也不因 ledger 放宽 permission/sandbox 边界，且不把它塞入 Plan 77 的 public event/snapshot projection。
+
+## Pi 全面复查(2026-09-24)
+
+基线换成 `earendil-works/pi@d5629e20489ccf770ed90b5a33941cb3b7ef24d0`(MIT,TS)。距 plan 81 的
+`2e4d239` 已过 872 个提交(+20 万/−5 万行),新增 durable、chord、session-backends、protocol/
+server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看了一遍。非测试 TS 约 37 万行
+(coding-agent 15 万 / ai 6.9 万 / agent 6.6 万 / tui 3.8 万)。pi **明确不做权限系统**,这一面不算差距。
+公开仓库,下文照常写 `file:line`(相对 `packages/`)。
+
+**定位:不作底座,不跟 HEAD。** agent 核心(循环、压缩、持久化、mock provider)kloop 大多已有且
+更严;价值集中在 provider 层积累的兼容知识和几处交互细节。本地 clone 暂留,等下列候选定案后退休。
+
+**值得吸收(按收益排;均未立 plan,立之前逐条问用户):**
+
+1. **溢出识别模式表**——`ai/src/utils/overflow.ts:37-79`,约 25 条正则覆盖各家兼容服务,另有
+   反向排除表防止把 "Too many tokens, please wait" 这类限流误判成溢出。kloop `is_overflow_message`
+   只有 3 个子串,第三方服务的溢出认不出来,reactive compaction 就不触发。注意:Anthropic 的
+   `request_too_large`(413)是请求体字节超限,不是 token 超限,别顺手改成触发压缩。
+   `overflow.ts:151-180` 还有"请求成功但 input 超窗口"的静默溢出判定,低优先。
+2. **429 的配额/计费排除**——`ai/src/utils/retry.ts:7-24`、`provider-retry.ts:23-66`。kloop
+   `failure.rs` 的 HTTP 重试只看状态码,响应体带 `insufficient_quota` 的 429 会白重试;流内错误那条
+   路径已拦。顺带支持 `x-should-retry` 与 `retry-after-ms`。
+3. **跨 rail 的 tool call id 规范化**——`ai/src/api/transform-messages.ts:59-63,136-142`。Anthropic
+   要 `^[a-zA-Z0-9_-]{1,64}$`,Responses 要 `fc_` 前缀;kloop 请求投影直接透传,Chat 兼容服务的
+   `functions.x:0` 形 id 切到 Anthropic 会 400。在投影层做确定性映射,不动历史。
+4. **小型内置模型元数据表**(窗口 / 最大输出 / 是否收图),替掉写死的 200k 默认;有了它才能做
+   `transform-messages.ts:12-57` 那种"目标模型不收图就换占位文本"。**不搬** `scripts/generate-models.ts`
+   那条 3500 行的目录生成管线。
+5. **多段编辑**——`coding-agent/src/core/tools/edit.ts:23-49`,`edits[]` 每段都对原文件匹配、不许
+   重叠,一次改多处。沿用 kloop `text_edit` 的三层匹配,逐段验唯一后原子写入。
+6. **被放弃分支的摘要**——`agent/src/harness/compaction/branch-summarization.ts`。kloop rewind/fork
+   后被放弃分支里学到的东西全丢;可复用 compact 的摘要链路。
+7. **follow-up 队列**——`agent/src/agent.ts:191-305`,steer(工具批次后注入)与 followUp(agent 本要
+   停时才投递)分开,运行中输入的 slash 命令也能排进 followUp。kloop 的 Enter 一律是 steer。
+8. **`/compact [instructions]`**,可带"重点保留什么"。改动很小。
+9. **composer 行编辑**——`tui/src/components/editor.ts`、`kill-ring.ts`、`undo-stack.ts`。kloop
+   `app.rs` 只处理方向键、Home/End、Backspace/Delete,没有 Ctrl+A/E/K/U/W、按词移动与撤销。
+10. **评测框架**——`evals/README.md`:(case, variant, model, run) 先展开成计划落盘;每臂全新容器、
+    降权 UID、看不到评分器;成对 A/B 算 lift;任一臂缺失/出错则整对作废、不计入结果但扣总分;按 run 号交替执行顺序。
+    kloop 没有真实模型行为评测,系统提示、工具描述、request reduction 的改动都无法量化。投入最大,长期
+    价值最高;只借方法,不依赖 vitest-evals。
+
+**可选:** 缓存保温(`coding-agent/src/core/cache-warmer.ts`,按 TTL 90% 刷新、预期节省够才发,
+需要可靠价格数据);hooks 加 `pre_compact`;用 `tracing` 看 provider 延迟、重试与工具耗时(pi 的
+telemetry 包本身不搬)。
+
+**已有:** 跨模型 thinking 处理(kloop 连 endpoint 指纹一起比,更严;pi 把旧 thinking 转成 text 是
+反例)、撕裂尾截断、崩溃时"已开始的调用"(plan 204 已覆盖 harness 的"先提交意图、再结算"思路,
+pi 的 `replay: "safe"` 重跑只读工具可作低优先补充)、bash 尾部截断落盘、按路径串行写、事件
+seq/replay、mock provider(kloop 的 Gate 更细)、差分渲染(kloop inline 视口 + 原生 scrollback,
+比 pi 必要时清空 scrollback 更稳)。
+
+**不需要:** 单文件树形会话(fork 能力对等)、进程内 TS 扩展系统、alt-screen、CBOR 协议与 SQLite
+后端、chord(JS 插件跨环境分发,和 keakon/chord 不是一个东西)、Lanes、pico3、把 AGENTS.md 放进
+系统提示(kloop 的合成首条 user 消息更好)。
+
+**未核实:** 调研时有一条说"后台 shell / 分离子 agent 的状态重启后丢失,可借 durable 的 task
+intent/outcome 持久化",没有读代码确认,立项前先核。
 
 ## grok-build / deepseek-harness 固定源码调研（2026-09-15）
 
