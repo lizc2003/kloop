@@ -24,8 +24,10 @@ mod sampling;
 use crate::request_reduction::RequestReduction;
 pub use crate::rollout::TurnError;
 use crate::rollout::TurnTerminal;
+pub(crate) use sampling::MAX_ATTEMPTS;
 use sampling::SampleOk;
 use sampling::Sampled;
+pub(crate) use sampling::retry_delay;
 use sampling::sample_with_retry;
 
 /// The single output seam: core emits an [`Event`](crate::event::Event) stream
@@ -537,6 +539,11 @@ impl Turn<'_> {
         {
             return None;
         }
+        // Paused after repeated failures: skip silently — the pause was
+        // announced once. A real overflow still has the reactive path.
+        if self.history.compaction_breaker().is_paused() {
+            return None;
+        }
         self.ui.emit(&Event::Note(
             "predicted context overflow; compacting history".into(),
         ));
@@ -567,9 +574,14 @@ impl Turn<'_> {
                     });
                 }
                 // Predictive failure is not fatal: fall through and let
-                // the request itself succeed or overflow reactively.
+                // the request itself succeed or overflow reactively. But each
+                // attempt is the most expensive request of the round, so a
+                // run of them pauses the path instead of paying every turn.
                 self.ui
                     .emit(&Event::Note(format!("predictive compaction failed: {e:#}")));
+                if self.history.compaction_breaker().record_failure() {
+                    self.ui.emit(&Event::Note(compact::pause_note()));
+                }
                 None
             }
         }
@@ -977,6 +989,7 @@ async fn turn_rounds(
             };
         }
     };
+    history.compaction_breaker().begin_turn();
     let mut turn = Turn {
         cfg,
         history,

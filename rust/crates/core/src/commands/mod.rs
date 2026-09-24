@@ -627,9 +627,10 @@ mod tests {
 
     #[tokio::test]
     async fn compact_reports_provider_error_without_mutating_history() {
+        // Not retryable: a transient one would be retried into the next turn.
         let provider =
-            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Error(
-                "summarizer unavailable".into(),
+            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Failure(
+                kloop_provider::ProviderFailure::protocol("summarizer unavailable"),
             )]);
         let cfg = test_cfg(provider, Some(200_000));
         let mut history = History::new(cfg.offload_dir.clone());

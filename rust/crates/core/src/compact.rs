@@ -400,7 +400,7 @@ pub(crate) async fn compact_once(
         let projected_request = history
             .provider_request_view_for(&request_plan.request, provider_attempt)
             .map_err(anyhow::Error::new)?;
-        match sample_summary(
+        match sample_summary_with_retry(
             provider_attempt,
             cfg.cache_key(),
             &projected_request,
@@ -540,6 +540,116 @@ fn shrink_to_newest(request: &mut Vec<Message>, target: u64) -> usize {
     }
     request.drain(..keep_from);
     keep_from
+}
+
+/// The summary request under the same transient-retry policy as a sampling
+/// round: a retryable provider failure is retried with the same backoff and
+/// `Retry-After`. Nothing is shown before the summary is complete, so a retry
+/// never replays anything the user saw. An overflow is not retried here — the
+/// caller answers that one by shrinking the request.
+async fn sample_summary_with_retry(
+    provider_attempt: &FrozenProviderAttempt,
+    cache_key: Option<&str>,
+    request: &[Message],
+    cancel: &CancellationToken,
+) -> Result<(String, Option<Usage>)> {
+    let mut attempt = 0;
+    loop {
+        let error = match sample_summary(provider_attempt, cache_key, request, cancel).await {
+            Ok(ok) => return Ok(ok),
+            Err(error) => error,
+        };
+        let Some(delay) = transient_failure(&error)
+            .filter(|_| attempt + 1 < crate::agent::MAX_ATTEMPTS)
+            .map(|failure| crate::agent::retry_delay(attempt, failure))
+        else {
+            return Err(error);
+        };
+        attempt += 1;
+        tokio::select! {
+            _ = cancel.cancelled() => bail!("compaction interrupted"),
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+fn transient_failure(error: &anyhow::Error) -> Option<&kloop_provider::ProviderFailure> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<kloop_provider::ProviderFailure>())
+        .filter(|failure| failure.is_retryable() && !failure.is_context_overflow())
+}
+
+/// Consecutive predictive-compaction failures that pause it.
+const PAUSE_AFTER_FAILURES: u32 = 2;
+/// Turns the pause lasts, not counting the one that tripped it. Turns, not
+/// rounds: one turn can run dozens of rounds, and a pause of three rounds
+/// would be over before it saved anything.
+const PAUSE_TURNS: u64 = 3;
+
+/// The note a turn shows when automatic compaction pauses.
+pub(crate) fn pause_note() -> String {
+    format!(
+        "automatic compaction paused for {PAUSE_TURNS} turns after {PAUSE_AFTER_FAILURES} \
+consecutive failures; /compact still works"
+    )
+}
+
+/// Stops predictive compaction from paying for a summary request, every turn,
+/// that keeps failing. Session-scoped and memory-only, like the usage anchor:
+/// lives on [`History`], so a sub-agent has its own. Only the predictive path
+/// consults it — reactive compaction is the turn's last way out and manual
+/// `/compact` is the user asking — but any applied compaction closes it
+/// (via [`History::replace_all`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CompactionBreaker {
+    /// Turns started on this history.
+    turns: u64,
+    consecutive_failures: u32,
+    /// The last turn predictive compaction is skipped in, while open.
+    paused_through: Option<u64>,
+}
+
+impl CompactionBreaker {
+    #[cfg(test)]
+    pub(crate) fn at(turns: u64, consecutive_failures: u32, paused_through: Option<u64>) -> Self {
+        Self {
+            turns,
+            consecutive_failures,
+            paused_through,
+        }
+    }
+
+    /// A turn is starting. A pause that has run its course closes here; the
+    /// failure count was already cleared when it tripped.
+    pub(crate) fn begin_turn(&mut self) {
+        self.turns += 1;
+        if self.paused_through.is_some_and(|last| self.turns > last) {
+            self.paused_through = None;
+        }
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused_through.is_some()
+    }
+
+    /// A predictive compaction failed (not by cancellation). Returns whether
+    /// this failure tripped the pause; the rest of this turn and the next
+    /// [`PAUSE_TURNS`] are skipped.
+    pub(crate) fn record_failure(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures < PAUSE_AFTER_FAILURES {
+            return false;
+        }
+        self.consecutive_failures = 0;
+        self.paused_through = Some(self.turns + PAUSE_TURNS);
+        true
+    }
+
+    pub(crate) fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.paused_through = None;
+    }
 }
 
 /// One summarization request: no tools, text collected from BlockDone.
@@ -724,7 +834,7 @@ mod tests {
     /// in history, and the session continues.
     #[tokio::test]
     async fn oversized_summary_request_drops_oldest_and_still_compacts() {
-        let provider = kloop_provider::Provider::mock_scripted(vec![
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
             kloop_provider::MockTurn::Overflow,
             kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
                 text: "summary of what fit".into(),
@@ -768,16 +878,28 @@ mod tests {
 
         // The refusal is remembered: planning now uses the observed ceiling.
         assert!(history.effective_window(u64::MAX) < u64::MAX);
+
+        // Shrunk and resent at once — not the transient retry, which would
+        // resend the same oversized request after a backoff.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].messages.len() < seen[0].messages.len());
     }
 
     /// A non-overflow failure must not be answered by shrinking — the fold window
-    /// has nothing to do with a dropped connection.
-    #[tokio::test]
+    /// has nothing to do with a dropped connection. It is retried under the
+    /// sampling budget instead, and surfaces once that is spent.
+    #[tokio::test(start_paused = true)]
     async fn a_transport_failure_is_not_treated_as_too_large() {
-        let provider = kloop_provider::Provider::mock_scripted(vec![
+        let reset = || {
             kloop_provider::MockTurn::Failure(kloop_provider::ProviderFailure::transport(
                 "connection reset",
-            )),
+            ))
+        };
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            reset(),
+            reset(),
+            reset(),
             kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
                 text: "must not be reached".into(),
             }]),
@@ -802,6 +924,145 @@ mod tests {
             history.effective_window(1_000),
             1_000,
             "no ceiling recorded"
+        );
+        // Three identical requests: retried whole, never shrunk.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), crate::agent::MAX_ATTEMPTS as usize);
+        assert!(
+            seen.iter()
+                .all(|request| request.messages == seen[0].messages)
+        );
+    }
+
+    /// One 5xx on the summary request is a blip, not a failed compaction: it
+    /// is retried and the compaction applies.
+    #[tokio::test]
+    async fn a_transient_summary_failure_is_retried() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Failure(kloop_provider::ProviderFailure::http(
+                503,
+                "overloaded",
+                Some(std::time::Duration::ZERO),
+            )),
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "summary after a retry".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "transient-retry");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        let outcome = compact_once(
+            &cfg,
+            &cfg.provider_route.primary_attempt(),
+            CompactionTrigger::Predictive,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("a single 503 must not fail the compaction");
+
+        assert!(
+            matches!(outcome, CompactionOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].messages, seen[1].messages);
+    }
+
+    /// A non-retryable failure is not retried: one request, then the error.
+    #[tokio::test]
+    async fn a_permanent_summary_failure_is_not_retried() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Failure(kloop_provider::ProviderFailure::protocol(
+                "summary refused",
+            )),
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "must not be reached".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "permanent-failure");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+
+        compact_once(
+            &cfg,
+            &cfg.provider_route.primary_attempt(),
+            CompactionTrigger::Predictive,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a protocol failure surfaces");
+
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Two failures pause predictive compaction for the rest of that turn and
+    /// three more; the one after that closes it with the count cleared, so a
+    /// single later failure does not re-trip.
+    #[test]
+    fn breaker_pauses_after_two_failures_for_three_turns() {
+        let mut breaker = CompactionBreaker::default();
+        breaker.begin_turn();
+        assert!(!breaker.record_failure());
+        assert_eq!(breaker, CompactionBreaker::at(1, 1, None));
+        breaker.begin_turn();
+        assert!(breaker.record_failure());
+        assert_eq!(breaker, CompactionBreaker::at(2, 0, Some(5)));
+        for turn in 3..=5 {
+            breaker.begin_turn();
+            assert!(breaker.is_paused(), "turn {turn} is inside the pause");
+        }
+        breaker.begin_turn();
+        assert_eq!(breaker, CompactionBreaker::at(6, 0, None));
+        assert!(!breaker.record_failure());
+        assert_eq!(breaker, CompactionBreaker::at(6, 1, None));
+    }
+
+    /// "Consecutive" means consecutive: a success in between starts over.
+    #[test]
+    fn breaker_success_clears_the_count() {
+        let mut breaker = CompactionBreaker::default();
+        breaker.begin_turn();
+        breaker.record_failure();
+        breaker.record_success();
+        assert!(!breaker.record_failure());
+        assert_eq!(breaker, CompactionBreaker::at(1, 1, None));
+    }
+
+    /// The pause only gates the automatic path. `/compact` during it runs
+    /// normally, and its success closes the breaker.
+    #[tokio::test]
+    async fn manual_compaction_during_a_pause_runs_and_closes_it() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "manual summary".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "manual-during-pause");
+        let mut history = seeded_history(cfg.offload_dir.clone());
+        history.compaction_breaker().begin_turn();
+        history.compaction_breaker().record_failure();
+        history.compaction_breaker().record_failure();
+
+        let outcome = compact_once(
+            &cfg,
+            &cfg.provider_route.primary_attempt(),
+            CompactionTrigger::Manual,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, CompactionOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            *history.compaction_breaker(),
+            CompactionBreaker::at(1, 0, None)
         );
     }
 
@@ -1087,9 +1348,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_compaction_leaves_history_untouched() {
+        // Not retryable: a transient one would be retried into the next turn.
         let provider =
-            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Error(
-                "summarizer unavailable".into(),
+            kloop_provider::Provider::mock_scripted(vec![kloop_provider::MockTurn::Failure(
+                kloop_provider::ProviderFailure::protocol("summarizer unavailable"),
             )]);
         let cfg = compact_test_cfg(provider, "fail");
         let mut history = seeded_history(cfg.offload_dir.clone());

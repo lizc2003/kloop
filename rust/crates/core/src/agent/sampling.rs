@@ -79,7 +79,21 @@ enum SampleError {
     },
 }
 
-const MAX_ATTEMPTS: u32 = 3;
+/// Attempts per request, the first one included. The summary request
+/// (`compact.rs`) retries under the same budget.
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
+
+/// How long to wait after failed attempt `attempt` (0-based) before the next
+/// one: exponential backoff with sub-ms jitter from the clock's nanoseconds. A
+/// bounded provider Retry-After takes precedence.
+pub(crate) fn retry_delay(attempt: u32, error: &ProviderFailure) -> Duration {
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) % 250)
+        .unwrap_or(0);
+    let local_delay = Duration::from_millis((250 << attempt) + jitter);
+    error.retry_after().unwrap_or(local_delay)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn sample_with_retry(
@@ -154,14 +168,7 @@ pub(super) async fn sample_with_retry(
                 if attempt + 1 == MAX_ATTEMPTS {
                     return Sampled::Failed(error);
                 }
-                // Exponential backoff with sub-ms jitter from the clock's
-                // nanoseconds. A bounded provider Retry-After takes precedence.
-                let jitter = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| u64::from(d.subsec_nanos()) % 250)
-                    .unwrap_or(0);
-                let local_delay = Duration::from_millis((250 << attempt) + jitter);
-                let delay = error.retry_after().unwrap_or(local_delay);
+                let delay = retry_delay(attempt, &error);
                 ui.emit(&Event::Note(format!(
                     "sampling failed (attempt {}/{MAX_ATTEMPTS}), retrying in {delay:?}: {error}",
                     attempt + 1

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use crate::compact::CompactionBreaker;
 use crate::provider_route::FrozenProviderAttempt;
 use crate::provider_route::FrozenProviderRoute;
 use crate::provider_route::ProvenanceMismatch;
@@ -78,6 +79,7 @@ pub struct History {
     /// Recording it makes the predictive threshold self-correct instead of
     /// walking into the same rejection every round.
     observed_overflow_ceiling: Option<u64>,
+    compaction_breaker: CompactionBreaker,
     /// Session file written through on every record/replace_all; None for
     /// in-memory-only histories (sub-agents, tests).
     rollout: Option<Rollout>,
@@ -103,6 +105,7 @@ impl History {
             cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
             observed_overflow_ceiling: None,
+            compaction_breaker: CompactionBreaker::default(),
             provider_usage: UsageLedger::default(),
             provider_routes: Vec::new(),
             rollout: None,
@@ -135,6 +138,7 @@ impl History {
             cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
             observed_overflow_ceiling: None,
+            compaction_breaker: CompactionBreaker::default(),
             provider_usage: resumed.provider_usage,
             provider_routes,
             next_memory_boundary: resumed.rollout.next_boundary(),
@@ -166,6 +170,7 @@ impl History {
         self.next_memory_boundary = resumed.rollout.next_boundary();
         self.rollout = Some(resumed.rollout);
         self.usage_anchor = None;
+        self.compaction_breaker = CompactionBreaker::default();
         for stub in &carried {
             self.persist(|rollout| rollout.append_request_stub(stub));
         }
@@ -639,6 +644,10 @@ impl History {
         });
     }
 
+    pub(crate) fn compaction_breaker(&mut self) -> &mut CompactionBreaker {
+        &mut self.compaction_breaker
+    }
+
     /// Current context size: the last real usage anchor plus a ~4 chars/token
     /// estimate for everything recorded after it. The staged input counts — it
     /// is in the next request, and a large paste is exactly the input that can
@@ -663,10 +672,15 @@ impl History {
     /// replace it away. It stays staged and lands after the summary, where it
     /// belongs — it is the newest thing in the conversation, not part of what
     /// was folded up.
+    ///
+    /// Every applied compaction lands here, whatever triggered it, so this is
+    /// also where the compaction breaker learns of a success. `/clear` lands
+    /// here too, and closing the breaker is right for it as well.
     pub fn replace_all(&mut self, items: Vec<Message>) {
         self.persist(|rollout| rollout.append_compacted(&items));
         self.items = items;
         self.usage_anchor = None;
+        self.compaction_breaker.record_success();
         self.reduction.reset();
     }
 

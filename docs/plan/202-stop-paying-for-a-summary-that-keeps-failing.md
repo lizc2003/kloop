@@ -97,4 +97,21 @@ chord 的做法(`internal/agent/compaction_failure_policy.go:14-16, 134-151`):**
 
 ## 七、完成记录
 
-(未开工)
+✅ 2026-09-24,提交号见下。开工问答:阈值照抄 2 / 3(用户「同意」)。
+
+- **断路器**:`compact::CompactionBreaker`,挂在 `History` 上(`compaction_breaker()`),
+  不进 rollout;`History::new`/`resume` 从闭合开始,`rebase` 重置,`replace_all` 即成功——
+  预测性、被动、`/compact`、`/clear` 都经它,所以"任何成功都闭合"不需要在三个调用点各写一遍。
+  turn 数在 `turn_rounds` 开头 `begin_turn()` 推进。触发的那个 turn 剩下的轮次也跳过
+  (同一 turn 里再试也是同一个坏 provider),之后再暂停 3 个 turn;触发时计数清零,于是期满后
+  要重新攒满 2 次才会再断。取消不计数(`compact_predictively` 本来就先判 `cancel`)。
+- **摘要重试**:`sample_summary_with_retry`,判据 `is_retryable() && !is_context_overflow()`,
+  最多 `MAX_ATTEMPTS` 次;退避抽成 `agent::sampling::retry_delay`,采样与摘要共用,
+  `MAX_ATTEMPTS` 同一个常量。重试没有发 note(`compact_once` 不持有 `Ui`,为一条 note 改签名不值)。
+- **测试**:`agent/tests.rs` 六个 turn 的请求计数与逐 turn note 整体断言(`[1,1,0,0,0,1]`)、
+  暂停期被动压缩照常且闭合、取消不计数;`compact.rs` 断路器状态机两条、503 一次后成功、
+  不可重试只发一次、transport 耗尽发 3 次同样的请求、超长走缩小而非退避(请求变短)、
+  暂停期 `/compact` 照常且闭合;`subagent.rs` 子 agent 的 `History` 断路器从默认开始。
+  另有两条旧用例因可重试失败被重试成功而改成不可重试失败(教训 189)。
+- chord clone **未退休**:203、204 尚未完成。
+

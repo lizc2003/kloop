@@ -1096,6 +1096,20 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The compaction breaker lives on `History`, and a child is always given
+    /// a fresh one: a parent paused by its own failing summaries does not stop
+    /// its children compacting, and a child's failures never pause the parent.
+    #[test]
+    fn child_history_starts_with_its_own_closed_compaction_breaker() {
+        let cfg = TestConfig::new("child-breaker").build();
+        let mut history = child_history(&cfg, None, "task".into())
+            .unwrap_or_else(|outcome| panic!("{:?}", outcome.reason));
+        assert_eq!(
+            *history.compaction_breaker(),
+            crate::compact::CompactionBreaker::default()
+        );
+    }
+
     #[tokio::test]
     async fn child_is_registered_before_sampling_and_can_list_main() {
         let (provider, seen) = Provider::mock_recording(vec![

@@ -1493,6 +1493,145 @@ async fn reactive_compaction_uses_the_active_attempt() {
     );
 }
 
+/// A history over a 30k window's predictive threshold, with something to fold.
+fn fat_history(cfg: &Config) -> History {
+    let fat = crate::compact::keep_recent_tokens() as usize * 4;
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("x".repeat(fat)));
+    history.record(Message::assistant(vec![ContentBlock::Text {
+        text: "y".repeat(fat),
+    }]));
+    history.record(Message::user_text("request 1"));
+    history
+}
+
+fn is_summary_request(request: &kloop_provider::MockRequest) -> bool {
+    request
+        .system
+        .starts_with("You summarize an in-progress coding-agent session")
+}
+
+/// A summary request that keeps failing is paid for twice, then not at all
+/// for three turns — the turns still run, on the uncompacted history — and
+/// is tried again on the sixth.
+#[tokio::test]
+async fn failing_predictive_compaction_pauses_for_three_turns() {
+    let refused = || MockTurn::Failure(ProviderFailure::protocol("summary refused"));
+    let (provider, seen) = Provider::mock_recording(vec![
+        refused(),
+        MockTurn::Blocks(text("answer 1")),
+        refused(),
+        MockTurn::Blocks(text("answer 2")),
+        MockTurn::Blocks(text("answer 3")),
+        MockTurn::Blocks(text("answer 4")),
+        MockTurn::Blocks(text("answer 5")),
+        refused(),
+        MockTurn::Blocks(text("answer 6")),
+    ]);
+    let cfg = compaction_cfg(provider, 30_000, "breaker-pause");
+    let mut history = fat_history(&cfg);
+    let mut summaries = Vec::new();
+    let mut notes = Vec::new();
+    for turn in 1..=6 {
+        if turn > 1 {
+            history.record(Message::user_text(format!("request {turn}")));
+        }
+        let turn_notes = Arc::new(NotesUi::default());
+        let ui: Arc<dyn Ui> = turn_notes.clone();
+        let sent_before = seen.lock().unwrap().len();
+
+        let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+        assert_eq!(outcome.final_text, format!("answer {turn}"));
+        let sent = &seen.lock().unwrap()[sent_before..];
+        summaries.push(sent.iter().filter(|r| is_summary_request(r)).count());
+        notes.push(turn_notes.0.lock().unwrap().clone());
+    }
+
+    assert_eq!(summaries, [1, 1, 0, 0, 0, 1]);
+    let failed = "predictive compaction failed: compaction request failed: provider protocol error: summary refused";
+    assert_eq!(notes[0], [PREDICTED_NOTE, failed]);
+    assert_eq!(
+        notes[1],
+        [
+            PREDICTED_NOTE,
+            failed,
+            "automatic compaction paused for 3 turns after 2 consecutive failures; \
+/compact still works"
+        ]
+    );
+    // The pause is announced once, not every turn it skips.
+    assert_eq!(notes[2..5], vec![Vec::<String>::new(); 3]);
+    assert_eq!(notes[5], [PREDICTED_NOTE, failed]);
+}
+
+/// The pause gates only the predictive path. An overflow the provider
+/// actually rejects is still compacted reactively, and that success closes
+/// the breaker.
+#[tokio::test]
+async fn reactive_compaction_runs_during_a_pause_and_closes_it() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Overflow,
+        MockTurn::Blocks(text("summary")),
+        MockTurn::Blocks(text("answer")),
+    ]);
+    let cfg = compaction_cfg(provider, 30_000, "breaker-reactive");
+    let mut history = fat_history(&cfg);
+    history.compaction_breaker().begin_turn();
+    history.compaction_breaker().record_failure();
+    history.compaction_breaker().record_failure();
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "answer");
+    let summaries: Vec<bool> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(is_summary_request)
+        .collect();
+    assert_eq!(summaries, [false, true, false]);
+    assert_eq!(
+        *history.compaction_breaker(),
+        compact::CompactionBreaker::at(2, 0, None)
+    );
+}
+
+/// A summary the user interrupted did not fail: it is not counted.
+#[tokio::test]
+async fn cancelled_predictive_compaction_is_not_a_failure() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (provider, _) = Provider::mock_recording(vec![MockTurn::Gate {
+        started: started_tx,
+        release: release_rx,
+        blocks: text("never delivered"),
+    }]);
+    let cfg = compaction_cfg(provider, 30_000, "breaker-cancel");
+    let cancel = CancellationToken::new();
+    let child_cancel = cancel.clone();
+    let handle = tokio::spawn(async move {
+        let ui: Arc<dyn Ui> = Arc::new(NullUi);
+        let mut history = fat_history(&cfg);
+        let outcome = run_turn(&cfg, &mut history, &ui, &child_cancel, 0).await;
+        (outcome, history)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+        .await
+        .expect("summary request did not start")
+        .expect("summary gate dropped");
+    cancel.cancel();
+    let (outcome, mut history) = handle.await.unwrap();
+
+    assert_eq!(outcome.reason, EndReason::Aborted);
+    assert_eq!(
+        *history.compaction_breaker(),
+        compact::CompactionBreaker::at(1, 0, None)
+    );
+}
+
 fn text(t: &str) -> Vec<AssistantBlock> {
     vec![AssistantBlock::Text { text: t.into() }]
 }
