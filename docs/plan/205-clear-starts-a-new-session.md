@@ -132,4 +132,30 @@ transcript 指针指向**父**会话文件;cache key、子 agent 会话文件名
 
 ## 八、完成记录
 
-(未开工)
+✅ 2026-09-24,两个提交:`61dcc8a`(`/clear` 开新会话)、`3c76b1c`(rewind 走同一个缝)。
+
+第五节七问的答案(用户逐条定):
+
+1. 后台工作**全部停掉**,屏幕上报停了几个(`stopped N background task(s)`,超时没收回的另报一行)。
+2. 权限:**模式保留、会话里记住的授权清掉、plan mode 退回进入前的模式**;全局/项目层与 approver 沿用
+   (`Permissions::fresh_session`)。
+3. server **拒绝** `/clear`,回一条 `system` 指向 `thread/start`;`thread/cleared` 通知与投影里的处理删掉。
+4. 清屏**连终端 scrollback 一起清**(`ESC[2J` + `ESC[3J`,后者绕过 ratatui 直接进帧缓冲)。
+5. worktree:新会话**回启动目录**,旧 worktree 按会话结束的规矩保留在盘上并提示路径。
+6. **不加** `/new`。
+7. rewind 修复**随本 plan、单独一个提交**。
+
+3.4 的空会话文件不用选:`Rollout` 本来就在 drop 时删掉只有 preamble 的文件(见 HANDOFF 教训 193),
+测试钉住了"清空后什么都没说就再清,不留空文件"。
+
+实现要点(设计以 `rust/DESIGN.md` 的 `/clear` 条与 Fork 节为准):
+
+- `Config::fresh_session` 用不带 `..` 的解构逐字段分类;PowerShell 闸门归"沿用"(挡住超时没收回的旧进程)。
+- `Scheduler::successor` 共享持久化 store,不共享 owner;`commands::start_fresh_session` /
+  `replace_session` 先建新 Config(建不出来就什么都不停),再停旧的。
+- TUI 的难点不在 worker:**UI loop 和退出收尾各自攥着第一个会话的 inbox / 权限闸 / Config**
+  (教训 194)。改成 worker 把当前 Config 发布到一个共享槽,UI loop 在 `Cleared`/`Forked` 后重读并重新订阅 inbox。
+  旧会话后台工作留下的待批准弹窗在切换时丢弃(= 拒绝)。
+- 顺带删掉失去调用者的 `TodoRegistry::clear`、`Config::reset_deferred_tool_capabilities`、`DeferredToolUnlocks::clear`。
+
+未验证:没在真终端里看 scrollback 清除的效果,也没接真实 provider 跑。
