@@ -17,6 +17,7 @@ use crate::tools::dispatch_tools;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::Injected;
 use kloop_protocol::Message;
 
 mod sampling;
@@ -293,7 +294,7 @@ async fn run_turn_with_options(
                 // Staged behind the turn's input, not recorded: context for a
                 // turn that never runs is context for nothing, and recording it
                 // here would also commit the input this turn may yet give back.
-                history.stage(Message::user_text(text));
+                history.stage(Message::injected(Injected::Hook, text));
             }
         }
     }
@@ -336,7 +337,7 @@ async fn run_turn_with_options(
         return outcome;
     }
     for text in stop_context {
-        history.record(Message::user_text(text));
+        history.record(Message::injected(Injected::Hook, text));
     }
     // The turn's last rollout line. Every message this turn produced — the stop
     // hook's injected context included — is already recorded, so the terminal is
@@ -669,7 +670,8 @@ impl Turn<'_> {
             // round returns only the remainder. Without this the resumed
             // half is the whole answer the caller sees.
             self.truncated_prefix.push_str(&round_text);
-            self.history.record(Message::user_text(STREAM_RESUME_MSG));
+            self.history
+                .record(Message::injected(Injected::Harness, STREAM_RESUME_MSG));
             return RoundStep::Retry;
         }
         RoundStep::Stop(Ending {
@@ -807,8 +809,10 @@ impl Turn<'_> {
                     self.ui.emit(&Event::Note(format!(
                         "response truncated by output limit; asking the model to continue ({recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
                     )));
-                    self.history
-                        .record(Message::user_text(TRUNCATION_CONTINUE_MSG));
+                    self.history.record(Message::injected(
+                        Injected::Harness,
+                        TRUNCATION_CONTINUE_MSG,
+                    ));
                     return Some(RoundStep::Retry);
                 }
                 Some(RoundStep::Stop(Ending {
@@ -879,8 +883,10 @@ impl Turn<'_> {
                 structured: None,
             });
         }
-        self.history
-            .record(Message::user_text(crate::structured_output::nudge()));
+        self.history.record(Message::injected(
+            Injected::Harness,
+            crate::structured_output::nudge(),
+        ));
         RoundStep::Retry
     }
 
@@ -938,7 +944,7 @@ impl Turn<'_> {
         // user-message context.
         for text in std::mem::take(&mut *ctx.hook_context.lock().unwrap_or_else(|e| e.into_inner()))
         {
-            self.history.record(Message::user_text(text));
+            self.history.record(Message::injected(Injected::Hook, text));
         }
         if self.cancel.is_cancelled() {
             return RoundStep::Stop(Ending {
@@ -1412,7 +1418,7 @@ fn remind_todos(cfg: &Config, history: &mut History, depth: u8) -> bool {
         return false;
     };
     let reminder = history.offload_text(reminder);
-    history.record(Message::user_text(reminder));
+    history.record(Message::injected(Injected::Harness, reminder));
     true
 }
 
@@ -1430,7 +1436,7 @@ fn remind_changed_reads(cfg: &Config, history: &mut History) -> bool {
         return false;
     };
     let reminder = history.offload_text(reminder);
-    history.record(Message::user_text(reminder));
+    history.record(Message::injected(Injected::Harness, reminder));
     true
 }
 

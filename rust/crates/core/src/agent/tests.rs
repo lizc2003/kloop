@@ -1153,8 +1153,9 @@ async fn predictive_compaction_fires_before_sampling() {
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.final_text, "final answer");
     let msgs = history.messages();
-    // [summary, ...kept tail..., assistant reply]; the fat prefix is gone.
-    let ContentBlock::Text { text } = &msgs[0].content[0] else {
+    // [anchors, summary, ...kept tail..., assistant reply]; the fat prefix is gone.
+    assert_eq!(msgs[0].injected, Some(Injected::UserAnchors));
+    let ContentBlock::Text { text } = &msgs[1].content[0] else {
         panic!("expected text summary at history start");
     };
     assert!(
@@ -1304,7 +1305,7 @@ async fn overflow_compacts_and_retries() {
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.final_text, "recovered answer");
-    let ContentBlock::Text { text } = &history.messages()[0].content[0] else {
+    let ContentBlock::Text { text } = &history.messages()[1].content[0] else {
         panic!("expected text summary at history start");
     };
     assert!(text.starts_with(crate::compact::SUMMARY_PREFIX));
@@ -1666,7 +1667,7 @@ async fn truncated_response_recovers_with_continuation() {
     assert_eq!(msgs.len(), 4);
     assert_eq!(
         msgs[2],
-        Message::user_text(super::TRUNCATION_CONTINUE_MSG),
+        Message::injected(Injected::Harness, super::TRUNCATION_CONTINUE_MSG),
         "the continuation nudge must be recorded so history stays legal"
     );
 }
@@ -1704,7 +1705,7 @@ async fn truncation_recovery_is_bounded() {
     let nudges = history
         .messages()
         .iter()
-        .filter(|m| *m == &Message::user_text(super::TRUNCATION_CONTINUE_MSG))
+        .filter(|m| *m == &Message::injected(Injected::Harness, super::TRUNCATION_CONTINUE_MSG))
         .count();
     assert_eq!(nudges, 3);
 }
@@ -2376,7 +2377,7 @@ async fn partial_stream_seals_the_open_item_then_continues_from_it() {
                 }],
                 cfg.provider_route.primary_attempt().provenance(3),
             ),
-            Message::user_text(super::STREAM_RESUME_MSG),
+            Message::injected(Injected::Harness, super::STREAM_RESUME_MSG),
             Message::assistant_from_provider(
                 vec![ContentBlock::Text {
                     text: " and the rest".into(),
@@ -2562,7 +2563,7 @@ async fn subagent_internal_delta_seals_then_continues_in_its_own_history() {
                 }],
                 "mock",
             ),
-            Message::user_text(super::STREAM_RESUME_MSG),
+            Message::injected(Injected::Harness, super::STREAM_RESUME_MSG),
             Message::assistant_from_provider(
                 vec![ContentBlock::Text {
                     text: " and the rest".into(),
@@ -3217,10 +3218,13 @@ async fn hook_stdout_is_injected_as_user_context() {
     //  user(post_tool ctx), assistant(text)]
     assert_eq!(
         msgs[1],
-        Message::user_text("[pre_turn hook]\nrepo rule: tests first")
+        Message::injected(Injected::Hook, "[pre_turn hook]\nrepo rule: tests first")
     );
     assert_eq!(msgs[2].role, Role::Assistant);
-    assert_eq!(msgs[4], Message::user_text("[post_tool hook]\nlint passed"));
+    assert_eq!(
+        msgs[4],
+        Message::injected(Injected::Hook, "[post_tool hook]\nlint passed")
+    );
 }
 
 /// Project instructions ride every sampling request as a synthetic first

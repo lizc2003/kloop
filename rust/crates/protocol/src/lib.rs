@@ -739,6 +739,16 @@ pub enum Injected {
     ContextSummary,
     /// Compaction had to drop a prefix it could not summarize at all.
     DroppedPrefix,
+    /// Compaction's verbatim copy of what the user said in the folded prefix.
+    /// The runtime writes it; the summary model never produces it.
+    UserAnchors,
+    /// Files compaction re-read so the work in progress survives the fold.
+    RestoredFiles,
+    /// stdout of an allowing hook, fed to the model as context.
+    Hook,
+    /// The harness talking to the model: round-boundary reminders and the
+    /// nudges that recover a truncated or malformed reply.
+    Harness,
 }
 
 impl Message {

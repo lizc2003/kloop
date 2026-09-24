@@ -647,7 +647,10 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
    3 个 turn(`compaction_failure_policy.go`)。压缩后每次请求临时注入 key files 头部
    (单文件 12KB / 总 48KB / ≤ 剩余预算 1/4,带 revision 与 changed 标记,过当前 read 权限,
    **不写进持久化历史**,`compaction_file_context.go:215-272`)——这正是 capability-report
-   里"压缩后重注入最近读过的文件"那行挂账的第二家做法。
+   里"压缩后重注入最近读过的文件"那行挂账的第二家做法。**anchors 与 key files 两件已由 plan 203 吸收**:anchors 照抄
+   (原始请求 + 之后的用户消息,4096 token 从新往旧装);key files 改成压缩时读一次、写进持久化
+   替换结果,不每次请求注入——kloop 的注入层在请求最前面,每次重读会击穿缓存。
+   runtime 渲染 todo/子代理段与 repair→fallback 链没有吸收。
 3. **token 估算的两套口径**:容量规划用最近 12 个样本 tokens/bytes 比值的中位数、钳到
    [0.05, 1.0];**请求准入仍用 bytes/3**,因为校准比值会被裁剪拉低
    (`internal/ctxmgr/manager.go:758-806`)。

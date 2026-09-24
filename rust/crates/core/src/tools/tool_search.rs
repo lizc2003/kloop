@@ -1721,7 +1721,7 @@ mod tests {
         assert_eq!(stats.summarized, 1);
         assert_eq!(stats.kept, 2);
         assert_eq!(
-            history.messages()[0],
+            history.messages()[1],
             kloop_protocol::Message::injected(
                 kloop_protocol::Injected::ContextSummary,
                 format!("{}summary", crate::compact::SUMMARY_PREFIX),

@@ -2048,6 +2048,10 @@ fn injected_label(injected: &Injected) -> String {
         Injected::PeerUndeliverable => "peer agent delivery failure".into(),
         Injected::ContextSummary => "context summary — earlier messages compacted".into(),
         Injected::DroppedPrefix => "earlier messages dropped without summarization".into(),
+        Injected::UserAnchors => "your earlier messages, carried verbatim across compaction".into(),
+        Injected::RestoredFiles => "files in use re-read after compaction".into(),
+        Injected::Hook => "hook output".into(),
+        Injected::Harness => "harness reminder".into(),
     }
 }
 

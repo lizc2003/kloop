@@ -591,7 +591,19 @@ mod tests {
             result,
             SlashResult::message("history compacted: 2 summarized, 1 kept verbatim")
         );
-        assert!(history.messages().len() < 3, "history shrank");
+        // [anchors, summary, kept tail]: the fat reply is gone.
+        assert_eq!(
+            history
+                .messages()
+                .iter()
+                .map(|message| message.injected.clone())
+                .collect::<Vec<_>>(),
+            [
+                Some(kloop_protocol::Injected::UserAnchors),
+                Some(kloop_protocol::Injected::ContextSummary),
+                None,
+            ]
+        );
         // The receipt above is the `SlashResult`; this is what the screen said
         // during the summary request, which is where the whole wait happens.
         assert_eq!(ui.notes(), ["compacting history"]);
