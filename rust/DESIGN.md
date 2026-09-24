@@ -526,6 +526,23 @@ A `request_stub` line records a tool result that requests carry as a stub
 from then on (see **Request-time reduction**). Like `provider_usage` it is not
 part of the conversation — replay leaves the messages alone and collects the
 stubs beside them — and a `compacted` marker voids every stub before it.
+A `tool_started` line (plan 204) records that one call is about to run: it is
+written after every gate (hooks, permission) has passed and nothing below can
+refuse the call, and only for a call that **may have side effects** — one that
+is not concurrency-safe, plus `run_agent`/`workflow`/`run_program`, which are
+batched as safe but whose children write and run things all the same. Reads go
+unrecorded: repeating them costs nothing, and they are most of every concurrent
+batch. The session file belongs to the turn's `History`, which the tool
+dispatcher cannot reach, so the call sends its id to the turn over a channel
+and waits for the acknowledgement; the rollout therefore says "started" before
+the effect can begin, never after. It is the one line that is `sync_data`'d:
+every other line is written but left in the page cache, which survives a
+process kill and loses only a power cut's worth of tail, whereas a lost
+`tool_started` would err toward danger — it would tell the model that a call
+that may have acted never ran. Replay never puts it in the conversation; only
+pairing repair reads it. Calls a program fires carry no sink — the program's
+own call is the one the session has to judge — and a sub-agent's turn records
+into its own file.
 
 Every line carries an envelope — `id` (`{session}#{seq}`, no rand
 dependency), `parent` (previous line's id, linked across resumed runs), `ts`
@@ -569,10 +586,20 @@ stamp that refers to that route spells it the same way rather than inventing
 
 Resume replays the file, then makes the history legal and consistent again. Read-only inspection (`thread/read`, `thread/list`, session pickers and event seeds) performs the same normalization only in memory and never changes the JSONL file:
 
-- pairing is repaired in both directions (as in claude-code): unanswered
-  `tool_use` blocks get the same `is_error` "interrupted" results the live
-  interrupt path uses, and stray `tool_result` blocks answering nothing are
-  dropped;
+- pairing is repaired in both directions (as in claude-code): stray
+  `tool_result` blocks answering nothing are dropped, and every unanswered
+  `tool_use` gets an `is_error` result that says which way the session died
+  around it (plan 204). A call with a `tool_started` line anywhere in the file
+  gets `interrupted: … It may have taken effect, fully or partly. Check the
+  current state before repeating it.`; any other gets `not run: … Nothing
+  happened; calling it again is safe.` A round's results are recorded as one
+  message, so a crash on its third call leaves the first two unanswered too —
+  they started, so they read "check first", which is what lets the model find
+  out they already happened. A read that died midway reads "not run", which is
+  as safe to act on. The live cancellation path (Ctrl+C) is not this: it knows
+  how far each call got and keeps its own plain `interrupted`. A file written
+  before `tool_started` existed reads every orphan as "not run" — no version
+  check, per the no-compatibility stance;
 - a torn tail (crash mid-append) is truncated to the last intact line —
   physically, before appending resumes, so the partial bytes can't merge
   with the next line and orphan everything after (read-only paths never modify

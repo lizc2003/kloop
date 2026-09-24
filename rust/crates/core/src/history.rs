@@ -572,6 +572,13 @@ impl History {
         self.persist(|rollout| rollout.append_turn_terminal(&terminal));
     }
 
+    /// Record that a call that may have side effects is about to run (plan
+    /// 204). Never enters `items`: only pairing repair reads it back, after a
+    /// crash, to tell "never ran" from "may have acted".
+    pub(crate) fn note_tool_started(&mut self, tool_use_id: &str) {
+        self.persist(|rollout| rollout.append_tool_started(tool_use_id));
+    }
+
     /// Persistence must never take down the live session: a failed write
     /// drops the rollout and the session continues in memory only.
     fn persist(&mut self, write: impl FnOnce(&mut Rollout) -> std::io::Result<()>) {

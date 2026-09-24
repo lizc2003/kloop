@@ -118,4 +118,34 @@ kloop 的意图屏障已经有了:带 `tool_use` 的 assistant 消息在派发�
 
 ## 九、完成记录
 
-(未开工)
+✅ 2026-09-24,提交见下一行补记。开工问答两问:
+
+1. 第四节 fsync:**要**(用户「同意」)。`RolloutLine::needs_sync` 穷尽 match,只有 `ToolStarted` 为真,
+   `append_line` 写完这一行才 `sync_data`。测试没做可注入写入器,改为直接断言 `needs_sync` 的分类
+   (新增变体不归类就编不过,已经是编译期约束)。
+2. 判据(plan 没列、开工读代码发现):`run_agent`/`workflow`/`run_program` 被标为并发安全,理由是"子调用
+   各自过门",但子调用照样有副作用。改为 `may_have_effects` = 非并发安全 **或** 这三个编排工具
+   (用户「同意」)。见 HANDOFF 教训 191。
+
+落地与 plan 的出入:
+
+- **在哪写**:`run_gated` 里 `authorize` 与 powershell 锁之后、`execute_tool` 之前,并发批与串行走的
+  都是这一处(`run_one → run_gated`),不用分两路覆盖。`run_gated` 因此多一个 `id` 参数。
+- **怎么到 `History`**:`ToolCtx.tool_started: Option<ToolStartedSink>`(无界 mpsc + oneshot ack)。
+  `dispatch_round` 用 `journal_tool_starts` 一边跑派发一边写行,写完才 ack,调用才往下执行——
+  "写了 = 已过门、即将执行"。进程内取消若恰在等 ack 时发生,行可能已写而调用没跑;
+  那一轮会由取消路径自己产 `interrupted` 结果,修复根本不会查到它。
+- **program 内的调用**不带 sink(`CoreBridge::new` 置 `None`):要判的是 `run_program` 那一次调用本身。
+  子 agent 的 turn 自己的 `dispatch_round` 建自己的 sink,写进自己的 rollout。
+- **修复结果的顺序**:原先按 `HashSet` 迭代补缺(多个缺失时顺序不定),改为按 assistant 消息里
+  `tool_use` 的原顺序。
+- 修复文案照 plan 第二节原句,未再磨。
+
+验证:`make check` 全绿(fmt + clippy + test + parity)。新增测试:rollout 层一轮三写、崩在第二个
+(`interrupted`,`interrupted`,`not run`,整对象断言,resume 与 fork 各走一遍,repaired 标记落盘后
+二次 resume 稳定);agent 层一轮 read_file + 放行的 write_file + 被拒的写 bash,只有 write_file 一条
+`tool_started`、夹在 tool_use 消息与 tool_result 消息之间、resume 后 messages 与内存历史一致;
+`may_have_effects` 分类;`needs_sync` 分类。
+
+收尾:DESIGN.md 会话持久化两处(`tool_started` 行一段、配对修复条改写);`refs/README.md` chord 表行、
+节标题、第 5 条标注吸收;**`refs/chord` 已删除**(删前 HEAD `cce05db`、工作树干净);plan 182 补记新行类型。

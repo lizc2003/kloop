@@ -2985,6 +2985,119 @@ async fn denied_tool_call_continues_the_turn() {
     assert!(!std::path::Path::new("should-not-exist").exists());
 }
 
+/// Plan 204: only a call that got past every gate and may have side effects
+/// leaves a `tool_started` line, written between the assistant message that
+/// asked for it and the round's results — and never as a message.
+#[tokio::test]
+async fn only_gated_side_effecting_calls_are_recorded_as_started() {
+    use crate::permissions::{
+        ApprovalScope, Approver, ConfirmRequest, Decision, Mode, PermissionRules, Permissions,
+    };
+    use std::pin::Pin;
+
+    struct DenyOneFile;
+    impl Approver for DenyOneFile {
+        fn confirm(
+            &self,
+            request: ConfirmRequest,
+        ) -> Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
+            let asked = format!("{request:?}");
+            Box::pin(async move {
+                if asked.contains("denied.txt") {
+                    Decision::Deny
+                } else {
+                    Decision::Allow(ApprovalScope::Once)
+                }
+            })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("kloop-plan204-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(dir).unwrap();
+    std::fs::write(dir.join("notes.txt"), "notes\n").unwrap();
+    let script = vec![
+        vec![
+            tool_use_named(
+                "r1",
+                "read_file",
+                json!({"path": dir.join("notes.txt").to_str().unwrap()}),
+            ),
+            tool_use_named(
+                "w1",
+                "write_file",
+                json!({"path": dir.join("done.txt").to_str().unwrap(), "content": "x"}),
+            ),
+            tool_use("w2", "printf x > denied.txt"),
+        ],
+        vec![AssistantBlock::Text {
+            text: "done".into(),
+        }],
+    ];
+    let mut cfg = crate::tools::testutil::TestConfig::new("agent-started")
+        .provider(Provider::mock(script))
+        .max_rounds(Some(4))
+        .build()
+        .test_clone();
+    cfg.cwd = dir.clone();
+    cfg.permissions = Arc::new(
+        Permissions::new(
+            Mode::Manual,
+            &PermissionRules::default(),
+            dir.clone(),
+            Some(Arc::new(DenyOneFile)),
+        )
+        .unwrap(),
+    );
+    let cfg = Arc::new(cfg);
+    let session = dir.join("session.jsonl");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("read, write, write"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert!(dir.join("done.txt").exists());
+    assert!(!dir.join("denied.txt").exists());
+
+    let lines: Vec<(String, Value)> = std::fs::read_to_string(&session)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .map(|line| (line["type"].as_str().unwrap().to_string(), line))
+        .collect();
+    let started: Vec<(usize, &Value)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, (kind, _))| kind == "tool_started")
+        .map(|(at, (_, line))| (at, &line["tool_use_id"]))
+        .collect();
+    assert_eq!(started.len(), 1, "{lines:?}");
+    let (at, id) = started[0];
+    assert_eq!(id, &json!("w1"));
+    let is_message_with = |at: usize, block: &str| {
+        lines[at].0 == "message"
+            && lines[at].1["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b["type"] == block)
+    };
+    assert!(is_message_with(at - 1, "tool_use"), "{lines:?}");
+    assert!(is_message_with(at + 1, "tool_result"), "{lines:?}");
+
+    // Replay leaves it out of the conversation, so no request can carry it.
+    assert_eq!(
+        crate::rollout::resume_session(&session).unwrap().messages,
+        history.messages()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn hooked_cfg(provider: Provider, defs: Vec<crate::hooks::HookDef>, tag: &str) -> Arc<Config> {
     let mut cfg = compaction_cfg(provider, 200_000, tag).test_clone();
     cfg.session_id = format!("session-{tag}");

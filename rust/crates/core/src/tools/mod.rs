@@ -405,6 +405,35 @@ pub trait ToolSource: Send + Sync {
 /// `run_one` returns. One slot per call, so concurrent program calls never race.
 pub type ProgramResultSink = Arc<std::sync::Mutex<Option<Value>>>;
 
+/// Where a call that may have side effects reports "about to run" (plan 204).
+/// The session file belongs to the turn's `History`, which `run_one` cannot
+/// reach, so the report travels to the turn and the call waits until the line
+/// is on disk: the rollout says "started" only before the effect can begin.
+#[derive(Clone)]
+pub(crate) struct ToolStartedSink(
+    tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>,
+);
+
+/// The turn's end of a [`ToolStartedSink`].
+pub(crate) type ToolStartedReceiver =
+    tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)>;
+
+impl ToolStartedSink {
+    pub(crate) fn channel() -> (Self, ToolStartedReceiver) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self(tx), rx)
+    }
+
+    /// Returns once the turn has written the line, or at once if the turn is
+    /// no longer listening — a note nobody can write must not block the call.
+    async fn note(&self, tool_use_id: &str) {
+        let (ack, written) = tokio::sync::oneshot::channel();
+        if self.0.send((tool_use_id.to_string(), ack)).is_ok() {
+            let _ = written.await;
+        }
+    }
+}
+
 /// Everything a tool execution needs; cheap to clone into spawned futures.
 #[derive(Clone)]
 pub struct ToolCtx {
@@ -439,6 +468,10 @@ pub struct ToolCtx {
     /// program instead of the flattened text `run_one` returns. `execute_tool`
     /// fills it on the relevant tools; the bridge reads it after `run_one`.
     pub program_result: Option<ProgramResultSink>,
+    /// Set only by a turn whose calls answer to a session file. None for
+    /// harness commands, and for calls a program fires: the program's own
+    /// call is the one the session's pairing repair has to judge.
+    pub(crate) tool_started: Option<ToolStartedSink>,
 }
 
 impl ToolCtx {
@@ -458,6 +491,7 @@ impl ToolCtx {
             program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
+            tool_started: None,
         }
     }
 }
@@ -784,6 +818,19 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
     }
 }
 
+/// Whether a call may change something outside the conversation, so that a
+/// crash while it ran leaves the world in an unknown state (plan 204).
+/// Concurrency safety is almost that question, except for the orchestrators:
+/// they are batched as safe because their children re-enter the gate, but
+/// those children write and run things all the same.
+fn may_have_effects(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
+    !is_concurrency_safe(name, input, sources)
+        || matches!(
+            Builtin::from_name(name),
+            Some(Builtin::RunAgent | Builtin::Workflow | Builtin::RunProgram)
+        )
+}
+
 /// The argument names other harnesses use for the same thing, and the one name
 /// kloop implements.
 ///
@@ -954,8 +1001,8 @@ pub async fn dispatch_tools(
     results
 }
 
-/// Also reused by rollout resume to patch tool_use blocks orphaned by a
-/// killed session.
+/// The in-process cancellation result: the call knows how far it got. A killed
+/// session's orphans get their own two texts from rollout repair instead.
 pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
     ContentBlock::ToolResult {
         tool_use_id: tool_use_id.into(),
@@ -1236,7 +1283,9 @@ async fn run_post_tool_hook(name: &str, input: &Value, execution: &ToolExecution
 /// permission wait and the execution itself. Cancellation kills this future
 /// outright unless one of the two flags says an irreversible commit is already
 /// under way, in which case [`run_one`] lets it finish.
+#[allow(clippy::too_many_arguments)]
 async fn run_gated(
+    id: &str,
     name: &str,
     input: &Value,
     ctx: &ToolCtx,
@@ -1268,6 +1317,13 @@ async fn run_gated(
         Some(guard) => Some(guard.enter_executor().await),
         None => None,
     };
+    // Every gate is behind us and nothing below can refuse the call, so this is
+    // the one point where "started" is true and not yet stale.
+    if let Some(sink) = &ctx.tool_started
+        && may_have_effects(name, input, &ctx.cfg.tool_sources)
+    {
+        sink.note(id).await;
+    }
     let foreground_shell =
         name == "powershell" || (name == "bash" && !input["background"].as_bool().unwrap_or(false));
     if foreground_shell {
@@ -1500,6 +1556,7 @@ async fn run_one(
     let local_send_committed = AtomicBool::new(false);
     let deadline = CallDeadline::new(&name, &input, &ctx);
     let mut gated = Box::pin(run_gated(
+        &id,
         &name,
         &input,
         &ctx,
@@ -2040,6 +2097,7 @@ pub(crate) mod testutil {
             program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
+            tool_started: None,
         }
     }
 
@@ -4220,6 +4278,27 @@ mod tests {
         assert_eq!(ids, vec!["t1", "t2", "t3"]);
     }
 
+    /// Plan 204: the orchestrators are batched as concurrency-safe, but what
+    /// they spawn acts on the world, so a crash inside one is not "nothing
+    /// happened".
+    #[test]
+    fn orchestrators_may_have_effects_though_batched_as_safe() {
+        let effects = |name: &str, input: Value| super::may_have_effects(name, &input, &[]);
+        assert_eq!(
+            [
+                effects("read_file", json!({"path": "x"})),
+                effects("bash", bash_input("ls")),
+                effects("bash_output", json!({"bash_id": "bg-1"})),
+                effects("write_file", json!({"path": "x", "content": ""})),
+                effects("bash", bash_input("rm x")),
+                effects("run_agent", json!({"prompt": "x"})),
+                effects("workflow", json!({})),
+                effects("run_program", json!({})),
+            ],
+            [false, false, false, true, true, true, true, true]
+        );
+    }
+
     #[test]
     fn concurrency_safety_by_name_and_input() {
         fn is_concurrency_safe(name: &str, input: &Value) -> bool {
@@ -4318,6 +4397,7 @@ mod tests {
             program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
+            tool_started: None,
         };
         let results = dispatch_tools(
             vec![

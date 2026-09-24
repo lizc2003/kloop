@@ -17,6 +17,12 @@
 最后一层最刺眼:`sessions_by_recency` 与 `session_digest`(plan 162 为 picker 加的)
 跟"往一个 rollout 文件尾巴追加一行"没有任何关系,它们是**会话目录的查询 API**。
 
+> **2026-09-24 补记(plan 204 先做了)**:`RolloutLine` 多了一种行 `ToolStarted { tool_use_id }`
+> (serde tag `tool_started`),另有 `RolloutLine::needs_sync`(只有它 `sync_data`)、`Rollout::append_tool_started`、
+> `ParsedSession::started` 与 `repair_pairing` 的第三个参数、`unfinished_result`。拆分时:`needs_sync` 跟 `RolloutLine`
+> 走 `line.rs`;`started` 的收集在 `parse_session`(→ `validate.rs`);`repair_pairing`/`unfinished_result` 跟修复一起走。
+> 第一节的行号与行数是 204 之前量的,开工时重量。
+
 ## 二、切法
 
 | 新文件 | 内容 | 预估 |

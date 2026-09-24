@@ -13,7 +13,7 @@ kloop 设计时对比研究过六个代码库。本文件是关于"别人代码"
 | **grok-build** | `refs/grok-build`(xAI 官方,固定 `37949780c144e37df692e3d669051a21fec24f20`;其 `SOURCE_REV` 指向上游 monorepo `c4ea71cf`) | **同语言同形态的第二个生产参考**(175 万行 Rust,与 codex 同量级)。重点看 PTY harness 分层(`xai-grok-pager-pty-harness`,4 万行:真 PTY spawn 二进制 + alacritty_terminal + 帧耗时 baseline + mock 推理服务)、`xai-codebase-graph`(tree-sitter 符号索引 + 增量重建 + mmap)、`xai-hunk-tracker`(agent/外部改动归因)、`xai-fast-worktree`(CoW + BTRFS O(1) 快照)、hooks 的 16 事件 macro 表驱动、permission 的 `bash_command_splitting`/`exec_risk`/`managed_policy`、`xai-sqlite-journal` 的 NFS 教训;不抄 hub/computer-hub 远程 workspace 面、plugin-marketplace、voice/announcements/mixpanel 遥测 |
 | **deepseek-harness** | `refs/deepseek-harness`(DeepSeek 官方,固定 `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`) | **唯一非 Rust 参考**(79 万行 TS),代码不可移植,价值全在边界语义:沙箱 fail-closed(`SANDBOX_UNAVAILABLE` / full-partial 强制等级 / 被拒后申请更宽一档)、spill 三层(失败退回内联)、guard(重复调用 advisory、cooperative 超时)、session-query(cwd 完全相同才允许跨会话)、session 格式迁移链。**不抄 Cordis「万物皆插件」+ profile/bundle/patch 组合**——kloop 是单体 Rust,那会把编译期检查换成运行期装配 |
 | **ZCode（已退休）** | `zai-org/ZCode@872ad960de7ec172591f7e1952f7849229f94521`(Apache-2.0 公开仓库;本地 clone 已可删,要回源重新 clone 即可) | **调研即退休**。只留两条:① 文件体积棘轮的机制(→ plan 176);② microcompact 的一份具体取值。它的项目级 hook 信任模型**读过、判不做**(有便宜十倍的替代)。沙箱、provider/wire、测试语料、CUA/Swift 四项全空,见本文 2026-09-21 节 |
-| **chord（待退休）** | `refs/chord`(`keakon/chord`,MIT,Go,固定 `cce05db7151f12a50a1e3334edb5e53caa81e54e`) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。**clone 留到 plan 200–204 全部做完即退休(最后完成的那条负责删),不跟 HEAD**,见本文 2026-09-23 节 |
+| **chord（已退休）** | `keakon/chord@cce05db7151f12a50a1e3334edb5e53caa81e54e`(MIT,Go;本地 clone 已于 2026-09-24 随 plan 204 删除,要回源重新 clone 即可) | **只看请求级上下文裁剪与 prompt cache 经济学**,六个既有参考里独一家:按工具类型×批龄×字节换结构化 stub、cache 摊销门、仍有效的 read 不裁、有损先落盘、召回反馈;另有压缩 anchors 逐字继承。沙箱为零、写盘非原子、复杂度失控,其余面不作来源。plan 200–204 已全部吸收,不跟 HEAD,见本文 2026-09-23 节 |
 | **crush（已退休）** | `charmbracelet/crush@72654940d9e46961a7d804d536c45761e7084a08`(FSL-1.1-MIT:公开可读、两年后转 MIT,只借判据不搬代码;本地 clone 可删) | **调研即退休**。LLM 层与 step 循环在外部库 `charm.land/fantasy`,不在仓库里。强项是工程运维面(C/S 自动拉起、取消序号、流空闲超时),kloop 已有对应物。只留两条:① edit 缩进容错,与 chord 方向相反(→ plan 201 第二个开工问题);② 重复调用守卫第三家实现,**本地复算仍零打转,不做**。"安全命令"免审批是反例。见本文 2026-09-23 crush 节 |
 
 `refs/*` 由根 `.gitignore` 全部排除（只有 `refs/README.md` 随 kloop 提交），都是本机只读参考；不得在其中开发或推送。**`refs/claude-code-2.1.220/` 这份 parity 语料也不在版本控制里**：它的 capture 里逐字嵌着对照产品自己的 system prompt 与 24 个工具定义，那不是我们能再分发的东西，只留在当初生成它的机器上。`claw-code` 本地克隆已退休，固定 commit 的历史调研和已吸收边界保留在本文，不再作为可回源目录。CodeWhale 的完整源码审计、成熟度边界和 A–D 候选清单见 `docs/plan/60-codewhale-source-review.md`。
@@ -607,7 +607,7 @@ kloop 执行命令。开这扇门(hook 声明随仓库分发)的收益对单用�
 Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行期路线。作为"编排能否
 静态验证"的阅读材料可以,**不作补齐来源**。
 
-## chord 固定源码调研(2026-09-23,待退休)
+## chord 固定源码调研(2026-09-23,已退休)
 
 基线固定为 `keakon/chord@cce05db7151f12a50a1e3334edb5e53caa81e54e`(MIT 公开仓库,Go,个人主导,
 2026-04 起 1852 个提交)。非测试约 24 万行(agent 7.7 万 / tui 5.9 万 / tools 2.4 万 / llm 2.1 万),
@@ -617,7 +617,7 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
 把请求级上下文裁剪和 prompt cache 经济学做到这个程度——这是它唯一的独有价值,而且是机制与
 取值,能一次提炼完。其余面(沙箱、协议、hooks、TUI、工具面)codex/grok-build 更扎实,Go 代码
 也不可移植。**不跟 HEAD**:它一天几个提交,文档已和代码对不上(见下文提前执行一条),往后跟
-看到的多是它自己的内部债。**本地 clone 留到从它提炼的 plan 200–204 全部做完,最后完成的那条负责退休**;
+看到的多是它自己的内部债。**本地 clone 已于 2026-09-24 退休**(plan 200–204 全部做完,最后一条 204 删除,删前 HEAD 仍是 `cce05db`、工作树干净);
 想看它有没有新的省 token 手段,翻 CHANGELOG 即可,不回源。README 里那张六家耗时/花费对比
 只有一个任务、一个模型、作者自测,只当方向信号。
 
@@ -662,7 +662,9 @@ Rust 没有对应物;kloop 已有的 code mode(QuickJS + 内存硬限)是运行�
    是过期文档。
 5. **可以对照的小件**:执行工具前先落盘带 tool_calls 的 assistant 消息 + 每个工具开始前 fsync
    一条 started,恢复时缺结果的调用分 `not_started` / `outcome_unknown`
-   (`internal/agent/restore_normalize.go:94-195`);前台 shell 到 yield 时间(默认 90s)自动
+   (`internal/agent/restore_normalize.go:94-195`;**已由 plan 204 吸收**:意图屏障 kloop 本来就有,
+   started 只给可能有副作用的调用记——非并发安全的,加上 run_agent/workflow/run_program——
+   且只有这一行 `sync_data`,修复时分 `not run` / `interrupted…先核实`);前台 shell 到 yield 时间(默认 90s)自动
    转后台 job、按进程组归属且停止前做成员见证防 pgid 复用(`internal/tools/jobs_registry.go:498`);
    edit 失败时给最近匹配块 + 差异行、漂移大就直接给 read offset/limit,容错不写进工具描述
    (`internal/tools/replace_edit.go:232-313`;**已由 plan 201 吸收**,连同标点容错第三层);headless 状态快照带单调 `seq`、首条固定 `ready`。

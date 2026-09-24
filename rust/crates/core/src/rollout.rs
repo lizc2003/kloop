@@ -34,7 +34,6 @@ use crate::provider_route::ReasoningShape;
 use crate::provider_route::validate_provenance;
 use crate::provider_route::validate_timeline;
 use crate::request_reduction::FrozenStub;
-use crate::tools::interrupted;
 use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -389,6 +388,14 @@ enum RolloutLine {
         #[serde(flatten)]
         stub: FrozenStub,
     },
+    /// A call that may have side effects got past every gate and is about to
+    /// run (plan 204). Not part of the conversation; only pairing repair reads
+    /// it, to tell a call that never started from one that may have acted.
+    ToolStarted {
+        #[serde(flatten)]
+        meta: LineMeta,
+        tool_use_id: String,
+    },
 }
 
 impl RolloutLine {
@@ -404,6 +411,26 @@ impl RolloutLine {
         )
     }
 
+    /// Whether the line must reach the disk, not just the page cache, before
+    /// the append returns. Only a lost `ToolStarted` errs toward danger — it
+    /// would tell the model a call that may have acted never ran — so only it
+    /// pays for a sync. Every other line lost to a power cut costs at most
+    /// the tail of a conversation.
+    fn needs_sync(&self) -> bool {
+        match self {
+            RolloutLine::ToolStarted { .. } => true,
+            RolloutLine::Session { .. }
+            | RolloutLine::ProviderRouteInitial { .. }
+            | RolloutLine::ProviderRouteChanged { .. }
+            | RolloutLine::Message { .. }
+            | RolloutLine::ProviderUsage { .. }
+            | RolloutLine::Compacted { .. }
+            | RolloutLine::TurnTerminal { .. }
+            | RolloutLine::Repaired { .. }
+            | RolloutLine::RequestStub { .. } => false,
+        }
+    }
+
     /// The line's metadata, common to every variant.
     fn meta(&self) -> &LineMeta {
         match self {
@@ -415,7 +442,8 @@ impl RolloutLine {
             | RolloutLine::Compacted { meta, .. }
             | RolloutLine::TurnTerminal { meta, .. }
             | RolloutLine::Repaired { meta, .. }
-            | RolloutLine::RequestStub { meta, .. } => meta,
+            | RolloutLine::RequestStub { meta, .. }
+            | RolloutLine::ToolStarted { meta, .. } => meta,
         }
     }
 
@@ -430,7 +458,8 @@ impl RolloutLine {
             | RolloutLine::Compacted { meta, .. }
             | RolloutLine::TurnTerminal { meta, .. }
             | RolloutLine::Repaired { meta, .. }
-            | RolloutLine::RequestStub { meta, .. } => meta,
+            | RolloutLine::RequestStub { meta, .. }
+            | RolloutLine::ToolStarted { meta, .. } => meta,
         }
     }
 }
@@ -695,6 +724,13 @@ impl Rollout {
         })
     }
 
+    pub(crate) fn append_tool_started(&mut self, tool_use_id: &str) -> io::Result<()> {
+        self.append_line(RolloutLine::ToolStarted {
+            meta: self.next_meta(),
+            tool_use_id: tool_use_id.to_string(),
+        })
+    }
+
     fn append_repaired(&mut self, repair: &PairingRepair) -> io::Result<()> {
         self.append_line(RolloutLine::Repaired {
             meta: self.next_meta(),
@@ -743,6 +779,9 @@ impl Rollout {
             .append(true)
             .open(&self.path)?;
         writeln!(file, "{json}")?;
+        if line.needs_sync() {
+            file.sync_data()?;
+        }
         // Only advance the chain once the line is durably in the file.
         self.wrote_content |= content;
         self.last_id = Some(line.into_meta().id);
@@ -769,6 +808,9 @@ struct ParsedSession {
     runtime: Option<SessionRuntime>,
     terminals: Vec<SnapshotTerminal>,
     route_timeline: Vec<ProviderRouteReceipt>,
+    /// Every call recorded as started, across the whole file: tool_use ids
+    /// are unique, so a compaction in between does not have to void them.
+    started: HashSet<String>,
     last_id: Option<String>,
     max_seq: u64,
     /// Byte offset just past the last intact line; anything after is a
@@ -1044,6 +1086,7 @@ fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
         runtime: None,
         terminals: Vec::new(),
         route_timeline: Vec::new(),
+        started: HashSet::new(),
         last_id: None,
         max_seq: 0,
         intact_end,
@@ -1078,6 +1121,10 @@ fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
             }
             RolloutLine::RequestStub { meta, stub } => {
                 parsed.request_stubs.push(stub);
+                meta
+            }
+            RolloutLine::ToolStarted { meta, tool_use_id } => {
+                parsed.started.insert(tool_use_id);
                 meta
             }
             RolloutLine::TurnTerminal { meta, terminal } => {
@@ -1181,7 +1228,7 @@ impl SessionRead {
 pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
     let raw = std::fs::read(path)?;
     let parsed = parse_session(&raw)?;
-    let repair = repair_pairing(parsed.items, parsed.terminals);
+    let repair = repair_pairing(parsed.items, parsed.terminals, &parsed.started);
     let snapshot = SessionSnapshot {
         messages: repair.messages.clone(),
         runtime: parsed.runtime,
@@ -1340,6 +1387,10 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
                 meta: remeta(meta),
                 stub,
             },
+            RolloutLine::ToolStarted { meta, tool_use_id } => RolloutLine::ToolStarted {
+                meta: remeta(meta),
+                tool_use_id,
+            },
         };
         out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
         out.push('\n');
@@ -1375,7 +1426,8 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
         | RolloutLine::Compacted { .. }
         | RolloutLine::TurnTerminal { .. }
         | RolloutLine::Repaired { .. }
-        | RolloutLine::RequestStub { .. } => false,
+        | RolloutLine::RequestStub { .. }
+        | RolloutLine::ToolStarted { .. } => false,
     }
 }
 
@@ -1579,9 +1631,14 @@ pub fn session_digest(path: &Path) -> io::Result<SessionDigest> {
 /// the live loop guarantees (cc's ensureToolResultPairing is also two-way):
 /// a tool_result must answer a tool_use in the immediately preceding
 /// assistant message — strays are dropped (a message stripped empty goes
-/// entirely) — and every tool_use left unanswered gets the same is_error
-/// result the interrupt path uses.
-fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> PairingRepair {
+/// entirely) — and every tool_use left unanswered gets an is_error result
+/// saying which way the session died around it: `started` holds the calls
+/// that got past their gates (plan 204), the only ones that may have acted.
+fn repair_pairing(
+    items: Vec<Message>,
+    terminals: Vec<SnapshotTerminal>,
+    started: &HashSet<String>,
+) -> PairingRepair {
     #[derive(Debug)]
     struct Entry {
         message: Message,
@@ -1651,10 +1708,16 @@ fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> Pair
                         .collect()
                 })
                 .unwrap_or_default();
-            let missing: Vec<ContentBlock> = uses
+            let missing: Vec<ContentBlock> = repaired[i]
+                .message
+                .content
                 .iter()
-                .filter(|id| !answered.contains(*id))
-                .map(|id| interrupted(id))
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } if !answered.contains(id) => {
+                        Some(unfinished_result(id, started.contains(id)))
+                    }
+                    _ => None,
+                })
                 .collect();
             inserted_tool_results += missing.len();
             if !missing.is_empty() {
@@ -1718,6 +1781,27 @@ fn repair_pairing(items: Vec<Message>, terminals: Vec<SnapshotTerminal>) -> Pair
         terminals: canonical_terminals,
         stats,
         changed,
+    }
+}
+
+/// What a crash left a call that never reported back. The two texts differ
+/// in what they tell the model to do next: a call that never started can be
+/// repeated as is; one that started may have acted, fully or partly, and the
+/// state has to be checked before repeating it. Only calls that may have
+/// side effects are ever recorded as started — a read that died midway is
+/// reported as not run, which is just as safe to act on.
+fn unfinished_result(tool_use_id: &str, started: bool) -> ContentBlock {
+    let content = if started {
+        "interrupted: the session ended while this call was running. It may have taken \
+         effect, fully or partly. Check the current state before repeating it."
+    } else {
+        "not run: the session ended before this call started. Nothing happened; \
+         calling it again is safe."
+    };
+    ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.into(),
+        content: content.into(),
+        is_error: true,
     }
 }
 
@@ -2336,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn orphaned_tool_use_gets_interrupted_result() {
+    fn orphaned_tool_use_that_never_started_gets_not_run() {
         let path = temp_file("orphan");
         let mut rollout = Rollout::new(path.clone());
         rollout
@@ -2351,11 +2435,7 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         assert_eq!(
             loaded[2],
-            Message::tool_results(vec![ContentBlock::ToolResult {
-                tool_use_id: "t1".into(),
-                content: "interrupted".into(),
-                is_error: true,
-            }])
+            Message::tool_results(vec![unfinished_result("t1", false)])
         );
         cleanup(&path);
     }
@@ -2375,14 +2455,7 @@ mod tests {
         assert_eq!(loaded.len(), 2, "no extra message inserted");
         assert_eq!(
             loaded[1],
-            Message::tool_results(vec![
-                tool_result("t1"),
-                ContentBlock::ToolResult {
-                    tool_use_id: "t2".into(),
-                    content: "interrupted".into(),
-                    is_error: true,
-                },
-            ])
+            Message::tool_results(vec![tool_result("t1"), unfinished_result("t2", false),])
         );
         cleanup(&path);
     }
@@ -2433,17 +2506,107 @@ mod tests {
         let loaded = load_session(&path).unwrap();
         assert_eq!(
             loaded[1],
-            Message::tool_results(vec![
-                tool_result("t1"),
-                ContentBlock::ToolResult {
-                    tool_use_id: "t2".into(),
-                    content: "interrupted".into(),
-                    is_error: true,
-                },
-            ]),
+            Message::tool_results(vec![tool_result("t1"), unfinished_result("t2", false),]),
             "ghost dropped, t2 patched, t1 kept"
         );
         cleanup(&path);
+    }
+
+    /// Plan 204: a round of three side-effecting calls, killed while the
+    /// second ran. Results are recorded for the round as a whole, so the
+    /// first — which finished — has none either; what tells the three apart
+    /// is only which ones got as far as starting.
+    #[test]
+    fn a_crash_mid_round_tells_started_calls_from_ones_that_never_ran() {
+        let dir = temp_file("started").parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("session.jsonl");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::user_text("do three things"))
+            .unwrap();
+        let assistant = Message::assistant(vec![tool_use("w1"), tool_use("w2"), tool_use("w3")]);
+        rollout.append_message(&assistant).unwrap();
+        rollout.append_tool_started("w1").unwrap();
+        rollout.append_tool_started("w2").unwrap();
+        drop(rollout);
+
+        let expected = vec![
+            Message::user_text("do three things"),
+            assistant,
+            Message::tool_results(vec![
+                unfinished_result("w1", true),
+                unfinished_result("w2", true),
+                unfinished_result("w3", false),
+            ]),
+        ];
+        assert_eq!(
+            expected[2].content[0],
+            ContentBlock::ToolResult {
+                tool_use_id: "w1".into(),
+                content: "interrupted: the session ended while this call was running. It may \
+                          have taken effect, fully or partly. Check the current state before \
+                          repeating it."
+                    .into(),
+                is_error: true,
+            }
+        );
+        assert_eq!(
+            expected[2].content[2],
+            ContentBlock::ToolResult {
+                tool_use_id: "w3".into(),
+                content: "not run: the session ended before this call started. Nothing \
+                          happened; calling it again is safe."
+                    .into(),
+                is_error: true,
+            }
+        );
+
+        // A fork copies the started lines with the prefix, so its own resume
+        // repairs the same way.
+        let fork = fork_session(&path, None, &dir).unwrap();
+        assert_eq!(resume_session(&fork).unwrap().messages, expected, "fork");
+
+        assert_eq!(resume_session(&path).unwrap().messages, expected, "resume");
+        // The repair marker persisted by that resume carries the texts; a
+        // second resume reads them back instead of repairing again.
+        assert_eq!(resume_session(&path).unwrap().messages, expected, "again");
+        let kinds: Vec<Value> = raw_lines(&path)
+            .into_iter()
+            .map(|line| line["type"].clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!("provider_route_initial"),
+                json!("message"),
+                json!("message"),
+                json!("tool_started"),
+                json!("tool_started"),
+                json!("repaired"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_started_line_is_synced_to_disk() {
+        let meta = || LineMeta {
+            id: "s#1".into(),
+            parent: None,
+            subagent_of: None,
+            format_version: None,
+            ts: 0,
+        };
+        let started = RolloutLine::ToolStarted {
+            meta: meta(),
+            tool_use_id: "w1".into(),
+        };
+        let message = RolloutLine::Message {
+            meta: meta(),
+            message: Message::user_text("hi"),
+        };
+        assert_eq!((started.needs_sync(), message.needs_sync()), (true, false));
     }
 
     /// The full resume story over the agent loop: a persisted turn, a process
