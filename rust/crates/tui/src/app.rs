@@ -1456,7 +1456,10 @@ impl App {
             // the first/last line (plan 38 slice 3).
             (KeyCode::Up, _) => self.composer.up(composer_width),
             (KeyCode::Down, _) => self.composer.down(composer_width),
-            (KeyCode::Char(c), false) => self.composer.insert_char(c),
+            // Alt+letter is a Meta chord (macOS Terminal sends Option+← as
+            // `ESC b`, which crossterm parses as Alt+'b'), not text: it falls to
+            // the swallowing arm below instead of typing the letter.
+            (KeyCode::Char(c), false) if !alt => self.composer.insert_char(c),
             (KeyCode::Backspace, _) => self.composer.backspace(),
             (KeyCode::Delete, _) => self.composer.delete(),
             (KeyCode::Left, _) => self.composer.left(),
@@ -3591,6 +3594,23 @@ mod tests {
         // A plain 'v' just types.
         app.on_key(80, key(KeyCode::Char('v')));
         assert_eq!(app.composer.text(), "v");
+    }
+
+    /// Alt (or Ctrl+Alt, AltGr on Windows) + a letter types nothing: terminals
+    /// that treat Option as Meta send such chords for word motion.
+    #[test]
+    fn alt_letter_does_not_type_the_letter() {
+        let mut app = App::new("s".into());
+        let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
+        assert_eq!(app.on_key(80, alt_b), Command::None);
+        let ctrl_alt_q = KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(app.on_key(80, ctrl_alt_q), Command::None);
+        assert_eq!(app.composer.text(), "");
+        app.on_key(80, key(KeyCode::Char('b')));
+        assert_eq!(app.composer.text(), "b");
     }
 
     /// Esc is a two-tap clear while the composer holds anything (CC parity: the
