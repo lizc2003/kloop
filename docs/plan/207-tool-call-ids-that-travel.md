@@ -1,4 +1,6 @@
-# Plan 207 — 换了 provider,工具调用的 id 也得能过关
+# Plan 207 — 换了 provider,工具调用的 id 也得能过关 ✅
+
+> **已完成(2026-09-28)**,提交号见第七节。开工实测推翻了第二、三节的几处设计,**以第七节为准**。
 
 > 来源:2026-09-24 读 `refs/pi`(`earendil-works/pi@d5629e2`,MIT)后与用户逐条定的,
 > 出处见 `refs/README.md`「Pi 全面复查(2026-09-24)」第 3 条。
@@ -144,3 +146,46 @@ core 测试:
   并注明已由 plan 207 吸收。
 - HANDOFF.md:若开工时核 API 得到了新事实(第四节第二问),记一条教训。
 - 本文件补 ✅ 与提交号。
+
+## 七、落地(2026-09-28)✅
+
+**开工两问**:① 映射放 provider 适配器(照推荐);② 用真实 API 核(照推荐)。用户指定用本机
+config 里已配的网关 provider:Messages、Responses 各一个,Chat 走 Responses 那个网关的
+`/chat/completions`。
+
+### 实测(每个用例重复 4 次;同一网关会把同一请求分到不同上游,结果不总一致)
+
+| rail | 被拒 | 收 |
+|---|---|---|
+| Messages | `.` `:` `\|`——只有一家上游校验,haiku 次次拒、sonnet 次次收、opus 两拒一收 | 长度到 4096 |
+| Responses(gpt 线) | 无 | 任何字符、长度到 4096 |
+| Responses(国产模型线) | 65 字节:一家上游明说长度须在 1–64,4 次拒 3 次 | 任何字符 |
+| Chat(glm / deepseek) | 无 | 任何字符、长度到 4096 |
+| 跨消息重复 id | **三条 rail、所有上游都收** | — |
+
+### 由此改掉的设计(与用户逐条确认过)
+
+- **第三节的表**:Messages = `[A-Za-z0-9_-]` + 64(字符集实测;64 沿用 pi,未测到但改写无代价);
+  Responses = **只限 ≤64 字节,字符不限**;Chat = **不映射**,`openai.rs` 一行没改逻辑。
+- **不做跨消息去重**(推翻第三节末句与 2.1 的"第 k 次出现改写"):没有一家拒;Chat 兼容服务按轮
+  编号,跨轮重复是它自己的格式,去重会在同一 rail 上改掉它自己发的 id。于是 `occurrence` 参数没了,
+  改写只是 id 的纯函数 `{前缀≤47}_{sha256(id) 前 8 字节 hex}`。
+- **2.2 整节不需要**:tool_use 与 tool_result 各自对同一个原 id 算出同一个值,自然配对;孤儿结果也一样。
+- **碰撞检查改为单射检查**:允许同一原 id 多次出现,只拒"两个**不同**原 id 算出同一个线上 id"
+  (64 位哈希碰撞,或历史里已原样存着另一个 id 的改写结果)。测试不用注入哈希:`a.b` 与字面的
+  `a_b_2e7336dc8eba87ef` 同时出现即可。
+- 用户追问"中途换 provider 呢":映射不存档、每次请求从 canonical 现算,A→B→A 不累积,回到原 rail
+  时发出的字节与从未离开时相同。
+
+### 代码与测试
+
+- 新 `provider/src/tool_id.rs`(`ToolIdRule::{Anthropic,Responses}` + `WireToolIds`);
+  `anthropic::messages_value`、`responses::to_input_items` 改为返回 `Result`,`stream_attempt`
+  在拼请求体前失败(与 Chat 投影失败同一条路),wiremock 收不到请求。
+- 测试:`tool_id` 5 条(只改拒收的、64 边界、`a.b`/`a:b` 分开、重复同值、碰撞报错);
+  `anthropic` 2 条(外来 id 改写且配对 + 两次投影字节相同;碰撞);`responses` 1 条;
+  `openai` 1 条(Chat 原样,含跨轮重复);`tests/anthropic.rs` 集成 1 条(改写后的请求体 + 碰撞时 0 请求);
+  core `history.rs` 1 条(Chat→Anthropic 切换仍 `Preserved`、request view 与 rollout 等于 canonical)。
+  现有断言期望值一个没改,只加了 `.unwrap()`。
+
+**提交**:见 git log `feat(plan207)`。

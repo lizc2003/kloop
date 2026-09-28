@@ -109,10 +109,12 @@ server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看�
 2. **429 的配额/计费排除**(→ plan 206,**已由 plan 206 吸收**,2026-09-28)——`ai/src/utils/retry.ts:7-24`、`provider-retry.ts:23-66`。kloop
    `failure.rs` 的 HTTP 重试只看状态码,响应体带 `insufficient_quota` 的 429 会白重试;流内错误那条
    路径已拦。顺带支持 `x-should-retry` 与 `retry-after-ms`。
-3. **跨 rail 的 tool call id 规范化**(→ plan 207)——`ai/src/api/transform-messages.ts:59-63,136-142`。
+3. **跨 rail 的 tool call id 规范化**(→ plan 207,**已由 plan 207 吸收**,2026-09-28)——`ai/src/api/transform-messages.ts:59-63,136-142`。
    Anthropic 要 `^[a-zA-Z0-9_-]{1,64}$`;kloop 三条 rail 都直接透传,Chat 兼容服务的 `functions.x:0` 形 id
    切到 Anthropic 会 400。`fc_` 前缀约束的是 Responses input item 的 `id`,kloop 只收发 `call_id`,不适用。
    **pi 的映射不能照抄**:`a.b` 与 `a:b` 会撞成同一个,截断也会撞,映射表按原 id 键、后出现的覆盖先出现的。
+   落地时实测过三条 rail,规则与 pi 不同:Responses 只限长度、不限字符;Chat 什么都收,不做映射;
+   跨消息重复的 id 没有一家拒,也不去重。结论与数字见 plan 207 第七节。
 4. ~~**小型内置模型元数据表**~~ **与用户核过后不做**:kloop 已有 `models."<id>".context_window` 配置、
    模型与网关取小,摘要被拒后还会把实测大小记成会话上限,内置表只省一行配置却多一份要跟版本的数据;
    不收图的降级只对纯文本模型有用,目前发图过去是直接报错、用户看得见。

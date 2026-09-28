@@ -64,6 +64,8 @@ fn split_blocks_for_chat(blocks: &[ContentBlock]) -> Result<(String, Vec<Value>)
 }
 
 /// Translate canonical (Anthropic-shaped) history into chat/completions messages.
+/// Tool-call ids go out verbatim: the services measured on this rail took any
+/// id, and it is their ids the other rails have to translate (`tool_id`).
 pub(super) fn to_openai_messages(
     system: &str,
     messages: &[Message],
@@ -766,6 +768,47 @@ mod tests {
                     ],
                 }),
             ]
+        );
+    }
+
+    /// Unlike the other two rails, this one translates no id (`tool_id`): an
+    /// id repeated across turns and one the Anthropic rail would refuse both
+    /// go out as the service minted them.
+    #[test]
+    fn tool_call_ids_go_out_verbatim() {
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: "functions.read_file:0".into(),
+                name: "read_file".into(),
+                input: json!({}),
+            }]));
+            messages.push(Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "functions.read_file:0".into(),
+                content: "ok".into(),
+                is_error: false,
+            }]));
+        }
+        let pair = [
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "functions.read_file:0",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            }),
+            json!({"role": "tool", "tool_call_id": "functions.read_file:0", "content": "ok"}),
+        ];
+        assert_eq!(
+            to_openai_messages("s", &messages).unwrap(),
+            [
+                vec![json!({"role": "system", "content": "s"})],
+                pair.to_vec(),
+                pair.to_vec(),
+            ]
+            .concat()
         );
     }
 }

@@ -303,6 +303,68 @@ async fn cache_off_sends_plain_request() {
     );
 }
 
+/// A history a chat service wrote reaches this rail after a `/provider` switch:
+/// its ids go out legal and still paired. Two ids that would go out as one
+/// never reach the wire at all.
+#[tokio::test]
+async fn tool_ids_from_another_rail_are_translated_before_the_wire() {
+    let history = |first: &str, second: &str| {
+        let mut messages = vec![Message::user_text("hi")];
+        for id in [first, second] {
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read_file".into(),
+                input: json!({}),
+            }]));
+            messages.push(Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+            }]));
+        }
+        messages
+    };
+    let send = |messages: Vec<Message>| async move {
+        let server = MockServer::start().await;
+        mount_sse(&server, sse_body(&[json!({"type": "message_stop"})])).await;
+        let provider = Arc::new(Provider::Anthropic {
+            cred: Credential::api_key("test-key"),
+            base: server.uri(),
+            prompt_cache: false,
+        });
+        let mut rx = provider.stream("test-model", "s", &messages, &[]);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        (events, server.received_requests().await.unwrap())
+    };
+
+    let (_, requests) = send(history("functions.read_file:0", "functions.read_file:1")).await;
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let pair = |id: &str| {
+        [
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "read_file", "input": {}},
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": "ok"},
+            ]}),
+        ]
+    };
+    let mut expected = vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})];
+    expected.extend(pair("functions_read_file_0_f9cc2c7822d54220"));
+    expected.extend(pair("functions_read_file_1_92a89ddf6b6a6230"));
+    assert_eq!(body["messages"], json!(expected));
+
+    let (events, requests) = send(history("a.b", "a_b_2e7336dc8eba87ef")).await;
+    assert_eq!(requests.len(), 0);
+    let [Err(failure)] = events.as_slice() else {
+        panic!("expected one failure, got {events:?}");
+    };
+    assert_eq!(failure.kind(), &ProviderFailureKind::Protocol);
+}
+
 /// Cache usage fields from message_start survive into Done: they are context
 /// the window still holds, reported next to (not inside) input_tokens.
 #[tokio::test]

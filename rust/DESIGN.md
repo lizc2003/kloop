@@ -4131,6 +4131,19 @@ cargo run -- --mock
 # exact final wire model. Messages/Responses replay only an exact match; legacy,
 # cross-provider/family/model reasoning fails before I/O, while Chat strips it.
 # Native thread/read and event snapshots omit replay provenance and opaque bytes.
+# Tool-call ids are the other thing a switch carries across (plan 207), and they
+# are translated in the adapter, on the way out — never in history, the request
+# view, rollout, tools, UI or request-reduction stubs, which all keep the id the
+# minting provider sent. Only an id the target rail refuses is rewritten, as
+# `{id with non-[A-Za-z0-9_-] as _, cut to 47}_{first 8 bytes of sha256(id), hex}`;
+# measured, Messages refuses characters outside [A-Za-z0-9_-] (64 kept as a cap
+# too, unmeasured), Responses refuses over 64 bytes, and Chat takes any id, so
+# Chat translates nothing. The rewrite is a function of the id alone: a call and
+# its result reach the same wire id independently, every request renders it the
+# same way (the cached prefix survives), and a session that never switches sends
+# the bytes it always did. Ids repeated across messages are left as they are —
+# chat services number calls per turn, and no rail measured refused a repeat.
+# Two different ids that would go out as one fail before I/O as a protocol error.
 #
 # The ignored native primitive evaluator accepts all three rails. Its Program
 # contract uses two explicit client turns: the first returns a Durable Run ID,
@@ -4443,6 +4456,7 @@ crates/provider/    kloop-provider — the adapter seam; owns reqwest
   src/anthropic.rs  Anthropic native SSE adapter
   src/openai.rs     OpenAI-compat chat/completions translation
   src/responses.rs  OpenAI Responses translation
+  src/tool_id.rs    tool-call ids as each rail will take them
   src/sse.rs        bounded incremental SSE parser
 
 crates/process-spawn/ process-wide child-creation gate shared across crates

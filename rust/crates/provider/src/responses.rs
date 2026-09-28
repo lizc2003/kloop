@@ -20,6 +20,8 @@ use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
 use super::sse::SseFrame;
+use super::tool_id::ToolIdRule;
+use super::tool_id::WireToolIds;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -73,7 +75,10 @@ fn blocks_to_output_items(blocks: &[ContentBlock], is_error: bool) -> Vec<Value>
 }
 
 /// Translate canonical (Anthropic-shaped) history into Responses input items.
-pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
+/// Only `call_id` goes out — never the item `id`, whose `fc_` prefix rule is
+/// therefore not ours to meet — and it is translated when too long (`tool_id`).
+pub(super) fn to_input_items(messages: &[Message]) -> Result<Vec<Value>, ProviderFailure> {
+    let mut ids = WireToolIds::new(ToolIdRule::Responses);
     let mut out = Vec::new();
     for msg in messages {
         match msg.role {
@@ -104,7 +109,7 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                         ContentBlock::RedactedThinking { .. } => {}
                         ContentBlock::ToolUse { id, name, input } => out.push(json!({
                             "type": "function_call",
-                            "call_id": id,
+                            "call_id": ids.wire(id)?,
                             "name": name,
                             "arguments": serde_json::to_string(input).unwrap_or_default(),
                         })),
@@ -144,7 +149,7 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
                             };
                             out.push(json!({
                                 "type": "function_call_output",
-                                "call_id": tool_use_id,
+                                "call_id": ids.wire(tool_use_id)?,
                                 "output": output,
                             }));
                         }
@@ -172,7 +177,7 @@ pub(super) fn to_input_items(messages: &[Message]) -> Vec<Value> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1437,7 +1442,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            to_input_items(&messages),
+            to_input_items(&messages).unwrap(),
             vec![
                 json!({
                     "type": "message",
@@ -1500,7 +1505,7 @@ mod tests {
             injected: None,
         }];
         assert_eq!(
-            to_input_items(&messages),
+            to_input_items(&messages).unwrap(),
             vec![json!({
                 "type": "message",
                 "role": "user",
@@ -1538,7 +1543,7 @@ mod tests {
             is_error: false,
         }])];
         assert_eq!(
-            to_input_items(&messages),
+            to_input_items(&messages).unwrap(),
             vec![json!({
                 "type": "function_call_output",
                 "call_id": "c1",
@@ -1563,8 +1568,40 @@ mod tests {
             signature: "enc".into(),
         }])];
         assert_eq!(
-            to_input_items(&messages),
+            to_input_items(&messages).unwrap(),
             vec![json!({"type": "reasoning", "summary": [], "encrypted_content": "enc"})]
+        );
+    }
+
+    /// This rail refuses only length: a chat service's `functions.read_file:0`
+    /// goes out as it is, a 70-byte id is cut to 64, and both halves of each
+    /// pair agree.
+    #[test]
+    fn only_an_overlong_call_id_is_rewritten() {
+        let long = "c".repeat(70);
+        let mut messages = Vec::new();
+        for id in ["functions.read_file:0", long.as_str()] {
+            messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read_file".into(),
+                input: json!({}),
+            }]));
+            messages.push(Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+            }]));
+        }
+        let pair = |id: &str| {
+            [
+                json!({"type": "function_call", "call_id": id, "name": "read_file", "arguments": "{}"}),
+                json!({"type": "function_call_output", "call_id": id, "output": "ok"}),
+            ]
+        };
+        let rewritten = format!("{}_6fe5981a314622bb", "c".repeat(47));
+        assert_eq!(
+            to_input_items(&messages).unwrap(),
+            [pair("functions.read_file:0"), pair(&rewritten)].concat()
         );
     }
 }

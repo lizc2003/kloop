@@ -8,6 +8,7 @@ mod openai;
 mod responses;
 pub mod sse;
 mod stream;
+mod tool_id;
 mod tool_input;
 
 use std::collections::HashSet;
@@ -587,11 +588,17 @@ impl Provider {
                 let url = format!("{base}/v1/messages");
                 let cred = cred.clone();
                 let cache = *prompt_cache;
+                let messages = match anthropic::messages_value(messages, cache) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        return spawn_stream(move |_sink| async move { Err(error) });
+                    }
+                };
                 let mut body = json!({
                     "model": model,
                     "max_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
                     "system": anthropic::system_value(system, cache),
-                    "messages": anthropic::messages_value(messages, cache),
+                    "messages": messages,
                     "tools": anthropic::tools_value(tools, cache),
                     "stream": true,
                 });
@@ -626,10 +633,16 @@ impl Provider {
             Provider::OpenAiResponses { cred, base } => {
                 let url = format!("{base}/responses");
                 let cred = cred.clone();
+                let input = match responses::to_input_items(messages) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        return spawn_stream(move |_sink| async move { Err(error) });
+                    }
+                };
                 let mut body = json!({
                     "model": model,
                     "instructions": system,
-                    "input": responses::to_input_items(messages),
+                    "input": input,
                     "tools": tools.iter().map(|t| json!({
                         "type": "function",
                         "name": t.name,

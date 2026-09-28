@@ -1795,6 +1795,84 @@ mod tests {
         assert_eq!(view[1].provider_provenance, None);
     }
 
+    /// A chat service's `functions.read_file:0` is a 400 on the Anthropic rail,
+    /// and translating it is the adapter's job (plan 207). Here, one layer up,
+    /// the switch must see nothing: the request view is still the canonical
+    /// history, so the switch reads as `Preserved`, and the rollout keeps the id
+    /// the service minted.
+    #[test]
+    fn a_switch_leaves_foreign_tool_ids_to_the_adapter() {
+        use std::sync::Arc;
+
+        use crate::provider_route::EffortRequest;
+        use crate::provider_route::ProviderCatalog;
+        use crate::provider_route::ProviderCatalogEntry;
+        use crate::provider_route::SessionProviderState;
+        use crate::provider_route::SwitchOutcome;
+        use kloop_protocol::ProviderAvailabilityCode;
+        use kloop_provider::Provider;
+
+        let chat = || Provider::OpenAiCompat {
+            cred: kloop_provider::Credential::bearer("unused"),
+            base: "https://chat.invalid".into(),
+        };
+        let anthropic = || Provider::Anthropic {
+            cred: kloop_provider::Credential::api_key("unused"),
+            base: "https://anthropic.invalid".into(),
+            prompt_cache: true,
+        };
+        let entry = |id: &str, factory: fn() -> Provider| ProviderCatalogEntry {
+            id: id.into(),
+            api_family: factory().api_family(),
+            endpoint_fingerprint: factory().endpoint_fingerprint(),
+            default_model: format!("{id}-model"),
+            models: vec![format!("{id}-model")],
+            context_window: None,
+            availability: ProviderAvailabilityCode::Ready,
+            default_effort: None,
+            factory: Arc::new(move || Ok(factory())),
+        };
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![entry("chat", chat), entry("anthropic", anthropic)]).unwrap(),
+        );
+        let initial = catalog.initial_route("chat", None).unwrap();
+        let state = SessionProviderState::from_route(Arc::clone(&catalog), initial.clone());
+        let dir = temp_dir("switch-foreign-tool-ids");
+        let _ = std::fs::remove_dir_all(&dir);
+        let session = dir.join("session.jsonl");
+        let mut history = History::new(dir.clone());
+        history.attach_rollout(Rollout::new_with_initial_route(session.clone(), &initial).unwrap());
+        history.record(Message::user_text("read a"));
+        history.record_provider_assistant(
+            vec![ContentBlock::ToolUse {
+                id: "functions.read_file:0".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "a"}),
+            }],
+            &initial.primary_attempt(),
+        );
+        history.record(tool_results(&[("functions.read_file:0", "ok".into())]));
+        let canonical = history.messages().to_vec();
+
+        let changed = history
+            .switch_provider(&state, 1, "anthropic", None, EffortRequest::Inherit)
+            .unwrap();
+        assert!(matches!(
+            changed,
+            SwitchOutcome::Changed {
+                continuity: ReasoningContinuity::Preserved,
+                ..
+            }
+        ));
+        let view = history
+            .provider_request_view(&state.freeze().primary_attempt())
+            .unwrap();
+        assert_eq!(view, canonical);
+        let reread = crate::rollout::resume_session(&session).unwrap();
+        assert_eq!(reread.messages, canonical);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The chat rail produces reasoning of its own — DeepSeek- and GLM-shaped
     /// models stream `reasoning_content`, which the adapter keeps as
     /// signature-less thinking. The next turn on that same route must strip it,

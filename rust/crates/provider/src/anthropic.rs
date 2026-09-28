@@ -11,8 +11,11 @@ use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
 use super::sse::SseFrame;
+use super::tool_id::ToolIdRule;
+use super::tool_id::WireToolIds;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
+use kloop_protocol::ContentBlock;
 use kloop_protocol::IncompleteReason;
 use kloop_protocol::Message;
 use kloop_protocol::OutputLimitKind;
@@ -59,19 +62,33 @@ pub(super) fn system_value(system: &str, cache: bool) -> Value {
 /// as the moving cache breakpoint. Earlier requests' breakpoints remain valid
 /// read points server-side, so each round reuses the whole prior prefix.
 /// cache_control stays out of the protocol types: it is a transport detail
-/// injected here, never persisted.
-pub(super) fn messages_value(messages: &[Message], cache: bool) -> Value {
-    let mut value = Value::Array(
-        messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect(),
-    );
+/// injected here, never persisted. Tool-call ids another rail minted are
+/// translated here on the same terms (`tool_id`).
+pub(super) fn messages_value(messages: &[Message], cache: bool) -> Result<Value, ProviderFailure> {
+    let mut ids = WireToolIds::new(ToolIdRule::Anthropic);
+    let mut rendered = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut content = Vec::with_capacity(message.content.len());
+        for block in &message.content {
+            let mut value = json!(block);
+            match block {
+                ContentBlock::ToolUse { id, .. } => value["id"] = json!(ids.wire(id)?),
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    value["tool_use_id"] = json!(ids.wire(tool_use_id)?);
+                }
+                ContentBlock::Text { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Image { .. } => {}
+            }
+            content.push(value);
+        }
+        rendered.push(json!({
+            "role": message.role,
+            "content": content,
+        }));
+    }
+    let mut value = Value::Array(rendered);
     if cache {
         // The API rejects cache_control on thinking blocks, so the marker
         // goes on the last cacheable block instead.
@@ -91,7 +108,7 @@ pub(super) fn messages_value(messages: &[Message], cache: bool) -> Value {
             block["cache_control"] = json!({"type": "ephemeral"});
         }
     }
-    value
+    Ok(value)
 }
 
 /// One in-flight content block, accumulated across its deltas.
@@ -471,9 +488,86 @@ pub(super) async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kloop_protocol::ContentBlock;
     use kloop_protocol::ImageSource;
     use kloop_protocol::Role;
+
+    fn call(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: "read_file".into(),
+            input: json!({"path": "a"}),
+        }
+    }
+
+    fn result(id: &str) -> Message {
+        Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+            is_error: false,
+        }])
+    }
+
+    /// A chat service's ids arrive on this rail after a switch: each call and
+    /// its result are rewritten to the same legal id, the id that service
+    /// reuses in a later turn is rewritten the same way again, and a native
+    /// id is left alone. Projecting twice gives the same bytes.
+    #[test]
+    fn ids_another_rail_minted_go_out_legal_and_paired() {
+        let messages = vec![
+            Message::user_text("read a twice"),
+            Message::assistant(vec![call("functions.read_file:0")]),
+            result("functions.read_file:0"),
+            Message::assistant(vec![call("functions.read_file:0")]),
+            result("functions.read_file:0"),
+            Message::assistant(vec![call("toolu_01ABCdef")]),
+            result("toolu_01ABCdef"),
+        ];
+        let wire_call = |id: &str| {
+            json!({
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": "read_file", "input": {"path": "a"}}],
+            })
+        };
+        let wire_result = |id: &str| {
+            json!({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}],
+            })
+        };
+        let rewritten = "functions_read_file_0_f9cc2c7822d54220";
+        let projected = messages_value(&messages, false).unwrap();
+        assert_eq!(
+            projected,
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "read a twice"}]},
+                wire_call(rewritten),
+                wire_result(rewritten),
+                wire_call(rewritten),
+                wire_result(rewritten),
+                wire_call("toolu_01ABCdef"),
+                wire_result("toolu_01ABCdef"),
+            ])
+        );
+        assert_eq!(messages_value(&messages, false).unwrap(), projected);
+    }
+
+    /// Pairing a result with the wrong call is worse than not sending: the
+    /// request fails before any I/O.
+    #[test]
+    fn two_ids_that_would_go_out_as_one_fail_the_projection() {
+        let messages = vec![
+            Message::assistant(vec![call("a.b")]),
+            result("a.b"),
+            Message::assistant(vec![call("a_b_2e7336dc8eba87ef")]),
+            result("a_b_2e7336dc8eba87ef"),
+        ];
+        assert_eq!(
+            messages_value(&messages, false),
+            Err(ProviderFailure::protocol(
+                "anthropic tool call ids \"a.b\" and \"a_b_2e7336dc8eba87ef\" would both go out as \"a_b_2e7336dc8eba87ef\""
+            ))
+        );
+    }
 
     /// The anthropic adapter serializes the protocol raw, so an image block
     /// reaches the wire as `{type:"image", source:{type:"base64", …}}`. The
@@ -497,7 +591,7 @@ mod tests {
             injected: None,
         }];
         assert_eq!(
-            messages_value(&messages, true),
+            messages_value(&messages, true).unwrap(),
             json!([{
                 "role": "user",
                 "content": [
@@ -528,7 +622,7 @@ mod tests {
             is_error: false,
         }])];
         assert_eq!(
-            messages_value(&messages, false),
+            messages_value(&messages, false).unwrap(),
             json!([{
                 "role": "user",
                 "content": [{
