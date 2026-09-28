@@ -1220,6 +1220,17 @@ impl App {
             .filter(|snapshot| !snapshot.todos.is_empty() && !self.todo_panel_retired)
     }
 
+    /// The composer's first word as a command name, when it names a known
+    /// command or skill (the slash-menu catalog). `None` for ordinary text: a
+    /// line like `/usr/bin is wrong` is a message, and an unknown `/word` is
+    /// left to `commands::run`, which answers it with a listing.
+    pub fn held_command(&self) -> Option<&str> {
+        let rest = self.composer.text().trim().strip_prefix('/')?;
+        let name = rest.split(char::is_whitespace).next()?;
+        (!name.is_empty() && self.commands.iter().any(|command| command.name == name))
+            .then_some(name)
+    }
+
     fn refresh_display_streaming(&mut self) {
         let last = self.cells.len().checked_sub(1);
         self.assistant_open =
@@ -1608,6 +1619,13 @@ impl App {
             return Command::Slash(command);
         }
         if self.running {
+            // A known command cannot run mid-turn — it owns session state, and
+            // the front-end already treats the turn as busy — so the draft stays
+            // in the composer and the hint above it says why. Pressing Enter
+            // again once the turn ends submits it for real.
+            if self.held_command().is_some() {
+                return Command::None;
+            }
             // Steering: only the text rides the running turn (absorbed at its
             // next round boundary). Attached images stay on the composer for the
             // next FRESH turn — a steer has no image channel, so taking them here
@@ -2989,6 +3007,57 @@ mod tests {
         assert_eq!(
             app.cells,
             vec![Cell::User("/help".into()), Cell::User("/cost".into())]
+        );
+    }
+
+    /// A known command typed while a turn runs cannot run (it owns session
+    /// state) and must not reach the model as text either — the draft stays put
+    /// and the hint row above the composer says when it will go.
+    #[test]
+    fn a_known_command_typed_mid_turn_waits_in_the_composer() {
+        let mut app = app_with_commands();
+        app.running = true;
+
+        type_str(&mut app, "/compact");
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.composer.text(), "/compact", "the draft is untouched");
+        assert!(app.cells.is_empty(), "nothing was sent or echoed");
+        assert_eq!(app.held_command(), Some("compact"));
+
+        // A skill name is the same story: it is in the catalog, so it waits.
+        let mut app = app_with_commands().with_commands(vec![menu::CommandInfo {
+            name: "review".into(),
+            description: "review a diff".into(),
+        }]);
+        app.running = true;
+        type_str(&mut app, "/review this diff");
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.composer.text(), "/review this diff");
+
+        // Editing away the leading `/` takes the hint with it: the row is
+        // derived from the composer, so there is nothing to disarm.
+        app.on_key(80, key(KeyCode::Home));
+        app.on_key(80, key(KeyCode::Delete));
+        assert_eq!(app.composer.text(), "review this diff");
+        assert_eq!(app.held_command(), None);
+
+        // An unknown `/word` is not a command — `commands::run` would answer it
+        // with a listing — so it steers like any other text.
+        let mut app = app_with_commands();
+        app.running = true;
+        type_str(&mut app, "/usr/bin 这个路径不对");
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Steer("/usr/bin 这个路径不对".into())
+        );
+
+        // Idle, the same line is a real command (routing does not consult the
+        // catalog — an unknown name is answered by `commands::run`).
+        let mut app = App::new("s".into());
+        type_str(&mut app, "/compact");
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Slash("/compact".into())
         );
     }
 

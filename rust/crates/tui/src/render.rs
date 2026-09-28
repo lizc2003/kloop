@@ -73,6 +73,9 @@ const TODO_PANEL_COMPLETED_LIMIT: usize = 3;
 pub struct LiveChromeLayout {
     pub activity_visible: bool,
     pub activity_spacer: bool,
+    /// A known slash command is parked in the composer while the turn runs; its
+    /// hint renders as one more row under the activity line.
+    pub held_command_visible: bool,
     pub todo_lines: Vec<Line<'static>>,
     /// The inline choice panel — an approval, a question, a picker — laid out to
     /// the rows it may occupy. None when nothing owns the keyboard. It is chrome
@@ -85,6 +88,7 @@ impl LiveChromeLayout {
     pub fn reserved_rows(&self) -> usize {
         usize::from(self.activity_visible)
             + usize::from(self.activity_spacer)
+            + usize::from(self.held_command_visible)
             + self.todo_lines.len()
             // The panel carries one blank row above it, separating it from the
             // transcript.
@@ -114,7 +118,10 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     let terminal_height = usize::from(viewport.height);
     let activity_visible = has_activity_line(app);
     let activity_spacer = activity_visible && !app.cells.is_empty();
-    let activity_rows = usize::from(activity_visible) + usize::from(activity_spacer);
+    let held_command_visible = has_held_command_line(app);
+    let activity_rows = usize::from(activity_visible)
+        + usize::from(activity_spacer)
+        + usize::from(held_command_visible);
     let fixed_bottom = 2 + composer_height(app, width) + 1;
     let transcript_capacity = terminal_height.saturating_sub(fixed_bottom).max(1);
     // The panel is the user's whole job while it is up, so it is served before
@@ -144,6 +151,7 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     LiveChromeLayout {
         activity_visible,
         activity_spacer,
+        held_command_visible,
         todo_lines,
         panel,
     }
@@ -793,6 +801,32 @@ pub fn has_activity_line(app: &App) -> bool {
     app.ctrl_c_exit_armed || app.esc_clear_armed || (app.running && !app.interaction_active())
 }
 
+/// Whether [`held_command_line`] will render a row — the reservation in
+/// [`live_chrome_layout`] must agree with the draw site, exactly as for the
+/// activity line above.
+pub fn has_held_command_line(app: &App) -> bool {
+    !app.interaction_active() && app.held_command().is_some()
+}
+
+/// A known slash command sitting in the composer while a turn runs. It cannot
+/// run mid-turn — commands own session state and the front-end already treats
+/// the turn as busy — so Enter is a no-op that leaves the draft in place, and
+/// this row says when it will go. Derived, not armed: the hint is true exactly
+/// while the command is in the composer, so it needs no disarming and cannot go
+/// stale if the user edits the line away.
+fn held_command_line(app: &App, width: usize) -> Option<Line<'static>> {
+    if !has_held_command_line(app) {
+        return None;
+    }
+    let name = app
+        .held_command()
+        .expect("checked by has_held_command_line");
+    Some(Line::from(truncate(
+        &format!("/{name} runs when this turn ends — press Enter again then"),
+        width,
+    )))
+}
+
 /// What Esc does from here, so the two hint lines never advertise a key that
 /// would do something else: a draft in the composer is cleared first, and only
 /// an empty composer lets Esc reach the running turn.
@@ -967,6 +1001,9 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
         if let Some(activity) = activity_line(app, hud) {
             lines.push(activity);
         }
+    }
+    if let Some(held) = held_command_line(app, width.max(1)) {
+        lines.push(held);
     }
     lines.extend(chrome.todo_lines);
     // The choice panel closes the transcript: a blank row, then its own rows, so
@@ -1540,6 +1577,70 @@ mod tests {
             "the retired panel gives its rows back to the transcript"
         );
         assert!(!line_text(&footer_line(&app, 140)).contains("ctrl+t"));
+    }
+
+    /// A known command parked in the composer mid-turn gets its own row under
+    /// the activity line, reserved by the shared layout and gone once the line
+    /// is edited away (or the turn ends).
+    #[test]
+    fn a_held_command_gets_a_hint_row_and_reserves_it() {
+        let hud = Hud::default();
+        let viewport = Rect::new(0, 0, 80, 24);
+        let mut app = App::new("s".into()).with_commands(vec![crate::menu::CommandInfo {
+            name: "compact".into(),
+            description: "compact the session".into(),
+        }]);
+        app.cells.push(Cell::Assistant("transcript".into()));
+        app.running = true;
+        assert!(!has_held_command_line(&app), "nothing parked yet");
+
+        app.composer.insert_char('/');
+        for c in "compact".chars() {
+            app.composer.insert_char(c);
+        }
+        assert!(has_held_command_line(&app));
+        let chrome = live_chrome_layout(&app, viewport);
+        assert!(chrome.held_command_visible);
+        // The activity line (1) + its spacer (1) + the hint (1).
+        assert_eq!(chrome.reserved_rows(), 3);
+
+        // Editing the `/` away drops the row and gives the space back.
+        app.composer.home();
+        app.composer.delete();
+        assert!(!has_held_command_line(&app));
+        assert_eq!(live_chrome_layout(&app, viewport).reserved_rows(), 2);
+
+        // An unknown name is not a command, so it is steering text, no row.
+        app.composer.clear();
+        for c in "/nope this is a path".chars() {
+            app.composer.insert_char(c);
+        }
+        assert_eq!(app.composer.text(), "/nope this is a path");
+        assert!(!has_held_command_line(&app));
+        assert_eq!(live_chrome_layout(&app, viewport).reserved_rows(), 2);
+
+        // An overlay owns the keyboard, and the hint would be a lie while it is up.
+        app.composer.clear();
+        for c in "/compact".chars() {
+            app.composer.insert_char(c);
+        }
+        assert_eq!(app.composer.text(), "/compact");
+        assert!(has_held_command_line(&app));
+        let (confirm_reply, _confirm_rx) = tokio::sync::oneshot::channel();
+        app.apply(crate::events::AgentEvent::Confirm {
+            req: kloop_core::permissions::ConfirmRequest {
+                description: "confirm".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                remember_rules: None,
+                preview: None,
+                ..Default::default()
+            },
+            reply: confirm_reply,
+        });
+        assert!(app.interaction_active());
+        assert!(!has_held_command_line(&app));
+        assert!(!live_chrome_layout(&app, viewport).held_command_visible);
+        let _ = hud;
     }
 
     #[test]
