@@ -310,7 +310,8 @@ fork:
   looping. "Too large" is read from the error text against one table of
   per-provider wordings (plan 206, ported from pi: Anthropic, OpenAI, Gemini,
   xAI, Groq, OpenRouter, Together, llama.cpp, LM Studio, Mistral, DashScope,
-  Ollama, …), with a throttle veto (`rate limit`, `too many requests`,
+  Ollama, …; plus Volcengine Ark's three per-model wordings, found by real
+  overflow tests because pi's table had none of them), with a throttle veto (`rate limit`, `too many requests`,
   `throttling`, `service unavailable`): the wider the table, the more a
   throttle like `Too many tokens, please wait` looks like an overflow, and a
   summary pays to fix what a few seconds' wait would. Over HTTP only a 4xx

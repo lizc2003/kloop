@@ -192,7 +192,7 @@ core 侧不用改:`retry_delay`(`sampling.rs:89-96`)已经让 provider 给的延
    分支及其测试覆盖。
 6. DESIGN 那段 open 超时写的是 45s,实际早已是 300s(`STREAM_OPEN_TIMEOUT`),改写时一并更正。
 
-测试:`classify.rs` 三条表驱动(24 种各家超长写法全 true;`request_too_large` 体、Bedrock 限流、
+测试:`classify.rs` 三条表驱动(24 种各家超长写法全 true,真实测试后加到 27;`request_too_large` 体、Bedrock 限流、
 `Rate limit reached…`、`429 Too Many Requests`、普通 400 全 false;配额三 true 一 false);`stream.rs`
 `retry-after-ms` 九种输入整体断言;wiremock:Chat 一条八个 HTTP 响应的 (kind, retryable, retry_after)
 整体断言(Together 400 → 超长、配额 429 丢 `Retry-After`、`Too many tokens` 429 可重试、503 带超长字样
@@ -200,5 +200,29 @@ core 侧不用改:`retry_delay`(`sampling.rs:89-96`)已经让 provider 给的延
 带配额文本不可重试、Anthropic 413 `request_too_large` 不是超长、Anthropic 流内 `rate_limit_error` 带
 `too many tokens` 可重试且不是超长、Responses `response.failed` Gemini 写法 → 超长。原有的超长、
 `Retry-After`、白名单测试原样通过。`make check` 全绿。
+
+**真实测试(2026-09-28,用户「真实测试了吗」「同意」,随后点名再测两个模型)**:默认 provider
+(Responses 线路)下配置的三个模型，约 400 万字符的随机词输入。
+
+| 模型 | 状态码 | 文案 | `099587e` 认得出吗 |
+|---|---|---|---|
+| `deepseek-v4.1-flash`(默认) | 400 | `Input exceeds the context limit (N tokens). Please shorten the input.` | 否 |
+| `deepseek-v4-flash-0731` | 400 | `Input length N exceeds the maximum length M.` | 否 |
+| `glm-5.3-flash` | 400 | `Total prompt tokens exceed max_prompt_tokens.` | 否 |
+
+三个都经火山方舟，都没有 `x-should-retry` / `retry-after-ms`。**新表和旧的 3 个子串一条都不中**——提交
+`099587e` 之后，这三个模型超窗口照样是普通 400、这一轮直接失败。状态码都是 400,第三节问题 1 的状态码
+边界对它们成立。补三条(`exceeds the context limit`、`input length \d+ exceeds the maximum length`、
+`prompt tokens exceed max_prompt_tokens`,后两条写具体，免得"某参数超过最大长度"一类校验错误被当成超长),
+提交 `fix(plan206): recognize Volcengine Ark's overflow wordings`。
+
+- 用 release 构建跑 `--headless`:修之前默认模型报 `provider http error … 400`;修之后三个模型都先出
+  `context window exceeded; compacting and retrying`,再以 `reactive compaction made no changes` 结束
+  (只有一条消息，没得折)——认出超长、进被动压缩这条链路在真实 provider 上通了。换模型是临时 HOME 里放一份
+  改了 `model` 行的配置副本(kloop 只读 `~/.kloop/config.toml`),测完即删。
+- 同一网关的另一条上游对超长输入**不报错**,等首包超时后回 504;请求随机落到哪条上游。这种没有任何超长
+  信号，只能按 5xx 重试、白等两次。本 plan 不处理，记在这里。
+- 没做的：带可折叠历史的完整被动压缩(要真付约百万 token 的输入费;压缩机制本身本 plan 没动)。413、
+  配额用完没法在真实环境里造。
 
 - `refs/pi` **未退休**:207–212 尚未完成。

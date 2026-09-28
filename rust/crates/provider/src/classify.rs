@@ -29,6 +29,11 @@ const OVERFLOW: &[&str] = &[
     r"prompt (?:is )?too long",               // Anthropic, z.ai
     r"input is too long for requested model", // Amazon Bedrock
     r"exceeds the context window",            // OpenAI (Chat & Responses)
+    // Volcengine Ark, one wording per model family, relayed by a gateway;
+    // kloop's own real overflow tests (2026-09-28), not pi's table.
+    r"exceeds the context limit",
+    r"input length \d+ exceeds the maximum length",
+    r"prompt tokens exceed max_prompt_tokens",
     r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI-compatible proxies (LiteLLM)
     r"input token count.*exceeds the maximum", // Google Gemini
     r"maximum prompt length is \d+",           // xAI
@@ -180,6 +185,9 @@ mod tests {
             r#"{"code":"1261","message":"Prompt too long"}"#,
             "Input is too long for requested model.",
             "Your input exceeds the context window of this model",
+            "HTTP 400: Input exceeds the context limit (262144 tokens). Please shorten the input.",
+            "HTTP 400: Input length 300000 exceeds the maximum length 262144.",
+            "HTTP 400: Total prompt tokens exceed max_prompt_tokens.",
             "Requested token count exceeds the model's maximum context length of 131072 tokens",
             "Input length (265330) exceeds model's maximum context length (262144).",
             "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
