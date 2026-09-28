@@ -1591,11 +1591,21 @@ impl App {
         // the echo pressing Enter leaves the screen exactly as it was. While a
         // turn runs, a '/'-line is steering.
         if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
-            let _ = self.composer.submit_text();
+            // The command line goes out EXPANDED — `/name <pasted block>` has to
+            // reach the skill / summarizer as its content, not as a
+            // `[Pasted #1: n chars]` label. Detection and the echo stay on the
+            // display text: a placeholder never starts with `/`, and an echo is
+            // an acknowledgement, so the raw paste does not belong in scrollback.
+            let command = self
+                .composer
+                .submit_text()
+                .expect("checked not blank")
+                .trim()
+                .to_string();
             self.cells.push(Cell::User(display.clone()));
             self.running = true;
             self.freeze_selected_route();
-            return Command::Slash(display);
+            return Command::Slash(command);
         }
         if self.running {
             // Steering: only the text rides the running turn (absorbed at its
@@ -2980,6 +2990,41 @@ mod tests {
             app.cells,
             vec![Cell::User("/help".into()), Cell::User("/cost".into())]
         );
+    }
+
+    /// A slash command goes out expanded: `/name <pasted block>` has to deliver
+    /// the block's content to the skill / summarizer, not its `[Pasted #N: …]`
+    /// label. The echo stays the compact display text — it is an acknowledgement,
+    /// and a large paste does not belong in scrollback.
+    #[test]
+    fn slash_command_sends_the_expanded_paste_not_its_placeholder() {
+        let pasted = "focus on the parser\n".repeat(20);
+        let mut app = App::new("s".into());
+        type_str(&mut app, "/compact ");
+        app.paste_text(&pasted);
+        let display = app.composer.text().to_string();
+        assert!(
+            display.contains("[Pasted #1:"),
+            "the composer still shows the compact label: {display:?}"
+        );
+
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Slash(format!("/compact {pasted}").trim().to_string())
+        );
+        assert_eq!(app.cells, vec![Cell::User(display.trim().to_string())]);
+
+        // A skill takes its arguments the same way; the trailing whitespace of the
+        // display text is trimmed off both the command and the echo.
+        let mut app = App::new("s".into());
+        type_str(&mut app, "/name ");
+        app.paste_text(&pasted);
+        let display = app.composer.text().to_string();
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Slash(format!("/name {pasted}").trim().to_string())
+        );
+        assert_eq!(app.cells, vec![Cell::User(display.trim().to_string())]);
     }
 
     /// A command's System output renders as its own cell.
