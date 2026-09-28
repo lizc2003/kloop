@@ -163,3 +163,42 @@ core 侧不用改:`retry_delay`(`sampling.rs:89-96`)已经让 provider 给的延
 - 本 plan 补 ✅ 与提交号。
 - `refs/README.md` Pi 节第 1、2 条标注"已由 plan 206 吸收";**若 Pi 节候选均已定案**,按该节
   约定退休 `refs/pi` 本地 clone(确认 HEAD 仍是 `d5629e2`、工作树干净后删除)。
+
+## 六、完成记录
+
+✅ 2026-09-28,提交号见下一个提交。开工问答三条都照推荐(用户逐条「同意」):① HTTP 上 429 与 5xx 的
+错误体不查超长;② 加 `regex`(workspace 登记一行,`Cargo.lock` 只多 provider 的一条依赖,无新下载);
+③ 超过 60s 的 `Retry-After` 维持封顶照等。
+
+- **`provider/src/classify.rs`**:超长表、排除表、配额表(`RegexSet` + `LazyLock`,大小写不敏感)与
+  `stream_failure`。原 `lib.rs` 的 `stream_error` / `is_fatal_stream_error` 搬进来,并把超长判断合进去,
+  四个流内调用点各变成一次调用;`is_overflow_message` 删除。
+- **HTTP 路径**(`stream.rs`):照 2.3 的顺序;可重试性经 `ProviderFailure::http_decided(…, HttpRetry)`
+  (crate 内),`http()` 保留"只看状态码"并委托给它。`retry-after-ms` 在 f64 里先封顶再转 `Duration`,
+  `1e300` 不 panic,`NaN`/`inf`/负数视为无效、回落 `Retry-After`。
+
+与 plan 的出入(都是开工核对时发现的):
+
+1. **超长表多留一条 kloop 旧子串 `maximum context length`**。第 2.2 节说"现有 3 个子串都被新表覆盖",
+   逐条对照后不成立:pi 里含这几个字的三条都要求具体结构,`maximum context length is 128,000 tokens`
+   这种千分位写法 `\d+` 就不认。为不回退保留旧子串,注释写明它比那三条宽。
+2. **排除表第一条没有照搬锚点**。pi 的 `^(Throttling error|Service unavailable):` 锚的是 pi 自己渲染
+   Bedrock 错误时加的前缀;kloop 匹配的是原始 wire 文本(多为 JSON 串),`^` 永远不中。改成不锚定的
+   `throttling`、`service unavailable` 两条。
+3. **流内路径也读配额表**。2.1 的表只写了"换函数",但第五节要 DESIGN 写"两条路配额判据一致":
+   label 不致命(如 `server_error`)而文本是配额的,现在也不可重试。
+4. `x-should-retry: true` 挡不住配额体(2.3 第 3 步先于第 4 步),测试钉住了这一条。
+5. core 没加测试:`http_decided` 是 crate 内构造器,按第四节约定由 `sampling.rs` 现有 `!is_retryable()`
+   分支及其测试覆盖。
+6. DESIGN 那段 open 超时写的是 45s,实际早已是 300s(`STREAM_OPEN_TIMEOUT`),改写时一并更正。
+
+测试:`classify.rs` 三条表驱动(24 种各家超长写法全 true;`request_too_large` 体、Bedrock 限流、
+`Rate limit reached…`、`429 Too Many Requests`、普通 400 全 false;配额三 true 一 false);`stream.rs`
+`retry-after-ms` 九种输入整体断言;wiremock:Chat 一条八个 HTTP 响应的 (kind, retryable, retry_after)
+整体断言(Together 400 → 超长、配额 429 丢 `Retry-After`、`Too many tokens` 429 可重试、503 带超长字样
+不算超长、`x-should-retry` 两向、`true` 挡不住配额、`retry-after-ms` 优先)、Chat 流内 `server_error`
+带配额文本不可重试、Anthropic 413 `request_too_large` 不是超长、Anthropic 流内 `rate_limit_error` 带
+`too many tokens` 可重试且不是超长、Responses `response.failed` Gemini 写法 → 超长。原有的超长、
+`Retry-After`、白名单测试原样通过。`make check` 全绿。
+
+- `refs/pi` **未退休**:207–212 尚未完成。

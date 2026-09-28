@@ -146,16 +146,26 @@ the five architectural bets below; it is now ten crates, and every bet held.
    spells it as Responses does.
 
 Provider sampling is bounded and typed: each attempt has one terminal outcome;
-open (45s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE
+open (300s), chunk-idle (15m), wall-clock (30m), response (10 MiB), and SSE
 frame (1 MiB) guards apply on all three wires. Transport/open/read failures,
-HTTP 408/429/5xx, and incomplete EOF retry up to 3 total attempts only before
-any text, reasoning, or complete tool call arrives; `Retry-After` is honored up
-to 60s. Stream-level errors on all three wires are surfaced faithfully by their
-real `code`/`type` and classified by a small fatal blacklist (auth, permission,
-quota, policy, invalid-request, request-too-large, billing); every other stream
-error — transient upstream, overload, and rate-limit conditions included —
-defaults to retryable, the inverse of the HTTP-status whitelist and gated by the
-same no-semantic-output rule. A named Chat `event: error` frame is recognized
+retryable HTTP failures, and incomplete EOF retry up to 3 total attempts only
+before any text, reasoning, or complete tool call arrives. Whether an HTTP
+failure is retryable is decided in order (plan 206): a context overflow (see
+**Reactive** below) never is; `x-should-retry: false` forbids it; a body in the
+quota/billing wording (`insufficient_quota`, `quota exceeded`, `out of budget`,
+`billing`) forbids it too, whatever the status or the header says, since no
+wait refills a quota; `x-should-retry: true` admits any status, 409 included;
+otherwise the 408/429/5xx allowlist decides. The server's delay rides only a
+retryable failure — `retry-after-ms` first, then `Retry-After` — capped at 60s,
+and a longer one is capped and waited out, not refused. Stream-level errors on
+all three wires are surfaced faithfully by their real `code`/`type` and
+classified by a small fatal blacklist (auth, permission, quota, policy,
+invalid-request, request-too-large, billing) plus the same quota wording the
+HTTP path reads, so a relay that files an exhausted quota under a transient type
+still stops; every other stream error — transient upstream, overload, and
+rate-limit conditions included — defaults to retryable, the inverse of the
+HTTP-status allowlist and gated by the same no-semantic-output rule. Both paths
+ask one module (`provider/src/classify.rs`). A named Chat `event: error` frame is recognized
 and read rather than rejected as an unknown event name. A Chat stream that
 reports `usage` more than once — a gateway attaching its own copy to the
 `finish_reason` frame on top of the trailing empty-choices frame
@@ -295,9 +305,21 @@ fork:
   out and `/compact` is the user asking. It lives on `History`
   (`compact::CompactionBreaker`), memory-only like the usage anchor, so resume
   starts closed and every sub-agent has its own.
-- **Reactive**: a request rejected as too large (`prompt is too long` /
-  `context_length_exceeded`) compacts once per turn and retries; a second
-  overflow surfaces as an error instead of looping.
+- **Reactive**: a request rejected as too large for the window compacts once
+  per turn and retries; a second overflow surfaces as an error instead of
+  looping. "Too large" is read from the error text against one table of
+  per-provider wordings (plan 206, ported from pi: Anthropic, OpenAI, Gemini,
+  xAI, Groq, OpenRouter, Together, llama.cpp, LM Studio, Mistral, DashScope,
+  Ollama, …), with a throttle veto (`rate limit`, `too many requests`,
+  `throttling`, `service unavailable`): the wider the table, the more a
+  throttle like `Too many tokens, please wait` looks like an overflow, and a
+  summary pays to fix what a few seconds' wait would. Over HTTP only a 4xx
+  other than 429 can be an overflow — a 5xx is the server's fault and a 429 is
+  throttling whatever its body says; in-stream, where there is no status, a
+  throttle/overload label (`rate_limit_error`, `overloaded_error`,
+  `rate_limit_exceeded`) outranks the text. Anthropic's `request_too_large`
+  (413) is deliberately not an overflow: it is the body's byte size, which
+  token-based trimming may not shrink, so it stays an ordinary fatal failure.
 
 Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary — eleven sections, with an `<analysis>` scratchpad the canonicalizer drops before the summary reaches context, plus a pointer to the session transcript so a dropped detail can be fetched instead of re-derived — canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a recent tail verbatim (`KEEP_RECENT_TOKENS`) (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. The replacement is `[UserAnchors?, DroppedPrefix?, ContextSummary, RestoredFiles?, tail…]`, and **only the summary is the model's** (plan 203). `UserAnchors` is the user's own words from every folded prefix so far — the original request (≤4,000 chars, head and tail kept) and later messages (≤2,000 chars each, 4,096 estimated tokens filled newest first, the rest counted as omitted) — copied by the runtime and inherited only from the previous generation's anchors, whose fixed format it parses back; it never reads the summary text. Asking the model to quote the user was not a guarantee: each compaction re-summarizes the previous summary, and by the third generation an early "do not do X" had been paraphrased away. So the prompt's user-message section now asks only how intent changed. "The user's words" means `injected` is `None` or `Steering` and no tool result: sub-agent results, scheduled prompts, peer messages, hook stdout (`Injected::Hook`) and harness reminders or recovery nudges (`Injected::Harness`) are not. The user's messages still in the kept tail are not repeated. `RestoredFiles` is the heads of up to five files last read (`read_file` tool uses in the folded prefix, newest first, deduplicated; paths the tail reads again, notebooks, missing, non-text and deny/sensitive paths skipped): 12,000 chars each with `read_file`'s own continuation line, 40,000 in total and at most a quarter of the window the replacement leaves. They are read through the real `read_file` dispatch on `ToolCtx::harness`, so the permission gate applies and the read leaves the same `FileState` observation a model read does: the file is editable at once, plan 197's changed-read reminder covers it afterwards, and its lines count as in context (so `forget_context_reads` now runs *before* these reads rather than after the replacement). Each file is sized from disk before its read, since a read whose lines are then left out would register lines the model does not have. It is written into the replacement and persisted with the `Compacted` line rather than injected fresh on each request, unlike chord: the per-request injection sits at the head of the prompt, where content re-read from disk would break the prompt cache from the first byte whenever a file changed; written once, it is byte-stable and identical after resume, and staleness is plan 197's job. Planning skips every leading compaction product (`fold_start`), and anchors are taken before an overflow shrinks the summary request, so what the user said survives even a dropped prefix. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. A summary request that is itself rejected as too large — the case that used to end the turn, since reactive compaction resends nearly the whole history — drops the oldest slice of what it was going to summarize and retries; the abandoned messages are announced by a `DROPPED_PREFIX` marker at the head of the rebuilt history, and the size that was refused becomes a ceiling on the planning window for the rest of the session (a configured window is a claim, a rejection is a measurement). Any other retryable provider failure on the summary request is retried with the sampling round's own backoff and `Retry-After` (`MAX_ATTEMPTS`, `retry_delay`) — nothing is shown before the summary is complete, so a retry replays nothing — which is what makes the breaker above count real failures, not one 5xx. Failed or cancelled summary requests otherwise leave history untouched.
 
@@ -4183,8 +4205,9 @@ Every session is saved and resumable — see Session persistence above.
   contracts for Anthropic Messages, OpenAI Chat Completions, and OpenAI
   Responses: strict item/part/order/identity closure, typed semantic outcomes,
   delta/final-value agreement, usage capture, strict UTF-8 terminal tails,
-  typed HTTP/timeout/protocol failures, fixed transport and SSE caps,
-  Retry-After, fail-closed tool input, producer cancellation, and mid-stream
+  typed HTTP/timeout/protocol failures, overflow/throttle/quota
+  classification, fixed transport and SSE caps, `x-should-retry` and the two
+  retry-delay headers, fail-closed tool input, producer cancellation, and mid-stream
   death.
 - **kloop-core** — every tool's execute path (output/exit capture, timeout
   kill, line numbering, parent-dir creation, edit ambiguity, offload id

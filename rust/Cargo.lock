@@ -1670,6 +1670,7 @@ dependencies = [
  "futures",
  "httpdate",
  "kloop-protocol",
+ "regex",
  "reqwest",
  "serde_json",
  "sha2",

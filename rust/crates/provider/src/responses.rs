@@ -19,7 +19,6 @@ use super::ProviderFailure;
 use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
-use super::is_overflow_message;
 use super::sse::SseFrame;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
@@ -911,22 +910,17 @@ fn terminal_outcome(
 fn stream_failure(event: &str, value: &Value, key: &str) -> ProviderFailure {
     if event == "response.failed" {
         let error = &value["response"]["error"];
-        if is_overflow_message(&error.to_string()) {
-            return ProviderFailure::context_overflow();
-        }
-        return crate::stream_error(
+        return crate::classify::stream_failure(
             "openai-responses",
             crate::error_label(error),
-            crate::error_detail(error, key),
+            error,
+            key,
         );
-    }
-    if is_overflow_message(&value.to_string()) {
-        return ProviderFailure::context_overflow();
     }
     // The `error` event's own `type` is the envelope ("error"), so only its
     // `code` names the failure here.
     let label = value["code"].as_str().unwrap_or("unknown");
-    crate::stream_error("openai-responses", label, crate::error_detail(value, key))
+    crate::classify::stream_failure("openai-responses", label, value, key)
 }
 
 /// Everything one Responses stream accumulates: the response identity it

@@ -59,6 +59,9 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 httpdate = "1"
+# Provider error classification (plan 206): the per-provider overflow wordings
+# carry `\d+` and optional words. Already in the tree via grep-regex.
+regex = "1"
 indexmap = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.46.10", default-features = false }
 # Global config/OAuth IO: macOS search-only directory descriptors plus safe

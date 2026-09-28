@@ -19,6 +19,16 @@ pub enum ProviderFailureKind {
     Cancelled,
 }
 
+/// Who decides whether an HTTP failure is worth retrying: the status allowlist
+/// alone, or the response overruling it — `x-should-retry` either way, or a
+/// quota body that no wait will fix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpRetry {
+    ByStatus,
+    Never,
+    Always,
+}
+
 /// A typed failure from one provider sampling attempt.
 ///
 /// Retry eligibility belongs to the producer-side classification, not to error
@@ -121,7 +131,20 @@ impl ProviderFailure {
     }
 
     pub fn http(status: u16, message: impl Into<String>, retry_after: Option<Duration>) -> Self {
-        let retryable = status == 408 || status == 429 || (500..=599).contains(&status);
+        Self::http_decided(status, message, retry_after, HttpRetry::ByStatus)
+    }
+
+    pub(crate) fn http_decided(
+        status: u16,
+        message: impl Into<String>,
+        retry_after: Option<Duration>,
+        retry: HttpRetry,
+    ) -> Self {
+        let retryable = match retry {
+            HttpRetry::ByStatus => status == 408 || status == 429 || (500..=599).contains(&status),
+            HttpRetry::Never => false,
+            HttpRetry::Always => true,
+        };
         Self::new(
             ProviderFailureKind::Http { status },
             message,

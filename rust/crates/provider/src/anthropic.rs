@@ -10,7 +10,6 @@ use super::ProviderFailure;
 use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
-use super::is_overflow_message;
 use super::sse::SseFrame;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
@@ -447,13 +446,11 @@ pub(super) async fn stream(
             }
             "ping" => {}
             "error" => {
-                if is_overflow_message(&value["error"].to_string()) {
-                    return Err(ProviderFailure::context_overflow());
-                }
-                return Err(crate::stream_error(
+                return Err(crate::classify::stream_failure(
                     "anthropic",
                     crate::error_label(&value["error"]),
-                    crate::error_detail(&value["error"], cred.secret()),
+                    &value["error"],
+                    cred.secret(),
                 ));
             }
             _ => return Err(protocol("returned an unknown semantic event")),

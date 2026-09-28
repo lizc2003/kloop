@@ -1332,6 +1332,26 @@ async fn failed_with_context_error_maps_to_overflow() {
     assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
+/// A wording the pre-table substrings missed (Gemini's, as relayed through a
+/// Responses-compatible gateway): it used to fail the turn instead of compacting.
+#[tokio::test]
+async fn failed_with_another_providers_overflow_wording_maps_to_overflow() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[json!({"type": "response.failed", "response": {"error": {
+            "code": "invalid_argument",
+            "message": "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+        }}})]),
+    )
+    .await;
+
+    let events = collect(responses(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
+}
+
 /// `response.failed` and the top-level `error` event share the unified
 /// classification: transient upstream conditions are retryable, client-side /
 /// permanent classes stay fatal.

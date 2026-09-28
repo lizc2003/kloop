@@ -18,6 +18,8 @@ use tokio::time::Sleep;
 
 use crate::ProviderFailure;
 use crate::TimeoutStage;
+use crate::classify;
+use crate::failure::HttpRetry;
 use crate::sse::SseFrame;
 use crate::sse::SseParser;
 
@@ -352,20 +354,38 @@ pub(crate) async fn send_checked(
     }
 
     let status = resp.status().as_u16();
-    let retry_after = resp
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| retry_after_delay(value, SystemTime::now()));
+    let headers = resp.headers();
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let retry_after = header("retry-after-ms")
+        .and_then(retry_after_ms_delay)
+        .or_else(|| {
+            header("retry-after").and_then(|value| retry_after_delay(value, SystemTime::now()))
+        });
+    let should_retry = match header("x-should-retry") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
     let text = bounded_http_error_body(resp).await;
-    if crate::is_overflow_message(&text) {
+    // Overflow is the request's own fault, which a server answers with a 4xx.
+    // A 429 is excluded outright: `Too many tokens, please wait` is a throttle
+    // that the overflow table would otherwise claim, and a summary cannot
+    // fix what waiting does. 5xx is the server's fault by definition.
+    if (400..500).contains(&status) && status != 429 && classify::is_overflow_text(&text) {
         return Err(ProviderFailure::context_overflow());
     }
+    let retry = match should_retry {
+        Some(false) => HttpRetry::Never,
+        _ if classify::is_quota_text(&text) => HttpRetry::Never,
+        Some(true) => HttpRetry::Always,
+        None => HttpRetry::ByStatus,
+    };
     let text = sanitized_http_error(&text, secret);
-    Err(ProviderFailure::http(
+    Err(ProviderFailure::http_decided(
         status,
         format!("{label} http {status} from {url}: {text}"),
         retry_after,
+        retry,
     ))
 }
 
@@ -454,6 +474,18 @@ pub(crate) fn retry_after_delay(value: &str, now: SystemTime) -> Option<Duration
     Some(delay.min(MAX_RETRY_AFTER))
 }
 
+/// `retry-after-ms`, the OpenAI/Anthropic SDKs' millisecond-precision sibling
+/// of `Retry-After`: a non-negative float. Capped like `Retry-After`, and in
+/// float space first, so an absurd value cannot overflow `Duration`.
+pub(crate) fn retry_after_ms_delay(value: &str) -> Option<Duration> {
+    let millis = value.trim().parse::<f64>().ok()?;
+    if !millis.is_finite() || millis < 0.0 {
+        return None;
+    }
+    let seconds = (millis / 1000.0).min(MAX_RETRY_AFTER.as_secs_f64());
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
@@ -539,6 +571,30 @@ mod tests {
         );
         assert_eq!(retry_after_delay("600", now), Some(Duration::from_secs(60)));
         assert_eq!(retry_after_delay("later", now), None);
+    }
+
+    #[test]
+    fn retry_after_ms_is_fractional_non_negative_and_capped() {
+        let parsed: Vec<Option<Duration>> = [
+            "1500", "0.5", " 250 ", "-1", "soon", "NaN", "inf", "600000", "1e300",
+        ]
+        .into_iter()
+        .map(retry_after_ms_delay)
+        .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                Some(Duration::from_millis(1500)),
+                Some(Duration::from_micros(500)),
+                Some(Duration::from_millis(250)),
+                None,
+                None,
+                None,
+                None,
+                Some(MAX_RETRY_AFTER),
+                Some(MAX_RETRY_AFTER),
+            ]
+        );
     }
 
     #[test]

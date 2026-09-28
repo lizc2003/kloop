@@ -98,7 +98,7 @@ server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看�
 
 **值得吸收(按收益排;2026-09-24 已立 plan 206–212,对应关系见各条;起草时核代码纠正了几处前提,已改在下面):**
 
-1. **溢出识别模式表**(→ plan 206)——`ai/src/utils/overflow.ts:37-79`,约 25 条正则覆盖各家兼容服务,另有
+1. **溢出识别模式表**(→ plan 206,**已由 plan 206 吸收**,2026-09-28)——`ai/src/utils/overflow.ts:37-79`,约 25 条正则覆盖各家兼容服务,另有
    反向排除表防止把 "Too many tokens, please wait" 这类限流误判成溢出。kloop `is_overflow_message`
    只有 3 个子串(其中 `maximum context length` 已覆盖 LiteLLM/OpenRouter),Gemini、xAI、Together、
    llama.cpp、LM Studio、Kimi、Mistral、DashScope、Ollama 等的溢出认不出来,reactive compaction 就不触发。
@@ -106,7 +106,7 @@ server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看�
    现在不重试也不压缩,是对的。pi 的排除表只认 Bedrock 前缀,裸 429 的 "Too many tokens" 仍会被它误判;
    kloop 的 HTTP 溢出检查也不看状态码(`stream.rs:361`),plan 206 一并处理。
    `overflow.ts:151-180` 还有"请求成功但 input 超窗口"的静默溢出判定,低优先。
-2. **429 的配额/计费排除**(→ plan 206)——`ai/src/utils/retry.ts:7-24`、`provider-retry.ts:23-66`。kloop
+2. **429 的配额/计费排除**(→ plan 206,**已由 plan 206 吸收**,2026-09-28)——`ai/src/utils/retry.ts:7-24`、`provider-retry.ts:23-66`。kloop
    `failure.rs` 的 HTTP 重试只看状态码,响应体带 `insufficient_quota` 的 429 会白重试;流内错误那条
    路径已拦。顺带支持 `x-should-retry` 与 `retry-after-ms`。
 3. **跨 rail 的 tool call id 规范化**(→ plan 207)——`ai/src/api/transform-messages.ts:59-63,136-142`。

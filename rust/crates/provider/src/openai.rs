@@ -10,7 +10,6 @@ use super::ProviderFailure;
 use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
-use super::is_overflow_message;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
@@ -433,13 +432,11 @@ pub(super) async fn stream(
         }
         let value = crate::parse_sse_json("openai-compat", &frame.data)?;
         if !value["error"].is_null() {
-            if is_overflow_message(&value["error"].to_string()) {
-                return Err(ProviderFailure::context_overflow());
-            }
-            return Err(crate::stream_error(
+            return Err(crate::classify::stream_failure(
                 "openai-compat",
                 crate::error_label(&value["error"]),
-                crate::error_detail(&value["error"], cred.secret()),
+                &value["error"],
+                cred.secret(),
             ));
         }
 

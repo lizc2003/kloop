@@ -735,6 +735,56 @@ async fn http_overflow_maps_to_overflow_error() {
     assert_eq!(error.kind(), &ProviderFailureKind::ContextOverflow);
 }
 
+/// `request_too_large` is the request body over its byte limit, not the prompt
+/// over the window: compaction trims tokens and may not shrink the bytes, so it
+/// stays an ordinary fatal HTTP failure instead of triggering a summary.
+#[tokio::test]
+async fn http_request_too_large_is_not_an_overflow() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(413).set_body_string(
+            r#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(
+        (
+            error.kind().clone(),
+            error.is_retryable(),
+            error.retry_after()
+        ),
+        (ProviderFailureKind::Http { status: 413 }, false, None)
+    );
+}
+
+/// The label outranks the prose: a `rate_limit_error` whose message says "too
+/// many tokens" is a throttle to wait out, not an overflow to pay a summary for.
+#[tokio::test]
+async fn stream_rate_limit_error_mentioning_tokens_is_not_an_overflow() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[json!({"type": "error", "error": {
+            "type": "rate_limit_error",
+            "message": "Too many tokens, please wait before trying again.",
+        }})]),
+    )
+    .await;
+
+    let events = collect(anthropic(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(
+        (error.kind().clone(), error.is_retryable()),
+        (ProviderFailureKind::Protocol, true)
+    );
+}
+
 /// Anthropic's `overloaded_error` (HTTP 529) is transient — surfaced faithfully
 /// and retryable (retry is still gated on no prior semantic output upstream).
 #[tokio::test]

@@ -2,6 +2,7 @@
 //! delta streams in, StreamEvent sequences out.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
@@ -11,6 +12,7 @@ use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
+use kloop_provider::ProviderFailure;
 use kloop_provider::ProviderFailureKind;
 use kloop_provider::Reasoning;
 use kloop_provider::StreamResult;
@@ -659,6 +661,81 @@ async fn http_status_and_retry_after_remain_typed() {
     assert_eq!(error.retry_after(), None);
 }
 
+/// One HTTP error response, and the single failure the chat rail makes of it.
+async fn http_failure(response: ResponseTemplate) -> ProviderFailure {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    events.into_iter().next().unwrap().unwrap_err()
+}
+
+/// Overflow, throttle and exhausted quota are three different answers, and the
+/// server's own retry headers outrank the status allowlist.
+#[tokio::test]
+async fn http_errors_tell_overflow_throttle_and_quota_apart() {
+    let quota = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+    let cases = [
+        // A wording the pre-table substrings missed: this was a plain 400.
+        ResponseTemplate::new(400).set_body_string(
+            "The input (300000 tokens) is longer than the model's context length (262144 tokens).",
+        ),
+        // Waiting cannot refill a quota, so the Retry-After goes with the retry.
+        ResponseTemplate::new(429)
+            .insert_header("Retry-After", "30")
+            .set_body_string(quota),
+        // Matches the overflow table's `too many tokens`; the 429 says throttle.
+        ResponseTemplate::new(429)
+            .set_body_string("Too many tokens, please wait before trying again."),
+        // 5xx is the server's fault even when the body mentions the window.
+        ResponseTemplate::new(503)
+            .set_body_string(r#"{"error":{"code":"context_length_exceeded"}}"#),
+        ResponseTemplate::new(429)
+            .insert_header("x-should-retry", "false")
+            .insert_header("Retry-After", "5")
+            .set_body_string("slow down"),
+        ResponseTemplate::new(409)
+            .insert_header("x-should-retry", "true")
+            .insert_header("Retry-After", "5")
+            .set_body_string("conflict"),
+        // An explicit "retry" does not buy a quota back either.
+        ResponseTemplate::new(429)
+            .insert_header("x-should-retry", "true")
+            .set_body_string(quota),
+        ResponseTemplate::new(503)
+            .insert_header("retry-after-ms", "1500")
+            .insert_header("Retry-After", "20")
+            .set_body_string("overloaded"),
+    ];
+    let mut verdicts = Vec::new();
+    for response in cases {
+        let error = http_failure(response).await;
+        verdicts.push((
+            error.kind().clone(),
+            error.is_retryable(),
+            error.retry_after(),
+        ));
+    }
+    let http = |status| ProviderFailureKind::Http { status };
+    assert_eq!(
+        verdicts,
+        vec![
+            (ProviderFailureKind::ContextOverflow, false, None),
+            (http(429), false, None),
+            (http(429), true, None),
+            (http(503), true, None),
+            (http(429), false, None),
+            (http(409), true, Some(Duration::from_secs(5))),
+            (http(429), false, None),
+            (http(503), true, Some(Duration::from_millis(1500))),
+        ]
+    );
+}
+
 /// The real gateway frame: a proxy relays a transient upstream error as a
 /// named `event: error` frame. It must surface the true `type` and be retryable,
 /// not degrade into the misleading "unknown SSE event name".
@@ -760,6 +837,26 @@ async fn named_error_event_with_fatal_type_stays_fatal() {
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
     assert!(!error.is_retryable());
     assert!(error.to_string().contains("invalid_request_error"));
+}
+
+/// A relay that files an exhausted quota under a transient type is still out of
+/// quota: the stream path reads the same quota wording the HTTP path does.
+#[tokio::test]
+async fn named_error_event_with_quota_message_is_fatal_whatever_its_type() {
+    let server = MockServer::start().await;
+    let error = json!({"error": {
+        "message": "You exceeded your current quota, please check your plan and billing details.",
+        "type": "server_error",
+    }});
+    mount_sse(&server, format!("event: error\ndata: {error}\n\n")).await;
+
+    let events = collect(openai(&server)).await;
+    assert_eq!(events.len(), 1);
+    let error = events.into_iter().next().unwrap().unwrap_err();
+    assert_eq!(
+        (error.kind().clone(), error.is_retryable()),
+        (ProviderFailureKind::Protocol, false)
+    );
 }
 
 /// Overflow still wins first, even when wrapped in a named error frame.
