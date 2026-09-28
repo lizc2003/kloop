@@ -4,6 +4,30 @@
 > 当时记在 HANDOFF「〇‴」一节;用户看完说「四个小问题,写个 plan 修啊」。四件互不相干,
 > 放一条 plan 是因为每件都只有几行,**但分四个提交**(一件一个,各带测试),出问题好回退。
 
+## ✅ 已完成(2026-09-28)
+
+四个提交,顺序 4 → 3 → 2 → 1,每个提交前 `make check` 全绿:
+
+| 件 | 提交 | 标题 |
+| --- | --- | --- |
+| 4 | `f4c3283` | `fix(plan213): correct the COMPACT_SYSTEM comment about tools and caching` |
+| 3 | `f1d797a` | `fix(plan213): stop Alt+letter from typing the letter` |
+| 2 | `49a230c` | `fix(plan213): send slash commands expanded, not their paste placeholders` |
+| 1 | `4139d8e` | `fix(plan213): park a known slash command in the composer mid-turn` |
+
+**开工问答结论**:第 1 件按推荐——已知命令留在输入框 + 一行提示,轮次结束后再按 Enter
+(用户「行,按推荐来」)。第 2 件按推荐——只记 HANDOFF,不立 plan,等 212 的评测量出摘要成本再说。
+
+**实现与 plan 的出入**:
+- 第 1 件的提示不是一条 cell,而是渲染层的一行 chrome(`render::held_command_line`),与活动行同槽、
+  经共享的 `live_chrome_layout` 预留行数,所以"画出来"和"冻结高度预算"两处不会各算各的。状态
+  **推导**而非武装(`App::held_command()` 读 composer + 目录),用户把 `/` 改掉就自然消失,没有可以
+  变馊的 flag。
+- 第 1 件的第 3、4 条测试(运行中 skill 名、空闲 `Command::Slash`)注意:空闲时输入 `/compact` 会打开
+  斜杠补全菜单,Enter 是"接受补全"而非提交,所以空闲路由那一条用空目录的 `App::new` 断言。
+- 第 3 件:`Char('v') + ALT` 仍是 `PasteClipboardImage`(它在按键 match 之前),`CONTROL|ALT` 仍落到
+  `_ => None`,都在新测试里钉住了。
+
 ## 一、四件事
 
 ### 1. 运行中输入的 `/命令` 被当成插话发给模型

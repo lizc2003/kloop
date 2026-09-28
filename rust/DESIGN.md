@@ -1255,11 +1255,16 @@ when the terminal and any multiplexer/SSH hop pass CSI-u through,
 do the same, with Ctrl+J remaining the reliable fallback for legacy terminals
 that encode Shift+Enter as ordinary Enter. Composer newline keys keep this
 meaning while a completion menu is open; bare **Tab / Enter** still accepts the
-highlighted completion.
+highlighted completion. **Alt+letter** is a Meta chord, not text: macOS Terminal
+sends Option+← as `ESC b`, which crossterm parses as Alt+'b', so an unbound
+Alt+char is swallowed rather than typed (word motion is a separate, later
+binding).
 
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
 stable ID. Its `[Pasted #N: M chars]` label is only a projection: submission,
-history recall, draft restore, and steering expand that exact payload once, while
+command submission (`/name <paste>` reaches the command — the skill, the
+summarizer — as its content, not as a label), history recall, draft restore,
+and steering expand that exact payload once, while
 identical text typed by the user remains literal. The label is a **composer**
 affordance only — once the turn is sent, the transcript echoes the expanded text
 in full (the same text a resumed session replays out of history). Bracketed paste canonicalizes
@@ -1289,7 +1294,11 @@ complete the highlighted entry into the composer (Enter completes rather than
 submits while the menu is open), **Esc** dismisses it, and every other key edits
 the query and re-filters. At most one menu is open at a time, and a pending
 approval prompt or rewind picker takes precedence. The slash menu is suppressed
-while a turn runs (a `/` line is then steering text). A submitted slash line
+while a turn runs, but a `/` line typed then is not automatically steering text:
+when its first word names a known command or skill — the same catalog the menu
+lists — the draft stays in the composer and a hint row above it says the
+command runs once the turn ends (press Enter again then). Any other `/` line
+(`/usr/bin is wrong`) steers as usual. A submitted slash line
 echoes into the transcript like a user turn — it records no user message, but
 `/compact` can work for a minute, and the echo is what says the command was
 accepted. Trigger detection carries the exact byte range and cursor identity
@@ -3071,8 +3080,12 @@ cache creation.
 
 An unknown `/name` lists the available commands (the same discoverable shape
 as an unknown `agent_type`). Commands run **only when idle** — they read or
-rewrite History, which a running turn is otherwise using; while a turn runs, a
-`/`-line is just steering text. The plain REPL runs them inline (it owns
+rewrite History, which a running turn is otherwise using. So while a turn runs,
+a `/`-line whose first word names a **known** command or skill is *parked*: the
+draft stays in the composer, Enter is a no-op that leaves it there, and a hint
+row above the composer says it runs when the turn ends. This is deliberately
+not `commands::is_command` (slash followed by non-space), which would swallow
+real steering like `/usr/bin is wrong`; the catalog decides. The plain REPL runs them inline (it owns
 History); the TUI routes them to its worker (which owns History) so a slow
 `/compact` shows as busy and Ctrl+C interrupts it like a turn. Only cc has
 this feature among the three references (claw has built-in slash but no user
