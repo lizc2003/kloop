@@ -121,6 +121,9 @@ server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看�
 5. **多段编辑**(→ plan 208)——`coding-agent/src/core/tools/edit.ts:23-49`,`edits[]` 每段都对原文件匹配、不许
    重叠,一次改多处。沿用 kloop `text_edit` 的三层匹配,逐段验唯一后原子写入。**不省轮次**(同一回复里
    的多个 `edit_file` 本来就在同一轮顺序执行);收益是原子性、一次审批一份 diff、都对原文件匹配。
+   **2026-09-29 搁置**(plan 208 末节):pi 在 `20a57e7` 曾让单段与 `edits[]` 并存,次日 `e773527` 因
+   模型频繁传错参数(#2639)收成只留数组,之后又兜底了字符串化与单对象;本机实测这件事要解决的
+   代价没有一例。
 6. **被放弃分支的摘要**(→ plan 210)——`agent/src/harness/compaction/branch-summarization.ts`。kloop rewind/fork
    后被放弃分支里学到的东西全丢;可复用 compact 的摘要链路。另:rewind 不回滚盘上的改动,新分支的
    `FileState` 是新建的,所以被放弃分支改过哪些文件要由运行时确定性列出,不能只靠摘要模型。
