@@ -2075,14 +2075,18 @@ impl Ui for ThreadUi {
     }
 }
 
+/// The two refusals are codex's: `decline` is "not this, carry on", `cancel` is
+/// "not this, and stop until I say" (plan 216). Anything the client did not
+/// clearly say — the removed accept_always token, an unknown or missing
+/// decision — also stops: an approval channel that has gone wrong is no
+/// reason to let the model keep acting.
 fn approval_decision(result: &Value) -> Decision {
     match result["decision"].as_str() {
         Some("accept") => Decision::Allow(ApprovalScope::Once),
         Some("accept_for_session") => Decision::Allow(ApprovalScope::WorkspaceSession),
         Some("accept_for_project") => Decision::Allow(ApprovalScope::Project),
-        // decline, cancel, the removed accept_always token, anything unknown, or
-        // a missing decision all fail closed.
-        _ => Decision::Deny,
+        Some("decline") => Decision::Deny,
+        _ => Decision::Stop,
     }
 }
 
@@ -2149,13 +2153,15 @@ impl Approver for ThreadUi {
             id,
             pending: self.pending.clone(),
         };
+        // A client that is gone cannot answer, and one that never got the
+        // question cannot either: both stop, like any reply it did not give.
         Box::pin(async move {
             let _guard = guard;
             if !sent {
-                return Decision::Deny;
+                return Decision::Stop;
             }
             let decision = rx.await;
-            decision.unwrap_or(Decision::Deny)
+            decision.unwrap_or(Decision::Stop)
         })
     }
 }
@@ -2256,14 +2262,20 @@ mod approval_response_tests {
             approval_decision(&json!({"decision": "accept_for_project"})),
             Decision::Allow(ApprovalScope::Project)
         );
+        // decline is codex's "not this, carry on"; everything else refuses AND
+        // stops the turn (plan 216) — cancel by meaning, the rest fail closed.
+        assert_eq!(
+            approval_decision(&json!({"decision": "decline"})),
+            Decision::Deny
+        );
         for result in [
-            json!({"decision": "decline"}),
             json!({"decision": "cancel"}),
             json!({"decision": "accept_always"}),
             json!({"decision": "unknown"}),
+            json!({"decision": 1}),
             json!({}),
         ] {
-            assert_eq!(approval_decision(&result), Decision::Deny);
+            assert_eq!(approval_decision(&result), Decision::Stop, "{result}");
         }
     }
 }

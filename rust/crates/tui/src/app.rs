@@ -229,8 +229,10 @@ pub fn confirm_choices(req: &ConfirmRequest) -> Vec<ConfirmChoice> {
         })
         .collect();
     // Denial is always the last row, so Esc has one fixed meaning everywhere.
+    // A person's No stops the turn (plan 216): the label promises they get to
+    // say what to do instead, and only an ended turn keeps that promise.
     choices.push(ConfirmChoice {
-        decision: Decision::Deny,
+        decision: Decision::Stop,
         label: "No, and tell kloop what to do differently".to_string(),
         detail: None,
         key: 'n',
@@ -726,6 +728,7 @@ impl App {
     }
 
     pub fn apply(&mut self, event: AgentEvent) {
+        self.drop_withdrawn_interactions();
         match event {
             // Agent output — the single core Event stream (plan 39).
             AgentEvent::Core(ev) => self.apply_core(ev),
@@ -1200,6 +1203,11 @@ impl App {
             EndReason::Completed => {}
             EndReason::MaxRounds => self.cells.push(Cell::Note("stopped: max rounds".into())),
             EndReason::Aborted => self.cells.push(Cell::Note("interrupted".into())),
+            // The turn is over because the user said No; the note says whose
+            // move it is, since nothing else on screen does.
+            EndReason::Stopped => self.cells.push(Cell::Note(
+                "stopped — tell kloop what to do differently".into(),
+            )),
             EndReason::Error(e) => self.cells.push(Cell::Note(format!("error: {e}"))),
         }
     }
@@ -1310,6 +1318,25 @@ impl App {
             }
             // The row is already frozen into scrollback.
             None => self.cells.push(plan),
+        }
+    }
+
+    /// Drop the prompts nobody is waiting on any more. A No stops the turn tree
+    /// that asked it (plan 216), and core withdraws that tree's other pending
+    /// approvals by dropping their futures, which closes the reply channel; left
+    /// queued, each would be put to the user in turn with its answer going
+    /// nowhere. Nothing tells the loop when that happens, but the withdrawn
+    /// call's own completion event follows, so checking on every event is
+    /// enough. A withdrawn plan keeps its Pending mark until the turn ends,
+    /// which marks it not approved.
+    fn drop_withdrawn_interactions(&mut self) {
+        let before = self.interactions.len();
+        self.interactions.retain(|interaction| match interaction {
+            PendingInteraction::Confirm { reply, .. } => !reply.is_closed(),
+            PendingInteraction::Question(question) => !question.reply.is_closed(),
+        });
+        if self.interactions.len() != before {
+            self.panel_scroll = 0;
         }
     }
 
@@ -1854,7 +1881,7 @@ impl App {
         if matches!(req.preview, Some(ConfirmPreview::Plan(_))) {
             self.settle_plan(match decision {
                 Decision::Allow(_) => PlanStatus::Approved,
-                Decision::Deny => PlanStatus::Declined,
+                Decision::Deny | Decision::Stop => PlanStatus::Declined,
             });
         }
         // The next queued prompt (if any) starts unscrolled.
@@ -3876,10 +3903,10 @@ mod tests {
             ]
         );
 
-        // Esc denies the front prompt, which is the first plan; Enter takes the
-        // cursor's default (Yes) on the second.
+        // Esc declines the front prompt, which is the first plan; Enter takes
+        // the cursor's default (Yes) on the second.
         app.on_key(80, key(KeyCode::Esc));
-        assert_eq!(first.await.unwrap(), Decision::Deny);
+        assert_eq!(first.await.unwrap(), Decision::Stop);
         app.on_key(80, key(KeyCode::Enter));
         assert_eq!(
             second.await.unwrap(),
@@ -3940,7 +3967,7 @@ mod tests {
         assert_eq!(app.cells, vec![read.clone(), plan(PlanStatus::Pending)]);
 
         app.on_key(80, key(KeyCode::Esc));
-        assert_eq!(rx.await.unwrap(), Decision::Deny);
+        assert_eq!(rx.await.unwrap(), Decision::Stop);
         app.apply(tool_end(
             "",
             "t2",
@@ -4159,18 +4186,19 @@ mod tests {
             ))
         );
 
-        // Esc is the deny row, wherever the cursor happens to be.
+        // Esc is the No row, wherever the cursor happens to be — and a No
+        // stops the turn (plan 216).
         let rx = confirm(&mut app, &scopes);
         app.on_key(80, key(KeyCode::Down));
         app.on_key(80, key(KeyCode::Esc));
-        assert_eq!(rx.await, Ok(Decision::Deny));
+        assert_eq!(rx.await, Ok(Decision::Stop));
 
         // A number with no row is inert — the prompt is still waiting.
         let rx = confirm(&mut app, &[kloop_core::permissions::ApprovalScope::Once]);
         app.on_key(80, key(KeyCode::Char('9')));
         assert_eq!(front_confirm_description(&app), "bash: git push");
         app.on_key(80, key(KeyCode::Char('2')));
-        assert_eq!(rx.await, Ok(Decision::Deny), "row 2 of two is deny");
+        assert_eq!(rx.await, Ok(Decision::Stop), "row 2 of two is No");
     }
 
     #[tokio::test]
@@ -4204,7 +4232,45 @@ mod tests {
         );
         assert_eq!(front_confirm_description(&app), "second");
         app.on_key(80, key(KeyCode::Char('n')));
-        assert_eq!(rx2.try_recv().unwrap(), Decision::Deny);
+        assert_eq!(rx2.try_recv().unwrap(), Decision::Stop);
+    }
+
+    /// A No stops the turn tree that asked (plan 216), and core withdraws that
+    /// tree's other waiting approvals by dropping their receivers. The queue
+    /// lets them go at the next event — here the withdrawn call's own
+    /// completion — instead of putting a question to the user whose answer
+    /// would go nowhere. One from elsewhere (a background agent) stays.
+    #[tokio::test]
+    async fn withdrawn_confirms_leave_the_queue() {
+        let mut app = App::new("s".into());
+        let req = |d: &str| ConfirmRequest {
+            description: d.into(),
+            approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+            ..Default::default()
+        };
+        let (r1, mut rx1) = oneshot::channel();
+        let (r2, rx2) = oneshot::channel();
+        let (r3, _rx3) = oneshot::channel();
+        for (description, reply) in [("first", r1), ("sibling", r2), ("background", r3)] {
+            app.apply(AgentEvent::Confirm {
+                req: req(description),
+                reply,
+            });
+        }
+
+        app.on_key(80, key(KeyCode::Char('n')));
+        assert_eq!(rx1.try_recv().unwrap(), Decision::Stop);
+        assert_eq!(front_confirm_description(&app), "sibling");
+
+        drop(rx2);
+        app.apply(tool_end(
+            "",
+            "t2",
+            false,
+            "Not run: the user stopped the turn before this call ran.",
+        ));
+        assert_eq!(app.interactions.len(), 1);
+        assert_eq!(front_confirm_description(&app), "background");
     }
 
     /// Enter on an option with a preview answers it; there is no notes step to
@@ -4527,6 +4593,12 @@ mod tests {
         assert_eq!(app.cells[1], Cell::Note("error: boom".into()));
         app.apply(turn_ended(EndReason::Completed));
         assert_eq!(app.cells.len(), 2, "completed turns add no note");
+        // A turn a No stopped says whose move it is (plan 216).
+        app.apply(turn_ended(EndReason::Stopped));
+        assert_eq!(
+            app.cells[2],
+            Cell::Note("stopped — tell kloop what to do differently".into())
+        );
     }
 
     // --- completion popups (plan 38 slice 4) ---------------------------------

@@ -450,9 +450,12 @@ fn spawn_background_program(
     let background_executions = ctx.cfg.background_executions.clone();
     let ui = ctx.ui.clone();
     // The program's tool calls run on the program's own cancel, not the parent
-    // turn's — the parent may end while the program is still going.
+    // turn's — the parent may end while the program is still going. Its own stop
+    // too: a No inside it ends the program's remaining calls, never whichever
+    // turn the parent is in by then.
     let mut bg_ctx = ctx.clone();
     bg_ctx.cancel = own_cancel.clone();
+    bg_ctx.stop = CancellationToken::new();
     bg_ctx.enclosing_execution = Some(receipt.as_execution_ref());
     let bridge = Arc::new(CoreBridge::new(
         bg_ctx,

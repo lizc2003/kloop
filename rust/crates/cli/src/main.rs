@@ -974,6 +974,9 @@ async fn plain_main(
                 EndReason::Completed => {}
                 EndReason::MaxRounds => println!("[scheduled delivery stopped: max rounds]"),
                 EndReason::Aborted => println!("[scheduled delivery interrupted]"),
+                EndReason::Stopped => {
+                    println!("[scheduled delivery stopped — tell kloop what to do differently]")
+                }
                 EndReason::Error(error) => println!("[scheduled delivery error: {error}]"),
             }
             if exit_requested {
@@ -1085,6 +1088,7 @@ async fn plain_main(
                 println!("[interrupted before the model replied — that message was not recorded]")
             }
             EndReason::Aborted => println!("[interrupted — history patched; exiting]"),
+            EndReason::Stopped => println!("[stopped — tell kloop what to do differently]"),
             EndReason::Error(e) => println!("[error: {e}]"),
         }
         if exit_requested {

@@ -49,6 +49,9 @@ pub enum EndReason {
     Completed,
     MaxRounds,
     Aborted,
+    /// The user answered an approval No (plan 216): the batch that asked
+    /// finished, and the turn waits for what they say instead.
+    Stopped,
     Error(TurnError),
 }
 
@@ -58,6 +61,7 @@ impl EndReason {
             Self::Completed => "completed",
             Self::MaxRounds => "max_rounds",
             Self::Aborted => "aborted",
+            Self::Stopped => "stopped",
             Self::Error(_) => "error",
         }
     }
@@ -65,7 +69,7 @@ impl EndReason {
     pub fn terminal_error(&self) -> Option<&TurnError> {
         match self {
             Self::Error(error) => Some(error),
-            Self::Completed | Self::MaxRounds | Self::Aborted => None,
+            Self::Completed | Self::MaxRounds | Self::Aborted | Self::Stopped => None,
         }
     }
 
@@ -91,6 +95,9 @@ pub struct TurnOutcome {
 #[derive(Clone, Debug, Default)]
 struct TurnOptions {
     structured_schema: Option<Value>,
+    /// The stop signal this turn answers to ([`ToolCtx::stop`]): fresh for a
+    /// top-level or background turn, the parent's for a foreground child.
+    stop: CancellationToken,
 }
 
 #[cfg(test)]
@@ -102,32 +109,47 @@ pub(crate) async fn run_structured_turn(
     depth: u8,
     schema: Value,
 ) -> TurnOutcome {
-    run_structured_turn_in_context(cfg, history, ui, cancel, depth, schema, None).await
+    let options = TurnOptions {
+        structured_schema: Some(schema),
+        stop: CancellationToken::new(),
+    };
+    run_structured_turn_in_context(cfg, history, ui, cancel, depth, options, None).await
 }
 
+/// `stop` is the caller's own ([`ToolCtx::stop`]): a structured child runs in
+/// the foreground, so the user's No inside it stops the turn that spawned it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_structured_turn_in_execution(
     cfg: &Arc<Config>,
     history: &mut History,
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
+    stop: &CancellationToken,
     depth: u8,
     schema: Value,
     execution: ExecutionRef,
 ) -> TurnOutcome {
-    run_structured_turn_in_context(cfg, history, ui, cancel, depth, schema, Some(execution)).await
+    let options = TurnOptions {
+        structured_schema: Some(schema),
+        stop: stop.clone(),
+    };
+    run_structured_turn_in_context(cfg, history, ui, cancel, depth, options, Some(execution)).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_structured_turn_in_context(
     cfg: &Arc<Config>,
     history: &mut History,
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     depth: u8,
-    schema: Value,
+    options: TurnOptions,
     enclosing_execution: Option<ExecutionRef>,
 ) -> TurnOutcome {
-    if let Err(error) = crate::structured_output::validate_schema(&schema) {
+    let schema = options
+        .structured_schema
+        .as_ref()
+        .expect("a structured turn carries its schema");
+    if let Err(error) = crate::structured_output::validate_schema(schema) {
         return TurnOutcome {
             reason: EndReason::Error(format!("{error:#}").into()),
             final_text: String::new(),
@@ -141,9 +163,7 @@ async fn run_structured_turn_in_context(
         ui,
         cancel,
         depth,
-        TurnOptions {
-            structured_schema: Some(schema),
-        },
+        options,
         enclosing_execution,
     )
     .await
@@ -209,24 +229,22 @@ pub async fn run_turn_with_input(
     (outcome, returned)
 }
 
+/// `stop` decides whose turn a No inside this one ends: the caller's own
+/// [`ToolCtx::stop`] for a foreground child, a fresh token for a background one.
 pub(crate) async fn run_turn_in_execution(
     cfg: &Arc<Config>,
     history: &mut History,
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
+    stop: &CancellationToken,
     depth: u8,
     execution: ExecutionRef,
 ) -> TurnOutcome {
-    run_turn_with_options(
-        cfg,
-        history,
-        ui,
-        cancel,
-        depth,
-        TurnOptions::default(),
-        Some(execution),
-    )
-    .await
+    let options = TurnOptions {
+        structured_schema: None,
+        stop: stop.clone(),
+    };
+    run_turn_with_options(cfg, history, ui, cancel, depth, options, Some(execution)).await
 }
 
 /// Every exit records the turn's terminal state, so a rollout always says why
@@ -926,6 +944,7 @@ impl Turn<'_> {
             cfg: self.cfg.clone(),
             ui: self.ui.clone(),
             cancel: self.cancel.clone(),
+            stop: self.options.stop.clone(),
             depth: self.depth,
             enclosing_execution: self.enclosing_execution.cloned(),
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1030,6 +1049,18 @@ async fn turn_rounds(
         produced_text: String::new(),
     };
     let ending = 'turn: loop {
+        // A No answered during the last batch ends the turn here, before the
+        // model is asked for anything more: the next word is the user's. At the
+        // loop head, not in `dispatch_round`, so it also catches a No that a
+        // foreground sibling answered after this turn's own batch had ended.
+        if options.stop.is_cancelled() {
+            break 'turn Ending {
+                reason: EndReason::Stopped,
+                text: None,
+                rounds: turn.rounds,
+                structured: None,
+            };
+        }
         if cfg.max_rounds.is_some_and(|limit| turn.rounds >= limit) {
             break 'turn Ending {
                 reason: EndReason::MaxRounds,
@@ -1587,5 +1618,7 @@ pub(crate) fn top_level_tool_defs(
     build_tools(cfg, 0, &TurnOptions::default()).map(|(tools, _)| tools)
 }
 
+#[cfg(test)]
+mod stop_tests;
 #[cfg(test)]
 mod tests;

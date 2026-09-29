@@ -57,11 +57,13 @@ pub(crate) fn assemble_prompt(positional: Option<&str>, stdin: Option<&str>) -> 
 /// Exit code by end reason: 0 only on a clean finish; error, interruption, and
 /// hitting the round cap are all 1 (a script wants to know the task did not run
 /// to completion). Mirrors cc (`is_error ? 1 : 0`, and max-turns yields an
-/// error result) and codex (`error_seen`/Interrupted → 1).
+/// error result) and codex (`error_seen`/Interrupted → 1). `Stopped` takes a
+/// person answering No, which [`DenyApprover`] never does; if it ever arrives,
+/// the task did not finish either.
 pub(crate) fn exit_code(reason: &EndReason) -> i32 {
     match reason {
         EndReason::Completed => 0,
-        EndReason::MaxRounds | EndReason::Aborted | EndReason::Error(_) => 1,
+        EndReason::MaxRounds | EndReason::Aborted | EndReason::Stopped | EndReason::Error(_) => 1,
     }
 }
 
@@ -70,7 +72,9 @@ const HEADLESS_TURN_ID: u64 = 1;
 
 /// Headless permission answer: always deny. There is nobody at the keyboard, so
 /// an ask that reaches this layer is refused (the safe default). Bypass/allow
-/// flags act before the approver, so they still loosen the gate.
+/// flags act before the approver, so they still loosen the gate. `Deny`, never
+/// `Stop` (plan 216): stopping to listen when nobody is there to speak would
+/// only fail the task, while the model can often finish another way.
 #[derive(Default)]
 pub(crate) struct DenyApprover;
 
@@ -199,6 +203,7 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             EndReason::Completed => {}
             EndReason::MaxRounds => eprintln!("error: maximum rounds reached"),
             EndReason::Aborted => eprintln!("error: interrupted"),
+            EndReason::Stopped => eprintln!("error: stopped at a declined approval"),
             EndReason::Error(error) => eprintln!("error: {error}"),
         }
         HeadlessResult {

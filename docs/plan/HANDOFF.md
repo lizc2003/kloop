@@ -78,10 +78,13 @@
 源文本局部决定)、流式回答同时给出"已定稿行数"、每种 cell 声明定稿行数与能否整格离开、一个 `freeze_target`
 取代 `commit_count`/`head_freeze_lines`/`is_committable`、只有补全弹窗还暂停提交。开工前有两问(plan 第七节)。
 
-**plan 216 选 No,就停下来听(同日立，未开工)。** 审批面板的拒绝行写着 "No, and tell kloop what to do differently",
-选了之后模型却接着跑(普通工具"换个办法",计划"改好再交")。codex 同一句文案对应 `ReviewDecision::Abort`(停下等用户)。
-用户定：所有审批，人按的 No/Esc 都在这一批工具做完后结束本轮;headless 的自动拒绝照旧继续。形状:`Decision::Stop`、
-跟着轮次树走的 `stop` 令牌(前台子 agent 共用、后台各自一份)、排队中的审批撤回。开工前有两问(plan 第六节)。
+**plan 216 选 No,就停下来听 ✅(同日立、同日做完，一次提交)。** 人按的 No/Esc(plain 的 `n`、server 的
+`cancel` 与一切没说清的回复)= `Decision::Stop`:这一条不跑，同批里还没开始的也不跑(开工另问、用户定，包括本来
+不用审批的写),正在跑的跑完，轮次以 `EndReason::Stopped`(状态 `stopped`)结束、不再采样;headless 与 server
+`decline` 仍是 `Deny`(不跑、继续)。`stop` 令牌在 `ToolCtx` 上、随 `TurnOptions` 进轮次：前台子 agent/workflow/
+前台 program 共用，后台各自一份(后台被停会注回一条说明);排队中的审批与令牌赛跑、输了就撤回,TUI 在下一个
+事件时把回复已关闭的面板出队。`exit_plan_mode` 描述按用户措辞重写(Yes 就做,No 就停，分歧先用
+`ask_user_question` 问清)。细节、与 plan 的出入、测试表见 plan 216 第八节。教训 204。
 
 ## 〇、当前这一批:架构重整 plan 177–186(2026-09-21 排定)
 
@@ -1958,3 +1961,5 @@ exit 0
 202. **macOS 27 上 release 构建报 `can't find crate for <x>_macro`,不是依赖坏了,是 1.98 之前 rustc 的 strip 把 Mach-O 的字符串表只对齐到 4 字节;修法是升工具链,不是关 strip。** 同事在 macOS 27 上 `make install` 挂在 `rquickjs_macro`,dyld 报 `mis-aligned LINKEDIT string pool`。取证不需要 macOS 27:`otool -l <dylib> | awk '/cmd LC_SYMTAB/{s=1} s&&/stroff/{print $2; exit}'` 取 `stroff`,看 `% 8`。本机 1.96.1 的 release 产物里 34 个 proc-macro dylib 有 2 个是 4(都是 `rquickjs_macro`),**kloop 可执行文件本身也是 4**;dev profile 不 strip,`target/debug/deps` 的 dylib 就是链接器原样输出,61 个全对齐,拿 1.96.1 的 `rust-objcopy --strip-debug` 过一遍就有 7 个变成 4——错位出在 strip,不出在链接器。上游 rust-lang/rust#158410 修在 1.98.0。几条可复用的:(a)**同事提的 `[profile.release] strip = "none"` 不对**——`debug = 0` 只管我们自己的代码,预编译的 std 自带调试信息,cargo 默认的 `strip = "debuginfo"` 正是剥它的;macOS 上 DWARF 不进二进制所以只差 1.5%,Linux 上会整块留在 release 二进制里。社区常见的 `[profile.release.build-override] strip = false` 只放过 host 产物,而本机的 kloop 可执行文件同样错位,在 macOS 27 上能不能起来没人验过——所以不选。(b)**会不会中取决于间接符号表条目数的奇偶**,换机器、换链接器结果就变:同事那边 `serde_derive`/`tokio_macros` 也中,本机只中 `rquickjs_macro`。别拿"本机没复现"当没问题。(c)1.98.1 的 `rust-objcopy` 改成动态链接 `libLLVM.dylib`,单独调用会被 dyld 拒(找不到库),只有 rustc 调它时能跑;验证只能走真构建:`touch` 一个标记文件,`make build`,再 `find … -newer <标记>` 只查新产物(`target/` 里还躺着旧工具链的同名产物),并用 `nm -a <产物> | grep -c ' OSO '` 为 0 确认 strip 真的跑了、不是悄悄失败。结果:19 个新 dylib 与 kloop 可执行文件全部 `% 8 == 0`。(d)升到 1.98.1 新增的红:`use super::*` 已带进 `Context` 时,再写 `use anyhow::Context as _` 被判为未使用(`tools/fs/` 的 unix/windows/fallback 三个平台文件都有,**每个平台只在自己的目标上报**——unix 靠 `make check`,windows 靠教训 201 的假编译器,fallback 没有能编它的目标,只能按"父模块无条件导入 + 同形"推断);clippy 新 lint `chunks_exact_to_as_chunks`。`rust-version` 同步到 1.98:没有 CI 之后 pin 是唯一被测的版本,再写 1.96 就是一个没人核的承诺;而用旧 rustc 的人会先得到 cargo 的"需要 1.98",而不是这个 dyld 谜题。
 
 203. **plan 的"没做"里写的边界，先问它是不是这个 plan 要消灭的那个失败的常见形态;验收测试的夹具要比屏幕大。** plan 194 的目标是"用户答之前看得见计划",末节却记了一条"待答的、比视口高的计划顶部仍会被剪"——而真实计划几乎总比视口高(一次会话里三份都在 53–59 显示行),于是它在最常见的情形下没有兑现目标，用户一周后原样报回来。它的端到端测试用的是一块放得下 40 行的屏，所以一直绿。这次挖下去是**三道闸叠在一起**:plan 76 为"浮窗盖住转录"加的"有 interaction 就不提交"(plan 104 把面板并进同一份高度预算后，这道闸就没有理由了，却没人回头拆)、计划上方那条 Running 的工具行挡住 `commit_count`、`head_freeze_lines` 不碰最后一个 cell。只修任意一两道，现象不变;反证时三处逐一撤回，端到端那条每次都红，才说明三处缺一不可。判据:(a)把某样东西搬进共享预算/新架构时，把"因为它原来不在里面"而加的守卫一起列出来重审;(b)"比屏幕高"类的问题，测试夹具必须比屏幕高，并直接断言 TestBackend 的 `scrollback()`(ratatui 0.30 有)而不只是 App 状态;(c)从参考项目搬交互，搬能力不搬步骤——备注能力 Other 文本已经有了，另开一个只在 preview 选项出现的强制步骤只会让人看不懂。
+
+204. **两道防线产出同一个结果时，只断言结果的测试只测到了其中一道——反证时逐道撤回，撤了还绿的那道要找一个只有它才有的可观测差别。** plan 216 让"已停之后同批没开始的调用不跑"落在两处:`run_one` 开头一查(不发 `ItemStarted`、不跑 pre-tool hook),以及 `authorize` 里审批等待与 stop 令牌赛跑(`biased` 先看令牌，所以令牌已触发时，连不用审批的调用也在这里收成 Not run)。两处给出**一字不差**的结果文案，批次测试只比结果，于是撤掉 `run_one` 那一查它照样绿——而那一查保护的恰恰是结果里看不见的东西:一个 pre-tool hook 是任意代码，停了之后不该再跑。补的断言是"只有第一条调用发过 `ItemStarted`",撤回后立刻红。同一次还有一条写 plan 时的盲点:3.2 写"已停就直接拒、不再问",是从"问人"这个入口想的，于是只覆盖了会问人的调用;同批里排在 No 后面、**本来就不问人**的写(目录内的 `edit_file`、沙箱自动放行的 bash、bypass 下几乎一切)会照跑——用户说的是"停",不是"别再问我"。判据:(a)一条"之后都不做 X"的规则，先列出不经过 X 入口也能产生同样后果的路径;(b)反证时每道防线单独撤，**撤了还绿**本身就是一个发现，不是"那道多余"的证明。另:撤回测试里等一个本该被撤回的 future,要包 `timeout`——不然回归时它不是红，是挂住。

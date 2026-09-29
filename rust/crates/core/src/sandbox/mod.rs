@@ -68,6 +68,12 @@ pub const ESCALATION_DECLINED: &str = "\n[The user declined to run this outside 
     Do not retry with disable_sandbox; take a different approach — write within the workspace or a \
     temp directory, or ask the user how to proceed.]";
 
+/// Appended when the user answered the escalation No (plan 216): the turn ends
+/// after this batch, so there is no "different approach" to take yet.
+pub const ESCALATION_STOPPED: &str = "\n[The user declined to run this outside kloop's sandbox \
+    and stopped the turn to tell you what to do instead. Their next message says what they want; \
+    do not retry with disable_sandbox unless they ask for it.]";
+
 /// Why one root remains writable when the active workspace changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WritableRootOrigin {

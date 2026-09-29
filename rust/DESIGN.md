@@ -535,7 +535,7 @@ input). It is historical transcript data, separate from the resettable context
 estimate and never enters provider replay, public display events, or snapshots.
 The same append-only chain also carries recovery-only `session`
 records (the canonical cwd and resolved model) and display `turn_terminal`
-records (completed/max_rounds/aborted/error, positioned after a message index).
+records (completed/max_rounds/aborted/stopped/error, positioned after a message index).
 Every turn that happened writes exactly one, from the agent loop's own exits
 rather than from a front end — including the two that end a turn before its
 first sampling request — so a transcript always says why the turn stopped; a
@@ -980,12 +980,41 @@ PowerShell gets no analysis, so asking every time is the only net it has. `p`
 allows for the current `ProjectId` across sessions and linked
 worktrees, persisting the suggested rule (for example `bash(cargo build *)`) to
 `~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails, only
-the current call runs and the UI says the grant was not saved. `n` denies. A
+the current call runs and the UI says the grant was not saved. A
 shared child in the same workspace sees its parent's cache; an isolated
 worktree starts with an empty WorkspaceId partition, while the base partition
 survives the transition. Sub-agents share the session mode/approver and project
-policy. A denial is not a turn abort: the model receives an `is_error`
-`tool_result` and is told to take another approach.
+policy.
+
+**No stops the turn** (plan 216). `n` (Esc in the TUI) is "No, and tell kloop
+what to do differently", and only an ended turn keeps that promise — it is
+codex's `ReviewDecision::Abort`, whose row reads the same. The refused call gets
+an `is_error` result saying the user stopped the turn to say what to do instead;
+calls in the same batch that have not started do not run (`Not run: …`) —
+including a contained write that would never have asked, since "stop" was said
+about the batch and not about asking; calls already running finish; no further
+round is sampled, and the turn ends `stopped`. Core keeps two refusals,
+`Decision::Deny` (not this call, carry on) and `Decision::Stop`, because not
+every refusal comes from a person who will speak next:
+
+| source | answer |
+|---|---|
+| TUI No / Esc; plain `n`, any answer naming an unoffered scope, EOF | Stop |
+| server `cancel`; unknown, missing or malformed reply; client gone | Stop |
+| server `decline` | Deny |
+| headless | Deny — nobody would speak next, so stopping would only fail the task |
+
+The stop is a `CancellationToken` on `ToolCtx` next to `cancel`, meaning
+something else: `cancel` interrupts now, `stop` lets the batch finish. It follows
+the foreground turn tree — a foreground sub-agent, a workflow child and a
+foreground program's calls share their caller's, so a No inside them ends the
+caller's turn too (`run_agent` says the user stopped it) — while a background
+agent or program has its own: a No inside it ends that one alone, and the main
+agent hears why in its reinjected result. An approval still waiting in the
+stopped tree is withdrawn rather than asked: the wait races the token, the loser
+is dropped, the reply channel closes, and the TUI drops closed prompts from its
+queue on the next event. A `!cmd` injection and a scheduled check run outside
+any turn and read a Stop as a plain denial.
 
 **Change previews**: when a `write_file`/`edit_file`/`notebook_edit` reaches
 the prompt, the request carries a line-numbered diff (`crates/core/src/diff.rs`,
@@ -1073,9 +1102,15 @@ taller than the screen is read in full before it is answered, not after
 (plan 214). Each plan is marked with how it ended (`✓ approved` / `✗ not approved`), because the cell is
 on screen before there is an answer — so a rejected plan stays put with the one
 that replaced it below it, which is the comparison a rejection invites. Approve
-restores the remembered mode and the model implements; reject leaves the session
-in Plan. The tool description says to put the plan in the argument and not
-repeat it in the reply — it is now shown in full.
+restores the remembered mode and the model implements; a No leaves the session
+in Plan and ends the turn, so the user's next message says what to change (a
+server `decline` stays in Plan and lets the model keep planning). The tool
+description says so in those words — Yes means implement exactly this plan, No
+means stop — and so asks for a plan that is already decided: open choices go to
+`ask_user_question` first, and a plan never ends by asking the user to pick
+(plan 216, after one that closed with "choose A, B or C" left the user nowhere
+to answer). It also says to put the plan in the argument and not repeat it in
+the reply — it is now shown in full.
 Sub-agents inherit Plan mode and are read-only, but cannot enter or exit it.
 The provider tool array advertises both controls for the whole session, so mode
 changes do not invalidate the prompt-cache prefix.
@@ -1127,7 +1162,7 @@ something warrants a pause (a hazard, a sub-agent, no OS sandbox), the
 scrollable preview (a file-change diff; a plan is in the transcript instead, so
 its panel has no body at all), and numbered answers: `↑↓` (or `j`/`k`) moves, `1`–`9`
 picks a row directly, Enter takes the cursor row, and Esc is
-always the last row — deny, or cancel. Approvals keep their `y`/`a`/`p`/`n`
+always the last row — No (which ends the turn), or cancel. Approvals keep their `y`/`a`/`p`/`n`
 letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
 summary (green/red) above the line-numbered body (plan 38 slice 6) and scrolls
 with PgUp/PgDn, while the header, subject, options and key hint stay put. The
@@ -1135,9 +1170,13 @@ panel is live chrome, counted in the same frozen-height budget as the activity
 and todo rows, so a scrollback commit can never scroll it away. While a panel is
 up the commit pauses and the tail above it may be clipped — except under a plan
 approval, whose content is the transcript itself (see Plan mode). Prompts from a
-concurrent tool batch queue and are answered in order.
+concurrent tool batch queue and are answered in order; a No stops the turn tree
+that asked (see Permissions), and that tree's prompts still in the queue are
+withdrawn by core and leave it unasked.
 
-Notices — a retry, a mode switch, a resumed session, a failed turn — render as
+Notices — a retry, a mode switch, a resumed session, a failed turn, a turn a
+No ended (`stopped — tell kloop what to do differently`, since nothing else on
+screen says whose move it is) — render as
 dim bracketed **notes** (`[error: provider http error: openai-responses http
 403: …]`). A note **wraps** to the terminal width, continuation rows indented one
 column under the bracket, so a provider's error body reads to its end instead of
@@ -1272,7 +1311,7 @@ disabled); Ctrl+R (idle) opens the rewind picker (see
 [Fork](#fork-and-rewind)). Scrolling back through history is the terminal's job
 now (native scrollback). While a choice panel is up it captures the keyboard,
 with the same keys on every surface: ↑↓ (or j/k) move, 1–9 pick a row, Enter
-takes the cursor row, Esc is the last row (deny / cancel), and PgUp/PgDn scroll
+takes the cursor row, Esc is the last row (No / cancel), and PgUp/PgDn scroll
 a tall preview. Approvals also answer to y/a/p/n.
 `--plain` keeps the old line-based REPL; `--mock` stays on plain output.
 
@@ -1500,10 +1539,15 @@ description, preview?, remember_rules?, approval_scopes}` (the kind comes from
 core, which knows what it built — it used to be read off `preview.is_some()`,
 which made every plan arrive as a file change) (server ids are integers
 in the server's own counter space), answered `{"decision": "accept" |
-"accept_for_session" | "accept_for_project" | "decline"}`. The request is
-authoritative: the client must offer only its advertised scopes, and core rejects
-a response outside that set. `accept_always`, cancel, unknown, missing, late, and
-EOF/disconnect replies all fail closed to deny. Approval payloads never contain
+"accept_for_session" | "accept_for_project" | "decline" | "cancel"}`. The two
+refusals are codex's: `decline` refuses the call and the model carries on,
+`cancel` refuses it and ends the turn once its batch is done (`turn/completed`
+status `stopped`, plan 216 — what a person's No means everywhere else). The
+request is authoritative: the client must offer only its advertised scopes, and
+core rejects a response outside that set. `accept_always`, unknown, missing and
+malformed replies, and EOF/disconnect, all fail closed the way `cancel` does — a
+broken approval channel is no reason to let the model keep acting; a late reply
+answers nothing. Approval payloads never contain
 the ProjectId, raw identity anchor, state path, policy body, or revision.
 General model questions use
 `question/request {thread_id, turn_id, question_index, question}` only when the
@@ -3475,7 +3519,10 @@ preview plus the spilled file's path. Program success uses the same drain-time
 rule. A failure is already truncated (~900 tokens, codex's cap) with
 re-dispatch guidance; an **interrupted sub-agent reinjects nothing** (codex's
 `is_final` — its partial output is noise, and cc diverges here by delivering a
-`killed` partial). A `BackgroundExecutions`
+`killed` partial). One the user stopped with a No shows as stopped too, but it
+does reinject a note saying so and asking the model to wait for the user rather
+than re-dispatch — the model did not stop it and would not otherwise know why it
+ended (plan 216). A `BackgroundExecutions`
 registry (`core/src/tools/background_executions.rs`) tracks detached agents,
 programs, and Workflows with the admission receipt itself, enforces one shared
 concurrency cap (8), and reaps on session end. Its typed registration handle

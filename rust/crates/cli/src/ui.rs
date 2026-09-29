@@ -91,7 +91,7 @@ impl Approver for CliApprover {
             match line {
                 Ok(Ok(answer)) => approval_decision(answer.trim(), &req),
                 // Reader died or stdin closed: the safe answer is no.
-                _ => Decision::Deny,
+                _ => Decision::Stop,
             }
         })
     }
@@ -111,7 +111,7 @@ fn approval_options(request: &ConfirmRequest) -> String {
     if request.approval_scopes.contains(&ApprovalScope::Project) {
         options.push("p = allow for this project across sessions and linked worktrees");
     }
-    options.push("n = deny");
+    options.push("n = no, and tell kloop what to do differently");
     options.join(" / ")
 }
 
@@ -122,9 +122,11 @@ fn approval_decision(answer: &str, request: &ConfirmRequest) -> Decision {
         "p" => Some(ApprovalScope::Project),
         _ => None,
     };
+    // Anything but an offered scope is a person's No (plan 216): the turn
+    // stops and the next line typed is what to do instead.
     match scope.filter(|scope| request.approval_scopes.contains(scope)) {
         Some(scope) => Decision::Allow(scope),
-        None => Decision::Deny,
+        None => Decision::Stop,
     }
 }
 
@@ -431,8 +433,14 @@ mod tests {
             preview: None,
             ..Default::default()
         };
-        assert_eq!(approval_options(&once), "y = allow once / n = deny");
-        assert_eq!(approval_decision("a", &once), Decision::Deny);
+        assert_eq!(
+            approval_options(&once),
+            "y = allow once / n = no, and tell kloop what to do differently"
+        );
+        // A person's No stops the turn (plan 216), and so does an answer naming
+        // a scope this prompt did not offer.
+        assert_eq!(approval_decision("n", &once), Decision::Stop);
+        assert_eq!(approval_decision("a", &once), Decision::Stop);
         assert_eq!(
             approval_decision("y", &once),
             Decision::Allow(ApprovalScope::Once)
@@ -448,13 +456,13 @@ mod tests {
         };
         assert_eq!(
             approval_options(&all),
-            "y = allow once / a = allow for this workspace session / p = allow for this project across sessions and linked worktrees / n = deny"
+            "y = allow once / a = allow for this workspace session / p = allow for this project across sessions and linked worktrees / n = no, and tell kloop what to do differently"
         );
         assert_eq!(
             approval_decision("p", &all),
             Decision::Allow(ApprovalScope::Project)
         );
-        assert_eq!(approval_decision("always", &all), Decision::Deny);
+        assert_eq!(approval_decision("always", &all), Decision::Stop);
     }
     #[test]
     fn selection_parser_handles_single_multi_other_and_rejects_bad_input() {

@@ -2846,6 +2846,63 @@ async fn approval_declined_then_accepted() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// Plan 216, codex's two refusals: `cancel` refuses the call AND ends the turn
+/// (`stopped`), and so does a reply the client did not clearly give; `decline`
+/// refuses the call and the model carries on. The script holds a reply after
+/// every call, so a turn that did not stop would go on to consume it.
+#[tokio::test]
+async fn approval_cancel_or_a_bad_reply_stops_the_turn_but_decline_goes_on() {
+    let dirs = test_dirs("approvalstop");
+    let target = dirs.root.join("never.txt");
+    let tool_turn = vec![tool_use(
+        "t1",
+        "write_file",
+        json!({"path": target.to_str().unwrap(), "content": "x"}),
+    )];
+    let script = vec![
+        tool_turn.clone(),
+        tool_turn.clone(),
+        tool_turn,
+        vec![text("after decline")],
+    ];
+    let mut client = start_server(factory(script, dirs.offload.clone(), true), &dirs);
+    let thread_id = client.init_and_start().await;
+
+    for (answer, status) in [
+        (json!({"decision": "cancel"}), "stopped"),
+        (json!({"decision": 7}), "stopped"),
+        (json!({"decision": "decline"}), "completed"),
+    ] {
+        client
+            .request(
+                "turn/start",
+                json!({"thread_id": thread_id, "input": "write it"}),
+            )
+            .await;
+        let log = client
+            .recv_until(|m| m["method"] == "approval/request")
+            .await;
+        let srv_id = log.last().unwrap()["id"].as_i64().unwrap();
+        client
+            .send(json!({"jsonrpc": "2.0", "id": srv_id, "result": answer}))
+            .await;
+        let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+        assert_eq!(
+            log.last().unwrap()["params"]["turn"]["status"],
+            status,
+            "{answer}: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|m| m["method"] == "approval/request"),
+            "{answer}: asked again in the same turn: {log:?}"
+        );
+    }
+    assert!(!target.exists());
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 /// A plan awaiting sign-off is its own kind of approval. It used to arrive as
 /// `file_change`, because the wire read the kind off the preview's presence and
 /// a plan is the only other thing that carries one (plan 194).

@@ -315,6 +315,7 @@ pub(crate) async fn structured_agent_admitted(
     let sub_cfg = Arc::new(sub);
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
+    let stop = ctx.stop.clone();
     let depth = ctx.depth + 1;
     let subagent_of = ctx.parent_rollout_id.clone();
     let (lease, worktree) = register_child_with_cleanup(
@@ -343,6 +344,7 @@ pub(crate) async fn structured_agent_admitted(
                 &mut history,
                 &ui,
                 &cancel,
+                &stop,
                 depth,
                 schema,
                 execution,
@@ -375,6 +377,11 @@ pub(crate) async fn structured_agent_admitted(
             "workflow agent: child stopped at its round limit without valid structured_output"
         )),
         EndReason::Aborted => Err(anyhow!("workflow agent: child was interrupted")),
+        // The No may have come from a sibling: a workflow starts children after
+        // the stop too, and those end before their first round.
+        EndReason::Stopped => Err(anyhow!(
+            "workflow agent: the user declined an approval and stopped the turn"
+        )),
         EndReason::Error(error) => Err(anyhow!("workflow agent: child failed: {error}")),
     };
     if let Some(worktree) = worktree {
@@ -584,6 +591,8 @@ async fn run_sub_agent_sync(
 ) -> Result<Admitted<String>> {
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
+    // The parent's own stop: a No inside this child ends the parent's turn too.
+    let stop = ctx.stop.clone();
     let subagent_of = ctx.parent_rollout_id.clone();
     let (lease, worktree) = register_child_with_cleanup(
         &sub_cfg,
@@ -606,7 +615,16 @@ async fn run_sub_agent_sync(
                 Err(outcome) => return outcome,
             };
 
-            run_turn_in_execution(&sub_cfg, &mut history, &ui, &cancel, depth, execution).await
+            run_turn_in_execution(
+                &sub_cfg,
+                &mut history,
+                &ui,
+                &cancel,
+                &stop,
+                depth,
+                execution,
+            )
+            .await
         }
     });
     let outcome = match handle.await {
@@ -633,6 +651,12 @@ async fn run_sub_agent_sync(
             outcome.final_text
         )),
         EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
+        // Not an error the model should work around: the parent's turn ends with
+        // this batch, and the user's next message says what to do instead.
+        EndReason::Stopped => Ok(format!(
+            "[the user declined an approval in this sub-agent and stopped the turn to tell you what to do instead]\n{}",
+            outcome.final_text
+        )),
         EndReason::Error(e) => Err(anyhow!("{who}: sub-agent failed: {e}")),
     };
     // Tear down or preserve the worktree, and tell the model where a preserved
@@ -797,7 +821,19 @@ async fn spawn_background(
                 Err(outcome) => return outcome,
             };
 
-            run_turn_in_execution(&sub_cfg, &mut history, &ui, &own_cancel, depth, execution).await
+            // Its own stop as well as its own cancel: a No inside a background
+            // agent ends that agent, never whichever turn the parent is in now.
+            let own_stop = CancellationToken::new();
+            run_turn_in_execution(
+                &sub_cfg,
+                &mut history,
+                &ui,
+                &own_cancel,
+                &own_stop,
+                depth,
+                execution,
+            )
+            .await
         }
     });
     background_executions.attach_abort_registration(&registration, worker.abort_handle());
@@ -946,6 +982,8 @@ fn child_session_note(cfg: &Config, subagent_of: Option<&str>) -> String {
 /// reinjection). Success/round-limit pass through verbatim (codex); a failure
 /// is truncated; an interrupted agent reinjects nothing (codex's is_final —
 /// its partial output is noise, and the model that stopped it already knows).
+/// One the user stopped with a No shows as stopped too, but the model did not
+/// stop it and would not know why it ended, so that one says so.
 fn classify_background(outcome: TurnOutcome) -> (ExecutionStatus, Option<String>) {
     match outcome.reason {
         EndReason::Completed => (ExecutionStatus::Completed, Some(outcome.final_text)),
@@ -964,6 +1002,13 @@ fn classify_background(outcome: TurnOutcome) -> (ExecutionStatus, Option<String>
             )),
         ),
         EndReason::Aborted => (ExecutionStatus::Aborted, None),
+        EndReason::Stopped => (
+            ExecutionStatus::Aborted,
+            Some(format!(
+                "[sub-agent stopped by the user] The user declined an approval in it and stopped it to say what to do instead; wait for their next message rather than re-dispatching it.\n{}",
+                outcome.final_text
+            )),
+        ),
     }
 }
 
@@ -2591,6 +2636,84 @@ mod tests {
             classify_background(outcome(EndReason::Aborted)),
             (ExecutionStatus::Aborted, None)
         );
+        // Stopped by the user's No: shown as stopped, but the model did not
+        // stop it, so it is told who did and to wait (plan 216).
+        assert_eq!(
+            classify_background(outcome(EndReason::Stopped)),
+            (
+                ExecutionStatus::Aborted,
+                Some(
+                    "[sub-agent stopped by the user] The user declined an approval in it and stopped it to say what to do instead; wait for their next message rather than re-dispatching it.\nthe answer"
+                        .into()
+                )
+            )
+        );
+    }
+
+    /// A background agent has its own stop (plan 216): the No inside it ends
+    /// that agent and reaches the parent as a message, and the parent's own
+    /// turn is not stopped by it.
+    #[tokio::test]
+    async fn a_no_inside_a_background_agent_leaves_the_parent_running() {
+        struct AnswersNo;
+        impl crate::permissions::Approver for AnswersNo {
+            fn confirm(
+                &self,
+                _: crate::permissions::ConfirmRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::permissions::Decision> + Send + '_>,
+            > {
+                Box::pin(async { crate::permissions::Decision::Stop })
+            }
+        }
+        let provider = Provider::mock(vec![
+            vec![AssistantBlock::ToolUse {
+                id: "s1".into(),
+                name: "bash".into(),
+                input: json!({"command": "printf x > f.txt"}),
+            }],
+            vec![AssistantBlock::Text {
+                text: "never requested".into(),
+            }],
+        ]);
+        let ctx = with_provider(test_ctx(0, "bg-stop"), provider);
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.permissions = std::sync::Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Manual,
+                &Default::default(),
+                cfg.cwd.clone(),
+                Some(std::sync::Arc::new(AnswersNo)),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolCtx {
+            cfg: std::sync::Arc::new(cfg),
+            ..ctx
+        };
+
+        let (out, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "go do it", "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        for _ in 0..300 {
+            if !ctx.cfg.inbox.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let items = ctx.cfg.inbox.drain();
+        let [InboxItem::SubAgentResult { summary, .. }] = items.as_slice() else {
+            panic!("expected one reinjected result, got {items:?}");
+        };
+        assert!(
+            summary.starts_with("[sub-agent stopped by the user]"),
+            "{summary}"
+        );
+        assert!(!ctx.stop.is_cancelled(), "the parent's turn goes on");
     }
 
     #[test]

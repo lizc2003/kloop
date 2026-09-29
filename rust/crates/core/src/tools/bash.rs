@@ -306,11 +306,15 @@ pub(crate) async fn run_foreground_bash(
             // The code-level escalation loop (codex's retry-on-denial):
             // ask once, and on approval re-run the command unsandboxed —
             // one fewer model round-trip than the disable_sandbox hint.
-            match workspace
+            let asking = workspace
                 .permissions
-                .escalate_sandbox(command, Some(&denial), ctx.depth)
+                .escalate_sandbox(command, Some(&denial), ctx.depth);
+            // A prompt withdrawn by another call's stop leaves the sandboxed
+            // failure standing, exactly as a decline would; the turn is ending.
+            let outcome = super::unless_stopped(&ctx.stop, asking)
                 .await
-            {
+                .unwrap_or(EscalationOutcome::Declined);
+            match outcome {
                 EscalationOutcome::Approved => {
                     let raw =
                         run_foreground(command, &cwd, None, bash, timeout_ms, &ctx.cancel).await?;
@@ -328,6 +332,10 @@ pub(crate) async fn run_foreground_bash(
                     });
                 }
                 EscalationOutcome::Declined => text.push_str(sandbox::ESCALATION_DECLINED),
+                EscalationOutcome::Stopped => {
+                    ctx.stop.cancel();
+                    text.push_str(sandbox::ESCALATION_STOPPED);
+                }
                 EscalationOutcome::NotAttempted => text.push_str(sandbox::DENIAL_HINT),
             }
         } else {
@@ -2576,6 +2584,28 @@ Wait-Process -Id $grandchild.Id
                 !out.contains("looks like a sandbox"),
                 "declined must not double up with the hint: {out}"
             );
+            assert!(!target.exists());
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+        }
+
+        /// Escalation loop, answered No (plan 216): the sandboxed failure is
+        /// kept as on a decline, the turn is stopped, and the model is told to
+        /// wait for the user rather than find another way.
+        #[tokio::test]
+        async fn escalation_no_keeps_denial_and_stops_the_turn() {
+            let (ctx, asked) = escalating_ctx("esc-stop", crate::permissions::Decision::Stop);
+            let target = outside_dir("esc-stop").join("nope.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo climbed > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(out.ends_with(crate::sandbox::ESCALATION_STOPPED), "{out}");
+            assert!(ctx.stop.is_cancelled());
             assert!(!target.exists());
             assert_eq!(asked.load(Ordering::SeqCst), 1);
         }

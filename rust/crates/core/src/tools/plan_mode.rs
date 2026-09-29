@@ -1,8 +1,8 @@
 //! `exit_plan_mode` (plan 37): the model's escape from plan mode. It presents
 //! the plan it built during read-only exploration for the user's approval; on
 //! approval the session leaves plan mode (restoring the pre-plan mode) and the
-//! model may act, on denial it stays in plan mode to keep planning — cc's
-//! ExitPlanMode. Session-control like the worktree tools: depth-0 only, and the
+//! model may act; on the user's No it stays in plan mode and the turn ends, so
+//! the next message can say what to change (plan 216) — cc's ExitPlanMode. Session-control like the worktree tools: depth-0 only, and the
 //! approval itself runs inside `Permissions::confirm_exit_plan`, which tags the
 //! plan text `ConfirmPreview::Plan` — the popup asks the question, the plan goes
 //! into the transcript where there is room to read it (plan 194).
@@ -12,8 +12,10 @@ use anyhow::bail;
 use serde_json::Value;
 use serde_json::json;
 
+use super::NOT_RUN_STOPPED;
 use super::ToolCtx;
 use super::str_arg;
+use super::unless_stopped;
 use crate::config::EffectiveWorkspace;
 use crate::permissions::Mode;
 use crate::permissions::PlanExitOutcome;
@@ -51,14 +53,17 @@ pub(super) async fn enter_plan_mode_tool(
 pub(super) fn exit_plan_mode_def() -> ToolDef {
     ToolDef {
         name: "exit_plan_mode".into(),
-        description: "Present your implementation plan for the user's approval and leave plan \
-            mode. Use this ONLY when the session is in plan mode and you have finished exploring \
-            (read-only) and have a concrete, step-by-step plan. Pass the full plan text; the user \
-            sees it and approves or rejects. On approval, plan mode turns off and you may make \
-            changes; on rejection, you stay in plan mode — refine the plan and call this again. The \
-            plan goes in the `plan` argument and nowhere else: it is shown in full, so do not also \
-            repeat it in your reply. Do not use it to ask general questions or when not in plan \
-            mode."
+        description: "Present your finished implementation plan to the user for a go/no-go \
+            decision. Use this ONLY when the session is in plan mode, you have finished exploring \
+            (read-only), and you have a concrete, step-by-step plan. The user sees the full plan \
+            and answers Yes or No. Yes means implement exactly this plan: plan mode turns off and \
+            you proceed. No means stop: the turn ends there, you stay in plan mode, and the user's \
+            next message says what to change. Yes and No are the only answers, so the plan must \
+            already be decided: settle every open choice with ask_user_question before calling \
+            this, and never end the plan by asking the user to pick (for example \"choose A, B or \
+            C\"). The plan goes in the `plan` argument and nowhere else: it is shown in full, so do \
+            not also repeat it in your reply. Do not use it to ask general questions or when not in \
+            plan mode."
             .into(),
         schema: json!({
             "type": "object",
@@ -85,7 +90,11 @@ pub(super) async fn exit_plan_mode_tool(
         bail!("exit_plan_mode: the session is not in plan mode, so there is nothing to exit");
     }
     let plan = str_arg(input, "plan", "exit_plan_mode")?;
-    match perms.confirm_exit_plan(plan, ctx.depth).await {
+    let Some(outcome) = unless_stopped(&ctx.stop, perms.confirm_exit_plan(plan, ctx.depth)).await
+    else {
+        bail!(NOT_RUN_STOPPED);
+    };
+    match outcome {
         PlanExitOutcome::Approved(mode) => {
             // Keep a cwd/mode-tracking client (the TUI status bar) honest.
             ctx.ui.emit(&crate::event::Event::ModeChanged(mode));
@@ -99,6 +108,14 @@ pub(super) async fn exit_plan_mode_tool(
             planning. Stay in plan mode: keep exploring read-only, refine the plan, and call \
             exit_plan_mode again when it is ready."
             .into()),
+        PlanExitOutcome::Stopped => {
+            ctx.stop.cancel();
+            Ok(
+                "The user did not approve the plan and stopped the turn to say what to change. \
+                You are still in plan mode; revise the plan from their next message."
+                    .into(),
+            )
+        }
         PlanExitOutcome::NoApprover => {
             bail!("exit_plan_mode: no one is available to approve the plan in this mode")
         }

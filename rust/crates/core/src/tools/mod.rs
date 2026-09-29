@@ -93,6 +93,8 @@ use crate::config::EffectiveWorkspace;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
+use crate::permissions::Refusal;
+use crate::permissions::user_stop;
 use crate::shell_programs::ShellPrograms;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
@@ -440,6 +442,12 @@ pub struct ToolCtx {
     pub cfg: Arc<Config>,
     pub ui: Arc<dyn Ui>,
     pub cancel: CancellationToken,
+    /// The user answered an approval No (plan 216). Unlike `cancel` nothing is
+    /// interrupted: calls already running finish, calls not yet started do not
+    /// run, and the turn ends after this batch. Shared down the foreground turn
+    /// tree — a No inside a foreground sub-agent stops its parent too — while a
+    /// background agent or program carries its own.
+    pub stop: CancellationToken,
     pub depth: u8,
     /// The execution enclosing this tool call. Root turns have none; admitted
     /// Agent turns and Program/Workflow bridges replace it with their fixed ref.
@@ -484,6 +492,7 @@ impl ToolCtx {
             cfg,
             ui: Arc::new(SilentHarnessUi),
             cancel,
+            stop: CancellationToken::new(),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1011,6 +1020,32 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
     }
 }
 
+/// A call the user's stop reached before it ran: never started, or its
+/// approval was still waiting when another one was answered No.
+pub(super) const NOT_RUN_STOPPED: &str = "Not run: the user stopped the turn before this call ran.";
+
+fn not_run(tool_use_id: &str) -> ContentBlock {
+    ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.into(),
+        content: NOT_RUN_STOPPED.into(),
+        is_error: true,
+    }
+}
+
+/// Wait for an answer from the user unless the turn is stopped first. A prompt
+/// still queued behind the No that stopped the turn is withdrawn (its future is
+/// dropped, which closes the reply channel) rather than asked. `None` = stopped.
+pub(crate) async fn unless_stopped<T>(
+    stop: &CancellationToken,
+    asking: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => None,
+        answer = asking => Some(answer),
+    }
+}
+
 /// A call to a tool that cannot run at all — a retired name, a control this
 /// depth is not given, a capability this front-end does not offer, a shell this
 /// host has none of. Rejected before hooks, the permission gate or the registry
@@ -1233,9 +1268,9 @@ impl PreparedCall {
             .as_ref()
             .and_then(fs::PreparedMutation::preview_context);
         let sandbox_auto_allow = bash::sandbox_auto_allowed(name, input, workspace);
-        let permission = workspace
-            .permissions
-            .check_call_with_resolved_path(
+        let permission = unless_stopped(
+            &ctx.stop,
+            workspace.permissions.check_call_with_resolved_path(
                 name,
                 input,
                 self.mutation
@@ -1245,12 +1280,18 @@ impl PreparedCall {
                 preview_context.as_ref(),
                 ctx.depth,
                 sandbox_auto_allow,
-            )
-            .await;
+            ),
+        )
+        .await;
         match permission {
-            Ok(Some(notice)) => ctx.ui.emit(&Event::Note(notice.message)),
-            Ok(None) => {}
-            Err(reason) => bail!(reason),
+            None => bail!(NOT_RUN_STOPPED),
+            Some(Ok(Some(notice))) => ctx.ui.emit(&Event::Note(notice.message)),
+            Some(Ok(None)) => {}
+            Some(Err(Refusal::Denied(reason))) => bail!(reason),
+            Some(Err(Refusal::Stopped)) => {
+                ctx.stop.cancel();
+                bail!(user_stop(name));
+            }
         }
         Ok(())
     }
@@ -1524,6 +1565,13 @@ async fn run_one(
     ctx: ToolCtx,
     expected_program_source: Option<SourceCallBinding>,
 ) -> ContentBlock {
+    // Checked here rather than in the batch loop so it also reaches a call that
+    // sat behind the concurrency limiter, and a program's calls, which arrive
+    // one by one. Such a call never showed a row, so it emits nothing either —
+    // the same as one the batch loop marks interrupted.
+    if ctx.stop.is_cancelled() {
+        return not_run(&id);
+    }
     // This call's own cancellation scope. Cancelling the parent still reaches
     // it, so an interrupted turn behaves exactly as before; what the child buys
     // is the other direction — the deadline can stop THIS call without
@@ -2090,6 +2138,7 @@ pub(crate) mod testutil {
             cfg,
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
+            stop: CancellationToken::new(),
             depth,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4390,6 +4439,7 @@ mod tests {
             cfg: testutil::TestConfig::new("test-cancel").build(),
             ui: Arc::new(NullUi),
             cancel,
+            stop: CancellationToken::new(),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4426,5 +4476,220 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+/// Plan 216: a person's No on an approval ends the turn once its batch is done.
+#[cfg(test)]
+mod stop_tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
+
+    use super::testutil::*;
+    use super::*;
+    use crate::permissions::Approver;
+    use crate::permissions::ConfirmRequest;
+    use crate::permissions::Decision;
+    use crate::permissions::Mode;
+    use crate::permissions::PermissionRules;
+    use crate::permissions::Permissions;
+
+    /// Answers every approval with one decision and counts the asks.
+    struct Answering {
+        decision: Decision,
+        asked: AtomicUsize,
+    }
+
+    impl Approver for Answering {
+        fn confirm(
+            &self,
+            _: ConfirmRequest,
+        ) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let decision = self.decision;
+            Box::pin(async move { decision })
+        }
+    }
+
+    /// Hands each approval to the test, which answers it (or doesn't).
+    struct Handing(mpsc::UnboundedSender<oneshot::Sender<Decision>>);
+
+    impl Approver for Handing {
+        fn confirm(
+            &self,
+            _: ConfirmRequest,
+        ) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
+            let (reply, answer) = oneshot::channel();
+            self.0.send(reply).unwrap();
+            Box::pin(async move { answer.await.unwrap_or(Decision::Deny) })
+        }
+    }
+
+    /// A manual-mode gate over a fresh directory that is also the cwd, so a
+    /// write inside it is contained (never asks) while an opaque bash script
+    /// always does.
+    fn gated_ctx(tag: &str, approver: Arc<dyn Approver>) -> (ToolCtx, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kloop-plan216-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let ctx = test_ctx(0, tag);
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.cwd = dir.clone();
+        cfg.permissions = Arc::new(
+            Permissions::new(
+                Mode::Manual,
+                &PermissionRules::default(),
+                dir.clone(),
+                Some(approver),
+            )
+            .unwrap(),
+        );
+        (
+            ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            },
+            dir,
+        )
+    }
+
+    fn result(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error: true,
+        }
+    }
+
+    /// Records which calls started.
+    #[derive(Default)]
+    struct Started(std::sync::Mutex<Vec<String>>);
+
+    impl Ui for Started {
+        fn emit(&self, ev: &Event) {
+            if let Event::ItemStarted { id, .. } = ev {
+                self.0.lock().unwrap().push(id.clone());
+            }
+        }
+    }
+
+    /// The No answers its own call and stops the turn; nothing after it in the
+    /// batch runs, including a write that would never have asked — and none
+    /// of those even starts (no row, no pre-tool hook).
+    #[tokio::test]
+    async fn a_no_leaves_the_rest_of_the_batch_unrun() {
+        let approver = Arc::new(Answering {
+            decision: Decision::Stop,
+            asked: AtomicUsize::new(0),
+        });
+        let (mut ctx, dir) = gated_ctx("batch", approver.clone());
+        let started = Arc::new(Started::default());
+        ctx.ui = started.clone();
+        let results = dispatch_tools(
+            vec![
+                (
+                    "b1".into(),
+                    "bash".into(),
+                    json!({"command": "printf x > one.txt"}),
+                ),
+                (
+                    "w1".into(),
+                    "write_file".into(),
+                    json!({"path": dir.join("two.txt"), "content": "x"}),
+                ),
+                (
+                    "b2".into(),
+                    "bash".into(),
+                    json!({"command": "printf y > three.txt"}),
+                ),
+            ],
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            results,
+            vec![
+                result("b1", &user_stop("bash")),
+                result("w1", NOT_RUN_STOPPED),
+                result("b2", NOT_RUN_STOPPED),
+            ]
+        );
+        assert_eq!(approver.asked.load(Ordering::SeqCst), 1, "asked only once");
+        assert_eq!(*started.0.lock().unwrap(), vec!["b1".to_string()]);
+        assert!(ctx.stop.is_cancelled());
+        assert!(!ctx.cancel.is_cancelled(), "a stop is not an interrupt");
+        assert!(!dir.join("two.txt").exists());
+    }
+
+    /// A plain Deny — what headless answers — refuses the call and nothing
+    /// more: the turn goes on and the next call in the batch runs.
+    #[tokio::test]
+    async fn a_deny_refuses_one_call_and_the_batch_goes_on() {
+        let approver = Arc::new(Answering {
+            decision: Decision::Deny,
+            asked: AtomicUsize::new(0),
+        });
+        let (ctx, dir) = gated_ctx("deny", approver.clone());
+        let results = dispatch_tools(
+            vec![
+                (
+                    "b1".into(),
+                    "bash".into(),
+                    json!({"command": "printf x > one.txt"}),
+                ),
+                (
+                    "w1".into(),
+                    "write_file".into(),
+                    json!({"path": dir.join("two.txt"), "content": "x"}),
+                ),
+            ],
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            results[0],
+            result(
+                "b1",
+                "The user declined this bash call. Do not retry the same call; take a different approach, or ask the user how to proceed."
+            )
+        );
+        assert!(
+            matches!(
+                &results[1],
+                ContentBlock::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ),
+            "{results:?}"
+        );
+        assert!(!ctx.stop.is_cancelled());
+        assert!(dir.join("two.txt").exists());
+    }
+
+    /// An approval still waiting when another call's No stops the turn is
+    /// withdrawn: the call does not run, and the reply channel closes, which
+    /// is how a front-end knows to take the question down.
+    #[tokio::test]
+    async fn a_waiting_approval_is_withdrawn_when_the_turn_stops() {
+        let (asks, mut asked) = mpsc::unbounded_channel();
+        let (ctx, _dir) = gated_ctx("withdraw", Arc::new(Handing(asks)));
+        let call = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { run_tool("bash", json!({"command": "printf x > f.txt"}), &ctx).await }
+        });
+        let reply = asked.recv().await.expect("the call asks");
+        assert!(!reply.is_closed());
+
+        ctx.stop.cancel();
+        let settled = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the stop withdraws the wait instead of leaving it hanging");
+        assert_eq!(settled.unwrap(), (NOT_RUN_STOPPED.to_string(), true));
+        assert!(reply.is_closed(), "nobody is waiting for this answer now");
     }
 }

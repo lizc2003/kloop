@@ -94,7 +94,22 @@ pub enum ApprovalScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Allow(ApprovalScope),
+    /// Not this call; the model carries on without it. For an approver with
+    /// no one behind it (headless), and for a client that asked for exactly that.
     Deny,
+    /// Not this call, and stop the turn here: the user will say what to do
+    /// instead. What a person's No means (plan 216).
+    Stop,
+}
+
+/// Why the gate refused a call, when the difference matters to the turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// A rule, a mode, or an answer that leaves the model free to go on.
+    Denied(String),
+    /// The person answered [`Decision::Stop`]: this call does not run, and the
+    /// turn ends once its batch is done.
+    Stopped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +169,8 @@ pub enum EscalationOutcome {
     /// The user was asked and declined: keep the sandboxed failure and do
     /// not invite a disable_sandbox retry.
     Declined,
+    /// Declined with [`Decision::Stop`]: as `Declined`, and the turn ends.
+    Stopped,
     /// Not asked (no approver, or tests/`--mock`): fall back to the
     /// model-driven denial hint.
     NotAttempted,
@@ -219,6 +236,8 @@ pub enum PlanExitOutcome {
     Approved(Mode),
     /// The user declined: the session stays in plan mode.
     Declined,
+    /// Declined with [`Decision::Stop`]: still in plan mode, and the turn ends.
+    Stopped,
     /// No approver available (headless / no TTY): the tool reports the block.
     NoApprover,
 }
@@ -886,6 +905,7 @@ impl Permissions {
             Decision::Allow(ApprovalScope::Once) => PlanExitOutcome::Approved(self.exit_plan()),
             Decision::Allow(ApprovalScope::WorkspaceSession | ApprovalScope::Project)
             | Decision::Deny => PlanExitOutcome::Declined,
+            Decision::Stop => PlanExitOutcome::Stopped,
         }
     }
 
@@ -908,6 +928,9 @@ impl Permissions {
     /// whose policy opts into approval-free contained runs. Only dispatch
     /// can know that (it is a fact of the call, not of the gate), so it
     /// arrives as a parameter.
+    ///
+    /// For a caller outside any turn (a `!cmd` injection, a scheduled check):
+    /// there is no turn to stop, so a [`Decision::Stop`] reads as a plain denial.
     pub async fn check_call(
         &self,
         name: &str,
@@ -917,6 +940,10 @@ impl Permissions {
     ) -> Result<Option<PermissionNotice>, String> {
         self.check_call_with_resolved_path(name, input, None, None, depth, sandbox_auto_allow)
             .await
+            .map_err(|refusal| match refusal {
+                Refusal::Denied(reason) => reason,
+                Refusal::Stopped => user_denial(name),
+            })
     }
 
     /// Mutation dispatch resolves and opens the target parent before permission.
@@ -930,7 +957,7 @@ impl Permissions {
         preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
         sandbox_auto_allow: bool,
-    ) -> Result<Option<PermissionNotice>, String> {
+    ) -> Result<Option<PermissionNotice>, Refusal> {
         if self.allow_everything {
             return Ok(None);
         }
@@ -948,19 +975,19 @@ impl Permissions {
 
         // 1. Deny rules — before everything, immune to every mode.
         if self.matches_deny(name, &call) {
-            return Err(format!(
+            return Err(Refusal::Denied(format!(
                 "{name}: blocked by a deny permission rule. Do not retry this call or try to \
                  work around the rule; choose a different approach or ask the user."
-            ));
+            )));
         }
 
         // 2. Sensitive reads — credentials and agent state must never enter the
         // model context. This is a hard verdict before plan/sandbox/bypass and
         // cannot be remembered or approved away.
         if call.sensitive_read {
-            return Err(format!(
+            return Err(Refusal::Denied(format!(
                 "{name}: reading this sensitive path is blocked. Do not retry or work around the protection."
-            ));
+            )));
         }
 
         // 3. Plan mode — read-only exploration only. A mutating call is refused
@@ -969,12 +996,12 @@ impl Permissions {
         // Above safety on purpose: a destructive command here is a flat "no",
         // not a "[destructive] approve?" whose yes would break the promise.
         if self.mode() == Mode::Plan && !call.is_readonly(name) {
-            return Err(format!(
+            return Err(Refusal::Denied(format!(
                 "{name}: this session is in plan mode, so only read-only exploration is allowed \
                  — file edits and commands with side effects are blocked. Keep investigating \
                  read-only, then call exit_plan_mode with your plan to get the user's approval \
                  before making any changes."
-            ));
+            )));
         }
 
         // 4. Safety checks — bypass-immune, straight to the user.
@@ -1125,11 +1152,12 @@ impl Permissions {
         depth: u8,
         hazard_tag: Option<&str>,
         remember: Option<Remember>,
-    ) -> Result<Option<PermissionNotice>, String> {
+    ) -> Result<Option<PermissionNotice>, Refusal> {
+        let denied = || Refusal::Denied(user_denial(name));
         let Some(approver) = &self.session.approver else {
-            return Err(format!(
+            return Err(Refusal::Denied(format!(
                 "{name}: approval required but no approver is available in this mode; denied."
-            ));
+            )));
         };
         let mut approval_scopes = vec![ApprovalScope::Once];
         if let Some(remember) = &remember {
@@ -1150,28 +1178,28 @@ impl Permissions {
                 .await
                 .map(ConfirmPreview::FileChange),
         };
-        let decision = approver.confirm(req).await;
-        let Decision::Allow(scope) = decision else {
-            return Err(user_denial(name));
+        let scope = match approver.confirm(req).await {
+            Decision::Allow(scope) => scope,
+            Decision::Deny => return Err(denied()),
+            Decision::Stop => return Err(Refusal::Stopped),
         };
         if !approval_scopes.contains(&scope) {
-            return Err(user_denial(name));
+            return Err(denied());
         }
         match scope {
             ApprovalScope::Once => Ok(None),
             ApprovalScope::WorkspaceSession => {
                 let Some(remember) = remember else {
-                    return Err(user_denial(name));
+                    return Err(denied());
                 };
                 self.remember_in_session(remember.signatures);
                 Ok(None)
             }
             ApprovalScope::Project => {
                 let Some(remember) = remember else {
-                    return Err(user_denial(name));
+                    return Err(denied());
                 };
-                let additions =
-                    ProjectAllowRules::parse(&remember.rules).map_err(|_| user_denial(name))?;
+                let additions = ProjectAllowRules::parse(&remember.rules).map_err(|_| denied())?;
                 match self.project.persist(additions).await {
                     Ok(_) => Ok(None),
                     Err(_) => Ok(Some(PermissionNotice {
@@ -1279,9 +1307,10 @@ impl Permissions {
             )),
             preview: None,
         };
-        let decision = approver.confirm(req).await;
-        let Decision::Allow(scope) = decision else {
-            return EscalationOutcome::Declined;
+        let scope = match approver.confirm(req).await {
+            Decision::Allow(scope) => scope,
+            Decision::Deny => return EscalationOutcome::Declined,
+            Decision::Stop => return EscalationOutcome::Stopped,
         };
         if !approval_scopes.contains(&scope) {
             return EscalationOutcome::Declined;
@@ -1430,6 +1459,14 @@ fn escalation_remember_payload(command: &str) -> Option<Remember> {
 fn user_denial(name: &str) -> String {
     format!(
         "The user declined this {name} call. Do not retry the same call; take a different approach, or ask the user how to proceed."
+    )
+}
+
+/// What [`Refusal::Stopped`] tells the model. The turn ends after this batch,
+/// so "take a different approach" would be advice it gets no round to follow.
+pub(crate) fn user_stop(name: &str) -> String {
+    format!(
+        "The user declined this {name} call and stopped the turn to tell you what to do instead. Their next message says what they want; do not retry this call unless they ask for it."
     )
 }
 
@@ -3511,6 +3548,32 @@ mod tests {
         assert!(err.contains("different approach"), "{err}");
     }
 
+    /// Plan 216: inside a turn a No is its own refusal, which dispatch turns
+    /// into the end of the turn; a caller outside any turn (`check_call`) has no
+    /// turn to end and hears the ordinary denial. A plain Deny stays a denial on
+    /// both paths.
+    #[tokio::test]
+    async fn a_stop_is_its_own_refusal_only_inside_a_turn() {
+        let approver = ScriptedApprover::new(vec![Decision::Stop, Decision::Stop, Decision::Deny]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        let write = file("/elsewhere/x.txt");
+        assert_eq!(
+            p.check_call_with_resolved_path("write_file", &write, None, None, 0, false)
+                .await,
+            Err(Refusal::Stopped)
+        );
+        assert_eq!(
+            p.check_call("write_file", &write, 0, false).await,
+            Err(user_denial("write_file"))
+        );
+        assert_eq!(
+            p.check_call_with_resolved_path("write_file", &write, None, None, 0, false)
+                .await,
+            Err(Refusal::Denied(user_denial("write_file")))
+        );
+        assert_eq!(approver.ask_count(), 3);
+    }
+
     #[tokio::test]
     async fn no_approver_auto_denies_instead_of_hanging() {
         let p = Permissions::new(
@@ -3667,8 +3730,11 @@ mod tests {
     /// mock) reports NotAttempted so the caller falls back to the hint.
     #[tokio::test]
     async fn escalate_sandbox_maps_decision_and_mode() {
-        let approver =
-            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once), Decision::Deny]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::Once),
+            Decision::Deny,
+            Decision::Stop,
+        ]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("npm install", None, 0).await,
@@ -3678,7 +3744,11 @@ mod tests {
             p.escalate_sandbox("git push", None, 0).await,
             EscalationOutcome::Declined
         );
-        assert_eq!(approver.ask_count(), 2);
+        assert_eq!(
+            p.escalate_sandbox("git push", None, 0).await,
+            EscalationOutcome::Stopped
+        );
+        assert_eq!(approver.ask_count(), 3);
         assert!(
             approver.asked()[0]
                 .description
@@ -3996,6 +4066,19 @@ mod tests {
             PlanExitOutcome::Declined
         );
         assert_eq!(p.mode(), Mode::Plan, "denied exit keeps plan mode");
+    }
+
+    /// A No on a plan (plan 216) is its own outcome — the tool ends the turn on
+    /// it — and leaves plan mode exactly as a decline does.
+    #[tokio::test]
+    async fn confirm_exit_plan_reports_a_stop_and_stays_in_plan() {
+        let approver = ScriptedApprover::new(vec![Decision::Stop]);
+        let p = gate(Mode::Plan, rules(&[], &[], &[]), approver);
+        assert_eq!(
+            p.confirm_exit_plan("the plan", 0).await,
+            PlanExitOutcome::Stopped
+        );
+        assert_eq!(p.mode(), Mode::Plan);
     }
 
     /// A construction-time plan mode restores to manual on exit (no prior mode).

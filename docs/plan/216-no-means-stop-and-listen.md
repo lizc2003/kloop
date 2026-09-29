@@ -131,13 +131,59 @@ pub enum Decision {
 
 ## 六、开工时定(问用户，一次一个)
 
-1. **轮次因 Stop 结束，要不要单独的结束原因?** 推荐加 `EndReason::Stopped`(server 的 turn 状态 `stopped`),
-   TUI 在转录末尾补一行 dim 提示"stopped — tell kloop what to do differently",让人一眼知道"轮到我说了"。
-   另一选择是复用 `Completed`、什么都不显示。
-2. **server 的 `decline` 是否也改成停?** 推荐不改：照 codex 保留"不执行、继续"与"停下来"两种，给客户端选。
+1. ~~**轮次因 Stop 结束，要不要单独的结束原因?**~~ 用户「同意」推荐:加 `EndReason::Stopped`(server 的 turn
+   状态 `stopped`),TUI 在转录末尾补一行 dim 提示"stopped — tell kloop what to do differently"。
+2. ~~**server 的 `decline` 是否也改成停?**~~ 用户「同意」推荐：不改,`decline` = 不执行、继续,`cancel` = 停。
+3. (开工时新发现、另问)**同批里排在 No 之后、本来不用审批的调用要不要也跳过?** 3.2 只写了"要审批的直接拒",
+   没想到同批里还有自动放行的写(工作目录内的 `edit_file`、沙箱自动放行的 bash、bypass 下几乎一切)——照字面，
+   按了 No 之后它们照样改文件。用户「同意」推荐:**已停之后，同批里还没开始的调用一律不跑**,正在跑的不打断。
 
 ## 七、收尾
 
 - DESIGN.md:权限/审批一节(拒绝的两种语义与来源表)、Plan mode 一段("reject leaves the session in Plan"
   之外补"并结束本轮")、server 协议里 `decision` 各取值的含义、TUI 面板一段(Esc/No 的效果)。
 - HANDOFF:状态行 ✅ + 提交号;有新教训就写。
+
+## 八、✅ 完成
+
+2026-09-29 当次会话做完，一次提交(SHA 以本条所在提交为准)。`make check` 全绿。
+
+与第三节的出入(都是实现时定的，不改语义):
+
+- **`stop` 放在 `TurnOptions` 里**,不单独加 `Turn` 字段、也不给 `run_turn_with_options`/`turn_rounds` 再加一个
+  位置参数:options 本来就穿过整个循环。`run_turn_in_execution`/`run_structured_turn_in_execution` 多一个
+  `stop` 参数，由调用方决定(前台传 `ctx.stop`,后台传新的)。`run_turn`/`run_turn_with_input` 每次新建。
+- **停止检查放在轮次循环头**,不放在 `dispatch_round` 里:效果对自己的批次一样，另外还能接住"自己这批已经
+  结束、兄弟子 agent 才按的 No",不会多采样一轮。
+- **"没跑"只有一种文案**:"Not run: the user stopped the turn before this call ran."——没开始的、审批被撤回的
+  都用它(第三问的结果让 3.3 的"before this call was approved"不再准确)。检查放在 `run_one` 开头(还没发
+  `ItemStarted`,不跑 pre-tool hook);审批等待与 `stop` 赛跑的那一处放在 `PreparedCall::authorize`。
+  `exit_plan_mode` 与沙箱升级的等待也赛跑(`unless_stopped`),撤回的升级按拒绝处理(保留沙箱内的失败)。
+- **后台子 agent 被 No 停下**:状态记 `Aborted`(界面上是 "stopped"),但与 stop_agent 停的不同，**要注回一条**
+  "[sub-agent stopped by the user] … wait for their next message rather than re-dispatching it"——模型没停它，
+  不注回就不知道它为什么没了。
+- **workflow 的子 agent**:workflow 桥不走 `run_one`,停了之后还可能起新的子 agent;它们在第 0 轮前就以
+  `Stopped` 结束，所以报错文案不写"在这个子 agent 里拒绝了",只写"用户拒绝了一次审批、停了本轮"。
+- **server 断连 / 发不出去**也按 `Stop`(3.1 表里"断连"一行);plain 的选项文案从 `n = deny` 改成
+  `n = no, and tell kloop what to do differently`,与 TUI 一致。
+- **TUI 的计划 cell** 仍打 `✗ not approved — still planning`(第四节说可改非必须):仍在 Plan 档，这句仍然对。
+
+| 测试 | 锁住什么 |
+|---|---|
+| `tools::stop_tests::a_no_leaves_the_rest_of_the_batch_unrun` | `[bash(问→Stop), 目录内 write_file(自动放行), bash]`:结果依次是 stop 文案、Not run、Not run(整对象);只问一次;只有 b1 发过 `ItemStarted`;文件没写;`cancel` 没被触发 |
+| `tools::stop_tests::a_deny_refuses_one_call_and_the_batch_goes_on` | headless 的形状:`Deny` 只拒这一条，同批下一条照跑,`stop` 不触发 |
+| `tools::stop_tests::a_waiting_approval_is_withdrawn_when_the_turn_stops` | 正在等的审批遇到 stop:5 秒内收成 Not run,回复通道被关闭 |
+| `agent::stop_tests::a_no_ends_the_turn_without_asking_the_model_again` | `EndReason::Stopped`、状态串 `stopped`、脚本里备好的第 1 轮**没被请求**、历史三条且结果配对 |
+| `agent::stop_tests::a_no_inside_a_foreground_sub_agent_stops_the_parent` | 子 agent 里的 No 让父也停:只请求了父第 0 轮与子第 0 轮;`run_agent` 结果写明用户在子 agent 里叫停 |
+| `agent::stop_tests::a_no_on_the_plan_ends_the_turn_in_plan_mode` | 计划被 No:轮次停、仍在 Plan 档、结果文案整句 |
+| `subagent::tests::a_no_inside_a_background_agent_leaves_the_parent_running` | 后台子 agent 里的 No:注回 "[sub-agent stopped by the user]…",父的 `stop` 不受影响 |
+| `subagent::tests::classify_background_maps_outcomes` | `Stopped` → `(Aborted, 注回说明)` |
+| `bash::tests::seatbelt::escalation_no_keeps_denial_and_stops_the_turn` | 沙箱升级被 No:保留沙箱失败、以 `ESCALATION_STOPPED` 结尾、`stop` 触发(macOS) |
+| `permissions::tests::a_stop_is_its_own_refusal_only_inside_a_turn` / `…escalate_sandbox_maps_decision_and_mode` / `…confirm_exit_plan_reports_a_stop_and_stays_in_plan` | 闸里 `Stop` → `Refusal::Stopped`,`check_call`(注入/调度)读作普通拒绝;升级与计划各自的 `Stopped` |
+| `app::tests::withdrawn_confirms_leave_the_queue` 等 | TUI:No/Esc/`n`/最后一行都回 `Stop`;回复已关闭的审批在下一个事件时出队，别处的留下;`Stopped` 的提示行 |
+| `server.rs::approval_cancel_or_a_bad_reply_stops_the_turn_but_decline_goes_on` | 契约:`cancel` 与畸形回复 → `turn/completed` 状态 `stopped` 且不再问;`decline` → `completed`(模型接着跑) |
+| `ui::tests::approval_prompt_and_answers_follow_advertised_scopes` | plain:`n` 与未提供的范围都是 `Stop` |
+
+反证：五处机制逐一撤回，各自的测试都红——去掉循环头检查(三条 agent 测试)、去掉 `run_one` 的提前检查
+(批次测试，靠 `ItemStarted` 断言;只看结果文案时它被 authorize 的赛跑遮住，见教训 204)、审批等待不赛跑
+(撤回测试，超时)、前台子 agent 拿新令牌(父停测试)、TUI 不剪队列(出队测试)。
