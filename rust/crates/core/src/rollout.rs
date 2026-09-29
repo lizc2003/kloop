@@ -3593,13 +3593,14 @@ mod tests {
         ] {
             assert!(checked_session_path(dir, id).is_ok(), "rejected {id:?}");
         }
-        let target = dir.join("outside.jsonl");
-        std::fs::write(&target, b"not a session").unwrap();
-        let leaf = dir.join("link.jsonl");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &leaf).unwrap();
-        #[cfg(unix)]
-        assert!(checked_session_path(dir, "link").is_err());
+        {
+            let target = dir.join("outside.jsonl");
+            std::fs::write(&target, b"not a session").unwrap();
+            let leaf = dir.join("link.jsonl");
+            std::os::unix::fs::symlink(&target, &leaf).unwrap();
+            assert!(checked_session_path(dir, "link").is_err());
+        }
         cleanup(&path);
     }
 

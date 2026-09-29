@@ -12,7 +12,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 
 use crate::private_store::read_private_string;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::private_store::write_private_atomic;
 
 pub(crate) const GLOBAL_CONFIG: &str = ".kloop/config.toml";
@@ -171,16 +171,15 @@ fn validate_root(table: &toml::Table) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn path(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dir =
             std::env::temp_dir().join(format!("kloop-user-config-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         dir.join("config.toml")
     }
 

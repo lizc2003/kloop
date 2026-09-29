@@ -515,7 +515,6 @@ pub(super) fn reject_unsafe_component(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let root =

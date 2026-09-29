@@ -1313,15 +1313,15 @@ impl Child {
     pub(super) async fn cleanup_after_exit(&mut self, timeout: Duration) -> io::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut first_error = self.killer.terminate().err();
-        if let Err(error) = wait_tree_empty(&self.killer, deadline).await {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+        if let Err(error) = wait_tree_empty(&self.killer, deadline).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        if let Err(error) = self.finish_debugger(deadline).await {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+        if let Err(error) = self.finish_debugger(deadline).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
         match first_error {
             Some(error) => Err(error),
@@ -1353,15 +1353,15 @@ impl Child {
                 None
             }
         };
-        if let Err(error) = wait_tree_empty(&self.killer, deadline).await {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+        if let Err(error) = wait_tree_empty(&self.killer, deadline).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        if let Err(error) = self.finish_debugger(deadline).await {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
+        if let Err(error) = self.finish_debugger(deadline).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
         match (first_error, exit) {
             (Some(error), _) => Err(error),

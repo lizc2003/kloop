@@ -179,6 +179,7 @@ fn create_private_dir_all(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         create_private_dir_all(parent)?;
     }
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

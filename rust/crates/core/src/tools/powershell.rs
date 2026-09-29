@@ -328,10 +328,10 @@ mod tests {
         async fn wait_for_pid(marker: &Path) -> u32 {
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
-                    if let Ok(text) = std::fs::read_to_string(marker) {
-                        if let Ok(pid) = text.trim().parse() {
-                            return pid;
-                        }
+                    if let Ok(text) = std::fs::read_to_string(marker)
+                        && let Ok(pid) = text.trim().parse()
+                    {
+                        return pid;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
