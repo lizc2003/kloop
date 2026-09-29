@@ -81,8 +81,23 @@ pub enum Decision {
 - 同批里因此没问、没跑的:"Not run: the user stopped the turn before this call was approved."
 - 计划被拒:"The user did not approve the plan and stopped the turn to say what to change. You are still in
   plan mode; revise the plan from their next message."
-- `exit_plan_mode` 的工具描述补一句：有待用户拍板的分歧，先用 `ask_user_question` 问清再交计划，不要让
-  计划以"请选 A/B/C"结尾(截图里那份正是这样)。
+- **`exit_plan_mode` 的工具描述重写**(`tools/plan_mode.rs` 的 `exit_plan_mode_def`,用户 2026-09-29 定:
+  「要明确显示plan了，yes就是做，no就是停」;另要求有待选的分歧先用 `ask_user_question` 问清，计划不要以
+  "请选 A/B/C"结尾——截图里那份正是这样)。**与本条的行为同一次提交**,否则"No 就是停"是一句假话。
+  措辞(model-facing,英文):
+
+  > Present your finished implementation plan to the user for a go/no-go decision. Use this ONLY when the
+  > session is in plan mode, you have finished exploring (read-only), and you have a concrete, step-by-step
+  > plan. The user sees the full plan and answers Yes or No. **Yes means implement exactly this plan**: plan
+  > mode turns off and you proceed. **No means stop**: the turn ends there, you stay in plan mode, and the
+  > user's next message says what to change. Yes and No are the only answers, so the plan must already be
+  > decided: settle every open choice with ask_user_question before calling this, and never end the plan by
+  > asking the user to pick (for example "choose A, B or C"). The plan goes in the `plan` argument and nowhere
+  > else: it is shown in full, so do not also repeat it in your reply. Do not use it to ask general questions
+  > or when not in plan mode.
+
+  `enter_plan_mode` 的描述与返回文案里 "for approval" 的说法与此一致，不用改;测试里若有对描述全文的
+  整串断言，一并更新。
 
 ### 3.4 轮次怎么结束
 
