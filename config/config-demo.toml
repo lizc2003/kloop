@@ -27,8 +27,7 @@ base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
 model       = "gpt-5.6-sol"
 models      = ["gpt-5.6-sol", "gpt-5.6-terra"]
-# context_window = 200000                               # only if the gateway hands out
-                                                        # less than the model itself takes
+# context_window = 200000
 effort      = "xhigh"
 
 # chat → POST {base_url}/chat/completions
@@ -36,7 +35,17 @@ effort      = "xhigh"
 wire_api    = "chat"
 base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
-model       = "deepseek-v4.1-flash"                           # no `models` = just this one
+model       = "grok-4.5"                           # no `models` = just this one
+effort      = "max"
+
+# responses → POST {base_url}/responses
+[providers.k-flash]
+wire_api    = "responses"
+base_url    = "https://gateway.example.com/v1"
+auth_header = { Authorization = "Bearer REPLACE-ME" }
+model       = "deepseek-v4.1-flash"
+models      = ["deepseek-v4-flash-0731", "deepseek-v4.1-flash", "glm-5.3-flash"]
+context_window = 1000000
 effort      = "xhigh"
 
 
