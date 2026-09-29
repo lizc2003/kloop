@@ -148,7 +148,7 @@ core,mock provider,整对象断言优先:
 
 ## 七、完成记录
 
-✅ 2026-09-29,提交见下(`feat(plan209): ...`)。
+✅ 2026-09-29,`1b966a9`(`feat(plan209): let /compact take a focus for this one summary`)。
 
 **第四节两问**:① 焦点只偏重这一次，不进 `UserAnchors`、不进 rollout(照推荐);② 超过 2,000 字符拒绝、不截断(照推荐)。
 开工另问了一件：真实 API 用本机默认 provider(`sky-bj`,`deepseek-v4.1-flash`)——用户同意。
