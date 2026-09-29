@@ -1,6 +1,6 @@
 # Plan 207 — 换了 provider,工具调用的 id 也得能过关 ✅
 
-> **已完成(2026-09-28)**,提交号见第七节。开工实测推翻了第二、三节的几处设计,**以第七节为准**。
+> **已完成(2026-09-28,`7bf137a`)**。开工实测推翻了第二、三节的几处设计,**以第七节为准**。
 
 > 来源:2026-09-24 读 `refs/pi`(`earendil-works/pi@d5629e2`,MIT)后与用户逐条定的,
 > 出处见 `refs/README.md`「Pi 全面复查(2026-09-24)」第 3 条。
@@ -188,4 +188,4 @@ config 里已配的网关 provider:Messages、Responses 各一个,Chat 走 Respo
   core `history.rs` 1 条(Chat→Anthropic 切换仍 `Preserved`、request view 与 rollout 等于 canonical)。
   现有断言期望值一个没改,只加了 `.unwrap()`。
 
-**提交**:见 git log `feat(plan207)`。
+**提交**:`7bf137a`。
