@@ -36,8 +36,8 @@ effort      = "xhigh"
 wire_api    = "chat"
 base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
-model       = "glm-5.3-flash"                           # no `models` = just this one
-effort      = "max"
+model       = "deepseek-v4.1-flash"                           # no `models` = just this one
+effort      = "xhigh"
 
 
 # [models."<id>"] — facts about a model, shared by every provider. All optional.
