@@ -595,7 +595,7 @@ fn serialize_notebook(notebook: &OrderedValue) -> Result<Vec<u8>> {
 
 fn generated_cell_id() -> Result<String> {
     let mut bytes = [0u8; 4];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|error| anyhow!("notebook_edit: could not generate a cell id: {error}"))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }

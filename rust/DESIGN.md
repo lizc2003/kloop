@@ -3999,6 +3999,20 @@ vt100 0.16.2; portable-pty, vt100, tempfile, insta 1 (whole-screen baselines),
 and its fixture wiremock remain dev edges rather than production or Windows
 dependencies.
 
+HTTP (providers, `web_fetch`/`web_search`, MCP over HTTP and its OAuth) goes
+through reqwest 0.13 with rustls on the aws-lc-rs provider. Server certificates
+are checked against the **operating system's trust store**
+(`rustls-platform-verifier`), not a root list compiled into the binary: a CA the
+machine already trusts (a corporate TLS-inspecting proxy's, say) works without
+configuration, and a Linux host needs its system CA bundle installed. Proxies
+still come only from the `HTTP(S)_PROXY`/`NO_PROXY` environment; reqwest's
+`system-proxy` feature stays off, so macOS/Windows system proxy settings are not
+read. The C parts of the build (QuickJS, tree-sitter, aws-lc) need a C compiler
+for the target; on the usual targets none of them needs libclang or CMake.
+x86_64 Windows is the exception for aws-lc: it wants NASM on `PATH`, or
+`AWS_LC_SYS_PREBUILT_NASM=1` to link the assembly objects aws-lc ships instead
+(ring, the provider before reqwest 0.13, needed neither).
+
 ```sh
 # usage summary of every flag
 cargo run -- --help

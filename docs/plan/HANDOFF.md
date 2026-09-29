@@ -82,7 +82,8 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
   (见 plan 179 §五 与教训 183)。结论留给后面同类的条目:scratch crate 那条路**真的走得通**
   ——`[workspace]` 独立小 crate + `anyhow` + 照抄 workspace feature 的 `windows-sys` + 一个把
   `super` 提供的东西做成 stub 的 `lib.rs`,`cargo check --target x86_64-pc-windows-msvc
-  --all-targets`;整 crate 交叉编译仍然走不通(`ring` 要 MSVC)。**⚠️ CI 已于 2026-09-22 删除**
+  --all-targets`;~~整 crate 交叉编译仍然走不通(`ring` 要 MSVC)~~ 2026-09-29 起整个 workspace
+  也能对 Windows 做 check/clippy 了:给 Windows triple 指一个只造空产物的假 `CC`/`AR`(教训 201)。**⚠️ CI 已于 2026-09-22 删除**
   (教训 175),所以"三平台绿"不是收工条件,收工要照实写成"交叉编译通过,未在 Windows 上
   执行"——179 就是这么写的。**并且:本机 `cargo build` 绿对一个 `#[cfg(windows)]` 文件是零
   信息**,179 那次它一次就过,而文件里有 7 处坏掉的模块路径(教训 183)。
@@ -1917,3 +1918,21 @@ target 全绿。判据:怀疑测试挂死之前,先看日志最后一行是 `Run
 
 200. **临时 worktree 别和主工作区共用 `CARGO_TARGET_DIR`。** plan 209 收尾时为了避开主工作区一处未提交的改动，在 scratch 里开 worktree 跑 `make check`,并把 target 指回主工作区的目录，省得重编依赖。回到主工作区再跑，TUI 一条纯函数的 insta 快照测试红了;`cargo clean -p kloop-tui` 重编之后就绿了。最可能的原因:同一 workspace 的 path crate 在两个 checkout 里算出同一个产物哈希，主工作区的源码 mtime 比 worktree 里编出的产物旧,cargo 就判定"不用重编",直接复用了那个二进制——它里面记的 `CARGO_MANIFEST_DIR` 与快照路径指向已经删掉的 worktree。这次只是一次假的红;反过来，旧二进制也能让一个本该红的改动显示成绿。判据:**要隔离检查，就连 target 一起隔离**(代价是重编一遍依赖);共用过之后回主工作区，先 `cargo clean -p` 掉 worktree 里编过的 crate 再信结果。另:`cargo clean -p kloop-tui` 一次删了 9.4GiB——包名匹配的是所有 profile 与历史哈希下的产物，不只是一个二进制。
 
+201. **`cargo check` 不链接,C 构建只要"成功"就行——给 Windows triple 指一个只造空产物的假编译器,整个 workspace 就能对 Windows 做类型检查。** 这次一口气升了 12 个大版本(rquickjs 0.14、reqwest 0.13、windows-sys 0.52→0.61 等),`make check` 一次全绿;而 windows-sys 0.59 起 `HANDLE` 从 `isize` 变成 `*mut c_void`,`#[cfg(windows)]` 的文件里其实有 21 处编不过——本机绿对它们是零信息(教训 183)。教训 166/183 的 scratch crate 一次只能验一个模块;整 crate 仍然卡在 C 构建(`ring` 换成了 `aws-lc-sys`,一样找不到 `windows.h`),但 `cargo check` 根本不链接,build script 产出的 `.o`/`.lib` 内容无关紧要。脚本(放 scratch,`chmod +x`):
+
+```sh
+#!/bin/sh
+# 在 -o / 归档目标 / /Fo / /OUT: 指向的地方造一个空文件,其余一律成功
+prev=""
+for a in "$@"; do
+  case "$prev" in -o|cq|crs|crus|rcs|qc) : > "$a" ;; esac
+  case "$a" in
+    /Fo*|-Fo*) : > "${a#???}" ;;
+    /OUT:*|-out:*|-OUT:*|/out:*) : > "${a#*:}" ;;
+  esac
+  prev="$a"
+done
+exit 0
+```
+
+然后 `CARGO_TARGET_DIR=<scratch>/wintarget CC_x86_64_pc_windows_msvc=<脚本> AR_x86_64_pc_windows_msvc=<脚本> CXX_x86_64_pc_windows_msvc=<脚本> cargo clippy --workspace --target x86_64-pc-windows-msvc --all-targets --all-features`。env 只按 triple 设,host 上 build script 自己的 C 构建不受影响;target 目录照教训 200 单独放。它先报出那 21 个真错(harness 红过一次,教训 166 第 2 条),修完只剩与本次无关的旧 warning——**这些是现存欠账,本次未修**:`core/src/session_store.rs` 多余的 `mut`、`cli/src/user_config.rs` 未用的 import 与函数 `path`、`core/src/tools/fs/windows.rs` 测试里未用的 `Write`、`core/src/rollout.rs` 测试里未用的 `leaf`,以及 clippy 的 5 处 `collapsible_if`(`process_tree/windows.rs` ×4、`tools/powershell.rs` ×1)。边界:只证明"编得过",不证明链接、不证明能跑,C 代码本身一行没编。同批两条:(a)**依赖升级先问"测试碰得到哪一层"**——仓库的 HTTP 测试全走 wiremock 的明文 http,reqwest 0.13 把 TLS 从 ring + 内置根证书换成 aws-lc-rs + 系统信任库,测试一行都碰不到;取证靠 scratch crate(同版本同 features、独立 target)对真站点发请求,再对 `expired.badssl.com` 确认会拒。(b)reqwest 0.13:`rustls-tls` 改名 `rustls`,`form`/`query` 改成 opt-in;`system-proxy` 不开时代理仍只读环境变量(hyper-util 的 `from_system` = `from_env` 加平台设置);Windows x86_64 构建 aws-lc 要 NASM,或设 `AWS_LC_SYS_PREBUILT_NASM=1`(DESIGN.md「Running」一节)。

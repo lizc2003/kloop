@@ -858,7 +858,10 @@ fn scheduler_for_session(
         return Ok(kloop_core::scheduler::Scheduler::in_memory(inbox));
     }
     let base = scheduler_project_identity(cwd)?;
-    let project_key = format!("{:x}", Sha256::digest(base.to_string_lossy().as_bytes()));
+    let project_key: String = Sha256::digest(base.to_string_lossy().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let global = runtime
         .config_path
         .parent()

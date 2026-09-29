@@ -36,7 +36,7 @@ anyhow = "1"
 # terminal's own text paste). arboard reads it (its macOS backend pulls only
 # image[tiff]); `png` encodes the raw RGBA it returns into bytes core validates.
 arboard = "3"
-png = "0.17"
+png = "0.18"
 # Pixel-aware image preparation (plan 156 item 4): decode dimensions, downscale,
 # re-encode. Already in the tree as arboard's dependency — this adds the decoder
 # features (jpeg/gif/webp) the wire formats need, not a new crate.
@@ -45,7 +45,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # function dependency (after similar, serde_yaml_ng); base64 is an unambiguous
 # standard codec, so a crate beats hand-rolling it. Already in the tree
 # transitively (reqwest et al.), so no new compile cost.
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
@@ -63,42 +63,46 @@ httpdate = "1"
 # carry `\d+` and optional words. Already in the tree via grep-regex.
 regex = "1"
 indexmap = { version = "2", features = ["serde"] }
-jsonschema = { version = "0.46.10", default-features = false }
+jsonschema = { version = "0.58.2", default-features = false }
 # Global config/OAuth IO: macOS search-only directory descriptors plus safe
 # descriptor-relative no-follow opens and atomic renames.
 libc = "0.2"
-rustix = { version = "0.38", features = ["fs", "process"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 # Markdown rendering in the TUI (plan 38 slice 1): parse assistant messages to
 # styled ratatui lines. default-features off drops the html/escape + getopts
 # (CLI-only) pieces — we only drive the pull parser. Syntax highlighting
 # (syntect) is deliberately deferred to a later slice (plan 38 关键决定 2).
 pulldown-cmark = { version = "0.13", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# 0.13 made `form`/`query` opt-in (mcp OAuth posts forms, web search sends a
+# query). `rustls` = aws-lc-rs + the OS trust store; `system-proxy` stays off, so
+# proxies still come from the environment only, as they did on 0.12.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "form", "query"] }
 # MCP remote OAuth (plan 34b): PKCE challenge = base64url(sha256(verifier)); a
 # CSPRNG for the verifier/state. Both are tiny single-purpose crates (kloop's
 # "borrow a small crate, not a framework" line) already resolved in the tree —
-# getrandom 0.2 reuses the transitive copy; sha2 is RustCrypto, no new toolchain.
-getrandom = "0.2"
-sha2 = "0.10"
+# getrandom reuses the copy tempfile and jobserver pull; sha2 is RustCrypto, no
+# new toolchain.
+getrandom = "0.4"
+sha2 = "0.11"
 # QuickJS engine for code-mode. `futures` = AsyncRuntime/AsyncContext, `parallel` =
 # Send+Sync handles for the multi-thread tokio runtime, `macro` = the binding macros.
 # `bindgen` is deliberately OFF: rquickjs-sys ships pregenerated bindings, so no libclang.
-rquickjs = { version = "0.12", default-features = false, features = ["futures", "parallel", "macro"] }
+rquickjs = { version = "0.14", default-features = false, features = ["futures", "parallel", "macro"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Skills frontmatter: parse the SKILL.md YAML block so any spec-compliant skill
 # from the ecosystem loads as-is. serde_yaml_ng is the maintained fork of the
 # archived serde_yaml; unknown frontmatter keys deserialize away for free.
 serde_yaml_ng = "0.10"
-similar = "2"
+similar = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "signal", "fs", "time", "sync", "test-util"] }
 tokio-util = "0.7"
-toml = "0.9"
-tree-sitter = "0.25"
+toml = "1.1"
+tree-sitter = "0.27"
 tree-sitter-bash = "0.25"
 tree-sitter-javascript = "0.25"
 url = "2"
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",

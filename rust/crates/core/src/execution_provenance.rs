@@ -273,7 +273,13 @@ impl OpaqueRef {
         digest.update(domain);
         digest.update((raw.len() as u64).to_be_bytes());
         digest.update(raw.as_bytes());
-        Self(format!("{:x}", digest.finalize()))
+        Self(
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
     }
 
     fn validate(&self) -> Result<()> {

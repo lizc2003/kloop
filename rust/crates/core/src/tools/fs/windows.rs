@@ -23,6 +23,7 @@ use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::OBJ_CASE_INSENSITIVE;
 use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
 use windows_sys::Win32::Foundation::UNICODE_STRING;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
@@ -53,7 +54,6 @@ use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 
 use super::*;
 use crate::file_state::FileIdentity;
@@ -80,7 +80,7 @@ pub(super) fn open_directory_absolute(path: &std::path::Path) -> Result<std::fs:
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            0,
+            ptr::null_mut(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -318,7 +318,7 @@ fn validate_handle(file: &std::fs::File, expected: ExpectedKind) -> Result<()> {
 }
 
 fn set_delete_disposition(file: &std::fs::File) -> Result<()> {
-    let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
     let success = unsafe {
         SetFileInformationByHandle(
             raw_handle(file),
@@ -362,11 +362,11 @@ fn nt_open_relative(
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: raw_handle(parent),
         ObjectName: &unicode,
-        Attributes: OBJ_CASE_INSENSITIVE as u32,
+        Attributes: OBJ_CASE_INSENSITIVE,
         SecurityDescriptor: ptr::null(),
         SecurityQualityOfService: ptr::null(),
     };
-    let mut handle: HANDLE = 0;
+    let mut handle: HANDLE = ptr::null_mut();
     let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
     let result = unsafe {
         NtCreateFile(
@@ -387,7 +387,7 @@ fn nt_open_relative(
         let code = unsafe { RtlNtStatusToDosError(result) };
         return Err(std::io::Error::from_raw_os_error(code as i32));
     }
-    if handle == 0 || handle == INVALID_HANDLE_VALUE {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::other(
             "NtCreateFile returned an invalid handle",
         ));
@@ -401,7 +401,7 @@ fn raw_handle(file: &std::fs::File) -> HANDLE {
 
 unsafe fn file_from_handle(handle: HANDLE) -> std::fs::File {
     // SAFETY: callers validate a live handle and transfer its ownership exactly once.
-    unsafe { std::fs::File::from_raw_handle(handle as *mut std::ffi::c_void) }
+    unsafe { std::fs::File::from_raw_handle(handle) }
 }
 
 pub(super) fn open_read_target(

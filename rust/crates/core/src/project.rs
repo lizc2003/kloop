@@ -353,7 +353,12 @@ fn hash_id(prefix: &str, domain: &[u8], path: &OsStr) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     update_path_digest(&mut hasher, path);
-    format!("{prefix}{:x}", hasher.finalize())
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{prefix}{hex}")
 }
 
 #[cfg(unix)]

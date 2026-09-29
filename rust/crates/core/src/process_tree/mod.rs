@@ -368,7 +368,7 @@ mod windows_tests {
 
         let handle =
             unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return true;
         }
         let exited = unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;

@@ -29,6 +29,7 @@ use windows_sys::Win32::Foundation::GENERIC_WRITE;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
@@ -104,7 +105,7 @@ unsafe impl Sync for OwnedHandle {}
 
 impl OwnedHandle {
     fn new(handle: HANDLE) -> io::Result<Self> {
-        if handle == 0 || handle == -1 {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             Err(last_error())
         } else {
             Ok(Self(handle))
@@ -893,7 +894,7 @@ fn process_in_job(process: HANDLE, job: &Job) -> io::Result<bool> {
 }
 
 fn close_debug_file(handle: HANDLE) {
-    if handle != 0 && handle != -1 {
+    if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
         unsafe {
             CloseHandle(handle);
         }
@@ -1052,8 +1053,8 @@ fn prepare_output(stdio: ProcessStdio) -> io::Result<(OwnedHandle, Option<File>)
                 lpSecurityDescriptor: ptr::null_mut(),
                 bInheritHandle: 1,
             };
-            let mut read = 0;
-            let mut write = 0;
+            let mut read: HANDLE = ptr::null_mut();
+            let mut write: HANDLE = ptr::null_mut();
             if unsafe { CreatePipe(&mut read, &mut write, &security, 0) } == 0 {
                 return Err(last_error());
             }
@@ -1087,14 +1088,14 @@ fn open_null(access: u32) -> io::Result<OwnedHandle> {
             &security,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
-            0,
+            ptr::null_mut(),
         )
     })
 }
 
 fn duplicate_handle(source: HANDLE, inheritable: bool) -> io::Result<OwnedHandle> {
     let process = unsafe { GetCurrentProcess() };
-    let mut duplicate = 0;
+    let mut duplicate: HANDLE = ptr::null_mut();
     if unsafe {
         DuplicateHandle(
             process,

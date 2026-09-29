@@ -127,7 +127,7 @@ fn open_directory_path(path: &Path, label: &str) -> Result<Option<std::fs::File>
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            0,
+            std::ptr::null_mut(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -159,6 +159,8 @@ fn open_relative(
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_REPARSE_POINT;
     use windows_sys::Wdk::Storage::FileSystem::FILE_SYNCHRONOUS_IO_NONALERT;
     use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
+    use windows_sys::Win32::Foundation::OBJ_CASE_INSENSITIVE;
+    use windows_sys::Win32::Foundation::OBJ_DONT_REPARSE;
     use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_COLLISION;
     use windows_sys::Win32::Foundation::STATUS_OBJECT_NAME_NOT_FOUND;
     use windows_sys::Win32::Foundation::STATUS_OBJECT_PATH_NOT_FOUND;
@@ -170,8 +172,6 @@ fn open_relative(
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-    use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
-    use windows_sys::Win32::System::Kernel::OBJ_DONT_REPARSE;
 
     validate_component(name, label)?;
     let mut wide: Vec<u16> = name.encode_wide().collect();
@@ -189,12 +189,12 @@ fn open_relative(
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: parent.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
         ObjectName: &unicode,
-        Attributes: (OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE) as u32,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
         SecurityDescriptor: std::ptr::null(),
         SecurityQualityOfService: std::ptr::null(),
     };
     let mut io_status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    let mut handle = 0;
+    let mut handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     let create_options = FILE_OPEN_REPARSE_POINT
         | FILE_SYNCHRONOUS_IO_NONALERT
         | if directory {
@@ -341,7 +341,9 @@ fn rename_private_file(
         bail!("private path component is too long for {label}");
     }
     let mut info = RenameInfo {
-        anonymous: FILE_RENAME_INFO_0 { ReplaceIfExists: 1 },
+        anonymous: FILE_RENAME_INFO_0 {
+            ReplaceIfExists: true,
+        },
         root_directory: dir.as_raw_handle() as HANDLE,
         file_name_length: (wide.len() * 2) as u32,
         file_name: [0; 255],
@@ -367,7 +369,7 @@ fn delete_private_file(file: &std::fs::File) {
     use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
     use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     let _ = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,

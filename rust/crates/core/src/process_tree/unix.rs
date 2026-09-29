@@ -143,7 +143,7 @@ impl Killer {
         let pid = rustix::process::Pid::from_raw(self.tree.pid as _)
             .context("process group id must be non-zero")
             .map_err(io::Error::other)?;
-        match rustix::process::kill_process_group(pid, rustix::process::Signal::Kill) {
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
             Ok(()) | Err(rustix::io::Errno::SRCH) => {
                 self.tree.terminated.store(true, Ordering::Release);
                 Ok(())

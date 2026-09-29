@@ -152,7 +152,7 @@ fn generate_pkce() -> Result<Pkce> {
 /// CSRF `state` are both this.
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|e| anyhow!("OS RNG unavailable: {e}"))?;
+    getrandom::fill(&mut bytes).map_err(|e| anyhow!("OS RNG unavailable: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 

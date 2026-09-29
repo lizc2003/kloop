@@ -1134,7 +1134,7 @@ impl Scheduler {
         let existing: HashSet<String> = self.list()?.into_iter().map(|job| job.id).collect();
         for _ in 0..16 {
             let mut bytes = [0_u8; 4];
-            getrandom::getrandom(&mut bytes)
+            getrandom::fill(&mut bytes)
                 .map_err(|error| anyhow!("generate scheduler job id: {error}"))?;
             let id = format!(
                 "{:02x}{:02x}{:02x}{:02x}",

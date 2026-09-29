@@ -1259,7 +1259,7 @@ exec sleep 60
                     continue;
                 };
                 if let Some(pid) = rustix::process::Pid::from_raw(raw) {
-                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
                 }
             }
             let _ = std::fs::remove_dir_all(&self.root);
@@ -1358,7 +1358,7 @@ Wait-Process -Id $grandchild.Id
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         let process = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-        if process == 0 {
+        if process.is_null() {
             return match unsafe { GetLastError() } {
                 ERROR_INVALID_PARAMETER => false,
                 ERROR_ACCESS_DENIED => true,
@@ -1387,7 +1387,7 @@ Wait-Process -Id $grandchild.Id
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
-        if process == 0 {
+        if process.is_null() {
             return;
         }
         unsafe {
