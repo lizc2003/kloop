@@ -72,6 +72,12 @@
 最后一个 cell 也能冻溢出前缀;提问的备注步骤连 `QuestionAnswer.notes` 与 server 的 `notes?` 整条删除。
 没做的两件(其它面板仍暂停提交、resume 的计划仍是工具行)见 plan 214 末节。教训 203。
 
+**plan 215 每一行，要么在屏上，要么在 scrollback 里(同日立，未开工，用户要在新会话实现)。** 同一次会话用户又报
+"结论边输出边被剪"、问"有没有彻底的方案";对照 codex(逐行冻结)与 grok-build(默认全屏自管滚动;minimal 模式
+与 kloop 同样会剪)后定了 codex 的做法，不做 `/transcript` 兜底。核心：markdown 渲染器改成前缀稳定(列表间距按
+源文本局部决定)、流式回答同时给出"已定稿行数"、每种 cell 声明定稿行数与能否整格离开、一个 `freeze_target`
+取代 `commit_count`/`head_freeze_lines`/`is_committable`、只有补全弹窗还暂停提交。开工前有两问(plan 第七节)。
+
 ## 〇、当前这一批:架构重整 plan 177–186(2026-09-21 排定)
 
 来源:plan 176 的体积棘轮落地当天,用户看了现状后一句「我要的是现有文件的架构重整啊」。
