@@ -142,9 +142,6 @@ fn format_answers(request: &QuestionRequest, answers: &[QuestionAnswer]) -> Stri
             used_free_text = true;
             values.push(other);
         }
-        if answer.notes.is_some() {
-            used_free_text = true;
-        }
         let answer_text = if values.is_empty() {
             "(no option selected)".to_string()
         } else {
@@ -158,10 +155,6 @@ fn format_answers(request: &QuestionRequest, answers: &[QuestionAnswer]) -> Stri
         {
             entry.push_str(" selected preview:\n");
             entry.push_str(preview);
-        }
-        if let Some(notes) = &answer.notes {
-            entry.push_str(" notes: ");
-            entry.push_str(notes);
         }
         entries.push(entry);
     }
@@ -230,18 +223,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answered_formats_selected_preview_and_notes() {
+    async fn answered_formats_selected_preview() {
         let ctx = ctx_with(QuestionOutcome::Answered(vec![QuestionAnswer {
             question_index: 0,
             selected: vec![1],
             other: None,
-            notes: Some("keep compact".into()),
         }]));
         let (out, is_error) = run_tool("ask_user_question", input(), &ctx).await;
         assert!(!is_error, "{out}");
         assert_eq!(
             out,
-            "The user answered: \"Which layout?\"=\"Columns\" selected preview:\nCOL notes: keep compact. Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say."
+            "Your questions have been answered: \"Which layout?\"=\"Columns\" selected preview:\nCOL. You can now continue with these answers in mind."
         );
     }
 
@@ -264,7 +256,6 @@ mod tests {
             question_index: 0,
             selected: vec![0],
             other: None,
-            notes: None,
         }]));
         let mut value = input();
         value["answers"] = json!({"Which layout?": "Columns"});

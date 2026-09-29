@@ -89,8 +89,6 @@ pub(super) enum QuestionResponse {
         selected: Vec<usize>,
         #[serde(default)]
         other: Option<String>,
-        #[serde(default)]
-        notes: Option<String>,
     },
     Cancelled,
 }
@@ -321,6 +319,27 @@ mod tests {
             RequestId::Str("c-1".into())
         );
         assert_eq!(serde_json::to_string(&RequestId::Num(7)).unwrap(), "7");
+    }
+
+    /// An answer is a selection and/or Other text. `notes` was dropped with the
+    /// TUI step that produced it (plan 214); a client still sending it is
+    /// malformed, and a malformed answer fails closed.
+    #[test]
+    fn a_question_answer_is_a_selection_or_other_text_and_nothing_else() {
+        let answer = |value: Value| serde_json::from_value::<QuestionResponse>(value);
+        assert!(matches!(
+            answer(json!({"outcome": "answered", "selected": [1], "other": "Z"})),
+            Ok(QuestionResponse::Answered { selected, other })
+                if selected == [1] && other.as_deref() == Some("Z")
+        ));
+        assert!(matches!(
+            answer(json!({"outcome": "cancelled"})),
+            Ok(QuestionResponse::Cancelled)
+        ));
+        let refused = answer(json!({"outcome": "answered", "selected": [1], "notes": "prefer B"}))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("unknown field `notes`"), "{refused}");
     }
 
     #[test]

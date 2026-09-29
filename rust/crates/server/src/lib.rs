@@ -640,16 +640,13 @@ impl Server {
                 reply,
             } => {
                 let outcome = match serde_json::from_value::<wire::QuestionResponse>(result) {
-                    Ok(wire::QuestionResponse::Answered {
-                        selected,
-                        other,
-                        notes,
-                    }) => QuestionOutcome::Answered(vec![QuestionAnswer {
-                        question_index,
-                        selected,
-                        other,
-                        notes,
-                    }]),
+                    Ok(wire::QuestionResponse::Answered { selected, other }) => {
+                        QuestionOutcome::Answered(vec![QuestionAnswer {
+                            question_index,
+                            selected,
+                            other,
+                        }])
+                    }
                     Ok(wire::QuestionResponse::Cancelled) => QuestionOutcome::Cancelled,
                     Err(error) => QuestionOutcome::Unavailable(format!(
                         "malformed question response: {error}"

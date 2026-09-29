@@ -2955,7 +2955,7 @@ async fn negotiated_questions_round_trip_multiple_answers() {
         .send(json!({
             "jsonrpc": "2.0",
             "id": first_id,
-            "result": {"outcome": "answered", "selected": [1], "notes": "prefer B"}
+            "result": {"outcome": "answered", "selected": [1]}
         }))
         .await;
 

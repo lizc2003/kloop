@@ -229,35 +229,10 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
             } else {
                 None
             };
-            let notes = if question
-                .options
-                .iter()
-                .any(|option| option.preview.is_some())
-            {
-                print!("  Notes (optional; Enter to skip) > ");
-                let _ = std::io::stdout().flush();
-                match read_terminal_line() {
-                    Ok(Some(value)) => {
-                        let value = value.trim();
-                        (!value.is_empty()).then(|| value.to_string())
-                    }
-                    Ok(None) => {
-                        return QuestionOutcome::Unavailable(
-                            "terminal input reached EOF while entering notes".into(),
-                        );
-                    }
-                    Err(error) => {
-                        return QuestionOutcome::Unavailable(format!("cannot read notes: {error}"));
-                    }
-                }
-            } else {
-                None
-            };
             answers.push(QuestionAnswer {
                 question_index,
                 selected,
                 other,
-                notes,
             });
             break;
         }

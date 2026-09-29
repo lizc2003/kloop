@@ -199,7 +199,6 @@ mod tests {
             question_index: 0,
             selected: vec![1],
             other: None,
-            notes: None,
         };
         reply
             .send(QuestionOutcome::Answered(vec![answer.clone()]))

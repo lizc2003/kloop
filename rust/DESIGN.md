@@ -1062,8 +1062,15 @@ was twice rejected by a user who had never seen it. So the request tags the text
 `ConfirmPreview::Plan`, the TUI writes it into the transcript as markdown the
 moment the prompt is queued and leaves the panel one question and two answers
 (twenty rows down to ten, and the conversation no longer covered), the plain
-REPL prints it uncoloured, and the server sends `kind:"plan"`. Each plan is
-marked with how it ended (`✓ approved` / `✗ not approved`), because the cell is
+REPL prints it uncoloured, and the server sends `kind:"plan"`. In the TUI the
+plan takes the place of its own `exit_plan_mode` row: left above it, that row
+would sit Running and hold every scrollback commit until the answer, and would
+end `✓` on a decline, which is not a tool error. With the row gone, the pending
+plan keeps flowing into scrollback while its panel is up (the one panel that does
+not pause the commit), and it is the one last cell whose overflowing top may
+freeze — its text never changes, the answer only appends a line — so a plan
+taller than the screen is read in full before it is answered, not after
+(plan 214). Each plan is marked with how it ended (`✓ approved` / `✗ not approved`), because the cell is
 on screen before there is an answer — so a rejected plan stays put with the one
 that replaced it below it, which is the comparison a rejection invites. Approve
 restores the remembered mode and the model implements; reject leaves the session
@@ -1075,8 +1082,10 @@ changes do not invalidate the prompt-cache prefix.
 
 **General questions are not approvals.** The depth-0-only
 `ask_user_question` tool uses a separate `Questioner` contract and can ask one
-to four bounded single- or multi-select questions, with Other text, option
-previews, and notes. An answer is recorded only as the matching tool result;
+to four bounded single- or multi-select questions, with Other text and option
+previews. There is no notes step after picking an option (plan 214 dropped it):
+Other text already says "A, but…", and a step that appeared only for options
+with a preview read as noise. An answer is recorded only as the matching tool result;
 explicit cancel is a non-error result, while EOF, disconnect, a dropped reply,
 or an unsupported client fails closed. Plain and TUI sessions render the
 question directly (TUI questions and approvals share one FIFO modal owner), and
@@ -1123,7 +1132,9 @@ letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
 summary (green/red) above the line-numbered body (plan 38 slice 6) and scrolls
 with PgUp/PgDn, while the header, subject, options and key hint stay put. The
 panel is live chrome, counted in the same frozen-height budget as the activity
-and todo rows, so a scrollback commit can never scroll it away. Prompts from a
+and todo rows, so a scrollback commit can never scroll it away. While a panel is
+up the commit pauses and the tail above it may be clipped — except under a plan
+approval, whose content is the transcript itself (see Plan mode). Prompts from a
 concurrent tool batch queue and are answered in order.
 
 Notices — a retry, a mode switch, a resumed session, a failed turn — render as
@@ -1497,7 +1508,7 @@ the ProjectId, raw identity anchor, state path, policy body, or revision.
 General model questions use
 `question/request {thread_id, turn_id, question_index, question}` only when the
 client advertised `capabilities.questions: true`; each question is answered
-`{"outcome":"answered","selected":[...],"other"?,"notes"?}` or
+`{"outcome":"answered","selected":[...],"other"?}` or
 `{"outcome":"cancelled"}`. Unknown, malformed, mismatched, disconnected, or
 dropped replies fail closed and pending reverse requests are removed when their
 turn is interrupted.

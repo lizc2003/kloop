@@ -97,7 +97,7 @@ impl LiveChromeLayout {
 }
 
 /// A choice panel never takes more than this many rows, however tall the
-/// terminal: a long diff or plan scrolls (PgUp/PgDn) rather than pushing the
+/// terminal: a long diff scrolls (PgUp/PgDn) rather than pushing the
 /// conversation that led to the prompt off screen.
 const PANEL_MAX_ROWS: usize = 20;
 
@@ -750,8 +750,11 @@ pub fn commit_count(
 ///
 /// The head is left alone while it can still change: a cell whose lines may
 /// re-wrap (a code fence closing, a table gaining a row) must not have half of
-/// it already nailed into scrollback. The last cell is never touched at all,
-/// for the same reason [`commit_count`] leaves it.
+/// it already nailed into scrollback. The last cell is left alone for the same
+/// reason [`commit_count`] leaves it — except a plan, whose text is fixed on
+/// arrival and whose answer only appends a line below it. A plan waiting on
+/// its answer is the last cell and routinely taller than the screen, and the
+/// user has to read all of it before answering (plan 214).
 pub fn head_freeze_lines(
     cells: &[Cell],
     width: usize,
@@ -760,10 +763,14 @@ pub fn head_freeze_lines(
     head_live: bool,
 ) -> usize {
     let active_h = active_h.max(1);
-    if cells.len() < 2 || head_live || !is_committable(&cells[0]) {
+    let Some(head) = cells.first() else {
+        return frozen;
+    };
+    let head_is_last = cells.len() == 1;
+    if head_live || !is_committable(head) || (head_is_last && !matches!(head, Cell::Plan { .. })) {
         return frozen;
     }
-    let head_h = cell_lines(&cells[0], width).len();
+    let head_h = cell_lines(head, width).len();
     let rest: usize = cells[1..].iter().map(|c| cell_lines(c, width).len()).sum();
     let live = (head_h + rest).saturating_sub(frozen);
     if live <= active_h {
@@ -1045,7 +1052,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     f.render_widget(Paragraph::new(comp_rows), input_area);
 
     // The panel takes the cursor only while it is taking text (a question's
-    // Other / Notes phase). A list panel leaves it hidden: the composer is not
+    // Other phase). A list panel leaves it hidden: the composer is not
     // where the next keystroke goes.
     if let Some((row, column)) = chrome.panel.as_ref().and_then(|panel| panel.editor_cursor) {
         let y = transcript_area
@@ -1259,13 +1266,6 @@ fn question_panel(question: &PendingQuestion, width: usize) -> choice::Panel {
             "Enter submit · Esc cancel",
             Some(choice::Editor {
                 prefix: "Your answer > ".to_string(),
-                text: question.editor.clone(),
-            }),
-        ),
-        QuestionPhase::Notes => (
-            "Enter submit · Esc cancel",
-            Some(choice::Editor {
-                prefix: "Notes (optional) > ".to_string(),
                 text: question.editor.clone(),
             }),
         ),
@@ -3045,6 +3045,32 @@ mod tests {
                 .map(|(name, _, _, want)| (*name, *want))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A plan waiting on its answer is the last cell, and the one last cell whose
+    /// overflow may freeze: its text is fixed on arrival (plan 214). Any other
+    /// last cell keeps the case above ("head is the last cell").
+    #[test]
+    fn head_freeze_takes_a_waiting_plans_overflow_though_it_is_last() {
+        let width = 40;
+        let active_h = 5;
+        let plan = Cell::Plan {
+            text: (0..20)
+                .map(|i| format!("- step {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            status: PlanStatus::Pending,
+        };
+        let lines = cell_lines(&plan, width);
+        let frozen = head_freeze_lines(
+            std::slice::from_ref(&plan),
+            width,
+            active_h,
+            0,
+            /*head_live=*/ false,
+        );
+        assert_eq!(frozen, lines.len() - active_h);
+        assert_eq!(line_text(&lines[frozen]), "• step 15");
     }
 
     /// The viewport picks the head cell up one line past the seam — and a prefix

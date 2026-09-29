@@ -242,7 +242,6 @@ pub fn confirm_choices(req: &ConfirmRequest) -> Vec<ConfirmChoice> {
 pub enum QuestionPhase {
     Select,
     Other,
-    Notes,
 }
 
 #[derive(Debug)]
@@ -254,7 +253,6 @@ pub struct PendingQuestion {
     pub answers: Vec<QuestionAnswer>,
     pub phase: QuestionPhase,
     pub editor: String,
-    pending_other: Option<String>,
     reply: oneshot::Sender<QuestionOutcome>,
 }
 
@@ -268,7 +266,6 @@ impl PendingQuestion {
             answers: Vec::new(),
             phase: QuestionPhase::Select,
             editor: String::new(),
-            pending_other: None,
             reply,
         }
     }
@@ -815,10 +812,7 @@ impl App {
                 // behind one another, and a plan that appeared third would read
                 // as if it had been written after whatever came in meanwhile.
                 if let Some(ConfirmPreview::Plan(plan)) = &req.preview {
-                    self.cells.push(Cell::Plan {
-                        text: plan.clone(),
-                        status: PlanStatus::Pending,
-                    });
+                    self.post_plan(plan.clone());
                 }
                 self.interactions.push_back(PendingInteraction::Confirm {
                     req,
@@ -1293,6 +1287,32 @@ impl App {
         }
     }
 
+    /// Put a plan up for approval where its `exit_plan_mode` row stands. The row
+    /// would otherwise sit above the plan still Running, which holds every
+    /// commit behind it, so a plan taller than the screen could not reach
+    /// scrollback until after it was answered (plan 214). It would also end as
+    /// `✓` even when the plan is declined, since a decline is not a tool error;
+    /// the plan's own ✓/✗ is the call's outcome. Same index, so no other index
+    /// map moves; the call's late ToolEnd finds no row and is a no-op.
+    fn post_plan(&mut self, text: String) {
+        let plan = Cell::Plan {
+            text,
+            status: PlanStatus::Pending,
+        };
+        let row = self.cells.iter().rposition(|cell| {
+            matches!(cell, Cell::Tool { name, status: ToolStatus::Running, .. }
+                if name == "exit_plan_mode")
+        });
+        match row {
+            Some(index) => {
+                self.tool_cells.retain(|_, i| *i != index);
+                self.cells[index] = plan;
+            }
+            // The row is already frozen into scrollback.
+            None => self.cells.push(plan),
+        }
+    }
+
     /// Stamp the oldest plan still awaiting an answer. `exit_plan_mode` is not
     /// concurrency-safe, so two plans are never on the table at once and the
     /// oldest pending cell is this answer's. If it has already been frozen into
@@ -1730,7 +1750,7 @@ impl App {
     pub fn paste_text(&mut self, s: &str) -> Command {
         let text = canonicalize_paste_newlines(s);
         if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut()
-            && matches!(question.phase, QuestionPhase::Other | QuestionPhase::Notes)
+            && question.phase == QuestionPhase::Other
         {
             question.editor.push_str(&text);
             return Command::None;
@@ -1743,11 +1763,20 @@ impl App {
         !self.interactions.is_empty()
     }
 
+    /// Whether the prompt on screen is a plan approval.
+    pub(crate) fn plan_awaiting_answer(&self) -> bool {
+        matches!(
+            self.interactions.front(),
+            Some(PendingInteraction::Confirm { req, .. })
+                if matches!(req.preview, Some(ConfirmPreview::Plan(_)))
+        )
+    }
+
     pub fn question_editor_active(&self) -> bool {
         matches!(
             self.interactions.front(),
             Some(PendingInteraction::Question(PendingQuestion {
-                phase: QuestionPhase::Other | QuestionPhase::Notes,
+                phase: QuestionPhase::Other,
                 ..
             }))
         )
@@ -1772,7 +1801,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::None;
         }
-        // Paging scrolls the panel body (a tall diff or plan); the arrows belong
+        // Paging scrolls the panel body (a tall diff); the arrows belong
         // to the option list now, so a long preview is read with PgUp/PgDn.
         match key.code {
             KeyCode::PageUp => {
@@ -1916,38 +1945,26 @@ impl App {
                         if question.selected.is_empty() {
                             question.selected.push(question.cursor);
                         }
-                        outcome = finish_question(question, None, None);
+                        outcome = finish_question(question, None);
                     }
                     KeyCode::Enter => {
                         question.selected.clear();
                         question.selected.push(question.cursor);
-                        if question.selected_preview().is_some() {
-                            question.phase = QuestionPhase::Notes;
-                            question.editor.clear();
-                        } else {
-                            outcome = finish_question(question, None, None);
-                        }
+                        outcome = finish_question(question, None);
                     }
                     _ => {}
                 }
             }
-            QuestionPhase::Other | QuestionPhase::Notes => match key.code {
+            QuestionPhase::Other => match key.code {
                 KeyCode::Char(c) => question.editor.push(c),
                 KeyCode::Backspace => {
                     question.editor.pop();
                 }
-                KeyCode::Enter if question.phase == QuestionPhase::Other => {
+                KeyCode::Enter => {
                     let value = question.editor.trim().to_string();
                     if !value.is_empty() {
-                        question.pending_other = Some(value.clone());
-                        outcome = finish_question(question, Some(value), None);
+                        outcome = finish_question(question, Some(value));
                     }
-                }
-                KeyCode::Enter => {
-                    let value = question.editor.trim();
-                    let notes = (!value.is_empty()).then(|| value.to_string());
-                    let other = question.pending_other.take();
-                    outcome = finish_question(question, other, notes);
                 }
                 _ => {}
             },
@@ -2062,20 +2079,17 @@ impl App {
 fn finish_question(
     question: &mut PendingQuestion,
     other: Option<String>,
-    notes: Option<String>,
 ) -> Option<QuestionOutcome> {
     question.answers.push(QuestionAnswer {
         question_index: question.question_index,
         selected: std::mem::take(&mut question.selected),
         other,
-        notes,
     });
     if question.question_index + 1 < question.req.questions.len() {
         question.question_index += 1;
         question.cursor = 0;
         question.phase = QuestionPhase::Select;
         question.editor.clear();
-        question.pending_other = None;
         return None;
     }
     let answers = std::mem::take(&mut question.answers);
@@ -3888,9 +3902,61 @@ mod tests {
         );
     }
 
+    /// The plan stands where its `exit_plan_mode` row stood. Left above it, the
+    /// Running row would hold every commit until the answer, and would end as ✓
+    /// on a decline — which is not a tool error (plan 214).
+    #[tokio::test]
+    async fn a_plan_takes_the_place_of_its_running_row() {
+        let mut app = App::new("s".into());
+        app.running = true;
+        app.apply(tool_start("", "t1", "read_file", r#"{"path":"a.rs"}"#));
+        app.apply(tool_end("", "t1", true, ""));
+        app.apply(tool_start(
+            "",
+            "t2",
+            "exit_plan_mode",
+            r#"{"plan":"- step"}"#,
+        ));
+        let (reply, rx) = oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "Exit plan mode and start on this plan?".into(),
+                approval_scopes: vec![kloop_core::permissions::ApprovalScope::Once],
+                preview: Some(ConfirmPreview::Plan("- step".into())),
+                ..Default::default()
+            },
+            reply,
+        });
+        let read = Cell::Tool {
+            name: "read_file".into(),
+            input: r#"{"path":"a.rs"}"#.into(),
+            status: ToolStatus::Ok,
+            output: None,
+        };
+        let plan = |status| Cell::Plan {
+            text: "- step".into(),
+            status,
+        };
+        assert_eq!(app.cells, vec![read.clone(), plan(PlanStatus::Pending)]);
+
+        app.on_key(80, key(KeyCode::Esc));
+        assert_eq!(rx.await.unwrap(), Decision::Deny);
+        app.apply(tool_end(
+            "",
+            "t2",
+            true,
+            "The user did not approve the plan",
+        ));
+        assert_eq!(
+            app.cells,
+            vec![read, plan(PlanStatus::Declined)],
+            "the call's late end has no row to mark"
+        );
+    }
+
     /// A turn that dies with a plan still on the table drops the prompt, which
     /// core reads as a denial. The transcript has to say the same thing — an
-    /// unstamped plan reads as an approved one, and never becomes committable.
+    /// unstamped plan reads as one still waiting on an answer.
     #[tokio::test]
     async fn a_turn_ending_declines_the_plan_it_left_unanswered() {
         let mut app = App::new("s".into());
@@ -4141,8 +4207,10 @@ mod tests {
         assert_eq!(rx2.try_recv().unwrap(), Decision::Deny);
     }
 
+    /// Enter on an option with a preview answers it; there is no notes step to
+    /// pass through first (plan 214).
     #[tokio::test]
-    async fn question_single_preview_notes_and_cancel_round_trip() {
+    async fn question_single_preview_answers_on_enter_and_esc_cancels() {
         let mut app = App::new("s".into());
         let (reply, mut rx) = oneshot::channel();
         app.apply(AgentEvent::Question {
@@ -4151,20 +4219,12 @@ mod tests {
         });
 
         assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
-        let Some(PendingInteraction::Question(question)) = app.interactions.front() else {
-            panic!("expected question interaction");
-        };
-        assert_eq!(question.phase, QuestionPhase::Notes);
-        assert_eq!(question.selected_preview(), Some("preview A"));
-        app.paste_text("ship\r\nit");
-        app.on_key(80, key(KeyCode::Enter));
         assert_eq!(
             rx.try_recv().unwrap(),
             QuestionOutcome::Answered(vec![QuestionAnswer {
                 question_index: 0,
                 selected: vec![0],
                 other: None,
-                notes: Some("ship\nit".into()),
             }])
         );
         assert!(app.interactions.is_empty());
@@ -4223,7 +4283,6 @@ mod tests {
                 question_index: 0,
                 selected: vec![0],
                 other: Some("custom".into()),
-                notes: None,
             }])
         );
     }

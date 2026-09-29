@@ -67,8 +67,8 @@ pub struct Panel {
     pub multi_select: bool,
     /// The dim key hint, the panel's only such line (the footer stays still).
     pub hint: String,
-    /// An editor row shown in place of the options (question's Other/Notes
-    /// phases): the prefix, then the live text. The caller places the cursor.
+    /// An editor row shown in place of the options (a question's Other
+    /// phase): the prefix, then the live text. The caller places the cursor.
     pub editor: Option<Editor>,
 }
 

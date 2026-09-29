@@ -902,7 +902,6 @@ async fn ask_plan_workflow_headless_report() -> Value {
         question_index: 0,
         selected: vec![1],
         other: None,
-        notes: Some("accepted locally".into()),
     });
     let permissions = Permissions::new(
         Mode::Manual,
@@ -940,7 +939,7 @@ async fn ask_plan_workflow_headless_report() -> Value {
     });
     let (answer, answer_error) =
         run_tool("ask_user_question", question_input.clone(), &context).await;
-    assert!(!answer_error && answer.contains("Yes") && answer.contains("accepted locally"));
+    assert!(!answer_error && answer.contains("Yes"));
     let mut plan_modes = vec![context.cfg.permissions.mode().label()];
     let (entered, entered_error) = run_tool("enter_plan_mode", json!({}), &context).await;
     assert!(!entered_error && entered.contains("Entered plan mode"));

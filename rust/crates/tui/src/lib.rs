@@ -949,8 +949,12 @@ where
 {
     for retry in 0..=1 {
         let drawn_viewport = draw_and_hand_over(terminal, app, hud)?;
-        let overlay_open =
-            !app.interactions.is_empty() || app.fork_picker.is_some() || app.popup.is_some();
+        // A plan approval does not hold the commit: the plan is in the
+        // transcript, not the panel (plan 194), and has to reach scrollback
+        // while the user is still reading it (plan 214).
+        let overlay_open = app.fork_picker.is_some()
+            || app.popup.is_some()
+            || (app.interaction_active() && !app.plan_awaiting_answer());
         if overlay_open {
             return Ok(drawn_viewport);
         }
@@ -1747,6 +1751,125 @@ mod tests {
             visible.first().map(String::as_str),
             Some(format!("row {frozen}").as_str()),
             "the viewport opens on the line after the scrollback seam"
+        );
+    }
+
+    /// A plan taller than the screen, still waiting on its answer. Its top has to
+    /// be in scrollback while the panel is up — the user reads the whole plan
+    /// before answering, not after (plan 214) — and answering only adds the
+    /// outcome below the seam.
+    #[test]
+    fn a_waiting_plan_reaches_scrollback_before_it_is_answered() {
+        use crate::app::PlanStatus;
+        use crate::app::ToolStatus;
+        use kloop_core::permissions::ApprovalScope;
+        use kloop_core::permissions::ConfirmPreview;
+        use kloop_core::permissions::ConfirmRequest;
+
+        let backend = PinnedBackend::new(TestBackend::new(40, 24));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .unwrap();
+        let mut app = App::new("plan-tall".into());
+        app.running = true;
+        app.cells = vec![
+            Cell::User("plan the fix".into()),
+            Cell::Tool {
+                name: "exit_plan_mode".into(),
+                input: "{}".into(),
+                status: ToolStatus::Running,
+                output: None,
+            },
+        ];
+        let plan = (0..40)
+            .map(|i| format!("- step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "Exit plan mode and start on this plan?".into(),
+                approval_scopes: vec![ApprovalScope::Once],
+                preview: Some(ConfirmPreview::Plan(plan.clone())),
+                ..Default::default()
+            },
+            reply,
+        });
+        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+
+        let width = usize::from(viewport.width);
+        let text = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let plan_lines: Vec<String> = render::cell_lines(&app.cells[0], width)
+            .iter()
+            .map(text)
+            .collect();
+        let visible = |app: &App| -> Vec<String> {
+            render::visible_transcript(app, &render::Hud::default(), width)
+                .iter()
+                .map(text)
+                .collect()
+        };
+        let frozen = app.head_skip(width);
+        let shown = visible(&app);
+        assert!(app.plan_awaiting_answer(), "the panel is still up");
+        assert_eq!(
+            app.cells,
+            vec![Cell::Plan {
+                text: plan.clone(),
+                status: PlanStatus::Pending,
+            }],
+            "the plan took its row's place and everything above it is in scrollback"
+        );
+        assert_eq!(shown.len(), overflow_active_h(&app, viewport));
+        assert_eq!(
+            [&plan_lines[..frozen], &shown[..]].concat(),
+            plan_lines,
+            "scrollback ends where the viewport begins, and nothing is dropped"
+        );
+        let scrollback = terminal.backend().inner.scrollback();
+        let rows: Vec<String> = (0..scrollback.area.height)
+            .map(|y| {
+                (0..scrollback.area.width)
+                    .map(|x| scrollback[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let top: Vec<String> = plan_lines[..frozen]
+            .iter()
+            .map(|line| line.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                &["".to_string(), "> plan the fix".to_string()][..],
+                &top[..]
+            ]
+            .concat(),
+            "the plan's top is in native scrollback, right under what came before"
+        );
+
+        app.on_key(
+            width,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter),
+        );
+        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let width = usize::from(viewport.width);
+        let shown = visible(&app);
+        assert_eq!(app.head_skip(width), frozen, "the seam did not move");
+        assert_eq!(
+            shown,
+            [&plan_lines[frozen..], &["  ✓ approved".to_string()]].concat()
         );
     }
 

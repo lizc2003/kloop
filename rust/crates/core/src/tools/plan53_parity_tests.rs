@@ -272,7 +272,6 @@ async fn question_report() -> Value {
             question_index: 0,
             selected: vec![0],
             other: None,
-            notes: None,
         }]),
         QuestionOutcome::Cancelled,
         QuestionOutcome::Unavailable("closed".into()),

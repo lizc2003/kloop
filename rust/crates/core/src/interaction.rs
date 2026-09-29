@@ -164,16 +164,9 @@ impl QuestionRequest {
                     &format!("answers[{expected_index}].other"),
                 )?;
             }
-            if let Some(notes) = &answer.notes {
-                validate_text(
-                    notes,
-                    MAX_FREE_TEXT_CHARS,
-                    &format!("answers[{expected_index}].notes"),
-                )?;
-            }
-            if answer.selected.is_empty() && answer.other.is_none() && answer.notes.is_none() {
+            if answer.selected.is_empty() && answer.other.is_none() {
                 return Err(format!(
-                    "questioner returned no selection, Other text, or notes for question {expected_index}"
+                    "questioner returned no selection or Other text for question {expected_index}"
                 ));
             }
         }
@@ -199,8 +192,6 @@ pub struct QuestionAnswer {
     pub selected: Vec<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub other: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,7 +244,6 @@ mod tests {
                 question_index: 0,
                 selected: vec![0],
                 other: None,
-                notes: Some("ship it".into()),
             }]),
             Ok(())
         );
@@ -270,7 +260,6 @@ mod tests {
                 question_index: 0,
                 selected: vec![9],
                 other: None,
-                notes: None,
             }])
             .unwrap_err()
             .contains("unknown option")
