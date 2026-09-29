@@ -2973,7 +2973,15 @@ only between steps (see `refs/README.md`).
 
 An input line starting with `/` is a **built-in command**, not a message to
 the model. The set is small and lives one-file-per-command under
-`core/src/commands/` (the directory listing *is* the catalog):
+`core/src/commands/` (the directory listing *is* the catalog). The dispatcher
+splits the line at the first whitespace into name and trimmed arguments. The
+commands that take none — `/help`, `/cost`, `/context`, `/clear`, `/exit` —
+**refuse** extra words (`/clear takes no arguments; nothing was done`) rather
+than run without them: `/clear then look at X` would otherwise start a new
+session and lose "look at X" without a word, the same silent drop plan 209
+fixed for `/compact`. The references split two other ways — codex and pi send
+the whole line to the model as a message, cc runs the command and drops the
+rest — and neither tells the user the command did not take them.
 
 - `/help` — list the commands, then the loaded skills (they are `/name`-invocable
   too, so leaving them out hid the builtins from everyone; a builtin is tagged

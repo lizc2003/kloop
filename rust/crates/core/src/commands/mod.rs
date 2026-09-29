@@ -226,17 +226,17 @@ pub async fn run_with_provider_state(
         None => (rest, ""),
     };
     match name {
-        "help" => help::run(cfg),
+        "help" => without_args(name, args, || help::run(cfg)),
         "provider" => provider::run(args, history, cfg, provider_state),
         "model" => model::run(args, history, cfg, provider_state),
         "effort" => effort::run(args, history, cfg, provider_state),
-        "cost" => cost::run(history, cfg),
-        "context" => context::run(history, cfg),
+        "cost" => without_args(name, args, || cost::run(history, cfg)),
+        "context" => without_args(name, args, || context::run(history, cfg)),
         "compact" => compact::run(args, history, cfg, ui, cancel).await,
-        "clear" => clear::run(),
+        "clear" => without_args(name, args, clear::run),
         "loop" => loop_command::run(args),
         "skills" => skills::run(args, cfg),
-        "exit" => exit::run(),
+        "exit" => without_args(name, args, exit::run),
         // A user-invoked skill or command: expand its body (same seam the
         // model's `skill` tool uses) and hand it back as a turn to run. Searches
         // every loaded entry — both `SKILL.md` skills and `.kloop/commands/*.md`
@@ -256,6 +256,20 @@ pub async fn run_with_provider_state(
             }
             Err(_) => unknown(name, cfg),
         },
+    }
+}
+
+/// A command that takes no arguments refuses extra words instead of running
+/// without them: `/clear then look at X` would otherwise start a new session and
+/// drop "look at X" without a word. None of the references refuses — codex and
+/// pi send the whole line to the model, cc runs the command and drops the rest —
+/// but sending runs something other than the command, and dropping loses what
+/// the words were for.
+fn without_args(name: &str, args: &str, run: impl FnOnce() -> SlashResult) -> SlashResult {
+    if args.is_empty() {
+        run()
+    } else {
+        SlashResult::message(format!("/{name} takes no arguments; nothing was done"))
     }
 }
 
@@ -589,6 +603,43 @@ mod tests {
         assert_eq!(ui.notes(), ["compacting history"]);
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(history.messages(), &[Message::user_text("only message")]);
+    }
+
+    /// Words after a command that takes none are refused, not dropped: nothing
+    /// runs — no new session, no quit — and History is as it was. Trailing
+    /// whitespace is not an argument.
+    #[tokio::test]
+    async fn commands_without_arguments_refuse_extra_words() {
+        let cfg = test_cfg(kloop_provider::Provider::mock(vec![]), Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("earlier work"));
+        let before = history.messages().to_vec();
+
+        for name in ["help", "cost", "context", "clear", "exit"] {
+            let result = run(
+                &format!("/{name} then look at X"),
+                &mut history,
+                &cfg,
+                &SilentUi,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(
+                result,
+                SlashResult::message(format!("/{name} takes no arguments; nothing was done"))
+            );
+        }
+        assert_eq!(history.messages(), before.as_slice());
+
+        let result = run(
+            "/exit   ",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(result.quit);
     }
 
     /// The words after `/compact` reach the summary request, and the reply says
