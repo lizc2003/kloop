@@ -232,7 +232,7 @@ pub async fn run_with_provider_state(
         "effort" => effort::run(args, history, cfg, provider_state),
         "cost" => cost::run(history, cfg),
         "context" => context::run(history, cfg),
-        "compact" => compact::run(history, cfg, ui, cancel).await,
+        "compact" => compact::run(args, history, cfg, ui, cancel).await,
         "clear" => clear::run(),
         "loop" => loop_command::run(args),
         "skills" => skills::run(args, cfg),
@@ -589,6 +589,138 @@ mod tests {
         assert_eq!(ui.notes(), ["compacting history"]);
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(history.messages(), &[Message::user_text("only message")]);
+    }
+
+    /// The words after `/compact` reach the summary request, and the reply says
+    /// they were used — before they took any, they were silently dropped.
+    #[tokio::test]
+    async fn compact_with_a_focus_uses_it_and_says_so() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![kloop_protocol::AssistantBlock::Text {
+                text: "what happened so far".into(),
+            }]),
+        ]);
+        let cfg = test_cfg(provider, Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::user_text("old request"));
+        history.record(Message::assistant(vec![ContentBlock::Text {
+            text: "old work ".repeat(crate::compact::keep_recent_tokens() as usize),
+        }]));
+        history.record(Message::user_text("current request"));
+
+        let ui = NoteUi::default();
+        let result = run(
+            "/compact  keep the failing test's root cause ",
+            &mut history,
+            &cfg,
+            &ui,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            SlashResult::message("history compacted: 2 summarized, 1 kept verbatim (with focus)")
+        );
+        assert_eq!(ui.notes(), ["compacting history"]);
+        let seen = seen.lock().unwrap();
+        let [ContentBlock::Text { text }] = seen[0].messages.last().unwrap().content.as_slice()
+        else {
+            panic!("the summary request ends in one text block")
+        };
+        assert!(
+            text.ends_with("\n<focus>\nkeep the failing test's root cause\n</focus>"),
+            "{text}"
+        );
+    }
+
+    /// Nothing new to fold: the last summary is not summarized again for a
+    /// focus, and the reply says the focus went unused.
+    #[tokio::test]
+    async fn compact_with_a_focus_on_compacted_history_says_it_was_not_applied() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(Vec::new());
+        let cfg = test_cfg(provider, Some(200_000));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.record(Message::injected(
+            kloop_protocol::Injected::ContextSummary,
+            format!("{}old summary", crate::compact::SUMMARY_PREFIX),
+        ));
+        history.record(Message::user_text("current request"));
+        let before = history.messages().to_vec();
+
+        let result = run(
+            "/compact keep the root cause",
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            SlashResult::message(
+                "history already compacted: nothing new to summarize (focus not applied)"
+            )
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(history.messages(), before.as_slice());
+    }
+
+    /// The limit counts characters, not bytes: 2,000 CJK characters are 6,000
+    /// bytes and still fit. One more is refused before anything happens — no
+    /// note, no request, History as it was.
+    #[tokio::test]
+    async fn compact_refuses_a_focus_over_the_limit() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Blocks(vec![kloop_protocol::AssistantBlock::Text {
+                text: "summary".into(),
+            }]),
+        ]);
+        let cfg = test_cfg(provider, Some(200_000));
+        let seeded = || {
+            let mut history = History::new(cfg.offload_dir.clone());
+            history.record(Message::user_text("old request"));
+            history.record(Message::assistant(vec![ContentBlock::Text {
+                text: "old work ".repeat(crate::compact::keep_recent_tokens() as usize),
+            }]));
+            history.record(Message::user_text("current request"));
+            history
+        };
+
+        let mut history = seeded();
+        let before = history.messages().to_vec();
+        let ui = NoteUi::default();
+        let result = run(
+            &format!("/compact {}", "字".repeat(2_001)),
+            &mut history,
+            &cfg,
+            &ui,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            SlashResult::message("compaction not started: focus is 2001 chars, limit 2000")
+        );
+        assert!(ui.notes().is_empty());
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(history.messages(), before.as_slice());
+
+        let mut history = seeded();
+        let result = run(
+            &format!("/compact {}", "字".repeat(2_000)),
+            &mut history,
+            &cfg,
+            &SilentUi,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            SlashResult::message("history compacted: 2 summarized, 1 kept verbatim (with focus)")
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

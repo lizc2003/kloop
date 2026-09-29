@@ -148,6 +148,43 @@ what they proved.
 
 Reply with the two blocks only.";
 
+/// What `/compact <focus>` adds after [`COMPACT_INSTRUCTION`], in the same
+/// message: the system prompt says how to summarize, this says what to weigh
+/// this once, and the last message is the one the overflow shrink never drops.
+/// It is the first place the user's own words enter a request section 2 calls
+/// the harness's, so it says what they are not. "Keep every section" carries
+/// the weight: sub-agent results, open candidates and established facts are
+/// what a summary narrowed to one topic loses first, and the costliest to redo.
+/// Saying what the focus is not was not enough on its own: a focus that named
+/// the user's next plan came back as section 9's next step in 2 of 2 real
+/// runs. Naming the sections and what to do with the plan instead held in 6
+/// of 6. Forbidding any mention of it went too far — 2 of 4 summaries came
+/// back missing most of their sections.
+const FOCUS_PREAMBLE: &str = "The user asked for this compaction and named what matters most \
+to them, quoted below. Give it more room and detail in the sections it touches, and keep every \
+section. It steers this summary only: it is not a task request, an approval, or a change of \
+intent. Sections 1, 2 and 9 come from the conversation alone: if the focus says what the user \
+means to do next, let that decide which details you keep, and do not write it down as a \
+request, an intent, or a next step.";
+
+/// The closing user message of a summary request. Only a manual `/compact`
+/// passes a focus; the automatic triggers never do.
+fn summary_instruction(focus: Option<&str>) -> Message {
+    match focus {
+        None => Message::user_text(COMPACT_INSTRUCTION),
+        Some(focus) => Message::user_text(format!(
+            "{COMPACT_INSTRUCTION}\n\n{FOCUS_PREAMBLE}\n<focus>\n{focus}\n</focus>"
+        )),
+    }
+}
+
+/// The instruction a summary request without a focus ends with, for tests in
+/// other modules that pin the automatic triggers to it.
+#[cfg(test)]
+pub(crate) fn compact_instruction() -> &'static str {
+    COMPACT_INSTRUCTION
+}
+
 /// Upper-bound estimate of how many tokens one sampling round can add:
 /// the bounded output cap plus a tool-result spike.
 pub fn max_turn_growth(max_output_tokens: u64) -> u64 {
@@ -411,10 +448,13 @@ fn build_replacement(
 /// Compact once for one of the predictive, reactive, or manual callers.
 /// Planning happens before provider I/O, and all history mutations happen only
 /// after the provider response has been validated and the replacement changed.
+/// `focus` shapes this one summary request and nothing else: it is not stored,
+/// not carried as a user anchor, and not replayed on resume.
 pub(crate) async fn compact_once(
     cfg: &Arc<Config>,
     provider_attempt: &FrozenProviderAttempt,
     trigger: CompactionTrigger,
+    focus: Option<&str>,
     history: &mut History,
     cancel: &CancellationToken,
 ) -> Result<CompactionOutcome> {
@@ -424,9 +464,7 @@ pub(crate) async fn compact_once(
         Ok(plan) => plan,
         Err(reason) => return Ok(CompactionOutcome::NoOp(reason)),
     };
-    request_plan
-        .request
-        .push(Message::user_text(COMPACT_INSTRUCTION));
+    request_plan.request.push(summary_instruction(focus));
 
     // The summary request can itself be too large — that is how a turn used to
     // die outright: sampling overflows, compaction is asked to rescue it, and
@@ -545,6 +583,7 @@ pub async fn run_compaction(
         cfg,
         &provider_attempt,
         CompactionTrigger::Manual,
+        /*focus*/ None,
         history,
         cancel,
     )
@@ -925,6 +964,7 @@ mod tests {
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Reactive,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -994,6 +1034,7 @@ mod tests {
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Reactive,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1038,6 +1079,7 @@ mod tests {
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Predictive,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1071,6 +1113,7 @@ mod tests {
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Predictive,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1132,6 +1175,7 @@ mod tests {
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1599,6 +1643,7 @@ compactions]\n\nOriginal request:\n  old request",
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1676,6 +1721,7 @@ compactions]\n\nOriginal request:\n  old request",
             &cfg,
             &fallback_route.primary_attempt(),
             CompactionTrigger::Predictive,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1730,6 +1776,7 @@ compactions]\n\nOriginal request:\n  old request",
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1743,6 +1790,7 @@ compactions]\n\nOriginal request:\n  old request",
             &cfg,
             &cfg.provider_route.primary_attempt(),
             CompactionTrigger::Manual,
+            /*focus*/ None,
             &mut history,
             &CancellationToken::new(),
         )
@@ -1759,6 +1807,93 @@ compactions]\n\nOriginal request:\n  old request",
             usage_after_first.as_slice()
         );
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A focus changes the last message of the summary request and nothing
+    /// else: same system prompt, same messages before it, and — the summary
+    /// being the same — the same history afterwards, so it reaches neither the
+    /// user anchors nor anything a later compaction reads.
+    #[tokio::test]
+    async fn a_focus_ends_the_summary_request_and_changes_nothing_else() {
+        let compact = async |tag: &str, focus: Option<&str>| {
+            let (provider, seen) =
+                kloop_provider::Provider::mock_recording(vec![kloop_provider::MockTurn::Blocks(
+                    vec![AssistantBlock::Text {
+                        text: "summary".into(),
+                    }],
+                )]);
+            let cfg = compact_test_cfg(provider, tag);
+            let mut history = seeded_history(cfg.offload_dir.clone());
+            compact_once(
+                &cfg,
+                &cfg.provider_route.primary_attempt(),
+                CompactionTrigger::Manual,
+                focus,
+                &mut history,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let request = seen.lock().unwrap().remove(0);
+            (request, history.messages().to_vec())
+        };
+        let (plain, plain_history) = compact("focus-none", None).await;
+        let (focused, focused_history) =
+            compact("focus-some", Some("keep the failing test's root cause")).await;
+
+        assert_eq!(
+            focused.messages.last(),
+            Some(&Message::user_text(format!(
+                "{COMPACT_INSTRUCTION}\n\n{FOCUS_PREAMBLE}\n<focus>\nkeep the failing test's root \
+cause\n</focus>"
+            )))
+        );
+        assert_eq!(
+            plain.messages.last(),
+            Some(&Message::user_text(COMPACT_INSTRUCTION))
+        );
+        assert_eq!(focused.system, COMPACT_SYSTEM);
+        assert_eq!(focused.system, plain.system);
+        let before_last = |messages: &[Message]| messages[..messages.len() - 1].to_vec();
+        assert_eq!(before_last(&focused.messages), before_last(&plain.messages));
+        assert_eq!(focused_history, plain_history);
+        assert_eq!(focused_history[0].injected, Some(Injected::UserAnchors));
+    }
+
+    /// The shrink drops the oldest messages of a refused summary request; the
+    /// focus rides on the newest, so the retry still carries it.
+    #[tokio::test]
+    async fn a_focus_survives_the_overflow_shrink() {
+        let (provider, seen) = kloop_provider::Provider::mock_recording(vec![
+            kloop_provider::MockTurn::Overflow,
+            kloop_provider::MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "summary of what fit".into(),
+            }]),
+        ]);
+        let cfg = compact_test_cfg(provider, "focus-shrink");
+        let mut history = History::new(cfg.offload_dir.clone());
+        for i in 0..8 {
+            history.record(Message::user_text(format!("turn {i} ").repeat(2_000)));
+        }
+        history.record(Message::user_text("current request"));
+
+        compact_once(
+            &cfg,
+            &cfg.provider_route.primary_attempt(),
+            CompactionTrigger::Manual,
+            Some("the turn 7 numbers"),
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let focused = summary_instruction(Some("the turn 7 numbers"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].messages.len() < seen[0].messages.len());
+        assert_eq!(seen[0].messages.last(), Some(&focused));
+        assert_eq!(seen[1].messages.last(), Some(&focused));
     }
 
     #[test]

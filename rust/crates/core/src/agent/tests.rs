@@ -1124,13 +1124,9 @@ fn compaction_cfg(provider: Provider, window: u64, tag: &str) -> Arc<Config> {
 /// the summary, turn 2 the actual reply.
 #[tokio::test]
 async fn predictive_compaction_fires_before_sampling() {
-    let provider = Provider::mock(vec![
-        vec![AssistantBlock::Text {
-            text: "summary of everything so far".into(),
-        }],
-        vec![AssistantBlock::Text {
-            text: "final answer".into(),
-        }],
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Blocks(text("summary of everything so far")),
+        MockTurn::Blocks(text("final answer")),
     ]);
     // growth = 8192 + 15_000 = 23_192; window 30_000 → threshold ≈ 6_808 tokens.
     // Each fat message is sized off the keep budget so one of them still has to
@@ -1166,6 +1162,12 @@ async fn predictive_compaction_fires_before_sampling() {
         history.estimated_tokens() < 5_000,
         "compaction should have shrunk the history, got {} tokens",
         history.estimated_tokens()
+    );
+    // A focus is only ever the user's, on `/compact`: the automatic path asks
+    // with the bare instruction.
+    assert_eq!(
+        seen.lock().unwrap()[0].messages.last(),
+        Some(&Message::user_text(crate::compact::compact_instruction()))
     );
 }
 
@@ -1491,6 +1493,10 @@ async fn reactive_compaction_uses_the_active_attempt() {
         seen[3]
             .system
             .starts_with("You summarize an in-progress coding-agent session")
+    );
+    assert_eq!(
+        seen[3].messages.last(),
+        Some(&Message::user_text(crate::compact::compact_instruction()))
     );
 }
 

@@ -554,6 +554,7 @@ impl Turn<'_> {
             self.cfg,
             &self.active_attempt,
             compact::CompactionTrigger::Predictive,
+            /*focus*/ None,
             self.history,
             self.cancel,
         )
@@ -611,6 +612,7 @@ impl Turn<'_> {
             self.cfg,
             &self.active_attempt,
             compact::CompactionTrigger::Reactive,
+            /*focus*/ None,
             self.history,
             self.cancel,
         )
