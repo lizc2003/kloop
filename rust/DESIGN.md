@@ -341,7 +341,11 @@ context_window = 272000        # what the model itself takes
 Neither side is privileged by being the provider: the smaller number decides, so
 a model narrower than the gateway's cap lowers the budget exactly as the cap
 does — which is what makes the model table worth filling in for every model a
-provider lists, not just the one it defaults to. The budget is re-derived for
+provider lists, not just the one it defaults to. When every model a provider
+lists shares one window, stating it once on the provider is accepted, the demo
+included; the cost is that a smaller model
+added to that list later inherits the larger number until it gets its own entry,
+and nothing checks for that. The budget is re-derived for
 the new (provider, model) pair on every `/provider` switch — carrying the old
 number across would mean a smaller window is only discovered by being rejected.
 (`/context` pins a number for the session; configuration never does.) When

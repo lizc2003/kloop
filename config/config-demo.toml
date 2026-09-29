@@ -42,7 +42,9 @@ effort      = "xhigh"
 
 # [models."<id>"] — facts about a model, shared by every provider. All optional.
 # `context_window` is the model's own window; the budget is the smaller of it and
-# the provider's cap, so a model that is smaller than its siblings says so here.
+# the provider's. A provider's `context_window` applies to every model it lists,
+# so a model smaller than that MUST say so here — nothing checks it, and until it
+# does, predictive compaction budgets it at its siblings' size and never fires.
 # A declared `efforts` list is the WHOLE list: leave "none" out and /effort none
 # is refused on that model, so list it unless the model really rejects it.
 

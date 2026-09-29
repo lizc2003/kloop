@@ -1048,14 +1048,18 @@ auth_header = { Authorization = "Bearer key" }
     }
 
     /// The shipped demo is the config every new user copies, and its numbers
-    /// have to survive a `/model`. A provider that lists several models cannot
-    /// state the window once on the profile: that number is then a claim about
-    /// whichever model happens to be selected and the siblings inherit it —
-    /// which is how a 200K model came to be budgeted against a sibling's 1M.
-    /// A single-model provider is exempt; there the two levels say the same
-    /// thing. Nothing else reads the demo's `[models]` tables.
+    /// have to survive a `/model`: every model a multi-model provider can
+    /// switch to gets a window from its own `[models]` entry or from the
+    /// provider, or it silently budgets against the 200K default (how
+    /// `gpt-5.6-terra` once did). What this cannot check is a provider window
+    /// that is wrong for one sibling — a smaller model without its own entry
+    /// inherits the larger number, which is how a 200K model once came to be
+    /// budgeted against a sibling's 1M. A provider-level window is accepted
+    /// anyway (2026-09-29: simpler when the whole list shares one window), and
+    /// the demo's `[models]` comment says a smaller model must declare itself.
+    /// A single-model provider is exempt: there is nothing to switch to.
     #[test]
-    fn every_model_the_demo_can_switch_to_declares_its_own_window() {
+    fn every_model_the_demo_can_switch_to_has_a_window() {
         let raw = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../config/config-demo.toml"),
@@ -1073,13 +1077,15 @@ auth_header = { Authorization = "Bearer key" }
             if models.len() < 2 {
                 continue;
             }
+            let provider_window = profile.get("context_window").is_some();
             for model in models {
                 assert!(
-                    knowledge
-                        .get(model)
-                        .is_some_and(|facts| facts.context_window.is_some()),
-                    "demo provider '{id}' can switch to '{model}', \
-                     which declares no context_window"
+                    provider_window
+                        || knowledge
+                            .get(model)
+                            .is_some_and(|facts| facts.context_window.is_some()),
+                    "demo provider '{id}' can switch to '{model}', which gets no \
+                     context_window from the provider or from [models]"
                 );
             }
         }
