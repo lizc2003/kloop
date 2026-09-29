@@ -78,6 +78,11 @@
 源文本局部决定)、流式回答同时给出"已定稿行数"、每种 cell 声明定稿行数与能否整格离开、一个 `freeze_target`
 取代 `commit_count`/`head_freeze_lines`/`is_committable`、只有补全弹窗还暂停提交。开工前有两问(plan 第七节)。
 
+**plan 216 选 No,就停下来听(同日立，未开工)。** 审批面板的拒绝行写着 "No, and tell kloop what to do differently",
+选了之后模型却接着跑(普通工具"换个办法",计划"改好再交")。codex 同一句文案对应 `ReviewDecision::Abort`(停下等用户)。
+用户定：所有审批，人按的 No/Esc 都在这一批工具做完后结束本轮;headless 的自动拒绝照旧继续。形状:`Decision::Stop`、
+跟着轮次树走的 `stop` 令牌(前台子 agent 共用、后台各自一份)、排队中的审批撤回。开工前有两问(plan 第六节)。
+
 ## 〇、当前这一批:架构重整 plan 177–186(2026-09-21 排定)
 
 来源:plan 176 的体积棘轮落地当天,用户看了现状后一句「我要的是现有文件的架构重整啊」。
