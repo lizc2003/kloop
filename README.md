@@ -32,7 +32,7 @@ reads the code, edits files, runs commands and looks things up until the job is 
 
 ## Install
 
-Rust 1.96+. macOS is the primary platform (the sandbox has a macOS backend only);
+Rust 1.98+. macOS is the primary platform (the sandbox has a macOS backend only);
 Linux and Windows build and run, but only macOS is exercised routinely — there is
 no CI, so `make check` on the developer's machine is the whole gate.
 

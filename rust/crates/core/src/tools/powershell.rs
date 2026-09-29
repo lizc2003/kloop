@@ -132,10 +132,8 @@ mod tests {
         let encoded = encode_command(&payload);
         let bytes = STANDARD.decode(encoded).unwrap();
         assert!(!bytes.starts_with(&[0xff, 0xfe]));
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let (pairs, _) = bytes.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         let decoded = String::from_utf16(&units).unwrap();
         assert_eq!(decoded, payload);
         assert!(decoded.contains(

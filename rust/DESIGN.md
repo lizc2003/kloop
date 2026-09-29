@@ -3988,10 +3988,16 @@ first run. An existing config is never read, rewritten or backed up: it holds th
 machine's gateway and credential, so the install has nothing to say about it.
 `make uninstall` removes the binary and leaves `~/.kloop` alone.
 
-Building the workspace requires Rust 1.96 or newer and uses Rust edition
+Building the workspace requires Rust 1.98 or newer and uses Rust edition
 2024. The repository's `rust/rust-toolchain.toml` pins development to
-Rust 1.96.1 with rustfmt and clippy, and since the CI matrix was removed that pin
-is the only toolchain any gate runs on. The terminal stack is
+Rust 1.98.1 with rustfmt and clippy, and since the CI matrix was removed that pin
+is the only toolchain any gate runs on, so `rust-version` names the same minor
+rather than an older floor nothing checks. 1.98 is also a hard floor on macOS 27:
+before it, rustc's post-link strip (`rust-objcopy`, on by default in release)
+could leave a Mach-O's LINKEDIT string pool 4-byte aligned, and macOS 27's dyld
+refuses such an image — a release build then dies with `can't find crate for
+<some>_macro` when the stripped proc-macro dylib will not load
+(rust-lang/rust#158410). The terminal stack is
 Ratatui 0.30.2 with its explicit `crossterm_0_29` integration, Crossterm 0.29.0
 (`event-stream` retained), `unicode-width` 0.2.2, and
 `unicode-segmentation` 1.13.3. The Unix-only real-binary PTY harness uses
@@ -4459,14 +4465,17 @@ There is no CI. The GitHub Actions workflow — a macOS/Linux/Windows matrix plu
 1.96.1 MSRV job — was deleted on 2026-09-22, at the user's call. Every run it ever
 made had failed at the same step, locked all-target/all-feature workspace clippy
 under `-D warnings`: the matrix asked for `+stable`, which had moved on to 1.98.1,
-while the repository pins 1.96.1, so the only thing the matrix reported was the
+while the repository pinned 1.96.1, so the only thing the matrix reported was the
 distance between its own toolchain and the project's (the 1.96.1 MSRV job beside
 it stayed green throughout). `make check` on the developer's machine is now the
 whole gate, and it runs on macOS only. Composer/unit/render/TestBackend
 correctness is cross-platform *code* — those suites carry no `cfg` — but nothing
 executes it on Linux or Windows; the native Windows evidence on record comes from
-a manual Windows 10 x64 run and from lifting a module into a scratch crate for a
-`--target x86_64-pc-windows-msvc` check. The real-binary TUI PTY
+a manual Windows 10 x64 run, from lifting a module into a scratch crate for a
+`--target x86_64-pc-windows-msvc` check, and from whole-workspace
+`cargo clippy --target x86_64-pc-windows-msvc` with a stand-in C compiler for that
+triple (HANDOFF lesson 201) — which type-checks every `cfg(windows)` line but
+neither links nor runs anything. The real-binary TUI PTY
 harness is `cfg(unix)` with Unix-only dev
 dependencies: it proves CPR, input/resize, terminal mode sequences, and the
 captured visible viewport on POSIX; a Windows skip/non-applicable build is not a

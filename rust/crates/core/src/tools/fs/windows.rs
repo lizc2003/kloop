@@ -6,7 +6,6 @@ use std::os::windows::io::FromRawHandle as _;
 use std::path::Path;
 use std::ptr;
 
-use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;

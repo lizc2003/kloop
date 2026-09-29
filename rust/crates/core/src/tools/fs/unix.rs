@@ -9,7 +9,6 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
 
