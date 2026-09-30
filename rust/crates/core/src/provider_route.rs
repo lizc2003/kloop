@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use kloop_protocol::ANTHROPIC_BUDGET_ANSWER_TOKENS;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
@@ -30,6 +31,10 @@ pub struct ProviderCatalogEntry {
     /// model itself. Only the gateway operator knows this — it is configuration,
     /// not a fact about the model.
     pub context_window: Option<u64>,
+    /// What this gateway lets one call ask for, when the operator says so. Like
+    /// `context_window` it is configuration: the rail default is a guess that
+    /// has to fit every model, and only whoever runs the gateway knows better.
+    pub max_output_tokens: Option<u64>,
     pub availability: ProviderAvailabilityCode,
     /// The configured effort this provider starts a session at. It seeds
     /// [`SessionProviderState`]; `/effort` then owns the value for the rest of
@@ -42,15 +47,17 @@ struct CatalogEntry {
     descriptor: ProviderDescriptor,
     endpoint_fingerprint: String,
     context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
     default_effort: Option<ReasoningEffort>,
     factory: ProviderFactory,
     provider: OnceLock<Result<Arc<Provider>, ProviderAvailabilityCode>>,
 }
 
 /// What is true about a model rather than chosen by the user: how much context
-/// it takes and which reasoning levels it accepts. It is knowledge, written once
-/// and then left alone, which is why it lives in its own `[models."<id>"]` table
-/// instead of being repeated inside every provider that can route to the model.
+/// it takes, how much output one call may ask for, and which reasoning levels
+/// it accepts. It is knowledge, written once and then left alone, which is why
+/// it lives in its own `[models."<id>"]` table instead of being repeated inside
+/// every provider that can route to the model.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelKnowledge {
     pub context_window: Option<u64>,
@@ -65,6 +72,10 @@ pub struct ModelKnowledge {
     /// [`ProviderCatalog::declared_efforts`] gives, which is how a model that
     /// takes no effort field at all becomes expressible.
     pub thinking_budgets: Option<BTreeMap<ReasoningEffort, u64>>,
+    /// The most output one call to this model may ask for. Declared when the
+    /// rail default is wrong for it: higher because the model takes more, or
+    /// lower because it refuses the default (Haiku 4.5 stops at 64,000).
+    pub max_output_tokens: Option<u64>,
 }
 
 pub struct ProviderCatalog {
@@ -122,6 +133,7 @@ impl ProviderCatalog {
                         descriptor,
                         endpoint_fingerprint,
                         context_window: entry.context_window,
+                        max_output_tokens: entry.max_output_tokens,
                         default_effort: entry.default_effort,
                         factory: entry.factory,
                         provider: OnceLock::new(),
@@ -161,11 +173,40 @@ impl ProviderCatalog {
             .model_knowledge
             .get(model)
             .and_then(|knowledge| knowledge.context_window);
-        match (declared, gateway) {
-            (Some(model_window), Some(cap)) => Some(model_window.min(cap)),
-            (Some(only), None) | (None, Some(only)) => Some(only),
-            (None, None) => None,
+        smaller_declared(declared, gateway)
+    }
+
+    /// A thinking budget must stay below the cap its model gets on every
+    /// provider that can send it, or the request asks for less output than
+    /// reasoning alone may take — which the Messages API refuses. Checked at
+    /// startup with every provider in view: a cap declared on one gateway can
+    /// undercut a budget that fits everywhere else.
+    pub fn check_thinking_budgets(&self) -> Result<(), String> {
+        for (provider_id, entry) in &self.entries {
+            if !rail_has_thinking_field(entry.descriptor.api_family) {
+                continue;
+            }
+            let caps = output_cap_routing(entry, &self.model_knowledge);
+            for model in &entry.descriptor.models {
+                let Some(budgets) = self
+                    .model_knowledge
+                    .get(model)
+                    .and_then(|knowledge| knowledge.thinking_budgets.as_ref())
+                else {
+                    continue;
+                };
+                let cap = caps.cap(model);
+                if let Some((level, budget)) = budgets.iter().find(|(_, budget)| **budget >= cap) {
+                    return Err(format!(
+                        "models.{model}.thinking_budget.{} is {budget} tokens, but provider \
+                         '{provider_id}' caps this model's output at {cap}; a budget must \
+                         stay below the output cap",
+                        level.as_str()
+                    ));
+                }
+            }
         }
+        Ok(())
     }
 
     /// Whether this model accepts that reasoning level. Declaring nothing means
@@ -222,6 +263,7 @@ impl ProviderCatalog {
             default_model: default_model.clone(),
             models,
             context_window: None,
+            max_output_tokens: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(move || {
@@ -332,11 +374,9 @@ impl ProviderCatalog {
             model: model.to_string(),
             allowed_models: entry.descriptor.models.clone(),
             provider,
+            output_cap: output_cap_routing(entry, &self.model_knowledge),
             thinking: ThinkingRouting {
-                rail_has_field: matches!(
-                    entry.descriptor.api_family,
-                    ProviderApiFamily::AnthropicMessages | ProviderApiFamily::Mock
-                ),
+                rail_has_field: rail_has_thinking_field(entry.descriptor.api_family),
                 budgets: entry
                     .descriptor
                     .models
@@ -364,6 +404,44 @@ impl ProviderCatalog {
             self.resolve(provider_id, model)?,
             self.default_effort(provider_id),
         ))
+    }
+}
+
+/// Only the Messages rail has a `thinking` field; the OpenAI rails carry the
+/// whole of the reasoning setting on their own effort field.
+fn rail_has_thinking_field(api_family: ProviderApiFamily) -> bool {
+    matches!(
+        api_family,
+        ProviderApiFamily::AnthropicMessages | ProviderApiFamily::Mock
+    )
+}
+
+fn output_cap_routing(
+    entry: &CatalogEntry,
+    knowledge: &BTreeMap<String, ModelKnowledge>,
+) -> OutputCapRouting {
+    OutputCapRouting {
+        rail_default: entry.descriptor.api_family.default_max_output_tokens(),
+        gateway: entry.max_output_tokens,
+        declared: entry
+            .descriptor
+            .models
+            .iter()
+            .filter_map(|model| {
+                let cap = knowledge.get(model)?.max_output_tokens?;
+                Some((model.clone(), cap))
+            })
+            .collect(),
+    }
+}
+
+/// Two declared limits on one quantity — the model's and the gateway's —
+/// combine to the smaller; one declared is that one.
+fn smaller_declared(model: Option<u64>, gateway: Option<u64>) -> Option<u64> {
+    match (model, gateway) {
+        (Some(model), Some(gateway)) => Some(model.min(gateway)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     }
 }
 
@@ -540,6 +618,41 @@ struct ResolvedRoute {
     /// the catalog in hand: a frozen route outlives the lookup that made it, and
     /// `child_route` can mint an attempt for any allowed model.
     thinking: ThinkingRouting,
+    /// The output cap, carried for the same reason.
+    output_cap: OutputCapRouting,
+}
+
+/// How many output tokens an attempt asks for, carried by a resolved route.
+#[derive(Clone)]
+struct OutputCapRouting {
+    rail_default: u64,
+    /// The provider profile's `max_output_tokens`.
+    gateway: Option<u64>,
+    /// `[models."<id>"].max_output_tokens`, for the route's allowed models.
+    declared: BTreeMap<String, u64>,
+}
+
+impl OutputCapRouting {
+    /// The smaller of what the model and the gateway declared, or the rail
+    /// default when neither did. Unlike the window, a declaration may *raise*
+    /// the number: the default is kloop's guess, not a measurement.
+    fn cap(&self, model: &str) -> u64 {
+        smaller_declared(self.declared.get(model).copied(), self.gateway)
+            .unwrap_or(self.rail_default)
+    }
+
+    /// A budget-dialect model asks for answer room on top of its budget, as it
+    /// always has — but never past the cap, which is the model's or the
+    /// gateway's hard limit. Startup keeps every budget below the cap
+    /// ([`ProviderCatalog::check_thinking_budgets`]), so the request still
+    /// leaves room for an answer.
+    fn resolve(&self, model: &str, thinking: ThinkingMode) -> u64 {
+        let cap = self.cap(model);
+        match thinking {
+            ThinkingMode::Budget(budget) => (ANTHROPIC_BUDGET_ANSWER_TOKENS + budget).min(cap),
+            ThinkingMode::Unset | ThinkingMode::Off | ThinkingMode::Adaptive => cap,
+        }
+    }
 }
 
 /// The `thinking` half of the reasoning knob, carried by a resolved route.
@@ -548,8 +661,7 @@ struct ResolvedRoute {
 /// is rather than merely the main one.
 #[derive(Clone)]
 struct ThinkingRouting {
-    /// Only the Messages rail has a `thinking` field; the OpenAI rails carry the
-    /// whole of the reasoning setting on their own effort field.
+    /// See [`rail_has_thinking_field`].
     rail_has_field: bool,
     /// Per-model effort -> token budget, for the models that read no effort
     /// field. Only the route's allowed models appear.
@@ -977,7 +1089,8 @@ impl FrozenProviderRoute {
     }
 
     fn attempt(&self, model: String) -> FrozenProviderAttempt {
-        let model_for_thinking = model.clone();
+        let thinking = self.route.thinking.resolve(&model, self.effort);
+        let max_output_tokens = self.route.output_cap.resolve(&model, thinking);
         FrozenProviderAttempt {
             identity: ProviderAttemptIdentity {
                 route_revision: self.revision,
@@ -986,12 +1099,8 @@ impl FrozenProviderRoute {
                 endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
                 model,
             },
-            reasoning: Reasoning::new(
-                self.effort,
-                self.route
-                    .thinking
-                    .resolve(&model_for_thinking, self.effort),
-            ),
+            reasoning: Reasoning::new(self.effort, thinking),
+            max_output_tokens,
             provider: Arc::clone(&self.route.provider),
         }
     }
@@ -1076,6 +1185,10 @@ pub struct FrozenProviderAttempt {
     /// route knows the model's dialect, and only the route is still holding the
     /// session effort.
     reasoning: Reasoning,
+    /// The output cap this attempt's requests ask for, resolved once with the
+    /// reasoning so the request, the compaction reserve and an error message
+    /// all read the same number.
+    max_output_tokens: u64,
     provider: Arc<Provider>,
 }
 
@@ -1112,6 +1225,10 @@ impl FrozenProviderAttempt {
     /// `thinking` field it rendered to for this model.
     pub fn reasoning(&self) -> Reasoning {
         self.reasoning
+    }
+
+    pub fn max_output_tokens(&self) -> u64 {
+        self.max_output_tokens
     }
 
     pub fn provenance(&self, route_boundary: u64) -> ProviderResponseProvenance {
@@ -1284,6 +1401,7 @@ mod tests {
             default_model: default_model.into(),
             models: models.iter().map(|model| (*model).to_string()).collect(),
             context_window: None,
+            max_output_tokens: None,
             availability: ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1306,6 +1424,7 @@ mod tests {
                     "budget-model".to_string(),
                     ModelKnowledge {
                         context_window: None,
+                        max_output_tokens: None,
                         efforts: Some(vec![ReasoningEffort::Low, ReasoningEffort::High]),
                         thinking_budgets: Some(BTreeMap::from([
                             (ReasoningEffort::Low, 2048),
@@ -1359,6 +1478,7 @@ mod tests {
                         "m1".to_string(),
                         ModelKnowledge {
                             context_window: None,
+                            max_output_tokens: None,
                             efforts: None,
                             // Even a budget table cannot conjure a field the rail
                             // does not have.
@@ -1379,6 +1499,148 @@ mod tests {
             );
             assert_eq!(attempt.effort(), Some(ReasoningEffort::High), "{family:?}");
         }
+    }
+
+    fn capped_entry(
+        id: &str,
+        api_family: ProviderApiFamily,
+        models: &[&str],
+        max_output_tokens: Option<u64>,
+    ) -> ProviderCatalogEntry {
+        ProviderCatalogEntry {
+            api_family,
+            max_output_tokens,
+            ..mock_entry(id, models[0], models)
+        }
+    }
+
+    fn knows_cap(max_output_tokens: u64) -> ModelKnowledge {
+        ModelKnowledge {
+            max_output_tokens: Some(max_output_tokens),
+            ..ModelKnowledge::default()
+        }
+    }
+
+    fn knows_budget(high: u64, max_output_tokens: Option<u64>) -> ModelKnowledge {
+        ModelKnowledge {
+            efforts: Some(vec![ReasoningEffort::None, ReasoningEffort::High]),
+            thinking_budgets: Some(BTreeMap::from([(ReasoningEffort::High, high)])),
+            max_output_tokens,
+            ..ModelKnowledge::default()
+        }
+    }
+
+    /// The number an attempt asks for: the rail default when nothing is
+    /// declared, a declaration that may raise it, the smaller of the model's
+    /// and the gateway's when both speak, and a budget model's answer room plus
+    /// budget — under the cap all the same.
+    #[test]
+    fn attempts_ask_for_the_declared_output_cap() {
+        let messages = ProviderApiFamily::AnthropicMessages;
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                capped_entry(
+                    "plain",
+                    messages,
+                    &["big", "small", "budget", "tight"],
+                    None,
+                ),
+                capped_entry("wide", messages, &["big", "small"], Some(128_000)),
+                capped_entry("resp", ProviderApiFamily::OpenAiResponses, &["big"], None),
+            ])
+            .unwrap()
+            .with_model_knowledge(BTreeMap::from([
+                ("small".to_string(), knows_cap(16_000)),
+                ("budget".to_string(), knows_budget(16_384, None)),
+                ("tight".to_string(), knows_budget(16_384, Some(20_000))),
+            ])),
+        );
+        let cap = |provider: &str, model: &str, effort: Option<ReasoningEffort>| {
+            let state =
+                SessionProviderState::new(Arc::clone(&catalog), provider, Some(model)).unwrap();
+            state.set_effort(effort);
+            state.freeze().primary_attempt().max_output_tokens()
+        };
+        let high = Some(ReasoningEffort::High);
+
+        assert_eq!(
+            [
+                cap("plain", "big", high),
+                cap("resp", "big", high),
+                cap("wide", "big", high),
+                cap("plain", "small", high),
+                cap("wide", "small", high),
+                cap("plain", "budget", high),
+                cap("plain", "tight", high),
+                cap("plain", "budget", None),
+            ],
+            [
+                64_000,
+                65_536,
+                128_000,
+                16_000,
+                16_000,
+                8_192 + 16_384,
+                20_000,
+                64_000,
+            ]
+        );
+
+        // A child on another allowed model gets that model's cap without the
+        // catalog in hand.
+        let wide = SessionProviderState::new(Arc::clone(&catalog), "wide", Some("big"))
+            .unwrap()
+            .freeze();
+        let child = wide
+            .child_route(Some(
+                &InheritedProviderModelOverride::parse("small").unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(child.primary_attempt().max_output_tokens(), 16_000);
+    }
+
+    /// The Messages API refuses a budget that is not below `max_tokens`, and a
+    /// gateway can declare a cap that undercuts a budget fine everywhere else.
+    /// The OpenAI rails never send the budget, so their caps do not count.
+    #[test]
+    fn a_thinking_budget_must_stay_below_every_cap_it_is_sent_under() {
+        let catalog = |gateway: Option<u64>| {
+            ProviderCatalog::new(vec![
+                capped_entry(
+                    "plain",
+                    ProviderApiFamily::AnthropicMessages,
+                    &["budget"],
+                    None,
+                ),
+                capped_entry(
+                    "narrow",
+                    ProviderApiFamily::AnthropicMessages,
+                    &["budget"],
+                    gateway,
+                ),
+                capped_entry(
+                    "resp",
+                    ProviderApiFamily::OpenAiResponses,
+                    &["budget"],
+                    Some(1_024),
+                ),
+            ])
+            .unwrap()
+            .with_model_knowledge(BTreeMap::from([(
+                "budget".to_string(),
+                knows_budget(16_384, None),
+            )]))
+        };
+
+        assert_eq!(catalog(Some(16_385)).check_thinking_budgets(), Ok(()));
+        assert_eq!(
+            catalog(Some(16_384)).check_thinking_budgets(),
+            Err(
+                "models.budget.thinking_budget.high is 16384 tokens, but provider 'narrow' \
+                 caps this model's output at 16384; a budget must stay below the output cap"
+                    .to_string()
+            )
+        );
     }
 
     fn receipt(

@@ -1193,6 +1193,7 @@ mod tests {
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
                     context_window: None,
+                    max_output_tokens: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
@@ -1203,6 +1204,7 @@ mod tests {
                 "m1".to_string(),
                 crate::provider_route::ModelKnowledge {
                     context_window: None,
+                    max_output_tokens: None,
                     efforts: Some(vec![
                         kloop_protocol::ReasoningEffort::Low,
                         kloop_protocol::ReasoningEffort::High,
@@ -1278,6 +1280,7 @@ mod tests {
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
                     context_window: None,
+                    max_output_tokens: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
@@ -1378,6 +1381,7 @@ mod tests {
             default_model: models[0].into(),
             models: models.iter().map(|model| (*model).to_string()).collect(),
             context_window: None,
+            max_output_tokens: None,
             availability: kloop_protocol::ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),
@@ -1392,6 +1396,7 @@ mod tests {
                 "b2".to_string(),
                 crate::provider_route::ModelKnowledge {
                     context_window: None,
+                    max_output_tokens: None,
                     efforts: Some(vec![
                         kloop_protocol::ReasoningEffort::Low,
                         kloop_protocol::ReasoningEffort::High,
@@ -1607,6 +1612,7 @@ mod tests {
                     default_model: "m1".into(),
                     models: vec!["m1".into()],
                     context_window: None,
+                    max_output_tokens: None,
                     availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                     default_effort: None,
                     factory: Arc::new(|| Ok(kloop_provider::Provider::mock(Vec::new()))),

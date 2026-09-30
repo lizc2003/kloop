@@ -126,3 +126,79 @@
    B 要量得先把上限临时调低才能复现，量的成本比它省下的高。
 4. 兜底规则是否不分 rail——推荐不分:"接着写"的前提是有可见输出，这在哪条 rail 上都不成立。
 5. 新错误的文案：带上限数，建议拆小请求或换模型，不提 effort——推荐这样。
+
+## 八、✅ 完成
+
+2026-09-30 当次会话做完，一次提交(SHA 以本条所在提交为准)。`make check` 全绿(1823 个测试,parity 语料校验通过)。
+
+### 开工五问
+
+1. **不用问。** 配置里能访问的 Responses 模型全都收 65,536:sky-bj 三个模型(`deepseek-v4.1-flash`、
+   `deepseek-v4-flash-0731`、`glm-5.3-flash`)在 65,536 上 200,在 10,000,000 上 400——网关确实校验，所以这个
+   200 有意义;`gpt-5.6-sol` 连 10,000,000 都是 200(看不出校验);`gpt-5.6-terra`/`luna` 用这把 key 一律 403(无权访问),
+   与上限无关。配置里没有 Chat provider。
+2. **plan 的推荐被实测推翻，用户另定了形状。** opus-4-8、sonnet-4-6 在 65,536 上各 5/5 通过;**haiku-4-5 的硬上限
+   是 64,000**(64,001 就 400,有没有 thinking 都一样)。而这个常量不只管 Adaptive:Unset/Off(比如 haiku 选
+   `none`)用的也是它,Budget 档是它加 budget——照 plan 取 65,536,haiku 每次都 400。用户:「可以在 provider
+   配置里加个配置，开一个自定义的口子吗」,商量后「两层都做」:
+   - `[providers.x] max_output_tokens`(网关给多少)与 `[models."x"] max_output_tokens`(模型收多少),两层都写
+     取较小的，只写一层用那一层，都不写用 rail 默认值;**声明可以往上抬**(默认值是猜的，不是量的)——与
+     `context_window` 唯一的不同。
+   - rail 默认值:Messages **64,000**(三个模型都收),Responses/Chat **65,536**。
+3. **A**:当场结束。
+4. **不分 rail。**
+5. 文案照推荐，数字取这一轮实际用的上限(用户:「不能写死」):
+   `the model spent the entire {N}-token output limit on reasoning and produced no answer; split the request into
+   smaller steps or switch models`。
+
+### 与第五节的出入
+
+- **上限由 route 解析，按 attempt 走。** `ProviderApiFamily::max_output_tokens` 改名
+  `default_max_output_tokens`,只当兜底;`OutputCapRouting`(与 `ThinkingRouting` 并列挂在 `ResolvedRoute` 上，
+  子 agent 换模型也不用回 catalog)按(模型, thinking)算出一个数，存进 `FrozenProviderAttempt::max_output_tokens`。
+  请求体、压缩预留、新错误三处读的是**同一个数**。Budget 档的公式也挪进 route:`min(8,192 + budget, 上限)`
+  (`ANTHROPIC_BUDGET_ANSWER_TOKENS`),provider 只照写，不再自己加。`stream_attempt` 多一个 `max_output_tokens`
+  参数(加了 `too_many_arguments` 的 allow,与仓库里其它几处同样处理)。
+- **Mock 钉在 8,192**,不跟 Messages 走:脚本化测试的增长预测一个不动。
+- **Messages 的压缩预留从 23,192 变成 35,000。** 第二节"上限多高都一样"只对 OpenAI 两条 rail 成立
+  (32k 与 64k 都大于 20k);Messages 从 8,192 抬到 64,000,`min(上限, 20k)` 从 8,192 变成 20,000。开工时向用户说明过。
+- **兜底只认 `OutputLimitKind::MaxOutputTokens`。** `ModelContextWindow` 且没有正文照旧续写(第六节"另议"):
+  那里说"推理用完了输出上限"是假话。
+- **启动时多一道检查**(`ProviderCatalog::check_thinking_budgets`):thinking budget 必须小于它在每个 Messages
+  provider 上拿到的上限，否则请求被 API 拒。原来 `parse_thinking_budget` 注释里"上界自己成立"在上限可配之后不再成立。
+- `config/config-demo.toml` 的 `[models]` 说明补了这个键,haiku 写上 `max_output_tokens = 64000`——provider 往上抬
+  时它不会被带着越过硬上限。
+
+| 测试 | 锁住什么 |
+|---|---|
+| `agent::tests::reasoning_only_truncation_ends_without_continuation` | 只有 thinking 的 `OutputLimit(MaxOutputTokens)`:错误带上限(8,192)、`rounds == 1`、`final_text` 为空、脚本第 2 轮没被请求(请求记录只有一条，且上限就是 attempt 的数)、历史里没有 continue 提示、没有发 Note |
+| `agent::tests::reasoning_only_truncation_mid_recovery_keeps_the_prefix` | 第 1 轮有正文被截 → 续写一次;第 2 轮只有推理 → 结束,`final_text` 是第 1 轮正文,`rounds == 2`,提示只有 1 条 |
+| `provider_route::tests::attempts_ask_for_the_declared_output_cap` | rail 默认(64,000 / 65,536)、provider 抬到 128,000、模型声明 16,000、两层取小、Budget 为 8,192 + budget、Budget 再被声明的上限封顶、Budget 模型不选 effort 时用上限、子 agent 换模型拿到那个模型的数 |
+| `provider_route::tests::a_thinking_budget_must_stay_below_every_cap_it_is_sent_under` | budget 等于某个 Messages provider 的上限 → 整句报错;OpenAI rail 的上限不参与 |
+| `rollout::tests::output_spent_on_reasoning_round_trips_with_its_cap` | 新变体落盘的 JSON 整对象、读回相等、显示文案整句 |
+| `provider_config::tests::the_output_cap_comes_from_the_profile_and_the_model` | 两层解析与取小、都不写用默认值、0 被拒 |
+| `provider_config::tests::a_thinking_budget_over_the_output_cap_fails_at_startup` | 配置层的启动报错整句 |
+| 改动的现有测试 | 请求体整对象里的 8,192 / 32,768 → 64,000 / 65,536;provider 层的 thinking 测试改成"照写传进来的数";`growth_follows_the_rail_cap` 改为 `growth_from_the_default_caps`(三条 rail 都到 20k 封顶,Mock 仍 8,192) |
+
+反证：把判空改成 `false &&`,两条新的 agent 测试红，原有三条截断测试照旧绿。
+
+## 九、真实验证(同日，正式构建)
+
+第二节的办法，这回不改源码，用 `make check` 编出的二进制(默认上限就是 65,536):临时 HOME 复制配置、项目目录与
+skills,配置加一条不带 matcher 的 `pre_tool` hook(内联 `/bin/sh -c '…; exit 2'`),`--fork 20260930-032304#518`
+接原审查原文,`--max-rounds 1`。上真实网关前先用本地假服务器验过：请求体里 `max_output_tokens` 是 65536,返回的
+`touch` 调用结果是 "blocked by hook",文件没建。
+
+| 次 | 输入(缓存命中) | 输出 | 推理 | 用时 | 结果 |
+|---|---|---|---|---|---|
+| 1 | 260,434(0) | **36,543** | 132,185 字符 | 约 7 分钟 | 正文 + 2 次 bash(都被拦) |
+| 2 | 260,496(6,144) | 29,716 | 112,466 字符 | 约 3.5 分钟 | 正文 + 2 次 bash(都被拦) |
+| 3 | 260,434(260,352) | 32,231 | 119,634 字符 | 约 6 分钟 | 正文 + 2 次 bash(都被拦) |
+
+- 三次都收住、写出正文、调了工具，结束状态都是 `max_rounds`(`--max-rounds 1` 的预期)。
+- **第 1 次在旧上限下会重演事故**:36,543 > 32,768,会被砍成只有推理，然后进续写。第 3 次离旧上限只差 537。
+  连同第二节，同一条输入的首轮现在有七个样本:≥32,768(事故)、18k、34k、20k、36.5k、29.7k、32.2k——三个超过
+  32k,最大 36.5k,离 65,536 还远。
+- 重放后原会话所在的仓库 `git status` 干净、HEAD 未变，模型要建的 `/tmp` 目录一个都没建;复制出来的配置(带 key)
+  已删。
+- 并行起三个 `--fork` 时有两个在同一秒撞了会话 id(`File exists`),错开 3 秒补跑。见 HANDOFF 217 条的"顺带发现"。

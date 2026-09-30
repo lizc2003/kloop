@@ -4176,6 +4176,7 @@ cargo run -- --mock
 #   model = "gpt-5.6-sol"               # this provider's default model
 #   models = ["gpt-5.6-sol", "gpt-5.6-mini"]   # optional; omitted = just `model`
 #   context_window = 200000             # optional; what this gateway caps at
+#   max_output_tokens = 128000          # optional; per-call output (see below)
 #
 #   [models."gpt-5.6-sol"]              # facts about the model, not settings
 #   context_window = 272000
@@ -4183,6 +4184,7 @@ cargo run -- --mock
 #
 #   [models."claude-haiku-4-5"]         # a model whose only dial is a budget
 #   thinking_budget = { low = 2048, high = 16384 }
+#   max_output_tokens = 64000           # optional; the most one call may ask for
 #
 # auth_header is one credential written the way the endpoint reads it, not a bag
 # of request headers: kloop sends exactly that spelling and nothing else. The two
@@ -4248,15 +4250,20 @@ cargo run -- --mock
 # last one moves forward each round. Turn it off only for a gateway that rejects
 # the field; usage reports cache_read/cache_creation so a real hit is visible.
 #
-# Output caps are rail-local and not user config, because the rails disagree
-# about whose budget reasoning comes out of. Anthropic Messages asks for 8,192
-# output tokens and adds any thinking budget on top of that number, so reasoning
-# can never eat the answer's room. Responses and Chat Completions ask for 32,768:
-# there reasoning is spent from the same budget as the answer (at xhigh a model
-# can spend the whole of a small cap on reasoning and never reach the text), and
-# neither rail re-sends the request with a larger cap, so the room has to be
-# there from the start. Predictive compaction reserves against the cap of the
-# rail the session is actually on, not a build-wide constant.
+# Every call asks for an explicit output cap: predictive compaction needs a
+# number to reserve against (at most 20,000 of it), and the request, that reserve
+# and the reasoning-only error below all read the one number the route resolved
+# for the attempt. On every rail reasoning is spent from that same budget —
+# adaptive thinking on Messages included — so the cap has to hold both; at 32,768
+# an xhigh round was measured spending all of it on reasoning with no answer.
+# Undeclared, the rail default applies: 64,000 on Messages (the largest every model
+# measured takes; Haiku 4.5 refuses 64,001) and 65,536 on Responses and Chat
+# Completions. `max_output_tokens` may be declared on a provider (what the gateway
+# gives) and in a model's table (what the model takes); both declared, the smaller
+# wins, and either may raise the default, which is a guess and not a measurement.
+# A budget-dialect model asks for 8,192 of answer room plus its budget, never past
+# the cap, and startup refuses a budget that is not below the cap on any Messages
+# provider that lists the model.
 #
 # Stream guards are fixed provider-internal safety defaults, not user config:
 # 45s response-header open, 15m per-chunk idle, 30m wall-clock, 10 MiB total
@@ -4302,7 +4309,11 @@ cargo run -- --mock
 # mandatory typed outcome. EndTurn, ToolUse, output limits, refusal, filtering,
 # and incomplete responses are distinct: only output limits enter bounded
 # continuation; refusal/filter/incomplete never retry, fallback, or dispatch a
-# tool. A truncated Responses terminal (incomplete_details.reason length or
+# tool. Continuation needs visible text to continue from: a round cut off at the
+# output cap with none spent all of it reasoning, which the next request may not
+# see (one gateway was measured not counting it as input), so asking again only
+# redraws the round. It ends the turn instead, as its own error naming the cap,
+# keeping whatever text earlier rounds produced. A truncated Responses terminal (incomplete_details.reason length or
 # max_output_tokens — one event, two vendor spellings) is an output limit, and
 # the complete tool calls such a response already emitted still dispatch as
 # ToolUse, since truncation lands on item boundaries and those calls carry the

@@ -35,11 +35,9 @@ use stream::spawn_stream;
 use sha2::Digest as _;
 use sha2::Sha256;
 
-use kloop_protocol::ANTHROPIC_MAX_OUTPUT_TOKENS;
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::Message;
-use kloop_protocol::OPENAI_MAX_OUTPUT_TOKENS;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
 use kloop_protocol::ProviderResponseProvenance;
@@ -64,6 +62,7 @@ pub struct MockRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub effort: Option<ReasoningEffort>,
+    pub max_output_tokens: u64,
     pub cache_key: Option<String>,
 }
 
@@ -129,7 +128,8 @@ pub enum ThinkingMode {
     Adaptive,
     /// `{"type": "enabled", "budget_tokens": n}` for pre-adaptive models
     /// (rejected by current ones). Thinking spends from max_tokens, so the
-    /// request raises max_tokens by the budget instead of clamping the budget.
+    /// route asks for answer room plus the budget rather than clamping the
+    /// budget; the provider writes whatever number it was handed.
     Budget(u64),
 }
 
@@ -518,6 +518,7 @@ impl Provider {
         self.stream_attempt(
             &attempt,
             Reasoning::default(),
+            self.api_family().default_max_output_tokens(),
             /*cache_key*/ None,
             system,
             messages,
@@ -534,6 +535,12 @@ impl Provider {
     /// sends no effort field on any rail. The caller has already validated it
     /// against this rail's [`ProviderApiFamily::accepted_efforts`].
     ///
+    /// `max_output_tokens` is the whole output cap this request asks for, already
+    /// resolved by the route from configuration, the rail default and — for a
+    /// budget-dialect model — the thinking budget. The adapter writes it into
+    /// its rail's field and does no arithmetic of its own, so the number sent is
+    /// the number compaction reserved against and an error can report.
+    ///
     /// `cache_key` is the session-stable cache-affinity hint: the session id,
     /// shared by sampling, compaction, and sub-agents. It only steers which
     /// backend serves the request — never what the request means — so a wrong
@@ -549,10 +556,12 @@ impl Provider {
     /// gateways that sit in front of it. Chat spells it the same way Responses
     /// does; see that arm for why the field rides there on acceptance rather
     /// than on a measured win.
+    #[allow(clippy::too_many_arguments)]
     pub fn stream_attempt(
         self: &Arc<Self>,
         attempt: &ProviderAttemptIdentity,
         reasoning: Reasoning,
+        max_output_tokens: u64,
         cache_key: Option<&str>,
         system: &str,
         messages: &[Message],
@@ -571,6 +580,7 @@ impl Provider {
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
                     effort,
+                    max_output_tokens,
                     cache_key: cache_key.map(str::to_string),
                 });
                 let turn = turns.lock().unwrap().pop_front().unwrap_or_else(|| {
@@ -596,7 +606,7 @@ impl Provider {
                 };
                 let mut body = json!({
                     "model": model,
-                    "max_tokens": ANTHROPIC_MAX_OUTPUT_TOKENS,
+                    "max_tokens": max_output_tokens,
                     "system": anthropic::system_value(system, cache),
                     "messages": messages,
                     "tools": anthropic::tools_value(tools, cache),
@@ -622,7 +632,6 @@ impl Provider {
                     ThinkingMode::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
                     ThinkingMode::Budget(n) => {
                         body["thinking"] = json!({"type": "enabled", "budget_tokens": n});
-                        body["max_tokens"] = json!(ANTHROPIC_MAX_OUTPUT_TOKENS + n);
                     }
                 }
                 let session = cache_key.map(str::to_string);
@@ -649,7 +658,7 @@ impl Provider {
                         "description": t.description,
                         "parameters": t.schema,
                     })).collect::<Vec<_>>(),
-                    "max_output_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                    "max_output_tokens": max_output_tokens,
                     "parallel_tool_calls": true,
                     "store": false,
                     "include": ["reasoning.encrypted_content"],
@@ -678,7 +687,7 @@ impl Provider {
                 };
                 let mut body = json!({
                     "model": model,
-                    "max_tokens": OPENAI_MAX_OUTPUT_TOKENS,
+                    "max_tokens": max_output_tokens,
                     "stream_options": {"include_usage": true},
                     "messages": messages,
                     "tools": tools.iter().map(|t| json!({

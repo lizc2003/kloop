@@ -770,6 +770,7 @@ async fn sample_summary(
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
         provider_attempt.reasoning(),
+        provider_attempt.max_output_tokens(),
         cache_key,
         COMPACT_SYSTEM,
         request,
@@ -1905,20 +1906,28 @@ cause\n</focus>"
         );
     }
 
-    /// A turn reserves against the cap its own rail asks for, not a global
-    /// number: the OpenAI rails request four times what Anthropic does, and
-    /// that room has to be reserved before the round, not discovered after it.
+    /// With nothing declared, both real rails ask for more than the reserve's
+    /// own ceiling, so raising a default does not move compaction; Mock's
+    /// smaller default is what scripted turns have always predicted.
     #[test]
-    fn growth_follows_the_rail_cap() {
+    fn growth_from_the_default_caps() {
+        use kloop_protocol::ProviderApiFamily;
         let growth =
-            |family: kloop_protocol::ProviderApiFamily| max_turn_growth(family.max_output_tokens());
+            |family: ProviderApiFamily| max_turn_growth(family.default_max_output_tokens());
         assert_eq!(
-            growth(kloop_protocol::ProviderApiFamily::AnthropicMessages),
-            8_192 + TOOL_RESULT_GROWTH_ESTIMATE
-        );
-        assert_eq!(
-            growth(kloop_protocol::ProviderApiFamily::OpenAiResponses),
-            OUTPUT_GROWTH_CAP + TOOL_RESULT_GROWTH_ESTIMATE
+            [
+                ProviderApiFamily::AnthropicMessages,
+                ProviderApiFamily::OpenAiResponses,
+                ProviderApiFamily::OpenAiChatCompletions,
+                ProviderApiFamily::Mock,
+            ]
+            .map(growth),
+            [
+                OUTPUT_GROWTH_CAP + TOOL_RESULT_GROWTH_ESTIMATE,
+                OUTPUT_GROWTH_CAP + TOOL_RESULT_GROWTH_ESTIMATE,
+                OUTPUT_GROWTH_CAP + TOOL_RESULT_GROWTH_ESTIMATE,
+                8_192 + TOOL_RESULT_GROWTH_ESTIMATE,
+            ]
         );
     }
 

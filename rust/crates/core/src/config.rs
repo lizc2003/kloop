@@ -1070,6 +1070,7 @@ mod context_budget_tests {
             default_model: format!("{id}-model"),
             models: vec![format!("{id}-model")],
             context_window: gateway,
+            max_output_tokens: None,
             availability: kloop_protocol::ProviderAvailabilityCode::Ready,
             default_effort: None,
             factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1085,6 +1086,7 @@ mod context_budget_tests {
                 "wide-model".to_string(),
                 ModelKnowledge {
                     context_window: Some(400_000),
+                    max_output_tokens: None,
                     efforts: None,
                     thinking_budgets: None,
                 },

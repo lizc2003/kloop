@@ -207,6 +207,7 @@ async fn sample_once(
     let mut rx = provider_attempt.provider().stream_attempt(
         provider_attempt.identity(),
         provider_attempt.reasoning(),
+        provider_attempt.max_output_tokens(),
         cfg.cache_key(),
         system,
         messages,

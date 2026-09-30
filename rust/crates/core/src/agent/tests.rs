@@ -1186,7 +1186,7 @@ impl Ui for NotesUi {
 const PREDICTED_NOTE: &str = "predicted context overflow; compacting history";
 
 fn growth(cfg: &Config) -> u64 {
-    crate::compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens())
+    crate::compact::max_turn_growth(cfg.provider_route.primary_attempt().max_output_tokens())
 }
 
 fn short_history(cfg: &Config) -> History {
@@ -1714,6 +1714,90 @@ async fn truncation_recovery_is_bounded() {
         .filter(|m| *m == &Message::injected(Injected::Harness, super::TRUNCATION_CONTINUE_MSG))
         .count();
     assert_eq!(nudges, 3);
+}
+
+fn thought(t: &str) -> Vec<AssistantBlock> {
+    vec![AssistantBlock::Thinking {
+        thinking: t.into(),
+        signature: "sig".into(),
+    }]
+}
+
+fn continue_nudges(history: &History) -> usize {
+    history
+        .messages()
+        .iter()
+        .filter(|m| *m == &Message::injected(Injected::Harness, super::TRUNCATION_CONTINUE_MSG))
+        .count()
+}
+
+/// A round that spent the whole cap reasoning has nothing visible to continue
+/// from, and the next request cannot be relied on to see that reasoning: asking
+/// again only redraws the same round. The turn ends on the first one, with an
+/// error that names the cap — and the scripted second round is never asked for.
+#[tokio::test]
+async fn reasoning_only_truncation_ends_without_continuation() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Truncated(thought(
+            "Let me start by verifying each of the three claims",
+        )),
+        MockTurn::Blocks(text("never requested")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "reasoning-only-truncation");
+    let notes = Arc::new(NotesUi::default());
+    let ui: Arc<dyn Ui> = notes.clone();
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("review these three findings"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(
+        outcome.reason,
+        EndReason::Error(TurnError::OutputSpentOnReasoning {
+            max_output_tokens: 8_192
+        })
+    );
+    assert_eq!((outcome.final_text.as_str(), outcome.rounds), ("", 1));
+    let sent: Vec<u64> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request.max_output_tokens)
+        .collect();
+    assert_eq!(sent, [8_192], "one request, asking for the attempt's cap");
+    assert_eq!(continue_nudges(&history), 0);
+    assert_eq!(*notes.0.lock().unwrap(), Vec::<String>::new());
+}
+
+/// Continuation still runs while there is text to continue; a later round that
+/// is all reasoning ends the turn the same way, and the text already produced
+/// is the deliverable.
+#[tokio::test]
+async fn reasoning_only_truncation_mid_recovery_keeps_the_prefix() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Truncated(text("part one, cut off mid-")),
+        MockTurn::Truncated(thought("Let me start over and re-read everything")),
+        MockTurn::Blocks(text("never requested")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "reasoning-only-mid-recovery");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("write something long"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(
+        outcome.reason,
+        EndReason::Error(TurnError::OutputSpentOnReasoning {
+            max_output_tokens: 8_192
+        })
+    );
+    assert_eq!(
+        (outcome.final_text.as_str(), outcome.rounds),
+        ("part one, cut off mid-", 2)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(continue_nudges(&history), 1);
 }
 
 #[tokio::test]

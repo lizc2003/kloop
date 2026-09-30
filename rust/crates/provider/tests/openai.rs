@@ -79,10 +79,10 @@ fn openai(server: &MockServer) -> Provider {
     }
 }
 
-/// The chat rail asks for the same output cap as Responses, and for the same
-/// reason: reasoning tokens come out of this budget too, and there is no
-/// "retry with a bigger cap" step behind either rail. The Anthropic rail keeps
-/// its smaller cap because a thinking budget is added on top of it there.
+/// With nothing declared, the chat rail asks for the same output cap as
+/// Responses, and for the same reason: reasoning tokens come out of this
+/// budget too, and there is no "retry with a bigger cap" step behind either
+/// rail.
 #[tokio::test]
 async fn chat_requests_carry_the_openai_output_cap() {
     let server = MockServer::start().await;
@@ -105,7 +105,7 @@ async fn chat_requests_carry_the_openai_output_cap() {
 
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["max_tokens"], json!(32_768));
+    assert_eq!(body["max_tokens"], json!(65_536));
 }
 
 /// Text deltas, tool_calls accumulated across chunks by index, usage arriving
@@ -931,6 +931,7 @@ async fn chat_carries_the_session_id_as_prompt_cache_key() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(None, kloop_provider::ThinkingMode::Unset),
+            /*max_output_tokens*/ 4_096,
             cache_key,
             "s",
             &[Message::user_text("hi")],
@@ -963,6 +964,7 @@ async fn effort_maps_to_reasoning_effort_field() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(effort, kloop_provider::ThinkingMode::Unset),
+            /*max_output_tokens*/ 4_096,
             None,
             "s",
             &[Message::user_text("hi")],

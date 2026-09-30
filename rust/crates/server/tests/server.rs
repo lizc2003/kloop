@@ -383,6 +383,7 @@ fn switch_factory(
                 default_model: "shared".into(),
                 models: vec!["shared".into(), format!("{id}-other")],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -431,6 +432,7 @@ fn renaming_factory(offload: PathBuf, configured: Arc<Mutex<Vec<String>>>) -> Co
                 default_model: "shared".into(),
                 models: vec!["shared".into()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(vec![vec![text("answer")]]))),
@@ -1187,6 +1189,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 default_model: "shared".into(),
                 models: vec!["shared".into(), "a-other".into()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1198,6 +1201,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 default_model: "shared".into(),
                 models: vec!["shared".into(), "b-other".into()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(|| Ok(Provider::mock(Vec::new()))),
@@ -1336,6 +1340,7 @@ async fn real_three_rail_route_switch_contract() {
                 default_model: anthropic_model.clone(),
                 models: vec![anthropic_model.clone()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -1356,6 +1361,7 @@ async fn real_three_rail_route_switch_contract() {
                 default_model: responses_model.clone(),
                 models: vec![responses_model.clone()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: None,
                 factory: Arc::new(move || {
@@ -1375,6 +1381,7 @@ async fn real_three_rail_route_switch_contract() {
                 default_model: responses_model.clone(),
                 models: vec![responses_model.clone()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 default_effort: Some(responses_effort),
                 factory: Arc::new(move || {
@@ -3914,6 +3921,7 @@ async fn real_effort_sweep_contract() {
                 default_model: model.clone(),
                 models: vec![model.clone()],
                 context_window: None,
+                max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
                 // The sweep sets every level explicitly; starting from "no field
                 // sent" keeps the first turn a clean control.

@@ -117,6 +117,9 @@ struct Profile {
     /// visible — it just compacts earlier than it had to, which is why it stays
     /// wrong for a long time.
     context_window: Option<u64>,
+    /// What this gateway lets one call ask for; see
+    /// [`ProviderCatalogEntry::max_output_tokens`].
+    max_output_tokens: Option<u64>,
 }
 
 struct GlobalFile {
@@ -205,6 +208,7 @@ fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings
             default_model: profile.model,
             models: profile.models,
             context_window: profile.context_window,
+            max_output_tokens: profile.max_output_tokens,
             availability,
             default_effort,
             factory,
@@ -215,6 +219,9 @@ fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings
             .map_err(anyhow::Error::msg)?
             .with_model_knowledge(file.model_knowledge),
     );
+    catalog
+        .check_thinking_budgets()
+        .map_err(anyhow::Error::msg)?;
     // A declared effort set is a claim the user made after testing; contradicting
     // it is a config mistake, and finding it at startup beats finding it in a 400
     // halfway through the first turn.
@@ -288,7 +295,7 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
         for key in spec.keys() {
             if !matches!(
                 key.as_str(),
-                "context_window" | "efforts" | "thinking_budget"
+                "context_window" | "efforts" | "thinking_budget" | "max_output_tokens"
             ) {
                 bail!("models.{id} has unknown key '{key}'");
             }
@@ -297,6 +304,11 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
             spec,
             "context_window",
             &format!("models.{id}.context_window"),
+        )?;
+        let max_output_tokens = optional_integer(
+            spec,
+            "max_output_tokens",
+            &format!("models.{id}.max_output_tokens"),
         )?;
         let thinking_budgets = parse_thinking_budget(spec, &id)?;
         if thinking_budgets.is_some() && spec.contains_key("efforts") {
@@ -327,6 +339,7 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
                 context_window,
                 efforts,
                 thinking_budgets,
+                max_output_tokens,
             },
         );
     }
@@ -338,8 +351,10 @@ fn parse_model_knowledge(table: &toml::Table) -> Result<BTreeMap<String, ModelKn
 /// One budget per effort level keeps `/effort` the single knob; kloop renders it
 /// into whichever field the model actually reads.
 ///
-/// The API floor is 1024, and the ceiling takes care of itself: a budget raises
-/// `max_tokens` by its own size, so it can never exceed it.
+/// The API floor is 1024. The ceiling is the output cap, which a budget raises
+/// the request by but can never pass — and a cap can be declared per provider,
+/// so that check waits for the whole catalog
+/// ([`ProviderCatalog::check_thinking_budgets`]).
 fn parse_thinking_budget(
     spec: &toml::Table,
     id: &str,
@@ -419,6 +434,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "prompt_cache"
                 | "effort"
                 | "context_window"
+                | "max_output_tokens"
         ) {
             bail!("providers.{id} has unknown key '{key}'");
         }
@@ -460,6 +476,11 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         "context_window",
         &format!("providers.{id}.context_window"),
     )?;
+    let max_output_tokens = optional_integer(
+        spec,
+        "max_output_tokens",
+        &format!("providers.{id}.max_output_tokens"),
+    )?;
     let auth = parse_auth_header(id, spec.get("auth_header"))?;
     Ok(Profile {
         wire,
@@ -470,6 +491,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         prompt_cache,
         effort,
         context_window,
+        max_output_tokens,
     })
 }
 
@@ -898,6 +920,7 @@ auth_header = { Authorization = "Bearer key" }
                 "claude-haiku-4-5".to_string(),
                 ModelKnowledge {
                     context_window: None,
+                    max_output_tokens: None,
                     // `none` rides along: it is not a budget, it is the
                     // disabled thinking field, and the renderer takes it on
                     // every model.
@@ -1145,6 +1168,64 @@ auth_header = { Authorization = "Bearer key" }
             "models.m has unknown key 'window'"
         );
         assert!(error("[models.m]\ncontext_window = 0\n").contains("positive token count"));
+        assert_eq!(
+            error("[models.m]\nmax_output_tokens = 0\n"),
+            "models.m.max_output_tokens must be a positive token count, got 0"
+        );
+    }
+
+    /// Read at both levels and combined like the window — the smaller of what
+    /// the model takes and what the gateway gives — except that a declaration
+    /// may also raise the rail default, which is a guess and not a measurement.
+    #[test]
+    fn the_output_cap_comes_from_the_profile_and_the_model() {
+        let cap = |gateway: &str, models: &str| {
+            resolve(Some(&with_knowledge(gateway, models)))
+                .unwrap()
+                .initial_route()
+                .primary_attempt()
+                .max_output_tokens()
+        };
+        let declared = "[models.m]\nmax_output_tokens = 100000\n";
+
+        assert_eq!(
+            [
+                cap("max_output_tokens = 128000", declared),
+                cap("", declared),
+                cap("max_output_tokens = 128000", ""),
+                cap("", ""),
+            ],
+            [100_000, 100_000, 128_000, 65_536]
+        );
+        assert_eq!(
+            resolve(Some(&with_knowledge("max_output_tokens = 0", "")))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "providers.g.max_output_tokens must be a positive token count, got 0"
+        );
+    }
+
+    /// A budget the output cap cannot hold is a request the Messages API
+    /// refuses; finding it at startup beats finding it at the first turn.
+    #[test]
+    fn a_thinking_budget_over_the_output_cap_fails_at_startup() {
+        let raw = |cap: u64| {
+            format!(
+                "provider = \"c\"\n[providers.c]\nwire_api = \"messages\"\n\
+                 auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n\
+                 [models.m]\nthinking_budget = {{ high = 16384 }}\nmax_output_tokens = {cap}\n"
+            )
+        };
+        assert!(resolve(Some(&raw(16_385))).is_ok());
+        assert_eq!(
+            resolve(Some(&raw(16_000)))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            "models.m.thinking_budget.high is 16384 tokens, but provider 'c' caps this \
+             model's output at 16000; a budget must stay below the output cap"
+        );
     }
 
     /// Real model ids contain dots (`gpt-5.6-sol`, `gpt-4.1`), so the table key

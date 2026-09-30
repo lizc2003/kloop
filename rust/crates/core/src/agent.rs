@@ -21,6 +21,7 @@ use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Injected;
 use kloop_protocol::Message;
+use kloop_protocol::OutputLimitKind;
 
 mod sampling;
 
@@ -486,9 +487,8 @@ struct Turn<'a> {
     /// The complete route, frozen once. Every round, compaction and child
     /// admission in this operation derives attempts from this same snapshot.
     active_attempt: FrozenProviderAttempt,
-    /// Per rail, not per build: the Responses/Chat cap is four times the
-    /// Anthropic one, and a round that may produce four times the output has to
-    /// reserve for it.
+    /// Reserved against the output cap this attempt actually asks for, which
+    /// differs by rail and can be declared per provider and per model.
     growth: u64,
     /// A sub-agent's text is its deliverable and returns via the tool result;
     /// streaming it to the main UI would interleave with the parent's output.
@@ -822,8 +822,24 @@ impl Turn<'_> {
                 rounds: round + 1,
                 structured: None,
             })),
-            AssistantOutcome::OutputLimit(_) => {
+            AssistantOutcome::OutputLimit(kind) => {
                 let round_text = text_content(blocks);
+                // "Continue where you left off" needs visible output to continue
+                // from. A round that spent the whole cap reasoning has none, and
+                // the next request is not guaranteed to see that reasoning (one
+                // gateway was measured not counting it as input at all), so
+                // asking again only redraws the same round — measured redrawing
+                // it from scratch, cap exhausted again, every time.
+                if *kind == OutputLimitKind::MaxOutputTokens && round_text.trim().is_empty() {
+                    return Some(RoundStep::Stop(Ending {
+                        reason: EndReason::Error(TurnError::OutputSpentOnReasoning {
+                            max_output_tokens: self.active_attempt.max_output_tokens(),
+                        }),
+                        text: Some(format!("{}{round_text}", self.truncated_prefix)),
+                        rounds: round + 1,
+                        structured: None,
+                    }));
+                }
                 if self.truncation_recoveries < TRUNCATION_RECOVERY_LIMIT {
                     self.truncation_recoveries += 1;
                     self.truncated_prefix.push_str(&round_text);
@@ -1026,6 +1042,7 @@ async fn turn_rounds(
         }
     };
     history.compaction_breaker().begin_turn();
+    let active_attempt = cfg.provider_route.primary_attempt();
     let mut turn = Turn {
         cfg,
         history,
@@ -1034,8 +1051,8 @@ async fn turn_rounds(
         depth,
         options,
         enclosing_execution,
-        active_attempt: cfg.provider_route.primary_attempt(),
-        growth: compact::max_turn_growth(cfg.provider_route.api_family().max_output_tokens()),
+        growth: compact::max_turn_growth(active_attempt.max_output_tokens()),
+        active_attempt,
         stream_text: depth == 0,
         tools,
         program_tool_manifest,

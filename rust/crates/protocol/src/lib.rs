@@ -422,14 +422,16 @@ impl ProviderApiFamily {
         self != Self::OpenAiChatCompletions
     }
 
-    /// Output tokens this rail asks for per sampling call, and the single
-    /// source both the request bodies and the compaction growth estimate read.
-    /// Mock rides the Anthropic value: it sends no request, and keeping the
-    /// number stable keeps scripted-turn growth predictions unchanged.
-    pub const fn max_output_tokens(self) -> u64 {
+    /// Output tokens this rail asks for per sampling call when neither the
+    /// provider profile nor the model's `[models."<id>"]` table declares
+    /// `max_output_tokens`. The route resolves the number an attempt actually
+    /// sends; this is only its fallback. Mock sends no request and keeps the
+    /// value it has always had, so scripted turns predict the same growth.
+    pub const fn default_max_output_tokens(self) -> u64 {
         match self {
-            Self::AnthropicMessages | Self::Mock => ANTHROPIC_MAX_OUTPUT_TOKENS,
+            Self::AnthropicMessages => ANTHROPIC_MAX_OUTPUT_TOKENS,
             Self::OpenAiChatCompletions | Self::OpenAiResponses => OPENAI_MAX_OUTPUT_TOKENS,
+            Self::Mock => 8_192,
         }
     }
 }
@@ -856,25 +858,32 @@ impl Message {
     }
 }
 
-/// Output cap for one Anthropic Messages call. A thinking budget is added on
-/// top of it rather than taken out of it (see the Anthropic request body), so
-/// reasoning can never consume the room the answer needs.
-pub const ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 8_192;
+/// Default output cap for one Anthropic Messages call. Adaptive thinking is
+/// spent from it, the same as on the OpenAI rails, so it has to leave reasoning
+/// room as well as answer room. 64,000 is the largest value every model we
+/// measured takes (2026-09-30: Haiku 4.5 refuses 64,001; Opus and Sonnet take
+/// more, and a profile or model table can declare it).
+pub const ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
+
+/// Answer room for a budget-dialect model (`thinking_budget`): the request asks
+/// for this plus the budget, so the budget alone cannot eat the answer — still
+/// bounded by the resolved output cap.
+pub const ANTHROPIC_BUDGET_ANSWER_TOKENS: u64 = 8_192;
 
 /// The smallest thinking budget the Messages API accepts. Below it the request
 /// is refused, so a configured budget is checked at startup rather than on the
 /// first turn.
 pub const ANTHROPIC_MIN_THINKING_BUDGET: u64 = 1_024;
 
-/// Output cap for one Responses or Chat Completions call. Deliberately four
-/// times the Anthropic one: on these rails reasoning tokens come out of the
-/// same budget as the answer — at xhigh, gw_cn's deepseek spends all 8,192 on
-/// reasoning alone and never reaches the text — and neither rail has a
-/// "retry the same request with a bigger cap" step to fall back on. Sending
-/// nothing at all is what codex does, but kloop's predictive compaction needs
-/// a number it can reserve against, so the cap is explicit and equal to the
-/// gateway default (32,768) we were otherwise cutting to a quarter.
-pub const OPENAI_MAX_OUTPUT_TOKENS: u64 = 32_768;
+/// Default output cap for one Responses or Chat Completions call. Reasoning
+/// comes out of the same budget as the answer, and at xhigh a single round was
+/// measured spending all of 32,768 on reasoning with no text and no tool call;
+/// the same input redrawn three times under 65,536 finished within 18k–35k
+/// every time (plan 217). Output is billed as used and compaction reserves at
+/// most 20,000 of it, so a higher cap costs nothing until a round needs it.
+/// Sending nothing at all is what codex does, but predictive compaction needs
+/// a number it can reserve against, so the cap is explicit.
+pub const OPENAI_MAX_OUTPUT_TOKENS: u64 = 65_536;
 
 /// Real token usage reported by the provider for one sampling call.
 /// `input_tokens` is only the uncached remainder: cached prompt tokens are
@@ -1065,20 +1074,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Reasoning comes out of the answer's budget on the OpenAI rails and is
-    /// added on top of it on the Anthropic one, so the two caps are not the
-    /// same number — and Mock stays on the Anthropic value so scripted turns
-    /// keep predicting the same growth.
+    /// The fallback each rail asks for when nothing is declared. Mock keeps
+    /// its old value so scripted turns keep predicting the same growth.
     #[test]
-    fn output_caps_split_by_rail() {
+    fn default_output_caps_split_by_rail() {
         assert_eq!(
             [
-                ProviderApiFamily::AnthropicMessages.max_output_tokens(),
-                ProviderApiFamily::Mock.max_output_tokens(),
-                ProviderApiFamily::OpenAiResponses.max_output_tokens(),
-                ProviderApiFamily::OpenAiChatCompletions.max_output_tokens(),
+                ProviderApiFamily::AnthropicMessages.default_max_output_tokens(),
+                ProviderApiFamily::Mock.default_max_output_tokens(),
+                ProviderApiFamily::OpenAiResponses.default_max_output_tokens(),
+                ProviderApiFamily::OpenAiChatCompletions.default_max_output_tokens(),
             ],
-            [8_192, 8_192, 32_768, 32_768]
+            [64_000, 8_192, 65_536, 65_536]
         );
     }
 

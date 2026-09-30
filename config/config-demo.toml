@@ -56,6 +56,9 @@ effort      = "xhigh"
 # does, predictive compaction budgets it at its siblings' size and never fires.
 # A declared `efforts` list is the WHOLE list: leave "none" out and /effort none
 # is refused on that model, so list it unless the model really rejects it.
+# `max_output_tokens` is the most one call may ask for (default 64000 on messages,
+# 65536 on responses/chat). A provider may declare one too, for every model it
+# lists; the smaller wins, so a model with a lower hard limit says so here.
 
 [models."claude-opus-4-8"]
 context_window = 1000000
@@ -72,6 +75,7 @@ efforts = ["none", "low", "medium", "high", "max"]      # no xhigh
 context_window = 200000                                 # a fifth of what the other two
                                                         # on that provider take
 thinking_budget = { low = 2048, medium = 8192, high = 16384 }
+max_output_tokens = 64000                               # its hard limit: 64001 is refused
 
 [models."gpt-5.6-sol"]
 context_window = 272000                                 # the default; this family can be

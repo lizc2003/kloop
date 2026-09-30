@@ -65,6 +65,11 @@ pub enum TurnError {
     Core(String),
     ProviderOutcome(AssistantOutcome),
     ProviderFailure(ProviderFailure),
+    /// A round hit its output cap with nothing visible to continue from: all
+    /// of it went to reasoning. Carries the cap the round asked for.
+    OutputSpentOnReasoning {
+        max_output_tokens: u64,
+    },
 }
 
 mod provider_failure_serde {
@@ -175,6 +180,7 @@ enum RecordedTurnError {
     Core(String),
     ProviderOutcome(AssistantOutcome),
     ProviderFailure(RecordedProviderFailure),
+    OutputSpentOnReasoning { max_output_tokens: u64 },
 }
 
 impl Serialize for TurnError {
@@ -187,6 +193,11 @@ impl Serialize for TurnError {
             Self::ProviderOutcome(outcome) => RecordedTurnError::ProviderOutcome(outcome.clone()),
             Self::ProviderFailure(failure) => {
                 RecordedTurnError::ProviderFailure(RecordedProviderFailure(failure.clone()))
+            }
+            Self::OutputSpentOnReasoning { max_output_tokens } => {
+                RecordedTurnError::OutputSpentOnReasoning {
+                    max_output_tokens: *max_output_tokens,
+                }
             }
         }
         .serialize(serializer)
@@ -203,6 +214,9 @@ impl<'de> Deserialize<'de> for TurnError {
             RecordedTurnError::ProviderOutcome(outcome) => Self::ProviderOutcome(outcome),
             RecordedTurnError::ProviderFailure(RecordedProviderFailure(failure)) => {
                 Self::ProviderFailure(failure)
+            }
+            RecordedTurnError::OutputSpentOnReasoning { max_output_tokens } => {
+                Self::OutputSpentOnReasoning { max_output_tokens }
             }
         })
     }
@@ -256,6 +270,13 @@ impl std::fmt::Display for TurnError {
             Self::ProviderOutcome(AssistantOutcome::ToolUse) => {
                 formatter.write_str("provider tool_use was misclassified as an error")
             }
+            // No advice about effort: lowering it was measured not to help.
+            Self::OutputSpentOnReasoning { max_output_tokens } => write!(
+                formatter,
+                "the model spent the entire {max_output_tokens}-token output limit on \
+                 reasoning and produced no answer; split the request into smaller steps \
+                 or switch models"
+            ),
         }
     }
 }
@@ -3353,6 +3374,30 @@ mod tests {
         assert_eq!(load_session_snapshot(&fork).unwrap().messages[1], assistant);
         assert_eq!(raw_lines(&fork)[3]["typed_error"], raw[3]["typed_error"]);
         cleanup(&path);
+    }
+
+    /// The reasoning-only stop keeps its cap through the session file, and the
+    /// line a reader sees says what happened and what to do — not "lower the
+    /// effort", which was measured not to help.
+    #[test]
+    fn output_spent_on_reasoning_round_trips_with_its_cap() {
+        let error = TurnError::OutputSpentOnReasoning {
+            max_output_tokens: 65_536,
+        };
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "kind": "output_spent_on_reasoning",
+                "value": {"max_output_tokens": 65_536},
+            })
+        );
+        assert_eq!(serde_json::from_value::<TurnError>(encoded).unwrap(), error);
+        assert_eq!(
+            error.to_string(),
+            "the model spent the entire 65536-token output limit on reasoning and produced \
+             no answer; split the request into smaller steps or switch models"
+        );
     }
 
     #[test]

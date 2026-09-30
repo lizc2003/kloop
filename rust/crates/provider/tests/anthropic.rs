@@ -192,7 +192,7 @@ async fn request_body_carries_cache_breakpoints() {
         body,
         json!({
             "model": "test-model",
-            "max_tokens": 8192,
+            "max_tokens": 64_000,
             "system": [{
                 "type": "text",
                 "text": "be brief",
@@ -248,6 +248,7 @@ async fn session_id_rides_the_gateway_header_without_touching_the_body() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(None, ThinkingMode::Unset),
+            /*max_output_tokens*/ 4_096,
             session,
             "be brief",
             &[Message::user_text("hi")],
@@ -292,7 +293,7 @@ async fn cache_off_sends_plain_request() {
         body,
         json!({
             "model": "test-model",
-            "max_tokens": 8192,
+            "max_tokens": 64_000,
             "system": "be brief",
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "hi"}]},
@@ -636,7 +637,8 @@ async fn thinking_blocks_stream_and_finalize_with_signature() {
 
 /// History thinking blocks replay verbatim (signature included, empty text
 /// included) and the moving cache breakpoint skips them; the thinking request
-/// field follows the configured mode, raising max_tokens by a legacy budget.
+/// field follows the configured mode. `max_tokens` is the number the route
+/// resolved (answer room plus the budget, there) — the adapter adds nothing.
 #[tokio::test]
 async fn thinking_replay_and_request_modes() {
     let server = MockServer::start().await;
@@ -666,6 +668,7 @@ async fn thinking_replay_and_request_modes() {
     let mut rx = provider.stream_attempt(
         &attempt,
         Reasoning::new(Some(ReasoningEffort::High), ThinkingMode::Budget(2048)),
+        /*max_output_tokens*/ 4_096,
         /*cache_key*/ None,
         "s",
         &messages,
@@ -684,7 +687,7 @@ async fn thinking_replay_and_request_modes() {
         None,
         "a budget-dialect model reads no effort field; sending one is an error there"
     );
-    assert_eq!(body["max_tokens"], json!(8192 + 2048));
+    assert_eq!(body["max_tokens"], json!(4_096));
     assert_eq!(
         body["messages"][1]["content"],
         json!([
@@ -699,7 +702,8 @@ async fn thinking_replay_and_request_modes() {
     );
 }
 
-/// Adaptive and off modes map to their wire shapes; Unset sends no field.
+/// Adaptive and off modes map to their wire shapes; Unset sends no field. The
+/// cap is the route's number whatever the mode.
 #[tokio::test]
 async fn thinking_mode_field_shapes() {
     let server = MockServer::start().await;
@@ -719,6 +723,7 @@ async fn thinking_mode_field_shapes() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(None, mode),
+            /*max_output_tokens*/ 4_096,
             /*cache_key*/ None,
             "s",
             &[Message::user_text("hi")],
@@ -728,7 +733,7 @@ async fn thinking_mode_field_shapes() {
         let requests = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body.get("thinking").cloned(), expected, "mode {mode:?}");
-        assert_eq!(body["max_tokens"], json!(8192), "mode {mode:?}");
+        assert_eq!(body["max_tokens"], json!(4_096), "mode {mode:?}");
     }
 }
 
@@ -990,6 +995,7 @@ async fn effort_and_thinking_render_as_one_knob() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(effort, mode),
+            /*max_output_tokens*/ 4_096,
             /*cache_key*/ None,
             "s",
             &[Message::user_text("hi")],
@@ -1023,6 +1029,7 @@ async fn a_disabled_mode_sends_no_effort_alongside_it() {
     let mut rx = provider.stream_attempt(
         &attempt,
         Reasoning::new(Some(ReasoningEffort::None), ThinkingMode::Off),
+        /*max_output_tokens*/ 4_096,
         /*cache_key*/ None,
         "s",
         &[Message::user_text("hi")],

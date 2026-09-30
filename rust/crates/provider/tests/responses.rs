@@ -143,7 +143,7 @@ async fn request_body_is_stateless_with_reasoning_include() {
                 "description": "run a command",
                 "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
             }],
-            "max_output_tokens": 32768,
+            "max_output_tokens": 65_536,
             "parallel_tool_calls": true,
             "store": false,
             "include": ["reasoning.encrypted_content"],
@@ -174,6 +174,7 @@ async fn prompt_cache_key_is_sent_when_bound_and_omitted_otherwise() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(None, kloop_provider::ThinkingMode::Unset),
+            /*max_output_tokens*/ 4_096,
             cache_key,
             "s",
             &[Message::user_text("hi")],
@@ -272,6 +273,7 @@ async fn effort_maps_to_reasoning_field() {
         let mut rx = provider.stream_attempt(
             &attempt,
             Reasoning::new(effort, kloop_provider::ThinkingMode::Unset),
+            /*max_output_tokens*/ 4_096,
             None,
             "s",
             &[Message::user_text("hi")],
