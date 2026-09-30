@@ -2296,6 +2296,13 @@ It never reaches the shell and never changes the result — the transcript
 row leads with it and keeps the command after it, so a row truncated to a narrow
 terminal still says what a long one-liner is for.
 
+The schema keeps it optional (a call without one runs as before), but its prose
+says what the field is for and asks for one on every call. A model settles on
+its first `bash` call of a session and copies that shape for the rest of it, so
+the wording that call reads decides a whole session: the original "optional
+display label, never changes the result", borrowed from `run_agent`, let whole
+sessions go without a single description.
+
 Every spawn owns a complete process tree: a dedicated process group on Unix or
 a fixed pair of dedicated Job Objects on native Windows. Windows creates the root
 suspended, assigns it to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, and resumes it

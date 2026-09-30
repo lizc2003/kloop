@@ -668,7 +668,7 @@ fn bash_def() -> ToolDef {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The command to run"},
-                "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes the command or result."},
+                "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "What this command does, in a few words on one line (e.g. \"Run the core tests\", \"Show the last five commits\"). It heads this call's row in the user's transcript, above the command, so they can tell what a long command is for without parsing it; give one on every call. It never reaches the shell and never changes the result."},
                 "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when background=true"},
                 "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-N id and output file path (default false)"},
                 "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively; the unsandboxed run requires user approval."}
