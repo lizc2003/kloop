@@ -1104,14 +1104,28 @@ on screen before there is an answer — so a rejected plan stays put with the on
 that replaced it below it, which is the comparison a rejection invites. Approve
 restores the remembered mode and the model implements; a No leaves the session
 in Plan and ends the turn, so the user's next message says what to change (a
-server `decline` stays in Plan and lets the model keep planning). The tool
-description says so in those words — Yes means implement exactly this plan, No
-means stop — and so asks for a plan that is already decided: open choices go to
-`ask_user_question` first, and a plan never ends by asking the user to pick
-(plan 216, after one that closed with "choose A, B or C" left the user nowhere
-to answer). It also says to put the plan in the argument and not repeat it in
-the reply — it is now shown in full.
-Sub-agents inherit Plan mode and are read-only, but cannot enter or exit it.
+server `decline` stays in Plan and lets the model keep planning). So the plan
+has to be decided before it is shown — one that closed with "choose A, B or C"
+left the user nowhere to answer (plan 216) — and the **plan-mode reminder**, the
+text every plan-mode request carries, says what to do about it in three actions:
+a choice that changes what gets built (approach, behaviour, interface, scope)
+and could go either way is asked before the plan is written, through
+`ask_user_question`, even with a default in mind, which goes first as the
+recommended option; style and convention are the model's to settle from the
+code; and the plan carries no alternatives, optional steps or closing "confirm".
+A front-end without questions (a server client that did not advertise them) is
+told to ask in its reply and end the turn instead. The wording was measured with
+real models across the three configured providers, on two requests with a real
+fork and two without: the first version, which only said the plan must be
+decided and put the rule in the tool description alone, left 5 of 16 forked
+plans ending in an open choice; "ask even with a default" alone fixed that but
+made the small default model ask which docstring style to use; the shipped text
+had 0 of 15 open endings and 0 of 9 needless questions. The test pins it whole —
+re-measure before editing it. The `exit_plan_mode` description says the same in
+short, and to put the plan in the argument and not repeat it in the reply — it
+is now shown in full.
+Sub-agents inherit Plan mode and are read-only, but cannot enter or exit it;
+their reminder says to report findings and leave the plan to the top level.
 The provider tool array advertises both controls for the whole session, so mode
 changes do not invalidate the prompt-cache prefix.
 

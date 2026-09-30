@@ -187,3 +187,41 @@ pub enum Decision {
 反证：五处机制逐一撤回，各自的测试都红——去掉循环头检查(三条 agent 测试)、去掉 `run_one` 的提前检查
 (批次测试，靠 `ItemStarted` 断言;只看结果文案时它被 authorize 的赛跑遮住，见教训 204)、审批等待不赛跑
 (撤回测试，超时)、前台子 agent 拿新令牌(父停测试)、TUI 不剪队列(出队测试)。
+
+## 九、真实测试与计划措辞(同日追加，第二次提交)
+
+用户问「真实测试了吗」——第一次提交只跑了 `make check`。补测用当时的二进制、临时 HOME(复制配置，0600/0700)、
+临时工作区,pty 驱动(脚本留在会话 scratchpad,不进仓库)。
+
+**机制，全部照预期:**
+
+- plain + Responses(sky-bj)与 plain + Messages(sky-claude):审批回 `n` → `[stopped — …]`,终态行 `stopped`,
+  下一句"只写到当前目录"被接住并执行——两条 rail 都收"tool_results 后面接一条用户消息"。Chat 兼容 rail
+  本机配置里没有，没测。
+- 两次模型都把"写工作区外"和"写当前目录 b.txt"放在同一批:No 之后 b.txt 是 "Not run",文件确实没写——
+  第六节第 3 问的决定在真实流量里触发了。
+- 真 TUI + plan 模式：计划审批按 Esc,两轮都 `stopped`、仍在 Plan、转录末尾有提示行，改完再交。
+
+**计划措辞只部分起效 → 量了四版，换了一版。** 第一次提交只改了 `exit_plan_mode` 描述(条件句"计划必须
+已定"),而每次 plan 模式请求都带的 plan-mode 提示一个字没提。真实模型仍会以"请确认采用哪种"收尾。用户同意
+先量再改。两道有真分歧的题(可配置问候语、多语言)+ 两道对照题(改 f-string;加类型注解和 docstring——后者
+留了 docstring 风格这个诱饵),三个 provider(sky-bj / sky-claude / sky-us 各自的默认模型),每次采到第一个
+`ask_user_question`/`exit_plan_mode` 调用为止:
+
+| 版本 | 分歧题：先问 / 已定 / 留尾巴 | 对照题：多问 |
+|---|---|---|
+| A 第一次提交的措辞 | 9 / 2 / **5**(16) | 0 / 12 |
+| B 规则进提示，三条动作;"代码或需求能定的你来定" | 6 / 10 / 0 | 0 / 6(只跑了 f-string) |
+| C "用户可能两种都要的就问，哪怕有默认" | 17 / 0 / 0 | **2** / 12(sky-bj 问 docstring 风格) |
+| D = C + "风格与惯例归你" | 12 / 3 / 0 | 0 / 9 |
+| E = D 调语序(提交的版本，改完重量) | 12 / 3 / 0(15) | 0 / 9 |
+
+B 消灭了尾巴，却让 sky-claude/sky-us 连"支持哪些语言"都自己定;C 反过来咬了诱饵;D/E 两头都守住。
+E 的 24 个样本里只有一处"没加模块级 docstring,需要的话我再加"式的范围说明，计划本身是定的。另见
+sky-claude 偶尔用日语回中文提问(A 里就有),与本条无关，未跟。
+
+落地：`PLAN_MODE_REMINDER` 常量改成 `plan_mode_reminder(depth, questions)`——顶层三条动作;前端不能答
+`ask_user_question` 时改说"在回复里问、不调 exit_plan_mode 就结束本轮";子 agent 只说"报告发现，计划由顶层写"
+(旧文本叫子 agent 去调它调不了的 `exit_plan_mode`)。`exit_plan_mode` 描述同步成动作句。测试
+`agent::tests::plan_mode_reminder_tells_the_top_level_what_to_do_with_a_users_choice` 整串钉住三种文本。教训 205。
+

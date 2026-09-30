@@ -5077,3 +5077,51 @@ async fn reduction_switched_off_sends_every_result_whole() {
     assert_eq!(seen.len(), 5);
     assert_eq!(sent_result(&seen[4].messages, "b1"), "x".repeat(5000));
 }
+
+/// The plan-mode reminder's top-level wording was measured against real models
+/// (plan 216): a rule that only said "the plan must be decided" left one plan in
+/// three ending with "confirm which"; "ask even with a default in mind" alone
+/// made the small default model ask about docstring style. Pinned whole, so a
+/// change to it is a deliberate one — re-measure before editing.
+#[test]
+fn plan_mode_reminder_tells_the_top_level_what_to_do_with_a_users_choice() {
+    let gate = "This session is in PLAN MODE. Only read-only exploration is allowed: read files, \
+        search, and run read-only commands to understand the task. Do NOT modify files or run \
+        commands with side effects — such calls are blocked by the permission gate.";
+    let top = |ask: &str| {
+        format!(
+            "<plan-mode>\n{gate}\n\nWhen the plan is ready, call exit_plan_mode with the full plan \
+             text. The user answers Yes, which means implement exactly this plan, or No, which \
+             stops the turn so they can say what to change. So the plan has to be decided before \
+             you call it:\n- If a choice changes what gets built — the approach, the behaviour, the \
+             interface or the scope — and the user could reasonably want it either way, ask them \
+             before writing the plan, even when you have a sensible default in mind (offer that \
+             default first, as the recommended option): {ask}.\n- Style and conventions (naming, \
+             docstring format, file layout) are yours: follow what the code already does, or the \
+             common choice. What the code or the request already fixes is not a question \
+             either.\n- The plan has no alternatives, no optional steps and no open questions, and \
+             it does not end by asking the user to confirm or pick: their Yes is the \
+             confirmation.\n\nMake no changes until the plan is approved.\n</plan-mode>"
+        )
+    };
+    assert_eq!(
+        plan_mode_reminder(0, true),
+        top("call ask_user_question, then write the plan with their answer")
+    );
+    // A front-end that cannot answer ask_user_question (a server client that
+    // did not advertise questions) must not be told to call it.
+    assert_eq!(
+        plan_mode_reminder(0, false),
+        top(
+            "ask in your reply and end your turn without calling exit_plan_mode, then write the \
+             plan once they have answered"
+        )
+    );
+    // A sub-agent can neither ask nor present a plan.
+    assert_eq!(
+        plan_mode_reminder(1, true),
+        format!(
+            "<plan-mode>\n{gate} Report what you find; the top-level agent writes the plan.\n</plan-mode>"
+        )
+    );
+}

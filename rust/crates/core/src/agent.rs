@@ -1518,13 +1518,44 @@ fn drain_local_mailbox(cfg: &Config, history: &mut History, ui: &Arc<dyn Ui>) ->
 
 /// The plan-mode operating instructions, injected while the session is in plan
 /// mode (plan 37): the hard gate blocks writes, this tells the model what to do
-/// instead. Rides every depth — a sub-agent is read-only in plan mode too.
-const PLAN_MODE_REMINDER: &str = "<plan-mode>\nThis session is in PLAN MODE. Only read-only \
-exploration is allowed: read files, search, and run read-only commands to understand the task. \
-Do NOT modify files or run commands with side effects — such calls are blocked by the permission \
-gate. Produce a concrete, step-by-step plan for the requested change. When the plan is ready, \
-call the exit_plan_mode tool with the full plan text to present it to the user; wait for their \
-approval before making any changes.\n</plan-mode>";
+/// instead. Rides every depth — a sub-agent is read-only in plan mode too — but
+/// only the top level presents a plan, so only it is told how.
+///
+/// The top-level text spells out what to DO with a choice that is the user's
+/// (plan 216): the approval is a bare Yes/No, and a rule that only said "the
+/// plan must be decided" still left a real model ending one plan in three with
+/// "confirm which one". `questions` = this front-end answers ask_user_question.
+fn plan_mode_reminder(depth: u8, questions: bool) -> String {
+    const GATE: &str = "This session is in PLAN MODE. Only read-only exploration is allowed: \
+        read files, search, and run read-only commands to understand the task. Do NOT modify \
+        files or run commands with side effects — such calls are blocked by the permission gate.";
+    if depth > 0 {
+        return format!(
+            "<plan-mode>\n{GATE} Report what you find; the top-level agent writes the plan.\n</plan-mode>"
+        );
+    }
+    let ask = if questions {
+        "call ask_user_question, then write the plan with their answer"
+    } else {
+        "ask in your reply and end your turn without calling exit_plan_mode, then write the plan \
+         once they have answered"
+    };
+    format!(
+        "<plan-mode>\n{GATE}\n\nWhen the plan is ready, call exit_plan_mode with the full plan \
+         text. The user answers Yes, which means implement exactly this plan, or No, which stops the \
+         turn so they can say what to change. So the plan has to be decided before you call it:\n\
+         - If a choice changes what gets built — the approach, the behaviour, the interface or the \
+         scope — and the user could reasonably want it either way, ask them before writing the plan, \
+         even when you have a sensible default in mind (offer that default first, as the recommended \
+         option): {ask}.\n\
+         - Style and conventions (naming, docstring format, file layout) are yours: follow what the \
+         code already does, or the common choice. What the code or the request already fixes is \
+         not a question either.\n\
+         - The plan has no alternatives, no optional steps and no open questions, and it does not \
+         end by asking the user to confirm or pick: their Yes is the confirmation.\n\n\
+         Make no changes until the plan is approved.\n</plan-mode>"
+    )
+}
 
 /// The synthetic first user message: the plan-mode reminder (when in plan mode),
 /// project instructions, the skills catalog, and the deferred-tools notice, in
@@ -1553,7 +1584,7 @@ pub(crate) fn injected_segments(
     depth: u8,
 ) -> Vec<(&'static str, String)> {
     let plan_reminder = (workspace.permissions.mode() == crate::permissions::Mode::Plan)
-        .then(|| PLAN_MODE_REMINDER.to_string());
+        .then(|| plan_mode_reminder(depth, cfg.surface.questions));
     let skills_catalog = (depth == 0)
         .then(|| crate::skills::skills_catalog(&cfg.skills))
         .flatten();

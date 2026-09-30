@@ -58,12 +58,13 @@ pub(super) fn exit_plan_mode_def() -> ToolDef {
             (read-only), and you have a concrete, step-by-step plan. The user sees the full plan \
             and answers Yes or No. Yes means implement exactly this plan: plan mode turns off and \
             you proceed. No means stop: the turn ends there, you stay in plan mode, and the user's \
-            next message says what to change. Yes and No are the only answers, so the plan must \
-            already be decided: settle every open choice with ask_user_question before calling \
-            this, and never end the plan by asking the user to pick (for example \"choose A, B or \
-            C\"). The plan goes in the `plan` argument and nowhere else: it is shown in full, so do \
-            not also repeat it in your reply. Do not use it to ask general questions or when not in \
-            plan mode."
+            next message says what to change. So do not call this while the plan still depends on a \
+            choice that is the user's to make: ask it first (with ask_user_question when you have \
+            it), then write their answer into the plan. The plan has no alternatives, optional steps \
+            or open questions, and does not end by asking the user to pick or confirm (for example \
+            \"choose A, B or C\") — Yes is the confirmation. The plan goes in the `plan` argument \
+            and nowhere else: it is shown in full, so do not also repeat it in your reply. Do not use \
+            it to ask general questions or when not in plan mode."
             .into(),
         schema: json!({
             "type": "object",
