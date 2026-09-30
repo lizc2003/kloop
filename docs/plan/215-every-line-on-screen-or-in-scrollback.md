@@ -184,6 +184,9 @@ picker 自 plan 104 起都在 `live_chrome_layout` 的预算里，删掉。代�
 2. **引用式链接 / 跨空行 HTML 块这类违反 P 的输入怎么办?** 推荐**接受并写进 DESIGN**(罕见，后果是接缝处
    重或丢一两行);另一选择是检测到定义行形状就把定稿退回到它之前。
 
+**开工时的答复(2026-09-30):** 两问都照推荐——Running 的 Tool/Agent 行不改(`Leave::AtCap`);违反 P 的
+两类输入接受，写进 DESIGN。
+
 ## 八、收尾清单
 
 - DESIGN.md 要改写(先读现状再改，不追加):TUI 一节讲提交的那段(`The commit only freezes a leading
@@ -193,3 +196,72 @@ picker 自 plan 104 起都在 `live_chrome_layout` 的预算里，删掉。代�
   the forming tail shows raw…`)。
 - plan 99、121、214 的相关段落各补一行"→ 被 plan 215 改写"。
 - HANDOFF:本条的状态行改 ✅ + 提交号;新教训写进第三节。
+
+## 九、✅ 完成
+
+2026-09-30 当次会话做完，一次提交(SHA 以本条所在提交为准)。`make check` 全绿。
+
+**照做的:** 4.1 列表间距按源文本局部空行;4.2 `assistant_stream(text, width) -> (lines, settled)`;4.3 每种
+cell 的定稿行数与 `Leave` 由 `render::shown_cells` 一处给出，画与冻共用;4.4 `freeze_target` 取代
+`commit_count`/`head_freeze_lines`/`is_committable`;4.5 `draw_frame` 只剩补全弹窗暂停提交;4.6 删
+`plan_awaiting_answer`,保留 `post_plan`;第五节的"文本被替换"保护(`App::replace_answer`:头 cell 已部分冻结、
+新文本不以旧文本开头时清 `head_frozen`)。
+
+**与 plan 的出入(都是实现时发现、写进了代码注释与 DESIGN):**
+
+- **只有完整的行才算边界。** 旧 `find_stream_safe_boundary` 把"最后一段只有空格、还没换行"的行当空行边界,
+  `para\n ` 之后来个 `more` 就并回同一段——显示时错一帧无所谓，冻进 scrollback 就错了。收紧后性质测试才绿;
+  反证：撤掉这条，性质测试在 "lists" 语料 `…**bold\n ` 处红。
+- **围栏配对与 `normalize_nested_fences` 同一套栈规则**(带信息串的一律是开，裸的关兼容的栈顶，否则开),
+  二者共用 `parse_fence_line`。旧扫描器用"开了就等同长关"的简单规则，遇到嵌套示例会判错"是否在围栏里",
+  而 4.2 的新分支会把整段(含尚未封口的段落)都算定稿。
+- **嵌套围栏的退路比 plan 写的更窄:** plan 说"退回到围栏开头";实现是**停在外层开着的围栏里第一条围栏行
+  之上**(`StreamCut::Split(nested_at)`)。围栏开头之后、第一条内层围栏行之前的代码行在最终渲染里完全相同,
+  退回开头反而会让定稿行数变少(已冻的行就对不上了),所以只退到必要处，且保持单调。反证：把这一支改回
+  `OpenFence`,性质测试在 "fences" 语料的 ```` ```md ```` 例子处红。
+- **`blank_before` 也在 `Event::Rule` 上更新**(分隔线也是块，plan 的列表里漏了);**`OpenItem` 记下开项时的
+  引用深度**,项里引用块内部的块不再各加一行空行——旧渲染对 `- a\n\n  > q` 输出两行空行，是既有 bug,
+  顺手修掉("引用块里照旧不加空行"的本意)。
+- **`AtCap` 的"4 屏"按"从这个 cell 起的尾巴"逐个算**,不是 plan 伪代码里开头算一次的总量——后者在 Running
+  行上方有一大段已封口内容时，会把它跟着冻走，哪怕它后面只有几行。与旧 `hard_cap` 的 `remaining` 语义一致。
+- **末位 cell 并非绝对不整格离开:** 一个不可拆的状态行(后台任务 Running / 排队消息，定稿 0 行)本身比活动区
+  还高时(极小终端)照样整格离开——守的是不变式;表里有专门一例。
+- **不是末位、仍在接收的回答**(交错的 item,见 `interleaved_display_*` 用例)照旧按整段 markdown 画，定稿行数
+  取 `assistant_stream(text).1`;由 P(取 k = 全长)这两者前 `settled` 行相同。
+- 性能：画与冻各调一次 `shown_cells`(冻结要用确认后的几何),与旧版同量级;围栏分支里整段与"到最后一个完整
+  行"各渲染一次，未另做缓存。
+
+**测试:**
+
+| 测试 | 锁住什么 |
+|---|---|
+| `markdown::tests::settled_lines_are_the_finished_render_at_every_cut` | 性质 P:5 份语料(紧/松/混合列表、嵌套列表、列表项里的段落与 3 格缩进围栏、跨行块注释与多行字符串的长代码、嵌套围栏两种写法、表格、引用、标题、分隔线、setext、缩进代码、跨行强调、中英混排、链接)× 宽 40/80 × **每个字符边界**:`lines[..settled] == markdown_lines(全文)[..settled]`,且 `settled` 单调不减 |
+| `markdown::tests::list_gaps_follow_the_blank_lines_in_the_source` | `- a\n- b\n\n- c` → `• a`/`• b`/``/`• c`;编号列表同形;后来变松的列表下紧的子列表仍紧;`>` 单独一行等于空行 |
+| `markdown::tests::a_quote_in_an_item_is_set_off_once` | 上面那个双空行 bug |
+| `markdown::tests::stream_cut_*`、`an_open_fence_renders_as_code_and_settles_line_by_line` | 只认完整行;嵌套围栏停在内层行之上;围栏里代码边写边高亮、逐行定稿 |
+| `render::tests::freeze_target_freezes_exactly_what_overflows` | 21 例表驱动：放得下、整格离开、按行切、只补新溢出、plan 99 的高消息、流式冻到定稿、开着的回答挡住后面、定稿少于已冻、live thinking、Running 行 4 屏内钉住/超了就走/4 屏按从它起的尾巴算、后台行需要时就走(结论与旧 `running_background_row_pins_tail_until_hard_cap_forces_freeze` 相反)、不可拆行整格走、待答计划作末位、末位不整格离开及其例外 |
+| `render::tests::shown_cells_say_what_each_cell_may_freeze` | 4.3 的表逐行(真实事件驱动出 live thinking 与流式回答) |
+| `app::tests::an_answer_replaced_by_other_text_gives_up_its_frozen_prefix` | 延长保留接缝，换成别的文本放弃接缝 |
+| `lib::tests::a_streaming_answer_reaches_scrollback_as_it_settles` | 端到端 1:三屏回答 5 字节一段流入，**每一帧** `scrollback() ++ 屏上 == 当时的显示` 且活动区不溢出;封口、收尾后等于 `markdown_lines(全文)` + 收尾线 |
+| `lib::tests::a_tall_code_block_reaches_scrollback_while_it_is_written` | 端到端 2:围栏还没关，代码行已在 scrollback |
+| `lib::tests::an_open_approval_does_not_hold_back_the_answer_above_it` | 端到端 3:bash 审批面板开着，上方 30 行回答的顶部已在 scrollback |
+| `lib::tests::a_running_background_row_does_not_hold_back_a_long_answer` | 端到端 4:Running 后台行之后流入长回答，逐帧不剪;任务结束的那一行追加在最后 |
+| `lib::tests::a_waiting_plan_reaches_scrollback_before_it_is_answered` | plan 214 那条原样保留(只把对已删函数的断言换成等价 `matches!`),仍绿 |
+
+**反证(逐道撤回，各自必红):** 列表改回整张松紧 → 性质测试在 `…- second…\n\n` 处红(正是第一节的样例形状);
+撤"只认完整行"、撤嵌套围栏退路 → 性质测试各红一次;面板重新暂停提交 → 端到端 3 红;后台行改回 `AtCap` →
+端到端 4 红;流式回答定稿记 0 → 端到端 1 红;围栏分支改回旧的"围栏里没有边界" → 端到端 2 红。四条端到端
+都红在"活动区放不下、顶部被剪"那句断言上。
+
+**另做的一次真二进制检查(未提交):** 用 `tests/tui_pty.rs` 的脚本 SSE 夹具起真 `kloop`(14×80 pty),
+一条 20 段落 + 30 行代码 + 20 组列表的回答切成 23 字节一段流入，把原始输出重放进带 scrollback 的 vt100,
+每个标记恰好出现一次、次序正确。夹具一次发完整个响应体，所以它验的是真终端里的终态;逐帧的性质由上面的
+TestBackend 端到端保证。
+
+### 没做 / 顺带发现
+
+- **HTML 块会并进下一段(既有 bug,未修)。** `Start(HtmlBlock)` 没有分支,`Event::Html` 的文本进了行内缓冲,
+  直到下一个段落 flush:`<div>\nhi\n</div>\n\npara` 渲染成一行 `<div>hi</div>para`。与本条无关、模型输出里
+  少见，记在这里，要修另立。
+- 违反 P 的两类输入(引用式链接定义在使用之后、跨空行的 HTML 块)按第七节第 2 问接受，已写进 DESIGN。
+

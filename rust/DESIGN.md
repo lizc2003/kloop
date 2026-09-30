@@ -1095,11 +1095,10 @@ REPL prints it uncoloured, and the server sends `kind:"plan"`. In the TUI the
 plan takes the place of its own `exit_plan_mode` row: left above it, that row
 would sit Running and hold every scrollback commit until the answer, and would
 end `✓` on a decline, which is not a tool error. With the row gone, the pending
-plan keeps flowing into scrollback while its panel is up (the one panel that does
-not pause the commit), and it is the one last cell whose overflowing top may
-freeze — its text never changes, the answer only appends a line — so a plan
-taller than the screen is read in full before it is answered, not after
-(plan 214). Each plan is marked with how it ended (`✓ approved` / `✗ not approved`), because the cell is
+plan flows into scrollback like any other settled text while its panel is up:
+its text never changes, so all of it is settled, and it only has to stay the live
+cell itself because the answer appends its mark below it (plan 214, plan 215).
+A plan taller than the screen is read in full before it is answered, not after. Each plan is marked with how it ended (`✓ approved` / `✗ not approved`), because the cell is
 on screen before there is an answer — so a rejected plan stays put with the one
 that replaced it below it, which is the comparison a rejection invites. Approve
 restores the remembered mode and the model implements; a No leaves the session
@@ -1146,7 +1145,8 @@ Headless mode never guesses an answer.
 The default entry point is a ratatui terminal UI. It renders **inline** (no
 alternate screen, plan 38 slice 0): a full-height viewport holds the still-live
 tail — the streaming answer, any running tool rows, a one-line status row, and
-the input — while every finalized cell scrolls up into the terminal's **native
+the input — while whatever no longer fits (finished cells, and the settled lines
+of an answer still arriving) scrolls up into the terminal's **native
 scrollback**, so the mouse wheel, text selection, and Cmd+F reach history
 directly (the UI keeps no scroll of its own). Tool calls render as
 human-readable rows (plan 38 slice 2, `crates/tui/src/toolrow.rs`): a
@@ -1181,9 +1181,12 @@ letters for fingers that know them. The diff keeps its GitHub-style `+N -M`
 summary (green/red) above the line-numbered body (plan 38 slice 6) and scrolls
 with PgUp/PgDn, while the header, subject, options and key hint stay put. The
 panel is live chrome, counted in the same frozen-height budget as the activity
-and todo rows, so a scrollback commit can never scroll it away. While a panel is
-up the commit pauses and the tail above it may be clipped — except under a plan
-approval, whose content is the transcript itself (see Plan mode). Prompts from a
+and todo rows, so a scrollback commit can never scroll it away — and so the
+commit does not pause for it: what an open panel pushes off the top of the tail
+goes to scrollback like anything else (plan 215; holding it back left the top of
+a long answer above a bash approval on no screen and in no scrollback). The cost:
+when the panel closes, the rows it frees stay blank at the top of the viewport
+until new output fills them; scrollback itself stays continuous. Prompts from a
 concurrent tool batch queue and are answered in order; a No stops the turn tree
 that asked (see Permissions), and that tree's prompts still in the queue are
 withdrawn by core and leave it unasked.
@@ -1232,8 +1235,11 @@ two-column indent rather than a padded rectangle, a thematic break (`---`) is a
 short 16-column dash run rather than a full-width bar (a four-finding review
 writes four of them, and it stays distinct from the full-width rule that closes a
 turn), list bullets change glyph by depth (`•`, `-`, `·`) so nesting reads as
-nesting, a loose list keeps the blank
-lines its author wrote (a tight one stays tight), and a link keeps its URL in dim
+nesting, a list keeps the blank lines its author wrote — item by item, from the
+source line above each one, not from whether the list as a whole is loose: one
+blank line late in a list makes all of it loose, and the items above it may be
+in scrollback already (plan 215), so `- a`/`- b`/blank/`- c` keeps `a` and `b`
+tight and sets `c` off — and a link keeps its URL in dim
 parentheses after the text — a terminal cannot click the underline. The base
 prompt carries the other half of this: lead a finding with its conclusion, in
 bold, then the reasoning.
@@ -1243,10 +1249,27 @@ Fenced code blocks that name a supported language are **syntax-highlighted**
 strings green, comments dim, types/functions cyan, everything else (operators and
 digits included, or a shell block lights up every `.`, `/` and `=1`) plain, and
 never yellow/blue. While a
-message is still streaming, only the part up to the last **stable boundary** (a
-blank line, or a closed code fence) is rendered as markdown; the forming tail
-shows raw, so a half-written table or fence never reflows mid-stream, and it
-snaps to markdown once it completes.
+message is still streaming, the part up to the last **stable boundary** (a whole
+blank line, or a closed code fence) is rendered as markdown and the forming tail
+shows raw, so a half-written table never reflows mid-stream; a message that ends
+inside an open code fence renders whole — the parser closes the fence at the end
+— so code shows highlighted as it is written. The streaming render also says how
+many of its lines are **settled**: `markdown_lines` of the finished message will
+start with exactly those lines, styles included, whatever arrives next. That is
+what lets the commit freeze a long answer line by line while it is still arriving
+(below), and it rests on a property the renderer keeps on purpose — nothing may
+reach back across a boundary and change what is above it. List spacing did, and
+now follows the source locally (above); the known exceptions are a
+reference-style link defined below its use (the render appends ` (url)` once the
+definition arrives) and an HTML block spanning blank lines (`<details>` and the
+like). Both are rare in model output and cost a line or two repeated or dropped
+at the seam, so they are accepted (plan 215). Only whole lines count toward a
+boundary (`para` then a line of spaces can still become one paragraph), and a
+fence line inside an open fence stops the settled part just above it: until the
+outer fence closes, the prefix cannot know `normalize_nested_fences` will
+lengthen it. Code settles line by line because synoptic tokenizes left to right
+with no lookahead — a block comment still open colours its lines the same as one
+already closed.
 
 Structure (`crates/tui`): the agent runs on its own tokio task and owns
 `History`; `ChannelUi` implements `Ui`, `Approver`, and `Questioner` by
@@ -1263,20 +1286,42 @@ without a terminal. `Terminal::draw` owns autoresize. After a completed frame,
 the backend captures one physical size and pins `Backend::size()` through
 confirmation, any irreversible overflow commit, and its repaint. If the captured
 geometry already differs from the completed frame, the loop redraws first;
-repeated resize churn skips commit for that frame. Once finalized cells must
-freeze, `insert_before` writes them to native scrollback, clear succeeds, the App
-drains that exact prefix, and the loop immediately repaints the tail while the
-size fence is still held. The commit only freezes a leading prefix that still
-leaves the live tail at least a viewport tall, so a tall final message (e.g. the
-last turn on `-c` resume, trailed by a one-line note) is never stranded behind a
-full-screen blank pad. One cell can be taller than the whole screen on its own
-(a replayed final answer, a long tool output), and there the two rules would
-collide: freezing it whole strands the note behind that blank pad, keeping it
-whole leaves `draw` to bottom-anchor and clip its top — content that is then on
-no screen and in no scrollback, unreachable by scrolling (plan 121). So the
-commit also freezes *lines*: the head cell's overflowing prefix goes to
-scrollback and the viewport picks the same cell up one line below the seam, which
-is what makes a resumed session's long conclusion scroll back in full. Because
+repeated resize churn skips commit for that frame. Once lines must freeze,
+`insert_before` writes them to native scrollback, clear succeeds, the App drains
+the cells that left whole, and the loop immediately repaints the tail while the
+size fence is still held. The rule the commit keeps is that **every rendered line
+is either on screen or in scrollback** (plan 215): `draw` bottom-anchors the tail
+and clips what does not fit, so whatever overflows is frozen — exactly that much,
+so a tall final message (the last turn on `-c` resume, trailed by a one-line
+note) is never stranded behind a full-screen blank pad (plan 99). Freezing goes
+by line. Each cell says how tall it is on screen, how many of its leading lines
+are settled, and whether it may leave whole (`render::shown_cells`, which the
+draw uses too, so the lines written to scrollback are the lines that were on
+screen); one pure `freeze_target` lets cells leave whole while they fit in the
+overflow, then freezes the settled prefix of the next one down to exactly the
+overflow, and the viewport picks that cell up one line below the seam. A finished
+cell is settled throughout and may leave. A streaming answer is settled as far
+as its streaming render says and stays put — it can still grow, or be replaced
+on completion (a replacement that does not continue the old text gives up the
+seam, so a stretch of scrollback repeats rather than goes missing). Live
+thinking is one clock line and stays. A waiting plan is settled throughout but
+stays, since its answer appends to it. A running tool or sub-agent row is
+settled nowhere and holds its place until the tail from it on is four screens
+tall — nothing grows behind it while the model waits on it. A running background
+task or queued message row is replaced in place, so settled nowhere, but it goes
+whenever the tail needs the room, because once frozen its terminal update is
+appended as a row of its own; one that does not fit the overflow goes whole,
+leaving a few blank rows at the top rather than a clipped one. Otherwise the
+last cell never leaves whole — the overflow is always less than what is live —
+and only gives up its settled prefix. The one case
+the rule cannot cover is a forming part that is itself taller than the viewport:
+in practice a table still being written that is taller than the screen, which
+reaches scrollback once it is complete. Earlier the commit had four ways to hold
+a top back — a streaming answer, the last cell, a running row, an open panel —
+and plans 99, 121 and 214 each opened one of them a little; plan 215 turned the
+rule around. A width change counts the head's frozen prefix as zero (it was
+wrapped for another width), so the cell comes back whole and re-freezes, and
+scrollback repeats a stretch (plan 121). Because
 the inline viewport is the full terminal height,
 `insert_before` runs Ratatui's default path (the `scrolling-regions` cargo
 feature is deliberately off): it scrolls committed lines into scrollback with
@@ -3554,10 +3599,11 @@ in the message, and only the result body is eligible for offload.
 
 The TUI renders this event as a session-owned lifecycle row, not as a turn-owned
 sub-agent row or an uncorrelated Note. Running/phase/terminal updates with the
-same execution ID replace one mutable live-tail row. A Running row is normally
-kept out of native scrollback; if the hard tail cap forces it into immutable
-scrollback, later Running updates are ignored and the unique terminal update is
-appended as a linked row with the same typed ID. `/clear` and rewind stop the
+same execution ID replace one mutable live-tail row. A Running row stays in the
+live tail while there is room for it; once the tail needs its rows it goes into
+immutable scrollback (plan 215 — pinning it in place clipped the top of whatever
+streamed in after it), later Running updates are ignored, and the unique terminal
+update is appended as a linked row with the same typed ID. `/clear` and rewind stop the
 old session's work and reset the UI indices; a straggler's late terminal still
 starts a fresh identifiable row. This
 is an event projection, not a resource manager: there is no list/hydration,

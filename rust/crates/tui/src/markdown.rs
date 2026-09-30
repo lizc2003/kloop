@@ -10,11 +10,21 @@
 //! a conclusion the model marked up stands out from the prose it sits in, while
 //! code spans stay one quiet colour and never outshine it.
 //!
-//! Streaming uses a claw-style safe-boundary buffer ([`find_stream_safe_boundary`]):
-//! only the part of the stream that ends on a stable boundary (a blank line, or a
-//! closed code fence) is rendered as markdown; the still-forming tail is shown
-//! raw so a half-written table or fence never reflows mid-stream. Once the tail
-//! stabilizes (or the message finalizes) it renders as markdown too.
+//! Streaming ([`assistant_stream`]) renders the part of the stream that ends on
+//! a stable boundary (a blank line, or a closed code fence) as markdown and the
+//! still-forming tail raw, so a half-written table never reflows mid-stream; a
+//! stream that ends inside an open code fence renders whole, the code showing
+//! as it is written. Alongside the lines it reports how many of them are
+//! settled — rendered exactly as the finished message will render them — which
+//! is what lets the viewport freeze a long answer into scrollback line by line
+//! while it is still arriving (plan 215).
+//!
+//! That count rests on one property of [`markdown_lines`]: a boundary means the
+//! same thing in a prefix as in the whole. So nothing may reach back across a
+//! blank line and change what is above it — which is why a list's spacing
+//! follows the blank lines in the source around each item, not whether the list
+//! as a whole is loose: one blank line late in a list turns all of it loose, and
+//! items already in scrollback would then need gaps they were frozen without.
 
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
@@ -68,25 +78,63 @@ pub fn markdown_lines(md: &str, width: usize) -> Vec<Line<'static>> {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     let mut r = Renderer::new(width.max(1));
-    for ev in Parser::new_ext(&normalized, opts) {
+    for (ev, range) in Parser::new_ext(&normalized, opts).into_offset_iter() {
+        // Table rows and cells, inline tags and text leave it alone: a table or
+        // code block reads it at its end tag, and must see its own start's.
+        let opens_block = matches!(
+            ev,
+            Event::Rule
+                | Event::Start(
+                    Tag::Paragraph
+                        | Tag::Heading { .. }
+                        | Tag::BlockQuote(_)
+                        | Tag::CodeBlock(_)
+                        | Tag::List(_)
+                        | Tag::Item
+                        | Tag::Table(_)
+                        | Tag::HtmlBlock
+                )
+        );
+        if opens_block {
+            r.blank_before = line_above_is_blank(&normalized, range.start);
+        }
         r.event(ev);
     }
     r.finish();
     r.out
 }
 
-/// Render a still-streaming assistant message: markdown for the stable prefix
-/// (up to the last safe boundary), the forming tail raw so it cannot reflow.
-/// The boundary is recomputed from the accumulated text each frame, so no
-/// streaming state is threaded through the pure render path.
-pub fn assistant_stream_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+/// Whether the source line above the one holding `offset` is blank. Quote
+/// markers count as blank, so `>` on its own line separates like an empty one.
+fn line_above_is_blank(src: &str, offset: usize) -> bool {
+    let Some(line_start) = src[..offset].rfind('\n') else {
+        return false;
+    };
+    let above = &src[..line_start];
+    let above = &above[above.rfind('\n').map_or(0, |i| i + 1)..];
+    above.chars().all(|c| c == '>' || c.is_whitespace())
+}
+
+/// Render a still-streaming assistant message, and say how many of the lines
+/// are settled: `markdown_lines` of the finished message — whatever it turns
+/// out to be — starts with exactly these lines, styles included. The viewport
+/// may freeze those into scrollback while the rest is still arriving (plan 215).
+///
+/// Up to the last safe boundary the text is markdown and settled; the forming
+/// tail is shown raw so it cannot reflow, and settles once a boundary passes
+/// it. A stream ending inside an open code fence renders whole — code does not
+/// reflow, so every complete line of it is settled as soon as it arrives. The
+/// cut is recomputed from the text each frame; no streaming state is threaded
+/// through the pure render path.
+pub fn assistant_stream(text: &str, width: usize) -> (Vec<Line<'static>>, usize) {
     let width = width.max(1);
-    match find_stream_safe_boundary(text) {
-        Some(split) => {
+    match stream_cut(text) {
+        StreamCut::Split(split) => {
             let mut lines = markdown_lines(&text[..split], width);
-            // The tail is whatever has arrived since the last stable boundary —
-            // a partial paragraph, or the open lines of an unclosed fence. Show
-            // it as plain wrapped text; it becomes markdown once it stabilizes.
+            let settled = lines.len();
+            // The tail is whatever has arrived since the last stable boundary.
+            // Show it as plain wrapped text; it becomes markdown once it
+            // stabilizes.
             let tail = text[split..].trim_matches('\n');
             if !tail.is_empty() {
                 if !lines.is_empty() {
@@ -94,13 +142,25 @@ pub fn assistant_stream_lines(text: &str, width: usize) -> Vec<Line<'static>> {
                 }
                 lines.extend(wrap(tail, width).into_iter().map(Line::from));
             }
-            lines
+            (lines, settled)
+        }
+        StreamCut::OpenFence { complete } => {
+            let lines = markdown_lines(text, width);
+            let settled = if complete == text.len() {
+                lines.len()
+            } else {
+                markdown_lines(&text[..complete], width).len()
+            };
+            (lines, settled)
         }
         // Nothing stable yet: the whole message is still forming, show it raw.
-        None => wrap(text.trim_matches('\n'), width)
-            .into_iter()
-            .map(Line::from)
-            .collect(),
+        StreamCut::Raw => {
+            let lines = wrap(text.trim_matches('\n'), width)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            (lines, 0)
+        }
     }
 }
 
@@ -124,12 +184,17 @@ struct Renderer {
     marker: Option<Span<'static>>,
     /// Open list levels; `Some(n)` is an ordered list's next ordinal.
     lists: Vec<Option<u64>>,
-    /// Items opened so far at each list level, so a loose list can tell its
-    /// first item (which needs no gap above it) from the rest.
+    /// Items opened so far at each list level, so a list can tell its first
+    /// item (which needs no gap above it) from the rest.
     list_items: Vec<u64>,
     /// The open list items, innermost last.
     items: Vec<OpenItem>,
     quote_depth: usize,
+    /// Whether the source line above the block being opened is blank — the one
+    /// thing the gaps inside a list follow. Local by design: the looseness
+    /// pulldown reports is a property of the whole list, and can change when an
+    /// item far below arrives (see the module doc).
+    blank_before: bool,
     /// Whether any top-level block has been emitted, so the next one is
     /// preceded by a blank separator (blocks nested in lists/quotes are tight).
     blocks_emitted: bool,
@@ -147,17 +212,16 @@ struct Renderer {
     table: Option<TableAcc>,
 }
 
-/// A table under construction: alignments from the `Table` tag, the header
-/// cells, then body rows. Cells are the inline styled chars of each `TableCell`.
-/// One open list item: where its content starts in `out`, and whether the
-/// source wrote the list loose. Loose means the item's blocks arrive wrapped in
-/// paragraphs — the author left blank lines — and only then do the blocks inside
-/// it get blank lines here. A tight nested list must stay tight.
+/// One open list item: where its content starts in `out`, and the quote depth
+/// it was opened at — a block inside a quote inside the item belongs to the
+/// quote, which stays tight.
 struct OpenItem {
     start: usize,
-    loose: bool,
+    quotes: usize,
 }
 
+/// A table under construction: alignments from the `Table` tag, the header
+/// cells, then body rows. Cells are the inline styled chars of each `TableCell`.
 struct TableAcc {
     aligns: Vec<Alignment>,
     head: Vec<Chars>,
@@ -179,6 +243,7 @@ impl Renderer {
             list_items: Vec::new(),
             items: Vec::new(),
             quote_depth: 0,
+            blank_before: false,
             blocks_emitted: false,
             link_urls: Vec::new(),
             code: None,
@@ -274,21 +339,10 @@ impl Renderer {
 
     fn start(&mut self, tag: Tag) {
         match tag {
-            // A paragraph sitting directly under an item marker means a loose
-            // list — its items are blank-line separated in the source, and they
-            // read that way here too, except above the first (the gap before the
-            // list already covers that one).
+            // A paragraph sitting directly under an item marker is the item's
+            // first line; any gap above it was the item's to open.
             Tag::Paragraph => {
-                if self.marker.is_some() {
-                    // Reaching a paragraph before the item's marker was consumed
-                    // is what identifies a loose list.
-                    if let Some(item) = self.items.last_mut() {
-                        item.loose = true;
-                    }
-                    if self.blocks_emitted && self.list_items.last().is_some_and(|&n| n > 1) {
-                        self.out.push(Line::default());
-                    }
-                } else {
+                if self.marker.is_none() {
                     self.block_gap();
                 }
             }
@@ -318,12 +372,17 @@ impl Renderer {
                 self.list_items.push(0);
             }
             Tag::Item => {
+                // Items the source set apart with a blank line read apart here
+                // too, except the first (the gap before the list covers it).
                 if let Some(n) = self.list_items.last_mut() {
+                    if *n > 0 && self.blank_before {
+                        self.out.push(Line::default());
+                    }
                     *n += 1;
                 }
                 self.items.push(OpenItem {
                     start: self.out.len(),
-                    loose: false,
+                    quotes: self.quote_depth,
                 });
                 let depth = self.lists.len().saturating_sub(1);
                 let marker = match self.lists.last().copied() {
@@ -469,23 +528,22 @@ impl Renderer {
         self.flush_para();
     }
 
-    /// A blank separator before the next top-level block. Blocks nested inside a
-    /// list or quote are tight (no blank), matching how markdown reads in a
-    /// terminal.
     /// The blank line between two blocks. At the top level every pair gets one.
-    /// Inside a list or quote only a block that follows content the same item
-    /// already emitted does — a gap above an item's first line would open a hole
-    /// under its own bullet.
+    /// Inside a list only a block the source set off with a blank line gets
+    /// one, and only after content the same item already emitted — a gap above
+    /// an item's first line would open a hole under its own bullet. Inside a
+    /// quote blocks stay tight.
     fn block_gap(&mut self) {
         if !self.blocks_emitted {
             return;
         }
         let nested = !self.lists.is_empty() || self.quote_depth > 0;
-        let item_has_content = self
-            .items
-            .last()
-            .is_some_and(|item| item.loose && self.out.len() > item.start);
-        if !nested || item_has_content {
+        let item_gap = self.blank_before
+            && self
+                .items
+                .last()
+                .is_some_and(|item| item.quotes == self.quote_depth && self.out.len() > item.start);
+        if !nested || item_gap {
             self.out.push(Line::default());
         }
     }
@@ -965,73 +1023,109 @@ fn truncate_chars(chars: &Chars, w: usize) -> Chars {
 // render.rs — the same logic, minus its ANSI specifics; see plan 38 参考结论).
 // ---------------------------------------------------------------------------
 
-/// The byte offset up to which `markdown` is safe to render without a later
-/// delta reflowing it: the end of the last blank line at top level, or the end
-/// of a line that closes an open code fence. `None` when nothing is stable yet.
-fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
-    let mut open_fence: Option<FenceMarker> = None;
-    let mut last_boundary = None;
-    let mut cursor = 0usize;
-    for line in markdown.split_inclusive('\n') {
-        let start = cursor;
-        cursor += line.len();
-        let bare = line.trim_end_matches('\n');
-        if let Some(opener) = open_fence {
-            if line_closes_fence(bare, opener) {
-                open_fence = None;
-                last_boundary = Some(start + line.len());
-            }
-            continue;
-        }
-        if let Some(opener) = parse_fence_opener(bare) {
-            open_fence = Some(opener);
-            continue;
-        }
-        if bare.trim().is_empty() {
-            last_boundary = Some(start + line.len());
-        }
-    }
-    last_boundary
-}
-
+/// Where a streaming message splits into what can be rendered as markdown and
+/// what is still forming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FenceMarker {
-    character: char,
-    length: usize,
+enum StreamCut {
+    /// No stable boundary yet: all of it is still forming.
+    Raw,
+    /// Markdown up to this byte offset, the rest still forming.
+    Split(usize),
+    /// The stream ends inside an open code fence that holds no fence lines of
+    /// its own: all of it renders as markdown (the parser closes the fence at
+    /// the end), and everything up to `complete` — the end of the last whole
+    /// line — is settled.
+    OpenFence { complete: usize },
 }
 
-fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
-    let indent = line.chars().take_while(|c| *c == ' ').count();
+/// Scan a streaming message for its [`StreamCut`]. Only whole lines count: a
+/// line still being written may yet turn into something else (`para\n ` gains
+/// `more` and joins the paragraph; a closing fence gains an info string and
+/// stops closing).
+///
+/// Fences are paired exactly as [`normalize_nested_fences`] pairs them, so a
+/// boundary here is a boundary in the finished message too. A fence line inside
+/// an open fence is the one place where the two can still disagree — until its
+/// outer fence closes, the prefix does not know it will be lengthened — so the
+/// cut stops just above the first such line.
+fn stream_cut(markdown: &str) -> StreamCut {
+    let mut open: Vec<FenceLine> = Vec::new();
+    // Start of the first fence line inside the outermost open fence.
+    let mut nested_at: Option<usize> = None;
+    let mut boundary: Option<usize> = None;
+    let mut complete = 0usize;
+    for line in markdown.split_inclusive('\n') {
+        if !line.ends_with('\n') {
+            break;
+        }
+        let start = complete;
+        complete += line.len();
+        match parse_fence_line(line) {
+            Some(fence) => {
+                let closes = !fence.has_info
+                    && open
+                        .last()
+                        .is_some_and(|top| top.ch == fence.ch && fence.len >= top.len);
+                if closes {
+                    open.pop();
+                    if open.is_empty() {
+                        boundary = Some(complete);
+                        nested_at = None;
+                    }
+                } else {
+                    if !open.is_empty() && nested_at.is_none() {
+                        nested_at = Some(start);
+                    }
+                    open.push(fence);
+                }
+            }
+            None if open.is_empty() && line.trim().is_empty() => boundary = Some(complete),
+            None => {}
+        }
+    }
+    match (open.is_empty(), nested_at, boundary) {
+        (false, Some(at), _) => StreamCut::Split(at),
+        (false, None, _) => StreamCut::OpenFence { complete },
+        (true, _, Some(at)) => StreamCut::Split(at),
+        (true, _, None) => StreamCut::Raw,
+    }
+}
+
+/// A line that opens or closes a code fence (up to three spaces of indent, then
+/// three or more backticks or tildes).
+struct FenceLine {
+    ch: char,
+    len: usize,
+    has_info: bool,
+    indent: usize,
+}
+
+fn parse_fence_line(line: &str) -> Option<FenceLine> {
+    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+    let indent = trimmed.chars().take_while(|c| *c == ' ').count();
     if indent > 3 {
         return None;
     }
-    let rest = &line[indent..];
-    let character = rest.chars().next()?;
-    if character != '`' && character != '~' {
+    let rest = &trimmed[indent..];
+    let ch = rest.chars().next()?;
+    if ch != '`' && ch != '~' {
         return None;
     }
-    let length = rest.chars().take_while(|c| *c == character).count();
-    if length < 3 {
+    let len = rest.chars().take_while(|c| *c == ch).count();
+    if len < 3 {
         return None;
     }
+    let after = &rest[len..];
     // A backtick fence's info string may not contain a backtick.
-    if character == '`' && rest[length..].contains('`') {
+    if ch == '`' && after.contains('`') {
         return None;
     }
-    Some(FenceMarker { character, length })
-}
-
-fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
-    let indent = line.chars().take_while(|c| *c == ' ').count();
-    if indent > 3 {
-        return false;
-    }
-    let rest = &line[indent..];
-    let length = rest.chars().take_while(|c| *c == opener.character).count();
-    if length < opener.length {
-        return false;
-    }
-    rest[length..].chars().all(|c| c == ' ' || c == '\t')
+    Some(FenceLine {
+        ch,
+        len,
+        has_info: !after.trim().is_empty(),
+        indent,
+    })
 }
 
 /// Wrap a fenced code block whose body contains fence markers of equal-or-greater
@@ -1039,45 +1133,12 @@ fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
 /// the close. LLMs emit nested triple-backtick examples constantly; without this
 /// the outer block breaks at the first inner fence.
 fn normalize_nested_fences(markdown: &str) -> String {
-    struct FenceLine {
-        ch: char,
-        len: usize,
-        has_info: bool,
-        indent: usize,
-    }
-
-    fn parse(line: &str) -> Option<FenceLine> {
-        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-        let indent = trimmed.chars().take_while(|c| *c == ' ').count();
-        if indent > 3 {
-            return None;
-        }
-        let rest = &trimmed[indent..];
-        let ch = rest.chars().next()?;
-        if ch != '`' && ch != '~' {
-            return None;
-        }
-        let len = rest.chars().take_while(|c| *c == ch).count();
-        if len < 3 {
-            return None;
-        }
-        let after = &rest[len..];
-        if ch == '`' && after.contains('`') {
-            return None;
-        }
-        Some(FenceLine {
-            ch,
-            len,
-            has_info: !after.trim().is_empty(),
-            indent,
-        })
-    }
-
     let lines: Vec<&str> = markdown.split_inclusive('\n').collect();
-    let info: Vec<Option<FenceLine>> = lines.iter().map(|l| parse(l)).collect();
+    let info: Vec<Option<FenceLine>> = lines.iter().map(|l| parse_fence_line(l)).collect();
 
     // Pair openers with closers via a stack; a labelled fence is always an
     // opener, a bare fence closes a compatible top-of-stack or else opens.
+    // [`stream_cut`] pairs the same way.
     let mut stack: Vec<usize> = Vec::new();
     let mut pairs: Vec<(usize, usize, usize)> = Vec::new(); // (opener, closer, max inner len)
     for (i, fi) in info.iter().enumerate() {
@@ -1338,6 +1399,42 @@ mod tests {
         );
     }
 
+    /// A list with one blank line in it is loose as a whole, but the gaps
+    /// follow the source line by line: `a` and `b` were already on screen
+    /// (maybe in scrollback) before the blank line under them arrived, and must
+    /// not need a gap between them afterwards (plan 215).
+    #[test]
+    fn list_gaps_follow_the_blank_lines_in_the_source() {
+        assert_eq!(
+            texts(&markdown_lines("- a\n- b\n\n- c", 40)),
+            vec!["• a", "• b", "", "• c"]
+        );
+        assert_eq!(
+            texts(&markdown_lines("1. a\n2. b\n\n3. c", 40)),
+            vec!["1. a", "2. b", "", "3. c"]
+        );
+        // A tight sublist stays tight under a list that turns loose later.
+        assert_eq!(
+            texts(&markdown_lines("- a\n  - b\n- c\n\n- d", 40)),
+            vec!["• a", "  - b", "• c", "", "• d"]
+        );
+        // Quote markers alone on a line separate like a blank line.
+        assert_eq!(
+            texts(&markdown_lines("> - a\n>\n> - b", 40)),
+            vec!["│ • a", "", "│ • b"]
+        );
+    }
+
+    /// A quote inside an item takes one gap above it, not one for the quote
+    /// and another for the paragraph inside it.
+    #[test]
+    fn a_quote_in_an_item_is_set_off_once() {
+        assert_eq!(
+            texts(&markdown_lines("- a\n\n  > q", 40)),
+            vec!["• a", "", "  │ q"]
+        );
+    }
+
     /// A second block inside one item — a nested list, another paragraph — is
     /// separated from the item's first line, which is what makes a long review
     /// item readable instead of one slab.
@@ -1428,32 +1525,48 @@ mod tests {
     }
 
     #[test]
-    fn safe_boundary_stops_at_blank_line_and_closed_fence() {
+    fn stream_cut_stops_at_whole_blank_lines_and_closed_fences() {
         // Boundary after the blank line; the second paragraph is still forming.
-        let md = "para one\n\npara two";
-        let split = find_stream_safe_boundary(md).unwrap();
-        assert_eq!(&md[..split], "para one\n\n");
-
-        // Inside an open fence there is no boundary until it closes.
-        assert_eq!(find_stream_safe_boundary("```\ncode\nmore"), None);
+        assert_eq!(stream_cut("para one\n\npara two"), StreamCut::Split(10));
+        // A line of spaces still being written is not a blank line yet: `more`
+        // may follow and continue the paragraph.
+        assert_eq!(stream_cut("para one\n  "), StreamCut::Raw);
+        // A closed fence is a boundary once its closing line is whole.
         let closed = "```\ncode\n```\n";
-        let split = find_stream_safe_boundary(closed).unwrap();
-        assert_eq!(&closed[..split], closed);
-
+        assert_eq!(stream_cut(closed), StreamCut::Split(closed.len()));
+        assert_eq!(
+            stream_cut("```\ncode\n```"),
+            StreamCut::OpenFence { complete: 9 }
+        );
+        // Inside an open fence, settled runs to the end of the last whole line.
+        assert_eq!(
+            stream_cut("x\n\n```\ncode\nmore"),
+            StreamCut::OpenFence { complete: 12 }
+        );
         // Nothing stable yet.
-        assert_eq!(find_stream_safe_boundary("half a line"), None);
+        assert_eq!(stream_cut("half a line"), StreamCut::Raw);
+    }
+
+    /// A fence line inside an open fence means the outer one will be lengthened
+    /// once it closes, which the prefix cannot know yet; the cut stops just
+    /// above that line. Once the outer fence closes it is a boundary again.
+    #[test]
+    fn stream_cut_stops_above_a_fence_nested_in_an_open_one() {
+        let md = "```md\nintro\n```sh\necho\n```\n";
+        assert_eq!(stream_cut(md), StreamCut::Split(12));
+        let closed = format!("{md}```\n\nafter");
+        assert_eq!(stream_cut(&closed), StreamCut::Split(md.len() + 5));
     }
 
     /// Streaming shows the stable prefix as markdown and the forming tail raw,
     /// so a half-written block never reflows. The tail's `**` is literal until
-    /// the stream stabilizes.
+    /// the stream stabilizes, and only the prefix is settled.
     #[test]
-    fn stream_lines_render_stable_prefix_and_raw_tail() {
+    fn stream_renders_stable_prefix_and_raw_tail() {
         let text = "# Done\n\nnow **bol";
-        let lines = assistant_stream_lines(text, 40);
-        let got = texts(&lines);
-        assert_eq!(got.first().map(String::as_str), Some("Done")); // heading rendered
-        assert!(got.contains(&"now **bol".to_string()), "tail raw: {got:?}");
+        let (lines, settled) = assistant_stream(text, 40);
+        assert_eq!(texts(&lines), vec!["Done", "", "now **bol"]);
+        assert_eq!(settled, 1);
         // The heading is bold (markdown), proving the prefix went through the
         // parser while the tail stayed literal.
         assert!(
@@ -1465,8 +1578,82 @@ mod tests {
     }
 
     #[test]
-    fn stream_lines_all_raw_before_first_boundary() {
-        let lines = assistant_stream_lines("still forming a sentence", 40);
+    fn stream_is_all_raw_and_unsettled_before_first_boundary() {
+        let (lines, settled) = assistant_stream("still forming a sentence", 40);
         assert_eq!(texts(&lines), vec!["still forming a sentence"]);
+        assert_eq!(settled, 0);
     }
+
+    /// Code inside an open fence shows highlighted as it is written, and each
+    /// whole line of it is settled at once — a long code block can go into
+    /// scrollback while it is still being written.
+    #[test]
+    fn an_open_fence_renders_as_code_and_settles_line_by_line() {
+        let text = "Here:\n\n```rust\nfn main() {\n    let x";
+        let (lines, settled) = assistant_stream(text, 40);
+        assert_eq!(
+            texts(&lines),
+            vec!["Here:", "", "  fn main() {", "      let x"]
+        );
+        assert_eq!(settled, 3);
+        let keyword = lines[2].spans.iter().find(|s| s.content.as_ref() == "fn");
+        assert_eq!(keyword.map(|s| s.style.fg), Some(Some(Color::Magenta)));
+    }
+
+    /// The property plan 215 rests on: cut a message anywhere, and the lines
+    /// the stream calls settled are exactly the first lines of the finished
+    /// render, styles included — and cutting later never settles fewer.
+    #[test]
+    fn settled_lines_are_the_finished_render_at_every_cut() {
+        for (name, doc) in STREAM_CORPUS {
+            for width in [40, 80] {
+                let full = markdown_lines(doc, width);
+                let mut prev = 0;
+                for (k, _) in doc.char_indices().chain([(doc.len(), ' ')]) {
+                    let (lines, settled) = assistant_stream(&doc[..k], width);
+                    assert!(
+                        settled <= lines.len() && settled <= full.len(),
+                        "{name} w{width} cut {k}: settled {settled} of {} / {}",
+                        lines.len(),
+                        full.len()
+                    );
+                    assert_eq!(
+                        lines[..settled],
+                        full[..settled],
+                        "{name} w{width} cut {k}: {:?}",
+                        &doc[..k]
+                    );
+                    assert!(
+                        settled >= prev,
+                        "{name} w{width} cut {k}: settled fell {prev} -> {settled}"
+                    );
+                    prev = settled;
+                }
+            }
+        }
+    }
+
+    /// Shapes models write, each ending the way a finished answer does.
+    const STREAM_CORPUS: &[(&str, &str)] = &[
+        (
+            "lists",
+            "Summary of the change:\n\n- first item\n- second item with `code` and **bold\n  text** across a soft break\n\n- third item after a blank line\n- fourth\n\n1. one\n2. two\n\n3. three\n\nDone.\n",
+        ),
+        (
+            "nested",
+            "# Plan\n\n- top level\n  - nested tight\n  - nested two\n\n  - nested after blank\n- back at top\n\n  A second paragraph inside the item, long enough to wrap at forty columns for sure.\n\n1. Step with code:\n\n   ```rust\n   fn main() {\n       println!(\"hi\");\n   }\n   ```\n\n2. Next step\n   - sub\n\n     detail under sub\n",
+        ),
+        (
+            "fences",
+            "Here is the file:\n\n```rust\n/* a block comment\n   spanning lines */\nfn main() {\n    let s = \"multi\nline string\";\n\n    let t = 1;\n}\n```\nRight after the fence.\n\nA nested example:\n\n````markdown\n```sh\necho hi\n```\n````\n\n```md\nOuter\n```py\nprint(1)\n```\nstill outer\n```\n\nEnd.\n",
+        ),
+        (
+            "blocks",
+            "## 结果 Results\n\n| 名字 | value |\n|---|--:|\n| 甲 | 1 |\n| beta | 22 |\n\n> 引用一段话，which mixes 中文 and English\n> across two lines.\n>\n> Second quoted paragraph.\n\n---\n\n**结论**:改动是安全的，因为 *every* path goes through `freeze_target`,\n而且 ~~没有~~ 例外。\n\nSetext title\n============\n\n    indented code\n\n    more of it\n\nLast [link](https://x.dev/a) and <https://x.dev/b>.\n",
+        ),
+        (
+            "long code",
+            "```python\nimport os\n\n\ndef walk(root):\n    for dirpath, dirnames, filenames in os.walk(root):\n        for name in filenames:\n            # a comment that is long enough to wrap at forty columns\n            yield os.path.join(dirpath, name)\n\n\nif __name__ == \"__main__\":\n    for path in walk(\".\"):\n        print(path)\n```\n",
+        ),
+    ];
 }

@@ -351,11 +351,9 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             }
         }
         Cell::Assistant(text) => {
-            // Sealed assistant message: render the whole thing as markdown. The
-            // live streaming path (draw) renders the still-open last cell via
-            // `markdown::assistant_stream_lines` instead — see `commit_count`
-            // never freezes the last cell, so a committed Assistant is always
-            // sealed and safe to parse in full.
+            // The whole message as markdown. A message still streaming as the
+            // last cell is drawn by [`shown_cells`] through the streaming render
+            // instead, which also says how much of it may freeze.
             lines.extend(crate::markdown::markdown_lines(text, width));
         }
         Cell::Thinking { seconds, .. } => {
@@ -644,141 +642,207 @@ pub fn transcript_lines(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
     cells.iter().flat_map(|c| cell_lines(c, width)).collect()
 }
 
-/// The uncommitted tail for the on-screen viewport: like [`transcript_lines`],
-/// but the last cell gets a live treatment when it is still streaming. An
-/// Assistant renders through the streaming safe-boundary buffer (a half-formed
-/// markdown block shows raw instead of reflowing each frame); a Thinking block
-/// shows a running clock (`hud.thinking`). Only the last cell can be streaming
-/// (any other event seals it), so these are the sole special cases.
-pub fn visible_transcript(app: &App, hud: &Hud, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let last = app.cells.len().saturating_sub(1);
-    for (i, cell) in app.cells.iter().enumerate() {
-        let mut rendered = match cell {
-            Cell::Assistant(text) if i == last && app.streaming_assistant() => {
-                crate::markdown::assistant_stream_lines(text, width)
-            }
-            Cell::Thinking { .. } if i == last && app.streaming_thinking() => {
-                let secs = hud.thinking.map(|d| d.as_secs()).unwrap_or(0);
-                vec![thinking_line(None, Some(secs), width)]
-            }
-            _ => cell_lines(cell, width),
-        };
-        // A head cell too tall for the viewport has had its overflowing prefix
-        // frozen into scrollback ([`head_freeze_lines`]); the viewport resumes
-        // the same cell one line below the seam.
-        if i == 0 {
-            let skip = app.head_skip(width).min(rendered.len());
-            rendered.drain(..skip);
+/// How a cell may leave the live tail for native scrollback as a whole
+/// (plan 215). Its settled lines may freeze whatever this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leave {
+    /// It can still change in ways that move its lines.
+    Never,
+    /// Nothing about it can change any more — or what can, its in-place status
+    /// rows, is written as a row of its own once it has left
+    /// (`frozen_background_tasks` / `frozen_agent_messages`).
+    Whole,
+    /// A running tool or sub-agent row: it holds its place until the tail from
+    /// it on is [`HARD_CAP_SCREENS`] screens tall, then goes so it cannot pin an
+    /// unbounded tail. Nothing grows behind it while it runs — the model is
+    /// waiting on it — so the cap is a backstop, not the common case.
+    AtCap,
+}
+
+/// How many screens of tail a running tool or sub-agent row may hold back.
+const HARD_CAP_SCREENS: usize = 4;
+
+/// One cell's part in the freeze: how tall it is on screen, how many of its
+/// leading lines can no longer change, and whether it may leave whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Freezable {
+    pub height: usize,
+    pub settled: usize,
+    pub leave: Leave,
+}
+
+/// One cell as the viewport draws it. The draw and the freeze both take cells
+/// from [`shown_cells`], so the lines written to scrollback are the lines that
+/// were on screen (plan 74: what is drawn and what is committed have one source).
+pub struct ShownCell {
+    pub lines: Vec<Line<'static>>,
+    pub settled: usize,
+    pub leave: Leave,
+}
+
+impl ShownCell {
+    fn done(lines: Vec<Line<'static>>) -> Self {
+        let settled = lines.len();
+        Self {
+            lines,
+            settled,
+            leave: Leave::Whole,
         }
-        lines.extend(rendered);
+    }
+
+    pub fn freezable(&self) -> Freezable {
+        Freezable {
+            height: self.lines.len(),
+            settled: self.settled,
+            leave: self.leave,
+        }
+    }
+}
+
+/// The uncommitted tail cell by cell, as the viewport shows it. The last cell
+/// gets a live treatment while it streams: an Assistant renders through
+/// [`crate::markdown::assistant_stream`], a Thinking block shows a running
+/// clock (`thinking_secs`). Only the last cell streams (any other event seals
+/// it), but an answer the model has not closed yet can still grow or be
+/// replaced wherever it stands, so it only ever freezes what is settled.
+pub fn shown_cells(app: &App, width: usize, thinking_secs: u64) -> Vec<ShownCell> {
+    let last = app.cells.len().saturating_sub(1);
+    app.cells
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| match cell {
+            Cell::Assistant(text) if app.display_cell_live(i) => {
+                let (streamed, settled) = crate::markdown::assistant_stream(text, width);
+                let lines = if i == last && app.streaming_assistant() {
+                    streamed
+                } else {
+                    cell_lines(cell, width)
+                };
+                ShownCell {
+                    lines,
+                    settled,
+                    leave: Leave::Never,
+                }
+            }
+            Cell::Thinking { .. } if app.display_cell_live(i) => {
+                let lines = if i == last && app.streaming_thinking() {
+                    vec![thinking_line(None, Some(thinking_secs), width)]
+                } else {
+                    cell_lines(cell, width)
+                };
+                ShownCell {
+                    lines,
+                    settled: 0,
+                    leave: Leave::Never,
+                }
+            }
+            Cell::Tool { status, .. } | Cell::Agent { status, .. }
+                if *status == ToolStatus::Running =>
+            {
+                ShownCell {
+                    lines: cell_lines(cell, width),
+                    settled: 0,
+                    leave: Leave::AtCap,
+                }
+            }
+            // Replaced in place while live, so none of it is settled — but
+            // once frozen its terminal update is appended as a row of its own,
+            // so it may go whenever the tail needs the room.
+            Cell::BackgroundTask(task) if task.status == BackgroundTaskStatus::Running => {
+                ShownCell {
+                    lines: cell_lines(cell, width),
+                    settled: 0,
+                    leave: Leave::Whole,
+                }
+            }
+            Cell::AgentMessage(message) if message.status == AgentMessageStatus::Queued => {
+                ShownCell {
+                    lines: cell_lines(cell, width),
+                    settled: 0,
+                    leave: Leave::Whole,
+                }
+            }
+            // The text is fixed on arrival; the answer only appends its mark
+            // below it, and that has to land on this cell.
+            Cell::Plan {
+                status: PlanStatus::Pending,
+                ..
+            } => {
+                let lines = cell_lines(cell, width);
+                ShownCell {
+                    settled: lines.len(),
+                    lines,
+                    leave: Leave::Never,
+                }
+            }
+            _ => ShownCell::done(cell_lines(cell, width)),
+        })
+        .collect()
+}
+
+/// The uncommitted tail for the on-screen viewport, flattened from
+/// [`shown_cells`]. The head cell resumes one line below whatever of it is
+/// already in scrollback.
+pub fn visible_transcript(app: &App, hud: &Hud, width: usize) -> Vec<Line<'static>> {
+    let secs = hud.thinking.map(|d| d.as_secs()).unwrap_or(0);
+    let mut skip = app.head_skip(width);
+    let mut lines = Vec::new();
+    for cell in shown_cells(app, width, secs) {
+        lines.extend(cell.lines.into_iter().skip(skip));
+        skip = 0;
     }
     lines
 }
 
-/// A cell is committable once it can no longer change: everything except a tool
-/// or sub-agent row that is still Running (its ✓/✗ has yet to land).
-fn is_committable(cell: &Cell) -> bool {
-    match cell {
-        Cell::Tool { status, .. } | Cell::Agent { status, .. } => *status != ToolStatus::Running,
-        Cell::BackgroundTask(task) => task.status != BackgroundTaskStatus::Running,
-        Cell::AgentMessage(message) => message.status != AgentMessageStatus::Queued,
-        // A plan awaiting its ✓/✗ is deliberately not listed: holding it back
-        // would also hold back [`head_freeze_lines`], and a plan is routinely
-        // taller than the viewport — its top would be clipped off screen
-        // without ever reaching scrollback, which is the very thing plan 194
-        // set out to stop. A plan that scrolls away before it is answered
-        // keeps no mark; one the user can still see is worth more.
-        _ => true,
-    }
-}
-
-/// How many leading cells to freeze into scrollback so the uncommitted tail fits
-/// an `active_h`-row viewport region. Commits only finalized cells and never the
-/// last one. A live assistant/reasoning cell is never committed even when it is
-/// no longer last; its completion must still update the original cell by id. A
-/// still-running tool/sub-agent row at the front holds the line until the backlog
-/// grows past a few screens, then may be frozen mid-run so it cannot pin an
-/// unbounded tail.
-pub fn commit_count(
-    cells: &[Cell],
-    width: usize,
-    active_h: usize,
-    mut display_cell_live: impl FnMut(usize) -> bool,
-) -> usize {
-    let active_h = active_h.max(1);
-    let heights: Vec<usize> = cells.iter().map(|c| cell_lines(c, width).len()).collect();
-    let total: usize = heights.iter().sum();
-    if total <= active_h {
-        return 0;
-    }
-    let hard_cap = active_h.saturating_mul(4);
-    let mut committed = 0;
-    let mut remaining = total;
-    while remaining > active_h && committed + 1 < cells.len() {
-        if display_cell_live(committed) {
-            break;
-        }
-        if !is_committable(&cells[committed]) && remaining <= hard_cap {
-            break;
-        }
-        // Keep the live tail at least a viewport tall: never commit a cell when
-        // doing so would strand a short remainder (e.g. a tall final message
-        // trailed by a one-line note on resume) behind a full-screen blank pad
-        // (plan 99). The last cell is already excluded by the loop condition.
-        if remaining - heights[committed] < active_h {
-            break;
-        }
-        remaining -= heights[committed];
-        committed += 1;
-    }
-    committed
-}
-
-/// How many of the head cell's leading rendered lines belong in native
-/// scrollback so the live tail fits `active_h` rows — the line-level remainder
-/// [`commit_count`] cannot take, because it only ever moves whole cells and
-/// never the last one. Returns the new total (never below `frozen`).
+/// What to freeze so the live tail fits an `active_h`-row region: how many
+/// leading cells leave whole, and how many leading lines of the new head are
+/// then in scrollback. `frozen` is how many of the current head's lines already
+/// are.
 ///
-/// One cell can be taller than the whole viewport: a replayed final answer, a
-/// long tool output. Committing it whole would leave a one-line note alone
-/// behind a full-screen blank pad (plan 99), so `commit_count` keeps it — and
-/// then [`draw`] bottom-anchors the tail and clips the top, which is content the
-/// user can never reach: it is neither on screen nor in scrollback. Freezing
-/// exactly the overflow instead keeps the seam continuous — scrollback ends
-/// where the viewport begins — and nothing is dropped.
+/// Every rendered line is either on screen or in scrollback (plan 215). The
+/// draw bottom-anchors the tail and clips its top, so whatever overflows must
+/// be frozen — and exactly that much, so the tail is never stranded behind a
+/// screen of blank rows (plan 99). A line may freeze once it is settled; a cell
+/// leaves whole once its [`Leave`] allows it. The one exception to the rule is
+/// a cell whose unsettled part is itself taller than the region — in practice a
+/// table still being written that is taller than the screen.
 ///
-/// The head is left alone while it can still change: a cell whose lines may
-/// re-wrap (a code fence closing, a table gaining a row) must not have half of
-/// it already nailed into scrollback. The last cell is left alone for the same
-/// reason [`commit_count`] leaves it — except a plan, whose text is fixed on
-/// arrival and whose answer only appends a line below it. A plan waiting on
-/// its answer is the last cell and routinely taller than the screen, and the
-/// user has to read all of it before answering (plan 214).
-pub fn head_freeze_lines(
-    cells: &[Cell],
-    width: usize,
-    active_h: usize,
-    frozen: usize,
-    head_live: bool,
-) -> usize {
+/// A status row that must not split (nothing of it settled) leaves whole even
+/// when that frees more rows than needed — a few blank rows at the top of the
+/// viewport beat a clipped one. Otherwise the last cell never leaves whole:
+/// what overflows is always less than what is live, so it only gives up its
+/// settled prefix.
+pub fn freeze_target(cells: &[Freezable], frozen: usize, active_h: usize) -> (usize, usize) {
     let active_h = active_h.max(1);
-    let Some(head) = cells.first() else {
-        return frozen;
-    };
-    let head_is_last = cells.len() == 1;
-    if head_live || !is_committable(head) || (head_is_last && !matches!(head, Cell::Plan { .. })) {
-        return frozen;
-    }
-    let head_h = cell_lines(head, width).len();
-    let rest: usize = cells[1..].iter().map(|c| cell_lines(c, width).len()).sum();
-    let live = (head_h + rest).saturating_sub(frozen);
+    let total: usize = cells.iter().map(|cell| cell.height).sum();
+    let mut live = total.saturating_sub(frozen);
     if live <= active_h {
-        return frozen;
+        return (0, frozen);
     }
-    // Freeze only what overflows, and never past the head's own last line:
-    // whole cells after it are `commit_count`'s business.
-    (frozen + (live - active_h)).min(head_h)
+    let mut over = live - active_h;
+    let mut skip = frozen;
+    for (index, cell) in cells.iter().enumerate() {
+        let rest = cell.height.saturating_sub(skip);
+        let leaves = match cell.leave {
+            Leave::Never => false,
+            Leave::Whole => true,
+            Leave::AtCap => live > HARD_CAP_SCREENS * active_h,
+        };
+        if leaves {
+            if rest <= over {
+                over -= rest;
+                live -= rest;
+                skip = 0;
+                continue;
+            }
+            if cell.settled < cell.height {
+                return (index + 1, 0);
+            }
+        }
+        let take = cell.settled.saturating_sub(skip).min(over);
+        return (index, skip + take);
+    }
+    (cells.len(), 0)
 }
 
 /// The on-screen height of the composer at `width`: its wrapped rows (already
@@ -2861,216 +2925,274 @@ mod tests {
     /// Nothing overflows: no cell is committed. Once the tail is taller than the
     /// region, the final leading cells are committed — but never the last one,
     /// and a still-running tool at the front holds the line.
-    #[test]
-    fn commit_count_freezes_the_overflowing_final_prefix() {
-        // Five one-line assistant cells; region only 3 rows tall.
-        let five: Vec<Cell> = (0..5)
-            .map(|i| Cell::Assistant(format!("line {i}")))
-            .collect();
-        assert_eq!(
-            commit_count(&five, 40, 10, |_| false),
-            0,
-            "fits: commit nothing"
-        );
-        // total 5 > 3: commit the front 2 so the last 3 fit.
-        assert_eq!(commit_count(&five, 40, 3, |_| false), 2);
-        // Never commit the last cell even if the region is tiny.
-        assert_eq!(commit_count(&five, 40, 1, |_| false), 4);
-        // A non-last display item can still receive deltas/completion by id and
-        // must never be frozen into immutable scrollback.
-        assert_eq!(commit_count(&five, 40, 1, |index| index == 0), 0);
-
-        // A running tool at the front is not committable, so it holds the line
-        // (and everything behind it) until it finishes — as long as the backlog
-        // stays under the force-commit cap.
-        let mut cells = vec![Cell::Tool {
-            name: "bash".into(),
-            input: "{}".into(),
-            status: ToolStatus::Running,
-            output: None,
-        }];
-        cells.extend((0..3).map(|i| Cell::Assistant(format!("l{i}"))));
-        assert_eq!(
-            commit_count(&cells, 40, 2, |_| false),
-            0,
-            "running front pins the tail"
-        );
+    fn freezable(height: usize, settled: usize, leave: Leave) -> Freezable {
+        Freezable {
+            height,
+            settled,
+            leave,
+        }
     }
 
-    #[test]
-    fn running_background_row_pins_tail_until_hard_cap_forces_freeze() {
-        let running = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
-            id: "agent-1".into(),
-            run_id: None,
-            kind: BackgroundTaskKind::Agent,
-            description: "long audit".into(),
-            status: BackgroundTaskStatus::Running,
-            output_path: None,
-            detail: None,
-        });
-        let mut under_cap = vec![running.clone()];
-        under_cap.extend((0..3).map(|i| Cell::Assistant(format!("l{i}"))));
-        assert_eq!(commit_count(&under_cap, 40, 2, |_| false), 0);
-
-        let mut over_cap = vec![running];
-        over_cap.extend((0..10).map(|i| Cell::Assistant(format!("l{i}"))));
-        assert!(
-            commit_count(&over_cap, 40, 2, |_| false) > 0,
-            "the hard cap must prevent an unbounded mutable tail"
-        );
+    /// A cell that is done: every line settled, free to leave.
+    fn done(height: usize) -> Freezable {
+        freezable(height, height, Leave::Whole)
     }
 
-    /// Regression (plan 99): resuming a session builds short leading cells, a
-    /// tall final assistant message, then a one-line note. Committing the tall
-    /// message would leave only the note live behind a full-viewport blank pad —
-    /// the exact `kloop -c` blank-gap bug. The commit must stop early so the live
-    /// tail still fills the viewport.
+    /// Each case: the tail, how much of its head is already frozen, the live
+    /// region's height, and (cells leaving whole, new head's frozen lines).
     #[test]
-    fn commit_keeps_a_tall_final_message_live_instead_of_a_blank_pad() {
-        let width = 40;
-        let active_h = 5;
-        // A System cell renders one row per source line, so this is 8 rows tall.
-        let tall = Cell::System(
-            (0..8)
-                .map(|i| format!("row {i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        let cells = vec![
-            Cell::Assistant("intro 0".into()),
-            Cell::Assistant("intro 1".into()),
-            tall,
-            Cell::Note("resumed session — 52 message(s)".into()),
-        ];
-        let n = commit_count(&cells, width, active_h, |_| false);
-        assert!(
-            n <= 2,
-            "must not freeze the tall final message: committed {n}"
-        );
-        let live_tail: usize = cells[n..].iter().map(|c| cell_lines(c, width).len()).sum();
-        assert!(
-            live_tail >= active_h,
-            "live tail {live_tail} must fill the {active_h}-row viewport",
-        );
-    }
-
-    /// The other half of the plan-99 rule: `commit_count` keeps the tall final
-    /// message live, and this freezes the lines of it that overflow the viewport
-    /// anyway — otherwise `draw` bottom-anchors the tail and clips a top that is
-    /// in no scrollback either, so a resumed answer's opening is unreachable.
-    #[test]
-    fn head_freeze_takes_exactly_the_tall_head_overflow() {
-        let width = 40;
-        let active_h = 5;
-        // 20 rows of message, then the one-line resume note: 16 rows overflow.
-        let cells = vec![
-            tall_cell(20),
-            Cell::Note("resumed session — 32 message(s)".into()),
-        ];
-        assert_eq!(
-            commit_count(&cells, width, active_h, |_| false),
-            0,
-            "the tall message stays live (plan 99)"
-        );
-        let frozen = head_freeze_lines(&cells, width, active_h, 0, /*head_live=*/ false);
-        assert_eq!(frozen, 16);
-        // Seam: scrollback ends on the last frozen line, the viewport opens on
-        // the next one, and together they are the whole message.
-        let head = cell_lines(&cells[0], width);
-        assert_eq!(line_text(&head[frozen - 1]), "row 15");
-        assert_eq!(line_text(&head[frozen]), "row 16");
-        let live: usize = head.len() - frozen + cell_lines(&cells[1], width).len();
-        assert_eq!(live, active_h, "the live tail fills the viewport exactly");
-    }
-
-    /// Freezing is per frame and cumulative: a later turn pushes more rows in,
-    /// and only the newly overflowing ones are added to what is already frozen.
-    #[test]
-    fn head_freeze_adds_only_the_new_overflow() {
-        let width = 40;
-        let cells = vec![
-            tall_cell(20),
-            Cell::Note("resumed session — 32 message(s)".into()),
-            Cell::User("and now what".into()),
-        ];
-        // The User cell renders a leading blank plus its text: two more rows.
-        assert_eq!(
-            head_freeze_lines(&cells, width, 5, 16, /*head_live=*/ false),
-            18
-        );
-    }
-
-    /// A head that can still change keeps its lines: half a cell nailed into
-    /// scrollback cannot be re-wrapped when the rest of it lands.
-    #[test]
-    fn head_freeze_leaves_a_settled_or_fitting_head_alone() {
-        let width = 40;
-        let active_h = 5;
-        let tail = Cell::Note("resumed session — 32 message(s)".into());
-        let running = Cell::Tool {
-            name: "Bash".into(),
-            input: "{}".into(),
-            status: ToolStatus::Running,
-            output: None,
-        };
-        let cases: Vec<(&str, Vec<Cell>, bool, usize)> = vec![
+    fn freeze_target_freezes_exactly_what_overflows() {
+        let running_row = freezable(1, 0, Leave::AtCap);
+        // A background task or queued message: replaced in place, so nothing
+        // settled, but free to go.
+        let status_row = freezable(3, 0, Leave::Whole);
+        let streaming = |height, settled| freezable(height, settled, Leave::Never);
+        let waiting_plan = |height| freezable(height, height, Leave::Never);
+        let live_thinking = freezable(1, 0, Leave::Never);
+        let one_line = |n| vec![done(1); n];
+        type Case = (&'static str, Vec<Freezable>, usize, usize, (usize, usize));
+        let cases: Vec<Case> = vec![
+            ("fits", vec![done(2), done(3)], 0, 10, (0, 0)),
             (
-                "fits the viewport",
-                vec![tall_cell(3), tail.clone()],
-                false,
-                0,
+                "fits below a frozen seam",
+                vec![done(20), done(1)],
+                16,
+                5,
+                (0, 16),
             ),
-            ("head is the last cell", vec![tall_cell(20)], false, 0),
+            ("front cells leave whole", one_line(5), 0, 3, (2, 0)),
             (
-                "head still streaming",
-                vec![tall_cell(20), tail.clone()],
-                true,
+                "a tiny region keeps only the last",
+                one_line(5),
                 0,
+                1,
+                (4, 0),
             ),
-            ("head still running", vec![running, tall_cell(20)], false, 0),
+            (
+                "a tall finished cell splits by line",
+                vec![done(20), done(1)],
+                0,
+                5,
+                (0, 16),
+            ),
+            (
+                "only the new overflow is added to the seam",
+                vec![done(20), done(1), done(2)],
+                16,
+                5,
+                (0, 18),
+            ),
+            (
+                "a fully frozen head leaves and the next one splits",
+                vec![done(20), done(1), done(10)],
+                20,
+                5,
+                (2, 5),
+            ),
+            (
+                "plan 99: a tall message is split, not stranding the tail",
+                vec![done(1), done(1), done(8), done(1)],
+                0,
+                5,
+                (2, 4),
+            ),
+            (
+                "a streaming answer freezes up to its settled lines",
+                vec![done(2), streaming(30, 12)],
+                0,
+                10,
+                (1, 12),
+            ),
+            (
+                "a streaming answer freezes only what overflows",
+                vec![streaming(30, 25)],
+                0,
+                10,
+                (0, 20),
+            ),
+            (
+                "an open answer holds back the cells behind it",
+                vec![streaming(10, 4), done(5)],
+                0,
+                3,
+                (0, 4),
+            ),
+            (
+                "settled below the seam freezes nothing more",
+                vec![streaming(10, 2), done(10)],
+                5,
+                5,
+                (0, 5),
+            ),
+            (
+                "live thinking holds its place",
+                vec![live_thinking, done(10)],
+                0,
+                3,
+                (0, 0),
+            ),
+            (
+                "a running tool row pins the tail under the cap",
+                [vec![running_row], one_line(3)].concat(),
+                0,
+                2,
+                (0, 0),
+            ),
+            (
+                "past four screens the running row goes",
+                [vec![running_row], one_line(10)].concat(),
+                0,
+                2,
+                (9, 0),
+            ),
+            (
+                "the cap counts the tail from the running row, not what left above it",
+                [vec![done(50), running_row], one_line(3)].concat(),
+                0,
+                2,
+                (1, 0),
+            ),
+            (
+                "a background row goes when the tail needs the room",
+                [vec![status_row], one_line(3)].concat(),
+                0,
+                2,
+                (2, 0),
+            ),
+            (
+                "a row that cannot split goes whole, freeing more than needed",
+                [vec![status_row], one_line(2)].concat(),
+                0,
+                4,
+                (1, 0),
+            ),
+            (
+                "a waiting plan as the last cell gives up its overflow",
+                vec![done(2), waiting_plan(25)],
+                0,
+                10,
+                (1, 15),
+            ),
+            (
+                "the last cell never leaves whole",
+                vec![done(30)],
+                0,
+                1,
+                (0, 29),
+            ),
+            (
+                "unless it is a row that cannot split, taller than the region",
+                vec![status_row],
+                0,
+                2,
+                (1, 0),
+            ),
         ];
-        let frozen: Vec<(&str, usize)> = cases
+        let got: Vec<(&str, (usize, usize))> = cases
             .iter()
-            .map(|(name, cells, head_live, _)| {
-                (
-                    *name,
-                    head_freeze_lines(cells, width, active_h, 0, *head_live),
-                )
+            .map(|(name, cells, frozen, active_h, _)| {
+                (*name, freeze_target(cells, *frozen, *active_h))
             })
             .collect();
-        assert_eq!(
-            frozen,
-            cases
-                .iter()
-                .map(|(name, _, _, want)| (*name, *want))
-                .collect::<Vec<_>>()
-        );
+        let want: Vec<(&str, (usize, usize))> = cases
+            .iter()
+            .map(|(name, _, _, _, want)| (*name, *want))
+            .collect();
+        assert_eq!(got, want);
     }
 
-    /// A plan waiting on its answer is the last cell, and the one last cell whose
-    /// overflow may freeze: its text is fixed on arrival (plan 214). Any other
-    /// last cell keeps the case above ("head is the last cell").
+    /// What each kind of cell claims (plan 215 §4.3): its on-screen height,
+    /// how much of it is settled, and whether it may leave whole.
     #[test]
-    fn head_freeze_takes_a_waiting_plans_overflow_though_it_is_last() {
+    fn shown_cells_say_what_each_cell_may_freeze() {
+        use kloop_core::event::Delta;
+        use kloop_core::event::Event;
+
         let width = 40;
-        let active_h = 5;
-        let plan = Cell::Plan {
-            text: (0..20)
-                .map(|i| format!("- step {i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            status: PlanStatus::Pending,
+        let tool = |status| Cell::Tool {
+            name: "Bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+            status,
+            output: None,
         };
-        let lines = cell_lines(&plan, width);
-        let frozen = head_freeze_lines(
-            std::slice::from_ref(&plan),
-            width,
-            active_h,
-            0,
-            /*head_live=*/ false,
+        let task = |status| {
+            Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+                id: "agent-1".into(),
+                run_id: None,
+                kind: BackgroundTaskKind::Agent,
+                description: "long audit".into(),
+                status,
+                output_path: None,
+                detail: None,
+            })
+        };
+        let plan = |status| Cell::Plan {
+            text: "- one\n- two".into(),
+            status,
+        };
+        let mut app = App::new("s".into());
+        app.cells = vec![
+            Cell::User("q".into()),
+            tool(ToolStatus::Running),
+            tool(ToolStatus::Ok),
+            Cell::Agent {
+                agent: "explorer".into(),
+                task: "look".into(),
+                status: ToolStatus::Running,
+                tools: 0,
+                last_tool: String::new(),
+            },
+            task(BackgroundTaskStatus::Running),
+            task(BackgroundTaskStatus::Completed),
+            Cell::AgentMessage(kloop_core::event::AgentMessageUpdate {
+                id: "message-12".parse().unwrap(),
+                from: "agent-4".parse().unwrap(),
+                to: "main".parse().unwrap(),
+                summary: "review".into(),
+                status: AgentMessageStatus::Queued,
+            }),
+            plan(PlanStatus::Pending),
+            plan(PlanStatus::Approved),
+            Cell::Thinking {
+                text: "…".into(),
+                seconds: Some(3),
+            },
+        ];
+        // Thinking still open but no longer last, then an answer streaming.
+        app.apply(crate::events::AgentEvent::Core(Event::ItemDelta {
+            id: "r".into(),
+            delta: Delta::Reasoning("hmm".into()),
+        }));
+        app.apply(crate::events::AgentEvent::Core(Event::ItemDelta {
+            id: "m".into(),
+            delta: Delta::Text("# Title\n\nsettled para\n\nstill form".into()),
+        }));
+        let got: Vec<(usize, usize, Leave)> = shown_cells(&app, width, 0)
+            .iter()
+            .map(|cell| (cell.lines.len(), cell.settled, cell.leave))
+            .collect();
+        let height = |cell: &Cell| cell_lines(cell, width).len();
+        let all = |i: usize| (height(&app.cells[i]), height(&app.cells[i]));
+        let none = |i: usize| (height(&app.cells[i]), 0);
+        let with = |(h, s): (usize, usize), leave| (h, s, leave);
+        assert_eq!(
+            got,
+            vec![
+                with(all(0), Leave::Whole),
+                with(none(1), Leave::AtCap),
+                with(all(2), Leave::Whole),
+                with(none(3), Leave::AtCap),
+                with(none(4), Leave::Whole),
+                with(all(5), Leave::Whole),
+                with(none(6), Leave::Whole),
+                with(all(7), Leave::Never),
+                with(all(8), Leave::Whole),
+                with(all(9), Leave::Whole),
+                (1, 0, Leave::Never),
+                // Title, gap, paragraph settled; gap and raw tail not.
+                (5, 3, Leave::Never),
+            ]
         );
-        assert_eq!(frozen, lines.len() - active_h);
-        assert_eq!(line_text(&lines[frozen]), "• step 15");
     }
 
     /// The viewport picks the head cell up one line past the seam — and a prefix

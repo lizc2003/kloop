@@ -903,9 +903,7 @@ impl App {
         match item {
             Item::AssistantMessage { text, .. } => {
                 if let Some(&index) = self.assistant_cells.get(&id) {
-                    if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
-                        *current = text;
-                    }
+                    self.replace_answer(index, text);
                 } else {
                     self.assistant_cells.insert(id, self.cells.len());
                     self.cells.push(Cell::Assistant(text));
@@ -1023,11 +1021,7 @@ impl App {
         match item {
             Item::AssistantMessage { text, .. } => {
                 match self.assistant_cells.remove(&id) {
-                    Some(index) => {
-                        if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
-                            *current = text;
-                        }
-                    }
+                    Some(index) => self.replace_answer(index, text),
                     None if !text.is_empty() => self.cells.push(Cell::Assistant(text)),
                     None => {}
                 }
@@ -1089,6 +1083,21 @@ impl App {
                     };
                 }
             }
+        }
+    }
+
+    /// Put `text` in place of an answer's text: its item restarted, or completed
+    /// with the full text. The answer may be the head with a prefix already in
+    /// scrollback, frozen as settled against the old text — which holds for any
+    /// continuation of that text, but not for a different one. Then the head
+    /// comes back whole and re-freezes: a stretch of scrollback repeated beats
+    /// one lost.
+    fn replace_answer(&mut self, index: usize, text: String) {
+        if let Some(Cell::Assistant(current)) = self.cells.get_mut(index) {
+            if index == 0 && !text.starts_with(current.as_str()) {
+                self.head_frozen = None;
+            }
+            *current = text;
         }
     }
 
@@ -1788,15 +1797,6 @@ impl App {
 
     pub fn interaction_active(&self) -> bool {
         !self.interactions.is_empty()
-    }
-
-    /// Whether the prompt on screen is a plan approval.
-    pub(crate) fn plan_awaiting_answer(&self) -> bool {
-        matches!(
-            self.interactions.front(),
-            Some(PendingInteraction::Confirm { req, .. })
-                if matches!(req.preview, Some(ConfirmPreview::Plan(_)))
-        )
     }
 
     pub fn question_editor_active(&self) -> bool {
@@ -2854,6 +2854,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A streaming answer at the head may have its settled prefix in
+    /// scrollback. Completing it with the text it grew to keeps that seam; a
+    /// completion that is not a continuation of it gives the seam up, so the
+    /// answer comes back whole instead of resuming mid-way through other text.
+    #[test]
+    fn an_answer_replaced_by_other_text_gives_up_its_frozen_prefix() {
+        let complete = |text: &str| {
+            AgentEvent::Core(Event::ItemCompleted {
+                id: "m".into(),
+                item: Item::AssistantMessage {
+                    text: text.into(),
+                    status: ItemStatus::Completed,
+                },
+            })
+        };
+        let mut app = App::new("s".into());
+        app.apply(text_delta("first para\n\nsecond"));
+        app.freeze_head_lines(40, 1);
+        app.apply(complete("first para\n\nsecond para"));
+        assert_eq!(app.head_skip(40), 1, "a continuation keeps the seam");
+
+        let mut app = App::new("s".into());
+        app.apply(text_delta("first para\n\nsecond"));
+        app.freeze_head_lines(40, 1);
+        app.apply(complete("rewritten"));
+        assert_eq!(app.head_skip(40), 0, "other text drops it");
     }
 
     #[test]

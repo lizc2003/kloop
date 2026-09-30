@@ -856,25 +856,16 @@ fn overflow_active_h(app: &App, viewport: Rect) -> usize {
     height.saturating_sub(reserve).max(1)
 }
 
-fn overflow_commit_count(app: &App, viewport: Rect) -> usize {
-    let width = usize::from(viewport.width).max(1);
-    render::commit_count(
-        &app.cells,
-        width,
-        overflow_active_h(app, viewport),
-        |index| app.display_cell_live(index),
-    )
-}
-
-/// Freeze finalized cells that overflow the last successfully drawn live region
-/// into native scrollback, then drop them from the app's tail. The caller must
-/// pass the viewport from that draw; committing from a pre-draw size probe would
-/// race Ratatui's own autoresize and could irreversibly freeze the wrong prefix.
+/// Freeze whatever of the live tail overflows the last successfully drawn live
+/// region into native scrollback, then drop the cells that left whole from the
+/// app's tail. The caller must pass the viewport from that draw; committing from
+/// a pre-draw size probe would race Ratatui's own autoresize and could
+/// irreversibly freeze the wrong prefix.
 ///
-/// Whole cells go first; whatever still overflows is a single head cell taller
-/// than the viewport, and its own overflowing lines are frozen too
-/// ([`render::head_freeze_lines`]) — otherwise the draw would clip that top off
-/// the screen without ever putting it in scrollback.
+/// Cells leave whole where they may; the new head then freezes its settled
+/// lines down to exactly the overflow ([`render::freeze_target`]). The lines
+/// written are the ones the viewport shows ([`render::shown_cells`]), so the
+/// scrollback continues seamlessly into the screen.
 fn commit_overflow<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
@@ -884,37 +875,46 @@ where
     B: ratatui::backend::Backend,
 {
     let width = usize::from(viewport.width).max(1);
-    let active_h = overflow_active_h(app, viewport);
-    let n = overflow_commit_count(app, viewport);
-    // Render each cell to fixed-height lines up front so the borrow of
-    // `app.cells` ends before `drain_committed` takes it mutably.
-    let mut blocks: Vec<Vec<Line<'static>>> = app.cells[..n]
-        .iter()
-        .map(|c| render::cell_lines(c, width))
-        .collect();
-    // The head's already-frozen prefix is in scrollback; committing the cell
-    // whole must not write it a second time.
-    if let Some(head) = blocks.first_mut() {
-        let skip = app.head_skip(width).min(head.len());
-        head.drain(..skip);
-    }
-    app.drain_committed(n);
-
+    let shown = render::shown_cells(app, width, 0);
     let frozen = app.head_skip(width);
-    let head_live = app.display_cell_live(0);
-    let target = render::head_freeze_lines(&app.cells, width, active_h, frozen, head_live);
-    if target > frozen {
-        let mut head = render::cell_lines(&app.cells[0], width);
-        head.truncate(target);
-        head.drain(..frozen);
-        blocks.push(head);
-        app.freeze_head_lines(width, target);
+    let (n, head) = overflow_freeze_target(app, &shown, viewport);
+    // Everything to write is taken from `shown` before `drain_committed`,
+    // which forgets the head's frozen prefix.
+    let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut already = frozen;
+    let mut cells = shown.into_iter();
+    for cell in cells.by_ref().take(n) {
+        blocks.push(cell.lines.into_iter().skip(already).collect());
+        already = 0;
+    }
+    if let Some(cell) = cells.next()
+        && head > already
+    {
+        blocks.push(cell.lines[already..head].to_vec());
     }
     if blocks.is_empty() {
         return Ok(false);
     }
+    app.drain_committed(n);
+    if head > 0 {
+        app.freeze_head_lines(width, head);
+    }
     insert_scrollback_blocks(terminal, blocks)?;
     Ok(true)
+}
+
+fn overflow_freeze_target(
+    app: &App,
+    shown: &[render::ShownCell],
+    viewport: Rect,
+) -> (usize, usize) {
+    let width = usize::from(viewport.width).max(1);
+    let cells: Vec<render::Freezable> = shown.iter().map(render::ShownCell::freezable).collect();
+    render::freeze_target(
+        &cells,
+        app.head_skip(width),
+        overflow_active_h(app, viewport),
+    )
 }
 
 /// Draw one frame and hand it to the terminal as a single synchronized write.
@@ -949,13 +949,12 @@ where
 {
     for retry in 0..=1 {
         let drawn_viewport = draw_and_hand_over(terminal, app, hud)?;
-        // A plan approval does not hold the commit: the plan is in the
-        // transcript, not the panel (plan 194), and has to reach scrollback
-        // while the user is still reading it (plan 214).
-        let overlay_open = app.fork_picker.is_some()
-            || app.popup.is_some()
-            || (app.interaction_active() && !app.plan_awaiting_answer());
-        if overlay_open {
+        // Only the completion menu holds the commit: it floats over the
+        // transcript, outside the height budget. The panels — approvals,
+        // questions, pickers — are in that budget (plan 104), so what they
+        // push off the top belongs in scrollback like anything else; held back,
+        // it would be neither on screen nor there (plan 215).
+        if app.popup.is_some() {
             return Ok(drawn_viewport);
         }
 
@@ -1704,8 +1703,8 @@ mod tests {
     }
 
     /// End of a resumed session: one answer taller than the whole screen, then
-    /// the resume note. `commit_count` cannot take the answer (that would strand
-    /// the note behind a blank pad) and `draw` clips its top, so the commit has
+    /// the resume note. Committing the answer whole would strand the note
+    /// behind a blank pad, and `draw` clips its top, so the commit has
     /// to freeze the overflowing lines themselves — otherwise the opening of the
     /// conclusion is on no screen and in no scrollback, and `kloop -r` can never
     /// show it.
@@ -1820,7 +1819,14 @@ mod tests {
         };
         let frozen = app.head_skip(width);
         let shown = visible(&app);
-        assert!(app.plan_awaiting_answer(), "the panel is still up");
+        assert!(
+            matches!(
+                app.interactions.front(),
+                Some(crate::app::PendingInteraction::Confirm { req, .. })
+                    if matches!(req.preview, Some(ConfirmPreview::Plan(_)))
+            ),
+            "the panel is still up"
+        );
         assert_eq!(
             app.cells,
             vec![Cell::Plan {
@@ -1873,6 +1879,294 @@ mod tests {
         );
     }
 
+    /// A terminal whose inline viewport is the whole screen, so every line a
+    /// commit writes lands in `TestBackend`'s scrollback.
+    fn full_screen(width: u16, height: u16) -> ratatui::Terminal<PinnedBackend<TestBackend>> {
+        ratatui::Terminal::with_options(
+            PinnedBackend::new(TestBackend::new(width, height)),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )
+        .unwrap()
+    }
+
+    fn rows(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn scrollback_rows(terminal: &ratatui::Terminal<PinnedBackend<TestBackend>>) -> Vec<String> {
+        let scrollback = terminal.backend().inner.scrollback();
+        (0..scrollback.area.height)
+            .map(|y| {
+                (0..scrollback.area.width)
+                    .map(|x| scrollback[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Draw a frame and check what plan 215 is about: scrollback followed by
+    /// the live tail is exactly `whole` — nothing repeated, nothing dropped —
+    /// and the live tail fits its rows, so none of it is clipped off the top.
+    fn draw_and_check(
+        terminal: &mut ratatui::Terminal<PinnedBackend<TestBackend>>,
+        app: &mut App,
+        whole: &[String],
+        context: &str,
+    ) {
+        let viewport = draw_frame(terminal, app, &render::Hud::default()).unwrap();
+        let width = usize::from(viewport.width);
+        let visible = rows(&render::visible_transcript(
+            app,
+            &render::Hud::default(),
+            width,
+        ));
+        let active_h = overflow_active_h(app, viewport);
+        assert!(
+            visible.len() <= active_h,
+            "{context}: {} live rows for {active_h}, the top is clipped",
+            visible.len()
+        );
+        assert_eq!(
+            [scrollback_rows(terminal), visible].concat(),
+            whole,
+            "{context}"
+        );
+    }
+
+    fn answer_delta(text: &str) -> AgentEvent {
+        AgentEvent::Core(CoreEvent::ItemDelta {
+            id: "m".into(),
+            delta: kloop_core::event::Delta::Text(text.into()),
+        })
+    }
+
+    fn answer_done(text: &str) -> AgentEvent {
+        AgentEvent::Core(CoreEvent::ItemCompleted {
+            id: "m".into(),
+            item: kloop_core::event::Item::AssistantMessage {
+                text: text.into(),
+                status: kloop_core::event::ItemStatus::Completed,
+            },
+        })
+    }
+
+    /// Stream `answer[from..to]` in `chunk`-byte deltas, checking every frame:
+    /// the lines above the answer (`above`), then the answer as it shows right
+    /// now, are split between scrollback and screen with nothing lost. Returns
+    /// how many rows scrollback holds at the end.
+    fn stream_and_check(
+        terminal: &mut ratatui::Terminal<PinnedBackend<TestBackend>>,
+        app: &mut App,
+        above: &[String],
+        answer: &str,
+        (from, to): (usize, usize),
+        chunk: usize,
+    ) -> usize {
+        let width = usize::from(terminal.get_frame().area().width);
+        let mut sent = from;
+        while sent < to {
+            let next = (sent + chunk).min(to);
+            app.apply(answer_delta(&answer[sent..next]));
+            sent = next;
+            let (showing, _) = crate::markdown::assistant_stream(&answer[..sent], width);
+            let whole = [above, &rows(&showing)].concat();
+            draw_and_check(terminal, app, &whole, &format!("after {sent} bytes"));
+        }
+        scrollback_rows(terminal).len()
+    }
+
+    /// An answer three screens tall, streamed in small pieces. At every frame
+    /// its settled top is in scrollback and the rest on screen; once it is
+    /// complete and the turn has closed, the two together are the finished
+    /// render, line for line.
+    #[test]
+    fn a_streaming_answer_reaches_scrollback_as_it_settles() {
+        let mut terminal = full_screen(40, 14);
+        let width = 40;
+        let mut app = App::new("stream-tall".into());
+        app.running = true;
+        let answer: String = (0..5)
+            .map(|i| {
+                format!(
+                    "Step {i} explains one more part of the change, in enough words to wrap.\n\n- point {i}a\n- point {i}b\n\n- point {i}c after a gap\n\n"
+                )
+            })
+            .collect();
+        let finished = rows(&crate::markdown::markdown_lines(&answer, width));
+        assert!(finished.len() > 3 * 8, "three screens of answer");
+
+        let frozen = stream_and_check(&mut terminal, &mut app, &[], &answer, (0, answer.len()), 5);
+        assert!(frozen > 8, "the top went to scrollback while it streamed");
+
+        app.apply(answer_done(&answer));
+        draw_and_check(&mut terminal, &mut app, &finished, "completed");
+        app.apply(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)));
+        app.seal_turn(5);
+        let rule = rows(&render::cell_lines(&Cell::TurnEnd(5), width));
+        draw_and_check(
+            &mut terminal,
+            &mut app,
+            &[finished, rule].concat(),
+            "turn closed",
+        );
+    }
+
+    /// A code block taller than the screen reaches scrollback line by line
+    /// while it is still being written, not only once its fence closes.
+    #[test]
+    fn a_tall_code_block_reaches_scrollback_while_it_is_written() {
+        let mut terminal = full_screen(40, 14);
+        let width = 40;
+        let mut app = App::new("stream-code".into());
+        app.running = true;
+        let body: String = (0..30)
+            .map(|i| format!("    total += step({i})  # line {i}\n"))
+            .collect();
+        let head = format!("The script:\n\n```python\ndef run():\n    total = 0\n{body}");
+        let answer = format!("{head}    return total\n```\n\nThat is all.\n");
+
+        stream_and_check(&mut terminal, &mut app, &[], &answer, (0, head.len()), 7);
+        assert!(
+            scrollback_rows(&terminal)
+                .iter()
+                .any(|row| row.ends_with("# line 0")),
+            "code went to scrollback before its fence closed"
+        );
+        stream_and_check(
+            &mut terminal,
+            &mut app,
+            &[],
+            &answer,
+            (head.len(), answer.len()),
+            7,
+        );
+        app.apply(answer_done(&answer));
+        let finished = rows(&crate::markdown::markdown_lines(&answer, width));
+        draw_and_check(&mut terminal, &mut app, &finished, "completed");
+    }
+
+    /// An approval is up under an answer taller than the screen. A panel used
+    /// to hold the commit, and the answer's top was then neither on screen nor
+    /// in scrollback while the user decided (plan 215).
+    #[test]
+    fn an_open_approval_does_not_hold_back_the_answer_above_it() {
+        use crate::app::ToolStatus;
+        use kloop_core::permissions::ApprovalScope;
+        use kloop_core::permissions::ConfirmRequest;
+
+        let mut terminal = full_screen(40, 24);
+        let width = 40;
+        let mut app = App::new("approval-tall".into());
+        app.running = true;
+        app.cells = vec![
+            Cell::Assistant(
+                (0..30)
+                    .map(|i| format!("- finding {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Cell::Tool {
+                name: "Bash".into(),
+                input: r#"{"command":"cargo test"}"#.into(),
+                status: ToolStatus::Running,
+                output: None,
+            },
+        ];
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "Run cargo test?".into(),
+                approval_scopes: vec![ApprovalScope::Once],
+                ..Default::default()
+            },
+            reply,
+        });
+        let whole: Vec<String> = app
+            .cells
+            .iter()
+            .flat_map(|cell| rows(&render::cell_lines(cell, width)))
+            .collect();
+        draw_and_check(&mut terminal, &mut app, &whole, "panel up");
+        assert!(app.interaction_active(), "the panel is still up");
+        assert_eq!(scrollback_rows(&terminal)[0], "• finding 0");
+    }
+
+    /// A background task's row stood in place while it ran and held everything
+    /// behind it until four screens had piled up. Now it leaves when the tail
+    /// needs the room, and its finish is written as a row of its own.
+    #[test]
+    fn a_running_background_row_does_not_hold_back_a_long_answer() {
+        use kloop_core::event::BackgroundTask;
+        use kloop_core::event::BackgroundTaskKind;
+        use kloop_core::event::BackgroundTaskStatus;
+
+        let mut terminal = full_screen(40, 14);
+        let width = 40;
+        let mut app = App::new("background-tall".into());
+        app.running = true;
+        let task = |status| BackgroundTask {
+            id: "agent-1".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Agent,
+            description: "long audit".into(),
+            status,
+            output_path: None,
+            detail: None,
+        };
+        app.apply(AgentEvent::Core(CoreEvent::BackgroundTaskUpdated(task(
+            BackgroundTaskStatus::Running,
+        ))));
+        let running = rows(&render::cell_lines(&app.cells[0], width));
+        let answer: String = (0..6)
+            .map(|i| format!("Finding {i} is written out as a paragraph long enough to wrap.\n\n"))
+            .collect();
+
+        stream_and_check(
+            &mut terminal,
+            &mut app,
+            &running,
+            &answer,
+            (0, answer.len()),
+            6,
+        );
+        app.apply(answer_done(&answer));
+        app.apply(AgentEvent::Core(CoreEvent::BackgroundTaskUpdated(task(
+            BackgroundTaskStatus::Completed,
+        ))));
+        let finished = rows(&crate::markdown::markdown_lines(&answer, width));
+        let done = rows(&render::cell_lines(app.cells.last().unwrap(), width));
+        assert_eq!(
+            done[0], "✓ Agent(long audit)",
+            "the finish is a row of its own"
+        );
+        draw_and_check(
+            &mut terminal,
+            &mut app,
+            &[running, finished, done].concat(),
+            "task finished",
+        );
+    }
+
+    /// How many whole cells a commit at `viewport` would move to scrollback.
+    fn cells_leaving(app: &App, viewport: Rect) -> usize {
+        let shown = render::shown_cells(app, usize::from(viewport.width), 0);
+        overflow_freeze_target(app, &shown, viewport).0
+    }
+
     #[test]
     fn overflow_budget_reserves_live_todos_without_committing_them() {
         let mut app = App::new("todo-overflow".into());
@@ -1880,10 +2174,10 @@ mod tests {
             .map(|index| Cell::Assistant(format!("history {index}")))
             .collect();
         let cells = app.cells.clone();
-        let without_todos = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
+        let without_todos = cells_leaving(&app, Rect::new(0, 0, 40, 10));
 
         app.todos = Some(snapshot(1, 3));
-        let with_todos = overflow_commit_count(&app, Rect::new(0, 0, 40, 10));
+        let with_todos = cells_leaving(&app, Rect::new(0, 0, 40, 10));
         assert!(with_todos > without_todos);
         assert_eq!(app.cells, cells);
         assert_eq!(app.todos.as_ref().unwrap().todos.len(), 3);
@@ -1908,8 +2202,8 @@ mod tests {
         app.cells = (1..=12)
             .map(|index| Cell::Assistant(format!("history {index}")))
             .collect();
-        let effective = overflow_commit_count(&app, viewport);
-        let physical = overflow_commit_count(&app, Rect::new(0, 0, 40, 12));
+        let effective = cells_leaving(&app, viewport);
+        let physical = cells_leaving(&app, Rect::new(0, 0, 40, 12));
         assert!(effective > physical);
     }
 

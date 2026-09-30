@@ -70,5 +70,6 @@
 
 - **Bug #1**:关 `ratatui` 的 `scrolling-regions` feature,全屏 inline `insert_before` 改走 append_lines LF-at-bottom 滚动(iTerm2 不再涂抹 DECSTBM 逐行);删 `PinnedBackend`/mock 的 `scroll_region_*` 转发与 "scroll" 事件代理,两个受影响测试改断 `app.cells.len()`(真实提交观测量);PTY 测试改名并改断 scroll-region 字节**缺席** + clear→tail 顺序。
 - **Bug #2**:`commit_count` 加"留活尾巴 ≥ active_h"守卫,高尾 assistant 消息 + 尾 note 的 `-c` resume 不再被整屏空白挤到底;新回归测试 `commit_keeps_a_tall_final_message_live_instead_of_a_blank_pad`。
+  **→ 被 plan 215 改写**:`commit_count` 由 `freeze_target` 取代，按行冻结恰好溢出的部分，这道守卫的效果随之保留(表驱动用例 "plan 99: a tall message is split, not stranding the tail")。
 - 验证:`cargo fmt --check` 干净;`cargo clippy --workspace --all-targets -- -D warnings` 全绿;`cargo test --workspace` 全绿(tui 173、tui_pty 9、新回归测试,0 失败)。README overflow-commit 段已同步两点。
 - 如实边界:Bug #1 的 iTerm2 串行消失属终端特有渲染,自动化只证"机制已换"(append_lines、无 scroll-region 字节),须人工 iTerm2 dogfood 复验;Bug #2 已完整单测。secrets/endpoints 未落任何文件。

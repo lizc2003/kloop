@@ -69,6 +69,10 @@ DESIGN.md 两处。**不动** `ask_user_question` 输入 schema 里的 `annotati
 
 反证：三处修改逐一撤回，端到端那条每次都红(撤工具行替换时 app 那条也红，撤 `head_freeze_lines` 放开时 render 那条也红)。
 
+**→ 被 plan 215 改写**:计划审批不暂停提交的特例(`App::plan_awaiting_answer`)与 `head_freeze_lines` 给计划开的口
+一起删掉——现在所有面板都不暂停提交，待答计划按"全部定稿、不可整格离开"冻。`post_plan` 原地替换保留;
+上面端到端那条原样保留、仍绿(只把对已删函数的断言换成等价的 `matches!`)。
+
 ### 没做(有意)
 
 - **其它面板仍暂停提交。** bash 审批、提问等面板开着时，转录尾部照旧可能被剪;它们的内容在面板里，

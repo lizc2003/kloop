@@ -64,6 +64,10 @@ plan 99 只在这两者里选了后者，没看到第三条路。
 算大；而保护活尾巴的那道闸 `remaining - heights[0] < active_h` 减掉的是整条高度，
 剩下的是 `heights[1..]` 的精确和，所以闸门仍然精确。
 
+**→ 被 plan 215 改写**:`commit_count` + `head_freeze_lines` 合成一个 `freeze_target`,按行冻结不再只限于
+"头部、已封口、不是最后一个"——每个 cell 报出定稿行数与能否整格离开，流式回答与末位 cell 也按定稿行冻。
+本条的四个 `head_freeze_*` 用例并进 `freeze_target_freezes_exactly_what_overflows` 的表里。
+
 ## 验证
 
 `crates/tui/src/render.rs`
