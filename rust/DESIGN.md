@@ -1249,9 +1249,14 @@ Fenced code blocks that name a supported language are **syntax-highlighted**
 strings green, comments dim, types/functions cyan, everything else (operators and
 digits included, or a shell block lights up every `.`, `/` and `=1`) plain, and
 never yellow/blue. While a
-message is still streaming, the part up to the last **stable boundary** (a whole
-blank line, or a closed code fence) is rendered as markdown and the forming tail
-shows raw, so a half-written table never reflows mid-stream; a message that ends
+message is still streaming, the part up to the last **stable boundary** — a whole
+blank line, a closed code fence, or the start of the line where the last block
+begins — is rendered as markdown and the forming tail shows raw, so a
+half-written table never reflows mid-stream. The last of those is what lets a
+long tight list settle item by item: it has no blank line in it until it ends,
+and every block above the last one is closed — only the open one can still be
+continued, gain a row, or turn into a setext heading (plan 215's real-model run
+caught a sixty-item list clipped for three seconds before this). A message that ends
 inside an open code fence renders whole — the parser closes the fence at the end
 — so code shows highlighted as it is written. The streaming render also says how
 many of its lines are **settled**: `markdown_lines` of the finished message will
@@ -1289,7 +1294,10 @@ geometry already differs from the completed frame, the loop redraws first;
 repeated resize churn skips commit for that frame. Once lines must freeze,
 `insert_before` writes them to native scrollback, clear succeeds, the App drains
 the cells that left whole, and the loop immediately repaints the tail while the
-size fence is still held. The rule the commit keeps is that **every rendered line
+size fence is still held. The first draw is not handed to the terminal before
+this: it overflows, so its top is clipped until the commit, and it goes out in
+the same synchronized frame as the commit and the repaint — handed over alone, a
+line would be on no screen and in no scrollback for one frame (plan 215). The rule the commit keeps is that **every rendered line
 is either on screen or in scrollback** (plan 215): `draw` bottom-anchors the tail
 and clips what does not fit, so whatever overflows is frozen — exactly that much,
 so a tall final message (the last turn on `-c` resume, trailed by a one-line

@@ -918,9 +918,10 @@ fn overflow_freeze_target(
 }
 
 /// Draw one frame and hand it to the terminal as a single synchronized write.
-/// Every draw in the loop goes through here: bytes a draw leaves in the
-/// [`FrameWriter`] are not on screen until the handover, and a handover in the
-/// middle of a repaint is exactly the flicker plan 103 removed.
+/// Bytes a draw leaves in the [`FrameWriter`] are not on screen until the
+/// handover, and a handover in the middle of a repaint is exactly the flicker
+/// plan 103 removed — so the one draw that is not handed over at once is the
+/// first in [`draw_frame`], which joins the commit's frame.
 fn draw_and_hand_over<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
@@ -948,13 +949,20 @@ where
     B: ratatui::backend::Backend,
 {
     for retry in 0..=1 {
-        let drawn_viewport = draw_and_hand_over(terminal, app, hud)?;
+        // Held rather than handed over: a frame that overflows is clipped at
+        // the top until the commit below moves the overflow to scrollback, so
+        // it reaches the terminal together with that commit and its repaint,
+        // as one frame — handed over alone, it would show the tail for a moment
+        // with its top on no screen and in no scrollback (plan 215).
+        terminal.draw(|frame| render::draw(frame, app, hud))?;
+        let drawn_viewport = terminal.get_frame().area();
         // Only the completion menu holds the commit: it floats over the
         // transcript, outside the height budget. The panels — approvals,
         // questions, pickers — are in that budget (plan 104), so what they
         // push off the top belongs in scrollback like anything else; held back,
         // it would be neither on screen nor there (plan 215).
         if app.popup.is_some() {
+            terminal.backend_mut().commit_frame()?;
             return Ok(drawn_viewport);
         }
 
@@ -969,6 +977,8 @@ where
             // inside one handover, so the screen never shows the gap (plan 103).
             if commit_overflow(terminal, app, confirmed_viewport)? {
                 draw_and_hand_over(terminal, app, hud)?;
+            } else {
+                terminal.backend_mut().commit_frame()?;
             }
             Ok(Some(terminal.get_frame().area()))
         })();
@@ -2023,6 +2033,37 @@ mod tests {
             &[finished, rule].concat(),
             "turn closed",
         );
+    }
+
+    /// A tight list has no blank line in it until it ends. Each item settles
+    /// when the next one starts, so a list taller than the screen reaches
+    /// scrollback while it is written instead of losing its top.
+    #[test]
+    fn a_tall_tight_list_reaches_scrollback_item_by_item() {
+        let mut terminal = full_screen(40, 14);
+        let width = 40;
+        let mut app = App::new("stream-list".into());
+        app.running = true;
+        let items: String = (1..=40)
+            .map(|i| format!("- item {i:02} is a short line\n"))
+            .collect();
+        let answer = format!("Files:\n{items}\nDone.\n");
+
+        let frozen = stream_and_check(
+            &mut terminal,
+            &mut app,
+            &[],
+            &answer,
+            (0, answer.len() - "\nDone.\n".len()),
+            4,
+        );
+        assert!(
+            frozen > 20,
+            "the list went to scrollback while it was written"
+        );
+        app.apply(answer_done(&answer));
+        let finished = rows(&crate::markdown::markdown_lines(&answer, width));
+        draw_and_check(&mut terminal, &mut app, &finished, "completed");
     }
 
     /// A code block taller than the screen reaches scrollback line by line

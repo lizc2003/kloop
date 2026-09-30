@@ -274,6 +274,76 @@ async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Res
     Ok(())
 }
 
+/// Scrollback followed by the screen, one string per row, oldest first.
+fn scrollback_and_screen(parser: &mut vt100::Parser, cols: u16) -> Vec<String> {
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let total = parser.screen().scrollback();
+    let mut rows = Vec::new();
+    // Scrolled back by `offset`, the top screen row is that far from the end
+    // of scrollback.
+    for offset in (1..=total).rev() {
+        parser.screen_mut().set_scrollback(offset);
+        rows.push(parser.screen().rows(0, cols).next().unwrap_or_default());
+    }
+    parser.screen_mut().set_scrollback(0);
+    rows.extend(parser.screen().rows(0, cols));
+    rows
+}
+
+/// Plan 215: in every frame the terminal is handed, each line of the answer is
+/// either on screen or in scrollback — replayed frame by frame from the raw
+/// output. A frame drawn before the commit that follows it is clipped at the
+/// top; handed over on its own, the answer's first lines were in neither place
+/// until the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_frame_keeps_each_line_on_screen_or_in_scrollback() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let mut answer = (0..30)
+        .map(|index| format!("LINE-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    answer.push_str("\n\nEVERY_FRAME_TAIL");
+    let fixture = ChatFixture::start(vec![sse_text(&answer)]).await;
+    let (rows, cols) = (14, 80);
+    let mut harness = spawn(&fixture, rows, cols)?;
+    wait_for_boot(&mut harness)?;
+    let mark = harness.raw_mark();
+    one_turn(&mut harness, "go", "EVERY_FRAME_TAIL")?;
+
+    let raw = harness.raw();
+    let mut parser = vt100::Parser::new(rows, cols, 10_000);
+    let mut at = 0;
+    let mut frames = 0;
+    while let Some(end) = find_bytes(&raw, END_SYNCHRONIZED_UPDATE, at) {
+        let end = end + END_SYNCHRONIZED_UPDATE.len();
+        parser.process(&raw[at..end]);
+        at = end;
+        if end <= mark {
+            continue;
+        }
+        let seen: Vec<String> = scrollback_and_screen(&mut parser, cols)
+            .iter()
+            .filter_map(|row| row.find("LINE-").map(|i| row[i..i + 7].to_string()))
+            .collect();
+        let expected: Vec<String> = (0..seen.len())
+            .map(|index| format!("LINE-{index:02}"))
+            .collect();
+        assert_eq!(seen, expected, "the frame ending at byte {end}");
+        frames += 1;
+    }
+    assert!(frames > 0, "the turn was drawn");
+    assert_eq!(
+        scrollback_and_screen(&mut parser, cols)
+            .iter()
+            .filter(|row| row.contains("LINE-"))
+            .count(),
+        30
+    );
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn double_ctrl_c_restores_terminal_modes_without_emergency_kill() -> Result<()> {
     let _guard = PTY_TEST_LOCK.lock().await;
