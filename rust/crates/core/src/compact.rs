@@ -387,19 +387,31 @@ fn canonicalize_summary(raw: &str) -> Result<String> {
     Ok(summary.to_owned())
 }
 
+/// Take the `<summary>` block and drop the `<analysis>` scratchpad. Both tags
+/// are best-effort: the prompt asks for them, but a summary that arrives bare is
+/// still a usable summary, so a missing tag falls through to the raw text rather
+/// than failing the compaction — the alternative is discarding real work over a
+/// formatting slip. An *unpaired* tag is dropped for the same reason: the text
+/// around it is real and the literal tag is not, and a `<summary>` left in front
+/// of the summary puts prompt scaffolding in the model's context — seen once in
+/// five real rewind summaries, where the closing tag was the one that went
+/// missing.
 fn strip_analysis_and_unwrap(raw: &str) -> &str {
     let after_analysis = match (raw.find("<analysis>"), raw.find("</analysis>")) {
         (Some(open), Some(close)) if close > open => &raw[close + "</analysis>".len()..],
         _ => raw,
     };
-    match (
-        after_analysis.find("<summary>"),
-        after_analysis.rfind("</summary>"),
-    ) {
-        (Some(open), Some(close)) if close > open => {
-            &after_analysis[open + "<summary>".len()..close]
-        }
-        _ => after_analysis,
+    let Some(open) = after_analysis.find("<summary>") else {
+        // No opener: a lone closing tag still marks where the summary ended.
+        return match after_analysis.find("</summary>") {
+            Some(close) => &after_analysis[..close],
+            None => after_analysis,
+        };
+    };
+    let body = &after_analysis[open + "<summary>".len()..];
+    match body.rfind("</summary>") {
+        Some(close) => &body[..close],
+        None => body,
     }
 }
 
@@ -895,6 +907,18 @@ mod tests {
         assert_eq!(
             canonicalize_summary("<analysis>notes</analysis>\ntail text").unwrap(),
             "tail text"
+        );
+        // An unpaired <summary> is scaffolding, not content: drop it and keep
+        // the body. Seen in 1 of 5 real rewind summaries (the closing tag was
+        // the half that went missing), so the literal tag must not reach context.
+        assert_eq!(
+            canonicalize_summary("<summary>\nthe real summary").unwrap(),
+            "the real summary"
+        );
+        // A lone closing tag likewise marks where the summary ends.
+        assert_eq!(
+            canonicalize_summary("the real summary\n</summary>").unwrap(),
+            "the real summary"
         );
         // An echoed marker is still stripped after unwrapping.
         let echoed = format!("<summary>{SUMMARY_PREFIX}already prefixed</summary>");
