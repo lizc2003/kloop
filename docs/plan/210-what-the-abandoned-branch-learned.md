@@ -189,10 +189,27 @@ TUI(worker 层,沿用 `clear.rs` rewind 用例的搭法):
 - **`opens_user_turn`**:核过其余 injected(Steering、Scheduled、SubAgent、Hook、Harness…)现在都算 turn
   开头,照 plan 只动 `BranchSummary`。
 
+**措辞真实模型实测(2026-09-30,`sky-bj`/`deepseek-v4.1-flash`,本机默认 provider)**:plan 说
+"没有拿真实模型量过"的那条已补上。现场:临时 HOME + 临时小项目(headless 造一个**两轮**的真实会话——
+第一轮只读;第二轮用 `edit_file` 把 `parse_line` 改名成 `parse_record`,再用 **shell** 往 `CHANGES.txt`
+追加一行,于是运行时清单只认得出 `parser.py` 一个)。pty 驱动脚本按 `Ctrl+R` → `s` 跑 5 次,每次都从
+原始副本恢复会话与工作区,从新分支的会话文件里取摘要。
+
+| 检查项 | 结果 |
+|---|---|
+| 6 节齐全 | 5/5 |
+| 把被放弃的改名写成当前任务/目标/下一步 | **0/5**(5 份都在第 1 节点明"背景,不是当前任务") |
+| 第 5 节点出 shell 改的 `CHANGES.txt` | 5/5 |
+| 编造(对着真实会话逐条核:先败后成的 `edit_file`、并行批次里 bash 照样执行、错误原文、`2 replacement(s)`、`git diff --stat`) | 0 处 |
+
+- 一处瑕疵:5 份里 1 份正文开头漏了一个字面 `<summary>` 标签。这是压缩与分支摘要**共用**的
+  `canonicalize_summary` 行为(只吃成对的标签),不在本 plan 里改。
+- 仍**只是一个小现场**(2 轮、一个文件、一个模型),证据强度同 209:真实模型上自洽,不等于长会话上也对。
+
 **测试**(第五节列的都有,位置有变):core `compact::branch` 八条(请求序列整体断言、压缩过后从第一处
 不同开始、无被放弃段不发请求、正文整体断言含旧会话指针与 usage 落在分支且旧文件不变、文件清单、超长砍旧、
 503 重试一次、断路器不动);`rollout` 一条(分支摘要不是 turn 开头——改规则前它会多出一个以摘要为预览的点,
 已实测);core `rewind` 五条(摘要成功、摘要失败照退并整体断言提示、`Gate` 卡住时取消——删掉清理那行它会红,
 已实测、Drop 不发请求、搬来的 `fork_here`);TUI app 四条(`s` 产出 `Summarize` 且进忙状态、摘要中 Enter
 留草稿 / Esc 中断 / 结束后照常提交、`Forked` 显示标签且不把摘要算作保留、原有两条改成新的 `Command::Fork`),
-render 一条(提示行)。`BRANCH_INSTRUCTION` 的措辞**没有拿真实模型量过**。
+render 一条(提示行)。`BRANCH_INSTRUCTION` 的措辞已用真实模型实测(见上)。
