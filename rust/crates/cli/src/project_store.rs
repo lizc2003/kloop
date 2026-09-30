@@ -590,13 +590,24 @@ mod tests {
                 .env("KLOOP_PROJECT_STORE_CHILD_ROOT", &root)
                 .env("KLOOP_PROJECT_STORE_CHILD_ID", id.as_str())
                 .env("KLOOP_PROJECT_STORE_CHILD_RULE", rule)
+                // Captured, not inherited: the child's own test report would
+                // land in the middle of the parent's.
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
                 .unwrap()
         };
         let first = child("bash(cargo test *)");
         let second = child("write_file(src/**)");
-        assert!(first.wait_with_output().unwrap().status.success());
-        assert!(second.wait_with_output().unwrap().status.success());
+        for child in [first, second] {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "child: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let snapshot = store.load_blocking(&id).unwrap();
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.allow.raw().len(), 2);

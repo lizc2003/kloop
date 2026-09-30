@@ -212,16 +212,24 @@ mod tests {
         }
 
         let root = root("lock-exit");
-        let status = Command::new(std::env::current_exe().unwrap())
+        // Captured, not inherited: the child's own test report would land in
+        // the middle of the parent's and break every count read off it.
+        let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "private_store::tests::abrupt_process_exit_releases_descriptor_lock",
                 "--test-threads=1",
             ])
             .env(CHILD_ROOT, &root)
-            .status()
+            .output()
             .unwrap();
-        assert_eq!(status.code(), Some(17));
+        assert_eq!(
+            output.status.code(),
+            Some(17),
+            "child: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let dir = PrivateDir::open(&root, &[OsStr::new("projects")], "test private store")
             .unwrap()

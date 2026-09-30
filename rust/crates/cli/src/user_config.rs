@@ -488,12 +488,17 @@ max_agents = 3
                 "user_config::tests::private_reads_reject_fifo_without_blocking",
             ])
             .env(CHILD_PATH, &fifo)
+            // Captured, not inherited: the child's own test report would land
+            // in the middle of the parent's. It is a few lines, well under
+            // what a pipe holds, so it cannot block the child.
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        let child_status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
+        let child_output = loop {
+            if child.try_wait().unwrap().is_some() {
+                break child.wait_with_output().unwrap();
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -504,7 +509,12 @@ max_agents = 3
             std::thread::sleep(Duration::from_millis(10));
         };
         let _ = std::fs::remove_dir_all(fifo.parent().unwrap());
-        assert!(child_status.success());
+        assert!(
+            child_output.status.success(),
+            "child: {}{}",
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr)
+        );
     }
 
     #[cfg(unix)]
