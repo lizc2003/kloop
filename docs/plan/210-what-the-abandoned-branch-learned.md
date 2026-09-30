@@ -160,7 +160,7 @@ TUI(worker 层,沿用 `clear.rs` rewind 用例的搭法):
 
 ## 七、完成记录
 
-✅ 2026-09-30(提交号见下一条 `docs(plan210)` 提交)。
+✅ 2026-09-30,`e9bf419`(`feat(plan210): let a rewind summarize the turns it abandons`)。
 
 **第四节四问,都照推荐**:① picker 里多一个键——Enter 照旧直接退回,`s` 先摘要再退回,底部提示把 `s`
 放在第二位(提示按宽度截断,新键不能排在尾巴上);② 只做 TUI 的 Ctrl+R,`--fork` 与 `thread/fork` 不管;
