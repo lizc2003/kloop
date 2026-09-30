@@ -22,6 +22,7 @@ use crate::text_layout::is_grapheme_boundary;
 use crate::text_layout::next_grapheme_boundary;
 use crate::text_layout::previous_grapheme_boundary;
 use crate::text_layout::snap_grapheme_boundary;
+use crate::text_layout::truncate;
 
 const PROMPT: &str = "› ";
 const CONT: &str = "  ";
@@ -29,6 +30,10 @@ const GUTTER_W: usize = 2;
 const MAX_ROWS: usize = 8;
 const PASTE_CHARS: usize = 400;
 const PASTE_LINES: usize = 5;
+/// Display columns of a large paste's first line shown in its label. The
+/// character count alone did not show that a clipboard held only the tail of
+/// what the user meant to copy; the opening words do, before it is sent.
+const PASTE_PREVIEW_COLS: usize = 24;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -264,6 +269,35 @@ fn map_end(offset: ByteOffset, old: TextRange, materialized_end: ByteOffset) -> 
     }
 }
 
+fn paste_label(id: PasteId, text: &str, character_count: usize) -> String {
+    match paste_preview(text) {
+        Some(preview) => format!("[Pasted #{}: {character_count} chars · {preview}]", id.0),
+        None => format!("[Pasted #{}: {character_count} chars]", id.0),
+    }
+}
+
+/// The first non-blank line on one row: whitespace runs become one space and
+/// control characters are dropped, so the label never breaks or styles the row.
+fn paste_preview(text: &str) -> Option<String> {
+    text.lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            if display_width(&line) <= PASTE_PREVIEW_COLS {
+                return line;
+            }
+            let cut = truncate(&line, PASTE_PREVIEW_COLS);
+            let kept = cut.strip_suffix('…').unwrap_or(&cut);
+            format!("{}…", kept.trim_end())
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryEntry {
     document: ComposerDocument,
@@ -444,7 +478,7 @@ impl Composer {
                 .next_paste_id
                 .checked_add(1)
                 .expect("paste id high-water exhausted");
-            let label = format!("[Pasted #{}: {character_count} chars]", id.0);
+            let label = paste_label(id, text, character_count);
             self.cursor = self
                 .document
                 .insert_atom(self.cursor, id, label, text.to_string());
@@ -848,15 +882,48 @@ mod tests {
 
     #[test]
     fn paste_atoms_expand_exactly_once_without_literal_collision() {
-        let mut composer = typed("literal [Pasted #1: 500 chars] ");
         let first = "x".repeat(500);
-        let second = format!("{} tail", "[Pasted #2: 500 chars]");
+        let first_label = format!("[Pasted #1: 500 chars · {}…]", "x".repeat(23));
+        let mut composer = typed(&format!("literal {first_label} "));
         composer.paste(&first);
-        composer.paste(&second.repeat(20));
+        assert_eq!(composer.document.atoms[0].label, first_label);
+        let second = "[Pasted #2: 540 chars · [Pasted #2: 500 chars] t…] tail".repeat(20);
+        composer.paste(&second);
         let submission = composer.submit().unwrap().text;
-        assert!(submission.starts_with("literal [Pasted #1: 500 chars] "));
-        assert!(submission.contains(&first));
-        assert!(submission.ends_with(&second.repeat(20)));
+        assert_eq!(submission, format!("literal {first_label} {first}{second}"));
+    }
+
+    #[test]
+    fn a_large_paste_label_previews_its_first_non_blank_line() {
+        let more = "\nmore".repeat(5);
+        let label_of = |text: &str| {
+            let mut composer = Composer::new();
+            composer.paste(text);
+            composer.text().to_string()
+        };
+        let cases = [
+            // Leading blank lines and indentation are skipped; a wide line is cut
+            // to the preview width, with no space left before the ellipsis.
+            (
+                format!("\n\n  - key 名场景：切点落在 \"api_key\" 中间。{more}"),
+                "- key 名场景：切点落在…",
+            ),
+            (format!("short{more}"), "short"),
+            // A line of only control characters is blank; tabs and runs of
+            // spaces fold to one space, and an escape byte never reaches the row.
+            (
+                format!("\u{7}\n\tfoo\t\tbar\u{1b}[31m  baz{more}"),
+                "foo bar[31m baz",
+            ),
+        ];
+        for (text, preview) in cases {
+            let count = text.chars().count();
+            assert_eq!(
+                label_of(&text),
+                format!("[Pasted #1: {count} chars · {preview}]")
+            );
+        }
+        assert_eq!(label_of(&" ".repeat(500)), "[Pasted #1: 500 chars]");
     }
 
     #[test]

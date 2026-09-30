@@ -1405,7 +1405,11 @@ Alt+char is swallowed rather than typed (word motion is a separate, later
 binding).
 
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
-stable ID. Its `[Pasted #N: M chars]` label is only a projection: submission,
+stable ID. Its `[Pasted #N: M chars · <preview>]` label shows the payload's first
+non-blank line (whitespace folded to single spaces, control characters dropped,
+cut to 24 columns; a whitespace-only paste has no preview) — the count alone let
+a clipboard holding only the tail of the intended selection go out unnoticed.
+The label is only a projection: submission,
 command submission (`/name <paste>` reaches the command — the skill, the
 summarizer — as its content, not as a label), history recall, draft restore,
 and steering expand that exact payload once, while
