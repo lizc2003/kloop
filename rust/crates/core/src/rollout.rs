@@ -485,13 +485,12 @@ impl RolloutLine {
     }
 }
 
-/// Append-only writer for one session file. The file (and its directory) are
-/// created on first append — which is the opening preamble, so the file exists
-/// from the start and its name reserves the session id against a concurrent
-/// process picking the same one. A writer that never gets past that preamble
-/// removes the file again when it is dropped, so starting kloop and quitting
-/// without a word leaves nothing behind. Tracks the id chain: each line's
-/// `parent` is the previous line's id.
+/// Append-only writer for one session file. A new session's file is created
+/// by [`claim_new_session`], which is what reserves its id against a
+/// concurrent process; appending only ever adds to it. A writer that owns its
+/// file and never gets past the opening preamble removes the file again when
+/// it is dropped, so starting kloop and quitting without a word leaves nothing
+/// behind. Tracks the id chain: each line's `parent` is the previous line's id.
 pub struct Rollout {
     path: PathBuf,
     prefix: String,
@@ -524,7 +523,8 @@ impl Drop for Rollout {
 
 impl Rollout {
     /// A fresh fixture session with a complete mock route timeline. Production
-    /// session owners use `new_with_initial_route` once their catalog route is resolved.
+    /// session owners use `claimed_with_initial_route` once their catalog route
+    /// is resolved.
     pub fn new(path: PathBuf) -> Self {
         let mut rollout = Self::with_origin(path, None);
         rollout
@@ -533,7 +533,26 @@ impl Rollout {
         rollout
     }
 
-    pub fn new_with_initial_route(path: PathBuf, route: &FrozenProviderRoute) -> io::Result<Self> {
+    /// A new session on the file [`claim_new_session`] just created. The file
+    /// exists but is this writer's own, so it goes again if nothing past the
+    /// preamble is ever written — including when writing the preamble fails.
+    pub fn claimed_with_initial_route(
+        claim: ClaimedSession,
+        route: &FrozenProviderRoute,
+    ) -> io::Result<Self> {
+        let mut rollout = Self::with_origin(claim.path, None);
+        rollout.preexisting = false;
+        rollout.append_initial_route(route)?;
+        Ok(rollout)
+    }
+
+    /// Test fixtures at a path of their choosing. Nothing claims that path, so
+    /// production code must not start a session this way.
+    #[cfg(test)]
+    pub(crate) fn new_with_initial_route(
+        path: PathBuf,
+        route: &FrozenProviderRoute,
+    ) -> io::Result<Self> {
         let mut rollout = Self::with_origin(path, None);
         rollout.append_initial_route(route)?;
         Ok(rollout)
@@ -1333,9 +1352,20 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
         )));
     }
 
-    let id = new_session_id(sessions_dir);
-    let path = session_path(sessions_dir, &id);
-    let prefix = id_prefix(&path);
+    let claim = claim_new_session(sessions_dir)?;
+    let written =
+        fork_lines(lines, cut, src, claim.path()).and_then(|out| std::fs::write(claim.path(), out));
+    if let Err(error) = written {
+        // The claimed file is this call's own and holds nothing usable.
+        let _ = std::fs::remove_file(claim.path());
+        return Err(error);
+    }
+    Ok(claim.path)
+}
+
+/// The kept prefix, re-enveloped under the fork's own stem.
+fn fork_lines(lines: Vec<RolloutLine>, cut: u64, src: &Path, path: &Path) -> io::Result<String> {
+    let prefix = id_prefix(path);
     let mut parent = Some(format!("{}#{cut}", id_prefix(src)));
     let mut out = String::new();
     for (n, line) in lines
@@ -1416,15 +1446,7 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
         out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
         out.push('\n');
     }
-    std::fs::create_dir_all(sessions_dir)?;
-    // create_new: new_session_id picked an unused id; clobbering an existing
-    // session here would destroy history, so a collision must be an error.
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)?;
-    file.write_all(out.as_bytes())?;
-    Ok(path)
+    Ok(out)
 }
 
 /// A line that begins a fresh user turn: a plain user message (a tool_result
@@ -1848,21 +1870,60 @@ fn tool_use_ids(message: &Message) -> HashSet<String> {
 // Shared by every frontend that manages sessions (cli picker, server
 // thread/start|resume|list), so they live next to the file format.
 
+/// A new session's id, held by having created its file (empty) under that id.
+#[derive(Debug)]
+pub struct ClaimedSession {
+    id: String,
+    path: PathBuf,
+}
+
+impl ClaimedSession {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Session ids are UTC wall-clock timestamps — readable, sortable, and free
 /// of a rand dependency. A collision within one second gets a numeric suffix.
-pub fn new_session_id(sessions_dir: &Path) -> String {
+///
+/// Picking the id and creating its file are one step (`create_new`), because
+/// as two they raced: two processes starting in the same second both saw the
+/// id free, and then a fork failed on `File exists` while two fresh sessions
+/// silently appended into one file — and when both writers had checked
+/// before either wrote, each thought the file its own, so the one that quit
+/// without a word could delete the other's conversation. Now the loser of
+/// the creation moves on to the next suffix.
+pub fn claim_new_session(sessions_dir: &Path) -> io::Result<ClaimedSession> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let base = timestamp_id(secs);
-    let mut id = base.clone();
+    claim_session_from(sessions_dir, &timestamp_id(secs))
+}
+
+fn claim_session_from(sessions_dir: &Path, base: &str) -> io::Result<ClaimedSession> {
+    std::fs::create_dir_all(sessions_dir)?;
+    let mut id = base.to_string();
     let mut n = 2;
-    while session_path(sessions_dir, &id).exists() {
-        id = format!("{base}-{n}");
-        n += 1;
+    loop {
+        let path = session_path(sessions_dir, &id);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(ClaimedSession { id, path }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                id = format!("{base}-{n}");
+                n += 1;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    id
 }
 
 pub(crate) fn timestamp_id(unix_secs: u64) -> String {
@@ -3532,6 +3593,67 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Processes that start in the same second race for one id. Creating the
+    /// file is the claim, so every racer ends up with its own id and its own
+    /// file — under the old "is it free?" check they all got the same one.
+    #[test]
+    fn racing_claims_in_one_second_never_share_an_id() {
+        let path = temp_file("claim-race");
+        let dir = path.parent().unwrap().to_path_buf();
+        let base = "20260930-120000";
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(session_path(&dir, base), b"").unwrap();
+        let racers = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(racers));
+        let handles: Vec<_> = (0..racers)
+            .map(|_| {
+                let (dir, barrier) = (dir.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_session_from(&dir, base).unwrap().id().to_string()
+                })
+            })
+            .collect();
+        let mut ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        ids.sort_by_key(|id| id.rsplit('-').next().unwrap().parse::<u32>().unwrap());
+
+        let expected: Vec<String> = (2..=racers + 1).map(|n| format!("{base}-{n}")).collect();
+        assert_eq!(
+            ids, expected,
+            "the taken base id is skipped, the rest are shared out"
+        );
+        assert!(ids.iter().all(|id| session_path(&dir, id).exists()));
+        cleanup(&path);
+    }
+
+    /// A claimed file is the new session's own: saying nothing still leaves
+    /// nothing behind, and saying something keeps it.
+    #[test]
+    fn a_claimed_session_is_removed_only_while_it_holds_nothing() {
+        let path = temp_file("claimed-owner");
+        let dir = path.parent().unwrap().to_path_buf();
+        let (_, route) = crate::provider_route::ProviderCatalog::from_provider(
+            "mock",
+            kloop_provider::Provider::mock(Vec::new()),
+            "mock",
+            vec!["mock".into()],
+        )
+        .unwrap();
+
+        let claim = claim_new_session(&dir).unwrap();
+        let quiet = claim.path().to_path_buf();
+        drop(Rollout::claimed_with_initial_route(claim, &route).unwrap());
+        assert!(!quiet.exists());
+
+        let claim = claim_new_session(&dir).unwrap();
+        let kept = claim.path().to_path_buf();
+        let mut rollout = Rollout::claimed_with_initial_route(claim, &route).unwrap();
+        rollout.append_message(&Message::user_text("hi")).unwrap();
+        drop(rollout);
+        assert_eq!(load_session_snapshot(&kept).unwrap().messages.len(), 1);
+        cleanup(&path);
+    }
+
     /// One recorded message is enough to keep it: the preamble it was holding
     /// is already in the file, so replay is unaffected.
     #[test]
@@ -3631,7 +3753,7 @@ mod tests {
         // Everything kloop mints must still pass: CLI/server stems and the
         // sub-agent transcripts derived from them.
         for id in [
-            new_session_id(dir).as_str(),
+            claim_new_session(dir).unwrap().id(),
             "20260831-083106",
             "20260831-083106-2",
             "20260831-083106-agent-1",

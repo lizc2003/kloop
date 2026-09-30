@@ -38,9 +38,10 @@ pub async fn start_fresh_session(old: &Config, ui: &Arc<dyn Ui>) -> anyhow::Resu
     let session_id = if old.sessions_dir.as_os_str().is_empty() {
         String::new()
     } else {
-        let id = crate::rollout::new_session_id(&old.sessions_dir);
-        history.attach_rollout(Rollout::new_with_initial_route(
-            crate::rollout::session_path(&old.sessions_dir, &id),
+        let claim = crate::rollout::claim_new_session(&old.sessions_dir)?;
+        let id = claim.id().to_string();
+        history.attach_rollout(Rollout::claimed_with_initial_route(
+            claim,
             &old.provider_route,
         )?);
         id

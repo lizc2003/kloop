@@ -201,4 +201,5 @@ skills,配置加一条不带 matcher 的 `pre_tool` hook(内联 `/bin/sh -c '…
   32k,最大 36.5k,离 65,536 还远。
 - 重放后原会话所在的仓库 `git status` 干净、HEAD 未变，模型要建的 `/tmp` 目录一个都没建;复制出来的配置(带 key)
   已删。
-- 并行起三个 `--fork` 时有两个在同一秒撞了会话 id(`File exists`),错开 3 秒补跑。见 HANDOFF 217 条的"顺带发现"。
+- 并行起三个 `--fork` 时有两个在同一秒撞了会话 id(`File exists`),错开 3 秒补跑。原因是 `new_session_id` 先查后建，
+  新会话那条路撞上时还会两段对话写进同一个文件;已单独修掉(本 plan 之后的 `fix:` 提交，见 HANDOFF 教训 212)。

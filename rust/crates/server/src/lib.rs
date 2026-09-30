@@ -665,23 +665,12 @@ impl Server {
                 format!("cannot create session directory: {e}"),
             )
         })?;
-        let thread_id = rollout::new_session_id(&dirs.sessions);
-        let path = rollout::session_path(&dirs.sessions, &thread_id);
-        // Claim the id atomically before writing the runtime. A timestamp
-        // collision must never truncate another server's session.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                (
-                    wire::SERVER_ERROR,
-                    format!("cannot create session directory: {e}"),
-                )
-            })?;
-        }
-        std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
+        // Claim the id before writing the runtime: a timestamp collision moves
+        // on to the next suffix and never shares another session's file.
+        let claim = rollout::claim_new_session(&dirs.sessions)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot claim session: {e}")))?;
+        let thread_id = claim.id().to_string();
+        let path = claim.path().to_path_buf();
         let runtime = runtime_from_options(&options);
         let rollout = match Rollout::new_with_runtime_pending_route(path.clone(), runtime.clone()) {
             Ok(rollout) => rollout,

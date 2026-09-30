@@ -521,9 +521,11 @@ Consequences worth knowing:
 Every session is persisted to `{project store}/sessions/{id}.jsonl`
 (`crates/core/src/rollout.rs`), one JSON line per recorded message or
 provider-usage record, written through as the history records — so a killed
-process loses at most the line being written. The file appears at startup (its
-name is what reserves the id against a concurrent process picking the same
-timestamp), but a writer that never gets past its opening preamble — the
+process loses at most the line being written. The file appears at startup: it
+is created empty, with create-new, as the one step that picks the id, so a
+concurrent process that picked the same timestamp fails that create and moves
+on to the next suffix instead of sharing the file. A writer that never gets
+past its opening preamble — the
 `session` and `provider_route_initial` lines — **removes the file again when it
 is dropped** (plan 115): launching kloop and quitting without a word leaves no
 session, and cannot beat the last real conversation to `--continue`. Only a file
@@ -652,11 +654,13 @@ Resume replays the file, then makes the history legal and consistent again. Read
 Server and CLI client-supplied session ids are restricted to one safe filename
 component; path separators, traversal forms, absolute paths, control characters
 and symlinked session leaves are rejected before any session file is read or
-written. Server thread creation claims a new JSONL with an atomic create-new
-operation, so a timestamp collision cannot truncate an existing transcript.
+written. Every new session — CLI start, `/clear`, a fork, a server thread —
+claims its JSONL with that same create-new step, so a timestamp collision can
+neither truncate nor share an existing transcript.
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
-dependency); `--resume` picks the most recently modified session, `--resume
+dependency; a second session in the same second gets `-2`, then `-3`);
+`--resume` picks the most recently modified session, `--resume
 <id>` a specific one, `--list-sessions` shows this project's sessions and
 `--list-sessions --all` every project's.
 

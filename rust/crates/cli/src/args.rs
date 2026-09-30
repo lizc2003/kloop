@@ -19,16 +19,15 @@ use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionDigest;
 use kloop_core::rollout::SessionOrigin;
 use kloop_core::rollout::checked_session_path;
+use kloop_core::rollout::claim_new_session;
 use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
 use kloop_core::rollout::load_session;
-use kloop_core::rollout::new_session_id;
 use kloop_core::rollout::resume_session;
 use kloop_core::rollout::session_digest;
 use kloop_core::rollout::session_id_of;
 use kloop_core::rollout::session_origin;
-use kloop_core::rollout::session_path;
 use kloop_core::rollout::sessions_by_recency;
 use kloop_core::session_store::ProjectBucket;
 use kloop_core::session_store::SessionDirs;
@@ -556,12 +555,10 @@ pub(crate) fn open_history(
     let offload_dir = dirs.offload.clone();
     let resume_path = match choice {
         SessionChoice::New => {
-            let id = new_session_id(sessions_dir);
+            let claim = claim_new_session(sessions_dir)?;
+            let id = claim.id().to_string();
             let mut history = History::new(offload_dir);
-            history.attach_rollout(Rollout::new_with_initial_route(
-                session_path(sessions_dir, &id),
-                initial_route,
-            )?);
+            history.attach_rollout(Rollout::claimed_with_initial_route(claim, initial_route)?);
             return Ok(Some((history, id)));
         }
         SessionChoice::Resume(id) => session_in_this_project(store, dirs, id)?,
