@@ -19,12 +19,16 @@ use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 
 mod anchors;
+mod branch;
 mod restore;
 
 #[cfg(test)]
 mod plan203_acceptance_tests;
 
 use anchors::UserAnchors;
+pub use branch::BRANCH_SUMMARY_PREFIX;
+pub use branch::BranchSummary;
+pub use branch::summarize_abandoned_branch;
 
 /// Cap on how much of the output limit the growth estimate reserves.
 const OUTPUT_GROWTH_CAP: u64 = 20_000;
@@ -466,46 +470,22 @@ pub(crate) async fn compact_once(
     };
     request_plan.request.push(summary_instruction(focus));
 
-    // The summary request can itself be too large — that is how a turn used to
-    // die outright: sampling overflows, compaction is asked to rescue it, and
-    // compaction sends nearly the same history. On a size rejection, drop the
-    // oldest slice of what we were going to summarize and try again; the tail is
-    // already held verbatim, so the summary should abut it. Losing the oldest
-    // context beats losing the turn — provided the loss is announced.
-    let mut dropped = 0usize;
-    let (summary, usage) = loop {
-        let projected_request = history
-            .provider_request_view_for(&request_plan.request, provider_attempt)
-            .map_err(anyhow::Error::new)?;
-        match sample_summary_with_retry(
-            provider_attempt,
-            cfg.cache_key(),
-            &projected_request,
-            cancel,
-        )
-        .await
-        {
-            Ok(ok) => break ok,
-            Err(error) if is_overflow(&error) && request_plan.request.len() > 2 => {
-                // A rejection is the only true reading we get of the real limit;
-                // record it so the predictive threshold stops walking into it.
-                let refused: u64 = request_plan
-                    .request
-                    .iter()
-                    .map(crate::history::estimate_message_tokens)
-                    .sum();
-                history.note_overflow_at(refused);
-                let just_dropped = shrink_to_newest(&mut request_plan.request, refused / 2);
-                if just_dropped == 0 {
-                    return Err(error.context("summary request too large to shrink further"));
-                }
-                dropped += just_dropped;
-                request_plan.summarized = request_plan.summarized.saturating_sub(just_dropped);
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    let summary = canonicalize_summary(&summary)?;
+    // The tail is already held verbatim, so a summary that had to shed its
+    // oldest slice still abuts it. Losing the oldest context beats losing the
+    // turn — provided the loss is announced.
+    let SampledSummary {
+        summary,
+        usage,
+        dropped,
+    } = sample_shrinking(
+        history,
+        provider_attempt,
+        cfg.cache_key(),
+        &mut request_plan.request,
+        cancel,
+    )
+    .await?;
+    request_plan.summarized = request_plan.summarized.saturating_sub(dropped);
     let pointer = transcript_pointer(cfg);
     // The folded tool results are gone from the context, so the file lines they
     // carried are not in front of the model either — reading those lines again
@@ -552,6 +532,62 @@ pub(crate) async fn compact_once(
         model: provider_attempt.model().to_string(),
         trigger,
     }))
+}
+
+/// A summary request's answer, canonicalized, and how many of the request's
+/// oldest messages had to be dropped unsummarized to get it.
+pub(crate) struct SampledSummary {
+    pub summary: String,
+    pub usage: Option<Usage>,
+    pub dropped: usize,
+}
+
+/// Send `request` — the messages to summarize, then the instruction — under
+/// [`COMPACT_SYSTEM`], with the transient retries of a sampling round. The
+/// request can itself be too large — that is how a turn used to die outright:
+/// sampling overflows, compaction is asked to rescue it, and compaction sends
+/// nearly the same history. On a size rejection the oldest slice is dropped
+/// and the request tried again; the instruction is last, so it is never the
+/// one dropped. Every summary request goes through here, compaction's and a
+/// rewind's alike.
+pub(crate) async fn sample_shrinking(
+    history: &mut History,
+    provider_attempt: &FrozenProviderAttempt,
+    cache_key: Option<&str>,
+    request: &mut Vec<Message>,
+    cancel: &CancellationToken,
+) -> Result<SampledSummary> {
+    let mut dropped = 0usize;
+    let (summary, usage) = loop {
+        let projected_request = history
+            .provider_request_view_for(request, provider_attempt)
+            .map_err(anyhow::Error::new)?;
+        match sample_summary_with_retry(provider_attempt, cache_key, &projected_request, cancel)
+            .await
+        {
+            Ok(ok) => break ok,
+            Err(error) if is_overflow(&error) && request.len() > 2 => {
+                // A rejection is the only true reading we get of the real limit;
+                // record it so the predictive threshold stops walking into it.
+                let refused: u64 = request
+                    .iter()
+                    .map(crate::history::estimate_message_tokens)
+                    .sum();
+                history.note_overflow_at(refused);
+                let just_dropped = shrink_to_newest(request, refused / 2);
+                if just_dropped == 0 {
+                    return Err(error.context("summary request too large to shrink further"));
+                }
+                dropped += just_dropped;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(SampledSummary {
+        summary: canonicalize_summary(&summary)?,
+        usage,
+        dropped,
+    })
 }
 
 /// Restored files may take a quarter of the window the replacement leaves.

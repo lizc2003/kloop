@@ -59,11 +59,10 @@ use kloop_core::inbox::Inbox;
 use kloop_core::inbox::InboxItem;
 use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
+use kloop_core::rewind::AbandonedBranch;
+use kloop_core::rewind::RewindOutcome;
 use kloop_core::rollout::fork_points;
 
-use kloop_core::rollout::fork_session;
-use kloop_core::rollout::inspect_session;
-use kloop_core::rollout::session_id_of;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Message;
 pub use session_picker::SessionEntry;
@@ -114,9 +113,12 @@ enum WorkerMsg {
     ListForkPoints,
     /// Rewind History onto the fork cut at `seq`: fork the session file, swap
     /// History to the branch, and reply with a `Forked` event carrying its
-    /// messages and id.
+    /// messages and id. `cancel` stops a summarizing rewind before anything
+    /// is swapped.
     Fork {
         seq: u64,
+        abandoned: AbandonedBranch,
+        cancel: CancellationToken,
     },
 }
 
@@ -549,9 +551,15 @@ async fn agent_worker(
                     return;
                 }
             }
-            WorkerMsg::Fork { seq } => {
+            WorkerMsg::Fork {
+                seq,
+                abandoned,
+                cancel,
+            } => {
                 if !rewind(
                     seq,
+                    abandoned,
+                    &cancel,
                     &mut cfg,
                     &mut history,
                     &mut provider_state,
@@ -560,6 +568,18 @@ async fn agent_worker(
                     &events,
                 )
                 .await
+                {
+                    return;
+                }
+                // Only a summarizing rewind made the UI busy.
+                let busy = match abandoned {
+                    AbandonedBranch::Drop => false,
+                    AbandonedBranch::Summarize => true,
+                };
+                if busy
+                    && events
+                        .send(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)))
+                        .is_err()
                 {
                     return;
                 }
@@ -572,8 +592,11 @@ async fn agent_worker(
 /// runs as a new session — new id, new session state — exactly like `/clear`,
 /// except that History keeps the branch's messages. `false` means the UI loop
 /// is gone.
+#[allow(clippy::too_many_arguments)]
 async fn rewind(
     seq: u64,
+    abandoned: AbandonedBranch,
+    cancel: &CancellationToken,
     cfg: &mut Arc<Config>,
     history: &mut History,
     provider_state: &mut kloop_core::provider_route::SessionProviderState,
@@ -581,46 +604,24 @@ async fn rewind(
     ui: &Arc<dyn Ui>,
     events: &mpsc::UnboundedSender<AgentEvent>,
 ) -> bool {
-    // A failed rewind leaves History and the session untouched; report and
-    // carry on the original branch.
-    let (session_id, resumed) = match fork_here(history, seq) {
-        Ok(forked) => forked,
-        Err(e) => {
+    // A failed or cancelled rewind leaves History and the session untouched;
+    // report and carry on the original branch.
+    let rewound = match kloop_core::rewind::rewind(cfg, history, seq, abandoned, ui, cancel).await {
+        Ok(RewindOutcome::Rewound(rewound)) => rewound,
+        Ok(RewindOutcome::Cancelled) => {
             return events
-                .send(AgentEvent::System(format!("rewind failed: {e}")))
+                .send(AgentEvent::System(
+                    "rewind cancelled — still on the same session".into(),
+                ))
                 .is_ok();
         }
-    };
-    let (fresh, report) = match kloop_core::commands::replace_session(cfg, session_id, ui).await {
-        Ok(replaced) => replaced,
         Err(e) => {
             return events
                 .send(AgentEvent::System(format!("rewind failed: {e:#}")))
                 .is_ok();
         }
     };
-    let messages = resumed.messages.clone();
-    history.rebase(resumed);
-    // A rewind does not change who is using the session, so the route it is
-    // running on right now — `/provider` included — carries onto the branch,
-    // and the cut's own route is not restored. Adopting writes to the forked
-    // rollout, so it runs after the rebase.
-    let mut notes = Vec::new();
-    *cfg = match history.adopt_provider_route(&cfg.provider_route) {
-        Ok((route, reopened)) => {
-            if let Some(reopened) = reopened {
-                notes.push(format!("rewind: {reopened}"));
-            }
-            Arc::new(fresh.clone_with_provider_route(route))
-        }
-        Err(error) => {
-            notes.push(format!(
-                "rewind landed on the new branch but its provider route \
-                 could not be adopted: {error}"
-            ));
-            Arc::new(fresh)
-        }
-    };
+    *cfg = Arc::new(rewound.cfg);
     *provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
         Arc::clone(&cfg.provider_catalog),
         history.provider_routes(),
@@ -628,34 +629,16 @@ async fn rewind(
     .expect("rewound provider timeline was validated on recovery");
     *current.lock().unwrap() = Arc::clone(cfg);
     let forked = AgentEvent::Forked {
-        session: session_switch(cfg, report),
-        messages,
+        session: session_switch(cfg, rewound.report),
+        messages: history.messages().to_vec(),
     };
     if events.send(forked).is_err() {
         return false;
     }
-    notes
+    rewound
+        .notes
         .into_iter()
         .all(|note| events.send(AgentEvent::System(note)).is_ok())
-}
-
-/// Fork the live session at `seq` and load the branch: the new id, its messages,
-/// and a rollout writer pointed at the fork file. The session's own directory is
-/// the sessions dir (branches are siblings). Errors if the history isn't backed
-/// by a file or the fork/reload fails.
-fn fork_here(
-    history: &History,
-    seq: u64,
-) -> std::io::Result<(String, kloop_core::rollout::ResumedSession)> {
-    let src = history.rollout_path().ok_or_else(|| {
-        std::io::Error::other("this session is not being saved, so it cannot be rewound")
-    })?;
-    let sessions_dir = src
-        .parent()
-        .ok_or_else(|| std::io::Error::other("session file has no parent directory"))?;
-    let fork_path = fork_session(src, Some(seq), sessions_dir)?;
-    let resumed = inspect_session(&fork_path)?.recover()?;
-    Ok((session_id_of(&fork_path), resumed))
 }
 
 type Terminal = ratatui::Terminal<
@@ -1209,8 +1192,14 @@ impl UiState {
                 // and replies with a ForkPoints event.
                 let _ = self.msgs.send(WorkerMsg::ListForkPoints);
             }
-            Command::Fork(seq) => {
-                let _ = self.msgs.send(WorkerMsg::Fork { seq });
+            Command::Fork { seq, abandoned } => {
+                let cancel = CancellationToken::new();
+                self.current_cancel = Some(cancel.clone());
+                let _ = self.msgs.send(WorkerMsg::Fork {
+                    seq,
+                    abandoned,
+                    cancel,
+                });
             }
             Command::Interrupt => {
                 if let Some(cancel) = &self.current_cancel {
@@ -1438,8 +1427,6 @@ mod tests {
     use ratatui::layout::Size;
 
     use super::*;
-    use kloop_core::rollout::Rollout;
-    use kloop_protocol::ContentBlock;
 
     struct StagedSizeBackend {
         inner: TestBackend,
@@ -1525,41 +1512,6 @@ mod tests {
         fn flush(&mut self) -> std::result::Result<(), Self::Error> {
             self.inner.flush()
         }
-    }
-
-    /// The worker's rewind primitive: fork the live session's file at a cut,
-    /// derive the sessions dir from the rollout path, and hand back the branch's
-    /// id and truncated messages (which `rebase` then installs).
-    #[test]
-    fn fork_here_branches_the_live_session_at_a_cut() {
-        let dir = std::env::temp_dir().join(format!("kloop-tui-forkhere-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let session = dir.join("session.jsonl");
-        let mut history = History::new(dir.clone());
-        history.attach_rollout(Rollout::new(session.clone()));
-        history.record(Message::user_text("one"));
-        history.record(Message::assistant(vec![ContentBlock::Text {
-            text: "done".into(),
-        }]));
-        history.record(Message::user_text("two"));
-        history.record(Message::assistant(vec![ContentBlock::Text {
-            text: "bye".into(),
-        }]));
-
-        // Route receipt + two messages keeps the first turn only.
-        let (id, resumed) = fork_here(&history, 3).unwrap();
-        assert_ne!(id, "session");
-        assert_eq!(
-            resumed.messages,
-            vec![
-                Message::user_text("one"),
-                Message::assistant(vec![ContentBlock::Text {
-                    text: "done".into(),
-                }]),
-            ]
-        );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn snapshot(revision: u64, todos: usize) -> kloop_core::tools::TodoSnapshot {

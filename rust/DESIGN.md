@@ -322,7 +322,7 @@ fork:
   (413) is deliberately not an overflow: it is the body's byte size, which
   token-based trimming may not shrink, so it stays an ordinary fatal failure.
 
-Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary — eleven sections, with an `<analysis>` scratchpad the canonicalizer drops before the summary reaches context, plus a pointer to the session transcript so a dropped detail can be fetched instead of re-derived — canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a recent tail verbatim (`KEEP_RECENT_TOKENS`) (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. The replacement is `[UserAnchors?, DroppedPrefix?, ContextSummary, RestoredFiles?, tail…]`, and **only the summary is the model's** (plan 203). `UserAnchors` is the user's own words from every folded prefix so far — the original request (≤4,000 chars, head and tail kept) and later messages (≤2,000 chars each, 4,096 estimated tokens filled newest first, the rest counted as omitted) — copied by the runtime and inherited only from the previous generation's anchors, whose fixed format it parses back; it never reads the summary text. Asking the model to quote the user was not a guarantee: each compaction re-summarizes the previous summary, and by the third generation an early "do not do X" had been paraphrased away. So the prompt's user-message section now asks only how intent changed. "The user's words" means `injected` is `None` or `Steering` and no tool result: sub-agent results, scheduled prompts, peer messages, hook stdout (`Injected::Hook`) and harness reminders or recovery nudges (`Injected::Harness`) are not. The user's messages still in the kept tail are not repeated. `RestoredFiles` is the heads of up to five files last read (`read_file` tool uses in the folded prefix, newest first, deduplicated; paths the tail reads again, notebooks, missing, non-text and deny/sensitive paths skipped): 12,000 chars each with `read_file`'s own continuation line, 40,000 in total and at most a quarter of the window the replacement leaves. They are read through the real `read_file` dispatch on `ToolCtx::harness`, so the permission gate applies and the read leaves the same `FileState` observation a model read does: the file is editable at once, plan 197's changed-read reminder covers it afterwards, and its lines count as in context (so `forget_context_reads` now runs *before* these reads rather than after the replacement). Each file is sized from disk before its read, since a read whose lines are then left out would register lines the model does not have. It is written into the replacement and persisted with the `Compacted` line rather than injected fresh on each request, unlike chord: the per-request injection sits at the head of the prompt, where content re-read from disk would break the prompt cache from the first byte whenever a file changed; written once, it is byte-stable and identical after resume, and staleness is plan 197's job. Planning skips every leading compaction product (`fold_start`), and anchors are taken before an overflow shrinks the summary request, so what the user said survives even a dropped prefix. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. A summary request that is itself rejected as too large — the case that used to end the turn, since reactive compaction resends nearly the whole history — drops the oldest slice of what it was going to summarize and retries; the abandoned messages are announced by a `DROPPED_PREFIX` marker at the head of the rebuilt history, and the size that was refused becomes a ceiling on the planning window for the rest of the session (a configured window is a claim, a rejection is a measurement). Any other retryable provider failure on the summary request is retried with the sampling round's own backoff and `Retry-After` (`MAX_ATTEMPTS`, `retry_delay`) — nothing is shown before the summary is complete, so a retry replays nothing — which is what makes the breaker above count real failures, not one 5xx. Failed or cancelled summary requests otherwise leave history untouched. A manual `/compact <focus>` appends the user's focus to the closing instruction and changes nothing else about the request (see `/compact` under slash commands); the automatic triggers never carry one.
+Compaction itself uses one internal seam for predictive admission, reactive overflow recovery, and manual `/compact`. It asks the model for a stable handoff summary — eleven sections, with an `<analysis>` scratchpad the canonicalizer drops before the summary reaches context, plus a pointer to the session transcript so a dropped detail can be fetched instead of re-derived — canonicalizes the result to one summary marker (replacing an older summary rather than stacking markers), keeps a recent tail verbatim (`KEEP_RECENT_TOKENS`) (never splitting a tool_use/tool_result pair at the boundary), and replaces the rest — the one sanctioned rewrite of the append-only history. The replacement is `[UserAnchors?, DroppedPrefix?, ContextSummary, RestoredFiles?, tail…]`, and **only the summary is the model's** (plan 203). `UserAnchors` is the user's own words from every folded prefix so far — the original request (≤4,000 chars, head and tail kept) and later messages (≤2,000 chars each, 4,096 estimated tokens filled newest first, the rest counted as omitted) — copied by the runtime and inherited only from the previous generation's anchors, whose fixed format it parses back; it never reads the summary text. Asking the model to quote the user was not a guarantee: each compaction re-summarizes the previous summary, and by the third generation an early "do not do X" had been paraphrased away. So the prompt's user-message section now asks only how intent changed. "The user's words" means `injected` is `None` or `Steering` and no tool result: sub-agent results, scheduled prompts, peer messages, hook stdout (`Injected::Hook`) and harness reminders or recovery nudges (`Injected::Harness`) are not. The user's messages still in the kept tail are not repeated. `RestoredFiles` is the heads of up to five files last read (`read_file` tool uses in the folded prefix, newest first, deduplicated; paths the tail reads again, notebooks, missing, non-text and deny/sensitive paths skipped): 12,000 chars each with `read_file`'s own continuation line, 40,000 in total and at most a quarter of the window the replacement leaves. They are read through the real `read_file` dispatch on `ToolCtx::harness`, so the permission gate applies and the read leaves the same `FileState` observation a model read does: the file is editable at once, plan 197's changed-read reminder covers it afterwards, and its lines count as in context (so `forget_context_reads` now runs *before* these reads rather than after the replacement). Each file is sized from disk before its read, since a read whose lines are then left out would register lines the model does not have. It is written into the replacement and persisted with the `Compacted` line rather than injected fresh on each request, unlike chord: the per-request injection sits at the head of the prompt, where content re-read from disk would break the prompt cache from the first byte whenever a file changed; written once, it is byte-stable and identical after resume, and staleness is plan 197's job. Planning skips every leading compaction product (`fold_start`), and anchors are taken before an overflow shrinks the summary request, so what the user said survives even a dropped prefix. If an existing summary has no newly foldable messages, compaction is a no-op: it does not call the provider or mutate history, usage, or rollout. A successful summary response with provider usage also enters the durable usage ledger before the compacted marker; compaction rewrites provider history, not the transcript's accumulated provider facts. Context-pressure admission uses the resettable estimate/anchor, while the ledger remains historical accounting; they are separate. A summary request that is itself rejected as too large — the case that used to end the turn, since reactive compaction resends nearly the whole history — drops the oldest slice of what it was going to summarize and retries; the abandoned messages are announced by a `DROPPED_PREFIX` marker at the head of the rebuilt history, and the size that was refused becomes a ceiling on the planning window for the rest of the session (a configured window is a claim, a rejection is a measurement). Any other retryable provider failure on the summary request is retried with the sampling round's own backoff and `Retry-After` (`MAX_ATTEMPTS`, `retry_delay`) — nothing is shown before the summary is complete, so a retry replays nothing — which is what makes the breaker above count real failures, not one 5xx. Failed or cancelled summary requests otherwise leave history untouched. A manual `/compact <focus>` appends the user's focus to the closing instruction and changes nothing else about the request (see `/compact` under slash commands); the automatic triggers never carry one. The request half — send, shrink on overflow, retry, canonicalize (`sample_shrinking`) — is also what a summarizing rewind sends its abandoned turns through (see **Fork (and rewind)**).
 
 The usable window is decided by two different kinds of statement. What the model
 can take is a **fact** about the model, written once in its own `[models."<id>"]`
@@ -751,9 +751,10 @@ codex's `thread/fork` both copy, neither replays across files):
   on a fork unchanged and forks can be forked again. `--list-sessions`
   shows the lineage as `[forked from {source}#{seq}]`;
 - a cut is legal only where the kept prefix ends a complete exchange (the
-  next line must start a fresh user turn — cc's `/rewind` whitelist rule),
-  which makes splitting a tool_use/tool_result pair impossible by
-  construction; an illegal cut lists the legal points near it;
+  next line must start a fresh user turn — cc's `/rewind` whitelist rule;
+  a rewind's branch summary, below, is not one), which makes splitting a
+  tool_use/tool_result pair impossible by construction; an illegal cut
+  lists the legal points near it;
 - a compacted marker inside the prefix replays as usual; a cut at a legal
   point *before* one forks the raw pre-compaction history, which never
   left the file;
@@ -782,10 +783,40 @@ beyond the file name: the compaction summary's transcript pointer, the prompt
 cache key, sub-agent file names and the scheduler's owner all read it, and
 before plan 205 a rewind left them on the parent. The fresh file observations
 mean a file read before the cut must be read again before it is edited. The
-next message continues the new branch (the old one stays on disk,
-forkable/resumable). Esc cancels. The picker's points are exactly the cuts
-`fork_session` accepts, so a selection can never be rejected. Rewind is
-idle-only — a running turn owns History (Ctrl+C first).
+next message continues the new branch; the old one stays on disk,
+forkable/resumable, and holds the abandoned turns in full. Esc cancels. The
+picker's points are exactly the cuts `fork_session` accepts, so a selection can
+never be rejected. Rewind is idle-only — a running turn owns History (Ctrl+C
+first). The orchestration lives in core (`rewind::rewind`) and the TUI swaps
+in the Config and History it hands back — the split `/clear` has.
+
+**A rewind does not undo anything on disk** — kloop keeps no file snapshots.
+The files the abandoned turns changed stay changed while the branch's model
+remembers the workspace as it was at the cut, and its fresh `FileState` means
+plan 197's changed-file reminder does not fire for them either. Pressing `s`
+instead of Enter (plan 210) closes that gap for the price of one request:
+before anything is swapped, what the live History has past its longest common
+prefix with the branch — by content, so after a compaction the summary and
+anchors go out too, repeating a little of what the branch holds — is
+summarized through compaction's request path (same system prompt, no tools,
+shrink on overflow, transient retry; like `/compact`, the compaction breaker
+is neither consulted nor charged), under an instruction that the abandoned
+requests are not current ones — a rewind is so often the user retracting one.
+The runtime then appends the files the abandoned turns wrote with
+`edit_file`/`write_file`/`notebook_edit` (calls that did not fail; what a
+shell command wrote is the summary's to name) and the *old* session's
+transcript pointer, and records it on the branch as one
+`Injected::BranchSummary` message, with its usage
+(`UsageOperation::BranchSummary`) on the branch's ledger. Files only read are
+not listed: the branch has to read them again anyway. The summary is not a
+turn, so the branch's next rewind point is the user's next message and
+rewinding there keeps it. The wait is busy like a slash command: Esc cancels
+the whole rewind (the branch file just forked is deleted, nothing else
+changed; Enter is the way to rewind without a summary), and Enter keeps the
+draft rather than steering it into the session being left. A failed summary
+does not stop the rewind: it lands without one, and a note names the old
+session file. `--fork` and `thread/fork` do not offer it — they abandon
+nothing, since the source stays resumable.
 
 ### Sub-agent sessions
 
@@ -1491,8 +1522,10 @@ not necessarily the user talking — the inbox reinjects sub-agent results,
 background program/workflow/shell reports, scheduled prompts and peer messages as
 user text so the model folds them in, hook stdout and harness reminders
 (todos, changed reads, truncation/stream-resume/structured-output nudges) ride
-the same way, and compaction swaps a folded prefix for its runtime-written
-anchors, a summary marker and restored files. So the **producer records what it made**:
+the same way, compaction swaps a folded prefix for its runtime-written
+anchors, a summary marker and restored files, and a summarizing rewind opens
+its branch with what the dropped turns learned (`BranchSummary`). So the
+**producer records what it made**:
 `Message.injected` carries a `kloop_protocol::Injected` kind (internal, like
 `provider_provenance` — adapters build request wire field by field, so it never
 reaches a provider), and replay reads that. Steering gives back what the user

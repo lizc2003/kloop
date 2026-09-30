@@ -1452,7 +1452,8 @@ fn fork_panel(picker: &ForkPicker) -> choice::Panel {
             .collect(),
         cursor: picker.cursor,
         prompt: Some("Rewind the conversation to which point?".to_string()),
-        hint: "Enter rewind · ↑↓ move · 1-9 pick · Esc cancel".to_string(),
+        hint: "Enter rewind · s summarize, then rewind · ↑↓ move · 1-9 pick · Esc cancel"
+            .to_string(),
         ..choice::Panel::default()
     }
 }
@@ -2462,9 +2463,9 @@ mod tests {
             ],
             cursor: 1,
         });
-        let panel = active_panel(&app, 60).expect("the picker owns the keyboard");
+        let panel = active_panel(&app, 80).expect("the picker owns the keyboard");
         assert_eq!(
-            choice::panel_lines(&panel, 60, 30, 0)
+            choice::panel_lines(&panel, 80, 30, 0)
                 .lines
                 .iter()
                 .map(line_text)
@@ -2479,7 +2480,7 @@ mod tests {
                 "> 2. add the panel",
                 "     #7",
                 "",
-                "Enter rewind · ↑↓ move · 1-9 pick · Esc cancel",
+                "Enter rewind · s summarize, then rewind · ↑↓ move · 1-9 pick · Esc cancel",
             ]
         );
     }

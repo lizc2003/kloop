@@ -38,6 +38,7 @@ use crate::usage::{ProviderUsageRecord, UsageLedger};
 use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::IncompleteReason;
+use kloop_protocol::Injected;
 use kloop_protocol::Message;
 use kloop_protocol::ProviderRouteReceipt;
 use kloop_protocol::ProviderRouteSource;
@@ -1453,10 +1454,15 @@ fn fork_lines(lines: Vec<RolloutLine>, cut: u64, src: &Path, path: &Path) -> io:
 /// carrier is the tail of the previous turn, not a new one). This is the cut
 /// boundary both `legal_cut_seqs` and `fork_points` key off, so a fork point
 /// the picker offers is always one `fork_session` will accept.
+///
+/// A rewind's branch summary is not one: it opens the branch, and the user's
+/// next message is the turn. Rewinding to that turn keeps the summary, and
+/// the picker previews what the user said rather than the summary's framing.
 fn opens_user_turn(line: &RolloutLine) -> bool {
     match line {
         RolloutLine::Message { message, .. } => {
             message.role == Role::User
+                && message.injected != Some(Injected::BranchSummary)
                 && !message
                     .content
                     .iter()
@@ -3006,6 +3012,34 @@ mod tests {
             }]))
             .unwrap();
         assert!(fork_points(&path).unwrap().is_empty());
+        cleanup(&path);
+    }
+
+    /// A rewind's summary opens its branch but is not a turn: the user's next
+    /// message is, so rewinding there keeps the summary, and the picker shows
+    /// what the user said rather than the summary's framing.
+    #[test]
+    fn a_branch_summary_is_not_a_turn_the_picker_offers() {
+        let path = temp_file("forkpointsbranch");
+        let mut rollout = Rollout::new(path.clone());
+        for m in [
+            Message::user_text("start"),
+            Message::assistant(vec![ContentBlock::Text { text: "ok".into() }]),
+            Message::injected(Injected::BranchSummary, "[rewound] what was learned"),
+            Message::user_text("a different way"),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "done".into(),
+            }]),
+        ] {
+            rollout.append_message(&m).unwrap();
+        }
+        assert_eq!(
+            fork_points(&path).unwrap(),
+            vec![ForkPoint {
+                seq: 4,
+                preview: "a different way".into(),
+            }]
+        );
         cleanup(&path);
     }
 

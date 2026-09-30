@@ -157,3 +157,42 @@ TUI(worker 层,沿用 `clear.rs` rewind 用例的搭法):
 - 本文件补 ✅、提交号与开工问答结果。
 - 若这是 pi 候选里最后一条落地的,按 `refs/README.md` pi 一节的约定考虑退休 `refs/pi` 本地 clone(确认 HEAD
   仍是 `d5629e2`、工作树干净)。
+
+## 七、完成记录
+
+✅ 2026-09-30(提交号见下一条 `docs(plan210)` 提交)。
+
+**第四节四问,都照推荐**:① picker 里多一个键——Enter 照旧直接退回,`s` 先摘要再退回,底部提示把 `s`
+放在第二位(提示按宽度截断,新键不能排在尾巴上);② 只做 TUI 的 Ctrl+R,`--fork` 与 `thread/fork` 不管;
+③ 运行时清单只列改过的文件;④ 第一版不做带指示的摘要。
+
+**与 plan 的出入**:
+
+- **顺序**:2.3 写"先摘要(什么都还没动)→ fork",做不到——2.1 的被放弃段是 live 与 **fork 出来的消息**
+  的公共前缀之后,不 fork 算不出来。改成 fork(只多一个本次认领的新文件)→ 摘要 → 取消就删掉它 →
+  `replace_session` → `rebase` → 接路由 → 记摘要与 usage。"取消后不留新会话文件"照样成立(教训 214)。
+- **编排挪进 core**:第五节的 worker 级测试在 TUI crate 里写不出来(造不出带 mock provider 的 `Config`)。
+  fork、摘要、取消清理、`replace_session`、`rebase`、接路由都搬进新的 `core/src/rewind.rs`(`rewind::rewind`,
+  `AbandonedBranch` 也在那里),TUI 的 `rewind` 只剩换 `Config`、重建 provider 状态、发事件。`fork_here`
+  和它的测试一起搬过去。和 `/clear` 的 `start_fresh_session` 是同一种分法。
+- **文件清单多一个工具、少一类调用**:`notebook_edit`(`notebook_path`)同样能确定认出路径,一并列;
+  结果是 `is_error` 的调用不列——这几个工具要么全写要么不写,列一个没动过的文件等于让模型白读一遍。
+- **摘要被截短时要说出来**:请求超长砍掉最旧几条时,正文开头多一句"最旧的 N 条没进摘要"——plan 没写,
+  但压缩那边"丢了就要说"是同一条纪律。
+- **摘要进行中 Enter 不 steer**:plan 没提。忙状态下 Enter 本来是 steering,会进即将被换掉的旧会话的
+  inbox、然后被 `Forked` 的重建冲掉,两头都看不见。改为草稿留在输入框,落到新分支后再发。
+- **"rewound — N message(s) kept"不数摘要**:它是新分支上新加的,不是保留下来的。
+- **`/cost` 分不出这笔钱**:plan 说加 `UsageOperation::BranchSummary` 后"`/cost` 能分清",其实 `/cost`
+  只按 provider/model 分组,operation 只落在 rollout 里。没扩 `/cost`,记在 HANDOFF。
+- **报错文案**:摘要失败的提示里是抽出来的公共路径原有的 "compaction request failed: …"。为守住第五节
+  "压缩现有用例不改断言",没改成"summary request";读起来略怪,但不误导。
+- **`opens_user_turn`**:核过其余 injected(Steering、Scheduled、SubAgent、Hook、Harness…)现在都算 turn
+  开头,照 plan 只动 `BranchSummary`。
+
+**测试**(第五节列的都有,位置有变):core `compact::branch` 八条(请求序列整体断言、压缩过后从第一处
+不同开始、无被放弃段不发请求、正文整体断言含旧会话指针与 usage 落在分支且旧文件不变、文件清单、超长砍旧、
+503 重试一次、断路器不动);`rollout` 一条(分支摘要不是 turn 开头——改规则前它会多出一个以摘要为预览的点,
+已实测);core `rewind` 五条(摘要成功、摘要失败照退并整体断言提示、`Gate` 卡住时取消——删掉清理那行它会红,
+已实测、Drop 不发请求、搬来的 `fork_here`);TUI app 四条(`s` 产出 `Summarize` 且进忙状态、摘要中 Enter
+留草稿 / Esc 中断 / 结束后照常提交、`Forked` 显示标签且不把摘要算作保留、原有两条改成新的 `Command::Fork`),
+render 一条(提示行)。`BRANCH_INSTRUCTION` 的措辞**没有拿真实模型量过**。

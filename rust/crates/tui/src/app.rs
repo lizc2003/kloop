@@ -26,6 +26,7 @@ use kloop_core::permissions::ConfirmPreview;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 use kloop_core::permissions::Mode;
+use kloop_core::rewind::AbandonedBranch;
 use kloop_core::rollout::ForkPoint;
 use kloop_core::tools::TodoSnapshot;
 use kloop_protocol::ContentBlock;
@@ -432,9 +433,13 @@ pub enum Command {
     /// Ask the worker for this session's rewind targets (Ctrl+R, idle only).
     /// The worker replies with a `ForkPoints` event that opens the picker.
     RequestForkPoints,
-    /// Rewind History onto the fork cut at this seq (the picker's selection).
-    /// The worker forks, swaps History, and replies with a `Forked` event.
-    Fork(u64),
+    /// Rewind History onto the fork cut at `seq` (the picker's selection).
+    /// The worker forks, swaps History, and replies with a `Forked` event; a
+    /// summarizing rewind is busy until its `TurnEnded`, like a slash command.
+    Fork {
+        seq: u64,
+        abandoned: AbandonedBranch,
+    },
     /// Run this slash-command line (`/help`, `/compact`, …) on the worker,
     /// which owns History. Only produced when idle; the worker replies with a
     /// System block and a TurnEnded that clears the busy state.
@@ -525,6 +530,9 @@ pub struct App {
     /// The rewind picker while it is open (Ctrl+R when idle); None otherwise.
     /// While open it captures the keyboard, like a confirm prompt.
     pub fork_picker: Option<ForkPicker>,
+    /// A rewind is summarizing the turns it drops. Enter keeps the draft: a
+    /// steer would land in the session the rewind is about to leave.
+    rewinding: bool,
     pub provider_picker: Option<ProviderPicker>,
     /// The current permission mode, shown in the status bar. A display mirror of
     /// the shared gate: shift+Tab updates it here and via `Command::SetMode`; an
@@ -593,6 +601,7 @@ impl App {
             agent_message_cells: HashMap::new(),
             frozen_agent_messages: HashSet::new(),
             fork_picker: None,
+            rewinding: false,
             provider_picker: None,
             mode: Mode::default(),
             ctrl_c_exit_armed: false,
@@ -796,13 +805,16 @@ impl App {
                 // The fork's content, rebuilt exactly like resuming into a session.
                 self.cells = cells_from_history(&messages);
                 // cells_from_history tags the tail "resumed session"; relabel it
-                // so the transcript says a rewind happened, not a resume.
+                // so the transcript says a rewind happened, not a resume. A
+                // branch summary is new on the branch, not something kept.
                 if matches!(self.cells.last(), Some(Cell::Note(_))) {
+                    let kept = messages
+                        .iter()
+                        .filter(|message| message.injected != Some(Injected::BranchSummary))
+                        .count();
                     self.cells.pop();
-                    self.cells.push(Cell::Note(format!(
-                        "rewound — {} message(s) kept",
-                        messages.len()
-                    )));
+                    self.cells
+                        .push(Cell::Note(format!("rewound — {kept} message(s) kept")));
                 }
                 if !report.is_empty() {
                     self.cells.push(Cell::System(report.join("\n")));
@@ -1174,6 +1186,7 @@ impl App {
     /// The turn closed: drop everything that belonged to it, then note why.
     fn apply_turn_ended(&mut self, reason: EndReason) {
         self.running = false;
+        self.rewinding = false;
         self.clear_frozen_route();
         self.assistant_open = false;
         self.thinking_open = false;
@@ -1674,6 +1687,9 @@ impl App {
             self.freeze_selected_route();
             return Command::Slash(command);
         }
+        if self.rewinding {
+            return Command::None;
+        }
         if self.running {
             // A known command cannot run mid-turn — it owns session state, and
             // the front-end already treats the turn as busy — so the draft stays
@@ -2061,8 +2077,10 @@ impl App {
         Command::None
     }
 
-    /// at the selected point, Esc backs out without touching History (Ctrl+C is
-    /// the two-tap quit, intercepted before routing here).
+    /// Keys for the open rewind picker: ↑↓/j/k move, Enter rewinds at the
+    /// selected point, `s` summarizes the dropped turns first, Esc backs out
+    /// without touching History (Ctrl+C is the two-tap quit, intercepted
+    /// before routing here).
     fn on_fork_key(&mut self, key: KeyEvent) -> Command {
         let picker = self.fork_picker.as_mut().expect("checked some");
         // Ctrl-modified keys are inert here (Ctrl+C two-tap quit is intercepted
@@ -2094,7 +2112,25 @@ impl App {
                 // always indexes a real point.
                 let seq = picker.points[picker.cursor].seq;
                 self.fork_picker = None;
-                return Command::Fork(seq);
+                return Command::Fork {
+                    seq,
+                    abandoned: AbandonedBranch::Drop,
+                };
+            }
+            // A full round-trip before anything changes on screen, so it is
+            // busy like a slash command, and Esc gets the rewind back.
+            KeyCode::Char('s') => {
+                let seq = picker.points[picker.cursor].seq;
+                self.fork_picker = None;
+                self.running = true;
+                self.rewinding = true;
+                self.cells.push(Cell::Note(
+                    "summarizing the turns being rewound away — Esc cancels the rewind".into(),
+                ));
+                return Command::Fork {
+                    seq,
+                    abandoned: AbandonedBranch::Summarize,
+                };
             }
             KeyCode::Esc => self.fork_picker = None,
             _ => {}
@@ -2147,6 +2183,7 @@ fn injected_label(injected: &Injected) -> String {
         Injected::DroppedPrefix => "earlier messages dropped without summarization".into(),
         Injected::UserAnchors => "your earlier messages, carried verbatim across compaction".into(),
         Injected::RestoredFiles => "files in use re-read after compaction".into(),
+        Injected::BranchSummary => "what the rewound-away turns learned".into(),
         Injected::Hook => "hook output".into(),
         Injected::Harness => "harness reminder".into(),
     }
@@ -3649,8 +3686,62 @@ mod tests {
 
         app.on_key(80, key(KeyCode::Up));
         assert_eq!(app.fork_picker.as_ref().unwrap().cursor, 0);
-        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::Fork(4));
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Fork {
+                seq: 4,
+                abandoned: AbandonedBranch::Drop,
+            }
+        );
         assert!(app.fork_picker.is_none(), "selecting closes the picker");
+        assert!(!app.running, "a plain rewind is not a wait");
+    }
+
+    /// `s` rewinds with a summary: a full request before anything changes, so
+    /// the app is busy and says what it is waiting on.
+    #[test]
+    fn fork_picker_s_summarizes_before_rewinding() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "two"), fp(6, "three")]));
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Char('s'))),
+            Command::Fork {
+                seq: 6,
+                abandoned: AbandonedBranch::Summarize,
+            }
+        );
+        assert!(app.fork_picker.is_none());
+        assert!(app.running);
+        assert_eq!(
+            app.cells,
+            [Cell::Note(
+                "summarizing the turns being rewound away — Esc cancels the rewind".into()
+            )]
+        );
+    }
+
+    /// While the summary runs, Enter keeps the draft: a steer would land in
+    /// the session being left. Esc on an empty composer cancels, and once the
+    /// wait ends the draft goes to the branch like any other turn.
+    #[test]
+    fn a_summarizing_rewind_holds_the_draft() {
+        let mut app = App::new("s".into());
+        app.apply(AgentEvent::ForkPoints(vec![fp(4, "two")]));
+        app.on_key(80, key(KeyCode::Char('s')));
+        type_str(&mut app, "try it another way");
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
+        assert_eq!(app.composer.text(), "try it another way");
+
+        let mut idle = App::new("s".into());
+        idle.apply(AgentEvent::ForkPoints(vec![fp(4, "two")]));
+        idle.on_key(80, key(KeyCode::Char('s')));
+        assert_eq!(idle.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
+
+        app.apply(AgentEvent::Core(Event::TurnEnded(EndReason::Completed)));
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit("try it another way".into())
+        );
     }
 
     /// The panel prints row numbers, so the numbers pick — here and in every
@@ -3661,7 +3752,13 @@ mod tests {
         app.apply(AgentEvent::ForkPoints(vec![fp(4, "two"), fp(6, "three")]));
         app.on_key(80, key(KeyCode::Char('9')));
         assert!(app.fork_picker.is_some(), "no ninth row to pick");
-        assert_eq!(app.on_key(80, key(KeyCode::Char('1'))), Command::Fork(4));
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Char('1'))),
+            Command::Fork {
+                seq: 4,
+                abandoned: AbandonedBranch::Drop,
+            }
+        );
         assert!(app.fork_picker.is_none());
     }
 
@@ -3721,6 +3818,31 @@ mod tests {
         assert_eq!(app.mode, Mode::Bypass);
         assert_eq!(app.todos.as_ref().unwrap().revision, 0);
         assert!(!app.show_todos);
+    }
+
+    /// The branch summary shows as what it is, and is not counted as kept.
+    #[test]
+    fn forked_with_a_summary_shows_it_and_counts_what_was_kept() {
+        let mut app = App::new("old".into());
+        app.apply(AgentEvent::Forked {
+            session: switch("new", &[]),
+            messages: vec![
+                Message::user_text("one"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "done".into(),
+                }]),
+                Message::injected(Injected::BranchSummary, "what was learned"),
+            ],
+        });
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::User("one".into()),
+                Cell::Assistant("done".into()),
+                Cell::Note("what the rewound-away turns learned".into()),
+                Cell::Note("rewound — 2 message(s) kept".into()),
+            ]
+        );
     }
 
     #[test]

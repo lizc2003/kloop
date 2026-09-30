@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub enum UsageOperation {
     Sampling,
     Compaction,
+    /// A rewind summarizing the turns it abandons (plan 210).
+    BranchSummary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -746,6 +746,9 @@ pub enum Injected {
     UserAnchors,
     /// Files compaction re-read so the work in progress survives the fold.
     RestoredFiles,
+    /// A rewind's summary of the turns it abandoned, opening the branch. Not
+    /// a compaction product: it is conversation, folded like any other.
+    BranchSummary,
     /// stdout of an allowing hook, fed to the model as context.
     Hook,
     /// The harness talking to the model: round-boundary reminders and the
