@@ -392,16 +392,22 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
         }
         Cell::BackgroundTask(task) => {
             let (mark, color) = background_status_mark(task.status);
-            // The id rides the title, not the status line: this row is about one
-            // job, and the title is what a reader takes in first — a transcript
-            // row for the same tool has no id, so the difference shows there.
-            let title = format!("{}({}) {}", task.kind.label(), task.description, task.id);
+            // The id rides the title rather than the status line: this row is
+            // about one job, and a transcript row for the same tool carries no
+            // id at all. Its width is therefore reserved *before* the
+            // description gets any — a long command must never be able to
+            // truncate away the one thing that links this row to its task, and
+            // a task with no output path has nowhere else to be recognized.
+            let id = format!(" {}", task.id);
+            let head = format!("{}({})", task.kind.label(), task.description);
+            let budget = width.saturating_sub(2 + display_width(&id));
             lines.push(Line::from(vec![
                 Span::styled(format!("{mark} "), Style::new().fg(color)),
                 Span::styled(
-                    truncate(&title, width.saturating_sub(2)),
+                    truncate(&head, budget),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(id, Style::new().add_modifier(Modifier::BOLD)),
             ]));
             let mut identity = background_status(task.status).to_string();
             if let Some(run_id) = &task.run_id {
@@ -3314,6 +3320,38 @@ mod tests {
             ]
         );
         assert_eq!(program_lines[0].spans[0].style.fg, Some(Color::Red));
+    }
+
+    /// The id is the row's identity: a description long enough to fill a narrow
+    /// terminal must not be able to truncate it away. The status line no longer
+    /// repeats it, and a task with no output path has nowhere else to be
+    /// recognized — so tasks sharing a description prefix would otherwise turn
+    /// into the same row.
+    #[test]
+    fn a_long_background_description_cannot_truncate_the_id_away() {
+        let description = "cargo test --workspace --all-features -- --nocapture --test-threads=1";
+        let task = |id: &str| {
+            Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+                id: id.into(),
+                run_id: None,
+                kind: BackgroundTaskKind::Bash,
+                description: description.into(),
+                status: BackgroundTaskStatus::Running,
+                output_path: None,
+                detail: None,
+            })
+        };
+        for width in [80, 40, 24] {
+            let nine = line_text(&cell_lines(&task("bg-9"), width)[0]);
+            let ten = line_text(&cell_lines(&task("bg-10"), width)[0]);
+            assert!(nine.ends_with(" bg-9"), "{width}: {nine:?}");
+            assert!(ten.ends_with(" bg-10"), "{width}: {ten:?}");
+            assert_ne!(
+                nine, ten,
+                "{width}: one description, two tasks, so the rows must differ"
+            );
+            assert!(display_width(&nine) <= width, "{width}: {nine:?}");
+        }
     }
 
     #[test]

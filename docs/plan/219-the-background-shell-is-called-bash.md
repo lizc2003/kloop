@@ -47,3 +47,11 @@
 
 - `make check`（fmt + clippy + test + parity）全绿。
 - 行为断言：`event.rs` 的注入注释用例（`Bash(cargo test) · Completed · bg-9 · …`）、`wire.rs` 的 `thread/background_task/updated` 夹具（`"kind": "bash"`）、`tui` 两条后台行用例（标题带 id、状态行只剩生命周期）。
+
+## 复审修正（P2：长描述会截掉任务 ID）
+
+复审指出：把 id 挪到标题末尾之后，标题整体仍按终端宽度**从右截断**，而状态行里那份 id 又被我删了——80 列终端上一条长 Bash 命令会把 `bg-N` 整个吃掉；没有输出路径的 Agent 条目再没有别处补显，描述前缀相同的多个任务因此无法区分，终态那行也难以关联回原任务。**这是本计划引入的回归，不是既有问题。**
+
+改法（采纳复审建议的"给 ID 预留宽度、只截断描述"）：标题拆成两段——`Kind(描述)` 按 `width − 标记宽 − id 宽` 截断，id 单独一段、始终完整。这样既保住"标题即身份"，又与注入注释的顺序一致（`Kind(描述) … id`）；把 id 挪到描述前面也能解，但那会和注释的形状分家。
+
+回归断言：`a_long_background_description_cannot_truncate_the_id_away`——同一个长描述配两个不同 id，在 80 / 40 / 24 列下断言 (a) 标题以各自的 id 结尾、(b) 两行不相等、(c) 不超出宽度。原先那条用例只覆盖了短标题。
