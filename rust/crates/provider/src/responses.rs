@@ -1279,11 +1279,15 @@ impl ResponseStream {
         if *arguments_done {
             return Err(protocol("received duplicate arguments done"));
         }
+        let deltas_seen = *arguments_started;
         *arguments_started = true;
-        if !arguments_agree(
-            required_str(&value["arguments"], "final arguments")?,
-            arguments.as_str(),
-        ) {
+        let final_arguments = required_str(&value["arguments"], "final arguments")?;
+        if !deltas_seen {
+            // Some relays deliver a whole call's arguments in this one frame,
+            // streaming no delta at all. Nothing was streamed, so nothing
+            // contradicts `.done`; a call that did stream is checked below.
+            *arguments = final_arguments.to_owned();
+        } else if !arguments_agree(final_arguments, arguments.as_str()) {
             return Err(protocol("arguments done did not match accumulated delta"));
         }
         *arguments_done = true;

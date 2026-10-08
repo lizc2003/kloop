@@ -1539,6 +1539,56 @@ async fn function_arguments_agree_across_pretty_and_compact() {
     assert_eq!(events.len(), 2);
 }
 
+/// Some relays send a whole function call's arguments only in
+/// `function_call_arguments.done`, streaming no delta at all — seen
+/// intermittently on a real gateway, in the same turn where another call did
+/// stream deltas. Nothing was streamed, so `.done` is taken as the value
+/// instead of being cross-checked against an empty accumulation.
+#[tokio::test]
+async fn function_arguments_without_any_delta_take_done_as_the_value() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_6", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_6", "status": "in_progress",
+                "call_id": "call_6", "name": "bash", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_6",
+                "arguments": "{\"command\": \"git log -1\", \"timeout_ms\": 60000}"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_6", "call_id": "call_6", "name": "bash",
+                "arguments": "{\"command\": \"git log -1\", \"timeout_ms\": 60000}",
+                "status": "completed"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_6", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(matches!(
+        &events[0],
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
+            if id == "call_6" && name == "bash"
+                && input == &json!({"command": "git log -1", "timeout_ms": 60000})
+    ));
+    assert!(matches!(
+        &events[1],
+        StreamEvent::Terminal {
+            outcome: AssistantOutcome::ToolUse,
+            ..
+        }
+    ));
+    assert_eq!(events.len(), 2);
+}
+
 /// Only whitespace/format differences are tolerated: when the accumulated
 /// delta and the `.done` arguments parse to genuinely different JSON values,
 /// the round still fails closed at the first comparison site.
