@@ -102,10 +102,10 @@ the five architectural bets below; it is now ten crates, and every bet held.
    both before and after the terminal, mirroring Anthropic's `ping`. Every
    other unknown SSE event still fails closed, naming the event. Responses function-call
    arguments are reconciled by JSON value (the proxy may stream compact deltas
-   but echo a pretty-printed `.done`), and a call that streamed no delta at all
-   — a relay delivering the whole object only in `.done` — takes that `.done`
-   as its value; text and reasoning stay byte-exact, and arguments that diverge
-   after deltas did stream still fail closed. Tool arguments are a string
+   but echo a pretty-printed `.done`), and a call whose arguments were never
+   streamed — a relay delivering the whole object only in `.done` — takes that
+   `.done` as its value; text and reasoning stay byte-exact, and arguments that
+   diverge once something did stream still fail closed. Tool arguments are a string
    the model wrote, so all three rails treat a broken one as the model's
    mistake rather than a broken wire: a whitelist repairs the few unambiguous
    slips (an unquoted value, a raw newline inside a string, a trailing comma)

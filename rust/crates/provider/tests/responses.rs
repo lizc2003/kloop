@@ -1589,6 +1589,50 @@ async fn function_arguments_without_any_delta_take_done_as_the_value() {
     assert_eq!(events.len(), 2);
 }
 
+/// The same holds when a delta frame did arrive but carried nothing: an empty
+/// accumulation has nothing to contradict `.done` with, and whether a relay
+/// streams at all is a property of how the response was generated rather than
+/// a signal about this item.
+#[tokio::test]
+async fn function_arguments_with_an_empty_delta_take_done_as_the_value() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "resp_7", "status": "in_progress"}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_7", "status": "in_progress",
+                "call_id": "call_7", "name": "bash", "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0,
+                "item_id": "fc_7", "delta": ""}),
+            json!({"type": "response.function_call_arguments.done", "output_index": 0,
+                "item_id": "fc_7",
+                "arguments": "{\"command\": \"git log -1\", \"timeout_ms\": 60000}"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "function_call", "id": "fc_7", "call_id": "call_7", "name": "bash",
+                "arguments": "{\"command\": \"git log -1\", \"timeout_ms\": 60000}",
+                "status": "completed"
+            }}),
+            json!({"type": "response.completed", "response": {"id": "resp_7", "status": "completed"}}),
+        ]),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(matches!(
+        &events[0],
+        StreamEvent::BlockDone(AssistantBlock::ToolUse { id, name, input })
+            if id == "call_7" && name == "bash"
+                && input == &json!({"command": "git log -1", "timeout_ms": 60000})
+    ));
+    assert_eq!(events.len(), 2);
+}
+
 /// Only whitespace/format differences are tolerated: when the accumulated
 /// delta and the `.done` arguments parse to genuinely different JSON values,
 /// the round still fails closed at the first comparison site.
