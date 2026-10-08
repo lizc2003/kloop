@@ -132,8 +132,8 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         "glob" => ("Glob".into(), s("pattern")),
         "web_fetch" => ("Fetch".into(), s("url")),
         "web_search" => ("Search".into(), s("query")),
-        "bash_output" => ("BashOutput".into(), s("bash_id")),
-        "stop_bash" => ("StopBash".into(), s("bash_id")),
+        "bash_output" => ("Output".into(), s("bash_id")),
+        "stop_bash" => ("Stop".into(), s("bash_id")),
         "run_agent" => {
             let description = s("description");
             let detail = if description.is_empty() {

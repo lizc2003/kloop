@@ -1593,7 +1593,7 @@ then the turn's items as
 `assistant_message` / `reasoning` / `tool_call` / `sub_agent` (a tool call
 carries its full `input`, and `output` + `agent` label when present); plus
 `thread/background_task/updated {task:{id, kind, description, status,
-output_path?, detail?, run_id?}}` for session-scoped shell/agent/program/workflow work (`run_id` is present for Program `run-*` and Workflow `wf_*`; **no
+output_path?, detail?, run_id?}}` for session-scoped bash/agent/program/workflow work (`run_id` is present for Program `run-*` and Workflow `wf_*`; **no
 `turn_id`**, because completion may arrive after the launching turn),
 `thread/agent_message/updated {message_id,from,to,summary,status}`
 for the separate Local Agent Mailbox lifecycle (`status` ∈ `queued` / `delivered` /

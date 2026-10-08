@@ -204,7 +204,7 @@ pub fn project_event(ev: &Event, turn_id: u64) -> Option<(&'static str, Value)> 
         )),
         Event::BackgroundTaskUpdated(task) => {
             let kind = match task.kind {
-                kloop_core::event::BackgroundTaskKind::Shell => "shell",
+                kloop_core::event::BackgroundTaskKind::Bash => "bash",
                 kloop_core::event::BackgroundTaskKind::Agent => "agent",
                 kloop_core::event::BackgroundTaskKind::Program => "program",
                 kloop_core::event::BackgroundTaskKind::Workflow => "workflow",
@@ -501,7 +501,7 @@ mod tests {
         let update = Event::BackgroundTaskUpdated(kloop_core::event::BackgroundTask {
             id: "bg-7".into(),
             run_id: None,
-            kind: kloop_core::event::BackgroundTaskKind::Shell,
+            kind: kloop_core::event::BackgroundTaskKind::Bash,
             description: "make test".into(),
             status: kloop_core::event::BackgroundTaskStatus::Failed,
             output_path: Some("/tmp/bg-7.out".into()),
@@ -513,7 +513,7 @@ mod tests {
                 "thread/background_task/updated",
                 json!({"task": {
                     "id": "bg-7",
-                    "kind": "shell",
+                    "kind": "bash",
                     "description": "make test",
                     "status": "failed",
                     "output_path": "/tmp/bg-7.out",

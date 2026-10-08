@@ -772,7 +772,7 @@ impl BackgroundShells {
         ctx.ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
             id: id.clone(),
             run_id: None,
-            kind: BackgroundTaskKind::Shell,
+            kind: BackgroundTaskKind::Bash,
             description: command.to_string(),
             status: BackgroundTaskStatus::Running,
             output_path: Some(path.to_string_lossy().to_string()),
@@ -1107,7 +1107,7 @@ async fn monitor(monitor: BackgroundMonitor) {
         ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
             id: id.clone(),
             run_id: None,
-            kind: BackgroundTaskKind::Shell,
+            kind: BackgroundTaskKind::Bash,
             description: command,
             status: event_status,
             output_path: Some(output_path.clone()),

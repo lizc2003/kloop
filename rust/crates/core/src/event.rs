@@ -26,15 +26,31 @@ use kloop_protocol::LocalMessageId;
 pub type ItemId = String;
 
 /// Session-scoped background work is not owned by the turn that launched it.
-/// Shells use their own registry while Agents, Programs, and Workflows share an
-/// execution registry; this read-only projection lets every frontend render one
-/// lifecycle without inventing a late `turn_id`.
+/// Bash tasks use their own registry while Agents, Programs, and Workflows share
+/// an execution registry; this read-only projection lets every frontend render
+/// one lifecycle without inventing a late `turn_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundTaskKind {
-    Shell,
+    Bash,
     Agent,
     Program,
     Workflow,
+}
+
+impl BackgroundTaskKind {
+    /// The name a task of this kind shows as: the tool the user invoked, so a
+    /// backgrounded `bash` call reads as the same thing its transcript row does.
+    /// Every front-end label comes from here, so the two cannot drift apart —
+    /// and only `bash` can be backgrounded at all (PowerShell is
+    /// foreground-only), which is why there is no umbrella "shell" name left.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bash => "Bash",
+            Self::Agent => "Agent",
+            Self::Program => "Program",
+            Self::Workflow => "Workflow",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,12 +219,7 @@ pub fn tool_summary(input: &Value) -> String {
 }
 
 fn background_task_note(task: &BackgroundTask) -> String {
-    let kind = match task.kind {
-        BackgroundTaskKind::Shell => "Shell",
-        BackgroundTaskKind::Agent => "Agent",
-        BackgroundTaskKind::Program => "Program",
-        BackgroundTaskKind::Workflow => "Workflow",
-    };
+    let kind = task.kind.label();
     let status = match task.status {
         BackgroundTaskStatus::Running => "Running",
         BackgroundTaskStatus::Completed => "Completed",
@@ -453,18 +464,18 @@ mod tests {
             )
         );
 
-        let shell = Event::BackgroundTaskUpdated(BackgroundTask {
+        let bash = Event::BackgroundTaskUpdated(BackgroundTask {
             id: "bg-9".into(),
             run_id: None,
-            kind: BackgroundTaskKind::Shell,
+            kind: BackgroundTaskKind::Bash,
             description: "cargo test".into(),
             status: BackgroundTaskStatus::Completed,
             output_path: Some("/tmp/bg-9.out".into()),
             detail: Some("exit code 0".into()),
         });
         assert_eq!(
-            shell.as_note().as_deref(),
-            Some("Shell(cargo test) · Completed · bg-9 · exit code 0 · output: /tmp/bg-9.out")
+            bash.as_note().as_deref(),
+            Some("Bash(cargo test) · Completed · bg-9 · exit code 0 · output: /tmp/bg-9.out")
         );
     }
 

@@ -311,15 +311,6 @@ fn agent_message_status(status: AgentMessageStatus) -> (&'static str, &'static s
     }
 }
 
-fn background_kind(kind: BackgroundTaskKind) -> &'static str {
-    match kind {
-        BackgroundTaskKind::Shell => "Shell",
-        BackgroundTaskKind::Agent => "Agent",
-        BackgroundTaskKind::Program => "Program",
-        BackgroundTaskKind::Workflow => "Workflow",
-    }
-}
-
 fn background_status(status: BackgroundTaskStatus) -> &'static str {
     match status {
         BackgroundTaskStatus::Running => "Running",
@@ -401,7 +392,10 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
         }
         Cell::BackgroundTask(task) => {
             let (mark, color) = background_status_mark(task.status);
-            let title = format!("{}({})", background_kind(task.kind), task.description);
+            // The id rides the title, not the status line: this row is about one
+            // job, and the title is what a reader takes in first — a transcript
+            // row for the same tool has no id, so the difference shows there.
+            let title = format!("{}({}) {}", task.kind.label(), task.description, task.id);
             lines.push(Line::from(vec![
                 Span::styled(format!("{mark} "), Style::new().fg(color)),
                 Span::styled(
@@ -409,7 +403,7 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
             ]));
-            let mut identity = format!("{} · {}", background_status(task.status), task.id);
+            let mut identity = background_status(task.status).to_string();
             if let Some(run_id) = &task.run_id {
                 identity.push_str(&format!(" · resumable as {run_id}"));
             }
@@ -3293,8 +3287,8 @@ mod tests {
         assert_eq!(
             workflow_lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "● Workflow(review changes)",
-                "  Running · workflow-3 · resumable as wf_3",
+                "● Workflow(review changes) workflow-3",
+                "  Running · resumable as wf_3",
                 "  Phase: Verify 2/4",
             ]
         );
@@ -3313,8 +3307,8 @@ mod tests {
         assert_eq!(
             program_lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "✗ Program(run checks)",
-                "  Failed · program-2 · resumable as run-2",
+                "✗ Program(run checks) program-2",
+                "  Failed · resumable as run-2",
                 "  exit code 1",
                 "  output: /tmp/run-2/error.txt",
             ]
