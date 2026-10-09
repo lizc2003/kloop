@@ -392,22 +392,23 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
         }
         Cell::BackgroundTask(task) => {
             let (mark, color) = background_status_mark(task.status);
-            // The id rides the title rather than the status line: this row is
-            // about one job, and a transcript row for the same tool carries no
-            // id at all. Its width is therefore reserved *before* the
-            // description gets any — a long command must never be able to
-            // truncate away the one thing that links this row to its task, and
-            // a task with no output path has nowhere else to be recognized.
-            let id = format!(" {}", task.id);
-            let head = format!("{}({})", task.kind.label(), task.description);
-            let budget = width.saturating_sub(2 + display_width(&id));
+            // `Kind(id)` leads and the description follows: the id is this row's
+            // identity and a transcript row for the same tool carries none, so
+            // leading with it keeps truncation from ever reaching the one thing
+            // that links this row to its task — a fact of the layout rather than
+            // a width calculation. Every kind reads the same way, so the
+            // parentheses always hold the handle.
+            let mut title = format!("{}({})", task.kind.label(), task.id);
+            if !task.description.is_empty() {
+                title.push(' ');
+                title.push_str(&task.description);
+            }
             lines.push(Line::from(vec![
                 Span::styled(format!("{mark} "), Style::new().fg(color)),
                 Span::styled(
-                    truncate(&head, budget),
+                    truncate(&title, width.saturating_sub(2)),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(id, Style::new().add_modifier(Modifier::BOLD)),
             ]));
             let mut identity = background_status(task.status).to_string();
             if let Some(run_id) = &task.run_id {
@@ -3293,7 +3294,7 @@ mod tests {
         assert_eq!(
             workflow_lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "● Workflow(review changes) workflow-3",
+                "● Workflow(workflow-3) review changes",
                 "  Running · resumable as wf_3",
                 "  Phase: Verify 2/4",
             ]
@@ -3313,7 +3314,7 @@ mod tests {
         assert_eq!(
             program_lines.iter().map(line_text).collect::<Vec<_>>(),
             vec![
-                "✗ Program(run checks) program-2",
+                "✗ Program(program-2) run checks",
                 "  Failed · resumable as run-2",
                 "  exit code 1",
                 "  output: /tmp/run-2/error.txt",
@@ -3322,11 +3323,10 @@ mod tests {
         assert_eq!(program_lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
-    /// The id is the row's identity: a description long enough to fill a narrow
-    /// terminal must not be able to truncate it away. The status line no longer
-    /// repeats it, and a task with no output path has nowhere else to be
-    /// recognized — so tasks sharing a description prefix would otherwise turn
-    /// into the same row.
+    /// The id is the row's identity: leading the title keeps a description long
+    /// enough to fill a narrow terminal from being able to truncate it away. A
+    /// task with no output path has nowhere else to be recognized, so tasks
+    /// sharing a description prefix would otherwise turn into the same row.
     #[test]
     fn a_long_background_description_cannot_truncate_the_id_away() {
         let description = "cargo test --workspace --all-features -- --nocapture --test-threads=1";
@@ -3344,14 +3344,17 @@ mod tests {
         for width in [80, 40, 24] {
             let nine = line_text(&cell_lines(&task("bg-9"), width)[0]);
             let ten = line_text(&cell_lines(&task("bg-10"), width)[0]);
-            assert!(nine.ends_with(" bg-9"), "{width}: {nine:?}");
-            assert!(ten.ends_with(" bg-10"), "{width}: {ten:?}");
+            assert!(nine.starts_with("● Bash(bg-9)"), "{width}: {nine:?}");
+            assert!(ten.starts_with("● Bash(bg-10)"), "{width}: {ten:?}");
             assert_ne!(
                 nine, ten,
                 "{width}: one description, two tasks, so the rows must differ"
             );
             assert!(display_width(&nine) <= width, "{width}: {nine:?}");
         }
+        // Only the description is ever cut: where the width fits, all of it lands.
+        let roomy = line_text(&cell_lines(&task("bg-9"), 120)[0]);
+        assert!(roomy.ends_with("test-threads=1"), "{roomy:?}");
     }
 
     #[test]

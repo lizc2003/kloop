@@ -2143,7 +2143,7 @@ mod tests {
         let finished = rows(&crate::markdown::markdown_lines(&answer, width));
         let done = rows(&render::cell_lines(app.cells.last().unwrap(), width));
         assert_eq!(
-            done[0], "✓ Agent(long audit) agent-1",
+            done[0], "✓ Agent(agent-1) long audit",
             "the finish is a row of its own"
         );
         draw_and_check(
