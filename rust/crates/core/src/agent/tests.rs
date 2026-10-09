@@ -227,12 +227,98 @@ async fn background_wait_is_a_harness_message_after_the_receipt_and_survives_com
     let summary = Message::injected(Injected::ContextSummary, "compacted work");
     history.replace_all(vec![summary.clone()]);
     assert!(remind_background_shells(&cfg, &mut history));
-    assert_eq!(history.messages(), &[summary, expected]);
+    let expected_history = vec![summary, expected];
+    assert_eq!(history.messages(), expected_history);
     cfg.background_shells
         .shutdown(std::time::Duration::from_secs(1))
         .await;
+    assert_eq!(cfg.background_shells.wait_reminder(), None);
     assert!(!remind_background_shells(&cfg, &mut history));
-    assert_eq!(history.messages().len(), 2);
+    assert_eq!(history.messages(), expected_history);
+}
+
+#[tokio::test]
+async fn background_wait_tracks_new_jobs_and_is_shared_with_subagents() {
+    use crate::tools::testutil::run_tool;
+    use crate::tools::testutil::test_ctx_with_cfg;
+
+    let (provider, seen) = Provider::mock_recording(vec![MockTurn::Blocks(text("done"))]);
+    let cfg = crate::tools::testutil::TestConfig::new("agent-background-wait-shared")
+        .provider(provider)
+        .build();
+    let ctx = test_ctx_with_cfg(0, cfg.clone());
+    let mut history = History::new(cfg.offload_dir.clone());
+    let mut expected = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let (receipt, is_error) = run_tool(
+            "bash",
+            json!({"command": "sleep 30", "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{receipt}");
+        let id = receipt
+            .strip_prefix("Command running in background with ID: ")
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap()
+            .to_owned();
+        ids.push(id);
+        ids.sort();
+        let reminder = crate::tools::BackgroundShells::wait_reminder_for_ids(&ids).unwrap();
+        assert_eq!(
+            cfg.background_shells.wait_reminder(),
+            Some(reminder.clone())
+        );
+        assert!(remind_background_shells(&cfg, &mut history));
+        expected.push(Message::injected(Injected::Harness, reminder));
+        assert_eq!(history.messages(), expected);
+        assert!(!remind_background_shells(&cfg, &mut history));
+        assert_eq!(history.messages(), expected);
+    }
+
+    let child_id = "agent-78".parse().unwrap();
+    let mut child = cfg.subagent_from(&cfg.effective_workspace(), None, child_id);
+    child.tool_allowlist = Some(Arc::new(HashSet::from(["bash_output".into()])));
+    let child = Arc::new(child);
+    assert!(Arc::ptr_eq(
+        &cfg.background_shells,
+        &child.background_shells
+    ));
+    let mut child_history = History::new(cfg.offload_dir.clone());
+    let child_input = Message::user_text("inspect the shared background jobs");
+    child_history.record(child_input.clone());
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let outcome = run_turn(
+        &child,
+        &mut child_history,
+        &ui,
+        &CancellationToken::new(),
+        1,
+    )
+    .await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        seen.lock().unwrap()[0].messages,
+        vec![child_input, expected.last().unwrap().clone()]
+    );
+    let child_ctx = test_ctx_with_cfg(1, child);
+    for id in &ids {
+        let (output, is_error) = run_tool(
+            "bash_output",
+            json!({"bash_id": id, "block": false}),
+            &child_ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert!(output.starts_with(&format!("{id}: running\n")), "{output}");
+    }
+    assert_eq!(history.messages(), expected);
+    cfg.background_shells
+        .shutdown(std::time::Duration::from_secs(1))
+        .await;
 }
 
 /// The same reminder seen from the loop rather than from its own function: a

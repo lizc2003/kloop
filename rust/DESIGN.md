@@ -2427,12 +2427,20 @@ output as data, so the launch receipt alone is not the authoritative channel
 for the waiting instruction. The reminder directs dependent work to blocking
 `bash_output`, including commands whose results go to another log file;
 independent work can continue. It lists only active native jobs in stable ID
-order and is suppressed when the agent cannot use `bash_output`. Each history
-deduplicates an unchanged reminder; completion clears that state without
-appending another message. Compaction and rebase reset it, and the round loop
+order and is suppressed when the agent cannot use `bash_output`. The registry
+is session-scoped and shared with sub-agents: a child with access to
+`bash_output` receives the same active-job list in its own history and can read
+the parent or a peer's job through that tool. This reminder is deliberately not
+suppressed by agent depth. Each history deduplicates an unchanged reminder;
+completion clears that state without
+appending another message. Earlier reminders remain in append-only history;
+querying their IDs still returns the job's current status and output.
+Compaction and rebase reset the deduplication memo, and the round loop
 rechecks after predictive compaction so a live job's reminder is restored
-before sampling. The message is persisted with the history, leaving the
-system prompt and earlier cache prefix unchanged. Shell scripts retain their
+before sampling. Every path that replaces history items must reset that memo;
+both current replacement paths have regression coverage. The message is
+persisted with the history, leaving the system prompt and earlier cache prefix
+unchanged. Shell scripts retain their
 original semantics, including legitimate uses of `sleep`.
 
 Session shutdown closes both background registries before worktree teardown,

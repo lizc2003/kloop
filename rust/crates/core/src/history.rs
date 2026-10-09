@@ -1108,6 +1108,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_wait_memo_tracks_changed_and_cleared_reminders() {
+        let mut history = History::new(temp_dir("background-wait-memo"));
+        let first =
+            crate::tools::BackgroundShells::wait_reminder_for_ids(&["bg-1".into()]).unwrap();
+        let second =
+            crate::tools::BackgroundShells::wait_reminder_for_ids(&["bg-1".into(), "bg-2".into()])
+                .unwrap();
+        let mut expected = Vec::new();
+        for reminder in [&first, &second] {
+            assert!(history.record_background_wait_reminder(Some(reminder.clone())));
+            assert_eq!(history.background_wait_reminder.as_ref(), Some(reminder));
+            expected.push(Message::injected(
+                kloop_protocol::Injected::Harness,
+                reminder.clone(),
+            ));
+            assert!(!history.record_background_wait_reminder(Some(reminder.clone())));
+            assert_eq!(history.messages(), expected);
+        }
+        assert!(!history.record_background_wait_reminder(None));
+        assert_eq!(history.background_wait_reminder, None);
+        assert_eq!(history.messages(), expected);
+        assert!(history.record_background_wait_reminder(Some(second.clone())));
+        expected.push(Message::injected(kloop_protocol::Injected::Harness, second));
+        assert_eq!(history.messages(), expected);
+    }
+
+    #[test]
+    fn background_wait_memo_is_cleared_by_compaction_and_rebase() {
+        let dir = temp_dir("background-wait-rewrite");
+        let mut history = History::new(dir.clone());
+        let reminder =
+            crate::tools::BackgroundShells::wait_reminder_for_ids(&["bg-1".into()]).unwrap();
+        let injected = Message::injected(kloop_protocol::Injected::Harness, reminder.clone());
+        assert!(history.record_background_wait_reminder(Some(reminder.clone())));
+        let summary = Message::injected(kloop_protocol::Injected::ContextSummary, "compacted");
+        history.replace_all(vec![summary.clone()]);
+        assert_eq!(history.background_wait_reminder, None);
+        assert!(history.record_background_wait_reminder(Some(reminder.clone())));
+        assert_eq!(history.messages(), &[summary, injected.clone()]);
+
+        let session_path = dir.join("branch.jsonl");
+        let mut branch = History::new(dir.clone());
+        branch.attach_rollout(Rollout::new(session_path.clone()));
+        let input = Message::user_text("rewound work");
+        branch.record(input.clone());
+        history.rebase(crate::rollout::resume_session(&session_path).unwrap());
+        assert_eq!(history.background_wait_reminder, None);
+        assert_eq!(history.messages(), std::slice::from_ref(&input));
+        assert!(history.record_background_wait_reminder(Some(reminder)));
+        assert_eq!(history.messages(), &[input, injected]);
+        assert_eq!(
+            crate::rollout::load_session(&session_path).unwrap(),
+            history.messages()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_estimate_counts_ascii_by_the_quarter_and_other_characters_whole() {
         assert_eq!(estimate_text_tokens(""), 0);
         assert_eq!(estimate_text_tokens("abcd"), 1);
