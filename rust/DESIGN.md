@@ -2386,13 +2386,24 @@ a file under the session store's `offload/`
 (`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
 returns immediately with the ID and the output path. Companions:
 
-- **bash_output** `{bash_id, block=true, timeout_ms=30000}` — 等指定后台命令完成；
-  `timeout_ms` 是最长等待（最多 600,000 ms），不是固定延时，完成就提前返回。
-  下一步依赖该命令时，模型应使用它，不得以 `sleep` 或 shell 轮询代替；
-  `bash` 与 `bash_output` 的工具说明都写明此约束，启动回执给出带实际 ID 的
-  `bash_output` 调用示例。无需等待时可以继续其他工作；`block=false` 只读当前状态和输出。
-  返回 `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`
-  及最后 30k bytes 的输出（更多内容用 `read_file` 读输出文件）。只读：跳过审批门，可并发。
+- **bash_output** `{bash_id, block=true, timeout_ms=30000}` — blocks until
+  the specified command finishes (or the timeout), or peeks with `block=false`.
+  `timeout_ms` is a maximum wait (up to 600,000 ms), not a fixed delay: completion
+  returns early. Both tool descriptions direct dependent steps here instead of
+  `sleep` or shell polling, and the launch receipt includes a runnable example
+  with the actual ID. Steps without that dependency can continue other work.
+  Reports `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`
+  plus the last 30k bytes of output (read the file with `read_file` for more).
+  Read-only: skips the gate, joins concurrent batches. These are instructions to
+  the model; unit tests of the text and early return do not establish that the
+  wording changes its tool choices. In plan 220's incident-context replay,
+  fixed sleeps occurred in 30/30 old-wording and 27/30 new-wording samples;
+  only 3/30 new-wording samples chose blocking `bash_output`. This wording
+  alone does not reliably prevent the reported behavior. A fresh comparison
+  with the harness reminder below found 27 fixed sleeps in 30 control samples,
+  while the revised runtime produced 27 blocking `bash_output` calls, two
+  nonblocking `bash_output` calls, and one upstream failure in 30 samples;
+  none of its completed replies used a fixed sleep.
 - **stop_bash** `{bash_id}` — terminates the whole owned process tree and waits
   for the registry to confirm. Auto-allowed: it can only signal processes this
   agent itself started.
@@ -2409,6 +2420,20 @@ when idle; plain/server deliver it on the next turn. `stop_bash`, a 1 GiB
 output-file watchdog, and explicit session shutdown reap the whole process
 tree. IDs are process-global (`bg-1`, `bg-2`, …) so sub-agents and server
 threads sharing one offload directory never collide.
+
+At sampling boundaries, active shell IDs also produce a separate
+`Injected::Harness` message at the end of history. The system treats tool
+output as data, so the launch receipt alone is not the authoritative channel
+for the waiting instruction. The reminder directs dependent work to blocking
+`bash_output`, including commands whose results go to another log file;
+independent work can continue. It lists only active native jobs in stable ID
+order and is suppressed when the agent cannot use `bash_output`. Each history
+deduplicates an unchanged reminder; completion clears that state without
+appending another message. Compaction and rebase reset it, and the round loop
+rechecks after predictive compaction so a live job's reminder is restored
+before sampling. The message is persisted with the history, leaving the
+system prompt and earlier cache prefix unchanged. Shell scripts retain their
+original semantics, including legitimate uses of `sleep`.
 
 Session shutdown closes both background registries before worktree teardown,
 requests cooperative cancellation, then bounds the wait (worker abort or shell

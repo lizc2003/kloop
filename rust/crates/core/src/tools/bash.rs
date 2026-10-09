@@ -812,6 +812,39 @@ impl BackgroundShells {
             .count()
     }
 
+    pub(crate) fn wait_reminder(&self) -> Option<String> {
+        let mut ids: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .shells
+            .iter()
+            .filter(|(_, shell)| shell.status.is_active())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        Self::wait_reminder_for_ids(&ids)
+    }
+
+    pub(crate) fn wait_reminder_for_ids(ids: &[String]) -> Option<String> {
+        let id = ids.first()?;
+        let commands = ids
+            .iter()
+            .map(|id| format!("- {id}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "<system-reminder>\nBackground bash commands are still running:\n{commands}\n\
+             If your next step needs a command's result, wait for its ID with bash_output \
+             {{\"bash_id\":\"{id}\",\"block\":true,\"timeout_ms\":{BLOCK_TIMEOUT_MAX_MS}}}. \
+             timeout_ms is only an upper bound; completion returns immediately. Do not use \
+             bash sleep or shell polling to wait for these commands, even if their actual \
+             results are written to a separate log file. After bash_output finishes, read \
+             that log as needed. Independent work can continue without waiting.\n\
+             </system-reminder>"
+        ))
+    }
+
     fn snapshot(&self, id: &str) -> Option<(BgStatus, PathBuf, Option<BgSandbox>)> {
         let registry = self.state.lock().unwrap();
         let shell = registry.shells.get(id)?;
@@ -1161,6 +1194,7 @@ async fn read_tail(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::BLOCK_TIMEOUT_MAX_MS;
     use super::FOREGROUND_OUTPUT_CAP_CHARS;
     use crate::event::BackgroundTaskStatus;
     use crate::event::Event;
@@ -1790,7 +1824,7 @@ Wait-Process -Id $grandchild.Id
         .unwrap();
         assert_eq!(
             wait_input,
-            json!({"bash_id": id, "block": true, "timeout_ms": 600_000})
+            json!({"bash_id": id, "block": true, "timeout_ms": BLOCK_TIMEOUT_MAX_MS})
         );
         assert!(out.contains("Do not use sleep or shell polling to wait for it."));
         let receipt = {

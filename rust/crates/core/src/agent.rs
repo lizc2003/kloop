@@ -1102,6 +1102,7 @@ async fn turn_rounds(
         drain_local_mailbox(cfg, turn.history, ui);
         remind_todos(cfg, turn.history, depth);
         remind_changed_reads(cfg, turn.history);
+        remind_background_shells(cfg, turn.history);
         // Without an anchor the system prompt, this round's tools and the
         // injected context are estimated here; a dynamic MCP refresh may have
         // replaced the tools or the deferred-tool notice since last round.
@@ -1116,6 +1117,7 @@ async fn turn_rounds(
         if let Some(ending) = turn.compact_predictively(estimated, round).await {
             break 'turn ending;
         }
+        remind_background_shells(cfg, turn.history);
         let reduction = cfg.request_reduction.then(|| RequestReduction {
             cwd: &workspace.cwd,
             now: std::time::SystemTime::now(),
@@ -1520,6 +1522,13 @@ fn remind_changed_reads(cfg: &Config, history: &mut History) -> bool {
     let reminder = history.offload_text(reminder);
     history.record(Message::injected(Injected::Harness, reminder));
     true
+}
+
+fn remind_background_shells(cfg: &Config, history: &mut History) -> bool {
+    if !crate::agent_type::tool_available(cfg.tool_allowlist.as_deref(), "bash_output") {
+        return history.record_background_wait_reminder(None);
+    }
+    history.record_background_wait_reminder(cfg.background_shells.wait_reminder())
 }
 
 fn drain_local_mailbox(cfg: &Config, history: &mut History, ui: &Arc<dyn Ui>) -> bool {

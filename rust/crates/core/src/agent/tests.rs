@@ -142,6 +142,99 @@ async fn a_stale_todo_list_is_reminded_at_the_end_of_history_and_only_at_depth_z
     assert_eq!(history.messages().len(), 2);
 }
 
+#[tokio::test]
+async fn background_wait_is_a_harness_message_after_the_receipt_and_survives_compaction() {
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Blocks(vec![tool_use_named(
+            "start",
+            "bash",
+            json!({"command": "sleep 30", "background": true}),
+        )]),
+        MockTurn::Blocks(vec![tool_use_named(
+            "independent",
+            "bash",
+            json!({"command": "printf independent"}),
+        )]),
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "done".into(),
+        }]),
+    ]);
+    let cfg = crate::tools::testutil::TestConfig::new("agent-background-wait-reminder")
+        .provider(provider)
+        .build();
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    assert!(!remind_background_shells(&cfg, &mut history));
+    history.record(Message::user_text("start a job and do independent work"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    let expected = Message::injected(
+        Injected::Harness,
+        cfg.background_shells.wait_reminder().unwrap(),
+    );
+    let ContentBlock::Text { text } = &expected.content[0] else {
+        panic!("expected a text reminder");
+    };
+    let wait_input: Value = serde_json::from_str(
+        text.split("with bash_output ")
+            .nth(1)
+            .unwrap()
+            .split(". timeout_ms")
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    {
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].messages.last(), Some(&expected));
+        assert!(matches!(
+            requests[1].messages[requests[1].messages.len() - 2].content.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, .. }] if tool_use_id == "start"
+        ));
+        let ContentBlock::ToolResult { content, .. } =
+            &requests[1].messages[requests[1].messages.len() - 2].content[0]
+        else {
+            panic!("expected the launch receipt");
+        };
+        let receipt = content.as_text();
+        let id = receipt
+            .strip_prefix("Command running in background with ID: ")
+            .unwrap()
+            .split('.')
+            .next()
+            .unwrap();
+        assert_eq!(wait_input["bash_id"], json!(id));
+        assert_eq!(wait_input["block"], json!(true));
+        assert_eq!(
+            requests[2]
+                .messages
+                .iter()
+                .filter(|message| **message == expected)
+                .count(),
+            1
+        );
+    }
+    assert!(!remind_background_shells(&cfg, &mut history));
+    let mut restricted = (*cfg).clone();
+    restricted.tool_allowlist = Some(Arc::new(HashSet::from(["read_file".into()])));
+    let mut restricted_history = History::new(cfg.offload_dir.clone());
+    assert!(!remind_background_shells(
+        &restricted,
+        &mut restricted_history
+    ));
+    assert!(restricted_history.messages().is_empty());
+    let summary = Message::injected(Injected::ContextSummary, "compacted work");
+    history.replace_all(vec![summary.clone()]);
+    assert!(remind_background_shells(&cfg, &mut history));
+    assert_eq!(history.messages(), &[summary, expected]);
+    cfg.background_shells
+        .shutdown(std::time::Duration::from_secs(1))
+        .await;
+    assert!(!remind_background_shells(&cfg, &mut history));
+    assert_eq!(history.messages().len(), 2);
+}
+
 /// The same reminder seen from the loop rather than from its own function: a
 /// real `run_turn` over a mock provider that writes a list and then works
 /// without touching it. The reminder has to arrive as a user message of its

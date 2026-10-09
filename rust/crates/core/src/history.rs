@@ -95,6 +95,7 @@ pub struct History {
     /// Which results requests carry as stubs (`request_reduction`). Never in
     /// `items`; the stubs themselves are `request_stub` lines in the rollout.
     reduction: ReductionState,
+    background_wait_reminder: Option<String>,
 }
 
 impl History {
@@ -112,6 +113,7 @@ impl History {
             next_memory_boundary: 1,
             staged: Vec::new(),
             reduction: ReductionState::default(),
+            background_wait_reminder: None,
         }
     }
 
@@ -145,6 +147,7 @@ impl History {
             rollout: Some(resumed.rollout),
             staged: Vec::new(),
             reduction: ReductionState::resumed(quiet_since, resumed.request_stubs),
+            background_wait_reminder: None,
         }
     }
 
@@ -171,6 +174,7 @@ impl History {
         self.rollout = Some(resumed.rollout);
         self.usage_anchor = None;
         self.compaction_breaker = CompactionBreaker::default();
+        self.background_wait_reminder = None;
         for stub in &carried {
             self.persist(|rollout| rollout.append_request_stub(stub));
         }
@@ -211,6 +215,21 @@ impl History {
     pub fn record(&mut self, msg: Message) {
         self.commit_staged();
         self.record_committed(msg);
+    }
+
+    pub(crate) fn record_background_wait_reminder(&mut self, reminder: Option<String>) -> bool {
+        if self.background_wait_reminder == reminder {
+            return false;
+        }
+        self.background_wait_reminder = reminder.clone();
+        let Some(reminder) = reminder else {
+            return false;
+        };
+        self.record(Message::injected(
+            kloop_protocol::Injected::Harness,
+            reminder,
+        ));
+        true
     }
 
     fn record_committed(&mut self, mut msg: Message) {
@@ -688,6 +707,7 @@ impl History {
         self.usage_anchor = None;
         self.compaction_breaker.record_success();
         self.reduction.reset();
+        self.background_wait_reminder = None;
     }
 
     /// Bound one round's tool results *together*. Each result has already
