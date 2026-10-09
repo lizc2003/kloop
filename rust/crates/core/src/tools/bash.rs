@@ -1169,7 +1169,12 @@ async fn monitor(monitor: BackgroundMonitor) {
                 summary,
             });
         }
-        debug_assert!(shells.complete_finish(&registration, status));
+        // The call itself cannot live inside `debug_assert!`: the macro does
+        // not evaluate its argument without `debug_assertions`, so a release
+        // build would leave every shell `Finishing` — active forever, and a
+        // blocking `bash_output` on it could only ever run out its clock.
+        let recorded = shells.complete_finish(&registration, status);
+        debug_assert!(recorded);
     }
 }
 
