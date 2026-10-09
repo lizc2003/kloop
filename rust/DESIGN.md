@@ -4192,7 +4192,7 @@ snapshot is not a runtime dependency.
 ## Running
 
 From the repository root a `Makefile` wraps the commands below: `make` (release
-build), `make debug`, `make test`, `make check` (fmt + clippy + test + parity — what
+build), `make debug`, `make test`, `make check` (fmt + clippy + test + test-release + parity — what
 to run before a commit; parity asserts kloop's own native reports against the
 local corpus, which is the one place a behavior change shows up red when every
 test is still green, and skips on a machine without the corpus), `make mock`,

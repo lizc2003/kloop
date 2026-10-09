@@ -5,7 +5,7 @@
 #
 #   make                 release 构建
 #   make test            全量测试
-#   make check           fmt --check + clippy -D warnings + test + parity(提交前的门禁,本地唯一一道)
+#   make check           fmt --check + clippy -D warnings + test + test-release + parity(提交前的门禁,本地唯一一道)
 #   make install         装二进制;没有配置时顺带铺一份 config-demo
 #   make help            列出所有目标
 
@@ -22,7 +22,7 @@ CONFIG := $(KLOOP_DIR)/config.toml
 CONFIG_DEMO := config/config-demo.toml
 
 .DEFAULT_GOAL := all
-.PHONY: all build debug test fmt fmt-check clippy check parity mock install install-config uninstall clean help
+.PHONY: all build debug test test-release fmt fmt-check clippy check parity mock install install-config uninstall clean help
 
 all: build
 
@@ -35,6 +35,12 @@ debug:
 test:
 	cd $(RUST_DIR) && $(CARGO) test --locked --workspace
 
+# release 下再跑一遍 kloop-core 的库测试:带副作用的调用若落在 debug_assert 这类只在
+# debug 生效的位置,行为差异只在 release 里显现,而 debug 门禁必然全绿(教训 218)。
+# 范围取整个 core 库、不按关键字过滤——过滤器会在测试改名后静默变窄。
+test-release:
+	cd $(RUST_DIR) && $(CARGO) test --locked --release -p kloop-core --lib
+
 fmt:
 	cd $(RUST_DIR) && $(CARGO) fmt --all
 
@@ -46,7 +52,7 @@ clippy:
 
 # parity 在 check 里:它断言 kloop 自己原生报告里的行为,改了行为只跑 test 是绿的,
 # 只有它会红(教训 156)。没有语料的机器上它跳过,不拖累别处。
-check: fmt-check clippy test parity
+check: fmt-check clippy test test-release parity
 
 # Claude Code 2.1.220 的 parity 语料。语料不在版本控制里(见 .gitignore),
 # 只在当初生成它的机器上;别处跑 make parity 会跳过而不是报错。
@@ -100,9 +106,10 @@ help:
 	@echo "  build (default)  release 构建 -> $(RELEASE_BIN)"
 	@echo "  debug            debug 构建"
 	@echo "  test             cargo test --workspace"
+	@echo "  test-release     cargo test --release -p kloop-core --lib(release-only 差异)"
 	@echo "  fmt / fmt-check  rustfmt 写入 / 只检查"
 	@echo "  clippy           clippy --all-targets --all-features -D warnings"
-	@echo "  check            fmt-check + clippy + test + parity"
+	@echo "  check            fmt-check + clippy + test + test-release + parity"
 	@echo "  parity           Claude Code 语料校验(只在有语料的机器上)"
 	@echo "  mock             cargo run -- --mock,无 key 冒烟"
 	@echo "  install          装到 $(BINDIR)/$(BIN);缺配置时铺一份 $(CONFIG)"
