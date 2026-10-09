@@ -91,11 +91,12 @@ static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
 #[serde(deny_unknown_fields)]
 struct BashInput {
     command: String,
-    /// Display-only, same contract as run_agent's: the UI reads it off the raw
-    /// call and nothing in here does. Declared so `deny_unknown_fields` accepts
-    /// it; its constraints are checked in `parse_bash_input`.
+    /// Display-only, same contract as run_agent's: it never reaches the shell.
+    /// Declared so `deny_unknown_fields` accepts it; its constraints are checked
+    /// in `parse_bash_input`, and a background call carries it into the task's
+    /// label so the lifecycle row reads as the model's summary.
     #[serde(default, rename = "description")]
-    _description: Option<String>,
+    description: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -224,7 +225,7 @@ pub(super) async fn bash_tool(
         // No timeout in background mode; the watchdog and stop_bash are the
         // safety net.
         return ctx.cfg.background_shells.spawn_background(
-            command,
+            &parsed,
             &cwd,
             sandbox.as_deref(),
             bash,
@@ -706,13 +707,15 @@ impl BackgroundShells {
     /// time, not per write (verified against the real sandbox-exec).
     fn spawn_background(
         self: &Arc<Self>,
-        command: &str,
+        input: &BashInput,
         cwd: &Path,
         sandbox: Option<&SandboxPolicy>,
         bash: &ShellProgram,
         ctx: &ToolCtx,
         workspace: &EffectiveWorkspace,
     ) -> Result<String> {
+        let command = input.command.as_str();
+        let description = input.description.as_deref().unwrap_or("");
         let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
@@ -780,7 +783,8 @@ impl BackgroundShells {
             id: id.clone(),
             run_id: None,
             kind: BackgroundTaskKind::Bash,
-            description: command.to_string(),
+            description: description.to_string(),
+            command: Some(command.to_string()),
             status: BackgroundTaskStatus::Running,
             output_path: Some(path.to_string_lossy().to_string()),
             detail: None,
@@ -791,6 +795,7 @@ impl BackgroundShells {
             shells: Arc::downgrade(self),
             registration,
             command: command.to_string(),
+            description: description.to_string(),
             child,
             killer,
             kill,
@@ -1053,6 +1058,10 @@ struct BackgroundMonitor {
     shells: Weak<BackgroundShells>,
     registration: BackgroundShellRegistration,
     command: String,
+    /// The model's one-line label, empty when it gave none; the terminal
+    /// notification uses it (via [`BackgroundTask::label`]) instead of re-quoting
+    /// the command.
+    description: String,
     child: ProcessTreeChild,
     killer: ProcessTreeKiller,
     kill: CancellationToken,
@@ -1069,6 +1078,7 @@ async fn monitor(monitor: BackgroundMonitor) {
         shells,
         registration,
         command,
+        description,
         mut child,
         killer,
         kill,
@@ -1143,19 +1153,25 @@ async fn monitor(monitor: BackgroundMonitor) {
             BackgroundTaskStatus::Cancelled => "cancelled",
         };
         let output_path = output_path.to_string_lossy().to_string();
-        let summary = match detail.as_deref() {
-            Some(detail) => format!("Background command {command:?} {status_label}: {detail}"),
-            None => format!("Background command {command:?} {status_label}"),
-        };
-        ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
+        let task = BackgroundTask {
             id: id.clone(),
             run_id: None,
             kind: BackgroundTaskKind::Bash,
-            description: command,
+            description,
+            command: Some(command),
             status: event_status,
             output_path: Some(output_path.clone()),
             detail: detail.clone(),
-        }));
+        };
+        // Name the job by the model's own label, falling back to the command for
+        // a shell it never described: the model already has its call, so
+        // re-quoting the command only made a long history line, and the status
+        // already rides the `[{id}] {status}` frame above.
+        let summary = match detail.as_deref() {
+            Some(detail) => format!("{} · {detail}", task.label()),
+            None => task.label().to_string(),
+        };
+        ui.emit(&Event::BackgroundTaskUpdated(task));
         let closing = event_status == BackgroundTaskStatus::Cancelled
             && matches!(
                 detail.as_deref(),
@@ -1947,7 +1963,7 @@ Wait-Process -Id $grandchild.Id
         let (ctx, ui) = recording_ctx("bg-events");
         let (out, is_error) = run_tool(
             "bash",
-            json!({"command": "printf done", "background": true}),
+            json!({"command": "printf done", "background": true, "description": "Print done"}),
             &ctx,
         )
         .await;
@@ -1967,9 +1983,14 @@ Wait-Process -Id $grandchild.Id
             })
             .collect::<Vec<_>>();
         assert_eq!(updates.len(), 2, "{updates:?}");
-        assert_eq!(updates[0].description, "printf done");
+        // The label is the model's description; the command rides its own field
+        // so the lifecycle row can show it whole on a line of its own.
+        assert_eq!(updates[0].description, "Print done");
+        assert_eq!(updates[0].command.as_deref(), Some("printf done"));
         assert_eq!(updates[0].status, BackgroundTaskStatus::Running);
         assert!(updates[0].output_path.is_some());
+        assert_eq!(updates[1].description, "Print done");
+        assert_eq!(updates[1].command.as_deref(), Some("printf done"));
         assert_eq!(updates[1].status, BackgroundTaskStatus::Completed);
         assert_eq!(updates[1].detail.as_deref(), Some("exit 0"));
         assert_eq!(updates[1].output_path, updates[0].output_path);
@@ -1985,9 +2006,32 @@ Wait-Process -Id $grandchild.Id
                 assert_eq!(notified_id, &id);
                 assert_eq!(status, "completed");
                 assert_eq!(Some(output_path), updates[1].output_path.as_ref());
-                assert!(summary.contains("printf done"), "{summary}");
-                assert!(summary.contains("exit 0"), "{summary}");
+                // The label names the job; the raw command is not re-quoted.
+                assert_eq!(summary, "Print done · exit 0");
             }
+            other => panic!("expected ShellResult, got {other:?}"),
+        }
+    }
+
+    /// A shell the model never described still reads as the command it ran.
+    #[tokio::test]
+    async fn background_shell_without_a_description_falls_back_to_the_command() {
+        let (ctx, _ui) = recording_ctx("bg-nodesc");
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": "printf done", "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        let id = bg_id(&out);
+        let (out, is_error) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+        assert!(!is_error, "{out}");
+
+        let items = ctx.cfg.inbox.drain();
+        assert_eq!(items.len(), 1, "{items:?}");
+        match &items[0] {
+            InboxItem::ShellResult { summary, .. } => assert_eq!(summary, "printf done · exit 0"),
             other => panic!("expected ShellResult, got {other:?}"),
         }
     }

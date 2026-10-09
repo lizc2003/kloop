@@ -428,6 +428,7 @@ fn emit_workflow(
         run_id: Some(run_id.to_string()),
         kind: BackgroundTaskKind::Workflow,
         description: description.to_string(),
+        command: None,
         status,
         output_path,
         detail,

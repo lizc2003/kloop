@@ -68,10 +68,32 @@ pub struct BackgroundTask {
     /// Workflows use `wf_*`; ordinary shell and Agent work is execution-id-only.
     pub run_id: Option<String>,
     pub kind: BackgroundTaskKind,
+    /// The model's one-line label for the task — the `description` argument of
+    /// the tool that launched it, empty when the model gave none. A background
+    /// shell may omit it; the other kinds always carry one.
     pub description: String,
+    /// The exact shell command, `Bash` only. Kept separate from the label so the
+    /// lifecycle row can show both: the label identifies the task, the command
+    /// gets a row of its own instead of being truncated inside the title.
+    pub command: Option<String>,
     pub status: BackgroundTaskStatus,
     pub output_path: Option<String>,
     pub detail: Option<String>,
+}
+
+impl BackgroundTask {
+    /// One string that names the task for a one-line projection: the model's
+    /// label, falling back to the command it ran. The TUI row reads both fields
+    /// directly (it has two rows to spend); every single-line projection — the
+    /// note, the terminal inbox message — goes through here so a shell the model
+    /// left unlabelled still reads as the command it was.
+    pub fn label(&self) -> &str {
+        if self.description.is_empty() {
+            self.command.as_deref().unwrap_or("")
+        } else {
+            &self.description
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,7 +248,7 @@ fn background_task_note(task: &BackgroundTask) -> String {
         BackgroundTaskStatus::Failed => "Failed",
         BackgroundTaskStatus::Cancelled => "Cancelled",
     };
-    let mut note = format!("{kind}({}) · {status} · {}", task.description, task.id);
+    let mut note = format!("{kind}({}) · {status} · {}", task.label(), task.id);
     if let Some(run_id) = &task.run_id {
         note.push_str(&format!(" · resumable as {run_id}"));
     }
@@ -434,6 +456,7 @@ mod tests {
             run_id: Some("run-123".into()),
             kind: BackgroundTaskKind::Program,
             description: "run checks".into(),
+            command: None,
             status: BackgroundTaskStatus::Cancelled,
             output_path: None,
             detail: Some("session shutdown".into()),
@@ -453,6 +476,7 @@ mod tests {
             run_id: Some("wf_abc".into()),
             kind: BackgroundTaskKind::Workflow,
             description: "review changes".into(),
+            command: None,
             status: BackgroundTaskStatus::Running,
             output_path: None,
             detail: Some("Verify 2/4".into()),
@@ -464,11 +488,13 @@ mod tests {
             )
         );
 
+        // A shell the model left unlabelled falls back to the command it ran.
         let bash = Event::BackgroundTaskUpdated(BackgroundTask {
             id: "bg-9".into(),
             run_id: None,
             kind: BackgroundTaskKind::Bash,
-            description: "cargo test".into(),
+            description: String::new(),
+            command: Some("cargo test".into()),
             status: BackgroundTaskStatus::Completed,
             output_path: Some("/tmp/bg-9.out".into()),
             detail: Some("exit code 0".into()),
@@ -476,6 +502,22 @@ mod tests {
         assert_eq!(
             bash.as_note().as_deref(),
             Some("Bash(cargo test) · Completed · bg-9 · exit code 0 · output: /tmp/bg-9.out")
+        );
+
+        // A labelled shell names the task by that label, never by the command.
+        let described = Event::BackgroundTaskUpdated(BackgroundTask {
+            id: "bg-10".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Bash,
+            description: "Run the gate".into(),
+            command: Some("cd /somewhere && cargo test --workspace".into()),
+            status: BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: None,
+        });
+        assert_eq!(
+            described.as_note().as_deref(),
+            Some("Bash(Run the gate) · Running · bg-10")
         );
     }
 

@@ -273,7 +273,7 @@ fn tool_command(name: &str, input: &str) -> Option<String> {
 }
 
 /// The shell-command row: dim, indented to the preview's gutter, one line.
-fn command_line(command: &str, width: usize) -> Line<'static> {
+pub(crate) fn command_line(command: &str, width: usize) -> Line<'static> {
     let content_w = width.saturating_sub(display_width(COMMAND_GUTTER)).max(1);
     Line::from(vec![
         Span::raw(COMMAND_GUTTER.to_string()),

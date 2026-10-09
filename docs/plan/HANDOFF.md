@@ -35,6 +35,18 @@ harness 消息通道，不能只塞进回执。单测验证注入位置和去重
 排序复审补充：稳定顺序也是文本去重的契约，应由共享生成入口保证；乱序输入现在同时
 验证完整正文、示例 ID 与去重，生产路径接收原有 `Vec` 原地排序，不增加拷贝。
 
+**后台 bash 的显示与历史文本（2026-10-09，plan 221）**：用户报「异步 Bash 的命令不单起一行，
+看不清」。固定的后台任务行把命令塞在标题尾部（`Bash(bg-N) <命令>`），一长就被截；根因是
+`BackgroundTask.description` 对 bash 存的就是命令本身，标签与命令挤在一个字段。现在拆开：
+`description` 在所有 kind 里都只表示模型写的一句标签，命令进独立的 `command: Option<String>`；
+TUI 行读 `Kind(id) 描述` + 命令单占一行，note 与终态历史消息统一走 `BackgroundTask::label()`
+（描述非空用它，否则回退命令）。终态消息也不再抄整条命令、不再重复状态（`[{id}] {status}` 已带）。
+模型侧口径不变：启动回执与 plan 220 的 harness 提醒都只认 `bg-N`，且是实测文案，本次不动——
+改它们要重跑 plan 220 的采样。
+教训：`Kind(描述) · 状态 · id` 那条 note 是前端降级（`Event::as_note` 喂 TUI / plain / headless /
+server），core 从不写进 `History`；plan 219 曾把它记成「模型面向、被实测过的措辞」。把显示层
+误当模型输入，会让一次纯 UI 改动多付一次没必要的实测。
+
 > 全局约束(定位、工作方式、风格、偏好)在根目录 CLAUDE.md(自动加载)。本文件是细节:读完即可开工,无需重新调研。参考库知识在 `refs/README.md`;与 cc/codex 的能力差距与补齐路线在 `docs/capability-report.md`(补能力前对着挑项,完成后销账)。
 
 ## 〇′、批外五条:plan 200–204(2026-09-23 立,来自 `refs/chord` 调研)

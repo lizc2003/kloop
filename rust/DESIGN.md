@@ -1592,8 +1592,8 @@ then the turn's items as
 `text`/`reasoning`/`output`) / `item/completed`, where `item.type` ∈
 `assistant_message` / `reasoning` / `tool_call` / `sub_agent` (a tool call
 carries its full `input`, and `output` + `agent` label when present); plus
-`thread/background_task/updated {task:{id, kind, description, status,
-output_path?, detail?, run_id?}}` for session-scoped bash/agent/program/workflow work (`run_id` is present for Program `run-*` and Workflow `wf_*`; **no
+`thread/background_task/updated {task:{id, kind, description, command?,
+status, output_path?, detail?, run_id?}}` for session-scoped bash/agent/program/workflow work (`run_id` is present for Program `run-*` and Workflow `wf_*`; **no
 `turn_id`**, because completion may arrive after the launching turn),
 `thread/agent_message/updated {message_id,from,to,summary,status}`
 for the separate Local Agent Mailbox lifecycle (`status` ∈ `queued` / `delivered` /
@@ -2329,7 +2329,12 @@ contract as `run_agent`/`run_program`: at most 200 Unicode characters, nonblank,
 single-line, control-character-free, and rejected before anything is spawned.
 It never reaches the shell and never changes the result — the transcript
 row leads with it and keeps the command after it, so a row truncated to a narrow
-terminal still says what a long one-liner is for.
+terminal still says what a long one-liner is for. The session-owned background
+lifecycle row (`BackgroundTaskUpdated`, below) reads the same way: `Bash(bg-N)`
+and the description lead, and the command gets a full-width row of its own. When
+the model gave no description, the one-line projections fall back to the command;
+the terminal notification written into history names the job by that label
+instead of re-quoting the whole command.
 
 The schema keeps it optional (a call without one runs as before), but its prose
 says what the field is for and asks for one on every call. A model settles on

@@ -410,6 +410,12 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
             ]));
+            // A shell's command gets a full-width row of its own, exactly as the
+            // transcript row for the same tool does: sharing the title truncated
+            // it precisely when it was longest.
+            if let Some(command) = &task.command {
+                lines.push(crate::toolrow::command_line(&format!("$ {command}"), width));
+            }
             let mut identity = background_status(task.status).to_string();
             if let Some(run_id) = &task.run_id {
                 identity.push_str(&format!(" · resumable as {run_id}"));
@@ -3123,6 +3129,7 @@ mod tests {
                 run_id: None,
                 kind: BackgroundTaskKind::Agent,
                 description: "long audit".into(),
+                command: None,
                 status,
                 output_path: None,
                 detail: None,
@@ -3286,6 +3293,7 @@ mod tests {
             run_id: Some("wf_3".into()),
             kind: BackgroundTaskKind::Workflow,
             description: "review changes".into(),
+            command: None,
             status: BackgroundTaskStatus::Running,
             output_path: None,
             detail: Some("Verify 2/4".into()),
@@ -3306,6 +3314,7 @@ mod tests {
             run_id: Some("run-2".into()),
             kind: BackgroundTaskKind::Program,
             description: "run checks".into(),
+            command: None,
             status: BackgroundTaskStatus::Failed,
             output_path: Some("/tmp/run-2/error.txt".into()),
             detail: Some("exit code 1".into()),
@@ -3336,6 +3345,7 @@ mod tests {
                 run_id: None,
                 kind: BackgroundTaskKind::Bash,
                 description: description.into(),
+                command: None,
                 status: BackgroundTaskStatus::Running,
                 output_path: None,
                 detail: None,
@@ -3355,6 +3365,78 @@ mod tests {
         // Only the description is ever cut: where the width fits, all of it lands.
         let roomy = line_text(&cell_lines(&task("bg-9"), 120)[0]);
         assert!(roomy.ends_with("test-threads=1"), "{roomy:?}");
+    }
+
+    /// A shell's command rides a full-width row of its own, the way the
+    /// transcript row for the same tool does: the title keeps the model's label
+    /// (or just the handle when it gave none), and a command long enough to fill
+    /// a narrow terminal is cut on its own row, never in the title.
+    #[test]
+    fn a_background_shell_command_gets_its_own_row() {
+        let described = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+            id: "bg-1".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Bash,
+            description: "Run the gate".into(),
+            command: Some("cd /somewhere && cargo test --workspace".into()),
+            status: BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: None,
+        });
+        assert_eq!(
+            cell_lines(&described, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec![
+                "● Bash(bg-1) Run the gate",
+                "  $ cd /somewhere && cargo test --workspace",
+                "  Running",
+            ]
+        );
+
+        let unlabelled = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+            id: "bg-2".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Bash,
+            description: String::new(),
+            command: Some("find . -name '*.tmp' -delete".into()),
+            status: BackgroundTaskStatus::Completed,
+            output_path: Some("/tmp/bg-2.out".into()),
+            detail: Some("exit 0".into()),
+        });
+        assert_eq!(
+            cell_lines(&unlabelled, 80)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            vec![
+                "✓ Bash(bg-2)",
+                "  $ find . -name '*.tmp' -delete",
+                "  Completed",
+                "  exit 0",
+                "  output: /tmp/bg-2.out",
+            ]
+        );
+
+        let long = Cell::BackgroundTask(kloop_core::event::BackgroundTask {
+            id: "bg-3".into(),
+            run_id: None,
+            kind: BackgroundTaskKind::Bash,
+            description: String::new(),
+            command: Some("x".repeat(300)),
+            status: BackgroundTaskStatus::Running,
+            output_path: None,
+            detail: None,
+        });
+        for width in [80, 40, 24] {
+            let lines = cell_lines(&long, width);
+            let title = line_text(&lines[0]);
+            let command = line_text(&lines[1]);
+            assert!(title.starts_with("● Bash(bg-3)"), "{width}: {title:?}");
+            assert!(display_width(&title) <= width, "{width}: {title:?}");
+            assert!(display_width(&command) <= width, "{width}: {command:?}");
+        }
     }
 
     #[test]
@@ -3391,6 +3473,7 @@ mod tests {
                 run_id: None,
                 kind: BackgroundTaskKind::Agent,
                 description: "detail says failed cancelled completed".into(),
+                command: None,
                 status,
                 output_path: None,
                 detail: Some("running failed cancelled completed".into()),

@@ -2116,6 +2116,7 @@ mod tests {
             run_id: None,
             kind: BackgroundTaskKind::Agent,
             description: "long audit".into(),
+            command: None,
             status,
             output_path: None,
             detail: None,
