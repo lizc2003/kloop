@@ -793,8 +793,11 @@ impl BackgroundShells {
         }));
         Ok(format!(
             "Command running in background with ID: {id}. Output is being written to: {}. \
-             You will be notified when it changes state. Check on it with bash_output; stop it \
-             with stop_bash.",
+             You will be notified when it changes state. If your next step depends on this \
+             command, wait with bash_output {{\"bash_id\":\"{id}\",\"block\":true,\"timeout_ms\":{BLOCK_TIMEOUT_MAX_MS}}}. \
+             It returns as soon as the command finishes; timeout_ms is only a maximum wait. \
+             Do not use sleep or shell polling to wait for it. Use block=false to peek \
+             without waiting; stop it with stop_bash.",
             path.display()
         ))
     }
@@ -1776,6 +1779,20 @@ Wait-Process -Id $grandchild.Id
         assert!(out.contains("Command running in background with ID: bg-"));
         assert!(out.contains("Output is being written to:"));
         let id = bg_id(&out);
+        let wait_input: serde_json::Value = serde_json::from_str(
+            out.split("wait with bash_output ")
+                .nth(1)
+                .unwrap()
+                .split(". It returns")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wait_input,
+            json!({"bash_id": id, "block": true, "timeout_ms": 600_000})
+        );
+        assert!(out.contains("Do not use sleep or shell polling to wait for it."));
         let receipt = {
             let registry = ctx.cfg.background_shells.state.lock().unwrap();
             Arc::clone(&registry.shells.get(&id).unwrap().receipt)
@@ -1791,8 +1808,12 @@ Wait-Process -Id $grandchild.Id
             DeliveryRoute::ShellOutputPointer
         );
 
-        // block=true (default) waits for completion.
-        let (out, is_error) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+        let (out, is_error) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_tool("bash_output", wait_input, &ctx),
+        )
+        .await
+        .expect("bash_output waited for the full timeout instead of returning on completion");
         assert!(!is_error, "{out}");
         assert!(out.contains(&format!("{id}: completed (exit 0)")), "{out}");
         assert!(out.contains("bg-hello"), "stdout captured: {out}");

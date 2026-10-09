@@ -687,19 +687,21 @@ fn bash_def() -> ToolDef {
             .remove("disable_sandbox");
         def
     };
+    let mut def = def;
+    def.description.push_str(" When your next step depends on a background command, call bash_output with its bg-N id and block=true. Its timeout_ms is only a maximum wait; it returns as soon as the command finishes. Do not use sleep or shell polling to wait for a background command. Use block=false only to inspect current output without waiting.");
     def
 }
 
 fn bash_output_def() -> ToolDef {
     ToolDef {
         name: "bash_output".into(),
-        description: "Retrieve the status and output of a background bash command. Blocks until it finishes by default (up to timeout_ms); pass block=false to peek without waiting. Returns the tail of the output; read the output file for the rest.".into(),
+        description: "Wait for a specific background bash command and retrieve its status and output using the bg-N id from bash. Blocks until it finishes by default (block=true); timeout_ms is only a maximum wait, not a fixed delay, and completion returns immediately. Do not use sleep or shell polling to wait for a background command. Pass block=false to peek without waiting. Returns the tail of the output; read the output file for the rest.".into(),
         schema: json!({
             "type": "object",
             "properties": {
                 "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"},
                 "block": {"type": "boolean", "description": "Wait for completion (default true)"},
-                "timeout_ms": {"type": "integer", "description": "Max wait when blocking (default 30000, max 600000)"}
+                "timeout_ms": {"type": "integer", "description": "Maximum wait when blocking, not a fixed delay: returns early on completion (default 30000, max 600000). For slow commands choose a sufficient upper bound instead of repeated short waits."}
             },
             "required": ["bash_id"],
             "additionalProperties": false
@@ -970,6 +972,17 @@ mod tests {
         let cx = DefCx::default();
         for builtin in ALL {
             assert_eq!(builtin.def(&cx).name, builtin.name());
+        }
+    }
+
+    #[test]
+    fn background_bash_wait_contract_directs_the_model_to_bash_output() {
+        let bash = bash_def();
+        assert!(bash.description.contains("call bash_output"));
+        for definition in [bash, bash_output_def()] {
+            assert!(definition.description.contains("maximum wait"));
+            assert!(definition.description.contains("Do not use sleep"));
+            assert!(definition.description.contains("block=false"));
         }
     }
 

@@ -2386,11 +2386,13 @@ a file under the session store's `offload/`
 (`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
 returns immediately with the ID and the output path. Companions:
 
-- **bash_output** `{bash_id, block=true, timeout_ms=30000}` — blocks until
-  the command finishes (or the timeout), or peeks with `block=false`;
-  reports `running` / `completed (exit 0)` / `failed (exit N)` /
-  `killed (reason)` plus the last 30k bytes of output (read the file with
-  `read_file` for more). Read-only: skips the gate, joins concurrent batches.
+- **bash_output** `{bash_id, block=true, timeout_ms=30000}` — 等指定后台命令完成；
+  `timeout_ms` 是最长等待（最多 600,000 ms），不是固定延时，完成就提前返回。
+  下一步依赖该命令时，模型应使用它，不得以 `sleep` 或 shell 轮询代替；
+  `bash` 与 `bash_output` 的工具说明都写明此约束，启动回执给出带实际 ID 的
+  `bash_output` 调用示例。无需等待时可以继续其他工作；`block=false` 只读当前状态和输出。
+  返回 `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`
+  及最后 30k bytes 的输出（更多内容用 `read_file` 读输出文件）。只读：跳过审批门，可并发。
 - **stop_bash** `{bash_id}` — terminates the whole owned process tree and waits
   for the registry to confirm. Auto-allowed: it can only signal processes this
   agent itself started.
