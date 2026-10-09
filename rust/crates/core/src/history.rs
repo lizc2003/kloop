@@ -1111,10 +1111,12 @@ mod tests {
     fn background_wait_memo_tracks_changed_and_cleared_reminders() {
         let mut history = History::new(temp_dir("background-wait-memo"));
         let first =
-            crate::tools::BackgroundShells::wait_reminder_for_ids(&["bg-1".into()]).unwrap();
-        let second =
-            crate::tools::BackgroundShells::wait_reminder_for_ids(&["bg-1".into(), "bg-2".into()])
-                .unwrap();
+            crate::tools::BackgroundShells::wait_reminder_for_ids(vec!["bg-1".into()]).unwrap();
+        let second = crate::tools::BackgroundShells::wait_reminder_for_ids(vec![
+            "bg-2".into(),
+            "bg-1".into(),
+        ])
+        .unwrap();
         let mut expected = Vec::new();
         for reminder in [&first, &second] {
             assert!(history.record_background_wait_reminder(Some(reminder.clone())));
@@ -1126,6 +1128,13 @@ mod tests {
             assert!(!history.record_background_wait_reminder(Some(reminder.clone())));
             assert_eq!(history.messages(), expected);
         }
+        assert!(!history.record_background_wait_reminder(
+            crate::tools::BackgroundShells::wait_reminder_for_ids(vec![
+                "bg-1".into(),
+                "bg-2".into(),
+            ])
+        ));
+        assert_eq!(history.messages(), expected);
         assert!(!history.record_background_wait_reminder(None));
         assert_eq!(history.background_wait_reminder, None);
         assert_eq!(history.messages(), expected);
@@ -1139,7 +1148,7 @@ mod tests {
         let dir = temp_dir("background-wait-rewrite");
         let mut history = History::new(dir.clone());
         let reminder =
-            crate::tools::BackgroundShells::wait_reminder_for_ids(&["bg-1".into()]).unwrap();
+            crate::tools::BackgroundShells::wait_reminder_for_ids(vec!["bg-1".into()]).unwrap();
         let injected = Message::injected(kloop_protocol::Injected::Harness, reminder.clone());
         assert!(history.record_background_wait_reminder(Some(reminder.clone())));
         let summary = Message::injected(kloop_protocol::Injected::ContextSummary, "compacted");

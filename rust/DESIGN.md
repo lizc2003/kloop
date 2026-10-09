@@ -2426,8 +2426,10 @@ At sampling boundaries, active shell IDs also produce a separate
 output as data, so the launch receipt alone is not the authoritative channel
 for the waiting instruction. The reminder directs dependent work to blocking
 `bash_output`, including commands whose results go to another log file;
-independent work can continue. It lists only active native jobs in stable ID
-order and is suppressed when the agent cannot use `bash_output`. The registry
+independent work can continue. It lists only active native jobs. The reminder
+builder sorts IDs lexicographically before rendering the list and choosing the
+example ID, so callers need not sort them. It is suppressed when the agent
+cannot use `bash_output`. The registry
 is session-scoped and shared with sub-agents: a child with access to
 `bash_output` receives the same active-job list in its own history and can read
 the parent or a peer's job through that tool. This reminder is deliberately not

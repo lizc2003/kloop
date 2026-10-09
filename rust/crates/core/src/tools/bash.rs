@@ -813,7 +813,7 @@ impl BackgroundShells {
     }
 
     pub(crate) fn wait_reminder(&self) -> Option<String> {
-        let mut ids: Vec<String> = self
+        let ids: Vec<String> = self
             .state
             .lock()
             .unwrap()
@@ -822,11 +822,11 @@ impl BackgroundShells {
             .filter(|(_, shell)| shell.status.is_active())
             .map(|(id, _)| id.clone())
             .collect();
-        ids.sort();
-        Self::wait_reminder_for_ids(&ids)
+        Self::wait_reminder_for_ids(ids)
     }
 
-    pub(crate) fn wait_reminder_for_ids(ids: &[String]) -> Option<String> {
+    pub(crate) fn wait_reminder_for_ids(mut ids: Vec<String>) -> Option<String> {
+        ids.sort();
         let id = ids.first()?;
         let commands = ids
             .iter()
@@ -1222,13 +1222,26 @@ mod tests {
 
     #[test]
     fn background_wait_reminder_matches_the_measured_wording() {
-        assert_eq!(super::BackgroundShells::wait_reminder_for_ids(&[]), None);
+        assert_eq!(
+            super::BackgroundShells::wait_reminder_for_ids(Vec::new()),
+            None
+        );
         for (ids, commands, example_id) in [
             (vec!["bg-12".into()], "- bg-12", "bg-12"),
             (
                 vec!["bg-10".into(), "bg-11".into(), "bg-12".into()],
                 "- bg-10\n- bg-11\n- bg-12",
                 "bg-10",
+            ),
+            (
+                vec!["bg-12".into(), "bg-10".into(), "bg-11".into()],
+                "- bg-10\n- bg-11\n- bg-12",
+                "bg-10",
+            ),
+            (
+                vec!["bg-2".into(), "bg-1".into(), "bg-10".into()],
+                "- bg-1\n- bg-10\n- bg-2",
+                "bg-1",
             ),
         ] {
             let expected = format!(
@@ -1242,7 +1255,7 @@ mod tests {
                  </system-reminder>"
             );
             assert_eq!(
-                super::BackgroundShells::wait_reminder_for_ids(&ids),
+                super::BackgroundShells::wait_reminder_for_ids(ids),
                 Some(expected)
             );
         }

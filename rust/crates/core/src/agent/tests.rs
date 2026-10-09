@@ -266,8 +266,7 @@ async fn background_wait_tracks_new_jobs_and_is_shared_with_subagents() {
             .unwrap()
             .to_owned();
         ids.push(id);
-        ids.sort();
-        let reminder = crate::tools::BackgroundShells::wait_reminder_for_ids(&ids).unwrap();
+        let reminder = crate::tools::BackgroundShells::wait_reminder_for_ids(ids.clone()).unwrap();
         assert_eq!(
             cfg.background_shells.wait_reminder(),
             Some(reminder.clone())
