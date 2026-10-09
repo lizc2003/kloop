@@ -570,12 +570,7 @@ pub(super) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<Str
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
-    let status_line = match &status {
-        BgStatus::Running | BgStatus::Stopping if block => {
-            format!("{id}: still {} after {timeout_ms}ms", status_text(&status))
-        }
-        _ => format!("{id}: {}", status_text(&status)),
-    };
+    let status_line = wait_status_line(id, &status, block, timeout_ms);
     let mut tail = read_tail(&path).await;
     if let (BgStatus::Exited(code), Some(sb)) = (&status, sandboxed)
         && *code != Some(0)
@@ -628,6 +623,18 @@ enum BgStatus {
 impl BgStatus {
     fn is_active(&self) -> bool {
         matches!(self, Self::Running | Self::Stopping | Self::Finishing)
+    }
+}
+
+/// The one line `bash_output` answers with. A wait that ran out of time says so
+/// and names how long it waited — for *every* active state, `Finishing`
+/// included: that one is not a finished job either, and reading it as a terminal
+/// report is exactly how a timed-out wait gets mistaken for a done one.
+fn wait_status_line(id: &str, status: &BgStatus, block: bool, timeout_ms: u64) -> String {
+    if block && status.is_active() {
+        format!("{id}: still {} after {timeout_ms}ms", status_text(status))
+    } else {
+        format!("{id}: {}", status_text(status))
     }
 }
 
@@ -1195,7 +1202,10 @@ async fn read_tail(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::BLOCK_TIMEOUT_MAX_MS;
+    use super::BgStatus;
     use super::FOREGROUND_OUTPUT_CAP_CHARS;
+    use super::status_text;
+    use super::wait_status_line;
     use crate::event::BackgroundTaskStatus;
     use crate::event::Event;
     use crate::execution_provenance::DeliveryRoute;
@@ -1839,6 +1849,38 @@ Wait-Process -Id $grandchild.Id
             "bounded output grew to {} characters",
             out.chars().count()
         );
+    }
+
+    /// A timed-out wait says so for every active state. `Finishing` is the one
+    /// that used to fall through to the terminal shape, which made a wait that
+    /// gave up read like a job that finished — hit for real on a 600s wait.
+    #[test]
+    fn a_timed_out_wait_is_reported_as_waiting_for_every_active_state() {
+        for (status, line) in [
+            (BgStatus::Running, "bg-1: still running after 30000ms"),
+            (BgStatus::Stopping, "bg-1: still stopping after 30000ms"),
+            (BgStatus::Finishing, "bg-1: still finishing after 30000ms"),
+            (BgStatus::Exited(Some(0)), "bg-1: completed (exit 0)"),
+            (BgStatus::Exited(Some(2)), "bg-1: failed (exit 2)"),
+            (BgStatus::Exited(None), "bg-1: failed (killed by signal)"),
+            (
+                BgStatus::Killed("session shutdown".into()),
+                "bg-1: killed (session shutdown)",
+            ),
+            (
+                BgStatus::Failed("wait failed".into()),
+                "bg-1: failed (wait failed)",
+            ),
+        ] {
+            assert_eq!(wait_status_line("bg-1", &status, true, 30_000), line);
+        }
+        // A peek never claims to be waiting; it reports the state itself.
+        for status in [BgStatus::Running, BgStatus::Stopping, BgStatus::Finishing] {
+            assert_eq!(
+                wait_status_line("bg-1", &status, false, 30_000),
+                format!("bg-1: {}", status_text(&status))
+            );
+        }
     }
 
     #[tokio::test]

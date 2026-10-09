@@ -2392,7 +2392,9 @@ returns immediately with the ID and the output path. Companions:
   returns early. Both tool descriptions direct dependent steps here instead of
   `sleep` or shell polling, and the launch receipt includes a runnable example
   with the actual ID. Steps without that dependency can continue other work.
-  Reports `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`
+  A wait that ran out of time says so — `still <state> after <timeout_ms>ms`,
+  for every active state including `Finishing` — while a peek or a finish
+  reports `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`,
   plus the last 30k bytes of output (read the file with `read_file` for more).
   Read-only: skips the gate, joins concurrent batches. These are instructions to
   the model; unit tests of the text and early return do not establish that the
