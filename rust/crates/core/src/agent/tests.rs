@@ -148,7 +148,7 @@ async fn background_wait_is_a_harness_message_after_the_receipt_and_survives_com
         MockTurn::Blocks(vec![tool_use_named(
             "start",
             "bash",
-            json!({"command": "sleep 30", "background": true}),
+            json!({"command": "while :; do sleep 1; done", "background": true}),
         )]),
         MockTurn::Blocks(vec![tool_use_named(
             "independent",
@@ -253,7 +253,7 @@ async fn background_wait_tracks_new_jobs_and_is_shared_with_subagents() {
     for _ in 0..3 {
         let (receipt, is_error) = run_tool(
             "bash",
-            json!({"command": "sleep 30", "background": true}),
+            json!({"command": "while :; do sleep 1; done", "background": true}),
             &ctx,
         )
         .await;

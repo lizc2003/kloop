@@ -1220,6 +1220,34 @@ mod tests {
     #[cfg(any(unix, windows))]
     static FOREGROUND_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn background_wait_reminder_matches_the_measured_wording() {
+        assert_eq!(super::BackgroundShells::wait_reminder_for_ids(&[]), None);
+        for (ids, commands, example_id) in [
+            (vec!["bg-12".into()], "- bg-12", "bg-12"),
+            (
+                vec!["bg-10".into(), "bg-11".into(), "bg-12".into()],
+                "- bg-10\n- bg-11\n- bg-12",
+                "bg-10",
+            ),
+        ] {
+            let expected = format!(
+                "<system-reminder>\nBackground bash commands are still running:\n{commands}\n\
+                 If your next step needs a command's result, wait for its ID with bash_output \
+                 {{\"bash_id\":\"{example_id}\",\"block\":true,\"timeout_ms\":{BLOCK_TIMEOUT_MAX_MS}}}. \
+                 timeout_ms is only an upper bound; completion returns immediately. Do not use \
+                 bash sleep or shell polling to wait for these commands, even if their actual \
+                 results are written to a separate log file. After bash_output finishes, read \
+                 that log as needed. Independent work can continue without waiting.\n\
+                 </system-reminder>"
+            );
+            assert_eq!(
+                super::BackgroundShells::wait_reminder_for_ids(&ids),
+                Some(expected)
+            );
+        }
+    }
+
     #[derive(Default)]
     struct RecordingUi {
         events: Mutex<Vec<Event>>,

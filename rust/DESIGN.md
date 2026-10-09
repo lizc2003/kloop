@@ -2443,6 +2443,10 @@ persisted with the history, leaving the system prompt and earlier cache prefix
 unchanged. Shell scripts retain their
 original semantics, including legitimate uses of `sleep`.
 
+Literal regression assertions pin the complete measured reminder wording
+independently of the renderer, with the timeout derived from its constant.
+They detect text drift; model compliance still requires real-model sampling.
+
 Session shutdown closes both background registries before worktree teardown,
 requests cooperative cancellation, then bounds the wait (worker abort or shell
 SIGKILL fallback). Late terminal events are thread/session scoped rather than
