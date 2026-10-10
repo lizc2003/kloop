@@ -4273,13 +4273,16 @@ snapshot is not a runtime dependency.
 
 ## Running
 
-From the repository root a `Makefile` wraps the commands below: `make` (release
-build), `make debug`, `make test`, `make check` (fmt + clippy + test + test-release + parity — what
-to run before a commit; parity asserts kloop's own native reports against the
-local corpus, which is the one place a behavior change shows up red when every
-test is still green, and skips on a machine without the corpus), `make mock`,
-`make parity`, `make help` for the rest. It shells
-into `rust/`, which is where the workspace lives.
+仓库根的 `Makefile` 包装工作区命令：`make` 构建 release，`make debug` 构建 debug，
+`make test` 跑 workspace 的 debug 全量测试。提交前运行 `make check`：fmt + clippy +
+debug 全量测试 + parity。parity 对照本机语料校验 kloop 自己的原生报告，能发现单测仍绿的
+行为漂移；没有语料时跳过。`make mock`、`make parity` 可单独运行，其余目标见 `make help`。
+这些命令都进入工作区所在的 `rust/` 执行。
+
+`make check-release` 是按需手动运行的检查：fmt + release clippy（workspace、全部 target
+与 feature、`-D warnings`）+ workspace release 全量测试 + 同一条 parity；parity 的报告
+生成仍使用自己的 debug 测试流程。`make test-release` 可单独跑 release 全量测试。
+2026-10-10 用户因耗时决定将 release 检查从提交门禁分离，不自动追加运行。
 
 `make install` puts the release binary in `$BINDIR` (default `~/.local/bin`;
 override `PREFIX` or `BINDIR`) and, **only when `~/.kloop/config.toml` does not

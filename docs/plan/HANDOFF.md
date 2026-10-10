@@ -1,5 +1,12 @@
 # HANDOFF — 当前状态与会话交接
 
+**提交门禁与手动 release 检查（2026-10-10）**：用户因耗时将 release 测试从提交门禁移除。
+`make check` 现在只跑 fmt + clippy + workspace debug 全量测试 + parity；
+`make check-release` 单独提供 fmt + release clippy + workspace release 全量测试 + parity，
+供用户按需手动运行，**不要在提交前自动追加**。`test-release` 的范围从 core 库扩大到整个
+workspace；parity 仍用原有的 debug 报告生成流程。教训 218 的故障与断言约束仍成立，
+但当时把 release 测试加入默认门禁的决定已被本条替代；门禁成本也必须尊重用户取舍。
+
 **用户 shell 与登录环境（2026-10-10，plan 223）**：Unix 的工具 shell 不再是冻结的
 `/bin/sh`，而是 `$SHELL` 检测到的用户 shell（`sh`/`bash`/`zsh`，可执行绝对路径），
 `[shells].bash` 现在 Unix 也可显式 pin，分类不了的 shell 落到冻结回退。启动时用该

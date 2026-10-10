@@ -85,5 +85,6 @@ that same file; the full field reference is
 | `docs/plan/` | One numbered file per development task, including what went wrong; `HANDOFF.md` is the current state (written in Chinese) |
 | `config/` | Configuration example |
 
-`make help` lists every build target (`make check` = fmt + clippy + test + test-release + parity,
-the commands to run before every commit).
+`make help` lists every build target. Run `make check` before every commit
+(fmt + clippy + workspace debug tests + parity). `make check-release` is a manual,
+optional check with release clippy and workspace release tests, plus fmt and parity.
