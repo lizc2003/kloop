@@ -39,6 +39,7 @@ pub mod sandbox;
 pub mod scheduler;
 pub mod session_store;
 pub mod shell;
+pub mod shell_env;
 pub mod shell_programs;
 pub mod skills;
 pub mod state_lock;

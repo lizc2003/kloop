@@ -1,5 +1,17 @@
 # HANDOFF — 当前状态与会话交接
 
+**用户 shell 与登录环境（2026-10-10，plan 223）**：Unix 的工具 shell 不再是冻结的
+`/bin/sh`，而是 `$SHELL` 检测到的用户 shell（`sh`/`bash`/`zsh`，可执行绝对路径），
+`[shells].bash` 现在 Unix 也可显式 pin，分类不了的 shell 落到冻结回退。启动时用该
+shell 跑一次 `-lc` + 标记包裹的 `env -0`，把登录环境抓成一张表（5s 超时、密钥与
+`[env]` 名被剔除），命令有捕获时改非登录 `-c` 并逐条注入，没有则退回 `-lc`。
+起因：`-lc` 的 `/etc/profile` 跑 `path_helper`，把 `/usr/bin` 提到用户 `~/.zprofile`
+前置的 homebrew 之前，`python3` 变成 Apple 的 3.9。教训：**注入的环境变量会被登录
+shell 的 profile 再初始化冲掉——要留住它就必须同时去掉 `-l`**，否则捕获等于白做；
+另外「继承的环境是对的」不代表「spawn 出去的环境是对的」，`ps -Eww` 读到的进程环境
+是 exec 时快照，判断差异要一路看到真正跑起来的那层。诊断过程中还撞到 `~/.kloop` 的
+敏感路径保护（读 config 被拒），最后是 `/etc/paths` + path_helper 的对照实验闭环的。
+
 **跨进程资源身份（2026-10-10，plan 222）**：offload、后台 Bash、子 agent、Program /
 Workflow 的执行与 run ID、定时任务、自动 worktree 名统一使用 64 位随机数 +
 11 位 Base58，UI / 工具 / 文件沿用同一 ID，不维护短编号映射，不恢复旧计数器。

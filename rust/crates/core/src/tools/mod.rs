@@ -1988,6 +1988,7 @@ pub(crate) mod testutil {
         context_window: Option<u64>,
         tool_sources: Vec<Arc<dyn ToolSource>>,
         dirs: Option<std::path::PathBuf>,
+        login_env: Option<crate::shell_env::ShellLoginEnv>,
         surface: crate::config::SurfaceCapabilities,
     }
 
@@ -2006,6 +2007,7 @@ pub(crate) mod testutil {
                 context_window: None,
                 tool_sources: Vec::new(),
                 dirs: None,
+                login_env: None,
                 // A test ctx models a front-end, and the one the tests want is
                 // the fully-featured one: a tool whose surface is off is not
                 // offered, so dispatch refuses it before the executor under
@@ -2037,6 +2039,13 @@ pub(crate) mod testutil {
 
         pub(crate) fn max_rounds(mut self, max_rounds: Option<usize>) -> Self {
             self.max_rounds = max_rounds;
+            self
+        }
+
+        /// Stand in for a captured login environment: the shell runs non-login
+        /// with these variables.
+        pub(crate) fn login_env(mut self, login_env: crate::shell_env::ShellLoginEnv) -> Self {
+            self.login_env = Some(login_env);
             self
         }
 
@@ -2094,6 +2103,7 @@ pub(crate) mod testutil {
                 hooks: Arc::new(crate::hooks::Hooks::none()),
                 background_shells: BackgroundShells::new(),
                 shell_programs: Arc::new(crate::shell_programs::ShellPrograms::test_fixture()),
+                shell_login_env: Arc::new(self.login_env.unwrap_or_default()),
                 powershell_execution_gate: Default::default(),
                 sandbox: None,
                 agent_types: Arc::new(Vec::new()),

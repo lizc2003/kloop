@@ -28,6 +28,7 @@ use kloop_core::permissions::ProjectPermissionPolicy;
 use kloop_core::permissions::ProjectPolicyRegistry;
 use kloop_core::project::WorkspaceIdentity;
 use kloop_core::session_store::SessionDirs;
+use kloop_core::shell_env::ShellLoginEnv;
 use kloop_core::shell_programs::ShellOverrides;
 use kloop_core::shell_programs::ShellPrograms;
 use kloop_core::skills::Skill;
@@ -63,6 +64,10 @@ pub(crate) struct RuntimeSettings {
     request_reduction: bool,
     defer_threshold: usize,
     shell_programs: Arc<ShellPrograms>,
+    /// The user's login environment captured once, empty when it could not be
+    /// (or `[shells].login_env = false`). Shared by every session this process
+    /// builds.
+    shell_login_env: Arc<ShellLoginEnv>,
     shell_warnings: Vec<String>,
 }
 
@@ -82,18 +87,26 @@ impl RuntimeSettings {
                 request_reduction: true,
                 defer_threshold: kloop_core::tools::TOOL_DEFER_THRESHOLD,
                 shell_programs: Arc::new(shell_programs),
+                shell_login_env: Arc::new(ShellLoginEnv::none()),
                 shell_warnings,
             });
         }
         let table = config.table();
         let config_path = config.path().to_path_buf();
-        let (shell_programs, shell_warnings) =
-            kloop_core::shell_programs::resolve_shell_programs(load_shell_overrides(table)?)?;
+        let (shell_overrides, login_env_enabled) = load_shell_overrides(table)?;
+        let (shell_programs, mut shell_warnings) =
+            kloop_core::shell_programs::resolve_shell_programs(shell_overrides)?;
         // `[env]` was applied in `main`, before this runtime existed. It is
         // parsed again here for one reason: the pre-runtime read swallows every
         // error so `--list-sessions` survives a broken file, which would
         // otherwise let a malformed [env] be skipped in silence.
-        crate::user_config::load_env_overrides(table)?;
+        let env_overrides = crate::user_config::load_env_overrides(table)?;
+        let shell_login_env = Arc::new(capture_login_env(
+            &shell_programs,
+            &env_overrides,
+            login_env_enabled,
+            &mut shell_warnings,
+        ));
         let permission_rules = parse_permission_rules(table)?;
         let global_permissions = Arc::new(GlobalPermissionPolicy::new(
             &permission_rules.deny,
@@ -116,6 +129,7 @@ impl RuntimeSettings {
             request_reduction: load_request_reduction(table)?,
             defer_threshold: crate::mcp::load_defer_threshold(table)?,
             shell_programs: Arc::new(shell_programs),
+            shell_login_env,
             shell_warnings,
         })
     }
@@ -139,14 +153,14 @@ impl RuntimeSettings {
     }
 }
 
-fn load_shell_overrides(root: &toml::Table) -> Result<ShellOverrides> {
+fn load_shell_overrides(root: &toml::Table) -> Result<(ShellOverrides, bool)> {
     let Some(section) = root.get("shells") else {
-        return Ok(ShellOverrides::default());
+        return Ok((ShellOverrides::default(), true));
     };
     let section = section.as_table().context("[shells] must be a table")?;
     for key in section.keys() {
-        if !matches!(key.as_str(), "bash" | "powershell") {
-            bail!("[shells] has unknown key '{key}' (bash | powershell)");
+        if !matches!(key.as_str(), "bash" | "powershell" | "login_env") {
+            bail!("[shells] has unknown key '{key}' (bash | powershell | login_env)");
         }
     }
     let path = |key: &str| -> Result<Option<PathBuf>> {
@@ -160,10 +174,61 @@ fn load_shell_overrides(root: &toml::Table) -> Result<ShellOverrides> {
             })
             .transpose()
     };
-    Ok(ShellOverrides {
-        bash: path("bash")?,
-        powershell: path("powershell")?,
-    })
+    let login_env = section
+        .get("login_env")
+        .map(|value| {
+            value
+                .as_bool()
+                .context("shells.login_env must be a boolean")
+        })
+        .transpose()?
+        .unwrap_or(true);
+    Ok((
+        ShellOverrides {
+            bash: path("bash")?,
+            powershell: path("powershell")?,
+        },
+        login_env,
+    ))
+}
+
+/// Capture the user's login environment once, so tool shells do not re-run a
+/// login profile (and its `path_helper` `PATH` reshuffle) on every command.
+///
+/// Any failure is a warning, never fatal: without a capture the shell tools
+/// keep the login `-lc` form, which is what kloop did before.
+#[cfg(unix)]
+fn capture_login_env(
+    shell_programs: &ShellPrograms,
+    env_overrides: &[(String, String)],
+    enabled: bool,
+    warnings: &mut Vec<String>,
+) -> ShellLoginEnv {
+    if !enabled {
+        return ShellLoginEnv::none();
+    }
+    let Some(shell) = shell_programs.bash.as_ref() else {
+        return ShellLoginEnv::none();
+    };
+    let names = env_overrides
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let (env, warning) = ShellLoginEnv::capture(&shell.executable, &names);
+    warnings.extend(warning);
+    env
+}
+
+/// No `$SHELL` to capture off Unix, and the login `-lc` shape there is the Git
+/// Bash kloop already validated.
+#[cfg(not(unix))]
+fn capture_login_env(
+    _shell_programs: &ShellPrograms,
+    _env_overrides: &[(String, String)],
+    _enabled: bool,
+    _warnings: &mut Vec<String>,
+) -> ShellLoginEnv {
+    ShellLoginEnv::none()
 }
 
 fn mock_shell_programs() -> Result<(ShellPrograms, Vec<String>)> {
@@ -945,6 +1010,7 @@ pub(crate) fn config_from_settings(
         hooks: Arc::clone(&runtime.hooks),
         background_shells: kloop_core::tools::BackgroundShells::new(),
         shell_programs: Arc::clone(&runtime.shell_programs),
+        shell_login_env: Arc::clone(&runtime.shell_login_env),
         powershell_execution_gate: Default::default(),
         background_executions: kloop_core::tools::BackgroundExecutions::new(),
         sandbox,
@@ -1057,7 +1123,7 @@ bash = 'C:\Program Files\Git\bin\bash.exe'
 powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
 "#,
         );
-        let overrides = load_shell_overrides(&root).unwrap();
+        let (overrides, login_env) = load_shell_overrides(&root).unwrap();
         assert_eq!(
             overrides.bash,
             Some(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"))
@@ -1066,6 +1132,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             overrides.powershell,
             Some(PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"))
         );
+        assert!(login_env, "login_env defaults to on");
 
         let error = load_shell_overrides(&config("[shells]\nbash = ['bash.exe', '-lc']"))
             .unwrap_err()
@@ -1075,6 +1142,18 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown key 'cmd'"), "{error}");
+    }
+
+    #[test]
+    fn shells_login_env_is_a_boolean_and_defaults_on() {
+        let off = config("[shells]\nlogin_env = false\n");
+        assert!(!load_shell_overrides(&off).unwrap().1);
+        let on = config("[shells]\nlogin_env = true\n");
+        assert!(load_shell_overrides(&on).unwrap().1);
+        let error = load_shell_overrides(&config("[shells]\nlogin_env = 'yes'"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be a boolean"), "{error}");
     }
 
     #[test]

@@ -359,6 +359,12 @@ pub struct Config {
     /// preserve the same executable paths across server threads, sub-agents,
     /// worktrees and code-mode calls.
     pub shell_programs: Arc<ShellPrograms>,
+    /// The user's login environment, captured once at CLI startup (plan 223).
+    /// Process-wide like `shell_programs`: a sibling session, a sub-agent and a
+    /// worktree all run commands in the same shell environment the user's own
+    /// login shell would. Empty means "no capture" — commands keep the login
+    /// `-lc` form.
+    pub shell_login_env: Arc<crate::shell_env::ShellLoginEnv>,
     /// Session-wide PowerShell exclusivity. Direct calls and foreground/background
     /// code-mode programs share this gate through Config clones; independent
     /// server threads build independent Configs and therefore do not serialize.
@@ -572,6 +578,7 @@ impl Config {
             tool_sources,
             hooks,
             shell_programs,
+            shell_login_env,
             // Serializes PowerShell across the process's sessions; a straggler
             // from the old session that missed the shutdown deadline still
             // queues behind it.
@@ -613,6 +620,7 @@ impl Config {
             tool_sources: tool_sources.clone(),
             hooks: Arc::clone(hooks),
             shell_programs: Arc::clone(shell_programs),
+            shell_login_env: Arc::clone(shell_login_env),
             powershell_execution_gate: Arc::clone(powershell_execution_gate),
             sandbox: sandbox.clone(),
             agent_types: Arc::clone(agent_types),
@@ -898,6 +906,7 @@ mod subagent_contract_tests {
             &child.background_shells
         ));
         assert!(Arc::ptr_eq(&parent.shell_programs, &child.shell_programs));
+        assert!(Arc::ptr_eq(&parent.shell_login_env, &child.shell_login_env));
         assert!(Arc::ptr_eq(
             &parent.powershell_execution_gate,
             &child.powershell_execution_gate
@@ -986,6 +995,7 @@ mod fresh_session_tests {
         );
         assert!(Arc::ptr_eq(&old.hooks, &fresh.hooks));
         assert!(Arc::ptr_eq(&old.shell_programs, &fresh.shell_programs));
+        assert!(Arc::ptr_eq(&old.shell_login_env, &fresh.shell_login_env));
         assert!(Arc::ptr_eq(
             &old.powershell_execution_gate,
             &fresh.powershell_execution_gate

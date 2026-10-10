@@ -111,14 +111,13 @@ pub fn resolve_shell_programs(overrides: ShellOverrides) -> Result<(ShellProgram
     }
     #[cfg(not(windows))]
     {
-        if overrides.bash.is_some() || overrides.powershell.is_some() {
-            bail!("[shells] executable overrides are only supported on native Windows");
+        if overrides.powershell.is_some() {
+            bail!("[shells].powershell is only supported on native Windows");
         }
-        let executable = if is_wsl() {
-            canonical_posix_executable(Path::new("/bin/bash"), "WSL Bash")?
-        } else {
-            resolve_posix_sh(std::env::var_os("PATH").as_deref(), Path::new("/bin/sh"))?
-        };
+        let executable = resolve_unix_shell(
+            overrides.bash.as_deref(),
+            std::env::var_os("SHELL").as_deref(),
+        )?;
         Ok((
             ShellPrograms {
                 bash: Some(ShellProgram {
@@ -130,6 +129,49 @@ pub fn resolve_shell_programs(overrides: ShellOverrides) -> Result<(ShellProgram
             Vec::new(),
         ))
     }
+}
+
+/// The Unix command shell: an explicit `[shells].bash` pin wins, then the user's
+/// own login shell, then the frozen `sh` lookup. On WSL the validated
+/// `/bin/bash` stays — a distribution's `/bin/sh` is not the Bash kloop was
+/// frozen against.
+#[cfg(not(windows))]
+fn resolve_unix_shell(
+    override_path: Option<&Path>,
+    user_shell: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(path) = override_path {
+        return canonical_posix_executable(path, "[shells].bash");
+    }
+    if is_wsl() {
+        return canonical_posix_executable(Path::new("/bin/bash"), "WSL Bash");
+    }
+    if let Some(shell) = user_posix_shell_from(user_shell) {
+        return Ok(shell);
+    }
+    resolve_posix_sh(std::env::var_os("PATH").as_deref(), Path::new("/bin/sh"))
+}
+
+/// The user's own shell from `$SHELL`, when it is one the command analysis
+/// already understands (`sh`/`bash`/`zsh`) and an executable regular file.
+///
+/// This is the whole point of not freezing `/bin/sh`: a login `sh` re-runs
+/// `/etc/profile`, whose `path_helper` moves `/etc/paths` — and therefore
+/// `/usr/bin` — in front of every user directory, while the user's own login
+/// profile (`~/.zprofile` for a zsh user) puts their toolchain back in front.
+/// A shell kloop cannot classify buys none of that, so it falls through to the
+/// frozen lookup instead.
+#[cfg(not(windows))]
+fn user_posix_shell_from(shell: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = PathBuf::from(shell?);
+    if !path.is_absolute() {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    if !matches!(name, "sh" | "bash" | "zsh") {
+        return None;
+    }
+    canonical_posix_executable(&path, "$SHELL").ok()
 }
 
 impl ShellDiscoveryEnv {
@@ -924,5 +966,68 @@ mod tests {
         let mut versions = ["7.4.2", "7.10.0", "7.3.9"];
         versions.sort_by_key(|version| powershell_version_key(version));
         assert_eq!(versions, ["7.3.9", "7.4.2", "7.10.0"]);
+    }
+
+    /// A POSIX-family interpreter that exists and is executable.
+    #[cfg(unix)]
+    fn install_shell(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Resolution canonicalizes, and /tmp is a symlink on macOS.
+        std::fs::canonicalize(&path).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_users_own_shell_is_preferred_when_it_is_posix() {
+        let dir = TestDir::new("user-shell");
+        let zsh = install_shell(dir.path(), "zsh");
+        assert_eq!(user_posix_shell_from(Some(zsh.as_os_str())), Some(zsh));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_shell_kloop_cannot_classify_falls_through() {
+        let dir = TestDir::new("foreign-shell");
+        let fish = install_shell(dir.path(), "fish");
+        assert_eq!(user_posix_shell_from(Some(fish.as_os_str())), None);
+        assert_eq!(
+            user_posix_shell_from(Some(std::ffi::OsStr::new("zsh"))),
+            None
+        );
+        let missing = dir.path().join("bash");
+        assert_eq!(user_posix_shell_from(Some(missing.as_os_str())), None);
+        assert_eq!(user_posix_shell_from(None), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_explicit_shells_bash_pin_beats_the_user_shell() {
+        let dir = TestDir::new("pinned-shell");
+        let pinned = install_shell(dir.path(), "bash");
+        let zsh = install_shell(dir.path(), "zsh");
+        assert_eq!(
+            resolve_unix_shell(Some(&pinned), Some(zsh.as_os_str())).unwrap(),
+            pinned
+        );
+        assert_eq!(
+            resolve_unix_shell(None, Some(zsh.as_os_str())).unwrap(),
+            zsh,
+            "without a pin the user's shell wins"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn without_a_usable_user_shell_the_frozen_lookup_still_answers() {
+        // `resolve_posix_sh` searches PATH for `sh` and only then falls back to
+        // `/bin/sh`; either way the answer is an absolute existing file rather
+        // than an error.
+        let resolved = resolve_unix_shell(None, None).unwrap();
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.is_file(), "{}", resolved.display());
     }
 }

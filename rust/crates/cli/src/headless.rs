@@ -353,6 +353,7 @@ mod tests {
             shell_programs: std::sync::Arc::new(
                 kloop_core::shell_programs::ShellPrograms::test_fixture(),
             ),
+            shell_login_env: std::sync::Arc::new(kloop_core::shell_env::ShellLoginEnv::none()),
             powershell_execution_gate: Default::default(),
             background_executions: kloop_core::tools::BackgroundExecutions::new(),
             sandbox: None,

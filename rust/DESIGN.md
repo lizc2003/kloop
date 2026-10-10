@@ -257,14 +257,36 @@ See [methodology and history](../refs/README.md), [Plan 59 final acceptance](../
 
 | Runtime | Bash-family tool | PowerShell tool | Process-tree ownership | OS filesystem/network sandbox |
 |---|---|---|---|---|
-| macOS | frozen executable POSIX `sh -lc` | not registered | dedicated process group | Seatbelt for Bash by default |
-| Linux | frozen executable POSIX `sh -lc`; WSL uses an executable `/bin/bash -lc` | not registered | dedicated process group | not implemented |
+| macOS | the user's `$SHELL` (`sh`/`bash`/`zsh`), else a frozen executable POSIX `sh`; the login environment is captured once and commands run non-login (`-c`) carrying it | not registered | dedicated process group | Seatbelt for Bash by default |
+| Linux | the user's `$SHELL` (`sh`/`bash`/`zsh`), else a frozen executable POSIX `sh`; WSL uses an executable `/bin/bash` | not registered | dedicated process group | not implemented |
 | Native Windows | validated Git for Windows `bin\bash.exe -lc`, registered only when available | highest trusted PowerShell 7 MSI/MSIX `pwsh.exe`, falling back to Windows PowerShell 5.1; foreground-only | kill-on-close root Job established before user code; every Bash/PowerShell spawn also debug-gates descendants into a fixed containment Job set | not implemented |
 
 Shell executables are resolved once at startup and inherited unchanged by server
 threads, sub-agents, worktrees, and code mode. Unix discovery skips non-executable
 `sh` candidates and validates the final regular-file executable, including the
-fallback and a symlink's target. On Windows, Job containment is mandatory even
+fallback and a symlink's target. On Unix the shell is the user's own `$SHELL`
+when it is one the command analysis already understands (`sh`, `bash`, or `zsh`)
+and an executable regular file; `[shells].bash` pins an explicit absolute path
+(Windows or Unix), and WSL keeps its validated `/bin/bash`. A shell kloop cannot
+classify falls through to the frozen `sh` lookup.
+
+**Why the user's shell, and a one-time capture of its login environment (Plan
+223).** A login POSIX shell re-runs `/etc/profile`, and on macOS that runs
+`path_helper`, which rebuilds `PATH` with `/etc/paths` first and everything else
+appended — a Homebrew prefix the user's login profile had put in front lands
+behind `/usr/bin`, and `python3` silently becomes Apple's. So kloop asks the
+user's shell once, at startup, what its login environment is (`<shell> -lc` plus
+a marked `env -0`, bounded by a five-second timeout), and runs commands in a
+**non-login** shell carrying that environment: nothing rewrites `PATH` behind its
+back. Provider and search credentials are filtered out of the capture the same
+way they are scrubbed from any model-controlled shell, names the config `[env]`
+sets are never taken from it, and names the shell derives itself (`PWD`,
+`OLDPWD`, `SHLVL`, `_`) are dropped so the child is not pinned to the capture's
+cwd. The capture is process-wide, like the shell identity: one login shell per
+process, shared by every session, sub-agent and worktree. It is best-effort — a
+failure (or `[shells].login_env = false`) is a startup warning and commands fall
+back to the login `-lc` form, which is what kloop did before. On Windows, Job
+containment is mandatory even
 though restricted-token/AppContainer filesystem and network sandboxing are not
 implemented; no setting or per-call field disables the Job. The debug gate is a
 process-tree ownership boundary, not a defense against protected processes or a
@@ -2332,10 +2354,14 @@ bypass` included.
 
 ## Foreground bash lifecycle (Plan 50 parity pass)
 
-Foreground `bash` runs the frozen shell identity with `-lc`: ordinary Unix resolves
-an executable regular-file POSIX `sh` (skipping non-executable PATH entries and
-validating the fallback/symlink target), WSL validates `/bin/bash`, and native
-Windows uses only a validated Git for Windows `bin\bash.exe`. Windows never substitutes PowerShell,
+Foreground `bash` runs the user's shell (the Unix `$SHELL` when kloop can
+classify it, else a frozen executable POSIX `sh`; WSL validates `/bin/bash`;
+native Windows uses only a validated Git for Windows `bin\bash.exe`). With a
+captured login environment the command runs non-login (`-c`) carrying it; without
+one it runs `-lc`, whose `/etc/profile` re-initialization is then the login
+behavior the user's own profile expects. Unix discovery skips non-executable
+`sh` candidates and validates the fallback/symlink target; Windows never
+substitutes PowerShell,
 `cmd.exe`, WSL, Cygwin, BusyBox, or an arbitrary PATH `sh.exe`. stdin is closed
 and stdout/stderr use separate pipes. Both pipes are drained concurrently to
 EOF, so a child filling one stream cannot deadlock behind an unread other
@@ -4351,7 +4377,10 @@ cargo run -- --mock
 # over the same name in the environment**: one file decides what this run's
 # environment is, for the same reason it decides everything else about the run.
 # Names it leaves out are inherited untouched. `HOME` cannot be set there: the
-# file was just read from it.
+# file was just read from it. A name written there also wins over the login
+# shell's own export: the captured login environment (Plan 223) never supplies a
+# name `[env]` sets, so the file stays the top of the environment precedence —
+# `[env]` over the captured login shell over what kloop inherited.
 #
 # There is no scope above the profile for
 # either model or effort: both belong to the provider that has to send them,
@@ -4807,7 +4836,8 @@ crates/core/        kloop-core — the agent, network-free
     mod.rs          ProcessSpec/Child/Killer façade and lifecycle tests
     unix.rs         process-group spawn, kill, reap, and residual checks
     windows.rs      suspended CreateProcessW, stdio handle list, Job Object RAII
-  src/shell_programs.rs frozen shell identities and Windows trusted discovery
+  src/shell_env.rs   the user's login environment, captured once
+  src/shell_programs.rs shell identities, `$SHELL`/override resolution, Windows trusted discovery
   src/tools/        the tool seam and the built-in tools
     mod.rs          catalog assembly, batched dispatch with hook+permission
                     gating; ToolSource seam for external (MCP) tools

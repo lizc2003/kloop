@@ -59,6 +59,8 @@ use crate::process_tree::ProcessTreeChild;
 use crate::process_tree::ProcessTreeKiller;
 use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
+use crate::shell_env::MODEL_SHELL_SECRET_ENV;
+use crate::shell_env::ShellLoginEnv;
 use crate::shell_programs::ShellProgram;
 
 /// Tail returned inline by bash_output; the rest stays in the output file
@@ -121,30 +123,31 @@ fn parse_bash_input(input: &Value) -> Result<BashInput> {
     serde_json::from_value(input.clone()).context("bash: invalid input")
 }
 
-const MODEL_SHELL_SECRET_ENV: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "OPENAI_API_KEY",
-    "TAVILY_API_KEY",
-    "BRAVE_API_KEY",
-];
-
 pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
     for name in MODEL_SHELL_SECRET_ENV {
         spec.env_remove(*name);
     }
 }
 
-/// The process spec for the frozen Bash-family executable's `-lc <command>`,
-/// wrapped in the OS sandbox when a policy applies. The env vars are hints only;
-/// enforcement is the profile.
+/// The process spec for the user's shell command, wrapped in the OS sandbox
+/// when a policy applies. The env vars are hints only; enforcement is the
+/// profile.
+///
+/// With a captured login environment the shell runs **non-login** (`-c`): a
+/// login `sh`/`bash` re-runs `/etc/profile`, whose `path_helper` would put
+/// `/etc/paths` — and `/usr/bin` — back in front of the captured `PATH`, and a
+/// login `zsh` would re-read `~/.zprofile` only to reach the same place by a
+/// different route. Without a capture it stays `-lc`, which is the old
+/// behavior.
 fn shell_spec(
     command: &str,
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
     bash: &ShellProgram,
+    login_env: &ShellLoginEnv,
 ) -> ProcessSpec {
-    let shell_args = vec!["-lc".into(), command.into()];
+    let flag = if login_env.is_active() { "-c" } else { "-lc" };
+    let shell_args = vec![flag.into(), command.into()];
     let (program, args) = match sandbox {
         Some(policy) => sandbox::seatbelt_command(policy, bash.executable.as_os_str(), &shell_args),
         None => (bash.executable.clone(), shell_args),
@@ -160,8 +163,10 @@ fn shell_spec(
         }
     }
     // Provider/search credentials belong to the parent process, never to a
-    // model-controlled shell.
+    // model-controlled shell — the capture is filtered the same way, so this
+    // stays the single place the removal is stated.
     scrub_model_shell_env(&mut spec);
+    login_env.apply(&mut spec);
     spec
 }
 
@@ -276,6 +281,7 @@ pub(crate) async fn run_foreground_bash(
         &cwd,
         effective_sandbox,
         bash,
+        &ctx.cfg.shell_login_env,
         timeout_ms,
         &ctx.cancel,
     )
@@ -310,8 +316,16 @@ pub(crate) async fn run_foreground_bash(
                 .unwrap_or(EscalationOutcome::Declined);
             match outcome {
                 EscalationOutcome::Approved => {
-                    let raw =
-                        run_foreground(command, &cwd, None, bash, timeout_ms, &ctx.cancel).await?;
+                    let raw = run_foreground(
+                        command,
+                        &cwd,
+                        None,
+                        bash,
+                        &ctx.cfg.shell_login_env,
+                        timeout_ms,
+                        &ctx.cancel,
+                    )
+                    .await?;
                     // What the sandbox refused is the only record of why this
                     // ran uncontained, and the sandboxed output is about to be
                     // dropped for the unsandboxed one. Carrying the line keeps
@@ -346,10 +360,11 @@ async fn run_foreground(
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
     bash: &ShellProgram,
+    login_env: &ShellLoginEnv,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<ForegroundOutput> {
-    let spec = shell_spec(command, cwd, sandbox, bash);
+    let spec = shell_spec(command, cwd, sandbox, bash, login_env);
     run_process_foreground(spec, timeout_ms, cancel, "bash").await
 }
 
@@ -737,7 +752,7 @@ impl BackgroundShells {
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
-        let mut spec = shell_spec(command, cwd, sandbox, bash);
+        let mut spec = shell_spec(command, cwd, sandbox, bash, &ctx.cfg.shell_login_env);
         spec.stdin = ProcessStdio::Null;
         spec.stdout = ProcessStdio::File(stdout);
         spec.stderr = ProcessStdio::File(stderr);
@@ -1224,6 +1239,7 @@ mod tests {
     use crate::execution_provenance::MailboxRoute;
     use crate::execution_provenance::TerminalOwner;
     use crate::inbox::InboxItem;
+    use crate::shell_env::ShellLoginEnv;
     use crate::tools::testutil::*;
     #[cfg(windows)]
     use base64::Engine as _;
@@ -1307,7 +1323,13 @@ mod tests {
         let bash = crate::shell_programs::ShellPrograms::test_fixture()
             .bash
             .unwrap();
-        let spec = super::shell_spec("exit 0", &std::env::current_dir().unwrap(), None, &bash);
+        let spec = super::shell_spec(
+            "exit 0",
+            &std::env::current_dir().unwrap(),
+            None,
+            &bash,
+            &ShellLoginEnv::none(),
+        );
         assert!(spec.windows_debug_descendants());
     }
 
@@ -1644,7 +1666,8 @@ Wait-Process -Id $grandchild.Id
         let cwd = std::env::current_dir().unwrap();
         let scrubbed = |allow_network: bool| {
             let policy = crate::sandbox::SandboxPolicy::workspace(&cwd, &[], allow_network);
-            let spec = super::shell_spec("true", &cwd, Some(&policy), &shell);
+            let spec =
+                super::shell_spec("true", &cwd, Some(&policy), &shell, &ShellLoginEnv::none());
             let mut names: Vec<String> = spec
                 .env_remove
                 .iter()
@@ -1667,6 +1690,71 @@ Wait-Process -Id $grandchild.Id
         ];
         assert_eq!(scrubbed(/*allow_network*/ false), sorted(&secrets));
         assert_eq!(scrubbed(/*allow_network*/ true), sorted(&secrets));
+    }
+
+    /// A captured login environment only survives in a non-login shell: `/etc/
+    /// profile`'s `path_helper` would otherwise put `/usr/bin` back in front of
+    /// the captured `PATH`. Without a capture the shell stays login `-lc`.
+    #[test]
+    #[cfg(unix)]
+    fn an_active_login_environment_runs_the_shell_non_login() {
+        let shell = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .expect("test shell is available");
+        let cwd = std::env::current_dir().unwrap();
+        let login = ShellLoginEnv::test_fixture(&[("PATH", "/login/bin")]);
+
+        let active = super::shell_spec("true", &cwd, None, &shell, &login);
+        assert_eq!(
+            active.args,
+            vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("true")
+            ]
+        );
+        assert!(active.env_add.contains(&(
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from("/login/bin")
+        )));
+
+        let inactive = super::shell_spec("true", &cwd, None, &shell, &ShellLoginEnv::none());
+        assert_eq!(
+            inactive.args,
+            vec![
+                std::ffi::OsString::from("-lc"),
+                std::ffi::OsString::from("true")
+            ]
+        );
+        assert!(
+            !inactive
+                .env_add
+                .iter()
+                .any(|(name, _)| name == std::ffi::OsStr::new("PATH"))
+        );
+    }
+
+    /// The whole point of the capture: a variable the login shell exports is
+    /// visible to the command kloop runs.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_captured_login_environment_reaches_the_command() {
+        let ctx = test_ctx_with_cfg(
+            0,
+            TestConfig::new("bash-login-env")
+                .login_env(ShellLoginEnv::test_fixture(&[(
+                    "KLOOP_TEST_SENTINEL",
+                    "from-login",
+                )]))
+                .build(),
+        );
+        let (out, is_error) = run_tool(
+            "bash",
+            bash_input("printf %s \"$KLOOP_TEST_SENTINEL\""),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("from-login"), "{out}");
     }
 
     #[tokio::test]
@@ -1705,6 +1793,7 @@ Wait-Process -Id $grandchild.Id
             &cwd,
             None,
             &bash,
+            &ShellLoginEnv::none(),
             10_000,
             &cancel,
         )
