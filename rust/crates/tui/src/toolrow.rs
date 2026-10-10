@@ -101,7 +101,7 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         // The header carries the model's one-line summary (empty is fine); the
         // command itself is [`tool_command`]'s row underneath.
         "bash" => ("Bash".into(), s("description")),
-        "powershell" => ("PowerShell".into(), String::new()),
+        "powershell" => ("PowerShell".into(), s("description")),
         "read_file" => ("Read".into(), path_of(&v)),
         "write_file" => {
             let n = v
@@ -444,6 +444,21 @@ mod tests {
         assert_eq!(
             texts(&lines),
             vec!["● PowerShell", "  PS> Write-Output '你好'"]
+        );
+    }
+
+    #[test]
+    fn powershell_row_shows_the_description_above_the_script() {
+        let lines = tool_cell_lines(
+            "powershell",
+            r#"{"command":"Get-Location","description":"Check the path"}"#,
+            ToolStatus::Ok,
+            None,
+            60,
+        );
+        assert_eq!(
+            texts(&lines),
+            vec!["✓ PowerShell Check the path", "  PS> Get-Location"]
         );
     }
 

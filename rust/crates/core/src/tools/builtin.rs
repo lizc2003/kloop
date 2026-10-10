@@ -732,6 +732,7 @@ fn powershell_def() -> ToolDef {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The original PowerShell script to run"},
+                "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "What this script does, in a few words on one line (e.g. \"Check the resolved version\", \"List changed files\"). It heads this call's row in the user's transcript, above the script, so they can tell what a long one-liner is for without parsing it; give one on every call. It never reaches PowerShell and never changes the result."},
                 "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000)"}
             },
             "required": ["command"],

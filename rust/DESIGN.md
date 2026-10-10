@@ -2496,7 +2496,10 @@ does not expose it. See `docs/plan/51-background-monitor-parity.md`.
 ## Native Windows PowerShell (Plan 62)
 
 Native Windows conditionally registers a separate foreground-only
-`powershell {command, timeout_ms?}` tool. Startup chooses the highest trusted
+`powershell {command, description?, timeout_ms?}` tool. Its optional
+`description` is the same display-only one-line label as `bash`'s — it heads the
+`PowerShell` row above the `PS>` script line, never reaches PowerShell, and never
+changes the result. Startup chooses the highest trusted
 PowerShell 7 installation: versioned MSI roots plus installed official
 `Microsoft.PowerShell[_-LTS]_8wekyb3d8bbwe` MSIX package roots resolved through
 the Windows package API. Candidates are ranked by the executable's file-version

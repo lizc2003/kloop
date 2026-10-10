@@ -78,8 +78,9 @@ fn validate_input(input: &Value) -> Result<()> {
     let object = input
         .as_object()
         .context("powershell: input must be an object")?;
+    super::optional_display_description(input, "powershell")?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "command" | "timeout_ms") {
+        if !matches!(key.as_str(), "command" | "description" | "timeout_ms") {
             bail!(
                 "powershell: unsupported field '{key}'; PowerShell v1 is foreground-only and does not support background, sandbox, stdin, PTY, session or executable overrides"
             );
@@ -221,6 +222,29 @@ mod tests {
             let error = validate_input(&input).unwrap_err().to_string();
             assert!(error.contains(field), "{error}");
             assert!(error.contains("foreground-only"), "{error}");
+        }
+    }
+
+    /// The one extra field v1 does take: a display-only label under the same
+    /// strict contract as bash's, rejected before anything is spawned.
+    #[test]
+    fn description_is_display_only_and_carries_the_bash_contract() {
+        assert!(validate_input(&serde_json::json!({"command": "Get-Location"})).is_ok());
+        assert!(
+            validate_input(
+                &serde_json::json!({"command": "Get-Location", "description": "Show the path"})
+            )
+            .is_ok()
+        );
+        for value in [
+            serde_json::json!("   "),
+            serde_json::json!("two\nlines"),
+            serde_json::json!("x".repeat(201)),
+            serde_json::json!(42),
+        ] {
+            let input = serde_json::json!({"command": "Get-Location", "description": value});
+            let error = validate_input(&input).unwrap_err().to_string();
+            assert!(error.contains("description"), "{error}");
         }
     }
 
