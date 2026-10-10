@@ -181,14 +181,16 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
         }
         "list_agents" => ("List Agents".into(), String::new()),
         // The panel above the composer already carries the list; the row only
-        // has to say how long it now is.
+        // has to say how long it now is. The verb is just `Todo`: `write` is the
+        // tail of the raw tool name, so it stays in the dim detail instead of
+        // wearing the bold the verb reserves for the tool it is.
         "todo_write" => {
             let detail = match v.get("todos").and_then(Value::as_array).map_or(0, Vec::len) {
-                0 => "cleared".into(),
-                1 => "1 todo".into(),
-                count => format!("{count} todos"),
+                0 => "write cleared".into(),
+                1 => "write 1 todo".into(),
+                count => format!("write {count} todos"),
             };
-            ("Todo write".into(), detail)
+            ("Todo".into(), detail)
         }
         "cron_create" => ("Cron create".into(), s("cron")),
         "cron_delete" => ("Cron delete".into(), s("id")),
@@ -819,6 +821,35 @@ mod tests {
             let lines = tool_cell_lines(name, input, ToolStatus::Ok, None, 80);
             assert_eq!(text(&lines[0]), expected, "{name}");
         }
+    }
+
+    /// `Todo` is the verb, so it is bold; `write` is the tail of the raw
+    /// `todo_write` name and stays dim with the count — the row reads the same
+    /// as before, but nothing past `Todo` wears the verb's emphasis.
+    #[test]
+    fn todo_row_highlights_only_the_verb() {
+        let lines = tool_cell_lines(
+            "todo_write",
+            r#"{"todos":[{"subject":"a","status":"pending"}]}"#,
+            ToolStatus::Ok,
+            None,
+            80,
+        );
+        assert_eq!(text(&lines[0]), "✓ Todo write 1 todo");
+        assert_eq!(lines[0].spans[1].content.as_ref(), "Todo");
+        assert!(
+            lines[0].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(lines[0].spans[3].content.as_ref(), "write 1 todo");
+        assert!(
+            !lines[0].spans[3]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     /// The fallback arm — raw name plus compacted JSON — is right for an MCP
