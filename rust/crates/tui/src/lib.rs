@@ -362,6 +362,7 @@ fn session_switch(cfg: &Config, report: Vec<String>) -> events::SessionSwitch {
     events::SessionSwitch {
         session_id: cfg.session_id.clone(),
         route: cfg.provider_route.public_route(),
+        context_window: cfg.context_window,
         mode: workspace.permissions.mode(),
         cwd: display_cwd(&workspace.cwd),
         branch: git_branch(&workspace.cwd),
@@ -398,7 +399,10 @@ async fn agent_worker(
         };
         match msg {
             WorkerMsg::Turn(turn) => {
-                let _ = events.send(AgentEvent::RouteFrozen(cfg.provider_route.public_route()));
+                let _ = events.send(AgentEvent::RouteFrozen {
+                    route: cfg.provider_route.public_route(),
+                    context_window: cfg.context_window,
+                });
                 // `--image` blocks ride the first turn; the composer's attached
                 // images ride the turn they were sent with. Merge both.
                 let mut images = std::mem::take(&mut pending_images);
@@ -429,7 +433,10 @@ async fn agent_worker(
                 }
             }
             WorkerMsg::Wake { cancel } => {
-                let _ = events.send(AgentEvent::RouteFrozen(cfg.provider_route.public_route()));
+                let _ = events.send(AgentEvent::RouteFrozen {
+                    route: cfg.provider_route.public_route(),
+                    context_window: cfg.context_window,
+                });
                 // Raced: a still-running turn already drained the reinjection,
                 // or stop_agent left nothing. Nothing to sample — just clear the
                 // busy state the UI loop set when it dispatched the wake.
@@ -454,7 +461,10 @@ async fn agent_worker(
                 }
             }
             WorkerMsg::Command { line, cancel } => {
-                let _ = events.send(AgentEvent::RouteFrozen(cfg.provider_route.public_route()));
+                let _ = events.send(AgentEvent::RouteFrozen {
+                    route: cfg.provider_route.public_route(),
+                    context_window: cfg.context_window,
+                });
                 let result = kloop_core::commands::run_with_provider_state(
                     &line,
                     &mut history,
@@ -468,7 +478,10 @@ async fn agent_worker(
                     let route = provider_state.active_route();
                     cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
                     *current.lock().unwrap() = Arc::clone(&cfg);
-                    let _ = events.send(AgentEvent::ProviderChanged(route));
+                    let _ = events.send(AgentEvent::ProviderChanged {
+                        route,
+                        context_window: cfg.context_window,
+                    });
                 }
                 if result.new_session {
                     let event = match kloop_core::commands::start_fresh_session(&cfg, &ui).await {

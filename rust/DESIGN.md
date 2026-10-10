@@ -1562,7 +1562,11 @@ status** — model name and a context gauge (`model · N% ctx`, refreshed at the
 of every agent round from the same usage accounting `/cost` reads, so a
 long turn's gauge moves while it runs, and once more after a slash command, so
 `/compact` and `/clear` move it without any turn at all) — flush right (dropped
-on a narrow row so the hints win). A **thinking block** shows a CC-style verb and
+on a narrow row so the hints win). 百分比分母来自当前路由的配置窗口：成功的
+provider/model 切换把重算后的窗口与路由一起送到 TUI，不能沿用启动时的值；
+未知窗口显示估算 token 数。运行中的操作同时冻结路由与窗口，结束后才展示新选择，
+旧 revision 的切换事件不能覆盖新窗口。`/clear` 与 rewind 也同步新会话的窗口。
+A **thinking block** shows a CC-style verb and
 elapsed rather than its text: `∗ Thinking… (Xs)` while it streams, `∗ Thought for
 Xs` once sealed. The animation self-drives — a frame tick wakes the loop only
 while a turn runs, so an idle session redraws on nothing and spends no CPU (tokio

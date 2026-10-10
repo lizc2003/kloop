@@ -1027,7 +1027,7 @@ fn system_status(app: &App) -> String {
         return String::new();
     }
     let identity = identity.unwrap_or_else(|| app.model.clone());
-    match app.context_window {
+    match app.display_context_window() {
         Some(window) if window > 0 => {
             let pct = (app.context_used as f64 / window as f64 * 100.0).round() as u64;
             format!("{identity} · {}% ctx", pct.min(100))
@@ -2811,6 +2811,43 @@ mod tests {
     }
 
     #[test]
+    fn context_gauge_follows_provider_and_model_windows() {
+        let initial = kloop_protocol::ActiveProviderRoute {
+            revision: 1,
+            provider_id: "wide".into(),
+            api_family: kloop_protocol::ProviderApiFamily::Mock,
+            model: "a".into(),
+            continuity: kloop_protocol::ReasoningContinuity::Preserved,
+            effort: None,
+        };
+        let mut app = App::new("s".into())
+            .with_context("a".into(), Some(1_000_000), 222_648)
+            .with_route(initial.clone());
+        assert_eq!(system_status(&app), "wide / a · r1 · 22% ctx");
+
+        for (revision, provider, model, window, gauge) in [
+            (2, "narrow", "a", Some(258_400), "86% ctx"),
+            (3, "narrow", "b", Some(400_000), "56% ctx"),
+            (4, "unknown", "c", None, "~222648 tok"),
+            (5, "wide", "a", Some(1_000_000), "22% ctx"),
+        ] {
+            app.apply(crate::events::AgentEvent::ProviderChanged {
+                route: kloop_protocol::ActiveProviderRoute {
+                    revision,
+                    provider_id: provider.into(),
+                    model: model.into(),
+                    ..initial.clone()
+                },
+                context_window: window,
+            });
+            assert_eq!(
+                system_status(&app),
+                format!("{provider} / {model} · r{revision} · {gauge}"),
+            );
+        }
+    }
+
+    #[test]
     fn footer_shows_selected_route_and_preserves_frozen_route_while_running() {
         let old = kloop_protocol::ActiveProviderRoute {
             revision: 4,
@@ -2831,17 +2868,20 @@ mod tests {
         let mut app = App::new("s".into())
             .with_context("legacy-model".into(), Some(100), 25)
             .with_route(old.clone());
-        assert!(system_status(&app).contains("alpha / a-model · r4"));
+        assert_eq!(system_status(&app), "alpha / a-model · r4 · 25% ctx");
 
         app.running = true;
         app.freeze_selected_route();
-        app.apply(crate::events::AgentEvent::ProviderChanged(new));
-        assert!(system_status(&app).contains("alpha / a-model · r4"));
+        app.apply(crate::events::AgentEvent::ProviderChanged {
+            route: new,
+            context_window: Some(50),
+        });
+        assert_eq!(system_status(&app), "alpha / a-model · r4 · 25% ctx");
 
         app.apply(crate::events::AgentEvent::Core(
             kloop_core::event::Event::TurnEnded(kloop_core::agent::EndReason::Completed),
         ));
-        assert!(system_status(&app).contains("beta / b-model · r5"));
+        assert_eq!(system_status(&app), "beta / b-model · r5 · 50% ctx");
     }
 
     #[test]

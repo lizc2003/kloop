@@ -32,11 +32,17 @@ pub enum AgentEvent {
     /// Output of a slash command (`/help`, `/cost`, …). Rendered as a wrapped
     /// system block, not a one-line note — emitted by the worker directly.
     System(String),
-    ProviderChanged(kloop_protocol::ActiveProviderRoute),
+    ProviderChanged {
+        route: kloop_protocol::ActiveProviderRoute,
+        context_window: Option<u64>,
+    },
     /// The immutable route snapshot used by the current turn/operation.
     /// ProviderChanged may arrive while this operation is still settling; it
     /// updates the idle selection but must not rewrite this snapshot.
-    RouteFrozen(kloop_protocol::ActiveProviderRoute),
+    RouteFrozen {
+        route: kloop_protocol::ActiveProviderRoute,
+        context_window: Option<u64>,
+    },
     /// Open the route picker on this payload. The stage inside it is the entry
     /// point the command named (`/provider`, `/model`, `/effort`), and Esc there
     /// closes the panel instead of descending a level that command never offered.
@@ -89,6 +95,7 @@ pub enum AgentEvent {
 pub struct SessionSwitch {
     pub session_id: String,
     pub route: kloop_protocol::ActiveProviderRoute,
+    pub context_window: Option<u64>,
     pub mode: kloop_core::permissions::Mode,
     /// Display-ready working directory, and its branch if in a repository.
     pub cwd: String,

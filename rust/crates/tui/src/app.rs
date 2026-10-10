@@ -565,13 +565,13 @@ pub struct App {
     pub selected_route: Option<kloop_protocol::ActiveProviderRoute>,
     /// Route snapshot for the currently running turn/operation, if any.
     pub frozen_route: Option<kloop_protocol::ActiveProviderRoute>,
+    frozen_context_window: Option<u64>,
     /// Last successful model choice per logical provider, used by the picker
     /// when a provider is selected without an explicit model.
     pub remembered_models: HashMap<String, String>,
-    /// Estimated context tokens in use (footer gauge), refreshed by the worker's
-    /// `Usage` events after each turn.
+    /// 上下文占用估算，随每轮采样和操作结束后的 `Usage` 事件刷新。
     pub context_used: u64,
-    /// The context window, if any (footer gauge denominator). Static per session.
+    /// 当前选中路由的配置窗口，随成功的 provider/model 切换更新。
     pub context_window: Option<u64>,
 }
 
@@ -613,6 +613,7 @@ impl App {
             model: String::new(),
             selected_route: None,
             frozen_route: None,
+            frozen_context_window: None,
             remembered_models: HashMap::new(),
             context_used: 0,
             context_window: None,
@@ -654,6 +655,14 @@ impl App {
         }
     }
 
+    pub(crate) fn display_context_window(&self) -> Option<u64> {
+        if self.running && self.frozen_route.is_some() {
+            self.frozen_context_window
+        } else {
+            self.context_window
+        }
+    }
+
     pub fn freeze_selected_route(&mut self) {
         self.freeze_selected_route_inner();
     }
@@ -661,16 +670,22 @@ impl App {
     fn freeze_selected_route_inner(&mut self) {
         if self.frozen_route.is_none() {
             self.frozen_route = self.selected_route.clone();
+            self.frozen_context_window = self.context_window;
         }
     }
 
     fn clear_frozen_route(&mut self) {
         self.frozen_route = None;
+        self.frozen_context_window = None;
     }
 
     /// Remember the model only after a successful provider transition. A late
     /// ProviderChanged for an older revision cannot overwrite newer selection.
-    fn accept_selected_route(&mut self, route: kloop_protocol::ActiveProviderRoute) {
+    fn accept_selected_route(
+        &mut self,
+        route: kloop_protocol::ActiveProviderRoute,
+        context_window: Option<u64>,
+    ) {
         if self
             .selected_route
             .as_ref()
@@ -680,6 +695,7 @@ impl App {
                 .insert(route.provider_id.clone(), route.model.clone());
             self.model = route.model.clone();
             self.selected_route = Some(route);
+            self.context_window = context_window;
         }
     }
 
@@ -701,6 +717,7 @@ impl App {
         let crate::events::SessionSwitch {
             session_id,
             route,
+            context_window,
             mode,
             cwd,
             branch,
@@ -708,7 +725,7 @@ impl App {
             report: _,
         } = session;
         self.session_id = session_id;
-        self.accept_selected_route(route);
+        self.accept_selected_route(route, context_window);
         self.mode = mode;
         self.cwd = cwd;
         self.branch = branch;
@@ -746,16 +763,23 @@ impl App {
                 self.thinking_open = false;
                 self.cells.push(Cell::System(text));
             }
-            AgentEvent::ProviderChanged(route) => {
-                self.accept_selected_route(route.clone());
+            AgentEvent::ProviderChanged {
+                route,
+                context_window,
+            } => {
+                self.accept_selected_route(route.clone(), context_window);
                 self.cells.push(Cell::System(format!(
                     "provider: {} {} (revision {})",
                     route.provider_id, route.model, route.revision
                 )));
             }
-            AgentEvent::RouteFrozen(route) => {
+            AgentEvent::RouteFrozen {
+                route,
+                context_window,
+            } => {
                 if self.running {
                     self.frozen_route = Some(route);
+                    self.frozen_context_window = context_window;
                 }
             }
             AgentEvent::InputReturned { text, images } => self.return_input(text, images),
@@ -901,8 +925,6 @@ impl App {
                 self.mode = mode;
             }
             Event::Usage(used) => {
-                // The worker's post-turn context estimate; the footer gauge reads
-                // it against the (static) window.
                 self.context_used = used;
             }
             Event::TurnEnded(reason) => self.apply_turn_ended(reason),
@@ -3235,6 +3257,7 @@ mod tests {
         crate::events::SessionSwitch {
             session_id: session_id.into(),
             route: route(3),
+            context_window: Some(200_000),
             mode: Mode::Bypass,
             cwd: "~/repo".into(),
             branch: Some("main".into()),
@@ -3251,7 +3274,8 @@ mod tests {
     /// mirror (id, mode, cwd, todo list, gauge) is the new session's.
     #[test]
     fn cleared_starts_the_transcript_over_on_the_new_session() {
-        let mut app = App::new("old".into());
+        let mut app =
+            App::new("old".into()).with_context("old-model".into(), Some(1_000_000), 50_000);
         app.cells.push(Cell::User("earlier".into()));
         app.tool_cells.insert("t1".into(), 0);
         app.background_task_cells.insert("agent-8".into(), 0);
@@ -3277,6 +3301,7 @@ mod tests {
         });
 
         assert_eq!(app.session_id, "new");
+        assert_eq!(app.context_window, Some(200_000));
         assert_eq!(
             app.cells,
             vec![
@@ -3386,7 +3411,10 @@ mod tests {
         );
         assert!(app.provider_picker.is_none());
 
-        app.apply(AgentEvent::ProviderChanged(active("a", "a2")));
+        app.apply(AgentEvent::ProviderChanged {
+            route: active("a", "a2"),
+            context_window: None,
+        });
         assert_eq!(app.model, "a2");
     }
 
@@ -3547,7 +3575,10 @@ mod tests {
     #[test]
     fn provider_picker_remembers_successful_model_selection() {
         let mut app = App::new("s".into());
-        app.apply(AgentEvent::ProviderChanged(active("a", "a2")));
+        app.apply(AgentEvent::ProviderChanged {
+            route: active("a", "a2"),
+            context_window: None,
+        });
         app.apply(open_picker(
             RoutePickerStage::Provider,
             vec![
@@ -3616,7 +3647,10 @@ mod tests {
         let mut app = App::new("s".into()).with_route(old.clone());
         app.running = true;
         app.freeze_selected_route();
-        app.apply(AgentEvent::ProviderChanged(new.clone()));
+        app.apply(AgentEvent::ProviderChanged {
+            route: new.clone(),
+            context_window: None,
+        });
 
         assert_eq!(app.selected_route, Some(new));
         assert_eq!(app.frozen_route, Some(old.clone()));
@@ -3647,14 +3681,48 @@ mod tests {
         };
         let mut app = App::new("s".into()).with_route(old.clone());
         app.running = true;
-        app.apply(AgentEvent::RouteFrozen(old.clone()));
-        app.apply(AgentEvent::ProviderChanged(new.clone()));
+        app.apply(AgentEvent::RouteFrozen {
+            route: old.clone(),
+            context_window: Some(1_000_000),
+        });
+        app.apply(AgentEvent::ProviderChanged {
+            route: new.clone(),
+            context_window: Some(258_400),
+        });
         app.apply(usage(123));
 
         assert_eq!(app.selected_route, Some(new));
         assert_eq!(app.frozen_route, Some(old.clone()));
         assert_eq!(app.display_route(), Some(&old));
         assert_eq!(app.context_used, 123);
+        assert_eq!(app.display_context_window(), Some(1_000_000));
+
+        app.apply(turn_ended(EndReason::Completed));
+        assert_eq!(app.display_context_window(), Some(258_400));
+    }
+
+    #[test]
+    fn stale_provider_change_cannot_replace_the_context_window() {
+        let mut app = App::new("s".into())
+            .with_context("mock-model".into(), Some(1_000_000), 222_648)
+            .with_route(route(1));
+        app.apply(AgentEvent::ProviderChanged {
+            route: route(3),
+            context_window: Some(258_400),
+        });
+        app.apply(AgentEvent::ProviderChanged {
+            route: route(2),
+            context_window: None,
+        });
+
+        assert_eq!(
+            (
+                app.selected_route.as_ref(),
+                app.display_context_window(),
+                app.context_used,
+            ),
+            (Some(&route(3)), Some(258_400), 222_648),
+        );
     }
     fn fp(seq: u64, preview: &str) -> ForkPoint {
         ForkPoint {
@@ -4925,8 +4993,7 @@ mod tests {
 
     // --- HUD state (plan 38 slice 5) -----------------------------------------
 
-    /// A Usage event refreshes the footer's context estimate; the window/model
-    /// stay put (seeded once).
+    /// `Usage` 只刷新占用，不改选中路由及其配置窗口。
     #[test]
     fn usage_event_updates_context_estimate() {
         let mut app = App::new("s".into()).with_context("m".into(), Some(1000), 100);
