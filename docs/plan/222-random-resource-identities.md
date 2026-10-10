@@ -24,5 +24,6 @@
 - Program / Workflow 恢复与重放、共享 offload、子 agent 既有日志保护继续通过。
 - OAuth 并发保存保留所有条目；首次保存先建立私有目录，再加锁读取。
 - DESIGN 已改写现有契约，HANDOFF 已记录跨进程身份、大小写别名与共享更新的教训。
+- ✅ 复核（审查 `45874b5^..64d4ee8`）：scheduler 的 jitter 按 id 前 8 位十六进制解码，新 `job-` + Base58 id 恒解析失败而静默退化为 0；改为对完整 id 取 SHA-256 摘要，撞名重取 id 时同步重算 `next_fire_at_ms`，jitter 测试改用真实 id 形状并断言前缀相同的两个 id 分数不同。`bash_id` schema 示例与 DESIGN 的 sandbox 豁免粒度一并更正。
 
 状态：✅ 已完成（提交 SHA 以本文件所在提交为准）。

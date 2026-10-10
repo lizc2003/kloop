@@ -13,6 +13,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Datelike, Local, Offset as _, TimeZone as _, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
+use sha2::Sha256;
 use tokio::sync::watch;
 
 use crate::inbox::{Inbox, InboxItem, ScheduledOrigin};
@@ -925,12 +927,17 @@ impl Scheduler {
             bail!("durable scheduler storage is unavailable for this session");
         }
         let id = self.fresh_id()?;
-        let next_fire_at_ms = next_cron_fire(&spec, now, now, &id, recurring, self.timezone)
-            .ok_or_else(|| {
+        // The fire time carries the jitter, and the jitter is the id's, so a
+        // re-rolled id (below) has to be recomputed with — not just re-stamped
+        // onto — the time already derived.
+        let fire_at = |id: &str| {
+            next_cron_fire(&spec, now, now, id, recurring, self.timezone).ok_or_else(|| {
                 anyhow!(
                     "Cron expression '{cron}' does not match any calendar date in the next year."
                 )
-            })?;
+            })
+        };
+        let next_fire_at_ms = fire_at(&id)?;
         let mut job = ScheduledJob {
             id,
             owner,
@@ -950,6 +957,7 @@ impl Scheduler {
             self.store.as_ref().unwrap().transaction(|jobs| {
                 while jobs.iter().any(|existing| existing.id == job.id) {
                     job.id = crate::resource_id::fresh("job-")?;
+                    job.next_fire_at_ms = fire_at(&job.id)?;
                 }
                 jobs.push(job.clone());
                 Ok(())
@@ -965,6 +973,7 @@ impl Scheduler {
                 .any(|existing| existing.id == job.id)
             {
                 job.id = crate::resource_id::fresh("job-")?;
+                job.next_fire_at_ms = fire_at(&job.id)?;
             }
             state.session_jobs.push(job.clone());
         }
@@ -1437,10 +1446,22 @@ fn next_cron_fire(
     }
 }
 
+/// A fraction in `[0, 1)` derived from the **whole** job id, which is what
+/// spreads jobs that share a schedule: recurring jitter is a share of the
+/// period, one-shot jitter an early start, both picked deterministically per
+/// job.
+///
+/// It reads a digest of the id rather than characters of it. The first version
+/// decoded the id's leading eight hex digits, which was right only while job
+/// ids *were* eight hex digits; when they became `job-` + Base58, every id
+/// stopped parsing and the `unwrap_or(0.0)` that guarded the read quietly turned
+/// the whole jitter into a constant zero — nothing failed, jobs just all fired
+/// at their nominal instant. A digest has no such coupling to how ids are
+/// spelled.
 fn id_fraction(id: &str) -> f64 {
-    u32::from_str_radix(id.get(..8).unwrap_or_default(), 16)
-        .map(|value| value as f64 / (u32::MAX as f64 + 1.0))
-        .unwrap_or(0.0)
+    let digest: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+    let head = u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 is 32 bytes"));
+    f64::from(head) / (f64::from(u32::MAX) + 1.0)
 }
 
 #[cfg(test)]
@@ -1998,23 +2019,47 @@ mod tests {
     #[test]
     fn jitter_is_deterministic_and_bounded() {
         let timezone = SchedulerTimeZone::Named(Tz::UTC);
+        // Real job ids: the jitter is a function of the id the scheduler stores,
+        // so a fixture in some other shape tests nothing about what runs.
+        let ids = ["job-11111111111", "job-jpXCZedGfVQ", "job-7hKq2mV9Qx4"];
         let hourly = CronSpec::parse("0 * * * *").unwrap();
         let after = utc_ms(2026, 8, 3, 12, 1);
-        let low = next_cron_fire(&hourly, after, after, "00000000", true, timezone).unwrap();
-        let high = next_cron_fire(&hourly, after, after, "ffffffff", true, timezone).unwrap();
-        assert_eq!(low, utc_ms(2026, 8, 3, 13, 0));
-        assert!(high >= low);
-        assert!(high.saturating_sub(low) < 6 * 60 * 1_000);
-        assert_eq!(
-            next_cron_fire(&hourly, after, after, "ffffffff", true, timezone),
-            Some(high)
-        );
+        let nominal = utc_ms(2026, 8, 3, 13, 0);
+        for id in ids {
+            let fire = next_cron_fire(&hourly, after, after, id, true, timezone).unwrap();
+            assert!(fire >= nominal, "{id}: {fire}");
+            assert!(
+                fire.saturating_sub(nominal) < 6 * 60 * 1_000,
+                "{id}: {fire}"
+            );
+            assert_eq!(
+                next_cron_fire(&hourly, after, after, id, true, timezone),
+                Some(fire),
+                "{id}: an id must always land on the same instant"
+            );
+        }
 
         let one_shot = CronSpec::parse("30 13 * * *").unwrap();
         let nominal = utc_ms(2026, 8, 3, 13, 30);
-        let early = next_cron_fire(&one_shot, after, after, "ffffffff", false, timezone).unwrap();
-        assert!(early <= nominal);
-        assert!(nominal.saturating_sub(early) <= ONE_SHOT_JITTER_MAX_MS);
+        for id in ids {
+            let early = next_cron_fire(&one_shot, after, after, id, false, timezone).unwrap();
+            assert!(early <= nominal, "{id}: {early}");
+            assert!(
+                nominal.saturating_sub(early) <= ONE_SHOT_JITTER_MAX_MS,
+                "{id}: {early}"
+            );
+        }
+
+        // Reading the fraction off the id's leading eight hex digits made it the
+        // constant 0 for every `job-` + Base58 id — every job fired at its
+        // nominal instant and nothing failed. The basis has to be the whole id.
+        let low = id_fraction(ids[0]);
+        let high = id_fraction(ids[1]);
+        for (id, fraction) in [(ids[0], low), (ids[1], high)] {
+            assert!((0.0..1.0).contains(&fraction), "{id}: {fraction}");
+            assert!(fraction > 0.0, "{id}: a zero fraction is every job at once");
+        }
+        assert_ne!(low, high, "ids sharing a prefix must not share a fraction");
     }
 
     #[tokio::test]

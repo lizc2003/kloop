@@ -45,11 +45,15 @@ the five architectural bets below; it is now ten crates, and every bet held.
 
    Two gates had to open for that path, and **the permission gate is the one
    that binds** — it runs before the sandbox and is immune to
-   `--permission-mode bypass`. Both now carry the same narrow exemption, keyed on
-   the file name (`off-*.txt`, `bg-*.out`, with exactly 11 Base58 digits) rather
-   than the directory: those are
+   `--permission-mode bypass`. It exempts one file *name* (`off-*.txt`,
+   `bg-*.out`, with exactly 11 Base58 characters) rather than one directory:
+   those are
    the model's own output, which it was handed a preview of and this exact path,
    so re-reading one discloses nothing a tool would not have returned anyway.
+   The sandbox's exemption is coarser by construction — it re-allows reads under
+   `offload/` as a whole, having no file-name rule of its own — and that is safe
+   only because the gate in front of it refuses first and `offload/` holds
+   nothing but spilled output.
    `config.toml` (the provider credential) and `sessions/` (every project's
    transcript) stay sensitive, writes stay denied, and a `..` forfeits the
    exemption — as it does for `.kloop/worktrees/`, the other structural
@@ -506,11 +510,12 @@ Consequences worth knowing:
   reads that file through the same permission check before writing into it, so a
   world-readable label would make the grant fail;
 - `~/.kloop` is denied read and write inside the sandbox — it holds the provider
-  credential and every project's transcript — **except** for spilled tool output
-  (`offload/off-*.txt`, `offload/bg-*.out`), which is carved back out as
-  readable. The permission gate carries the matching exemption (see bet 1); the
-  sandbox alone would not have been enough, because the permission gate refuses
-  first. The carve-out is read-only: writes stay denied with the rest of the
+  credential and every project's transcript — **except** for spilled tool output,
+  carved back out as the whole `offload/` directory. The sandbox has no
+  file-name rule, so the name rule (`offload/off-*.txt`, `offload/bg-*.out`)
+  lives in the permission gate above it, which refuses first — `offload/` holds
+  nothing else, which is what makes a directory-wide carve-out harmless here. The
+  carve-out is read-only: writes stay denied with the rest of the
   store, and the deny/allow pair is emitted in that order because seatbelt takes
   the last matching rule. Read and write are denied *together* on purpose, and a
   test holds that pairing for every denied path: denies match by path, so a shell

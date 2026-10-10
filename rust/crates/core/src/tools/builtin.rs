@@ -699,7 +699,7 @@ fn bash_output_def() -> ToolDef {
         schema: json!({
             "type": "object",
             "properties": {
-                "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"},
+                "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-7hKq2mV9Qx4"},
                 "block": {"type": "boolean", "description": "Wait for completion (default true)"},
                 "timeout_ms": {"type": "integer", "description": "Maximum wait when blocking, not a fixed delay: returns early on completion (default 30000, max 600000). For slow commands choose a sufficient upper bound instead of repeated short waits."}
             },
@@ -716,7 +716,7 @@ fn stop_bash_def() -> ToolDef {
         schema: json!({
             "type": "object",
             "properties": {
-                "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-1"}
+                "bash_id": {"type": "string", "description": "ID from a background bash call, e.g. bg-7hKq2mV9Qx4"}
             },
             "required": ["bash_id"],
             "additionalProperties": false
