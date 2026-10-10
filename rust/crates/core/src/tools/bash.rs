@@ -175,9 +175,10 @@ fn shell_spec(
 /// arrives as `$1`, so it never has to be quoted into a script. Without a
 /// capture the shell stays `-lc`, which is the old behavior.
 fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> Vec<OsString> {
-    if !login_env.is_active() {
-        return vec!["-lc".into(), command.into()];
-    }
+    let replay_path = match login_env.replay_path_for_use() {
+        Ok(Some(path)) => path,
+        Ok(None) | Err(_) => return vec!["-lc".into(), command.into()],
+    };
     let mut args: Vec<OsString> = Vec::with_capacity(6);
     if bash.flavor == ShellFlavor::Zsh {
         args.push("-f".into());
@@ -187,13 +188,7 @@ fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> 
     // `$0`, so the command sees what `-c` would have given it.
     args.push(bash.executable.clone().into_os_string());
     args.push(command.into());
-    args.push(
-        login_env
-            .replay_path()
-            .expect("active capture has a replay file")
-            .as_os_str()
-            .into(),
-    );
+    args.push(replay_path.into_os_string());
     args
 }
 
@@ -1744,7 +1739,11 @@ Wait-Process -Id $grandchild.Id
                 prelude.clone(),
                 shell.executable.clone().into_os_string(),
                 std::ffi::OsString::from("true"),
-                login.replay_path().unwrap().as_os_str().into(),
+                login
+                    .replay_path_for_use()
+                    .unwrap()
+                    .unwrap()
+                    .into_os_string(),
             ],
             "the command is an argument, so nothing is quoted into the script"
         );
@@ -1999,6 +1998,85 @@ Wait-Process -Id $grandchild.Id
         .await;
         assert!(!is_error, "{out}");
         assert!(out.contains("from-login"), "{out}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn clearing_replay_files_does_not_break_the_next_bash_call() {
+        let directory =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-replay-cleanup-").unwrap());
+        let login = ShellLoginEnv::test_fixture_in(
+            &[
+                ("KLOOP_TEST_SENTINEL", "from-login"),
+                ("KLOOP_REPLAY_DIR", directory.to_str().unwrap()),
+            ],
+            &[],
+            &directory,
+        );
+        let original = login.replay_path_for_use().unwrap().unwrap();
+        let ctx = test_ctx_with_cfg(
+            0,
+            TestConfig::new("bash-replay-cleanup")
+                .login_env(login)
+                .build(),
+        );
+        for command in [
+            "rm -f -- \"$KLOOP_REPLAY_DIR\"/*.sh; printf %s \"$KLOOP_TEST_SENTINEL\"",
+            "printf %s \"$KLOOP_TEST_SENTINEL\"",
+        ] {
+            let (out, is_error) = run_tool("bash", bash_input(command), &ctx).await;
+            assert!(!is_error, "{out}");
+            assert!(out.contains("from-login"), "{out}");
+            assert!(!original.exists());
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        drop(ctx);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replay_write_failure_uses_a_login_shell_and_retries_later() {
+        let directory =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-replay-retry-").unwrap());
+        let login = ShellLoginEnv::test_fixture_in(
+            &[("KLOOP_TEST_SENTINEL", "from-login")],
+            &[],
+            &directory,
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        let shell = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .unwrap();
+        let command = "printf '%s|%s' \"$KLOOP_TEST_SENTINEL\" \"$#\"";
+        for expected_flag in ["-lc", "-c"] {
+            let spec = super::shell_spec(
+                command,
+                &std::env::current_dir().unwrap(),
+                None,
+                &shell,
+                &login,
+            );
+            assert_eq!(spec.args[0], std::ffi::OsString::from(expected_flag));
+            let output = super::run_process_foreground(
+                spec,
+                10_000,
+                &tokio_util::sync::CancellationToken::new(),
+                "bash",
+            )
+            .await
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"from-login|0", "{output:?}");
+            if expected_flag == "-lc" {
+                std::fs::remove_file(&directory).unwrap();
+            }
+        }
+        drop(login);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[tokio::test]

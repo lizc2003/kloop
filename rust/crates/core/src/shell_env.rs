@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::process_tree::ProcessSpec;
 
@@ -52,7 +53,6 @@ const VOLATILE_ENV: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
 #[cfg(unix)]
 const KLOOP_SHELL_ENV: &[&str] = &["KLOOP_SANDBOX", "KLOOP_SANDBOX_NETWORK_DISABLED"];
 
-#[cfg(any(unix, test))]
 const SHELL_READONLY_ENV: &[&str] = &[
     "BASHOPTS",
     "BASH_VERSINFO",
@@ -77,14 +77,23 @@ const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(unix)]
 const CAPTURE_MARKER: u8 = 0x01;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct ShellLoginEnv {
     vars: BTreeMap<String, String>,
     removed: BTreeSet<String>,
-    replay_file: Option<Arc<ReplayFile>>,
+    replay_dir: PathBuf,
+    replay_file: Arc<Mutex<Option<ReplayFile>>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl PartialEq for ShellLoginEnv {
+    fn eq(&self, other: &Self) -> bool {
+        self.vars == other.vars && self.removed == other.removed
+    }
+}
+
+impl Eq for ShellLoginEnv {}
+
+#[derive(Debug)]
 struct ReplayFile {
     path: PathBuf,
 }
@@ -101,8 +110,7 @@ impl ShellLoginEnv {
         Self::default()
     }
 
-    /// True when a login environment was captured, and so when commands run in
-    /// a non-login shell carrying it.
+    /// 是否已捕获登录环境；临时回放文件不可用时，命令仍可暂用登录 shell。
     pub fn is_active(&self) -> bool {
         !self.vars.is_empty()
     }
@@ -120,40 +128,63 @@ impl ShellLoginEnv {
 
     #[cfg(test)]
     pub fn test_fixture_with_removals(vars: &[(&str, &str)], removed: &[&str]) -> Self {
-        Self {
+        Self::test_fixture_in(vars, removed, &std::env::temp_dir())
+    }
+
+    #[cfg(test)]
+    pub fn test_fixture_in(vars: &[(&str, &str)], removed: &[&str], replay_dir: &Path) -> Self {
+        let env = Self {
             vars: vars
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
             removed: removed.iter().map(|name| (*name).to_string()).collect(),
-            replay_file: None,
+            replay_dir: replay_dir.to_path_buf(),
+            ..Self::default()
+        };
+        env.replay_path_for_use()
+            .expect("create the test replay file");
+        env
+    }
+
+    pub(crate) fn replay_path_for_use(&self) -> std::io::Result<Option<PathBuf>> {
+        if !self.is_active() {
+            return Ok(None);
         }
-        .prepare_replay()
-        .expect("create the test replay file")
+        let mut slot = self
+            .replay_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(file) = slot.as_ref()
+            && file.path.is_file()
+        {
+            return Ok(Some(file.path.clone()));
+        }
+        *slot = None;
+        let file = self.write_replay_file().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("{}: {error}", self.replay_dir.display()),
+            )
+        })?;
+        let path = file.path.clone();
+        *slot = Some(file);
+        Ok(Some(path))
     }
 
-    pub(crate) fn replay_path(&self) -> Option<&Path> {
-        self.replay_file.as_ref().map(|file| file.path.as_path())
-    }
-
-    #[cfg(any(unix, test))]
-    fn prepare_replay(mut self) -> std::io::Result<Self> {
+    fn write_replay_file(&self) -> std::io::Result<ReplayFile> {
         use std::io::Write as _;
 
-        if !self.is_active() {
-            return Ok(self);
-        }
         let (_, path, mut file) =
-            crate::resource_id::create_file(&std::env::temp_dir(), "shell-env-", ".sh")?;
-        let replay_file = Arc::new(ReplayFile { path });
+            crate::resource_id::create_file(&self.replay_dir, "shell-env-", ".sh")?;
+        let replay_file = ReplayFile { path };
         file.write_all(self.replay().as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
         }
-        self.replay_file = Some(replay_file);
-        Ok(self)
+        Ok(replay_file)
     }
 
     /// Replay the capture on a process spec: the environment the login shell
@@ -189,7 +220,6 @@ impl ShellLoginEnv {
     /// left out — an environment name may contain anything, and one that is not
     /// an identifier would turn this script into a syntax error. Those names are
     /// still covered by the process spec's own additions and removals.
-    #[cfg(any(unix, test))]
     fn replay(&self) -> String {
         let unset: BTreeSet<&str> = MODEL_SHELL_SECRET_ENV
             .iter()
@@ -229,10 +259,10 @@ impl ShellLoginEnv {
     /// Run `<shell> -lc` once and keep the environment it comes up with.
     ///
     /// `config_env` 的实际值覆盖捕获，并在 shell 启动之后恢复。
-    /// 失败返回启动警告与 `none()`，继续沿用登录 `-lc`。
+    /// 捕获失败返回 `none()`；文件准备失败保留捕获供重试，并警告暂用登录 `-lc`。
     #[cfg(unix)]
     pub fn capture(shell: &Path, config_env: &[(String, String)]) -> (Self, Option<String>) {
-        Self::capture_within(shell, config_env, CAPTURE_TIMEOUT)
+        Self::capture_within(shell, config_env, CAPTURE_TIMEOUT, &std::env::temp_dir())
     }
 
     #[cfg(unix)]
@@ -240,6 +270,7 @@ impl ShellLoginEnv {
         shell: &Path,
         config_env: &[(String, String)],
         timeout: std::time::Duration,
+        replay_dir: &Path,
     ) -> (Self, Option<String>) {
         // `command` keeps a shell function named `env` out of the way; the
         // markers separate `env -0` from anything the login profile prints.
@@ -269,16 +300,19 @@ impl ShellLoginEnv {
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>(),
         );
-        match (Self {
+        let env = Self {
             vars,
             removed,
-            replay_file: None,
-        })
-        .prepare_replay()
-        {
-            Ok(env) => (env, None),
-            Err(_) => (Self::none(), Some(unavailable(shell))),
-        }
+            replay_dir: replay_dir.to_path_buf(),
+            ..Self::default()
+        };
+        let warning = env.replay_path_for_use().err().map(|error| {
+            format!(
+                "the login environment replay file could not be prepared ({error}); \
+                 shell tools will start a login shell instead"
+            )
+        });
+        (env, warning)
     }
 
     #[cfg(not(unix))]
@@ -320,7 +354,6 @@ fn removals(
 }
 
 /// Whether a name may appear in the replay script at all.
-#[cfg(any(unix, test))]
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
@@ -329,7 +362,6 @@ fn is_identifier(name: &str) -> bool {
 
 /// Single-quote a value for the replay script: everything inside is literal, and
 /// an embedded quote closes, escapes and reopens it.
-#[cfg(any(unix, test))]
 fn quote_sh(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -583,7 +615,7 @@ with both'"#
     #[test]
     fn replay_file_is_private_and_lives_until_the_last_capture_is_dropped() {
         let env = ShellLoginEnv::test_fixture(&[("PATH", "/login/bin")]);
-        let path = env.replay_path().unwrap().to_path_buf();
+        let path = env.replay_path_for_use().unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), env.replay());
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -594,6 +626,69 @@ with both'"#
         assert!(path.exists());
         drop(shared);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn deleted_replay_is_rebuilt_once_for_concurrent_clones() {
+        let env = ShellLoginEnv::test_fixture_with_removals(
+            &[("PATH", "/login/bin"), ("GREETING", "it's still here")],
+            &["PYTHONHOME"],
+        );
+        let original = env.replay_path_for_use().unwrap().unwrap();
+        std::fs::remove_file(&original).unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let shared = env.clone();
+                std::thread::spawn(move || shared.replay_path_for_use().unwrap().unwrap())
+            })
+            .collect();
+        let paths: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let rebuilt = &paths[0];
+        assert_ne!(rebuilt, &original);
+        assert!(paths.iter().all(|path| path == rebuilt), "{paths:?}");
+        assert_eq!(std::fs::read_to_string(rebuilt).unwrap(), env.replay());
+        assert_eq!(
+            std::fs::metadata(rebuilt).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let shared = env.clone();
+        drop(env);
+        assert!(rebuilt.exists());
+        drop(shared);
+        assert!(!rebuilt.exists());
+    }
+
+    #[test]
+    fn replay_preparation_failure_warns_with_its_cause_and_preserves_the_capture() {
+        let shell = fake_shell("replay-fail", &format!("#!/bin/sh\n{MARKED}\n"));
+        let directory = shell.parent().unwrap().join("blocked");
+        std::fs::write(&directory, b"not a directory").unwrap();
+        let error = std::fs::create_dir_all(&directory).unwrap_err();
+        let (env, warning) =
+            ShellLoginEnv::capture_within(&shell, &[], CAPTURE_TIMEOUT, &directory);
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("replay file could not be prepared"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(&directory.display().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains(&error.to_string()), "{warning}");
+        assert!(warning.contains("start a login shell instead"), "{warning}");
+        assert!(!warning.contains("could not be captured"), "{warning}");
+        assert_eq!(env.get("KLOOP_TEST_SENTINEL"), Some("1"));
+        assert_eq!(env.replay_path_for_use().unwrap_err().kind(), error.kind());
+        std::fs::remove_file(&directory).unwrap();
+        let path = env.replay_path_for_use().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), env.replay());
+        drop(env);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(shell.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -617,8 +712,12 @@ with both'"#
     fn a_wedged_shell_capture_times_out() {
         let shell = fake_shell("slow", "#!/bin/sh\n/bin/sleep 30\n");
         let start = std::time::Instant::now();
-        let (env, warning) =
-            ShellLoginEnv::capture_within(&shell, &[], std::time::Duration::from_secs(2));
+        let (env, warning) = ShellLoginEnv::capture_within(
+            &shell,
+            &[],
+            std::time::Duration::from_secs(2),
+            &std::env::temp_dir(),
+        );
         assert!(!env.is_active());
         assert!(warning.is_some());
         assert!(
@@ -739,8 +838,12 @@ with both'"#
             .unwrap();
             std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            let (env, _) =
-                ShellLoginEnv::capture_within(&shell, &[], std::time::Duration::from_secs(5));
+            let (env, _) = ShellLoginEnv::capture_within(
+                &shell,
+                &[],
+                std::time::Duration::from_secs(5),
+                &std::env::temp_dir(),
+            );
             assert!(!env.is_active(), "{tag}");
 
             // A freshly written executable pays a one-off exec cost on macOS, so
