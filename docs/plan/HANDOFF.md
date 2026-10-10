@@ -6,12 +6,21 @@
 技术失败不静默剔除或补样成成功。协议不自动加载或强制执行；未新增执行器、脚本、
 题库或容器，也未开展新实验。真实 API 评测仍不进 `make check`。教训 219。
 
-**提交门禁与手动 release 检查（2026-10-10）**：用户因耗时将 release 测试从提交门禁移除。
-`make check` 现在只跑 fmt + clippy + workspace debug 全量测试 + parity；
-`make check-release` 单独提供 fmt + release clippy + workspace release 全量测试 + parity，
-供用户按需手动运行，**不要在提交前自动追加**。`test-release` 的范围从 core 库扩大到整个
-workspace；parity 仍用原有的 debug 报告生成流程。教训 218 的故障与断言约束仍成立，
-但当时把 release 测试加入默认门禁的决定已被本条替代；门禁成本也必须尊重用户取舍。
+**分级提交验证与手动 release 检查（2026-10-10）**：根 `AGENTS.md` 的规则已改为按变更
+影响分级。纯说明、设计、计划或开发约定修订，且不影响构建/运行/测试输入时，只核对
+文档与差异，跑 `git diff --check` 和暂存后的 `git diff --cached --check`，不编译、不跑测试。
+代码、配置、脚本、测试、夹具、快照、内置提示词或 skills 等运行时输入仍跑完整 `make check`；
+不能看 `.md` 就豁免，混合或不确定影响的变更同样走完整门禁。只修订计划不标记功能完成。
+`make check` 的命令语义不变：fmt + clippy + workspace debug 全量测试 + parity。
+**`make test` 及包含它的 `make check` 要在外层执行沙箱之外运行**：真实 macOS 沙箱测试
+嵌套执行会遇到 `sandbox_apply: Operation not permitted`，PTY 可能卡在意外审批直到超时。
+按执行器权限规则申请，不绕过审批，也不关闭 kloop 自身沙箱或放宽断言。
+
+用户因耗时将 release 测试从默认提交门禁移除；`make check-release` 单独提供 fmt + release
+clippy + workspace release 全量测试 + parity，供用户按需手动运行，**不要在提交前自动追加**。
+`test-release` 的范围从 core 库扩大到整个 workspace；parity 仍用原有的 debug 报告生成流程。
+手动 release 测试也须在外层沙箱之外运行。教训 218 的故障与断言约束仍成立，但当时把
+release 测试加入默认门禁的决定已被本条替代；门禁成本也必须尊重用户取舍。
 
 **PTY 稳定帧断言（2026-10-10）**：两轮溢出测试在默认并行门禁两次读到 `[manual] = 0`，
 单跑与串行通过。根因是先对 `wait_for` 返回的中间帧计数，随后才等待静默；输入提示与
@@ -183,7 +192,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **208** ⛔ 一次调用,改好几处 | `edit_file` 加 `edits[]`,都对原文件匹配、不重叠、原子写。**已搁置(2026-09-29)**:plan 推荐的「两种形状都收」pi 做过、一天后就撤了(模型频繁传错参数);本机 26 组同回复同文件多次 edit 全是两处、半截状态与相邻干扰 0 次。重开条件与起步形状见 plan 末节(教训 198) | 中 |
 | **209** ✅ 压缩时告诉它什么最要紧 | `/compact <focus>`,只动 core。**已完成(2026-09-29,`1b966a9`)**:焦点拼在摘要请求最后那条指令之后，只偏重这一次(不进 anchors、不进 rollout),超 2,000 字符拒绝;开工两问照推荐。措辞比 plan 多一句"第 1、2、9 节只来自对话",是真实模型量出来的(教训 199) | 小 |
 | **210** ✅ 退回去之前,先记下那条路上学到了什么 | rewind 时可选摘要被放弃的分支,运行时列出它改过的文件。**已完成(2026-09-30,`e9bf419`)**:picker 里 `s` = 先摘要再退回(Enter 照旧),只做 TUI;清单只列改过的(`edit_file`/`write_file`/`notebook_edit`,失败的调用不算);不做带指示的摘要——四问都照推荐。采样循环抽成 `compact::sample_shrinking`;rewind 编排挪进 core 的 `rewind::rewind`(照 `/clear` 的分法),plan 写的 worker 级测试才写得出来(教训 214)。摘要措辞已用真实模型实测(5/5,见 plan 第七节) | 中 |
-| **211** 输入框该像 shell 一样能编辑 | Ctrl+A/E/K/U/W、按词移动、kill ring、撤销 | 中 |
+| **211** 先补基础编辑，再做可靠撤销 | **2026-10-10 修订，待实现**：下一会话只做基础行/词编辑；撤销另立后续任务，先定载荷共享与内存预算；高级剪切暂缓 | 中 |
 | **212** ✅ 先量,再调 | **已完成(2026-10-10)**：轻量行为评测 Markdown 协议定稿于 DESIGN；每次实验在对应 plan 记录，不新增平台、不承诺后续实现 | 设计 |
 | **213** 起草时顺手看到的四件小事 | 下面列的四件,开工先问第 1 件怎么处理 | 小 |
 

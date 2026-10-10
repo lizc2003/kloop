@@ -34,7 +34,7 @@ reads the code, edits files, runs commands and looks things up until the job is 
 
 Rust 1.98+. macOS is the primary platform (the sandbox has a macOS backend only);
 Linux and Windows build and run, but only macOS is exercised routinely — there is
-no CI, so `make check` on the developer's machine is the whole gate.
+no CI, so full code-change validation runs locally with `make check` (see below).
 
 ```sh
 make install          # release build, installed into ~/.local/bin (override PREFIX=)
@@ -85,6 +85,18 @@ that same file; the full field reference is
 | `docs/plan/` | One numbered file per development task, including what went wrong; `HANDOFF.md` is the current state (written in Chinese) |
 | `config/` | Configuration example |
 
-`make help` lists every build target. Run `make check` before every commit
-(fmt + clippy + workspace debug tests + parity). `make check-release` is a manual,
-optional check with release clippy and workspace release tests, plus fmt and parity.
+`make help` lists every build target. Code, dependency, configuration, script,
+test/fixture/snapshot, and built-in prompt or skill changes require `make check`
+(fmt + clippy + workspace debug tests + parity). Pure documentation that changes
+no build, runtime, or test inputs needs content/reference review and
+`git diff --check`, plus `git diff --cached --check` after staging — not compilation
+or tests. A Markdown runtime asset is not documentation-only; mixed or uncertain
+changes require the full gate. `make check` always runs the full checks, regardless
+of which files changed. The complete policy is in [`AGENTS.md`](AGENTS.md).
+
+Run `make test` and the containing `make check` outside the agent executor's outer
+sandbox, with any required approval: the tests exercise the macOS sandbox, and
+nesting it can fail with `sandbox_apply: Operation not permitted`. This does not
+mean disabling kloop's own sandbox or weakening assertions. `make check-release`
+remains a manual, optional check with release clippy and workspace release tests,
+plus fmt and parity; its tests need the same outer-sandbox-free environment.

@@ -4284,10 +4284,23 @@ snapshot is not a runtime dependency.
 ## Running
 
 仓库根的 `Makefile` 包装工作区命令：`make` 构建 release，`make debug` 构建 debug，
-`make test` 跑 workspace 的 debug 全量测试。提交前运行 `make check`：fmt + clippy +
-debug 全量测试 + parity。parity 对照本机语料校验 kloop 自己的原生报告，能发现单测仍绿的
-行为漂移；没有语料时跳过。`make mock`、`make parity` 可单独运行，其余目标见 `make help`。
-这些命令都进入工作区所在的 `rust/` 执行。
+`make test` 跑 workspace 的 debug 全量测试。提交验证按变更影响分级：纯说明、设计、计划
+或开发约定修订，且不影响构建、运行或测试输入时，只核对文档内容、引用、状态与差异，
+运行 `git diff --check`，暂存后再运行 `git diff --cached --check`，不编译、不跑测试。
+源码、依赖、构建/运行配置、脚本、测试、夹具、快照、内置提示词或 skills 等运行时输入的
+变更，提交前仍须 `make check` 全绿；被编译或加载的 Markdown 不属于纯文档，混合或
+不确定影响的变更也走完整门禁。用户明确要求的额外验证另行执行。
+
+`make check` 本身始终运行 fmt + clippy + debug 全量测试 + parity，不按文件类型自动跳过。
+parity 对照本机语料校验 kloop 自己的原生报告，能发现单测仍绿的行为漂移；没有语料时跳过。
+`make mock`、`make parity` 可单独运行，其余目标见 `make help`。这些命令都进入工作区所在的
+`rust/` 执行；完整规则以根 `AGENTS.md` 为准。
+
+`make test` 及包含它的 `make check` 需要在本机终端或经批准的外层执行沙箱之外运行。
+测试包含真实 macOS 沙箱与进程集成，嵌套沙箱会导致 `sandbox_apply: Operation not permitted`，
+PTY 还可能停在意外出现的沙箱升级审批上直到超时。这不是要求关闭 kloop 自身沙箱或放宽
+测试断言；执行器需要审批时按权限规则申请，不能绕过审批。手动 release 测试同样需要
+这个执行环境。
 
 `make check-release` 是按需手动运行的检查：fmt + release clippy（workspace、全部 target
 与 feature、`-D warnings`）+ workspace release 全量测试 + 同一条 parity；parity 的报告
@@ -4882,7 +4895,8 @@ under `-D warnings`: the matrix asked for `+stable`, which had moved on to 1.98.
 while the repository pinned 1.96.1, so the only thing the matrix reported was the
 distance between its own toolchain and the project's (the 1.96.1 MSRV job beside
 it stayed green throughout). `make check` on the developer's machine is now the
-whole gate, and it runs on macOS only. Composer/unit/render/TestBackend
+whole code-change gate, and it runs on macOS only. Documentation-only changes
+follow the lighter checks described under Running. Composer/unit/render/TestBackend
 correctness is cross-platform *code* — those suites carry no `cfg` — but nothing
 executes it on Linux or Windows; the native Windows evidence on record comes from
 a manual Windows 10 x64 run, from lifting a module into a scratch crate for a
