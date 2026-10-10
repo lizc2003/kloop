@@ -275,7 +275,7 @@ mod tests {
         }
         let root = base.join(".kloop");
         let store = ProjectStore::new(root);
-        let id = ProjectId::from_str(&format!("p1_{}", "3".repeat(50))).unwrap();
+        let id = ProjectId::from_str(&format!("p1_{}", "3".repeat(25))).unwrap();
         (base, store, id)
     }
 
@@ -348,7 +348,7 @@ mod tests {
         // A project that predates the question — sessions but no record — is
         // answered for all the same, and one project says nothing about another.
         let (other_base, other_store, other_id) = fixture("trust-sessions");
-        let untouched = ProjectId::from_str(&format!("p1_{}", "4".repeat(50))).unwrap();
+        let untouched = ProjectId::from_str(&format!("p1_{}", "4".repeat(25))).unwrap();
         std::fs::create_dir_all(other_store.project_dir(&other_id).join("sessions")).unwrap();
         assert!(other_store.trusted_blocking(&other_id));
         assert!(
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
 
         value.as_object_mut().unwrap().remove("unknown");
-        value["project_id"] = serde_json::json!(format!("p1_{}", "4".repeat(50)));
+        value["project_id"] = serde_json::json!(format!("p1_{}", "4".repeat(25)));
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
 
@@ -618,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn project_ids_have_separate_files_and_locks() {
         let (base, store, first_id) = fixture("isolated");
-        let second_id = ProjectId::from_str(&format!("p1_{}", "4".repeat(50))).unwrap();
+        let second_id = ProjectId::from_str(&format!("p1_{}", "4".repeat(25))).unwrap();
         store
             .append(
                 first_id.clone(),

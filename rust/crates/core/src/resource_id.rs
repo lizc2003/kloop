@@ -6,8 +6,8 @@ use std::path::PathBuf;
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const ID_LEN: usize = 11;
-const DIGEST_LEN: usize = 50;
-const MAX_DIGEST: &str = "6dp5qcb22im238nr3wvp0ic7q99w035jmy2iw7i6n43d37jtof";
+const DIGEST_LEN: usize = 25;
+const MAX_DIGEST: &str = "f5lxx1zz5pnorynqglhzmsp33";
 
 pub fn fresh(prefix: &str) -> io::Result<String> {
     let mut bytes = [0_u8; 8];
@@ -36,7 +36,9 @@ fn encode<const BYTES: usize, const DIGITS: usize>(
 }
 
 pub fn encode_digest(bytes: [u8; 32]) -> String {
-    encode::<32, DIGEST_LEN>(bytes, BASE36)
+    let mut prefix = [0; 16];
+    prefix.copy_from_slice(&bytes[..16]);
+    encode::<16, DIGEST_LEN>(prefix, BASE36)
 }
 
 pub(crate) fn is_digest(value: &str) -> bool {
@@ -99,22 +101,31 @@ mod tests {
     }
 
     #[test]
-    fn digest_encoding_preserves_all_256_bits_in_50_lowercase_base36_digits() {
-        assert_eq!(encode_digest([0; 32]), "0".repeat(50));
+    fn digest_encoding_preserves_the_first_128_bits_in_25_lowercase_base36_digits() {
+        assert_eq!(encode_digest([0; 32]), "0".repeat(25));
         assert_eq!(encode_digest([255; 32]), MAX_DIGEST);
         let mut lowest_bit = [0; 32];
-        lowest_bit[31] = 1;
-        assert_eq!(encode_digest(lowest_bit), format!("{}1", "0".repeat(49)));
+        lowest_bit[15] = 1;
+        assert_eq!(encode_digest(lowest_bit), format!("{}1", "0".repeat(24)));
         let mut highest_bit = [0; 32];
         highest_bit[0] = 128;
-        assert_eq!(
-            encode_digest(highest_bit),
-            "36ukv65j19b11mbvjyfui963v4my01krth19g3r3bk1ojlrwu8"
-        );
+        assert_eq!(encode_digest(highest_bit), "7ksyyizzkutudzbv8aqztecjk");
+        assert!(is_digest(&"0".repeat(25)));
         assert!(is_digest(MAX_DIGEST));
-        assert!(!is_digest(&"z".repeat(50)));
-        assert!(!is_digest(&"0".repeat(49)));
+        assert!(!is_digest("f5lxx1zz5pnorynqglhzmsp34"));
+        assert!(!is_digest(&"0".repeat(24)));
+        assert!(!is_digest(&"0".repeat(50)));
         assert!(!is_digest(&MAX_DIGEST.to_uppercase()));
+    }
+
+    #[test]
+    fn digest_encoding_ignores_the_last_128_bits() {
+        let prefix_only = [42; 32];
+        let mut changed_tail = prefix_only;
+        changed_tail[16..].fill(255);
+        assert_eq!(encode_digest(prefix_only), encode_digest(changed_tail));
+        changed_tail[15] ^= 1;
+        assert_ne!(encode_digest(prefix_only), encode_digest(changed_tail));
     }
 
     #[test]

@@ -1228,7 +1228,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         assert_eq!(base_identity, worktree_identity);
         let base_key = scheduler_project_key(&repository).unwrap();
         assert_eq!(base_key, scheduler_project_key(&worktree).unwrap());
-        assert_eq!(base_key.len(), 50);
+        assert_eq!(base_key.len(), 25);
         assert_eq!(base_key, base_key.to_lowercase());
         assert_eq!(
             base_identity,

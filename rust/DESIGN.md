@@ -478,10 +478,10 @@ from the exact directory that wrote it. `project.json` labels the partition
 with the path it was named after, so cross-project listings print real
 directories rather than digests.
 
-项目与工作区身份仍对规范路径做带域隔离的完整 SHA-256；摘要以固定 50 位全小写 Base36
-编码，分别加 `p1_` / `w1_` 前缀，项目目录由此前的 67 字符缩至 53 字符。
+项目与工作区身份对规范路径做带域隔离的 SHA-256，取摘要前 128 位，以固定 25 位全小写
+Base36 编码，分别加 `p1_` / `w1_` 前缀，目录名共 28 字符。
 只使用小写字符，避免在不区分大小写的文件系统上引入额外别名。
-不截断摘要，不读取或迁移旧十六进制目录。`project.json` 的标签与信任时间更新
+不读取或迁移旧格式目录。`project.json` 的标签与信任时间更新
 共用 `project.lock`，在锁内读改写，再以排他创建的临时文件原子替换，避免多个
 实例丢掉对方刚写的 `granted_at`。
 
@@ -2605,7 +2605,7 @@ Durable jobs are stored at:
 
 The project key derives from the canonical Git common directory, so a primary checkout and
 its worktrees share one base-project identity; a non-Git project uses its canonical cwd.
-项目键保留 SHA-256 的全部 256 位，改为固定 50 位全小写 Base36，多个实例仍定位同一
+项目键取 SHA-256 的前 128 位，编码为固定 25 位全小写 Base36，多个实例仍定位同一
 目录。任务 ID 为 `job-` 加 11 位随机 Base58；持久任务的查重与插入在同一个
 存储锁事务内，内存任务在注册表互斥锁内完成。不查找或迁移旧目录。
 A durable job is bound to its creating session/thread owner. Other owners cannot list,

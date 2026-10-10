@@ -104,7 +104,7 @@ fn validate_id(value: &str, prefix: &str) -> Result<(), &'static str> {
         return Err("identity has the wrong version prefix");
     };
     if !crate::resource_id::is_digest(digest) {
-        return Err("identity must contain one full lowercase Base36 SHA-256 digest");
+        return Err("identity must contain a lowercase Base36 128-bit SHA-256 prefix");
     }
     Ok(())
 }
@@ -467,7 +467,7 @@ mod tests {
         assert_ne!(main.workspace_id(), first.workspace_id());
         assert_ne!(first.workspace_id(), second.workspace_id());
         assert!(main.project_id().unwrap().as_str().starts_with("p1_"));
-        assert_eq!(main.project_id().unwrap().as_str().len(), 53);
+        assert_eq!(main.project_id().unwrap().as_str().len(), 28);
 
         let _ = std::fs::remove_dir_all(tree_a);
         let _ = std::fs::remove_dir_all(tree_b);
@@ -591,16 +591,17 @@ mod tests {
             ProjectIdentityStatus::Unavailable(IdentityUnavailableReason::CwdCanonicalization)
         );
         assert!(!identity.workspace_id().as_str().contains("kloop-project"));
-        assert_eq!(identity.workspace_id().as_str().len(), 53);
+        assert_eq!(identity.workspace_id().as_str().len(), 28);
     }
 
     #[test]
     fn ids_reject_truncation_uppercase_overflow_and_wrong_prefix() {
-        let valid = format!("p1_{}", "3".repeat(50));
+        let valid = format!("p1_{}", "3".repeat(25));
         assert!(ProjectId::from_str(&valid).is_ok());
-        assert!(ProjectId::from_str(&format!("p1_{}", "3".repeat(49))).is_err());
-        assert!(ProjectId::from_str(&format!("p1_{}", "A".repeat(50))).is_err());
-        assert!(ProjectId::from_str(&format!("p1_{}", "z".repeat(50))).is_err());
-        assert!(ProjectId::from_str(&format!("w1_{}", "3".repeat(50))).is_err());
+        assert!(ProjectId::from_str(&format!("p1_{}", "3".repeat(24))).is_err());
+        assert!(ProjectId::from_str(&format!("p1_{}", "3".repeat(50))).is_err());
+        assert!(ProjectId::from_str(&format!("p1_{}", "A".repeat(25))).is_err());
+        assert!(ProjectId::from_str(&format!("p1_{}", "z".repeat(25))).is_err());
+        assert!(ProjectId::from_str(&format!("w1_{}", "3".repeat(25))).is_err());
     }
 }
