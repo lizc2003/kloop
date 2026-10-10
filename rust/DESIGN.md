@@ -282,7 +282,15 @@ back. Provider and search credentials are filtered out of the capture the same
 way they are scrubbed from any model-controlled shell, names the config `[env]`
 sets are never taken from it, and names the shell derives itself (`PWD`,
 `OLDPWD`, `SHLVL`, `_`) are dropped so the child is not pinned to the capture's
-cwd. The capture is process-wide, like the shell identity: one login shell per
+cwd. Replay is a full picture, not a set of additions: the probe is its own
+process group and a timeout kills that whole group (a profile waiting on a child
+script would otherwise leave it running, holding the pipe), the names the login
+shell *dropped* are removed from the command, and the startup files a
+non-interactive shell would still read on its own are suppressed — zsh runs with
+`-f`, because it re-reads `~/.zshenv` even when it is neither login nor
+interactive, and `BASH_ENV`/`ENV` are removed. Without that, a credential the
+capture filtered out walks straight back in. The capture is process-wide, like
+the shell identity: one login shell per
 process, shared by every session, sub-agent and worktree. It is best-effort — a
 failure (or `[shells].login_env = false`) is a startup warning and commands fall
 back to the login `-lc` form, which is what kloop did before. On Windows, Job

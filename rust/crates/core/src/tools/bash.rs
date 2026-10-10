@@ -9,6 +9,7 @@
 //! events. cc's auto-backgrounding and model-visible Monitor tool are not ported.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +62,7 @@ use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
 use crate::shell_env::MODEL_SHELL_SECRET_ENV;
 use crate::shell_env::ShellLoginEnv;
+use crate::shell_programs::ShellFlavor;
 use crate::shell_programs::ShellProgram;
 
 /// Tail returned inline by bash_output; the rest stays in the output file
@@ -131,14 +133,7 @@ pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
 
 /// The process spec for the user's shell command, wrapped in the OS sandbox
 /// when a policy applies. The env vars are hints only; enforcement is the
-/// profile.
-///
-/// With a captured login environment the shell runs **non-login** (`-c`): a
-/// login `sh`/`bash` re-runs `/etc/profile`, whose `path_helper` would put
-/// `/etc/paths` — and `/usr/bin` — back in front of the captured `PATH`, and a
-/// login `zsh` would re-read `~/.zprofile` only to reach the same place by a
-/// different route. Without a capture it stays `-lc`, which is the old
-/// behavior.
+/// profile. The shell arguments are [`shell_args`]'s business.
 fn shell_spec(
     command: &str,
     cwd: &Path,
@@ -146,8 +141,7 @@ fn shell_spec(
     bash: &ShellProgram,
     login_env: &ShellLoginEnv,
 ) -> ProcessSpec {
-    let flag = if login_env.is_active() { "-c" } else { "-lc" };
-    let shell_args = vec![flag.into(), command.into()];
+    let shell_args = shell_args(bash, command, login_env);
     let (program, args) = match sandbox {
         Some(policy) => sandbox::seatbelt_command(policy, bash.executable.as_os_str(), &shell_args),
         None => (bash.executable.clone(), shell_args),
@@ -168,6 +162,29 @@ fn shell_spec(
     scrub_model_shell_env(&mut spec);
     login_env.apply(&mut spec);
     spec
+}
+
+/// The arguments one command is run with.
+///
+/// A capture is replayed into a **non-login** shell: a login `sh`/`bash` re-runs
+/// `/etc/profile`, whose `path_helper` would put `/etc/paths` — and `/usr/bin` —
+/// back in front of the captured `PATH`. zsh is the one shell that also re-reads
+/// a startup file (`~/.zshenv`) when it is neither login nor interactive, so it
+/// gets `-f` to suppress every one of them; `bash` and POSIX `sh` read none in
+/// this shape. Without a capture the shell stays `-lc`, which is the old
+/// behavior.
+fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(3);
+    if login_env.is_active() {
+        if bash.flavor == ShellFlavor::Zsh {
+            args.push("-f".into());
+        }
+        args.push("-c".into());
+    } else {
+        args.push("-lc".into());
+    }
+    args.push(command.into());
+    args
 }
 
 /// The session sandbox policy for this call: disable_sandbox is the model's
@@ -1240,6 +1257,7 @@ mod tests {
     use crate::execution_provenance::TerminalOwner;
     use crate::inbox::InboxItem;
     use crate::shell_env::ShellLoginEnv;
+    use crate::shell_programs::ShellFlavor;
     use crate::tools::testutil::*;
     #[cfg(windows)]
     use base64::Engine as _;
@@ -1694,7 +1712,10 @@ Wait-Process -Id $grandchild.Id
 
     /// A captured login environment only survives in a non-login shell: `/etc/
     /// profile`'s `path_helper` would otherwise put `/usr/bin` back in front of
-    /// the captured `PATH`. Without a capture the shell stays login `-lc`.
+    /// the captured `PATH`. zsh additionally gets `-f`, because it re-reads
+    /// `~/.zshenv` even when it is neither login nor interactive — a file that
+    /// can export a credential the capture filtered out. Without a capture the
+    /// shell stays login `-lc`.
     #[test]
     #[cfg(unix)]
     fn an_active_login_environment_runs_the_shell_non_login() {
@@ -1716,6 +1737,20 @@ Wait-Process -Id $grandchild.Id
             std::ffi::OsString::from("PATH"),
             std::ffi::OsString::from("/login/bin")
         )));
+
+        let zsh = crate::shell_programs::ShellProgram {
+            flavor: ShellFlavor::Zsh,
+            ..shell.clone()
+        };
+        assert_eq!(
+            super::shell_spec("true", &cwd, None, &zsh, &login).args,
+            vec![
+                std::ffi::OsString::from("-f"),
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("true")
+            ],
+            "zsh suppresses its startup files when a capture is replayed"
+        );
 
         let inactive = super::shell_spec("true", &cwd, None, &shell, &ShellLoginEnv::none());
         assert_eq!(

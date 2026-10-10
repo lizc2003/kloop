@@ -9,6 +9,10 @@ use anyhow::bail;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellFlavor {
     PosixSh,
+    /// zsh re-reads `~/.zshenv` even when it is neither login nor interactive,
+    /// so the tool shells suppress startup files (`-f`) to keep the captured
+    /// login environment authoritative.
+    Zsh,
     GitBash,
     PowerShell7,
     WindowsPowerShell,
@@ -114,16 +118,13 @@ pub fn resolve_shell_programs(overrides: ShellOverrides) -> Result<(ShellProgram
         if overrides.powershell.is_some() {
             bail!("[shells].powershell is only supported on native Windows");
         }
-        let executable = resolve_unix_shell(
+        let (executable, flavor) = resolve_unix_shell(
             overrides.bash.as_deref(),
             std::env::var_os("SHELL").as_deref(),
         )?;
         Ok((
             ShellPrograms {
-                bash: Some(ShellProgram {
-                    executable,
-                    flavor: ShellFlavor::PosixSh,
-                }),
+                bash: Some(ShellProgram { executable, flavor }),
                 powershell: None,
             },
             Vec::new(),
@@ -139,17 +140,37 @@ pub fn resolve_shell_programs(overrides: ShellOverrides) -> Result<(ShellProgram
 fn resolve_unix_shell(
     override_path: Option<&Path>,
     user_shell: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, ShellFlavor)> {
     if let Some(path) = override_path {
-        return canonical_posix_executable(path, "[shells].bash");
+        let pinned = canonical_posix_executable(path, "[shells].bash")?;
+        let flavor = flavor_of(&pinned);
+        return Ok((pinned, flavor));
     }
     if is_wsl() {
-        return canonical_posix_executable(Path::new("/bin/bash"), "WSL Bash");
+        return Ok((
+            canonical_posix_executable(Path::new("/bin/bash"), "WSL Bash")?,
+            ShellFlavor::PosixSh,
+        ));
     }
     if let Some(shell) = user_posix_shell_from(user_shell) {
-        return Ok(shell);
+        let flavor = flavor_of(&shell);
+        return Ok((shell, flavor));
     }
-    resolve_posix_sh(std::env::var_os("PATH").as_deref(), Path::new("/bin/sh"))
+    Ok((
+        resolve_posix_sh(std::env::var_os("PATH").as_deref(), Path::new("/bin/sh"))?,
+        ShellFlavor::PosixSh,
+    ))
+}
+
+/// Which POSIX-family shell an executable is, by the same basename rule the
+/// command analysis uses. Only zsh changes how kloop spawns it (`-f`, see
+/// [`ShellFlavor::Zsh`]); everything else is the plain POSIX `sh` shape.
+#[cfg(not(windows))]
+fn flavor_of(executable: &Path) -> ShellFlavor {
+    match executable.file_name().and_then(|name| name.to_str()) {
+        Some("zsh") => ShellFlavor::Zsh,
+        _ => ShellFlavor::PosixSh,
+    }
 }
 
 /// The user's own shell from `$SHELL`, when it is one the command analysis
@@ -1011,12 +1032,30 @@ mod tests {
         let zsh = install_shell(dir.path(), "zsh");
         assert_eq!(
             resolve_unix_shell(Some(&pinned), Some(zsh.as_os_str())).unwrap(),
-            pinned
+            (pinned, ShellFlavor::PosixSh)
         );
         assert_eq!(
             resolve_unix_shell(None, Some(zsh.as_os_str())).unwrap(),
-            zsh,
-            "without a pin the user's shell wins"
+            (zsh, ShellFlavor::Zsh),
+            "without a pin the user's shell wins, and zsh is named as such"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zsh_is_the_one_flavor_that_needs_startup_suppression() {
+        let dir = TestDir::new("shell-flavor");
+        assert_eq!(
+            flavor_of(&install_shell(dir.path(), "zsh")),
+            ShellFlavor::Zsh
+        );
+        assert_eq!(
+            flavor_of(&install_shell(dir.path(), "bash")),
+            ShellFlavor::PosixSh
+        );
+        assert_eq!(
+            flavor_of(&install_shell(dir.path(), "sh")),
+            ShellFlavor::PosixSh
         );
     }
 
@@ -1026,7 +1065,8 @@ mod tests {
         // `resolve_posix_sh` searches PATH for `sh` and only then falls back to
         // `/bin/sh`; either way the answer is an absolute existing file rather
         // than an error.
-        let resolved = resolve_unix_shell(None, None).unwrap();
+        let (resolved, flavor) = resolve_unix_shell(None, None).unwrap();
+        assert_eq!(flavor, ShellFlavor::PosixSh);
         assert!(resolved.is_absolute(), "{}", resolved.display());
         assert!(resolved.is_file(), "{}", resolved.display());
     }

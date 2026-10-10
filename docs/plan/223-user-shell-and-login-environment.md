@@ -51,6 +51,24 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
 - Windows 不变（Git Bash 路径与 `-lc` 原样）；hooks 不变（hook 命令是用户自己的 argv，
   不经 kloop 的冻结 shell）。
 
+## 复审修正（四条，来自代码审查）
+
+1. **[P1] 非登录 zsh 仍读 `~/.zshenv`。** 只把参数改成 `-c` 不够:zsh 即使非登录、
+   非交互也会读 `~/.zshenv`。本机实测确认——`zsh -c` 会把 `~/.zshenv` 里导出、而捕获
+   已按黑名单剔除的 `TAVILY_API_KEY` 重新导出（`-f` 之后为 unset）。修法:捕获生效时
+   zsh 加 `-f`（抑制全部启动文件）,并在 `apply` 里移除 `BASH_ENV`/`ENV`（非交互 shell
+   仍会展开的启动钩子）。新增 `ShellFlavor::Zsh`,由 shell basename 判定（与命令分析同
+   一套规则）。
+2. **[P2] 快照只记录新增,不记录删除。** profile `unset PYTHONHOME` 后,父进程那个错误
+   值会沿继承回来。修法:`ShellLoginEnv` 增加 `removed`——捕获时取「kloop 环境里存在、
+   但不在过滤后捕获里的名字」,排除配置 `[env]` 的名字与 kloop 自己注入的
+   `KLOOP_SANDBOX*`;回放时 `env_remove` 这些名字再 `env` 写入捕获值。
+3. **[P2] 超时只杀根进程。** 探针改用独立进程组（`process_group(0)`）,超时/错误路径
+   用 `rustix::process::kill_process_group` 杀整组,读取线程随管道写端全部消失而结束。
+4. **[P2] 捕获辅助项缺 `#[cfg(unix)]`。** Windows 下 `VOLATILE_ENV`、`CAPTURE_*`、
+   `unavailable`、`parse_env0`、`removals`、`kill_group` 等会变成 dead_code,在
+   `-D warnings` 门禁下报错。已逐个补齐。验证方式见下。
+
 ## 验证
 
 - `make check`（fmt + clippy + workspace test + release 测试 + parity）全绿。
@@ -64,3 +82,13 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
   `config` 的 `fresh_session` 同一 `Arc` 断言、`startup` 的 `login_env` 解析与默认值。
 - 本机真实捕获（不进自动门禁）：`/bin/zsh -lc` 抓回的 PATH 里 homebrew 在第 2 位，
   用它跑非登录 zsh，`python3` = `/opt/homebrew/bin/python3`（3.14.4）。
+- 复审修正的断言：`shell_env::tests::{removals_are_what_the_profile_dropped,
+  replay_writes_the_removals_and_the_additions, kill_group_ends_the_whole_group}`、
+  `bash::tests::an_active_login_environment_runs_the_shell_non_login`（含 zsh 的
+  `-f -c` 形状）。`kill_group_ends_the_whole_group` 做过判别力验证：临时去掉 killpg
+  时它会失败（后代留在组里），恢复后通过。
+- P1 的本机验证：`zsh -c` 下 `TAVILY_API_KEY` 为 SET，`zsh -f -c` 下为 unset。
+- P2（cfg）的验证：本机装了 `x86_64-pc-windows-msvc` target，但交叉编译被
+  `aws-lc-sys` 缺 Windows SDK 头挡住；改为把 `shell_env.rs` 的 unix cfg 临时翻转成
+  非 unix 形状跑 `cargo check -p kloop-core --lib`，该模块零警告，随后恢复原文件并重跑
+  测试。
