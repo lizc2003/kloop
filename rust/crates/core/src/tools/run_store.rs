@@ -86,6 +86,27 @@ impl RunStore {
         })
     }
 
+    pub(super) fn create_fresh(&self, prefix: &str) -> Result<RunDir> {
+        self.create_fresh_with(|| Ok(crate::resource_id::fresh(prefix)?))
+    }
+
+    fn create_fresh_with(&self, mut next: impl FnMut() -> Result<String>) -> Result<RunDir> {
+        loop {
+            let id = RunId::parse(&next()?)?;
+            match self.create(&id) {
+                Ok(run) => return Ok(run),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(super) fn create(&self, id: &RunId) -> Result<RunDir> {
         self.verify_root()?;
         #[cfg(unix)]
@@ -102,6 +123,7 @@ impl RunStore {
                     | Mode::ROTH
                     | Mode::XOTH,
             )
+            .map_err(std::io::Error::from)
             .with_context(|| format!("cannot create run {}", id.as_str()))?;
         }
         #[cfg(not(unix))]
@@ -483,6 +505,28 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_run_retries_a_collision_without_reusing_its_artifacts() {
+        let base =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-run-collision-").unwrap());
+        let store = RunStore::new(&base.join("offload"), RunNamespace::Program).unwrap();
+        let original = store.create(&RunId::parse("run-taken").unwrap()).unwrap();
+        original.write_atomic("source.js", b"original").unwrap();
+        let mut candidates = ["run-taken", "run-fresh"].into_iter();
+        let fresh = store
+            .create_fresh_with(|| Ok(candidates.next().unwrap().into()))
+            .unwrap();
+        assert_eq!(fresh.id().as_str(), "run-fresh");
+        assert_eq!(original.read("source.js").unwrap(), b"original");
+        assert!(
+            fresh
+                .read_optional_bounded("source.js", 100)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn run_ids_reject_path_components_and_unicode() {

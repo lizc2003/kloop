@@ -279,8 +279,8 @@ async fn run_turn_with_options(
     let agent = cfg.agent_label();
     // The type run_agent dispatched to, read once from the live directory: a
     // sub-agent registers before its turn task is spawned and its lease outlives
-    // the turn, so both hook points see the same value. The label ("agent-N") is
-    // a spawn counter, never the type.
+    // the turn, so both hook points see the same value. The label ("agent-*") is
+    // a random instance identity, never the type.
     let agent_type = if agent.is_empty() {
         None
     } else {

@@ -324,7 +324,7 @@ async fn background_program_returns_immediately_and_reinjects() {
     let program_id = out
         .lines()
         .find_map(|line| line.strip_prefix("Program ID: "))
-        .expect("background response must expose program-N");
+        .expect("background response must expose program-*");
     let run_id_from_launch = out
         .lines()
         .find_map(|line| line.strip_prefix("Run ID: "))

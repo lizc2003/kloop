@@ -1,6 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -51,10 +49,6 @@ use kloop_protocol::Message;
 /// error-branch limit). A successful result is passed through verbatim; only a
 /// failure is truncated, since its noise shouldn't crowd the parent's context.
 const MAX_REINJECT_ERROR_CHARS: usize = 3600;
-
-/// Process-global so parallel run_agent calls (and any future spawner) never hand
-/// out the same label — same reasoning as the offload counter (lesson 2).
-static AGENT_SEQ: AtomicUsize = AtomicUsize::new(1);
 
 pub(crate) struct Admitted<T> {
     pub(crate) value: T,
@@ -136,7 +130,7 @@ pub(crate) async fn run_agent_admitted(
         Some("worktree") => true,
         Some(other) => bail!("run_agent: unknown isolation '{other}' (expected \"worktree\")"),
     };
-    let agent = next_agent_label();
+    let agent = crate::resource_id::fresh("agent-")?;
     let agent_type_name = agent_type.map(|agent_type| agent_type.name.clone());
     let mut sub = build_sub_config(
         ctx,
@@ -272,7 +266,7 @@ pub(crate) async fn structured_agent_admitted(
         ),
         Some(_) => bail!("workflow agent: model must be a non-blank string"),
     };
-    let agent = next_agent_label();
+    let agent = crate::resource_id::fresh("agent-")?;
     let workspace = ctx.cfg.effective_workspace();
     let mut sub = build_sub_config(ctx, &workspace, max_rounds, agent.clone(), agent_type)?;
     if let Some(model) = model.as_ref() {
@@ -472,11 +466,6 @@ async fn register_child_with_cleanup(
             }
         }
     }
-}
-
-/// Process-global monotonic agent label, so parallel spawners never collide.
-fn next_agent_label() -> String {
-    format!("agent-{}", AGENT_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 fn mint_agent_receipt(
@@ -695,7 +684,7 @@ pub(crate) async fn fork_skill(
     if ctx.depth >= 1 {
         return Ok(body);
     }
-    let agent = next_agent_label();
+    let agent = crate::resource_id::fresh("agent-")?;
     let mut sub = clone_for_subagent(ctx, workspace, None, agent.clone());
     if let Some(model) = &skill.model {
         let model = InheritedProviderModelOverride::parse(model)
@@ -1113,6 +1102,7 @@ mod tests {
     use kloop_protocol::LocalAgentId;
     use kloop_provider::Provider;
     use serde_json::json;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn subagent_file_observations_are_fresh() {
@@ -2472,7 +2462,7 @@ mod tests {
     }
 
     /// A sub-agent spawned by a PERSISTENT parent writes its own session file:
-    /// named `{parent id}-{agent-N}`, first line stamped `subagent_of` = the
+    /// named `{parent id}-{agent-*}`, first line stamped `subagent_of` = the
     /// parent turn that spawned it, classified as a sub-agent (so it stays out
     /// of the resume picker), and replaying to the sub-agent's own transcript.
     #[tokio::test]

@@ -23,8 +23,6 @@ use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -58,6 +56,7 @@ pub(crate) const WORKTREES_DIR: &str = ".kloop/worktrees";
 /// [`encode_name`] already avoids inside the name itself.
 const WORKTREE_BRANCH_PREFIX: &str = "kloop-worktree-";
 static WORKTREE_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+#[cfg(test)]
 static GENERATED_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
@@ -419,21 +418,8 @@ pub(crate) fn compute_overrides(
     Ok((permissions, sandbox, system))
 }
 
-pub fn generated_name() -> String {
-    const ADJECTIVES: &[&str] = &["bright", "calm", "gentle", "quiet", "swift", "wild"];
-    const VERBS: &[&str] = &[
-        "drifting", "flowing", "growing", "humming", "moving", "rising",
-    ];
-    const NOUNS: &[&str] = &["brook", "forest", "meadow", "mist", "river", "stone"];
-    let sequence = GENERATED_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    let value = sequence ^ nanos.rotate_left(17) ^ u64::from(std::process::id());
-    let adjective = ADJECTIVES[(value as usize) % ADJECTIVES.len()];
-    let verb = VERBS[((value >> 8) as usize) % VERBS.len()];
-    let noun = NOUNS[((value >> 16) as usize) % NOUNS.len()];
-    format!("{adjective}-{verb}-{noun}")
+pub fn generated_name() -> Result<String> {
+    Ok(crate::resource_id::fresh("wt-")?)
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -860,6 +846,7 @@ fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
         return Ok(());
     };
     std::fs::create_dir_all(parent).context("creating git info directory")?;
+    let _lock = crate::state_lock::StateLock::acquire(&parent.join(".kloop-exclude.lock"))?;
     let line = format!("{WORKTREES_DIR}/");
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     if current.lines().any(|current| current.trim() == line) {
@@ -871,7 +858,17 @@ fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
     }
     next.push_str(&line);
     next.push('\n');
-    std::fs::write(&exclude, next).context("updating git info exclude")
+    use std::io::Write as _;
+    let (_, temp, mut file) = crate::resource_id::create_file(parent, ".kloop-exclude-", ".tmp")?;
+    let result = (|| {
+        file.write_all(next.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &exclude)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result.context("updating git info exclude")
 }
 
 fn git_command(dir: &Path, args: &[&str]) -> Command {

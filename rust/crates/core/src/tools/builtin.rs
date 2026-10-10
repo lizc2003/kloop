@@ -329,7 +329,7 @@ impl Builtin {
             Self::RunAgent | Self::WaitForActivity | Self::StopAgent => Gate::Depth0,
             Self::ToolSearch | Self::CallTool | Self::Skill => Gate::Elsewhere,
             // stop_program rides run_program's flag: without that tool there is
-            // no program-N to stop.
+            // no program-* to stop.
             Self::RunProgram | Self::StopProgram => Gate::Surface(SurfaceGate::Program),
             Self::CronCreate | Self::CronDelete | Self::CronList | Self::ScheduleWakeup => {
                 Gate::Surface(SurfaceGate::Scheduler)
@@ -663,14 +663,14 @@ fn bash_def() -> ToolDef {
     let def =
     ToolDef {
         name: "bash".into(),
-        description: "Run a shell command with `sh -lc`. Prefer the dedicated tools over shell equivalents: grep (not grep/rg), glob (not find), read_file (not cat/head/tail), edit_file (not sed); reserve bash for real shell work like builds, tests, installs, and git. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-N id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network beyond this machine — a loopback listener (a test server) works, so do not disable the sandbox for one; a failure that looks sandbox-caused is annotated in the result.".into(),
+        description: "Run a shell command with `sh -lc`. Prefer the dedicated tools over shell equivalents: grep (not grep/rg), glob (not find), read_file (not cat/head/tail), edit_file (not sed); reserve bash for real shell work like builds, tests, installs, and git. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-* id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network beyond this machine — a loopback listener (a test server) works, so do not disable the sandbox for one; a failure that looks sandbox-caused is annotated in the result.".into(),
         schema: json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The command to run"},
                 "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "What this command does, in a few words on one line (e.g. \"Run the core tests\", \"Show the last five commits\"). It heads this call's row in the user's transcript, above the command, so they can tell what a long command is for without parsing it; give one on every call. It never reaches the shell and never changes the result."},
                 "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when background=true"},
-                "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-N id and output file path (default false)"},
+                "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-* id and output file path (default false)"},
                 "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively; the unsandboxed run requires user approval."}
             },
             "required": ["command"],
@@ -688,14 +688,14 @@ fn bash_def() -> ToolDef {
         def
     };
     let mut def = def;
-    def.description.push_str(" When your next step depends on a background command, call bash_output with its bg-N id and block=true. Its timeout_ms is only a maximum wait; it returns as soon as the command finishes. Do not use sleep or shell polling to wait for a background command. Use block=false only to inspect current output without waiting.");
+    def.description.push_str(" When your next step depends on a background command, call bash_output with its bg-* id and block=true. Its timeout_ms is only a maximum wait; it returns as soon as the command finishes. Do not use sleep or shell polling to wait for a background command. Use block=false only to inspect current output without waiting.");
     def
 }
 
 fn bash_output_def() -> ToolDef {
     ToolDef {
         name: "bash_output".into(),
-        description: "Wait for a specific background bash command and retrieve its status and output using the bg-N id from bash. Blocks until it finishes by default (block=true); timeout_ms is only a maximum wait, not a fixed delay, and completion returns immediately. Do not use sleep or shell polling to wait for a background command. Pass block=false to peek without waiting. Returns the tail of the output; read the output file for the rest.".into(),
+        description: "Wait for a specific background bash command and retrieve its status and output using the bg-* id from bash. Blocks until it finishes by default (block=true); timeout_ms is only a maximum wait, not a fixed delay, and completion returns immediately. Do not use sleep or shell polling to wait for a background command. Pass block=false to peek without waiting. Returns the tail of the output; read the output file for the rest.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -712,7 +712,7 @@ fn bash_output_def() -> ToolDef {
 fn stop_bash_def() -> ToolDef {
     ToolDef {
         name: "stop_bash".into(),
-        description: "Stop a running background bash command by its bg-N id; terminates the whole owned process tree. Any other resource id is rejected with a directed correction.".into(),
+        description: "Stop a running background bash command by its bg-* id; terminates the whole owned process tree. Any other resource id is rejected with a directed correction.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -869,7 +869,7 @@ fn glob_def() -> ToolDef {
 fn run_agent_def() -> ToolDef {
     ToolDef {
         name: "run_agent".into(),
-        description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Dispatch one only when the user, an AGENTS.md file, or a skill asks for delegation, and give it the part you are not doing yourself: a sub-agent that restates your own task costs several times what doing it yourself costs and returns little you would not have found. Use bash for fixed tool/code batching (a shell one-liner or `python3 -c` beats a wrapper), and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-N id and receive a bounded result preview later as an inbox message (oversized success text is saved to a file whose path the preview names). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-N id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
+        description: "Run one open-ended sub-agent with a fresh history on a self-contained prompt. Dispatch one only when the user, an AGENTS.md file, or a skill asks for delegation, and give it the part you are not doing yourself: a sub-agent that restates your own task costs several times what doing it yourself costs and returns little you would not have found. Use bash for fixed tool/code batching (a shell one-liner or `python3 -c` beats a wrapper), and Workflow only when the user explicitly requested multi-agent orchestration. By default this blocks and returns the final text; while main is synchronously waiting it has no model round in which to call send_message, so use background=true when main must send follow-up instructions during the run. Consecutive run_agent calls in one model response run in parallel. Set background=true to return immediately with an agent-* id and receive a bounded result preview later as an inbox message (oversized success text is saved to a file whose path the preview names). Optional description is display-only and falls back to a prompt preview. Background results are delivered automatically; call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop Agent only with that agent-* id. Background work is session-scoped, not durable across session shutdown. Sub-agents cannot spawn further sub-agents. Pass agent_type for a configured specialized agent; omit it for the general-purpose agent. Model-generated text is not deterministic and runtime gates still enforce tools, permissions, sandbox, and result limits.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -877,7 +877,7 @@ fn run_agent_def() -> ToolDef {
                 "prompt": {"type": "string", "description": "Complete standalone work description"},
                 "agent_type": {"type": ["string", "null"], "minLength": 1, "description": "Name of a configured agent type; omit for a general-purpose sub-agent"},
                 "model": {"type": ["string", "null"], "minLength": 1, "pattern": ".*\\S.*", "description": "Optional model override on this sub-agent's inherited frozen provider; it must be in that provider's model allowlist"},
-                "background": {"type": "boolean", "description": "Return an agent-N id immediately and deliver the result later (default false)"},
+                "background": {"type": "boolean", "description": "Return an agent-* id immediately and deliver the result later (default false)"},
                 "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared (default) uses the current workspace; worktree gives the agent a private git worktree"}
             },
             "required": ["prompt"],
@@ -903,11 +903,11 @@ fn wait_for_activity_def() -> ToolDef {
 fn stop_agent_def() -> ToolDef {
     ToolDef {
         name: "stop_agent".into(),
-        description: "Stop a running background agent by its agent-N id. It ends without reporting a result. Use stop_program for program-N, stop_workflow for workflow-N, or stop_bash for bg-N.".into(),
+        description: "Stop a running background agent by its agent-* id. It ends without reporting a result. Use stop_program for program-*, stop_workflow for workflow-*, or stop_bash for bg-*.".into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "agent_id": {"type": "string", "description": "The agent-N id from run_agent with background=true"}
+                "agent_id": {"type": "string", "description": "The agent-* id from run_agent with background=true"}
             },
             "required": ["agent_id"],
             "additionalProperties": false
@@ -916,15 +916,15 @@ fn stop_agent_def() -> ToolDef {
 }
 
 /// Kept on `run_program`'s surface flag: without that tool there is no
-/// `program-N` to stop.
+/// `program-*` to stop.
 fn stop_program_def() -> ToolDef {
     ToolDef {
         name: "stop_program".into(),
-        description: "Stop a running background code-mode program by its program-N id. It ends without reporting a result. Use stop_agent for agent-N, stop_workflow for workflow-N, or stop_bash for bg-N; this is not a durable run_id.".into(),
+        description: "Stop a running background code-mode program by its program-* id. It ends without reporting a result. Use stop_agent for agent-*, stop_workflow for workflow-*, or stop_bash for bg-*; this is not a durable run_id.".into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "program_id": {"type": "string", "description": "The program-N id from run_program with background=true"}
+                "program_id": {"type": "string", "description": "The program-* id from run_program with background=true"}
             },
             "required": ["program_id"],
             "additionalProperties": false

@@ -160,7 +160,7 @@ impl Hooks {
         }
     }
 
-    /// `agent` is the sub-agent label ("agent-N") when a sub-agent's tool call
+    /// `agent` is the sub-agent label ("agent-*") when a sub-agent's tool call
     /// triggered this, or "" for the main agent. Both cc and codex carry an
     /// `agent_id` present only on sub-agent tool events; kloop mirrors that by
     /// adding the `agent` field only when non-empty, so main-agent payloads
@@ -221,7 +221,7 @@ impl Hooks {
     }
 
     /// A sub-agent's turn is starting (its counterpart to pre_turn). Fires only
-    /// for sub-agents; `agent` is the label ("agent-N"), `agent_type` the type
+    /// for sub-agents; `agent` is the label ("agent-*"), `agent_type` the type
     /// `run_agent` dispatched to (None becomes [`DEFAULT_AGENT_TYPE`], which is
     /// what a matcher sees). Can block like pre_turn — a policy hook may refuse
     /// to let a sub-agent run.

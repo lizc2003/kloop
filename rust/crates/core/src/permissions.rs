@@ -1715,15 +1715,15 @@ fn worktree_mention_is_structural(command: &str) -> bool {
 /// credential is in `config.toml` and every project's transcript in `sessions/`,
 /// and both stay sensitive.
 fn is_spill_file_name(name: &str) -> bool {
-    let numbered = |rest: &str, ext: &str| {
+    let random = |rest: &str, ext: &str| {
         rest.strip_suffix(ext)
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .is_some_and(crate::resource_id::is_suffix)
     };
     name.strip_prefix("off-")
-        .is_some_and(|rest| numbered(rest, ".txt"))
+        .is_some_and(|rest| random(rest, ".txt"))
         || name
             .strip_prefix("bg-")
-            .is_some_and(|rest| numbered(rest, ".out"))
+            .is_some_and(|rest| random(rest, ".out"))
 }
 
 /// Whether one shell token is exactly such a spill path. Token-wise rather than
@@ -2870,9 +2870,9 @@ mod tests {
         let store = "/home/u/.kloop/projects/v1/p1_abc";
 
         for command in [
-            format!("wc -c {store}/offload/off-0001.txt"),
-            format!("python3 -c 'print(1)' < {store}/offload/off-0042.txt"),
-            format!("cat {store}/offload/bg-3.out"),
+            format!("wc -c {store}/offload/off-11111111111.txt"),
+            format!("python3 -c 'print(1)' < {store}/offload/off-11111111112.txt"),
+            format!("cat {store}/offload/bg-11111111113.out"),
         ] {
             assert!(
                 ok(&p, "bash", json!({"command": command})).await,
@@ -2883,7 +2883,7 @@ mod tests {
             ok(
                 &p,
                 "read_file",
-                json!({"path": format!("{store}/offload/off-0001.txt")})
+                json!({"path": format!("{store}/offload/off-11111111111.txt")})
             )
             .await
         );
@@ -2894,13 +2894,13 @@ mod tests {
             format!("cat {store}/sessions/20260101-000000.jsonl"),
             // Not a spill file, merely sitting next to one.
             format!("cat {store}/offload/notes.txt"),
-            format!("cat {store}/offload/off-0001.txt.bak"),
+            format!("cat {store}/offload/off-11111111111.txt.bak"),
             // Traversal forfeits the exemption, as it does for worktrees.
             format!("cat {store}/offload/../../../config.toml"),
-            format!("cat {store}/offload/off-0001.txt/../../config.toml"),
+            format!("cat {store}/offload/off-11111111111.txt/../../config.toml"),
             // Masking one token must not unmask another in the same command.
-            format!("cat {store}/offload/off-0001.txt /home/u/.kloop/config.toml"),
-            format!("cat {store}/offload/off-0001.txt; cat ~/.kloop/config.toml"),
+            format!("cat {store}/offload/off-11111111111.txt /home/u/.kloop/config.toml"),
+            format!("cat {store}/offload/off-11111111111.txt; cat ~/.kloop/config.toml"),
         ] {
             assert!(
                 !ok(&p, "bash", json!({"command": command})).await,

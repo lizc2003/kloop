@@ -137,6 +137,7 @@ mod tests {
         let fresh = start_fresh_session(&cfg, &ui()).await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&old_path).unwrap(), before);
+        drop(history);
         assert_eq!(
             crate::rollout::resume_session(&old_path).unwrap().messages,
             [Message::user_text("before the clear")]

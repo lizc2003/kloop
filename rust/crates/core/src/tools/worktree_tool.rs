@@ -146,7 +146,7 @@ fn parse_enter(input: &Value) -> Result<EnterInput> {
             Ok(EnterInput::Create(name))
         }
         (None, Some(path)) => Ok(EnterInput::Existing(PathBuf::from(path))),
-        (None, None) => Ok(EnterInput::Create(worktree::generated_name())),
+        (None, None) => Ok(EnterInput::Create(worktree::generated_name()?)),
     }
 }
 

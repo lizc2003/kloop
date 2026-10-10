@@ -481,11 +481,11 @@ impl BackgroundExecutions {
             ));
         } else if id.starts_with("run-") {
             return Err(format!(
-                "{id} is a durable Program resume id; stop_program requires the program-N execution id returned by run_program"
+                "{id} is a durable Program resume id; stop_program requires the program-* execution id returned by run_program"
             ));
         } else if id.starts_with("wf_") {
             return Err(format!(
-                "{id} is a durable workflow run id; stop_workflow requires the workflow-N execution id returned by workflow"
+                "{id} is a durable workflow run id; stop_workflow requires the workflow-* execution id returned by workflow"
             ));
         }
 
@@ -875,7 +875,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .unwrap_err();
-        assert!(mismatch.contains("Program execution id must use `program-N`"));
+        assert!(mismatch.contains("Program execution id has the wrong shape"));
 
         for (kind, id, description) in [
             (ExecutionKind::Agent, "agent-1", "agent"),
@@ -958,7 +958,7 @@ mod tests {
             let (durable, durable_error) = run_tool(tool, input, &ctx).await;
             assert!(durable_error, "{tool}: {durable}");
             assert!(durable.contains("durable Program resume id"), "{durable}");
-            assert!(durable.contains("program-N execution id"), "{durable}");
+            assert!(durable.contains("program-* execution id"), "{durable}");
         }
 
         for (tool, input) in [
@@ -969,7 +969,7 @@ mod tests {
             let (durable, durable_error) = run_tool(tool, input, &ctx).await;
             assert!(durable_error, "{tool}: {durable}");
             assert!(durable.contains("durable workflow run id"), "{durable}");
-            assert!(durable.contains("workflow-N execution id"), "{durable}");
+            assert!(durable.contains("workflow-* execution id"), "{durable}");
         }
     }
 

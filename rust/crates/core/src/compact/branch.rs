@@ -458,9 +458,9 @@ mod tests {
                 usage,
             )]
         );
-        let resumed = crate::rollout::resume_session(branch.rollout_path().unwrap()).unwrap();
+        let resumed = crate::rollout::inspect_session(branch.rollout_path().unwrap()).unwrap();
         assert_eq!(
-            resumed.provider_usage.records(),
+            resumed.provider_usage().records(),
             branch.provider_usage().records()
         );
         assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live_before);

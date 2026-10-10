@@ -15,11 +15,11 @@ const MAX_DIAGNOSTIC_CHARS: usize = 80;
 pub(super) fn send_message_def() -> ToolDef {
     ToolDef {
         name: "send_message".into(),
-        description: "Queue one bounded text message for another live Agent in this local session. The runtime supplies from/message/context/status; you supply only an exact main or agent-N target, optional short UI summary, and message body. Queued means accepted by the target mailbox, not read, understood, replied to, or completed. Delivery occurs only at the recipient's next safe round boundary. Use background run_agent when main must send follow-up instructions while a child is still running; a foreground run_agent blocks main's model loop. This is local session coordination, not remote A2A, a Task API, permission transfer, broadcast, or durable messaging.".into(),
+        description: "Queue one bounded text message for another live Agent in this local session. The runtime supplies from/message/context/status; you supply only an exact main or agent-* target, optional short UI summary, and message body. Queued means accepted by the target mailbox, not read, understood, replied to, or completed. Delivery occurs only at the recipient's next safe round boundary. Use background run_agent when main must send follow-up instructions while a child is still running; a foreground run_agent blocks main's model loop. This is local session coordination, not remote A2A, a Task API, permission transfer, broadcast, or durable messaging.".into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "Exact local target: main or a live agent-N"},
+                "to": {"type": "string", "description": "Exact local target: main or a live agent-*"},
                 "summary": {"type": "string", "maxLength": crate::agent_mailbox::MAX_SUMMARY_CHARS, "description": "Optional single-line UI preview"},
                 "message": {"type": "string", "description": "Text delivered at the recipient's next safe round boundary"}
             },
@@ -32,7 +32,7 @@ pub(super) fn send_message_def() -> ToolDef {
 pub(super) fn list_agents_def() -> ToolDef {
     ToolDef {
         name: "list_agents".into(),
-        description: "List the other live, open Agents addressable from this Agent in the current local session. Returns exact ephemeral main/agent-N addresses plus parent/type/description metadata. The result is a snapshot, not remote Agent Card discovery or a promise that a target will remain open.".into(),
+        description: "List the other live, open Agents addressable from this Agent in the current local session. Returns exact ephemeral main/agent-* addresses plus parent/type/description metadata. The result is a snapshot, not remote Agent Card discovery or a promise that a target will remain open.".into(),
         schema: json!({
             "type": "object",
             "properties": {},
@@ -324,7 +324,7 @@ mod tests {
             json!({"to":"agent-2","message":"x".repeat(crate::agent_mailbox::MAX_MESSAGE_BYTES + 1)}),
             json!({"to":"agent-2","message":"x","summary":"界".repeat(crate::agent_mailbox::MAX_SUMMARY_CHARS + 1)}),
             json!({"to":format!("agent-{}", "9".repeat(MAX_TARGET_BYTES)),"message":"x"}),
-            json!({"to":"agent-02","message":"x"}),
+            json!({"to":"agent-x/y","message":"x"}),
         ] {
             assert!(parse_send_message(&input).is_err(), "{input}");
         }

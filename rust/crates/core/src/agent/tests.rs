@@ -480,7 +480,9 @@ async fn a_changed_read_is_named_between_rounds_and_replays_in_place() {
         "replay"
     );
     assert_eq!(
-        crate::rollout::resume_session(&session).unwrap().messages,
+        crate::rollout::load_session_snapshot(&session)
+            .unwrap()
+            .messages,
         messages,
         "resume"
     );
@@ -1212,7 +1214,7 @@ async fn subagent_turn_routes_to_subagent_hooks() {
 
 /// Plan 153: the agent TYPE reaches the sub-agent hook points, and a matcher
 /// filters on it. The type lives only in the live Agent directory — the label
-/// ("agent-N") is a spawn counter — so this covers the whole path from
+/// ("agent-*") is a random instance identity — so this covers the whole path from
 /// `register_child` to the hook's stdin.
 #[tokio::test]
 async fn subagent_hooks_carry_the_registered_agent_type() {
@@ -3360,7 +3362,9 @@ async fn only_gated_side_effecting_calls_are_recorded_as_started() {
 
     // Replay leaves it out of the conversation, so no request can carry it.
     assert_eq!(
-        crate::rollout::resume_session(&session).unwrap().messages,
+        crate::rollout::load_session_snapshot(&session)
+            .unwrap()
+            .messages,
         history.messages()
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -5202,7 +5206,9 @@ async fn an_old_result_goes_out_as_a_stub_while_history_keeps_it_whole() {
     let file_after = std::fs::read(&session).unwrap();
     assert_eq!(file_after[..file_before.len()], file_before[..]);
     assert_eq!(
-        crate::rollout::resume_session(&session).unwrap().messages,
+        crate::rollout::load_session_snapshot(&session)
+            .unwrap()
+            .messages,
         history.messages()
     );
     let _ = std::fs::remove_file(session);
@@ -5306,6 +5312,7 @@ async fn a_rewound_branch_records_the_stubs_it_keeps_sending() {
     );
     history.rebase(crate::rollout::resume_session(&fork).unwrap());
 
+    drop(history);
     let branch = crate::rollout::resume_session(&fork).unwrap();
     assert_eq!(branch.request_stubs.len(), 1);
     assert_eq!(branch.request_stubs[0].stub, stub);

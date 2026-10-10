@@ -1994,7 +1994,19 @@ async fn read_methods_do_not_repair_torn_tail() {
     let read = client.recv().await;
     assert!(read["error"].is_null());
     assert_eq!(std::fs::read(&path).unwrap(), raw);
+    client
+        .request("thread/resume", json!({"thread_id": "torn"}))
+        .await;
+    let blocked = client.recv().await;
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already active")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), raw);
     client.shutdown().await;
+    drop(rollout);
 
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
@@ -2074,6 +2086,7 @@ async fn recovery_repairs_pairing_once_and_preserves_public_shape() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     client.shutdown().await;
+    drop(rollout);
 
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;

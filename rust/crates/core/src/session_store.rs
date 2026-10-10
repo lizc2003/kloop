@@ -29,14 +29,15 @@ const OFFLOAD: &str = "offload";
 /// the record of a trust grant — so its shape lives here, in
 /// [`project_label_bytes`], rather than being spelled twice.
 pub const PROJECT_LABEL: &str = "project.json";
+pub const PROJECT_LABEL_LOCK: &str = "project.lock";
 
 /// One project's session storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionDirs {
     /// Rollout transcripts, `{session-id}.jsonl`.
     pub sessions: PathBuf,
-    /// Oversized tool results (`off-NNNN.txt`) and background shell output
-    /// (`bg-N.out`).
+    /// Oversized tool results (`off-*.txt`) and background shell output
+    /// (`bg-*.out`).
     pub offload: PathBuf,
 }
 
@@ -242,6 +243,7 @@ fn label_names(value: &serde_json::Value, project_id: &ProjectId, anchor: &Path)
 /// this writer never observed — a human answering yes — and dropping it while
 /// fixing an unrelated field would be a loss nobody asked for.
 fn write_project_label(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io::Result<()> {
+    let _lock = crate::state_lock::StateLock::acquire(&dir.join(PROJECT_LABEL_LOCK))?;
     let path = dir.join(PROJECT_LABEL);
     let existing = std::fs::read_to_string(&path)
         .ok()
@@ -256,18 +258,16 @@ fn write_project_label(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io:
         .and_then(|value| value.get("granted_at"))
         .and_then(serde_json::Value::as_str);
     let bytes = project_label_bytes(project_id, anchor, granted_at)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    // Owner-only, like everything else in this directory — and load-bearing
-    // rather than tidy: the CLI's project store opens the label through a
-    // reader that refuses a file any group or other can reach, so a
-    // world-readable label would make it reject the very grant it is writing.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+    let (_, temp, mut file) = crate::resource_id::create_file(dir, ".project-", ".tmp")?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
     }
-    options.open(&path)?.write_all(&bytes)
+    result
 }
 
 fn read_project_anchor(dir: &Path) -> Option<PathBuf> {

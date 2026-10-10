@@ -46,7 +46,8 @@ the five architectural bets below; it is now ten crates, and every bet held.
    Two gates had to open for that path, and **the permission gate is the one
    that binds** — it runs before the sandbox and is immune to
    `--permission-mode bypass`. Both now carry the same narrow exemption, keyed on
-   the file name (`off-NNNN.txt`, `bg-N.out`) rather than the directory: those are
+   the file name (`off-*.txt`, `bg-*.out`, with exactly 11 Base58 digits) rather
+   than the directory: those are
    the model's own output, which it was handed a preview of and this exact path,
    so re-reading one discloses nothing a tool would not have returned anyway.
    `config.toml` (the provider credential) and `sessions/` (every project's
@@ -136,7 +137,7 @@ the five architectural bets below; it is now ten crates, and every bet held.
    unknown key in silence. Responses
    requests also carry `prompt_cache_key` — the session id, shared by this
    session's sampling and compaction — so the growing prefix keeps landing on a
-   backend that already holds it; a sub-agent sends its own `{parent}-{agent-N}`
+   backend that already holds it; a sub-agent sends its own `{parent}-{agent-*}`
    instead, its prefix having nothing in common with the parent's. An unbound
    session (`--mock`, tests) sends no field.
    The Anthropic rail carries the same id as the `x-claude-code-session-id`
@@ -417,7 +418,7 @@ are `remind_changed_reads`' job. Each stub keeps what lets the model continue
 without the original (read: path, line range, size, why; search: up to 20 file
 names and the line count; shell: the last 20 lines ≤ 1500 chars; external: the
 first 500 chars) and points at the original, written through the offload
-store's `off-NNNN.txt` naming so the permission/sandbox exemption above covers
+store's `off-*.txt` naming so the permission/sandbox exemption above covers
 it. A stub is a pure function of the result and the call — nothing time-relative
 in it. If the original cannot be written the result goes out whole, as with the
 round budget.
@@ -458,11 +459,12 @@ directory (`crates/core/src/session_store.rs`):
 ```
 ~/.kloop/projects/v1/{project-id}/
     permissions.json      durable project approvals
-    project.json          the partition's label, written once and pretty:
+    project.lock          cross-process project-label update lock
+    project.json          the partition's label, atomically replaced and pretty:
                           version, project_id, anchor — plus granted_at when
                           a human answered yes here
-    sessions/{id}.jsonl   transcripts, including `{parent}-{agent-N}` sub-agents
-    offload/              off-NNNN.txt and background shell bg-N.out
+    sessions/{id}.jsonl   transcripts, including `{parent}-{agent-*}` sub-agents
+    offload/              off-*.txt and background shell bg-*.out
     program-runs/         run_program artifacts (RunStore anchors on offload's
     workflow-runs/        parent, so run state follows the session store)
 ```
@@ -475,6 +477,13 @@ layout cannot answer "show me all my sessions": a transcript is only findable
 from the exact directory that wrote it. `project.json` labels the partition
 with the path it was named after, so cross-project listings print real
 directories rather than digests.
+
+项目与工作区身份仍对规范路径做带域隔离的完整 SHA-256；摘要以固定 50 位全小写 Base36
+编码，分别加 `p1_` / `w1_` 前缀，项目目录由此前的 67 字符缩至 53 字符。
+只使用小写字符，避免在不区分大小写的文件系统上引入额外别名。
+不截断摘要，不读取或迁移旧十六进制目录。`project.json` 的标签与信任时间更新
+共用 `project.lock`，在锁内读改写，再以排他创建的临时文件原子替换，避免多个
+实例丢掉对方刚写的 `granted_at`。
 
 That label is **written once and never rewritten while it still agrees with the
 project it names**, and the anchor is why that is safe: the `ProjectId` is a
@@ -498,7 +507,7 @@ Consequences worth knowing:
   world-readable label would make the grant fail;
 - `~/.kloop` is denied read and write inside the sandbox — it holds the provider
   credential and every project's transcript — **except** for spilled tool output
-  (`offload/off-NNNN.txt`, `offload/bg-N.out`), which is carved back out as
+  (`offload/off-*.txt`, `offload/bg-*.out`), which is carved back out as
   readable. The permission gate carries the matching exemption (see bet 1); the
   sandbox alone would not have been enough, because the permission gate refuses
   first. The carve-out is read-only: writes stay denied with the rest of the
@@ -646,11 +655,10 @@ Resume replays the file, then makes the history legal and consistent again. Read
   terminal boundaries and repair statistics. The marker is replay-only metadata:
   it does not enter provider history, public protocol/events or the provider
   usage ledger. A second resume is a no-op and does not append another marker;
-- the process-global offload counter advances past every `off-NNNN.txt`
-  already on disk, so new spills never clobber files the resumed history
-  points at (usage anchors are not persisted — the estimate re-anchors on
-  the first sampled response; provider-usage records replay in the same scan,
-  with a complete usage line retained even if the following message line tore).
+- offload 使用新的随机 ID，以排他创建取得文件句柄后直接写入；遇到已有文件
+  重新生成，不扫描目录恢复序号。恢复历史中的旧指针不会被覆盖。usage anchor
+  不持久化，第一次采样响应重新锚定；provider usage 仍在同一重放中恢复，
+  后续消息行撕裂不影响已经完整写下的 usage 行。
 
 
 Server and CLI client-supplied session ids are restricted to one safe filename
@@ -659,6 +667,12 @@ and symlinked session leaves are rejected before any session file is read or
 written. Every new session — CLI start, `/clear`, a fork, a server thread —
 claims its JSONL with that same create-new step, so a timestamp collision can
 neither truncate nor share an existing transcript.
+
+每份可写 rollout 在首次追加前持有同名 `.lock` 的跨进程独占租约，直到 writer
+销毁；恢复已有会话先尝试取得租约，再重新读取、修复或截断尾部。已有实例
+仍持有会话时，第二个 writer 明确报错。只读列表、inspect 与快照不取得写租约，
+也不会为查看记录截断文件。子 agent 的 JSONL 同样用排他创建，禁止把新历史
+追加到已有同名日志。
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency; a second session in the same second gets `-2`, then `-3`);
@@ -830,8 +844,8 @@ this (cc's `subagents/agent-<id>.jsonl` sidechains, codex's one rollout per
 child thread); kloop keeps its flat, single-file layout rather than cc's
 nested dirs or codex's SQLite `thread_spawn_edges`:
 
-- the child file is `{parent id}-{agent-N}.jsonl` — the name itself shows the
-  lineage and stays unique (parent id is unique, the label is process-global);
+- 子 agent 文件为 `{parent id}-{agent-*}.jsonl`，名字保留父子关系；随机 agent ID
+  避免实例间重复，JSONL 排他创建进一步拒绝复用已有日志；
 - its first line carries `subagent_of` = `{parent id}#{seq}` of the parent
   turn's assistant line that made the spawning `run_agent` call — a *line-level*
   back-pointer (finer than either reference's session-level link), independent
@@ -1741,6 +1755,9 @@ never blocks: a server that needs OAuth but has no stored token degrades to a
 warning pointing at `kloop mcp login <name>`. Keyring storage, cross-process
 refresh locks, the legacy SSE transport, and the manual-paste (no-browser)
 fallback are out of scope (see the plan).
+本地凭据文件的读改写使用 `mcp-oauth.lock` 跨进程串行化：锁内重新读取后更新
+目标条目，再原子替换；不同实例更新不同服务不会互相覆盖。此锁只保护文件更新，
+不把远端 refresh 请求包进同一个事务。
 
 Servers are planned and connected once at startup; the handshake remains
 `initialize` → `notifications/initialized` → `tools/list` (with bounded
@@ -1942,11 +1959,11 @@ sub-agent finishes" hook are cleanly separable. `subagent_stop` carries the
 sub-agent's own `agent` label, its `agent_transcript_path` (the child session
 file, omitted for an in-memory sub-agent) and its `last_assistant_message`
 (the result) — enough for an audit or notification hook. A sub-agent's
-`pre_tool` / `post_tool` additionally carry an `agent` field (`agent-N`);
+`pre_tool` / `post_tool` additionally carry an `agent` field (`agent-*`);
 main-agent tool events omit it, so their payload is byte-identical to before.
 
 A `matcher` on `subagent_start` / `subagent_stop` filters by **agent type** —
-the `agent_type` `run_agent` dispatched to, not the `agent-N` label, which is
+the `agent_type` `run_agent` dispatched to, not the `agent-*` label, which is
 only a spawn counter. A sub-agent started without a type (`run_agent` omitted
 `agent_type`, or a `fork` skill spawned it) reports the type `default`, so
 `matcher = "reviewer"` does **not** fire for it and `matcher = "default"`
@@ -2330,7 +2347,7 @@ single-line, control-character-free, and rejected before anything is spawned.
 It never reaches the shell and never changes the result — the transcript
 row leads with it and keeps the command after it, so a row truncated to a narrow
 terminal still says what a long one-liner is for. The session-owned background
-lifecycle row (`BackgroundTaskUpdated`, below) reads the same way: `Bash(bg-N)`
+lifecycle row (`BackgroundTaskUpdated`, below) reads the same way: `Bash(bg-*)`
 and the description lead, and the command gets a full-width row of its own. When
 the model gave no description, the one-line projections fall back to the command;
 the terminal notification written into history names the job by that label
@@ -2388,7 +2405,7 @@ batching: read-only calls may overlap, while opaque calls execute serially.
 `bash` takes `background`: the command starts in its own owned process
 tree (Unix process group or Windows Job), stdout/stderr interleave straight into
 a file under the session store's `offload/`
-(`bg-N.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
+(`bg-*.out`, fd-level — no reader tasks, no pipe deadlock), and the tool
 returns immediately with the ID and the output path. Companions:
 
 - **bash_output** `{bash_id, block=true, timeout_ms=30000}` — blocks until
@@ -2425,8 +2442,9 @@ only the status, summary, and output-file pointer — command output stays in th
 file. A running turn sees it at the next sampling boundary; the TUI autowakes
 when idle; plain/server deliver it on the next turn. `stop_bash`, a 1 GiB
 output-file watchdog, and explicit session shutdown reap the whole process
-tree. IDs are process-global (`bg-1`, `bg-2`, …) so sub-agents and server
-threads sharing one offload directory never collide.
+tree. 后台 Bash ID 统一为 `bg-` 加 11 位 Base58 随机串；UI、工具回执和
+`offload/<id>.out` 使用同一个 ID。输出文件以 `create_new` 排他分配，遇到重名
+重新生成，并把已取得的句柄直接交给子进程，禁止随后按路径重新打开覆盖。
 
 At sampling boundaries, active shell IDs also produce a separate
 `Injected::Harness` message at the end of history. The system treats tool
@@ -2587,6 +2605,9 @@ Durable jobs are stored at:
 
 The project key derives from the canonical Git common directory, so a primary checkout and
 its worktrees share one base-project identity; a non-Git project uses its canonical cwd.
+项目键保留 SHA-256 的全部 256 位，改为固定 50 位全小写 Base36，多个实例仍定位同一
+目录。任务 ID 为 `job-` 加 11 位随机 Base58；持久任务的查重与插入在同一个
+存储锁事务内，内存任务在注册表互斥锁内完成。不查找或迁移旧目录。
 A durable job is bound to its creating session/thread owner. Other owners cannot list,
 delete, or claim it; competing runtimes of the same owner claim under the store lock and
 deliver only once. A late durable one-shot remains pending in a headless run or a
@@ -2681,8 +2702,8 @@ the shared permission gate see every inner call, and concurrent approval
 prompts serialize (the TUI already queues; the plain REPL takes a mutex so
 one prompt owns the terminal at a time).
 
-Every spawn gets a process-global label (`agent-1`, `agent-2`, …) stamped on
-its typed session-local identity. While live, the same canonical label is its Local
+每次 spawn 生成 `agent-` 加 11 位随机 Base58 的标签，作为带类型的会话内身份。
+While live, the same canonical label is its Local
 Agent Mailbox address; `main` is the root address. The address is ephemeral and
 resolves only inside that session — it is not a remote endpoint, Agent Card, or
 Task ID. Core's `Event` stream (plan 39) carries the display label end to end.
@@ -2738,7 +2759,7 @@ further sub-agents, and they share the parent's permission gate — the human's
 last word doesn't loosen inside a sub-agent. `--mock` reads no config, so it
 sees no types.
 
-Sub-agent transcripts are persisted in their own `{parent}-agent-N.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `run_agent {"background": true}` plus `wait_for_activity`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; `max_rounds` remains a per-call native guardrail.
+Sub-agent transcripts are persisted in their own `{parent}-agent-*.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `run_agent {"background": true}` plus `wait_for_activity`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; `max_rounds` remains a per-call native guardrail.
 
 ### Worktree isolation
 
@@ -2774,6 +2795,11 @@ encoded as `+`. Managed trees live at `.kloop/worktrees/<encoded-name>` on
 (cc uses `.claude/worktrees` + `worktree-<slug>`). An existing `path` must canonicalize to a registered
 worktree with the same Git common directory. Entering by path grants
 **External** custody only.
+
+省略名称时生成 `wt-` 加 11 位随机 Base58；子 agent 隔离树使用其随机 agent ID。
+明确指定的名称仍拒绝重名，Git 负责分支与目录的排他创建。共享 Git common
+directory 的 `info/exclude` 更新使用 `.kloop-exclude.lock`，锁内重新读取，写入
+排他创建的临时文件后原子替换，避免不同进程的读改写互相覆盖。
 
 Nesting the trees under `.kloop/` costs one exemption, because `.kloop` is
 otherwise a sensitive path component: a write there is privilege escalation and
@@ -3497,7 +3523,7 @@ Agent and falls back to a first-line source preview. Validation happens before t
 run store is opened; description never enters `source.js`, the manifest, source
 identity, or journal replay keys. The launch response has two intentionally
 different identities: transient
-`program-N` belongs to this session and is the only ID accepted by
+`program-*` belongs to this session and is the only ID accepted by
 `stop_program`; durable `run-*` names the persisted source/journal and is the only
 ID accepted by `resume_from_run_id`. The result is delivered to the parent as a
 later message, so a long fan-out/migration does not hold up the turn. Oversized
@@ -3532,7 +3558,7 @@ that model call — it does not make generated text deterministic, prove unchang
 workspace state, or provide exactly-once semantics for external side effects.
 
 Each Program attempt, including foreground and resume, also gets a fresh private
-`program-N` linked to its durable `run-*` in bounded
+`program-*` linked to its durable `run-*` in bounded
 `.kloop/program-runs/<run-id>/provenance.json`. The append-preserved v1 sidecar
 stores at most 32 validated 2 KiB receipts in a 128 KiB file. It is private audit
 metadata: no prompt, command, raw path, endpoint, credential, provider/model,
@@ -3554,7 +3580,7 @@ Skills, not a code-mode one). See `docs/plan/24-code-mode.md` and
 
 `workflow` is a separate, depth-0-only orchestration tool; it is not an alias
 for `run_program`. It always launches in the background and returns a
-`workflow-N` execution id, a stable `wf_*` run id, the managed script path, and
+`workflow-*` execution id, a stable `wf_*` run id, the managed script path, and
 resume guidance before any agent work completes. `stop_workflow` accepts only
 the execution id; the durable run id is only for resume. The script must begin
 with a pure-literal
@@ -3588,7 +3614,7 @@ exactly-once boundary, and neither changes the return value.
 Each run is stored under `.kloop/workflow-runs/<run-id>/`; a versioned
 manifest governs its managed script, args, journal, terminal result/error, and
 private bounded `provenance.json` attempt history. Every launch/resume receives a
-fresh `workflow-N` while retaining the same durable `wf_*`; the Workflow itself
+fresh `workflow-*` while retaining the same durable `wf_*`; the Workflow itself
 is explicitly not a local mailbox peer. A later call with `resume_from_run_id`
 may use an edited managed script: journal v3 reuses only `agent()` results whose
 topology ID and complete structured input still match, including native JSON
@@ -3608,7 +3634,7 @@ revalidates paths but does not claim race-hard reparse-point safety until the
 future Windows backend lands. Background completion/failure is persisted as
 `result.json`/`error.txt`, delivered with a bounded summary at a step boundary,
 and observable through global `wait_for_activity`; cancellation uses
-`stop_workflow {workflow_id}` with `workflow-N`, never durable `wf_*`.
+`stop_workflow {workflow_id}` with `workflow-*`, never durable `wf_*`.
 
 Passing `schema` in a Workflow `agent()` call activates the internal
 **`structured_output`** protocol for that child. The requested JSON Schema is
@@ -3626,20 +3652,29 @@ resolution are intentional first-release omissions.
 ## Async sub-agents (Phase 2, eighteenth slice)
 
 `run_agent` takes `background: true`: instead of blocking and returning the
-sub-agent's final text, it returns a typed `agent-N` execution ID immediately and
+sub-agent's final text, it returns a typed `agent-*` execution ID immediately and
 delivers the result to the parent Inbox automatically when it finishes. Program
 and Workflow use the same delivery boundary while retaining separate durable
 identities:
 
 | wire tool | UI product | execution ID (status/stop) | durable ID (resume) |
 |---|---|---|---|
-| `bash {background:true}` | Shell | `bg-N` | — |
-| `run_agent {background:true}` | Agent | `agent-N` | — |
-| `run_program {background:true}` | Program | `program-N` | `run-*` |
-| `workflow` | Workflow | `workflow-N` | `wf_*` |
+| `bash {background:true}` | Shell | `bg-*` | — |
+| `run_agent {background:true}` | Agent | `agent-*` | — |
+| `run_program {background:true}` | Program | `program-*` | `run-*` |
+| `workflow` | Workflow | `workflow-*` | `wf_*` |
+
+这些资源统一从 OS 随机源读取 64 位，以固定 11 位 Base58 编码；随机串只含
+字母和数字，排除 `0/O/I/l`，不含 `-` 或 `_`。类型前缀保留，界面、工具参数
+与路径沿用同一 ID，不另建短编号映射。`off-*`、`job-*` 和自动 worktree 名同样
+遵循此规则。文件与 run 目录排他创建，冲突重新生成；Program / Workflow 的
+执行 ID 在持有 run 租约时检查已有 provenance。恢复 run 保留 durable ID，
+每次执行重新分配 execution ID。输入只按不透明的安全路径组件处理，不解析
+数字序号，不扫描或恢复计数器。rollout 的行号、mail 的 `message-N` 与 journal
+拓扑序号仍表达各自范围内的顺序，不能与共享资源身份混为一谈。
 
 Passing `run-*` to any typed stop fails closed and directs the caller to the
-launch response's `program-N`; `wf_*` behaves likewise for Workflow. Background
+launch response's `program-*`; `wf_*` behaves likewise for Workflow. Background
 control remains resource specific:
 
 - `wait_for_activity {timeout_ms?}` is a non-draining global session activity
@@ -3648,11 +3683,11 @@ control remains resource specific:
   activity. Results still arrive at the next step/final/idle delivery boundary if
   the tool is never called. A timeout is not a resource failure, consumes nothing,
   and must not become a short-period polling loop.
-- `stop_agent {agent_id}` accepts only `agent-N`.
-- `stop_program {program_id}` accepts only `program-N`.
-- `stop_workflow {workflow_id}` accepts only `workflow-N`, never durable `wf_*`.
+- `stop_agent {agent_id}` accepts only `agent-*`.
+- `stop_program {program_id}` accepts only `program-*`.
+- `stop_workflow {workflow_id}` accepts only `workflow-*`, never durable `wf_*`.
 - Shells retain `bash_output {bash_id}` for file-backed output and use
-  `stop_bash {bash_id}` for `bg-N`.
+  `stop_bash {bash_id}` for `bg-*`.
 
 Passing an ID to the wrong stop tool fails and names the correct tool. The
 executor also enforces the declared schemas: `wait_for_activity` rejects every
@@ -3699,8 +3734,8 @@ atomic stop-vs-completion arbitration, so panic/forced abort still publishes
 exactly one terminal state. Both registries project through the same session-
 scoped `BackgroundTaskUpdated` event; this shared DTO is the compatibility seam,
 not a forced internal merge. Agent, Program, and Workflow completion messages
-retain their canonical typed IDs as `[Agent agent-N]`, `[Program program-N] run
-run-*`, and `[Workflow workflow-N] run wf_*`; the private receipt is never placed
+retain their canonical typed IDs as `[Agent agent-*]`, `[Program program-*] run
+run-*`, and `[Workflow workflow-*] run wf_*`; the private receipt is never placed
 in the message, and only the result body is eligible for offload.
 
 The TUI renders this event as a session-owned lifecycle row, not as a turn-owned
@@ -3732,7 +3767,7 @@ Sub-agents cannot spawn further sub-agents, so the whole background surface — 
 Every real Agent at every depth has two strict built-ins:
 
 - `send_message {to,message,summary?}` queues one bounded text message for an
-  exact live peer address (`main` or `agent-N`). The runtime, not the model,
+  exact live peer address (`main` or `agent-*`). The runtime, not the model,
   supplies sender, `message-N`, opaque local context, and lifecycle state. A
   successful result means **queued**, not read, understood, replied to, or
   completed. The body is at most 8 KiB; the optional one-line summary is at most
@@ -3773,7 +3808,7 @@ not inferred from a peer message.
 
 This is an **A2A-aligned local envelope**, not A2A support. The local `to` is an
 in-process transport address and is excluded from an A2A Message projection;
-`message-N` is not an A2A Task ID, and `agent-N` is not an Agent Card endpoint.
+`message-N` is not an A2A Task ID, and `agent-*` is not an Agent Card endpoint.
 Remote discovery, Agent Cards, HTTP/JSON-RPC/gRPC, streaming/push, authentication,
 A2A Task lifecycle, and artifacts require a separate gateway.
 
@@ -4558,7 +4593,7 @@ Every session is saved and resumable — see Session persistence above.
   round-trip, envelope
   chain (ids link across restarts, no collisions), compacted marker replay,
   two-way pairing repair on resume, torn-tail physical truncation,
-  unknown-field forward compatibility, offload counter sync, and a full
+  unknown-field forward compatibility, 随机 ID 编码与排他创建撞名重试、会话写租约, and a full
   persist → restart → resume turn over the Mock provider; fork contracts
   (prefix copy with cross-file lineage and preserved timestamps, branches
   append independently, illegal cuts rejected with nearby legal points,

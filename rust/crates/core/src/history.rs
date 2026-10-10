@@ -1,7 +1,5 @@
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 use crate::compact::CompactionBreaker;
 use crate::provider_route::FrozenProviderAttempt;
@@ -27,10 +25,6 @@ use kloop_protocol::ProviderRouteSource;
 use kloop_protocol::ReasoningContinuity;
 use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
-
-/// Offload ids are process-global so a sub-agent's spills never clobber the
-/// parent's files in the shared offload directory.
-static NEXT_OFFLOAD_ID: AtomicUsize = AtomicUsize::new(1);
 
 const HEAD_CHARS: usize = 1500;
 const TAIL_CHARS: usize = 500;
@@ -127,7 +121,6 @@ impl History {
     /// re-append to the session file. The usage anchor starts empty and
     /// re-anchors on the first sampled response.
     pub fn resume(offload_dir: PathBuf, resumed: ResumedSession) -> Self {
-        sync_offload_counter(&offload_dir);
         let provider_routes = resumed.snapshot.provider_routes.clone();
         // The last write to the session file is no earlier than its last
         // request, so idleness measured from it is never overstated.
@@ -829,13 +822,13 @@ pub(crate) fn is_offload_pointer(text: &str) -> bool {
     text.ends_with(POINTER_END)
 }
 
-/// Write `content` to a fresh `off-NNNN.txt`. Every file the model is pointed
+/// Write `content` to a fresh `off-*.txt`. Every file the model is pointed
 /// at goes through here: the permission gate and the sandbox exempt offload
 /// files by that name, so a new name would mean a new hole in both.
 fn write_offload_file(dir: &Path, content: &str) -> std::io::Result<PathBuf> {
-    let id = format!("off-{:04}", NEXT_OFFLOAD_ID.fetch_add(1, Ordering::Relaxed));
-    let path = dir.join(format!("{id}.txt"));
-    std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, content))?;
+    use std::io::Write as _;
+    let (_, path, mut file) = crate::resource_id::create_file(dir, "off-", ".txt")?;
+    file.write_all(content.as_bytes())?;
     Ok(path)
 }
 
@@ -1008,27 +1001,6 @@ fn provider_request_view(
     Ok(projected)
 }
 
-/// A resumed session shares the offload dir with the files its earlier run
-/// spilled, but the process-global counter restarts at 1 — advance it past
-/// every id already on disk so new spills never clobber old files.
-pub fn sync_offload_counter(offload_dir: &Path) {
-    let mut max_seen = 0;
-    if let Ok(entries) = std::fs::read_dir(offload_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let id = name
-                .to_str()
-                .and_then(|n| n.strip_prefix("off-"))
-                .and_then(|n| n.strip_suffix(".txt"))
-                .and_then(|n| n.parse::<usize>().ok());
-            if let Some(id) = id {
-                max_seen = max_seen.max(id);
-            }
-        }
-    }
-    NEXT_OFFLOAD_ID.fetch_max(max_seen + 1, Ordering::Relaxed);
-}
-
 /// The token estimate every context number in the session is built from: an
 /// ASCII byte is a quarter token (the ~4 chars/token rule for English, code and
 /// JSON), and every other character is one token. Counting bytes alone put a
@@ -1162,6 +1134,7 @@ mod tests {
         branch.attach_rollout(Rollout::new(session_path.clone()));
         let input = Message::user_text("rewound work");
         branch.record(input.clone());
+        drop(branch);
         history.rebase(crate::rollout::resume_session(&session_path).unwrap());
         assert_eq!(history.background_wait_reminder, None);
         assert_eq!(history.messages(), std::slice::from_ref(&input));
@@ -1232,7 +1205,7 @@ mod tests {
     /// the only place it appears now that the id is not a model-facing handle.
     fn pointer_id(pointer: &str) -> String {
         let start = pointer.find("off-").expect("pointer names the file");
-        pointer[start..start + 8].to_string()
+        pointer[start..].split_once(".txt").unwrap().0.to_string()
     }
 
     #[test]
@@ -1520,8 +1493,8 @@ mod tests {
 
     #[test]
     fn offload_ids_unique_across_histories() {
-        // Parent and sub-agent share the offload dir; the process-global
-        // counter must keep their spill files from clobbering each other.
+        // Parent and sub-agent share the offload dir; exclusive allocation
+        // must keep their spill files from clobbering each other.
         let dir = temp_dir("shared");
         let mut a = History::new(dir.clone());
         let mut b = History::new(dir.clone());
@@ -1608,6 +1581,7 @@ mod tests {
             history.provider_usage().records(),
             std::slice::from_ref(&record)
         );
+        drop(history);
         assert_eq!(
             crate::rollout::resume_session(&session)
                 .unwrap()
@@ -1686,12 +1660,11 @@ mod tests {
     }
 
     #[test]
-    fn synced_offload_counter_never_clobbers_existing_files() {
+    fn new_history_never_clobbers_existing_offloads() {
         let dir = temp_dir("counter");
         std::fs::create_dir_all(&dir).unwrap();
         // A file left behind by the session being resumed.
         std::fs::write(dir.join("off-0007.txt"), "old spill").unwrap();
-        sync_offload_counter(&dir);
 
         let mut h = History::new(dir.clone());
         h.record(tool_result("n".repeat(OFFLOAD_CAP_CHARS + 1_000)));
@@ -1959,6 +1932,7 @@ mod tests {
             .provider_request_view(&state.freeze().primary_attempt())
             .unwrap();
         assert_eq!(view, canonical);
+        drop(history);
         let reread = crate::rollout::resume_session(&session).unwrap();
         assert_eq!(reread.messages, canonical);
         let _ = std::fs::remove_dir_all(dir);
@@ -2147,6 +2121,7 @@ mod tests {
         // receipt names a provider no longer in the catalog restores anyway, and
         // opening again on the same default writes nothing: reopening twice must
         // not stack revisions.
+        drop(history);
         let reread = crate::rollout::resume_session(&session).unwrap();
         let timeline = reread.snapshot.provider_routes.clone();
         assert_eq!(timeline.len(), 2);

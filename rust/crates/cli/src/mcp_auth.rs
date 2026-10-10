@@ -50,9 +50,7 @@ struct StoreFile {
 }
 
 /// Read/modify/write access to the token file. Cheap (just holds the path); each
-/// operation re-reads so a refresh from one place doesn't clobber another's
-/// write. One process, so the in-file races two references guard with a file
-/// lock are out of scope (noted in the plan).
+/// operation locks and re-reads the shared store before replacing it.
 #[derive(Clone)]
 pub struct CredentialStore {
     path: PathBuf,
@@ -79,8 +77,22 @@ impl CredentialStore {
         crate::private_store::write_private_atomic(&self.path, OAUTH_STORE_LABEL, json.as_bytes())
     }
 
+    fn lock(&self) -> Result<crate::private_store::ExclusiveFileLock> {
+        let parent = self
+            .path
+            .parent()
+            .context("OAuth store has no parent directory")?;
+        let lock_path = self.path.with_extension("lock");
+        let name = lock_path
+            .file_name()
+            .context("OAuth store has no lock file name")?;
+        let dir = crate::private_store::PrivateDir::ensure(parent, &[], OAUTH_STORE_LABEL)?;
+        dir.open_lock(name, OAUTH_STORE_LABEL)
+    }
+
     /// Persist a fresh login, replacing any prior credential for this server.
     fn save(&self, name: &str, outcome: LoginOutcome) -> Result<()> {
+        let _lock = self.lock()?;
         let mut file = self.read()?;
         file.version = 1;
         file.credentials.insert(
@@ -102,6 +114,7 @@ impl CredentialStore {
     /// Write back a refreshed token (the [`OAuthSession`] callback). Missing key
     /// = the file changed under us; nothing to update.
     fn update_token(&self, name: &str, url: &str, token: &OAuthToken) -> Result<()> {
+        let _lock = self.lock()?;
         let mut file = self.read()?;
         if let Some(cred) = file.credentials.get_mut(&credential_key(name, url)) {
             cred.token = token.clone();
@@ -261,6 +274,67 @@ mod tests {
         assert_ne!(a, credential_key("other", "https://a/mcp"));
         // Stable for the same inputs.
         assert_eq!(a, credential_key("gh", "https://a/mcp"));
+    }
+
+    #[test]
+    fn first_login_creates_a_private_store_before_locking_and_reading() {
+        let (store, path) = store_in("first-login");
+        let dir = path.parent().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        store.save("gh", outcome("access", "refresh")).unwrap();
+        assert_eq!(
+            store
+                .get("gh", "https://mcp.example.com/mcp")
+                .unwrap()
+                .unwrap()
+                .token,
+            outcome("access", "refresh").token
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_store_instances_preserve_every_login() {
+        let (store, path) = store_in("parallel-logins");
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let workers: Vec<_> = (0..16)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .save(&format!("server-{index}"), outcome("access", "refresh"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let expected: BTreeMap<_, _> = (0..16)
+            .map(|index| {
+                (
+                    credential_key(&format!("server-{index}"), "https://mcp.example.com/mcp"),
+                    StoredCredential {
+                        client_id: "client-1".into(),
+                        token_endpoint: "https://as/token".into(),
+                        resource: "https://mcp.example.com/mcp".into(),
+                        token: outcome("access", "refresh").token,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(store.read().unwrap().credentials, expected);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

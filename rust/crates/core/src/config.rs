@@ -316,7 +316,7 @@ pub struct Config {
     pub offload_dir: PathBuf,
     /// Directory holding session rollout files, the `sessions` sibling of
     /// `offload_dir`. A sub-agent spawned by run_agent writes its own session
-    /// file here, named `{parent session_id}-{agent-N}`, so its transcript is
+    /// file here, named `{parent session_id}-{agent-*}`, so its transcript is
     /// auditable and separately resumable. Sub-agents inherit the parent's dir
     /// with the Config clone. Empty for ephemeral sessions (tests) — a
     /// sub-agent then stays in-memory like before.

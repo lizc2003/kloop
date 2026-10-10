@@ -493,6 +493,7 @@ impl RolloutLine {
 /// it is dropped, so starting kloop and quitting without a word leaves nothing
 /// behind. Tracks the id chain: each line's `parent` is the previous line's id.
 pub struct Rollout {
+    lease: Option<crate::state_lock::StateLock>,
     path: PathBuf,
     prefix: String,
     next_seq: u64,
@@ -602,7 +603,14 @@ impl Rollout {
         subagent_of: String,
         route: &FrozenProviderRoute,
     ) -> io::Result<Self> {
+        let lease = crate::state_lock::StateLock::try_acquire(&path.with_extension("lock"))?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         let mut rollout = Self::with_origin(path, Some(subagent_of));
+        rollout.lease = Some(lease);
+        rollout.preexisting = false;
         rollout.append_initial_route(route)?;
         Ok(rollout)
     }
@@ -610,6 +618,7 @@ impl Rollout {
     fn with_origin(path: PathBuf, subagent_of: Option<String>) -> Self {
         let prefix = id_prefix(&path);
         Self {
+            lease: None,
             // A file already on disk belongs to a resumed or forked session:
             // this writer did not create it and must never remove it.
             preexisting: path.exists(),
@@ -803,7 +812,22 @@ impl Rollout {
         }
     }
 
+    fn ensure_lease(&mut self) -> io::Result<()> {
+        if self.lease.is_none() {
+            self.lease = Some(
+                crate::state_lock::StateLock::try_acquire(&self.path.with_extension("lock"))
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "session is already active or cannot be locked: {error}"
+                        ))
+                    })?,
+            );
+        }
+        Ok(())
+    }
+
     fn append_line(&mut self, line: RolloutLine) -> io::Result<()> {
+        self.ensure_lease()?;
         if self.next_seq == u64::MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1225,6 +1249,16 @@ impl SessionRead {
     /// Perform the only on-disk recovery operation: truncate an intact prefix
     /// and, when necessary, append one canonical pairing marker.
     pub fn recover(self) -> io::Result<ResumedSession> {
+        let lease = crate::state_lock::StateLock::try_acquire(&self.path.with_extension("lock"))
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "session is already active or cannot be locked: {error}"
+                ))
+            })?;
+        inspect_session(&self.path)?.recover_locked(lease)
+    }
+
+    fn recover_locked(self, lease: crate::state_lock::StateLock) -> io::Result<ResumedSession> {
         let next_seq = self.max_seq.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "session sequence exhausted")
         })?;
@@ -1235,6 +1269,7 @@ impl SessionRead {
             ));
         }
         let mut rollout = Rollout {
+            lease: Some(lease),
             path: self.path.clone(),
             prefix: id_prefix(&self.path),
             next_seq,
@@ -1965,7 +2000,7 @@ pub fn session_path(sessions_dir: &Path, id: &str) -> PathBuf {
 
 /// The character set a session id may use. Every id kloop mints already fits —
 /// CLI and server stems are `YYYYMMDD-HHMMSS[-N]`, sub-agent transcripts append
-/// `-agent-N` — so this rejects nothing kloop produces.
+/// `-agent-*` — so this rejects nothing kloop produces.
 ///
 /// The rule it replaced asked only about path traversal (no `/`, no `..`, no
 /// control characters), which left non-ASCII ids accepted. That was never
@@ -2064,6 +2099,54 @@ fn user_snippet(messages: &[Message], max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_live_session_can_be_inspected_but_cannot_get_a_second_writer() {
+        let dir =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-session-lease-").unwrap());
+        let path = dir.join("session.jsonl");
+        let mut writer = Rollout::new(path.clone());
+        let message = Message::user_text("owned by the first writer");
+        writer.append_message(&message).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            inspect_session(&path)
+                .unwrap()
+                .snapshot()
+                .messages
+                .as_slice(),
+            std::slice::from_ref(&message)
+        );
+        assert!(resume_session(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(writer);
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages, [message]);
+        drop(resumed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_subagent_cannot_append_a_new_history_into_an_existing_transcript() {
+        let dir =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-child-claim-").unwrap());
+        let path = dir.join("child.jsonl");
+        let cfg = crate::tools::testutil::TestConfig::new("child-claim").build();
+        let mut writer =
+            Rollout::new_subagent_with_route(path.clone(), "parent#1".into(), &cfg.provider_route)
+                .unwrap();
+        writer
+            .append_message(&Message::user_text("original child"))
+            .unwrap();
+        drop(writer);
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            Rollout::new_subagent_with_route(path.clone(), "parent#2".into(), &cfg.provider_route)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn timestamp_ids_match_utc_civil_time() {
@@ -2218,6 +2301,7 @@ mod tests {
                 },
             })
         );
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(
             resumed.provider_usage.records(),
@@ -2287,6 +2371,7 @@ mod tests {
         }
         // A resumed writer appends to a file that already opened with its
         // version, and must not stamp a second one.
+        drop(rollout);
         let mut resumed = resume_session(&path).unwrap().rollout;
         resumed
             .append_message(&Message::user_text("three"))
@@ -2423,6 +2508,7 @@ mod tests {
             .append_provider_usage(&usage_record("after", 20))
             .unwrap();
 
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(resumed.messages, vec![Message::user_text("[summary]")]);
         assert_eq!(
@@ -2460,6 +2546,7 @@ mod tests {
             .and_then(|line| line["id"].as_str()?.rsplit_once('#')?.1.parse().ok())
             .unwrap();
 
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(resumed.request_stubs, vec![stub("t1")]);
         let mut with_next = conversation.clone();
@@ -2479,6 +2566,7 @@ mod tests {
             .append_compacted(&[Message::user_text("[summary]")])
             .unwrap();
         rollout.append_request_stub(&stub("t2")).unwrap();
+        drop(rollout);
         assert_eq!(
             resume_session(&path).unwrap().request_stubs,
             vec![stub("t2")]
@@ -2859,6 +2947,7 @@ mod tests {
             .unwrap();
 
         let fork_path = fork_session(&path, Some(4), &dir).unwrap();
+        drop(rollout);
         let forked = resume_session(&fork_path).unwrap();
         assert_eq!(
             forked.provider_usage.records(),
@@ -2868,6 +2957,7 @@ mod tests {
             resume_session(&path).unwrap().provider_usage.records(),
             &[usage_record("primary", 10), usage_record("fallback", 20),]
         );
+        drop(forked);
         let fork_of_fork = fork_session(&fork_path, None, &dir).unwrap();
         assert_eq!(
             resume_session(&fork_of_fork)
@@ -3052,7 +3142,7 @@ mod tests {
         let fork_path = fork_session(&path, Some(5), &dir).unwrap();
 
         // Resume both branches against the shared offload dir and spill from
-        // each: the ids must never collide (counter is dir-global).
+        // each: exclusive creation must preserve both branches’ output.
         let spill_from = |session: &Path| {
             let resumed = resume_session(session).unwrap();
             let mut history = History::resume(dir.clone(), resumed);
@@ -3069,7 +3159,7 @@ mod tests {
             let content = content.as_text();
             // The id lives only in the path the pointer names now.
             let start = content.find("off-").expect("pointer names the file");
-            content[start..start + 8].to_string()
+            content[start..].split_once(".txt").unwrap().0.to_string()
         };
         let main_id = spill_from(&path);
         let fork_id = spill_from(&fork_path);
@@ -3463,6 +3553,7 @@ mod tests {
             TurnError::ProviderFailure(failure)
         );
 
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(resumed.messages[1].provider_provenance, Some(provenance));
         let fork = fork_session(&path, None, &dir).unwrap();
@@ -3507,6 +3598,7 @@ mod tests {
         raw.push_str("{\"type\":\"message");
         std::fs::write(&path, raw).unwrap();
 
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(
             resumed.provider_usage.records(),
@@ -3528,6 +3620,7 @@ mod tests {
         raw.push_str("{\"type\":\"provider_usage\",\"id\":\"session#2\"");
         std::fs::write(&path, raw).unwrap();
 
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert!(resumed.provider_usage.records().is_empty());
         assert_eq!(resumed.messages, vec![Message::user_text("intact")]);
@@ -3550,6 +3643,7 @@ mod tests {
         raw.push_str("{\"type\":\"mess"); // torn write, no newline
         std::fs::write(&path, &raw).unwrap();
 
+        drop(rollout);
         let mut resumed = resume_session(&path).unwrap();
         assert_eq!(resumed.messages, vec![Message::user_text("intact")]);
         assert_eq!(
@@ -3584,6 +3678,7 @@ mod tests {
         assert_eq!(inspected.repair_stats().inserted_tool_results, 1);
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
+        drop(rollout);
         let resumed = inspected.recover().unwrap();
         assert_eq!(resumed.repair.inserted_tool_results, 1);
         let lines = raw_lines(&path);
@@ -3735,6 +3830,7 @@ mod tests {
         let snapshot = load_session_snapshot(&path).unwrap();
         assert_eq!(snapshot.messages.len(), 2);
         assert_eq!(snapshot.terminals[0].after_message, 2);
+        drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(resumed.snapshot.terminals[0].after_message, 2);
         assert_eq!(load_session_snapshot(&path).unwrap(), resumed.snapshot);
@@ -3756,6 +3852,7 @@ mod tests {
             vec![Message::user_text("good")]
         );
         assert_eq!(std::fs::read(&path).unwrap(), raw);
+        drop(rollout);
         resume_session(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
         cleanup(&path);

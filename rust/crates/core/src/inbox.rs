@@ -91,13 +91,13 @@ pub enum InboxItem {
     /// User steering typed while the turn runs (plan 22).
     Steer(String),
     /// A background sub-agent's terminal summary, reinjected to its parent
-    /// (plan 26). `label` is the "agent-N" id; `summary` is the framed body.
+    /// (plan 26). `label` is the "agent-*" id; `summary` is the framed body.
     SubAgentResult {
         label: String,
         summary: String,
     },
     /// A background program's return value, reinjected to its parent
-    /// (plan 24). `label` is the "program-N" execution id; `run_id` is the
+    /// (plan 24). `label` is the "program-*" execution id; `run_id` is the
     /// durable "run-*" resume id; `summary` is the return value.
     ProgramResult {
         label: String,

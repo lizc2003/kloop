@@ -160,7 +160,6 @@ mod tests {
     use crate::compact::BRANCH_SUMMARY_PREFIX;
     use crate::rollout::Rollout;
     use crate::rollout::fork_points;
-    use crate::rollout::resume_session;
     use crate::rollout::session_path;
     use crate::tools::testutil::SilentUi;
     use crate::tools::testutil::TestConfig;
@@ -291,7 +290,9 @@ mod tests {
             session_path(&dir, &rewound.cfg.session_id).as_path()
         );
         assert_eq!(
-            resume_session(branch_path).unwrap().messages,
+            crate::rollout::load_session_snapshot(branch_path)
+                .unwrap()
+                .messages,
             history.messages()
         );
         assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live_before);

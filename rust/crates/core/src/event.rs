@@ -21,7 +21,7 @@ use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalMessageId;
 
 /// A stable identifier for an item within a turn. Tool calls reuse the model's
-/// `tool_use` id; a sub-agent uses its label ("agent-N");
+/// `tool_use` id; a sub-agent uses its label ("agent-*");
 /// assistant/reasoning messages use a turn-local counter.
 pub type ItemId = String;
 
@@ -202,7 +202,7 @@ pub enum Item {
         status: ItemStatus,
     },
     /// `agent` is "" for the main agent's calls and the sub-agent's label
-    /// ("agent-N") for calls made inside a task. `output` is set only on the
+    /// ("agent-*") for calls made inside a task. `output` is set only on the
     /// completed item (bounded for transport).
     ToolCall {
         agent: String,

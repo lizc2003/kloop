@@ -19,7 +19,7 @@ const SESSION_DOMAIN: &[u8] = b"kloop-execution-session/v1\0";
 const THREAD_DOMAIN: &[u8] = b"kloop-execution-thread/v1\0";
 const ROLLOUT_DOMAIN: &[u8] = b"kloop-execution-rollout/v1\0";
 
-macro_rules! transient_id {
+macro_rules! resource_id {
     ($name:ident, $prefix:literal, $noun:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
         #[serde(transparent)]
@@ -37,20 +37,8 @@ macro_rules! transient_id {
 
         impl $name {
             pub(crate) fn parse(raw: &str) -> Result<Self> {
-                let Some(sequence) = raw.strip_prefix($prefix) else {
-                    return Err(anyhow!(concat!($noun, " id must use `", $prefix, "N`")));
-                };
-                if sequence.is_empty()
-                    || sequence.starts_with('0')
-                    || !sequence.bytes().all(|byte| byte.is_ascii_digit())
-                    || sequence.parse::<u64>().is_err()
-                {
-                    return Err(anyhow!(concat!(
-                        $noun,
-                        " id must use canonical `",
-                        $prefix,
-                        "N` with N >= 1"
-                    )));
+                if !kloop_protocol::is_resource_id(raw, $prefix) {
+                    return Err(anyhow!(concat!($noun, " id has the wrong shape")));
                 }
                 Ok(Self(raw.to_string()))
             }
@@ -62,13 +50,6 @@ macro_rules! transient_id {
             fn validate(&self) -> Result<()> {
                 Self::parse(&self.0).map(|_| ())
             }
-
-            fn sequence(&self) -> Result<u64> {
-                self.validate()?;
-                Ok(self.0[$prefix.len()..]
-                    .parse()
-                    .expect("validated transient execution sequence"))
-            }
         }
 
         impl fmt::Display for $name {
@@ -79,62 +60,13 @@ macro_rules! transient_id {
     };
 }
 
-transient_id!(AgentExecutionId, "agent-", "Agent execution");
-transient_id!(ProgramExecutionId, "program-", "Program execution");
-transient_id!(WorkflowExecutionId, "workflow-", "Workflow execution");
-transient_id!(BackgroundShellId, "bg-", "background shell");
+resource_id!(AgentExecutionId, "agent-", "Agent execution");
+resource_id!(ProgramExecutionId, "program-", "Program execution");
+resource_id!(WorkflowExecutionId, "workflow-", "Workflow execution");
+resource_id!(BackgroundShellId, "bg-", "background shell");
 
-macro_rules! durable_id {
-    ($name:ident, $prefix:literal, $separator:literal, $noun:literal) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-        #[serde(transparent)]
-        pub(crate) struct $name(String);
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                let raw = String::deserialize(deserializer)?;
-                Self::parse(&raw).map_err(serde::de::Error::custom)
-            }
-        }
-
-        impl $name {
-            pub(crate) fn parse(raw: &str) -> Result<Self> {
-                let Some(rest) = raw.strip_prefix($prefix) else {
-                    return Err(anyhow!(concat!($noun, " id has the wrong prefix")));
-                };
-                let Some((clock, sequence)) = rest.split_once($separator) else {
-                    return Err(anyhow!(concat!($noun, " id has the wrong shape")));
-                };
-                if clock.is_empty()
-                    || !clock.bytes().all(|byte| byte.is_ascii_digit())
-                    || sequence.is_empty()
-                    || sequence.starts_with('0')
-                    || !sequence.bytes().all(|byte| byte.is_ascii_digit())
-                    || sequence.parse::<u64>().is_err()
-                {
-                    return Err(anyhow!(concat!($noun, " id has the wrong shape")));
-                }
-                Ok(Self(raw.to_string()))
-            }
-
-            fn validate(&self) -> Result<()> {
-                Self::parse(&self.0).map(|_| ())
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
-            }
-        }
-    };
-}
-
-durable_id!(ProgramRunId, "run-", "-", "Program run");
-durable_id!(WorkflowRunId, "wf_", "-", "Workflow run");
+resource_id!(ProgramRunId, "run-", "Program run");
+resource_id!(WorkflowRunId, "wf_", "Workflow run");
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
@@ -172,15 +104,6 @@ impl TransientExecutionId {
             Self::Shell(id) => id.validate(),
         }
     }
-
-    fn sequence(&self) -> Result<u64> {
-        match self {
-            Self::Agent(id) => id.sequence(),
-            Self::Program(id) => id.sequence(),
-            Self::Workflow(id) => id.sequence(),
-            Self::Shell(id) => id.sequence(),
-        }
-    }
 }
 
 impl fmt::Display for TransientExecutionId {
@@ -199,8 +122,8 @@ pub(crate) enum DurableExecutionId {
 impl DurableExecutionId {
     fn as_str(&self) -> &str {
         match self {
-            Self::Program(id) => &id.0,
-            Self::Workflow(id) => &id.0,
+            Self::Program(id) => id.as_str(),
+            Self::Workflow(id) => id.as_str(),
         }
     }
 
@@ -406,11 +329,7 @@ fn validate_digest_id(raw: &str, prefix: &str, noun: &str) -> Result<()> {
     let Some(digest) = raw.strip_prefix(prefix) else {
         return Err(anyhow!("{noun} has the wrong prefix"));
     };
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !crate::resource_id::is_digest(digest) {
         return Err(anyhow!("{noun} is malformed"));
     }
     Ok(())
@@ -917,13 +836,13 @@ impl ProvenanceHistory {
     }
 }
 
-/// Return the canonical transient sequences already recorded for one durable
+/// Return the canonical transient IDs already recorded for one durable
 /// execution kind. `None` means the history is unavailable and must not be
 /// inferred; a missing sidecar is a valid empty history.
-pub(crate) fn persisted_attempt_sequences(
+pub(crate) fn persisted_attempt_ids(
     existing: Option<&[u8]>,
     kind: ExecutionKind,
-) -> Option<Vec<u64>> {
+) -> Option<Vec<String>> {
     let Some(bytes) = existing else {
         return Some(Vec::new());
     };
@@ -938,9 +857,7 @@ pub(crate) fn persisted_attempt_sequences(
     attempts
         .into_iter()
         .map(|receipt| {
-            (receipt.execution().kind() == kind)
-                .then(|| receipt.execution().sequence().ok())
-                .flatten()
+            (receipt.execution().kind() == kind).then(|| receipt.execution().as_str().to_string())
         })
         .collect()
 }
@@ -1106,19 +1023,19 @@ mod tests {
             "agent-1"
         );
         assert!(AgentExecutionId::parse("program-1").is_err());
-        assert!(AgentExecutionId::parse("agent-0").is_err());
-        assert!(ProgramExecutionId::parse("program-01").is_err());
-        assert!(WorkflowExecutionId::parse("workflow-x").is_err());
+        assert!(AgentExecutionId::parse("agent-../bad").is_err());
+        assert!(ProgramExecutionId::parse("program-").is_err());
+        assert!(WorkflowExecutionId::parse("workflow-x/y").is_err());
         assert!(BackgroundShellId::parse("bg-2").is_ok());
         assert!(ProgramRunId::parse("run-0-1").is_ok());
-        assert!(ProgramRunId::parse("run-1-x").is_err());
+        assert!(ProgramRunId::parse("run-../bad").is_err());
         assert!(WorkflowRunId::parse("wf_1-1").is_ok());
         assert!(WorkflowRunId::parse("run-1-1").is_err());
-        assert!(serde_json::from_value::<ProgramExecutionId>(json!("program-0")).is_err());
-        assert!(serde_json::from_value::<ProgramExecutionId>(json!("program-x")).is_err());
-        assert!(serde_json::from_value::<WorkflowExecutionId>(json!("workflow-0")).is_err());
-        assert!(serde_json::from_value::<ProgramRunId>(json!("run-bad-1")).is_err());
-        assert!(serde_json::from_value::<WorkflowRunId>(json!("wf_bad-1")).is_err());
+        assert!(serde_json::from_value::<ProgramExecutionId>(json!("program-../bad")).is_err());
+        assert!(serde_json::from_value::<ProgramExecutionId>(json!("program-x/y")).is_err());
+        assert!(serde_json::from_value::<WorkflowExecutionId>(json!("workflow-x/y")).is_err());
+        assert!(serde_json::from_value::<ProgramRunId>(json!("run-../bad")).is_err());
+        assert!(serde_json::from_value::<WorkflowRunId>(json!("wf_../bad")).is_err());
     }
 
     #[test]
@@ -1249,32 +1166,32 @@ mod tests {
             ProvenanceHistoryUpdate::Preserve
         ));
         assert_eq!(
-            persisted_attempt_sequences(Some(&second_bytes), ExecutionKind::Program),
-            Some(vec![1, 2])
+            persisted_attempt_ids(Some(&second_bytes), ExecutionKind::Program),
+            Some(vec!["program-1".into(), "program-2".into()])
         );
         assert_eq!(
-            persisted_attempt_sequences(None, ExecutionKind::Program),
+            persisted_attempt_ids(None, ExecutionKind::Program),
             Some(Vec::new())
         );
         assert_eq!(
-            persisted_attempt_sequences(Some(&second_bytes), ExecutionKind::Workflow),
+            persisted_attempt_ids(Some(&second_bytes), ExecutionKind::Workflow),
             None
         );
 
         let mut malformed_transient: Value = serde_json::from_slice(&second_bytes).unwrap();
-        malformed_transient["attempts"][0]["execution"]["id"] = json!("program-0");
+        malformed_transient["attempts"][0]["execution"]["id"] = json!("program-../bad");
         let malformed_transient = serde_json::to_vec(&malformed_transient).unwrap();
         assert!(matches!(
             update_provenance_history(Some(&malformed_transient), &next),
             ProvenanceHistoryUpdate::Preserve
         ));
         assert_eq!(
-            persisted_attempt_sequences(Some(&malformed_transient), ExecutionKind::Program),
+            persisted_attempt_ids(Some(&malformed_transient), ExecutionKind::Program),
             None
         );
 
         let mut malformed_durable: Value = serde_json::from_slice(&second_bytes).unwrap();
-        malformed_durable["attempts"][0]["durable"]["id"] = json!("run-bad-1");
+        malformed_durable["attempts"][0]["durable"]["id"] = json!("run-../bad");
         let malformed_durable = serde_json::to_vec(&malformed_durable).unwrap();
         assert!(matches!(
             update_provenance_history(Some(&malformed_durable), &next),
@@ -1288,8 +1205,8 @@ mod tests {
             panic!("fresh Workflow provenance history was not written");
         };
         assert_eq!(
-            persisted_attempt_sequences(Some(&workflow_bytes), ExecutionKind::Workflow),
-            Some(vec![9])
+            persisted_attempt_ids(Some(&workflow_bytes), ExecutionKind::Workflow),
+            Some(vec!["workflow-9".into()])
         );
     }
 

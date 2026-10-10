@@ -948,13 +948,13 @@ fn real_local_agent_mailbox_contract() {
         .to_string();
 
     let agent_a_prompt = format!(
-        "You are mailbox Agent A. First call bash exactly once with command `sleep 8`. After it completes, consume the local peer message from main. Then call list_agents exactly once, select the other open Agent whose description is exactly `{MAILBOX_AGENT_B_DESCRIPTION}`, and call send_message exactly once to its exact agent-N id with summary `A to B` and message `{MAILBOX_A_TO_B}`. Do not use wait_for_activity or any status polling. After the queued result, finish with exactly `MAILBOX_A_DONE_70`."
+        "You are mailbox Agent A. First call bash exactly once with command `sleep 8`. After it completes, consume the local peer message from main. Then call list_agents exactly once, select the other open Agent whose description is exactly `{MAILBOX_AGENT_B_DESCRIPTION}`, and call send_message exactly once to its exact agent-* id with summary `A to B` and message `{MAILBOX_A_TO_B}`. Do not use wait_for_activity or any status polling. After the queued result, finish with exactly `MAILBOX_A_DONE_70`."
     );
     let agent_b_prompt = format!(
         "You are mailbox Agent B. First call bash exactly once with command `sleep 25`. At the next safe boundary, consume Agent A's peer message `{MAILBOX_A_TO_B}`. Then call send_message exactly once to `main` with summary `B to main` and message `{MAILBOX_B_TO_MAIN}`. Do not use wait_for_activity, list_agents, or any status polling. After the queued result, finish with exactly `MAILBOX_B_DONE_70`."
     );
     let main_prompt = format!(
-        "Exercise the local Agent mailbox contract. In one assistant response call run_agent exactly twice with background=true: description `{MAILBOX_AGENT_A_DESCRIPTION}` and prompt `{agent_a_prompt}`; description `{MAILBOX_AGENT_B_DESCRIPTION}` and prompt `{agent_b_prompt}`. After both launch tool results return, identify Agent A's exact agent-N id from its description and call send_message exactly once to it with summary `main to A` and message `{MAILBOX_MAIN_TO_A}`. Do not call wait_for_activity, list_agents, stop tools, or poll status. After the queued result, end the current turn with `MAILBOX_MAIN_LAUNCHED_70`; background terminals and results will arrive automatically."
+        "Exercise the local Agent mailbox contract. In one assistant response call run_agent exactly twice with background=true: description `{MAILBOX_AGENT_A_DESCRIPTION}` and prompt `{agent_a_prompt}`; description `{MAILBOX_AGENT_B_DESCRIPTION}` and prompt `{agent_b_prompt}`. After both launch tool results return, identify Agent A's exact agent-* id from its description and call send_message exactly once to it with summary `main to A` and message `{MAILBOX_MAIN_TO_A}`. Do not call wait_for_activity, list_agents, stop tools, or poll status. After the queued result, end the current turn with `MAILBOX_MAIN_LAUNCHED_70`; background terminals and results will arrive automatically."
     );
     let mut messages = client.run_turn(&thread_id, &main_prompt);
     let deadline = Instant::now() + Duration::from_secs(600);

@@ -848,6 +848,12 @@ fn scheduler_project_identity(cwd: &Path) -> Result<PathBuf> {
         .context("canonicalize scheduler git common directory")
 }
 
+fn scheduler_project_key(cwd: &Path) -> Result<String> {
+    let base = scheduler_project_identity(cwd)?;
+    let digest = Sha256::digest(base.to_string_lossy().as_bytes());
+    Ok(kloop_core::resource_id::encode_digest(digest.into()))
+}
+
 fn scheduler_for_session(
     args: &CliArgs,
     runtime: &RuntimeSettings,
@@ -857,11 +863,7 @@ fn scheduler_for_session(
     if args.mock {
         return Ok(kloop_core::scheduler::Scheduler::in_memory(inbox));
     }
-    let base = scheduler_project_identity(cwd)?;
-    let project_key: String = Sha256::digest(base.to_string_lossy().as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let project_key = scheduler_project_key(cwd)?;
     let global = runtime
         .config_path
         .parent()
@@ -1224,6 +1226,10 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         let base_identity = scheduler_project_identity(&repository).unwrap();
         let worktree_identity = scheduler_project_identity(&worktree).unwrap();
         assert_eq!(base_identity, worktree_identity);
+        let base_key = scheduler_project_key(&repository).unwrap();
+        assert_eq!(base_key, scheduler_project_key(&worktree).unwrap());
+        assert_eq!(base_key.len(), 50);
+        assert_eq!(base_key, base_key.to_lowercase());
         assert_eq!(
             base_identity,
             repository.join(".git").canonicalize().unwrap()

@@ -655,7 +655,12 @@ impl DurableStore {
         for job in &store.jobs {
             CronSpec::parse(&job.cron)
                 .with_context(|| format!("scheduler store contains invalid job {}", job.id))?;
-            if job.owner.is_empty() || job.id.len() != 8 {
+            if job.owner.is_empty()
+                || !job
+                    .id
+                    .strip_prefix("job-")
+                    .is_some_and(crate::resource_id::is_suffix)
+            {
                 bail!("scheduler store contains malformed job identity");
             }
         }
@@ -926,7 +931,7 @@ impl Scheduler {
                     "Cron expression '{cron}' does not match any calendar date in the next year."
                 )
             })?;
-        let job = ScheduledJob {
+        let mut job = ScheduledJob {
             id,
             owner,
             cron: spec.source().to_string(),
@@ -943,6 +948,9 @@ impl Scheduler {
         };
         if durable {
             self.store.as_ref().unwrap().transaction(|jobs| {
+                while jobs.iter().any(|existing| existing.id == job.id) {
+                    job.id = crate::resource_id::fresh("job-")?;
+                }
                 jobs.push(job.clone());
                 Ok(())
             })?;
@@ -950,6 +958,13 @@ impl Scheduler {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 bail!("scheduler is closed");
+            }
+            while state
+                .session_jobs
+                .iter()
+                .any(|existing| existing.id == job.id)
+            {
+                job.id = crate::resource_id::fresh("job-")?;
             }
             state.session_jobs.push(job.clone());
         }
@@ -1035,7 +1050,7 @@ impl Scheduler {
         let id = self.fresh_id()?;
         let parts = self.timezone.local_parts(target)?;
         let cron = format!("{} {} * * *", parts.minute, parts.hour);
-        let job = ScheduledJob {
+        let mut job = ScheduledJob {
             id,
             owner,
             cron,
@@ -1067,6 +1082,13 @@ impl Scheduler {
                 .session_jobs
                 .retain(|existing| existing.kind != ScheduledKind::LoopWakeup);
             let cancelled = before - state.session_jobs.len();
+            while state
+                .session_jobs
+                .iter()
+                .any(|existing| existing.id == job.id)
+            {
+                job.id = crate::resource_id::fresh("job-")?;
+            }
             state.session_jobs.push(job);
             cancelled
         };
@@ -1131,20 +1153,7 @@ impl Scheduler {
     }
 
     fn fresh_id(&self) -> Result<String> {
-        let existing: HashSet<String> = self.list()?.into_iter().map(|job| job.id).collect();
-        for _ in 0..16 {
-            let mut bytes = [0_u8; 4];
-            getrandom::fill(&mut bytes)
-                .map_err(|error| anyhow!("generate scheduler job id: {error}"))?;
-            let id = format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                bytes[0], bytes[1], bytes[2], bytes[3]
-            );
-            if !existing.contains(&id) {
-                return Ok(id);
-            }
-        }
-        bail!("could not allocate a unique scheduler job id")
+        Ok(crate::resource_id::fresh("job-")?)
     }
 
     fn notify_change(&self) {
@@ -1955,7 +1964,7 @@ mod tests {
         store
             .transaction(|jobs| {
                 jobs.push(ScheduledJob {
-                    id: "c0ffee58".into(),
+                    id: "job-11111111111".into(),
                     owner: "owner-a".into(),
                     cron: "0 0 * * *".into(),
                     prompt: "persist".into(),

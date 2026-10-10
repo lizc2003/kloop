@@ -206,7 +206,7 @@ pub struct ReductionStats {
 
 /// Where a stub's pieces go. The history implements it with its offload store
 /// — so the file name, and with it the permission and sandbox exemption for
-/// `off-NNNN.txt`, stays the one offload already uses — and its session file.
+/// `off-*.txt`, stays the one offload already uses — and its session file.
 pub(crate) trait StubStore {
     /// Save a result's original where its stub will point.
     fn save_original(&mut self, content: &str) -> std::io::Result<PathBuf>;

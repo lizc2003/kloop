@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
@@ -64,10 +63,6 @@ const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
 /// call, short enough that the manifest stops being a second copy of the tool
 /// catalog — see [`summary_line`].
 pub(super) const MANIFEST_SUMMARY_CHARS: usize = 120;
-
-/// Process-global so parallel background spawns never collide on a label — same
-/// reasoning as the offload/agent counters.
-static PROGRAM_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,26 +238,20 @@ pub(super) async fn run_program_tool(
             (id, run)
         }
         None => {
-            let id = RunId::parse(&new_run_id()).expect("generated run id is valid");
             let run = store
-                .create(&id)
+                .create_fresh("run-")
                 .map_err(|error| anyhow!("run_program: cannot create run: {error:#}"))?;
             persist_program_source(&run, &source)
                 .context("run_program: cannot persist source contract")?;
-            (id, run)
+            (run.id().clone(), run)
         }
     };
     let run_id_text = run_id.as_str().to_string();
     let lease = run_dir
         .acquire()
         .map_err(|error| anyhow!("run_program: run is already active: {error:#}"))?;
-    let sequence = super::provenance_store::reserve_attempt_sequence(
-        &run_dir,
-        ExecutionKind::Program,
-        &PROGRAM_SEQ,
-    )
-    .map_err(|error| anyhow!("run_program: cannot allocate execution id: {error:#}"))?;
-    let label = format!("program-{sequence}");
+    let label =
+        super::provenance_store::fresh_attempt_id(&run_dir, ExecutionKind::Program, "program-")?;
     let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
         session_id: &ctx.cfg.session_id,
         parent: ctx.enclosing_execution.clone(),
@@ -367,22 +356,6 @@ fn verify_program_source(run_dir: &super::run_store::RunDir, source: &str) -> Re
         );
     }
     Ok(())
-}
-
-/// Process-global run counter; combined with a wall-clock second it makes a
-/// run_id unique within a process and (near-certainly) across processes. No
-/// rand/Date dependency.
-static PROGRAM_RUN_SEQ: AtomicUsize = AtomicUsize::new(1);
-
-fn new_run_id() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!(
-        "run-{secs}-{}",
-        PROGRAM_RUN_SEQ.fetch_add(1, Ordering::Relaxed)
-    )
 }
 
 /// Append resume guidance to a program failure, but only if at least one
@@ -531,7 +504,7 @@ fn spawn_background_program(
         }
     });
     Ok(format!(
-        "Program({description}) started in the background.\nProgram ID: {label}\nRun ID: {run_id}\nKeep working; its return value will be delivered automatically as a message when it finishes. Call wait_for_activity once only if you need to block for any activity, stop only the program-N ID with stop_program {{\"program_id\": \"{label}\"}}, or resume a failed run-* ID with run_program.resume_from_run_id and the byte-identical source."
+        "Program({description}) started in the background.\nProgram ID: {label}\nRun ID: {run_id}\nKeep working; its return value will be delivered automatically as a message when it finishes. Call wait_for_activity once only if you need to block for any activity, stop only the program-* ID with stop_program {{\"program_id\": \"{label}\"}}, or resume a failed run-* ID with run_program.resume_from_run_id and the byte-identical source."
     ))
 }
 
@@ -848,10 +821,10 @@ There is no filesystem, network, module import, or console — the public API be
 to reach outside.\n\n\
 Return your final result (a string, or an object which will be JSON-stringified).\n\n\
 Set `background: true` to run the program detached: the launch response contains a transient \
-program-N ID for stop/lifecycle and a durable run-* ID for resume. Optional `description` is \
+program-* ID for stop/lifecycle and a durable run-* ID for resume. Optional `description` is \
 display-only and falls back to a source preview. Its return value is delivered automatically as a \
 later message. Call `wait_for_activity` once only when you truly need to block for any activity; \
-never use it as a status/output polling loop. Stop only the program-N ID with `stop_program`. Use \
+never use it as a status/output polling loop. Stop only the program-* ID with `stop_program`. Use \
 this for long fan-outs/migrations; omit it for a normal synchronous run.\n\n\
 If a program fails after successful agent calls, its error names a `Durable Run ID: run-*`. The \
 next action is an explicit run_program call with the byte-identical source and that exact \
@@ -888,7 +861,7 @@ the program:\n",
             "properties": {
                 "description": {"type": ["string", "null"], "minLength": 1, "maxLength": super::MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Optional short, single-line display label. It never changes source identity, journal replay, or the result."},
                 "source": {"type": "string", "description": "The JavaScript program to run"},
-                "background": {"type": "boolean", "description": "Run detached: return a transient program-N stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-N)."},
+                "background": {"type": "boolean", "description": "Run detached: return a transient program-* stop ID plus a durable run-* resume ID immediately, then deliver the return value later (default false). Wait with wait_for_activity; stop only with stop_program(program-*)."},
                 "resume_from_run_id": {"type": ["string", "null"], "pattern": "^run-[A-Za-z0-9_-]+$", "description": "Resume a failed run-* ID with the byte-identical source; only matching journal-v3 agent calls are reused. Journal v1/v2/future entries are safe cache misses."}
             },
             "required": ["source"],

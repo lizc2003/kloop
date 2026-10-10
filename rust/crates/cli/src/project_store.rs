@@ -137,13 +137,12 @@ impl ProjectStore {
     /// writes the partition's label with the grant in it. A failure to persist
     /// is reported: the session still runs on the answer just given, but the
     /// next one asks again.
-    ///
-    /// No lock, because there is nothing to read back and modify: this runs
-    /// only when the directory is absent, so the file it writes is one no
-    /// other writer has touched, and two launches answering at once only
-    /// decide whose timestamp wins.
     pub(crate) fn grant_trust_blocking(&self, project_id: &ProjectId, anchor: &Path) -> Result<()> {
         let dir = self.ensure_project(project_id)?;
+        let _lock = dir.open_lock(
+            OsStr::new(kloop_core::session_store::PROJECT_LABEL_LOCK),
+            LABEL_LABEL,
+        )?;
         let label = project_label_bytes(
             project_id,
             anchor,
@@ -276,7 +275,7 @@ mod tests {
         }
         let root = base.join(".kloop");
         let store = ProjectStore::new(root);
-        let id = ProjectId::from_str(&format!("p1_{}", "a".repeat(64))).unwrap();
+        let id = ProjectId::from_str(&format!("p1_{}", "3".repeat(50))).unwrap();
         (base, store, id)
     }
 
@@ -326,13 +325,15 @@ mod tests {
         assert_eq!(granted_at.len(), 20, "{granted_at}");
         assert!(granted_at.ends_with('Z'), "{granted_at}");
 
-        // The grant is one write, not a read-modify-write, so the partition
-        // holds that one file and no lock.
-        let names: Vec<String> = std::fs::read_dir(store.project_dir(&id))
+        let mut names: Vec<String> = std::fs::read_dir(store.project_dir(&id))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, [PROJECT_LABEL]);
+        names.sort();
+        assert_eq!(
+            names,
+            [PROJECT_LABEL, kloop_core::session_store::PROJECT_LABEL_LOCK]
+        );
 
         // Answering the same question again is the same answer.
         store
@@ -347,7 +348,7 @@ mod tests {
         // A project that predates the question — sessions but no record — is
         // answered for all the same, and one project says nothing about another.
         let (other_base, other_store, other_id) = fixture("trust-sessions");
-        let untouched = ProjectId::from_str(&format!("p1_{}", "b".repeat(64))).unwrap();
+        let untouched = ProjectId::from_str(&format!("p1_{}", "4".repeat(50))).unwrap();
         std::fs::create_dir_all(other_store.project_dir(&other_id).join("sessions")).unwrap();
         assert!(other_store.trusted_blocking(&other_id));
         assert!(
@@ -513,7 +514,7 @@ mod tests {
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
 
         value.as_object_mut().unwrap().remove("unknown");
-        value["project_id"] = serde_json::json!(format!("p1_{}", "b".repeat(64)));
+        value["project_id"] = serde_json::json!(format!("p1_{}", "4".repeat(50)));
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
 
@@ -617,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn project_ids_have_separate_files_and_locks() {
         let (base, store, first_id) = fixture("isolated");
-        let second_id = ProjectId::from_str(&format!("p1_{}", "b".repeat(64))).unwrap();
+        let second_id = ProjectId::from_str(&format!("p1_{}", "4".repeat(50))).unwrap();
         store
             .append(
                 first_id.clone(),

@@ -14,8 +14,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -81,11 +79,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FOREGROUND_STREAM_CAP_BYTES: usize = 150_000;
 const FOREGROUND_OUTPUT_CAP_CHARS: usize = 30_000;
 const FOREGROUND_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Process-global so parent/sub-agents and server threads sharing one
-/// offload directory never collide on output file names (same lesson as the
-/// offload counter).
-static NEXT_BG_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -719,7 +712,8 @@ impl BackgroundShells {
         let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
-        let id = format!("bg-{}", NEXT_BG_ID.fetch_add(1, Ordering::Relaxed));
+        let (id, path, stdout) = crate::resource_id::create_file(offload_dir, "bg-", ".out")
+            .context("bash: cannot allocate output file")?;
         let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
             session_id: &ctx.cfg.session_id,
             parent: ctx.enclosing_execution.clone(),
@@ -740,9 +734,6 @@ impl BackgroundShells {
             ),
         })?;
         let registration = ExecutionRegistration::new(Arc::clone(&receipt));
-        let path = offload_dir.join(format!("{id}.out"));
-        let stdout = std::fs::File::create(&path)
-            .with_context(|| format!("bash: cannot create {}", path.display()))?;
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
@@ -1598,7 +1589,7 @@ Wait-Process -Id $grandchild.Id
         }
     }
 
-    /// Pull the `bg-N` id out of the spawn message.
+    /// Pull the `bg-*` id out of the spawn message.
     fn bg_id(spawn_message: &str) -> String {
         spawn_message
             .split("ID: ")

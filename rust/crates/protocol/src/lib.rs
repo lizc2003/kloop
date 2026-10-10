@@ -53,6 +53,16 @@ impl fmt::Display for LocalAgentId {
     }
 }
 
+pub fn is_resource_id(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 100
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
 impl FromStr for LocalAgentId {
     type Err = String;
 
@@ -60,15 +70,8 @@ impl FromStr for LocalAgentId {
         if value == "main" {
             return Ok(Self::Main);
         }
-        let Some(number) = value.strip_prefix("agent-") else {
-            return Err("local Agent id must be `main` or `agent-N`".into());
-        };
-        if number.is_empty()
-            || number.starts_with('0')
-            || !number.bytes().all(|byte| byte.is_ascii_digit())
-            || number.parse::<u64>().is_err()
-        {
-            return Err("local Agent id must use canonical `agent-N` with N >= 1".into());
+        if !is_resource_id(value, "agent-") {
+            return Err("local Agent id must be `main` or `agent-<id>`".into());
         }
         Ok(Self::Agent(value.to_string()))
     }
@@ -1507,9 +1510,9 @@ mod tests {
             "",
             "Main",
             "agent-",
-            "agent-0",
-            "agent-01",
-            "agent-x",
+            "agent-../other",
+            "agent-x/y",
+            "agent-雪",
             "program-1",
         ] {
             assert!(invalid.parse::<LocalAgentId>().is_err(), "{invalid}");

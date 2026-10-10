@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
@@ -49,8 +48,6 @@ use kloop_codemode::PreparedWorkflow;
 use kloop_protocol::ToolDef;
 
 const MAX_REINJECT_CHARS: usize = 8_000;
-static WORKFLOW_SEQ: AtomicU64 = AtomicU64::new(1);
-static WORKFLOW_RUN_SEQ: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +71,7 @@ struct WorkflowInput {
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),
-        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and bash for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v3 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-N stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered automatically later. Call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop only workflow-N with stop_workflow. Resume may edit the managed script; journal v3 replays only calls whose stable ID and complete input still match, while v1, v2, and future-version entries are safe cache misses. Structured agent schemas use the internal structured_output protocol. Agent options preserve string model overrides, but runtime accepts only non-blank models allowlisted by the inherited frozen provider route.".into(),
+        description: "Run an explicitly user-authorized multi-agent JavaScript Workflow in the background. Use Workflow only when the user asked for multi-agent orchestration; use run_agent for one open-ended delegate and bash for fixed tool/code batching. The script must begin with `export const meta = { name, description, phases }`; its body can use immutable args/meta plus agent(), log(), phase(), parallel(), and pipeline(). In concurrent callbacks call `scope.agent(...)`; pipeline provides scope as its fourth stage argument, and nested helpers use scope.parallel/scope.pipeline. Unscoped agent/helper calls inside concurrent callbacks fail closed so journal-v3 resume keeps stable topology IDs. Pipeline items advance independently without a stage barrier. Live agents are bounded and excess calls queue; total calls and helper input sizes have separate hard caps. Workflow scripts have no tools object, filesystem, network, process, imports, Date, or randomness. phase() only labels live progress; it is not a checkpoint, transaction, idempotency, or exactly-once boundary. Agent text remains model-generated. The tool returns a transient workflow-* stop ID plus a durable wf_* resume ID immediately; result.json is persisted and a bounded summary is delivered automatically later. Call wait_for_activity once only when you truly need to block for any activity, never as an output/status polling loop. Stop only workflow-* with stop_workflow. Resume may edit the managed script; journal v3 replays only calls whose stable ID and complete input still match, while v1, v2, and future-version entries are safe cache misses. Structured agent schemas use the internal structured_output protocol. Agent options preserve string model overrides, but runtime accepts only non-blank models allowlisted by the inherited frozen provider route.".into(),
         schema: json!({
             "type": "object",
             "properties": {
@@ -93,11 +90,11 @@ pub(super) fn workflow_def() -> ToolDef {
 pub(super) fn stop_workflow_def() -> ToolDef {
     ToolDef {
         name: "stop_workflow".into(),
-        description: "Stop a running Workflow by its workflow-N execution id. It ends without reporting a result. Use stop_agent for agent-N, stop_program for program-N, or stop_bash for bg-N. Do not pass the durable wf_* run id used for resume.".into(),
+        description: "Stop a running Workflow by its workflow-* execution id. It ends without reporting a result. Use stop_agent for agent-*, stop_program for program-*, or stop_bash for bg-*. Do not pass the durable wf_* run id used for resume.".into(),
         schema: json!({
             "type": "object",
             "properties": {
-                "workflow_id": {"type": "string", "description": "The workflow-N id returned when the Workflow launched"}
+                "workflow_id": {"type": "string", "description": "The workflow-* id returned when the Workflow launched"}
             },
             "required": ["workflow_id"],
             "additionalProperties": false
@@ -167,24 +164,18 @@ pub(super) async fn workflow_tool_in_workspace(
         // Validate before creating any task or durable run state.
         kloop_codemode::prepare_workflow(&source)?;
         kloop_codemode::prepare_workflow_args(&args)?;
-        let run_id = RunId::parse(&new_run_id()).expect("generated Workflow run id is valid");
         let run_dir = store
-            .create(&run_id)
+            .create_fresh("wf_")
             .context("workflow: cannot create run")?;
-        (run_id, run_dir, source, args)
+        (run_dir.id().clone(), run_dir, source, args)
     };
     let prepared = kloop_codemode::prepare_workflow(&source)?;
     let run_id_text = run_id.as_str().to_string();
     let lease = run_dir
         .acquire()
         .context("workflow: run is already active")?;
-    let sequence = super::provenance_store::reserve_attempt_sequence(
-        &run_dir,
-        ExecutionKind::Workflow,
-        &WORKFLOW_SEQ,
-    )
-    .context("workflow: cannot allocate execution id")?;
-    let execution_id = format!("workflow-{sequence}");
+    let execution_id =
+        super::provenance_store::fresh_attempt_id(&run_dir, ExecutionKind::Workflow, "workflow-")?;
     let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
         session_id: &ctx.cfg.session_id,
         parent: ctx.enclosing_execution.clone(),
@@ -239,17 +230,6 @@ fn persist_inputs(
         }))?,
     )?;
     Ok(())
-}
-
-fn new_run_id() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format!(
-        "wf_{seconds}-{}",
-        WORKFLOW_RUN_SEQ.fetch_add(1, Ordering::Relaxed)
-    )
 }
 
 fn launch_workflow(
