@@ -142,8 +142,9 @@ fn shell_spec(
     sandbox: Option<&SandboxPolicy>,
     bash: &ShellProgram,
     login_env: &ShellLoginEnv,
+    ui: &dyn Ui,
 ) -> ProcessSpec {
-    let shell_args = shell_args(bash, command, login_env);
+    let shell_args = shell_args(bash, command, login_env, ui);
     let (program, args) = match sandbox {
         Some(policy) => sandbox::seatbelt_command(policy, bash.executable.as_os_str(), &shell_args),
         None => (bash.executable.clone(), shell_args),
@@ -174,10 +175,22 @@ fn shell_spec(
 /// re-applies the capture after it and only then runs the command. The command
 /// arrives as `$1`, so it never has to be quoted into a script. Without a
 /// capture the shell stays `-lc`, which is the old behavior.
-fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> Vec<OsString> {
+fn shell_args(
+    bash: &ShellProgram,
+    command: &str,
+    login_env: &ShellLoginEnv,
+    ui: &dyn Ui,
+) -> Vec<OsString> {
     let replay_path = match login_env.replay_path_for_use() {
         Ok(Some(path)) => path,
-        Ok(None) | Err(_) => return vec!["-lc".into(), command.into()],
+        Ok(None) => return vec!["-lc".into(), command.into()],
+        Err(error) => {
+            ui.emit(&Event::Note(format!(
+                "warning: could not prepare the login environment replay file ({error}); \
+                 this command will use a login shell (-lc); later commands will retry"
+            )));
+            return vec!["-lc".into(), command.into()];
+        }
     };
     let mut args: Vec<OsString> = Vec::with_capacity(6);
     if bash.flavor == ShellFlavor::Zsh {
@@ -298,16 +311,7 @@ pub(crate) async fn run_foreground_bash(
     } else {
         sandbox.as_deref()
     };
-    let output = run_foreground(
-        command,
-        &cwd,
-        effective_sandbox,
-        bash,
-        &ctx.cfg.shell_login_env,
-        timeout_ms,
-        &ctx.cancel,
-    )
-    .await?;
+    let output = run_foreground(command, &cwd, effective_sandbox, bash, timeout_ms, ctx).await?;
     let mut text = format_output(&output);
     let success = output.status.success();
     if remembered_escalation {
@@ -338,16 +342,7 @@ pub(crate) async fn run_foreground_bash(
                 .unwrap_or(EscalationOutcome::Declined);
             match outcome {
                 EscalationOutcome::Approved => {
-                    let raw = run_foreground(
-                        command,
-                        &cwd,
-                        None,
-                        bash,
-                        &ctx.cfg.shell_login_env,
-                        timeout_ms,
-                        &ctx.cancel,
-                    )
-                    .await?;
+                    let raw = run_foreground(command, &cwd, None, bash, timeout_ms, ctx).await?;
                     // What the sandbox refused is the only record of why this
                     // ran uncontained, and the sandboxed output is about to be
                     // dropped for the unsandboxed one. Carrying the line keeps
@@ -382,12 +377,18 @@ async fn run_foreground(
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
     bash: &ShellProgram,
-    login_env: &ShellLoginEnv,
     timeout_ms: u64,
-    cancel: &CancellationToken,
+    ctx: &ToolCtx,
 ) -> Result<ForegroundOutput> {
-    let spec = shell_spec(command, cwd, sandbox, bash, login_env);
-    run_process_foreground(spec, timeout_ms, cancel, "bash").await
+    let spec = shell_spec(
+        command,
+        cwd,
+        sandbox,
+        bash,
+        &ctx.cfg.shell_login_env,
+        ctx.ui.as_ref(),
+    );
+    run_process_foreground(spec, timeout_ms, &ctx.cancel, "bash").await
 }
 
 pub(super) async fn run_process_foreground(
@@ -774,7 +775,14 @@ impl BackgroundShells {
         let stderr = stdout
             .try_clone()
             .context("bash: cannot clone output file")?;
-        let mut spec = shell_spec(command, cwd, sandbox, bash, &ctx.cfg.shell_login_env);
+        let mut spec = shell_spec(
+            command,
+            cwd,
+            sandbox,
+            bash,
+            &ctx.cfg.shell_login_env,
+            ctx.ui.as_ref(),
+        );
         spec.stdin = ProcessStdio::Null;
         spec.stdout = ProcessStdio::File(stdout);
         spec.stderr = ProcessStdio::File(stderr);
@@ -1353,6 +1361,7 @@ mod tests {
             None,
             &bash,
             &ShellLoginEnv::none(),
+            &RecordingUi::default(),
         );
         assert!(spec.windows_debug_descendants());
     }
@@ -1690,8 +1699,14 @@ Wait-Process -Id $grandchild.Id
         let cwd = std::env::current_dir().unwrap();
         let scrubbed = |allow_network: bool| {
             let policy = crate::sandbox::SandboxPolicy::workspace(&cwd, &[], allow_network);
-            let spec =
-                super::shell_spec("true", &cwd, Some(&policy), &shell, &ShellLoginEnv::none());
+            let spec = super::shell_spec(
+                "true",
+                &cwd,
+                Some(&policy),
+                &shell,
+                &ShellLoginEnv::none(),
+                &RecordingUi::default(),
+            );
             let mut names: Vec<String> = spec
                 .env_remove
                 .iter()
@@ -1731,7 +1746,7 @@ Wait-Process -Id $grandchild.Id
         let login = ShellLoginEnv::test_fixture(&[("PATH", "/login/bin")]);
         let prelude = std::ffi::OsString::from(super::REPLAY_PRELUDE);
 
-        let active = super::shell_spec("true", &cwd, None, &shell, &login);
+        let active = super::shell_spec("true", &cwd, None, &shell, &login, &RecordingUi::default());
         assert_eq!(
             active.args,
             vec![
@@ -1757,12 +1772,19 @@ Wait-Process -Id $grandchild.Id
             ..shell.clone()
         };
         assert_eq!(
-            super::shell_spec("true", &cwd, None, &zsh, &login).args[0],
+            super::shell_spec("true", &cwd, None, &zsh, &login, &RecordingUi::default()).args[0],
             std::ffi::OsString::from("-f"),
             "zsh suppresses the startup files it would otherwise read"
         );
 
-        let inactive = super::shell_spec("true", &cwd, None, &shell, &ShellLoginEnv::none());
+        let inactive = super::shell_spec(
+            "true",
+            &cwd,
+            None,
+            &shell,
+            &ShellLoginEnv::none(),
+            &RecordingUi::default(),
+        );
         assert_eq!(
             inactive.args,
             vec![
@@ -1801,6 +1823,7 @@ Wait-Process -Id $grandchild.Id
             None,
             &shell,
             &login,
+            &RecordingUi::default(),
         );
         // Leave the inherited PATH for the prelude to remove: the process spec
         // alone would have hidden it.
@@ -1856,6 +1879,7 @@ Wait-Process -Id $grandchild.Id
                     None,
                     &shell,
                     &login,
+                    &RecordingUi::default(),
                 );
                 let output = super::run_process_foreground(
                     spec,
@@ -1894,6 +1918,7 @@ Wait-Process -Id $grandchild.Id
             None,
             &shell,
             &login,
+            &RecordingUi::default(),
         );
         let output = super::run_process_foreground(
             spec,
@@ -1926,6 +1951,7 @@ Wait-Process -Id $grandchild.Id
             None,
             &shell,
             &login,
+            &RecordingUi::default(),
         );
         let output = super::run_process_foreground(
             spec,
@@ -1955,6 +1981,7 @@ Wait-Process -Id $grandchild.Id
             None,
             &shell,
             &login,
+            &RecordingUi::default(),
         );
         spec.args[1] = format!(
             "PATH=/startup/bin; HTTP_PROXY=http://startup; {}",
@@ -2014,12 +2041,14 @@ Wait-Process -Id $grandchild.Id
             &directory,
         );
         let original = login.replay_path_for_use().unwrap().unwrap();
-        let ctx = test_ctx_with_cfg(
+        let mut ctx = test_ctx_with_cfg(
             0,
             TestConfig::new("bash-replay-cleanup")
                 .login_env(login)
                 .build(),
         );
+        let ui = Arc::new(RecordingUi::default());
+        ctx.ui = ui.clone();
         for command in [
             "rm -f -- \"$KLOOP_REPLAY_DIR\"/*.sh; printf %s \"$KLOOP_TEST_SENTINEL\"",
             "printf %s \"$KLOOP_TEST_SENTINEL\"",
@@ -2029,6 +2058,13 @@ Wait-Process -Id $grandchild.Id
             assert!(out.contains("from-login"), "{out}");
             assert!(!original.exists());
         }
+        assert!(
+            !ui.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, Event::Note(_)))
+        );
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         drop(ctx);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
@@ -2058,6 +2094,7 @@ Wait-Process -Id $grandchild.Id
                 None,
                 &shell,
                 &login,
+                &RecordingUi::default(),
             );
             assert_eq!(spec.args[0], std::ffi::OsString::from(expected_flag));
             let output = super::run_process_foreground(
@@ -2077,6 +2114,72 @@ Wait-Process -Id $grandchild.Id
         drop(login);
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replay_write_failures_warn_for_foreground_and_background_commands() {
+        let directory =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-replay-warnings-").unwrap());
+        let login = ShellLoginEnv::test_fixture_in(
+            &[("KLOOP_TEST_SENTINEL", "from-login")],
+            &[],
+            &directory,
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        let error = login.replay_path_for_use().unwrap_err();
+        let warning = format!(
+            "warning: could not prepare the login environment replay file ({error}); \
+             this command will use a login shell (-lc); later commands will retry"
+        );
+        let mut ctx = test_ctx_with_cfg(
+            0,
+            TestConfig::new("bash-replay-warnings")
+                .login_env(login)
+                .build(),
+        );
+        let ui = Arc::new(RecordingUi::default());
+        ctx.ui = ui.clone();
+        for blocked in [true, false] {
+            if !blocked {
+                std::fs::remove_file(&directory).unwrap();
+            }
+            for background in [false, true] {
+                let (mut out, is_error) = run_tool(
+                    "bash",
+                    json!({
+                        "command": "printf %s \"$KLOOP_TEST_SENTINEL\"",
+                        "background": background,
+                    }),
+                    &ctx,
+                )
+                .await;
+                assert!(!is_error, "{out}");
+                if background {
+                    let id = bg_id(&out);
+                    let (completed, is_error) =
+                        run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+                    assert!(!is_error, "{completed}");
+                    out = completed;
+                }
+                assert!(out.contains("from-login"), "{out}");
+            }
+            let notes: Vec<_> = ui
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, Event::Note(_)))
+                .cloned()
+                .collect();
+            assert_eq!(
+                notes,
+                vec![Event::Note(warning.clone()), Event::Note(warning.clone())]
+            );
+        }
+        drop(ctx);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -2109,15 +2212,14 @@ Wait-Process -Id $grandchild.Id
         let bash = crate::shell_programs::ShellPrograms::test_fixture()
             .bash
             .expect("Git Bash fixture is available");
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = test_ctx(0, "git-bash-unicode");
         let output = super::run_foreground(
             "printf '你好' > marker.txt; printf stdout; printf stderr >&2",
             &cwd,
             None,
             &bash,
-            &ShellLoginEnv::none(),
             10_000,
-            &cancel,
+            &ctx,
         )
         .await
         .unwrap();
