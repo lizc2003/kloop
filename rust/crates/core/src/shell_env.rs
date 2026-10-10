@@ -11,9 +11,10 @@
 //! exactly the old behavior.
 //!
 //! The capture is a full picture, not a set of additions: a name the profile
-//! dropped is dropped from the command too, and the startup files a
-//! non-interactive shell would still read on its own are suppressed. Otherwise
-//! the captured environment would not be the environment.
+//! dropped is dropped from the command too, and the shell re-applies the
+//! capture itself just before the command runs — zsh reads `/etc/zshenv` no
+//! matter how it is invoked (the manual: "this cannot be overridden"), so a
+//! process environment alone can be rewritten before the command starts.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -32,6 +33,11 @@ pub(crate) const MODEL_SHELL_SECRET_ENV: &[&str] = &[
     "BRAVE_API_KEY",
 ];
 
+/// The variable that carries [`ShellLoginEnv::replay`] into the shell. Its value
+/// is built from the environment the shell is already given, so it adds no new
+/// exposure; the shell unsets it before the command runs.
+pub(crate) const REPLAY_ENV: &str = "KLOOP_SHELL_ENV_REPLAY";
+
 /// Startup hooks a non-interactive shell still expands on its own: bash reads
 /// `BASH_ENV`, a POSIX `sh` historically reads `ENV` when interactive. Letting
 /// one run would let the captured environment be rewritten from under kloop —
@@ -47,7 +53,11 @@ const VOLATILE_ENV: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
 /// Variables kloop itself adds to a shell command. The capture never saw them,
 /// so they are not the login shell's to drop.
 #[cfg(unix)]
-const KLOOP_SHELL_ENV: &[&str] = &["KLOOP_SANDBOX", "KLOOP_SANDBOX_NETWORK_DISABLED"];
+const KLOOP_SHELL_ENV: &[&str] = &[
+    "KLOOP_SANDBOX",
+    "KLOOP_SANDBOX_NETWORK_DISABLED",
+    REPLAY_ENV,
+];
 
 /// The capture is one `env -0` of a login shell; anything this large is not it.
 #[cfg(unix)]
@@ -121,6 +131,49 @@ impl ShellLoginEnv {
         for (name, value) in &self.vars {
             spec.env(name.as_str(), value.as_str());
         }
+        // The process environment is not the last word: the shell re-applies
+        // this itself, after whatever startup file it could not be stopped from
+        // reading.
+        spec.env(REPLAY_ENV, self.replay());
+    }
+
+    /// The script the shell runs before the command: drop the names the login
+    /// shell dropped (and the credential names it must never carry), then put
+    /// the captured values back.
+    ///
+    /// Values are single-quoted, and a name that is not a shell identifier is
+    /// left out — an environment name may contain anything, and one that is not
+    /// an identifier would turn this script into a syntax error. Those names are
+    /// still covered by the process spec's own additions and removals.
+    pub(crate) fn replay(&self) -> String {
+        let unset: BTreeSet<&str> = MODEL_SHELL_SECRET_ENV
+            .iter()
+            .copied()
+            .chain(SHELL_STARTUP_HOOKS.iter().copied())
+            .chain(self.removed.iter().map(String::as_str))
+            .filter(|name| is_identifier(name))
+            .collect();
+        let mut script = String::new();
+        if !unset.is_empty() {
+            script.push_str("unset");
+            for name in unset {
+                script.push(' ');
+                script.push_str(name);
+            }
+        }
+        for (name, value) in &self.vars {
+            if !is_identifier(name) {
+                continue;
+            }
+            if !script.is_empty() {
+                script.push('\n');
+            }
+            script.push_str("export ");
+            script.push_str(name);
+            script.push('=');
+            script.push_str(&quote_sh(value));
+        }
+        script
     }
 
     /// Run `<shell> -lc` once and keep the environment it comes up with.
@@ -146,8 +199,9 @@ impl ShellLoginEnv {
         let Some(bytes) = run_capture(shell, script, timeout) else {
             return (Self::none(), Some(unavailable(shell)));
         };
+        let parsed = parse_env0(&bytes);
         let mut vars = BTreeMap::new();
-        for (name, value) in parse_env0(&bytes) {
+        for (name, value) in parsed.pairs {
             if MODEL_SHELL_SECRET_ENV.contains(&name.as_str())
                 || VOLATILE_ENV.contains(&name.as_str())
                 || config_env_names.iter().any(|blocked| blocked == &name)
@@ -161,7 +215,7 @@ impl ShellLoginEnv {
         }
         let removed = removals(
             std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()),
-            &vars,
+            &parsed.names,
             config_env_names,
         );
         (Self { vars, removed }, None)
@@ -177,15 +231,20 @@ impl ShellLoginEnv {
 /// absent from the capture. Replaying the capture as additions alone would let a
 /// value the profile deliberately unset (`PYTHONHOME` is the classic) walk back
 /// in through inheritance.
+///
+/// `kept` is every name the capture *reported*, not just the ones whose value
+/// kloop could decode: a name whose value is not UTF-8 is still a name the login
+/// shell kept, and dropping it would take a variable like `PATH` away from a
+/// user who never unset it.
 #[cfg(unix)]
 fn removals(
     process: impl IntoIterator<Item = String>,
-    kept: &BTreeMap<String, String>,
+    kept: &BTreeSet<String>,
     config_env_names: &[String],
 ) -> BTreeSet<String> {
     let mut removed = BTreeSet::new();
     for name in process {
-        if kept.contains_key(&name)
+        if kept.contains(&name)
             || config_env_names.iter().any(|blocked| blocked == &name)
             || KLOOP_SHELL_ENV.contains(&name.as_str())
         {
@@ -194,6 +253,29 @@ fn removals(
         removed.insert(name);
     }
     removed
+}
+
+/// Whether a name may appear in the replay script at all.
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Single-quote a value for the replay script: everything inside is literal, and
+/// an embedded quote closes, escapes and reopens it.
+fn quote_sh(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 #[cfg(unix)]
@@ -238,28 +320,30 @@ fn run_capture(shell: &Path, script: &str, timeout: std::time::Duration) -> Opti
     });
 
     let deadline = Instant::now() + timeout;
-    loop {
+    let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    return None;
+                    break None;
                 }
                 // The reader may still be draining the last of the pipe; give
                 // it a moment rather than dropping a complete capture.
-                return rx.recv_timeout(std::time::Duration::from_millis(200)).ok();
+                break rx.recv_timeout(std::time::Duration::from_millis(200)).ok();
             }
             Ok(None) => {}
-            Err(_) => {
-                kill_group(pid, &mut child);
-                return None;
-            }
+            Err(_) => break None,
         }
         if Instant::now() >= deadline {
-            kill_group(pid, &mut child);
-            return None;
+            break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    };
+    // Every way out of the loop — a nonzero exit, a success whose stdout a
+    // background descendant still holds open, a timeout, a wait error — means
+    // the capture is unusable, and the probe's group must not outlive it. A
+    // plain `Child` drop would leave those descendants running.
+    kill_group(pid, &mut child);
+    outcome
 }
 
 /// Kill the probe's whole process group, then reap its root. The reader thread
@@ -273,36 +357,48 @@ fn kill_group(pid: u32, child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// The NUL-separated `NAME=VALUE` records between the capture markers. Entries
-/// that are not UTF-8 or have no `=` are dropped rather than guessed at.
+/// A parsed capture: the `NAME=VALUE` pairs kloop can replay, and every name the
+/// login shell reported — including entries whose value is not UTF-8, which are
+/// kept as names so they are not mistaken for names the profile dropped.
 #[cfg(unix)]
-fn parse_env0(bytes: &[u8]) -> Vec<(String, String)> {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedEnv {
+    pairs: Vec<(String, String)>,
+    names: BTreeSet<String>,
+}
+
+/// The NUL-separated `NAME=VALUE` records between the capture markers. An entry
+/// with no `=` is dropped; an entry whose value is not UTF-8 keeps its name but
+/// no value, because kloop cannot replay what it cannot read.
+#[cfg(unix)]
+fn parse_env0(bytes: &[u8]) -> ParsedEnv {
     let Some(start) = bytes.iter().position(|byte| *byte == CAPTURE_MARKER) else {
-        return Vec::new();
+        return ParsedEnv::default();
     };
     let Some(end) = bytes.iter().rposition(|byte| *byte == CAPTURE_MARKER) else {
-        return Vec::new();
+        return ParsedEnv::default();
     };
     if end <= start {
-        return Vec::new();
+        return ParsedEnv::default();
     }
-    let mut out = Vec::new();
+    let mut parsed = ParsedEnv::default();
     for entry in bytes[start + 1..end].split(|byte| *byte == 0) {
         if entry.is_empty() {
             continue;
         }
-        let Ok(text) = std::str::from_utf8(entry) else {
+        let Some(equals) = entry.iter().position(|byte| *byte == b'=') else {
             continue;
         };
-        let Some((name, value)) = text.split_once('=') else {
-            continue;
-        };
+        let name = String::from_utf8_lossy(&entry[..equals]).into_owned();
         if name.is_empty() {
             continue;
         }
-        out.push((name.to_string(), value.to_string()));
+        parsed.names.insert(name.clone());
+        if let Ok(value) = std::str::from_utf8(&entry[equals + 1..]) {
+            parsed.pairs.push((name, value.to_string()));
+        }
     }
-    out
+    parsed
 }
 
 #[cfg(all(test, unix))]
@@ -333,18 +429,62 @@ mod tests {
         let bytes = b"profile banner\x01A=1\0B=2\0\x01trailing";
         assert_eq!(
             parse_env0(bytes),
-            vec![
-                ("A".to_string(), "1".to_string()),
-                ("B".to_string(), "2".to_string())
-            ]
+            ParsedEnv {
+                pairs: vec![
+                    ("A".to_string(), "1".to_string()),
+                    ("B".to_string(), "2".to_string())
+                ],
+                names: ["A".to_string(), "B".to_string()].into_iter().collect(),
+            }
         );
     }
 
     #[test]
     fn parse_env0_ignores_entries_with_no_name_or_no_value() {
+        assert_eq!(parse_env0(b"\x01\0=NOPE\0A\0\x01"), ParsedEnv::default());
+    }
+
+    /// A value kloop cannot decode still means the login shell *has* the name.
+    /// Reading it as absent would make the replay drop it — and a `PATH` whose
+    /// directories are not valid UTF-8 would take the user's toolchain with it.
+    #[test]
+    fn an_undecodable_value_keeps_its_name_but_no_value() {
+        let parsed = parse_env0(b"\x01PATH=/bin\0WEIRD=\xff\xfe\0\x01");
         assert_eq!(
-            parse_env0(b"\x01\0=NOPE\0A\0\x01"),
-            Vec::<(String, String)>::new()
+            parsed.pairs,
+            vec![("PATH".to_string(), "/bin".to_string())],
+            "only the decodable value is replayable"
+        );
+        assert!(parsed.names.contains("WEIRD"), "{:?}", parsed.names);
+
+        let removed = removals(
+            vec!["PATH".to_string(), "WEIRD".to_string()],
+            &parsed.names,
+            &[],
+        );
+        assert!(removed.is_empty(), "{removed:?}");
+    }
+
+    #[test]
+    fn replay_unsets_what_it_dropped_and_quotes_what_it_keeps() {
+        let env = ShellLoginEnv::test_fixture_with_removals(
+            &[("GREETING", "it's a line\nwith both")],
+            &["PYTHONHOME", "not-an-identifier"],
+        );
+        let script = env.replay();
+        assert!(script.starts_with("unset "), "{script}");
+        assert!(script.contains(" PYTHONHOME"), "{script}");
+        assert!(script.contains(" OPENAI_API_KEY"), "{script}");
+        assert!(
+            !script.contains("not-an-identifier"),
+            "a name a shell cannot parse stays out of the script: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"export GREETING='it'\''s a line
+with both'"#
+            ),
+            "quoted literally, newline and all: {script}"
         );
     }
 
@@ -375,11 +515,16 @@ mod tests {
 
     #[test]
     fn a_wedged_shell_capture_times_out() {
-        let shell = fake_shell("slow", "#!/bin/sh\nsleep 30\n");
+        let shell = fake_shell("slow", "#!/bin/sh\n/bin/sleep 30\n");
+        let start = std::time::Instant::now();
         let (env, warning) =
-            ShellLoginEnv::capture_within(&shell, &[], std::time::Duration::from_millis(200));
+            ShellLoginEnv::capture_within(&shell, &[], std::time::Duration::from_secs(2));
         assert!(!env.is_active());
         assert!(warning.is_some());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(6),
+            "the deadline, not the shell, must end the probe"
+        );
     }
 
     /// The timeout must end the probe's whole process group, not just the shell: a
@@ -451,8 +596,7 @@ mod tests {
 
     #[test]
     fn removals_are_what_the_profile_dropped() {
-        let kept: BTreeMap<String, String> =
-            [("PATH".to_string(), "/login/bin".to_string())].into();
+        let kept: BTreeSet<String> = ["PATH".to_string()].into_iter().collect();
         let removed = removals(
             vec![
                 "PATH".to_string(),
@@ -468,6 +612,72 @@ mod tests {
             ["PYTHONHOME".to_string()].into_iter().collect(),
             "a name the capture kept, the config owns, or kloop adds is not a removal"
         );
+    }
+
+    /// Both failure paths must clean up too: a nonzero exit, and a success whose
+    /// stdout a background descendant still holds open.
+    #[test]
+    fn both_failure_paths_leave_nothing_behind() {
+        use std::time::Instant;
+
+        for (tag, exit) in [("nonzero-exit", "exit 3"), ("held-pipe", "exit 0")] {
+            let dir =
+                std::env::temp_dir().join(format!("kloop-shell-env-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let ready = dir.join("child.pid");
+            let shell = dir.join("shell");
+            // The descendant holds our stdout, so the held-pipe case is exactly
+            // the one where the reader would otherwise wait for it.
+            std::fs::write(
+                &shell,
+                format!(
+                    "#!/bin/sh\n/bin/sleep 30 & printf %s $! > '{}'; {exit}\n",
+                    ready.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let (env, _) =
+                ShellLoginEnv::capture_within(&shell, &[], std::time::Duration::from_secs(5));
+            assert!(!env.is_active(), "{tag}");
+
+            // A freshly written executable pays a one-off exec cost on macOS, so
+            // wait for the descendant to announce itself rather than assume it
+            // is already there.
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let pid: i32 = std::fs::read_to_string(&ready)
+                .unwrap_or_else(|e| panic!("{tag}: no descendant pid: {e}"))
+                .trim()
+                .parse()
+                .unwrap();
+
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while process_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                !process_alive(pid),
+                "{tag}: a descendant outlived the capture"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Whether `pid` still exists (signal 0); a killed child is reaped a moment
+    /// later, so callers poll.
+    fn process_alive(pid: i32) -> bool {
+        let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+            return false;
+        };
+        matches!(
+            rustix::process::test_kill_process(pid),
+            Ok(()) | Err(rustix::io::Errno::PERM)
+        )
     }
 
     #[test]
@@ -488,6 +698,14 @@ mod tests {
             spec.env_add.contains(&("PATH".into(), "/login/bin".into())),
             "{:?}",
             spec.env_add
+        );
+        assert_eq!(
+            spec.env_add
+                .iter()
+                .find(|(name, _)| name == REPLAY_ENV)
+                .map(|(_, value)| value.to_string_lossy().into_owned()),
+            Some(env.replay()),
+            "the shell gets the replay script to run after its own startup files"
         );
     }
 }

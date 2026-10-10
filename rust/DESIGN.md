@@ -282,15 +282,26 @@ back. Provider and search credentials are filtered out of the capture the same
 way they are scrubbed from any model-controlled shell, names the config `[env]`
 sets are never taken from it, and names the shell derives itself (`PWD`,
 `OLDPWD`, `SHLVL`, `_`) are dropped so the child is not pinned to the capture's
-cwd. Replay is a full picture, not a set of additions: the probe is its own
-process group and a timeout kills that whole group (a profile waiting on a child
-script would otherwise leave it running, holding the pipe), the names the login
-shell *dropped* are removed from the command, and the startup files a
-non-interactive shell would still read on its own are suppressed — zsh runs with
-`-f`, because it re-reads `~/.zshenv` even when it is neither login nor
-interactive, and `BASH_ENV`/`ENV` are removed. Without that, a credential the
-capture filtered out walks straight back in. The capture is process-wide, like
-the shell identity: one login shell per
+cwd. Replay is a full picture, not a set of additions. The probe is its own
+process group, and **every** way its capture can end — a nonzero exit, a success
+whose stdout a background descendant still holds, a timeout, a wait error — kills
+that whole group; a plain `Child` drop would leave the descendants running and
+holding the pipe. The names the login shell *dropped* are removed from the
+command, not merely left out: replaying additions alone would let a value the
+profile unset come back through inheritance. A name whose value the capture could
+not decode still counts as kept — reading it as absent would take a `PATH` that
+holds non-UTF-8 directories away from a user who never unset it.
+
+The replay is done **by the shell, after its own startup files**, not only by the
+process environment: `-f` suppresses every startup file except `/etc/zshenv`,
+which zsh documents as unavoidable ("commands are first read from /etc/zshenv;
+this cannot be overridden"), and `BASH_ENV`/`ENV` are removed because a
+non-interactive bash still expands them. So the shell runs a fixed prelude that
+evaluates the replay script from `KLOOP_SHELL_ENV_REPLAY`, unsets that carrier,
+and only then runs the command — which kloop passes as an argument, so nothing is
+quoted into the script and the command is never re-parsed differently. Without
+this a credential the capture filtered out walks straight back in. The capture is
+process-wide, like the shell identity: one login shell per
 process, shared by every session, sub-agent and worktree. It is best-effort — a
 failure (or `[shells].login_env = false`) is a startup warning and commands fall
 back to the login `-lc` form, which is what kloop did before. On Windows, Job

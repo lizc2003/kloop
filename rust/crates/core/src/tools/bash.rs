@@ -131,6 +131,11 @@ pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
     }
 }
 
+/// The script every captured command runs through: replay the capture (from
+/// [`crate::shell_env::REPLAY_ENV`], which the shell then unsets so the command
+/// cannot read it), then the command itself, passed as `$1`.
+const REPLAY_PRELUDE: &str = "__kloop_cmd=$1; shift; eval \"${KLOOP_SHELL_ENV_REPLAY-}\"; unset KLOOP_SHELL_ENV_REPLAY; eval \"$__kloop_cmd\"";
+
 /// The process spec for the user's shell command, wrapped in the OS sandbox
 /// when a policy applies. The env vars are hints only; enforcement is the
 /// profile. The shell arguments are [`shell_args`]'s business.
@@ -166,23 +171,24 @@ fn shell_spec(
 
 /// The arguments one command is run with.
 ///
-/// A capture is replayed into a **non-login** shell: a login `sh`/`bash` re-runs
-/// `/etc/profile`, whose `path_helper` would put `/etc/paths` — and `/usr/bin` —
-/// back in front of the captured `PATH`. zsh is the one shell that also re-reads
-/// a startup file (`~/.zshenv`) when it is neither login nor interactive, so it
-/// gets `-f` to suppress every one of them; `bash` and POSIX `sh` read none in
-/// this shape. Without a capture the shell stays `-lc`, which is the old
-/// behavior.
+/// A capture is replayed by the shell itself. `-f` suppresses every startup file
+/// **except** `/etc/zshenv`, which zsh documents as unavoidable ("commands are
+/// first read from /etc/zshenv; this cannot be overridden"), so a fixed prelude
+/// re-applies the capture after it and only then runs the command. The command
+/// arrives as `$1`, so it never has to be quoted into a script. Without a
+/// capture the shell stays `-lc`, which is the old behavior.
 fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> Vec<OsString> {
-    let mut args = Vec::with_capacity(3);
-    if login_env.is_active() {
-        if bash.flavor == ShellFlavor::Zsh {
-            args.push("-f".into());
-        }
-        args.push("-c".into());
-    } else {
-        args.push("-lc".into());
+    if !login_env.is_active() {
+        return vec!["-lc".into(), command.into()];
     }
+    let mut args: Vec<OsString> = Vec::with_capacity(5);
+    if bash.flavor == ShellFlavor::Zsh {
+        args.push("-f".into());
+    }
+    args.push("-c".into());
+    args.push(REPLAY_PRELUDE.into());
+    // `$0`, so the command sees what `-c` would have given it.
+    args.push(bash.executable.clone().into_os_string());
     args.push(command.into());
     args
 }
@@ -1257,6 +1263,7 @@ mod tests {
     use crate::execution_provenance::TerminalOwner;
     use crate::inbox::InboxItem;
     use crate::shell_env::ShellLoginEnv;
+    #[cfg(unix)]
     use crate::shell_programs::ShellFlavor;
     use crate::tools::testutil::*;
     #[cfg(windows)]
@@ -1710,12 +1717,11 @@ Wait-Process -Id $grandchild.Id
         assert_eq!(scrubbed(/*allow_network*/ true), sorted(&secrets));
     }
 
-    /// A captured login environment only survives in a non-login shell: `/etc/
+    /// A captured login environment is replayed by the shell itself. `/etc/
     /// profile`'s `path_helper` would otherwise put `/usr/bin` back in front of
-    /// the captured `PATH`. zsh additionally gets `-f`, because it re-reads
-    /// `~/.zshenv` even when it is neither login nor interactive — a file that
-    /// can export a credential the capture filtered out. Without a capture the
-    /// shell stays login `-lc`.
+    /// the captured `PATH`, and zsh reads `/etc/zshenv` no matter how it is
+    /// invoked; `-f` covers the rest. Without a capture the shell stays login
+    /// `-lc`.
     #[test]
     #[cfg(unix)]
     fn an_active_login_environment_runs_the_shell_non_login() {
@@ -1724,14 +1730,18 @@ Wait-Process -Id $grandchild.Id
             .expect("test shell is available");
         let cwd = std::env::current_dir().unwrap();
         let login = ShellLoginEnv::test_fixture(&[("PATH", "/login/bin")]);
+        let prelude = std::ffi::OsString::from(super::REPLAY_PRELUDE);
 
         let active = super::shell_spec("true", &cwd, None, &shell, &login);
         assert_eq!(
             active.args,
             vec![
                 std::ffi::OsString::from("-c"),
-                std::ffi::OsString::from("true")
-            ]
+                prelude.clone(),
+                shell.executable.clone().into_os_string(),
+                std::ffi::OsString::from("true"),
+            ],
+            "the command is an argument, so nothing is quoted into the script"
         );
         assert!(active.env_add.contains(&(
             std::ffi::OsString::from("PATH"),
@@ -1743,13 +1753,9 @@ Wait-Process -Id $grandchild.Id
             ..shell.clone()
         };
         assert_eq!(
-            super::shell_spec("true", &cwd, None, &zsh, &login).args,
-            vec![
-                std::ffi::OsString::from("-f"),
-                std::ffi::OsString::from("-c"),
-                std::ffi::OsString::from("true")
-            ],
-            "zsh suppresses its startup files when a capture is replayed"
+            super::shell_spec("true", &cwd, None, &zsh, &login).args[0],
+            std::ffi::OsString::from("-f"),
+            "zsh suppresses the startup files it would otherwise read"
         );
 
         let inactive = super::shell_spec("true", &cwd, None, &shell, &ShellLoginEnv::none());
@@ -1765,6 +1771,50 @@ Wait-Process -Id $grandchild.Id
                 .env_add
                 .iter()
                 .any(|(name, _)| name == std::ffi::OsStr::new("PATH"))
+        );
+    }
+
+    /// The replay runs *inside* the shell, after whatever startup file it could
+    /// not be stopped from reading: what the capture dropped is gone even though
+    /// the shell inherited it, and what it kept is there.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_replay_prelude_beats_the_inherited_environment() {
+        let (ctx, _ui) = recording_ctx("bash-replay-prelude");
+        let shell = ctx
+            .cfg
+            .shell_programs
+            .bash
+            .clone()
+            .expect("test shell is available");
+        let login = ShellLoginEnv::test_fixture_with_removals(
+            &[("KLOOP_TEST_SENTINEL", "from-login")],
+            &["PATH"],
+        );
+        let mut spec = super::shell_spec(
+            "printf '%s|%s' \"${KLOOP_TEST_SENTINEL-unset}\" \"${PATH+set}\"",
+            &ctx.cfg.cwd,
+            None,
+            &shell,
+            &login,
+        );
+        // Leave the inherited PATH for the prelude to remove: the process spec
+        // alone would have hidden it.
+        spec.env_remove.retain(|name| name != "PATH");
+
+        let output = super::run_process_foreground(
+            spec,
+            10_000,
+            &tokio_util::sync::CancellationToken::new(),
+            "bash",
+        )
+        .await
+        .unwrap();
+        let text = super::format_output(&output);
+        assert!(text.contains("from-login|"), "{text}");
+        assert!(
+            !text.contains("from-login|set"),
+            "the prelude, not the inherited environment, has the last word: {text}"
         );
     }
 

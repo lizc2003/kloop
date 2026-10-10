@@ -69,6 +69,28 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
    `unavailable`、`parse_env0`、`removals`、`kill_group` 等会变成 dead_code,在
    `-D warnings` 门禁下报错。已逐个补齐。验证方式见下。
 
+## 复审修正（第二轮，四条）
+
+1. **[P1] `-f` 挡不住 `/etc/zshenv`。** 官方文档写明「Commands are first read from
+   /etc/zshenv; this cannot be overridden」——`-f` 只能让该文件自己用 `if [[ -o rcs ]]`
+   自我跳过。所以「启动文件已全部抑制」是错的：一个 root 拥有的 `/etc/zshenv` 仍可在回放
+   之后重新导出被过滤的密钥、改写 PATH 或代理。修法:回放改由 **shell 自己在启动文件之后**
+   执行——`bash.rs` 用一个固定 prelude(`eval "${KLOOP_SHELL_ENV_REPLAY-}"` → `unset` 载体
+   → `eval "$1"`),载体 `KLOOP_SHELL_ENV_REPLAY` 里是要执行的 replay 脚本(`unset` 掉
+   删除集与密钥,`export` 回捕获值,单引号转义,非标识符名不进脚本)。命令作为 `$1` 传入,
+   所以不需要把它引号进脚本,也不会被二次解析。保留 `-f`(压掉其余启动文件与副作用)与
+   `BASH_ENV`/`ENV` 移除(bash 非交互仍会展开它们)。载体值本身就是子进程环境的一部分,
+   不新增暴露面;prelude 在跑命令前把它 unset。
+2. **[P2] 非 UTF-8 值被误判成「profile 删除了」。** `parse_env0` 现在返回 `ParsedEnv
+   { pairs, names }`:值不可解码时仍记名字,`removals` 以 **names** 判断存在性,于是
+   PATH 里含非 UTF-8 目录时不会被误删(那个变量仍继承父进程的值,只是无法回放)。
+3. **[P2] Windows 测试模块的 `ShellFlavor` 导入未受 cfg 保护。** 该导入只被 `#[cfg(unix)]`
+   的测试用到,Windows 的 `clippy --all-targets … -D warnings` 会因 unused_imports 报错
+   ——已补 `#[cfg(unix)]`。
+4. **[P2] 捕获失败路径仍会留下后代。** 原来只有 `try_wait` 报错和主循环超时会清进程组;
+   非零退出、以及根进程成功退出但后台后代占着 stdout 导致读取超时,都会直接返回。现在循环
+   只负责得出结果,`kill_group` 在**所有**退出路径之后无条件执行。
+
 ## 验证
 
 - `make check`（fmt + clippy + workspace test + release 测试 + parity）全绿。
@@ -92,3 +114,15 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
   `aws-lc-sys` 缺 Windows SDK 头挡住；改为把 `shell_env.rs` 的 unix cfg 临时翻转成
   非 unix 形状跑 `cargo check -p kloop-core --lib`，该模块零警告，随后恢复原文件并重跑
   测试。
+- 第二轮新增断言：`shell_env::tests::{an_undecodable_value_keeps_its_name_but_no_value,
+  replay_unsets_what_it_dropped_and_quotes_what_it_keeps,
+  both_failure_paths_leave_nothing_behind}`、
+  `bash::tests::the_replay_prelude_beats_the_inherited_environment`（用真 `/bin/sh` 跑
+  prelude，且故意把 PATH 从 `env_remove` 里放回去，证明是 prelude 而不是进程环境在起作用）。
+  `both_failure_paths_leave_nothing_behind` 做过判别力验证：把退出路径上的 `kill_group`
+  停掉时它会红（后代活过捕获），恢复后通过。
+- 第二轮本机验证：真 zsh 上跑 prelude——不带 prelude 时 `TAVILY_API_KEY` 为 SET，带上
+  之后为清空、捕获值生效、载体 `KLOOP_SHELL_ENV_REPLAY` 在命令里已 unset。
+- 排查记录（教训）：新写的可执行脚本在 macOS 上**首次 exec 约 200ms**，第一版失败用例用的
+  是 300ms 超时，于是测试把「起步慢」误报成产品缺陷。凡是「写文件 + 立刻执行 + 短超时」的
+  测试都要留出这段首次执行开销，或轮询等待就绪信号而不是假设立即就绪。

@@ -27,6 +27,14 @@ profile 起的后代（还占着管道），探针改独立进程组、整组 ki
 不等于「环境受控」——shell 的启动文件是环境的一部分，抑制它和注入它同样必要；写
 「重放」语义时先问一句「删除怎么表达」。** 另：`kill_group` 的测试一开始没有判别力
 （探针还没起后代就被杀），改成等后代就绪再杀、并临时去掉 killpg 验证它会红。
+**第二轮复审（四条，均已修）**：① `-f` 压不住 `/etc/zshenv`(zsh 文档明说不可覆盖),所以回放
+必须由 shell 自己在启动文件之后执行——固定 prelude 从 `KLOOP_SHELL_ENV_REPLAY` 载体里
+读 replay 脚本、`unset` 载体、再 `eval "$1"` 跑命令;② `parse_env0` 要连名字一起留(值不可
+解码也算「捕获里有」),否则 PATH 含非 UTF-8 目录时会被当成 profile 删除而整条去掉;
+③ Windows 测试模块的新导入要 `#[cfg(unix)]`,否则 `-D warnings` 挂在 unused_imports;
+④ 捕获的**每条**退出路径都要清进程组,不只是超时和 wait 出错。教训:**「加了 `-f`」不等于
+「启动文件不会跑」——先查文档里那条例外,再决定回放放在进程环境还是 shell 自己里;另外
+新写脚本在 macOS 上首次 exec 约 200ms,短超时的测试会把这段开销误报成缺陷。**
 
 **跨进程资源身份（2026-10-10，plan 222）**：offload、后台 Bash、子 agent、Program /
 Workflow 的执行与 run ID、定时任务、自动 worktree 名统一使用 64 位随机数 +
