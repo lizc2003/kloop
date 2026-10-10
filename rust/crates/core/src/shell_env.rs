@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::process_tree::ProcessSpec;
 
@@ -32,11 +34,6 @@ pub(crate) const MODEL_SHELL_SECRET_ENV: &[&str] = &[
     "TAVILY_API_KEY",
     "BRAVE_API_KEY",
 ];
-
-/// The variable that carries [`ShellLoginEnv::replay`] into the shell. Its value
-/// is built from the environment the shell is already given, so it adds no new
-/// exposure; the shell unsets it before the command runs.
-pub(crate) const REPLAY_ENV: &str = "KLOOP_SHELL_ENV_REPLAY";
 
 /// Startup hooks a non-interactive shell still expands on its own: bash reads
 /// `BASH_ENV`, a POSIX `sh` historically reads `ENV` when interactive. Letting
@@ -53,10 +50,20 @@ const VOLATILE_ENV: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_"];
 /// Variables kloop itself adds to a shell command. The capture never saw them,
 /// so they are not the login shell's to drop.
 #[cfg(unix)]
-const KLOOP_SHELL_ENV: &[&str] = &[
-    "KLOOP_SANDBOX",
-    "KLOOP_SANDBOX_NETWORK_DISABLED",
-    REPLAY_ENV,
+const KLOOP_SHELL_ENV: &[&str] = &["KLOOP_SANDBOX", "KLOOP_SANDBOX_NETWORK_DISABLED"];
+
+#[cfg(any(unix, test))]
+const SHELL_READONLY_ENV: &[&str] = &[
+    "BASHOPTS",
+    "BASH_VERSINFO",
+    "EUID",
+    "PPID",
+    "SHELLOPTS",
+    "UID",
+    "ZSH_EVAL_CONTEXT",
+    "ZSH_PATCHLEVEL",
+    "ZSH_SUBSHELL",
+    "ZSH_VERSION",
 ];
 
 /// The capture is one `env -0` of a login shell; anything this large is not it.
@@ -74,6 +81,18 @@ const CAPTURE_MARKER: u8 = 0x01;
 pub struct ShellLoginEnv {
     vars: BTreeMap<String, String>,
     removed: BTreeSet<String>,
+    replay_file: Option<Arc<ReplayFile>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReplayFile {
+    path: PathBuf,
+}
+
+impl Drop for ReplayFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl ShellLoginEnv {
@@ -107,7 +126,34 @@ impl ShellLoginEnv {
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
                 .collect(),
             removed: removed.iter().map(|name| (*name).to_string()).collect(),
+            replay_file: None,
         }
+        .prepare_replay()
+        .expect("create the test replay file")
+    }
+
+    pub(crate) fn replay_path(&self) -> Option<&Path> {
+        self.replay_file.as_ref().map(|file| file.path.as_path())
+    }
+
+    #[cfg(any(unix, test))]
+    fn prepare_replay(mut self) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        if !self.is_active() {
+            return Ok(self);
+        }
+        let (_, path, mut file) =
+            crate::resource_id::create_file(&std::env::temp_dir(), "shell-env-", ".sh")?;
+        let replay_file = Arc::new(ReplayFile { path });
+        file.write_all(self.replay().as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        }
+        self.replay_file = Some(replay_file);
+        Ok(self)
     }
 
     /// Replay the capture on a process spec: the environment the login shell
@@ -129,12 +175,10 @@ impl ShellLoginEnv {
             spec.env_remove(name.as_str());
         }
         for (name, value) in &self.vars {
-            spec.env(name.as_str(), value.as_str());
+            if !is_blocked(name) {
+                spec.env(name.as_str(), value.as_str());
+            }
         }
-        // The process environment is not the last word: the shell re-applies
-        // this itself, after whatever startup file it could not be stopped from
-        // reading.
-        spec.env(REPLAY_ENV, self.replay());
     }
 
     /// The script the shell runs before the command: drop the names the login
@@ -145,13 +189,14 @@ impl ShellLoginEnv {
     /// left out — an environment name may contain anything, and one that is not
     /// an identifier would turn this script into a syntax error. Those names are
     /// still covered by the process spec's own additions and removals.
-    pub(crate) fn replay(&self) -> String {
+    #[cfg(any(unix, test))]
+    fn replay(&self) -> String {
         let unset: BTreeSet<&str> = MODEL_SHELL_SECRET_ENV
             .iter()
             .copied()
             .chain(SHELL_STARTUP_HOOKS.iter().copied())
             .chain(self.removed.iter().map(String::as_str))
-            .filter(|name| is_identifier(name))
+            .filter(|name| is_identifier(name) && !SHELL_READONLY_ENV.contains(name))
             .collect();
         let mut script = String::new();
         if !unset.is_empty() {
@@ -160,9 +205,13 @@ impl ShellLoginEnv {
                 script.push(' ');
                 script.push_str(name);
             }
+            script.push_str(" || exit $?");
         }
         for (name, value) in &self.vars {
-            if !is_identifier(name) {
+            if !is_identifier(name)
+                || is_blocked(name)
+                || SHELL_READONLY_ENV.contains(&name.as_str())
+            {
                 continue;
             }
             if !script.is_empty() {
@@ -172,25 +221,24 @@ impl ShellLoginEnv {
             script.push_str(name);
             script.push('=');
             script.push_str(&quote_sh(value));
+            script.push_str(" || exit $?");
         }
         script
     }
 
     /// Run `<shell> -lc` once and keep the environment it comes up with.
     ///
-    /// `config_env_names` are the `[env]` names: the config file wins over what
-    /// the shell exported (plan 172), so they are neither taken from the capture
-    /// nor dropped by it. The returned warning is for the startup line;
-    /// `none()` means "keep the login `-lc` behavior".
+    /// `config_env` 的实际值覆盖捕获，并在 shell 启动之后恢复。
+    /// 失败返回启动警告与 `none()`，继续沿用登录 `-lc`。
     #[cfg(unix)]
-    pub fn capture(shell: &Path, config_env_names: &[String]) -> (Self, Option<String>) {
-        Self::capture_within(shell, config_env_names, CAPTURE_TIMEOUT)
+    pub fn capture(shell: &Path, config_env: &[(String, String)]) -> (Self, Option<String>) {
+        Self::capture_within(shell, config_env, CAPTURE_TIMEOUT)
     }
 
     #[cfg(unix)]
     fn capture_within(
         shell: &Path,
-        config_env_names: &[String],
+        config_env: &[(String, String)],
         timeout: std::time::Duration,
     ) -> (Self, Option<String>) {
         // `command` keeps a shell function named `env` out of the way; the
@@ -200,12 +248,12 @@ impl ShellLoginEnv {
             return (Self::none(), Some(unavailable(shell)));
         };
         let parsed = parse_env0(&bytes);
+        if parsed.pairs.is_empty() {
+            return (Self::none(), Some(unavailable(shell)));
+        }
         let mut vars = BTreeMap::new();
-        for (name, value) in parsed.pairs {
-            if MODEL_SHELL_SECRET_ENV.contains(&name.as_str())
-                || VOLATILE_ENV.contains(&name.as_str())
-                || config_env_names.iter().any(|blocked| blocked == &name)
-            {
+        for (name, value) in parsed.pairs.into_iter().chain(config_env.iter().cloned()) {
+            if is_blocked(&name) || VOLATILE_ENV.contains(&name.as_str()) {
                 continue;
             }
             vars.insert(name, value);
@@ -216,15 +264,31 @@ impl ShellLoginEnv {
         let removed = removals(
             std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()),
             &parsed.names,
-            config_env_names,
+            &config_env
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
         );
-        (Self { vars, removed }, None)
+        match (Self {
+            vars,
+            removed,
+            replay_file: None,
+        })
+        .prepare_replay()
+        {
+            Ok(env) => (env, None),
+            Err(_) => (Self::none(), Some(unavailable(shell))),
+        }
     }
 
     #[cfg(not(unix))]
-    pub fn capture(_shell: &Path, _config_env_names: &[String]) -> (Self, Option<String>) {
+    pub fn capture(_shell: &Path, _config_env: &[(String, String)]) -> (Self, Option<String>) {
         (Self::none(), None)
     }
+}
+
+fn is_blocked(name: &str) -> bool {
+    MODEL_SHELL_SECRET_ENV.contains(&name) || SHELL_STARTUP_HOOKS.contains(&name)
 }
 
 /// Which names the login shell dropped: present in kloop's own environment but
@@ -256,6 +320,7 @@ fn removals(
 }
 
 /// Whether a name may appear in the replay script at all.
+#[cfg(any(unix, test))]
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
@@ -264,6 +329,7 @@ fn is_identifier(name: &str) -> bool {
 
 /// Single-quote a value for the replay script: everything inside is literal, and
 /// an embedded quote closes, escapes and reopens it.
+#[cfg(any(unix, test))]
 fn quote_sh(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -421,7 +487,7 @@ mod tests {
     }
 
     const MARKED: &str = "printf '\\001'; printf \
-        'PATH=/login/bin\\000KLOOP_TEST_SENTINEL=1\\000ANTHROPIC_API_KEY=leak\\000PWD=/login\\000BLOCKED=cfg\\000'; \
+        'PATH=/login/bin\\000KLOOP_TEST_SENTINEL=1\\000ANTHROPIC_API_KEY=leak\\000PWD=/login\\000BLOCKED=cfg\\000BASH_ENV=/dev/null\\000ENV=/dev/null\\000'; \
         printf '\\001'";
 
     #[test]
@@ -489,20 +555,45 @@ with both'"#
     }
 
     #[test]
-    fn capture_keeps_the_login_environment_but_not_secrets_or_config_names() {
+    fn capture_merges_config_values_without_secrets_or_startup_hooks() {
         let shell = fake_shell("keep", &format!("#!/bin/sh\n{MARKED}\n"));
-        let (env, warning) = ShellLoginEnv::capture(&shell, &["BLOCKED".to_string()]);
+        let config = [
+            ("BLOCKED".into(), "from-config".into()),
+            ("PATH".into(), "/configured/bin".into()),
+            ("CONFIG_ONLY".into(), "present".into()),
+            ("OPENAI_API_KEY".into(), "config-secret".into()),
+            ("BASH_ENV".into(), "/configured-hook".into()),
+            ("ENV".into(), "/configured-hook".into()),
+        ];
+        let (env, warning) = ShellLoginEnv::capture(&shell, &config);
         assert!(warning.is_none());
         assert!(env.is_active());
-        assert_eq!(env.get("PATH"), Some("/login/bin"));
-        assert_eq!(env.get("KLOOP_TEST_SENTINEL"), Some("1"));
         assert_eq!(
-            env.get("ANTHROPIC_API_KEY"),
-            None,
-            "secrets never come back"
+            env.vars,
+            BTreeMap::from([
+                ("BLOCKED".into(), "from-config".into()),
+                ("CONFIG_ONLY".into(), "present".into()),
+                ("KLOOP_TEST_SENTINEL".into(), "1".into()),
+                ("PATH".into(), "/configured/bin".into()),
+            ])
         );
-        assert_eq!(env.get("PWD"), None, "the shell derives this per call");
-        assert_eq!(env.get("BLOCKED"), None, "the config file wins");
+        assert!(!env.removed.contains("CONFIG_ONLY"));
+    }
+
+    #[test]
+    fn replay_file_is_private_and_lives_until_the_last_capture_is_dropped() {
+        let env = ShellLoginEnv::test_fixture(&[("PATH", "/login/bin")]);
+        let path = env.replay_path().unwrap().to_path_buf();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), env.replay());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        let shared = env.clone();
+        drop(env);
+        assert!(path.exists());
+        drop(shared);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -511,6 +602,15 @@ with both'"#
         let (env, warning) = ShellLoginEnv::capture(&shell, &[]);
         assert!(!env.is_active());
         assert!(warning.unwrap().contains("login environment"));
+    }
+
+    #[test]
+    fn config_values_do_not_turn_an_empty_capture_into_a_snapshot() {
+        let shell = fake_shell("empty", "#!/bin/sh\nprintf '\\001\\001'\n");
+        let config = [("PATH".into(), "/configured/bin".into())];
+        let (env, warning) = ShellLoginEnv::capture(&shell, &config);
+        assert_eq!(env, ShellLoginEnv::none());
+        assert!(warning.is_some());
     }
 
     #[test]
@@ -699,13 +799,6 @@ with both'"#
             "{:?}",
             spec.env_add
         );
-        assert_eq!(
-            spec.env_add
-                .iter()
-                .find(|(name, _)| name == REPLAY_ENV)
-                .map(|(_, value)| value.to_string_lossy().into_owned()),
-            Some(env.replay()),
-            "the shell gets the replay script to run after its own startup files"
-        );
+        assert_eq!(spec.env_add, vec![("PATH".into(), "/login/bin".into())]);
     }
 }

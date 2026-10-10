@@ -133,46 +133,44 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
 
     let initial_cpr = harness.snapshot().cpr_count;
     harness.resize(16, 60)?;
-    let shrunk = harness.wait_for("shrink redraw", Duration::from_millis(1500), |frame| {
+    harness.wait_for("shrink redraw", Duration::from_millis(1500), |frame| {
         frame.rows == 16
             && frame.cols == 60
             && frame.cpr_count > initial_cpr
             && frame.cursor.1 == 14
             && frame.contains("[manual]")
     })?;
-    assert_eq!(harness.pty_size()?, (16, 60));
-    assert!(shrunk.cursor.0 < shrunk.rows && shrunk.cursor.1 < shrunk.cols);
-    assert_eq!(shrunk.count("[manual]"), 1);
-    // The spot checks above say the cursor and the badge survived the shrink.
-    // The baseline says what the other 959 cells hold: where the banner wrapped,
-    // how the 70-column input rewrapped, whether the footer kept its row.
-    let settled = harness.wait_for_quiescent(
+    // PTY 读到局部重绘不代表整屏已经完成，计数、光标与快照必须检查同一个稳定帧。
+    let shrunk = harness.wait_for_quiescent(
         "shrunk screen settles",
         Duration::from_secs(3),
         QUIET,
         |frame| frame.rows == 16 && frame.cols == 60,
     )?;
-    insta::assert_snapshot!("resize_shrunk_16x60", settled.stable_text());
+    assert_eq!(harness.pty_size()?, (16, 60));
+    assert!(shrunk.cursor.0 < shrunk.rows && shrunk.cursor.1 < shrunk.cols);
+    assert_eq!(shrunk.count("[manual]"), 1);
+    insta::assert_snapshot!("resize_shrunk_16x60", shrunk.stable_text());
 
     let shrunk_cpr = shrunk.cpr_count;
     harness.resize(24, 100)?;
-    let grown = harness.wait_for("grow redraw", Duration::from_millis(1500), |frame| {
+    harness.wait_for("grow redraw", Duration::from_millis(1500), |frame| {
         frame.rows == 24
             && frame.cols == 100
             && frame.cpr_count > shrunk_cpr
             && frame.cursor.1 == 72
             && frame.contains("[manual]")
     })?;
-    assert_eq!(harness.pty_size()?, (24, 100));
-    assert!(grown.cursor.0 < grown.rows && grown.cursor.1 < grown.cols);
-    assert_eq!(grown.count("[manual]"), 1);
-    let settled = harness.wait_for_quiescent(
+    let grown = harness.wait_for_quiescent(
         "grown screen settles",
         Duration::from_secs(3),
         QUIET,
         |frame| frame.rows == 24 && frame.cols == 100,
     )?;
-    insta::assert_snapshot!("resize_grown_24x100", settled.stable_text());
+    assert_eq!(harness.pty_size()?, (24, 100));
+    assert!(grown.cursor.0 < grown.rows && grown.cursor.1 < grown.cols);
+    assert_eq!(grown.count("[manual]"), 1);
+    insta::assert_snapshot!("resize_grown_24x100", grown.stable_text());
 
     graceful_exit(&mut harness)?;
     Ok(())
@@ -207,22 +205,20 @@ async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Res
 
     harness.write(b"second turn")?;
     harness.write(ENTER)?;
-    let final_frame = harness.wait_for("second turn", Duration::from_secs(8), |frame| {
+    harness.wait_for("second turn", Duration::from_secs(8), |frame| {
         frame.contains("SECOND_TAIL")
             && !frame.contains("Working")
             && frame.contains("Type a message")
     })?;
-    assert_eq!(final_frame.count("Type a message"), 1);
-    assert_eq!(final_frame.count("[manual]"), 1);
-    // Two commits have scrolled the first turn away; what is left is the seam
-    // between them. Counting "Type a message" cannot see a stray blank row or a
-    // line of the previous turn left behind by the clear — the baseline can.
+    // 输入提示与状态行可能落在不同读取片段里，完整性断言与整屏快照都必须等重绘稳定。
     let settled = harness.wait_for_quiescent(
         "second turn settles",
         Duration::from_secs(3),
         QUIET,
         |frame| frame.contains("SECOND_TAIL") && frame.contains("Type a message"),
     )?;
+    assert_eq!(settled.count("Type a message"), 1);
+    assert_eq!(settled.count("[manual]"), 1);
     insta::assert_snapshot!("two_turn_overflow_14x80", settled.stable_text());
 
     let raw = harness.raw_since(mark);

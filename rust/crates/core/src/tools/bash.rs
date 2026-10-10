@@ -131,10 +131,7 @@ pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
     }
 }
 
-/// The script every captured command runs through: replay the capture (from
-/// [`crate::shell_env::REPLAY_ENV`], which the shell then unsets so the command
-/// cannot read it), then the command itself, passed as `$1`.
-const REPLAY_PRELUDE: &str = "__kloop_cmd=$1; shift; eval \"${KLOOP_SHELL_ENV_REPLAY-}\"; unset KLOOP_SHELL_ENV_REPLAY; eval \"$__kloop_cmd\"";
+const REPLAY_PRELUDE: &str = ". \"$2\" || exit $?; eval 'set --; '\"$1\"";
 
 /// The process spec for the user's shell command, wrapped in the OS sandbox
 /// when a policy applies. The env vars are hints only; enforcement is the
@@ -181,7 +178,7 @@ fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> 
     if !login_env.is_active() {
         return vec!["-lc".into(), command.into()];
     }
-    let mut args: Vec<OsString> = Vec::with_capacity(5);
+    let mut args: Vec<OsString> = Vec::with_capacity(6);
     if bash.flavor == ShellFlavor::Zsh {
         args.push("-f".into());
     }
@@ -190,6 +187,13 @@ fn shell_args(bash: &ShellProgram, command: &str, login_env: &ShellLoginEnv) -> 
     // `$0`, so the command sees what `-c` would have given it.
     args.push(bash.executable.clone().into_os_string());
     args.push(command.into());
+    args.push(
+        login_env
+            .replay_path()
+            .expect("active capture has a replay file")
+            .as_os_str()
+            .into(),
+    );
     args
 }
 
@@ -1740,6 +1744,7 @@ Wait-Process -Id $grandchild.Id
                 prelude.clone(),
                 shell.executable.clone().into_os_string(),
                 std::ffi::OsString::from("true"),
+                login.replay_path().unwrap().as_os_str().into(),
             ],
             "the command is an argument, so nothing is quoted into the script"
         );
@@ -1815,6 +1820,160 @@ Wait-Process -Id $grandchild.Id
         assert!(
             !text.contains("from-login|set"),
             "the prelude, not the inherited environment, has the last word: {text}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replay_cannot_replace_the_command_or_restore_startup_hooks() {
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+        for (executable, flavor) in [
+            ("/bin/sh", ShellFlavor::PosixSh),
+            ("/bin/zsh", ShellFlavor::Zsh),
+        ] {
+            if !Path::new(executable).is_file() {
+                continue;
+            }
+            let shell = crate::shell_programs::ShellProgram {
+                executable: executable.into(),
+                flavor,
+            };
+            for login in [
+                ShellLoginEnv::test_fixture(&[
+                    ("__kloop_cmd", "printf replaced"),
+                    ("BASH_ENV", "/dev/null"),
+                    ("ENV", "/dev/null"),
+                ]),
+                ShellLoginEnv::test_fixture_with_removals(
+                    &[("BASH_ENV", "/dev/null"), ("ENV", "/dev/null")],
+                    &["__kloop_cmd"],
+                ),
+            ] {
+                let spec = super::shell_spec(
+                    "printf 'checked:%s|%s|' \"$#\" \"${1-unset}\"; /bin/bash -c 'printf \"%s|%s\" \"${BASH_ENV+set}\" \"${ENV+set}\"'",
+                    &std::env::current_dir().unwrap(),
+                    None,
+                    &shell,
+                    &login,
+                );
+                let output = super::run_process_foreground(
+                    spec,
+                    10_000,
+                    &tokio_util::sync::CancellationToken::new(),
+                    "bash",
+                )
+                .await
+                .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(output.stdout, b"checked:0|unset||", "{output:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replay_preserves_inherited_bash_options_without_assigning_readonly_variables() {
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let shell = crate::shell_programs::ShellProgram {
+            executable: "/bin/bash".into(),
+            flavor: ShellFlavor::PosixSh,
+        };
+        let login = ShellLoginEnv::test_fixture(&[
+            ("SHELLOPTS", "errexit:nounset:pipefail"),
+            ("BASHOPTS", "checkwinsize:extquote"),
+            ("UID", "1"),
+            ("EUID", "1"),
+            ("PPID", "1"),
+        ]);
+        let spec = super::shell_spec(
+            "case $- in *e*) printf errexit;; esac; printf '|ok'",
+            &std::env::current_dir().unwrap(),
+            None,
+            &shell,
+            &login,
+        );
+        let output = super::run_process_foreground(
+            spec,
+            10_000,
+            &tokio_util::sync::CancellationToken::new(),
+            "bash",
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"errexit|ok", "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_large_capture_does_not_duplicate_the_environment_in_exec_arguments() {
+        let shell = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .unwrap();
+        let value = "x".repeat(50_000);
+        let login = ShellLoginEnv::test_fixture(&[
+            ("KLOOP_LARGE_A", &value),
+            ("KLOOP_LARGE_B", &value),
+            ("KLOOP_LARGE_C", &value),
+        ]);
+        let spec = super::shell_spec(
+            "printf '%s|%s|%s' \"${#KLOOP_LARGE_A}\" \"${#KLOOP_LARGE_B}\" \"${#KLOOP_LARGE_C}\"",
+            &std::env::current_dir().unwrap(),
+            None,
+            &shell,
+            &login,
+        );
+        let output = super::run_process_foreground(
+            spec,
+            10_000,
+            &tokio_util::sync::CancellationToken::new(),
+            "bash",
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"50000|50000|50000", "{output:?}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn replay_restores_config_values_after_shell_startup() {
+        let shell = crate::shell_programs::ShellPrograms::test_fixture()
+            .bash
+            .unwrap();
+        let login = ShellLoginEnv::test_fixture(&[
+            ("PATH", "/configured/bin"),
+            ("HTTP_PROXY", "http://configured"),
+        ]);
+        let mut spec = super::shell_spec(
+            "printf '%s|%s' \"$PATH\" \"$HTTP_PROXY\"",
+            &std::env::current_dir().unwrap(),
+            None,
+            &shell,
+            &login,
+        );
+        spec.args[1] = format!(
+            "PATH=/startup/bin; HTTP_PROXY=http://startup; {}",
+            super::REPLAY_PRELUDE
+        )
+        .into();
+        let output = super::run_process_foreground(
+            spec,
+            10_000,
+            &tokio_util::sync::CancellationToken::new(),
+            "bash",
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout, b"/configured/bin|http://configured",
+            "{output:?}"
         );
     }
 

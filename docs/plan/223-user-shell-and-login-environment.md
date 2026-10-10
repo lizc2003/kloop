@@ -29,12 +29,14 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
 2. **登录环境捕获**（新模块 `shell_env.rs`，`ShellLoginEnv`）：Unix 下跑一次
    `<shell> -lc`，脚本用 `\001` 包裹 `command env -0`，5s 超时、1 MiB 上限，
    按 NUL 切 `NAME=VALUE`。过滤三类名字：现有密钥黑名单（`MODEL_SHELL_SECRET_ENV`，
-   常量从 `bash.rs` 移到这里，只有一处定义）、配置 `[env]` 会设的名字（配置赢，
-   Plan 172）、shell 每次自己派生的 `PWD/OLDPWD/SHLVL/_`。失败/超时/关闭开关一律
+   常量从 `bash.rs` 移到这里，只有一处定义）、启动钩子 `BASH_ENV/ENV`、shell 每次自己
+   派生的 `PWD/OLDPWD/SHLVL/_`。再合并配置 `[env]` 的实际值（配置赢，Plan 172；
+   同样过滤密钥、钩子与派生变量）。失败/超时/空捕获/关闭开关一律
    返回 `none()`，不是错误。
-3. **命令改非登录**（`bash.rs::shell_spec`）：有捕获时参数用 `["-c", command]`，
+3. **命令改非登录**（`bash.rs::shell_spec`）：有捕获时使用固定 prelude 与非登录 `-c`，
    逐条 `spec.env(name, value)` 覆盖注入（不 `env_clear`，与 `[env]`「没提的名字
-   原样继承」一致，也保住 Windows 的环境块）；没有捕获时维持 `["-lc", command]`。
+   原样继承」一致，也保住 Windows 的环境块），启动文件后 source 私有临时文件恢复环境，
+   再执行作为位置参数传入的原命令；没有捕获时维持 `["-lc", command]`。
    捕获若仍走登录 shell，`/etc/profile` 的 path_helper 会把注入的 PATH 再重排一遍，
    所以「非登录」是捕获生效的必要条件，不是风格选择。
 4. **接线**：`Config` 增 `shell_login_env: Arc<ShellLoginEnv>`（进程级，与
@@ -75,12 +77,12 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
    /etc/zshenv; this cannot be overridden」——`-f` 只能让该文件自己用 `if [[ -o rcs ]]`
    自我跳过。所以「启动文件已全部抑制」是错的：一个 root 拥有的 `/etc/zshenv` 仍可在回放
    之后重新导出被过滤的密钥、改写 PATH 或代理。修法:回放改由 **shell 自己在启动文件之后**
-   执行——`bash.rs` 用一个固定 prelude(`eval "${KLOOP_SHELL_ENV_REPLAY-}"` → `unset` 载体
+   执行——当时 `bash.rs` 用一个固定 prelude(`eval "${KLOOP_SHELL_ENV_REPLAY-}"` → `unset` 载体
    → `eval "$1"`),载体 `KLOOP_SHELL_ENV_REPLAY` 里是要执行的 replay 脚本(`unset` 掉
    删除集与密钥,`export` 回捕获值,单引号转义,非标识符名不进脚本)。命令作为 `$1` 传入,
    所以不需要把它引号进脚本,也不会被二次解析。保留 `-f`(压掉其余启动文件与副作用)与
    `BASH_ENV`/`ENV` 移除(bash 非交互仍会展开它们)。载体值本身就是子进程环境的一部分,
-   不新增暴露面;prelude 在跑命令前把它 unset。
+   不新增暴露面;prelude 在跑命令前把它 unset。该载体与命令保存方式已被第三轮修正替代。
 2. **[P2] 非 UTF-8 值被误判成「profile 删除了」。** `parse_env0` 现在返回 `ParsedEnv
    { pairs, names }`:值不可解码时仍记名字,`removals` 以 **names** 判断存在性,于是
    PATH 里含非 UTF-8 目录时不会被误删(那个变量仍继承父进程的值,只是无法回放)。
@@ -91,10 +93,29 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
    非零退出、以及根进程成功退出但后台后代占着 stdout 导致读取超时,都会直接返回。现在循环
    只负责得出结果,`kill_group` 在**所有**退出路径之后无条件执行。
 
+## 复审修正（第三轮，五条，针对 `0d633d2`）
+
+1. **启动钩子被回放重新导出。** `BASH_ENV`/`ENV` 从捕获与 `[env]` 合并中剔除，
+   进程注入与脚本回放也过滤它们，避免命令中的嵌套 bash 再次读取钩子。
+2. **普通变量不能保存已获准命令。** 去掉 `__kloop_cmd`；原命令一直保留在位置参数，
+   回放不写位置参数。执行原命令前清空参数，命令仍看到 `$# = 0`。
+3. **内建只读变量不做运行时赋值。** `SHELLOPTS`、`BASHOPTS`、`UID` 等仅通过进程环境
+   继承，脚本不 export/unset，避免 `errexit` 下执行原命令之前退出。
+4. **回放载体不能重复整份启动环境。** 用已有随机资源 ID 与排他创建逻辑生成临时脚本，
+   创建时 0600、写完 0400，`Arc` 持有到最后一次正常释放并删除。argv 只带路径，环境仍
+   逐项注入；既避开单个变量的长度限制，也不再重复占用 exec 的总启动空间。准备失败沿用
+   捕获失败的警告与 `-lc` 回退。
+5. **配置优先级必须在启动文件之后兑现。** 捕获接口接收 `[env]` 的键和值，合并为最终
+   快照，进程环境和回放使用同一组值，PATH 与代理不再被启动文件覆盖。
+
 ## 验证
 
-- `make check`（fmt + clippy + workspace test + release 测试 + parity）全绿。
-- 新断言：`shell_env::tests::*`（标记解析、密钥/`[env]`/易变名被剔除、非零退出与
+- 本轮默认并行 `make check`（fmt + clippy + workspace debug 全量测试 + parity）全绿；
+  PTY 整组 18 项也单独按默认并行运行通过。release 检查按用户要求只手动运行。
+- 本轮门禁发现并按用户要求修复 PTY 测试时序：两轮溢出测试先检查中间帧上的
+  `[manual]` 数量、后等待静默，默认并行运行两次失败而单跑/串行通过。完整屏幕断言
+  改在 `wait_for_quiescent` 后与快照检查同一帧，缩放测试的同类断言一并修正。
+- 新断言：`shell_env::tests::*`（标记解析、密钥/钩子/易变名过滤、`[env]` 合并、非零退出与
   超时降级）、`shell_programs::tests::{the_users_own_shell_is_preferred_when_it_is_posix,
   a_shell_kloop_cannot_classify_falls_through,
   an_explicit_shells_bash_pin_beats_the_user_shell,
@@ -123,6 +144,12 @@ grok 两者都有且可配置；codewhale 的任务路径与 kloop 同形；pi �
   停掉时它会红（后代活过捕获），恢复后通过。
 - 第二轮本机验证：真 zsh 上跑 prelude——不带 prelude 时 `TAVILY_API_KEY` 为 SET，带上
   之后为清空、捕获值生效、载体 `KLOOP_SHELL_ENV_REPLAY` 在命令里已 unset。
+- 第三轮回归断言：捕获同时过滤 profile 与配置中的钩子/密钥，配置实际值覆盖 PATH；
+  真 sh/zsh 上验证回放 export/unset `__kloop_cmd` 都不能改变原命令，命令看到零个
+  位置参数，嵌套 bash 不继承启动钩子；真 bash 导入 `errexit:nounset:pipefail` 后仍能
+  执行命令；三个各 50,000 字节的变量可以启动并完整恢复；模拟启动文件改写 PATH/代理后
+  配置值恢复；临时文件权限为 0400、共享快照释放到最后一次才删除；空捕获即使有配置
+  覆盖也降级，不把配置本身误当作成功捕获。
 - 排查记录（教训）：新写的可执行脚本在 macOS 上**首次 exec 约 200ms**，第一版失败用例用的
   是 300ms 超时，于是测试把「起步慢」误报成产品缺陷。凡是「写文件 + 立刻执行 + 短超时」的
   测试都要留出这段首次执行开销，或轮询等待就绪信号而不是假设立即就绪。

@@ -210,11 +210,7 @@ fn capture_login_env(
     let Some(shell) = shell_programs.bash.as_ref() else {
         return ShellLoginEnv::none();
     };
-    let names = env_overrides
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    let (env, warning) = ShellLoginEnv::capture(&shell.executable, &names);
+    let (env, warning) = ShellLoginEnv::capture(&shell.executable, env_overrides);
     warnings.extend(warning);
     env
 }

@@ -270,41 +270,32 @@ and an executable regular file; `[shells].bash` pins an explicit absolute path
 (Windows or Unix), and WSL keeps its validated `/bin/bash`. A shell kloop cannot
 classify falls through to the frozen `sh` lookup.
 
-**Why the user's shell, and a one-time capture of its login environment (Plan
-223).** A login POSIX shell re-runs `/etc/profile`, and on macOS that runs
-`path_helper`, which rebuilds `PATH` with `/etc/paths` first and everything else
-appended — a Homebrew prefix the user's login profile had put in front lands
-behind `/usr/bin`, and `python3` silently becomes Apple's. So kloop asks the
-user's shell once, at startup, what its login environment is (`<shell> -lc` plus
-a marked `env -0`, bounded by a five-second timeout), and runs commands in a
-**non-login** shell carrying that environment: nothing rewrites `PATH` behind its
-back. Provider and search credentials are filtered out of the capture the same
-way they are scrubbed from any model-controlled shell, names the config `[env]`
-sets are never taken from it, and names the shell derives itself (`PWD`,
-`OLDPWD`, `SHLVL`, `_`) are dropped so the child is not pinned to the capture's
-cwd. Replay is a full picture, not a set of additions. The probe is its own
-process group, and **every** way its capture can end — a nonzero exit, a success
-whose stdout a background descendant still holds, a timeout, a wait error — kills
-that whole group; a plain `Child` drop would leave the descendants running and
-holding the pipe. The names the login shell *dropped* are removed from the
-command, not merely left out: replaying additions alone would let a value the
-profile unset come back through inheritance. A name whose value the capture could
-not decode still counts as kept — reading it as absent would take a `PATH` that
-holds non-UTF-8 directories away from a user who never unset it.
+**用户 shell 与一次性登录环境捕获（Plan 223）。** 登录 POSIX shell 会再次读
+`/etc/profile`；macOS 的 `path_helper` 因此可能把 `/usr/bin` 排到用户已前置的
+Homebrew 之前。kloop 在启动时用用户 shell 跑一次 `-lc` 和带标记的 `env -0`
+（5s 超时、1 MiB 上限），后续命令用非登录 shell。捕获同时记录新增与删除：
+profile 主动 unset 的变量不能沿父进程继承回来；值不是 UTF-8 的变量仍保留其名字，
+避免误判为删除。探针使用独立进程组，每条退出路径都清整组，包括非零退出与后代
+占着 stdout 的情况。
 
-The replay is done **by the shell, after its own startup files**, not only by the
-process environment: `-f` suppresses every startup file except `/etc/zshenv`,
-which zsh documents as unavoidable ("commands are first read from /etc/zshenv;
-this cannot be overridden"), and `BASH_ENV`/`ENV` are removed because a
-non-interactive bash still expands them. So the shell runs a fixed prelude that
-evaluates the replay script from `KLOOP_SHELL_ENV_REPLAY`, unsets that carrier,
-and only then runs the command — which kloop passes as an argument, so nothing is
-quoted into the script and the command is never re-parsed differently. Without
-this a credential the capture filtered out walks straight back in. The capture is
-process-wide, like the shell identity: one login shell per
-process, shared by every session, sub-agent and worktree. It is best-effort — a
-failure (or `[shells].login_env = false`) is a startup warning and commands fall
-back to the login `-lc` form, which is what kloop did before. On Windows, Job
+密钥与启动钩子 `BASH_ENV`/`ENV` 从捕获和配置覆盖中剔除，也在执行命令前再次清除，
+避免嵌套 bash 又加载它们。`PWD`、`OLDPWD`、`SHLVL`、`_` 由每次 shell 自己派生。
+其余 `[env]` 值覆盖捕获值，并参加启动文件之后的恢复，因此配置优先级在 shell 内仍成立。
+`SHELLOPTS`、`BASHOPTS`、`UID` 等 shell 内建只读变量仅通过进程环境继承，不在回放
+脚本中再次 export 或 unset；bash 可在启动时导入选项，执行回放不会因只读赋值与
+`errexit` 提前退出。
+
+环境恢复必须发生在启动文件之后：zsh 的 `-f` 压不住 `/etc/zshenv`。回放脚本放在
+排他创建的随机临时文件中，创建权限为 0600，写完收紧到 0400；快照通过 `Arc` 持有文件，
+最后一个持有者正常释放时删除。环境本身仍逐项注入子进程，启动参数只携带文件路径，
+不再把整份环境重复放入单个变量或参数，避免新增单条或总启动长度限制。
+固定 prelude 先 source 文件，再执行命令。原命令始终留在位置参数中，回放不借用可被
+export/unset 覆盖的普通变量；eval 展开原命令后先清空位置参数，保留原来的 `$# = 0`
+语义。回放失败即退出，不在未恢复的环境中继续执行。
+
+捕获与 shell 身份同为进程级，共享给会话、子 agent 与 worktree。捕获或临时文件准备失败
+时发启动警告并退回旧的登录 `-lc`；`[shells].login_env = false` 主动保留旧行为。
+On Windows, Job
 containment is mandatory even
 though restricted-token/AppContainer filesystem and network sandboxing are not
 implemented; no setting or per-call field disables the Job. The debug gate is a
@@ -4400,9 +4391,9 @@ cargo run -- --mock
 # environment is, for the same reason it decides everything else about the run.
 # Names it leaves out are inherited untouched. `HOME` cannot be set there: the
 # file was just read from it. A name written there also wins over the login
-# shell's own export: the captured login environment (Plan 223) never supplies a
-# name `[env]` sets, so the file stays the top of the environment precedence —
-# `[env]` over the captured login shell over what kloop inherited.
+# shell's own export. Plan 223 在捕获后合并 `[env]` 的实际值，并在 shell 启动文件之后
+# 再恢复一次，保持 `[env]` > 登录环境 > 继承环境。模型 shell 的密钥过滤、启动钩子
+# 移除及 shell 自己派生的变量不受该覆盖规则改变。
 #
 # There is no scope above the profile for
 # either model or effort: both belong to the provider that has to send them,
@@ -4740,15 +4731,15 @@ Every session is saved and resumable — see Session persistence above.
 - **kloop TUI PTY (Unix only)** — `cargo test -p kloop --test tui_pty --
   --nocapture` launches the real default binary in a sealed `portable-pty`, serves
   deterministic loopback OpenAI-compatible SSE, answers every split/multiple CPR
-  query, and feeds raw output incrementally to a zero-history `vt100` parser. Ten
+  query, and feeds raw output incrementally to a zero-history `vt100` parser. 13
   tests cover boot/bracketed-paste/no alternate screen, shrink/grow resize with
   continued CPR, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
   restoration, exact UTF-8 input through grapheme edits, and three pure-layout
   scenarios (a markdown reply with a list and a code block, a tool call with its
   result, a result past the preview cap). Captured request projections exclude
-  headers/Authorization and raw ANSI is bounded fail-closed. Five of the ten also
+  headers/Authorization and raw ANSI is bounded fail-closed. 7 of the 13 also
   assert the whole settled screen against a checked-in `insta` baseline (plan
-  149), six baselines in all, each bound to its own `rows×cols`: `stable_text()`
+  149), 8 baselines in all, each bound to its own `rows×cols`: `stable_text()`
   emits size, cursor and screen text with the per-run noise normalized away —
   mock port and sandbox path by literal substitution, elapsed readouts by an
   anchored `<elapsed>` token (the turn-end rule is rebuilt to the width it
@@ -4756,11 +4747,11 @@ Every session is saved and resumable — see Session persistence above.
   `KLOOP_NO_ANIM`, the banner's build stamp pinned to `v0.0.0 (0000000)` by
   `KLOOP_VERSION` so a commit does not move every frame, and the workspace placed
   under `$HOME` so the banner prints a fixed-width `~/workspace` instead of a temp
-  path that resizes its box. Baseline
-  frames are taken with `wait_for_quiescent`, which waits for the screen to stop
-  being written to rather than for one string to appear; the point assertions
-  stay, because they say what the test means and the baseline says what the
-  screen holds. `cargo insta review` accepts an intended change.
+  path that resizes its box. 整屏快照、提示/状态行计数与最终光标检查必须使用
+  `wait_for_quiescent` 返回的同一个稳定帧；`wait_for` 只表示局部就绪，PTY 的读取片段
+  可能先包含输入提示、后包含状态行，不能在等待静默之前做整屏完整性断言。
+  两轮溢出与缩放测试都遵守这条约束，保留原有计数与快照，不靠放宽断言或重试掩盖错误。
+  `cargo insta review` accepts an intended change.
 
 One repository-wide invariant rides in the binary's integration tests, because it
 belongs to no single crate: `doc_placement.rs` pins a doc comment to the item it
