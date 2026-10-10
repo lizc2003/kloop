@@ -135,11 +135,14 @@ server/client、evals、telemetry 等包,AgentHarness 大改,所以整体重看�
    server 都把整行交给 `commands::run_with_provider_state`)。
 9. **composer 行编辑**(→ plan 211)——`tui/src/components/editor.ts`、`kill-ring.ts`、`undo-stack.ts`。kloop
    `app.rs` 只处理方向键、Home/End、Backspace/Delete,没有 Ctrl+A/E/K/U/W、按词移动与撤销。
-10. **评测框架**(→ plan 212,设计 plan)——`evals/README.md`:(case, variant, model, run) 先展开成计划落盘;每臂全新容器、
-    降权 UID、看不到评分器;成对 A/B 算 lift;任一臂缺失/出错则该对 blocked,整个评测集的通过率与 lift 不发布(withheld)
-    且进程非零退出;按 run 号交替执行顺序。
-    kloop 没有真实模型行为评测,系统提示、工具描述、request reduction 的改动都无法量化。投入最大,长期
-    价值最高;只借方法,不依赖 vitest-evals。
+10. **成对 A/B 评测方法**(→ plan 212,**已由 plan 212 吸收方法**,2026-10-10)——参考实现
+    `evals/README.md`:(case, variant, model, run) 先展开成计划落盘;每臂全新容器、降权 UID、
+    看不到评分器;成对 A/B 算 lift;任一臂缺失/出错则该对 blocked,整个评测集的通过率与 lift
+    不发布(withheld)且进程非零退出;按 run 号交替执行顺序。
+    kloop 后续已有专项真实模型实测，缺口不再是“没有评测”，而是复用实验口径。212 定稿为
+    `rust/DESIGN.md`「Behavior evals」的轻量 Markdown 协议，具体实验写进对应 plan；
+    区分触发点重放与完整任务验收，保留技术失败与配对完整性。只借方法，不引入框架、容器
+    或 vitest-evals，也不照搬“任一 blocked 就不发布整集通过率”的报告政策。
 
 **可选:** 缓存保温(`coding-agent/src/core/cache-warmer.ts`,按 TTL 90% 刷新、预期节省够才发,
 需要可靠价格数据);hooks 加 `pre_compact`;用 `tracing` 看 provider 延迟、重试与工具耗时(pi 的

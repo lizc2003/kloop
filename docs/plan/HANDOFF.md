@@ -1,5 +1,11 @@
 # HANDOFF — 当前状态与会话交接
 
+**轻量行为评测协议（2026-10-10，plan 212）**：已从通用评测平台设计收窄为 Markdown
+规范，定稿在 `rust/DESIGN.md`「Behavior evals」；每次实验在对应 plan 跑前填实测协议，
+跑后补完整计数、偏离与结论。区分触发点重放和完整任务验收，核对被测因素真的生效，
+技术失败不静默剔除或补样成成功。协议不自动加载或强制执行；未新增执行器、脚本、
+题库或容器，也未开展新实验。真实 API 评测仍不进 `make check`。教训 219。
+
 **提交门禁与手动 release 检查（2026-10-10）**：用户因耗时将 release 测试从提交门禁移除。
 `make check` 现在只跑 fmt + clippy + workspace debug 全量测试 + parity；
 `make check-release` 单独提供 fmt + release clippy + workspace release 全量测试 + parity，
@@ -178,7 +184,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **209** ✅ 压缩时告诉它什么最要紧 | `/compact <focus>`,只动 core。**已完成(2026-09-29,`1b966a9`)**:焦点拼在摘要请求最后那条指令之后，只偏重这一次(不进 anchors、不进 rollout),超 2,000 字符拒绝;开工两问照推荐。措辞比 plan 多一句"第 1、2、9 节只来自对话",是真实模型量出来的(教训 199) | 小 |
 | **210** ✅ 退回去之前,先记下那条路上学到了什么 | rewind 时可选摘要被放弃的分支,运行时列出它改过的文件。**已完成(2026-09-30,`e9bf419`)**:picker 里 `s` = 先摘要再退回(Enter 照旧),只做 TUI;清单只列改过的(`edit_file`/`write_file`/`notebook_edit`,失败的调用不算);不做带指示的摘要——四问都照推荐。采样循环抽成 `compact::sample_shrinking`;rewind 编排挪进 core 的 `rewind::rewind`(照 `/clear` 的分法),plan 写的 worker 级测试才写得出来(教训 214)。摘要措辞已用真实模型实测(5/5,见 plan 第七节) | 中 |
 | **211** 输入框该像 shell 一样能编辑 | Ctrl+A/E/K/U/W、按词移动、kill ring、撤销 | 中 |
-| **212** 先量,再调 | 真实模型成对 A/B 评测的**设计** plan,不写实施 | 设计 |
+| **212** ✅ 先量,再调 | **已完成(2026-10-10)**：轻量行为评测 Markdown 协议定稿于 DESIGN；每次实验在对应 plan 记录，不新增平台、不承诺后续实现 | 设计 |
 | **213** 起草时顺手看到的四件小事 | 下面列的四件,开工先问第 1 件怎么处理 | 小 |
 
 - **顺序约束**(已解除):原写"209 与 210 都要从 `compact_once` 抽摘要循环"。209 做下来用不着抽——它只改
@@ -2146,3 +2152,11 @@ exit 0
 217. **把一组状态逐个列出来做分支的地方，先看有没有一个判定函数已经定义了那组状态——没有就先建一个；枚举会随状态增长而静默漏掉新的那个。** `bash_output` 回答里"等到超时"的形状是 `{id}: still {状态} after {timeout_ms}ms`，条件是 `BgStatus::Running | Stopping if block`，而 `is_active()` 早就是三个状态（`Running | Stopping | Finishing`）——枚举了三个里的两个，`Finishing` 落进 `_` 分支。后果是：**一等就是 600 秒、最后超时放弃**的回答变成 `bg-1: finishing`，与"作业已经结束"在字面上毫无区别。我是在真实会话里等着的那一头看到它的：按 harness 提醒写了阻塞 `bash_output`（`block=true, timeout_ms=600000`），拿回来的就是这个形状，事后**连我自己都分不出那次是等到了还是等超时了**，只能先去问用户——用户的回答（"真实情况是等了"）才把推理钉死：`Finishing` 是活动态，所以那次必然是超时退出。修法是把条件换成 `block && status.is_active()`，并**把这句话抽成能单独测的函数**——这种瞬时态（`Finishing` 只在三段同步代码之间出现）在集成测试里抢不到，抽出来才能用表驱动钉住。另记两条：(a) 那次超时那一刻的状态恰是 `Finishing`，而 `begin_finish`→`complete_finish` 之间没有 `.await`，撞上的概率约 10⁻⁵，所以要么是最后一个轮询刻度的巧合、要么发布真被卡过——**这条我没有定论**，正因如此"先让下次能读出来"是往下查的前提；(b) 我最先想到的解释是"`Finishing` 被前端通道堵住"，被代码否掉了——TUI 的 `ChannelUi` 用的是 `mpsc::UnboundedSender`，`emit` 不可能阻塞。**先查最容易想到的那个解释是否被代码允许，再拿它去解释观测。**
 
 218. **带副作用的调用不许放进 `debug_assert!`（以及任何只为断言而存在的谓词）——它让 release 与 debug 行为不同，而门禁天天跑的是 debug。** `bash.rs` 收尾那句写成 `debug_assert!(shells.complete_finish(&registration, status));`，而 `complete_finish` **是带副作用的**（把状态从 `Finishing` 落成终态）。`debug_assert!` 展开为 `if cfg!(debug_assertions) { assert!(…) }`，**release 里那个表达式不求值** ⇒ 装出来的二进制（Makefile 默认 `--locked --release`）里**每个后台 shell 永远停在 `Finishing`**，而 `is_active()` 把它算作活动。后果不是"少一条断言"：任何 `block=true` 的 `bash_output` **永不提前返回**，一律等满 `timeout_ms`——而 plan 220 的提醒正好教模型写 600000，于是几秒钟跑完的作业要干等十分钟，那条机制的收益被反过来；提醒清单还会把尸体一直列着（`wait_reminder()` 只看 `is_active()`），示例 ID 可能指向尸体；事件流说 Completed、注册表说活动。**为什么五轮门禁与 150 次真实采样都没看见**：`cargo test` 是 debug ⇒ `debug_assertions` 开 ⇒ 副作用照跑，这一类在测试里**结构性地不可见**；plan 220 的采样只取首轮回复、不执行工具，也没走这条路径。发现它靠的是**真实使用**——本会话两次后台作业跑完后，harness 提醒仍把它们列为"仍在运行"，我那次 `bash_output` 只拿回 `bg-1: finishing`（超时那一刻的状态）。判据三条：(a) **看到"状态没落地"这类症状，先问"是不是有东西只在 debug 下跑"**；(b) 顺手把全仓同款写法扫一遍——`debug_assert!` 6 处，其余 5 处都是纯读判断（`!observed.is_active()`、`observed != Running`、`shares_receipt`、`!current.is_main()`、`current.is_none()`），只有这一处把副作用塞了进去，且 `debug_assertions` 全仓只有这一个入口；(c) 这类 bug **只加 debug 测试守不住**（debug 门禁必然绿），但**已经写在仓库里的那条测试在 release 下正好抓得住它**：`background_spawn_then_blocking_output_sees_completion` 用 5 秒外层超时套住 `bash_output`、再断言 `{id}: completed (exit 0)`；带 bug 的 release 里那个调用会跑满 600 秒，于是外层超时先响，`.expect` 里那句话（"waited for the full timeout instead of returning on completion"）本身就是诊断。所以守法是两条一起——**把已有测试放进 release 跑**（`make check` 的 `test-release`，`defc0de`），**并且断言的参数必须是纯的**（带副作用的调用挪到外面，把它的返回值交给断言）。注意 `test-release` 的范围是 kloop-core 的库，所以这一类在**那一层**被守住，别处的 debug-only 差异仍会漏——这是它故意的边界，不是保证。再记一条方法上的：我第一次看到"BashOutput 不返回"时判成"不是 bug，是 timeout 设长了"，**那半句错了**——等待确实会等满 timeout（我确实设长了），但"完成就立即返回"这条契约在 release 里从未生效。**用户报的现象比我的解释更接近真相。**
+
+219. **真实模型评测的结论不能越过实际观察边界，协议也不能冒充执行器。** plan 212 原稿从
+“尚无真实模型评测”出发设计通用平台；开工时 plan 204、209、216、220 已有专项实测，缺的
+是可复用口径。用户同意收窄为两层：DESIGN 维护通用规则，每次任务的 plan 跑前定具体协议、
+跑后补完整计数和限制。plan 220 的首轮重放能验证模型工具选择，不能证明后续后台作业收尾；
+本次整理文档也没有重新验证那些原始捕获。判据：先写观察终点，再写结论；技术失败、缺失
+和不可评分保留身份与预定计数，不悄悄丢掉或补成成功。Markdown 规范供人和 agent 核对，
+不会自动加载、调度或强制执行；自动化等重复需求明确后再提取，不能为写协议先承诺平台。
