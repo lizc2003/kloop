@@ -17,7 +17,12 @@ jitter 一直按 id 前 8 位十六进制解码，id 换成 `job-` + Base58 后�
 `unwrap_or(0.0)` 把 jitter 静默变成常量 0（所有定时任务同一瞬间触发，没有任何报错），
 而旧测试喂的是 `"00000000"` / `"ffffffff"` 字面量所以照旧全绿。凡按固定宽度/编码解码
 id 的地方应改为对完整 id 取摘要，测试也须用真实 id 形状——一份用旧格式 fixture 的
-测试，测不出新格式在生产里已经失效。
+测试，测不出新格式在生产里已经失效。这两条约定已落到代码里：「id 不透明」写进
+`resource_id` 的模块文档，派生值（`fraction`）与 id 生成同址，「要派生值就取摘要、
+不要解码」不再只是注释；会话恢复取写租约这件事不再只写在 DESIGN 里——`SessionRead::recover`
+更名 `recover_for_writing`，`resume_session` 的契约直接写明会取写租约、被占用即失败。
+**命名要说出副作用**：只读的 `inspect_session` 与取得写权的 `recover` 混在一个动词下，
+代价是一批测试只能从 `resume_session` 退到 `load_session_snapshot` 才表达得出意图。
 
 **后台 Bash 等待修复（2026-10-09，plan 220）**：用户明确用 `bash_output` 解决固定 `sleep` 的死等。
 `4d49ba0` 只补工具说明和启动回执，基线真实 A/B 证实不够：旧文案 30/30 次固定 `sleep`，

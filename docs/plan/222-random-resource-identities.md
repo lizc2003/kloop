@@ -25,5 +25,6 @@
 - OAuth 并发保存保留所有条目；首次保存先建立私有目录，再加锁读取。
 - DESIGN 已改写现有契约，HANDOFF 已记录跨进程身份、大小写别名与共享更新的教训。
 - ✅ 复核（审查 `45874b5^..64d4ee8`）：scheduler 的 jitter 按 id 前 8 位十六进制解码，新 `job-` + Base58 id 恒解析失败而静默退化为 0；改为对完整 id 取 SHA-256 摘要，撞名重取 id 时同步重算 `next_fire_at_ms`，jitter 测试改用真实 id 形状并断言前缀相同的两个 id 分数不同。`bash_id` schema 示例与 DESIGN 的 sandbox 豁免粒度一并更正。
+- ✅ 复核收尾：「id 不透明」从注释升级为 `resource_id` 的模块约定，派生值 `fraction` 与 id 生成同址（前缀相同的 id 必须给出不同分数，零分数即为当初的失效形态）；会话写租约进入 API 契约——`SessionRead::recover` 更名 `recover_for_writing`，`resume_session` 写明取写租约、被占用即失败，CLI 的失败文案随之从「读不了文件」改为 `cannot resume session`。
 
 状态：✅ 已完成（提交 SHA 以本文件所在提交为准）。

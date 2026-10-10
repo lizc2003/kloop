@@ -13,8 +13,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Datelike, Local, Offset as _, TimeZone as _, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-use sha2::Digest as _;
-use sha2::Sha256;
 use tokio::sync::watch;
 
 use crate::inbox::{Inbox, InboxItem, ScheduledOrigin};
@@ -1430,7 +1428,7 @@ fn next_cron_fire(
     timezone: SchedulerTimeZone,
 ) -> Option<i64> {
     let nominal = spec.next_after(after_ms, timezone)?;
-    let fraction = id_fraction(id);
+    let fraction = crate::resource_id::fraction(id);
     if recurring {
         let following = spec.next_after(nominal, timezone)?;
         let period = following.saturating_sub(nominal);
@@ -1444,24 +1442,6 @@ fn next_cron_fire(
         let jitter = (ONE_SHOT_JITTER_MAX_MS as f64 * fraction) as i64;
         Some(nominal.saturating_sub(jitter).max(created_at_ms))
     }
-}
-
-/// A fraction in `[0, 1)` derived from the **whole** job id, which is what
-/// spreads jobs that share a schedule: recurring jitter is a share of the
-/// period, one-shot jitter an early start, both picked deterministically per
-/// job.
-///
-/// It reads a digest of the id rather than characters of it. The first version
-/// decoded the id's leading eight hex digits, which was right only while job
-/// ids *were* eight hex digits; when they became `job-` + Base58, every id
-/// stopped parsing and the `unwrap_or(0.0)` that guarded the read quietly turned
-/// the whole jitter into a constant zero — nothing failed, jobs just all fired
-/// at their nominal instant. A digest has no such coupling to how ids are
-/// spelled.
-fn id_fraction(id: &str) -> f64 {
-    let digest: [u8; 32] = Sha256::digest(id.as_bytes()).into();
-    let head = u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 is 32 bytes"));
-    f64::from(head) / (f64::from(u32::MAX) + 1.0)
 }
 
 #[cfg(test)]
@@ -2049,17 +2029,6 @@ mod tests {
                 "{id}: {early}"
             );
         }
-
-        // Reading the fraction off the id's leading eight hex digits made it the
-        // constant 0 for every `job-` + Base58 id — every job fired at its
-        // nominal instant and nothing failed. The basis has to be the whole id.
-        let low = id_fraction(ids[0]);
-        let high = id_fraction(ids[1]);
-        for (id, fraction) in [(ids[0], low), (ids[1], high)] {
-            assert!((0.0..1.0).contains(&fraction), "{id}: {fraction}");
-            assert!(fraction > 0.0, "{id}: a zero fraction is every job at once");
-        }
-        assert_ne!(low, high, "ids sharing a prefix must not share a fraction");
     }
 
     #[tokio::test]

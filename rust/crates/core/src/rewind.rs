@@ -137,7 +137,7 @@ fn fork_here(history: &History, seq: u64) -> anyhow::Result<(String, ResumedSess
         .parent()
         .context("session file has no parent directory")?;
     let fork_path = fork_session(src, Some(seq), sessions_dir)?;
-    let resumed = inspect_session(&fork_path)?.recover()?;
+    let resumed = inspect_session(&fork_path)?.recover_for_writing()?;
     Ok((session_id_of(&fork_path), resumed))
 }
 

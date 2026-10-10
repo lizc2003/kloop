@@ -724,7 +724,7 @@ impl Server {
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
         let options = resume_options(&inspected.snapshot(), params, &self.default_cwd)?;
         let resumed = inspected
-            .recover()
+            .recover_for_writing()
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();
@@ -780,13 +780,14 @@ impl Server {
         let new_path = rollout::fork_session(&src, cut, &dirs.sessions)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
-        let resumed = match rollout::inspect_session(&new_path).and_then(|read| read.recover()) {
-            Ok(resumed) => resumed,
-            Err(error) => {
-                let _ = std::fs::remove_file(&new_path);
-                return Err((wire::SERVER_ERROR, format!("cannot resume fork: {error}")));
-            }
-        };
+        let resumed =
+            match rollout::inspect_session(&new_path).and_then(|read| read.recover_for_writing()) {
+                Ok(resumed) => resumed,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&new_path);
+                    return Err((wire::SERVER_ERROR, format!("cannot resume fork: {error}")));
+                }
+            };
         let options = resume_options(&resumed.snapshot, params, &self.default_cwd)?;
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();

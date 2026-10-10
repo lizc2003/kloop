@@ -1,7 +1,22 @@
+//! The identities kloop mints: an opaque token — a prefix plus 11 Base58
+//! characters carrying 64 random bits — and the fixed-width Base36 encoding of
+//! the digest behind the deterministic project/workspace/scheduler names.
+//!
+//! An identity is **opaque**. It may be compared, stored, shown, and *validated
+//! by shape* ([`is_suffix`], [`is_digest`]): a shape that no longer matches
+//! fails loudly, at the validator that refused it. It must never be *decoded* —
+//! read a counter, a timestamp or a hex field out of its characters — because
+//! that failure has no voice: the old parse stops matching, the fallback fires,
+//! and the value it feeds quietly becomes a constant. Anything that needs a
+//! number derived from an identity takes a digest of the whole id instead; see
+//! [`fraction`].
+
 use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+
+use sha2::Digest as _;
 
 const BASE58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -49,6 +64,21 @@ pub(crate) fn is_digest(value: &str) -> bool {
 
 pub(crate) fn is_suffix(value: &str) -> bool {
     value.len() == ID_LEN && value.bytes().all(|byte| BASE58.contains(&byte))
+}
+
+/// A deterministic fraction in `[0, 1)` derived from an identity, for callers
+/// that spread work by identity — the scheduler's jitter is the only one today.
+///
+/// Digesting the whole id is the point: the version before this read the id's
+/// leading eight hex digits, which was a valid basis only while ids *were*
+/// eight hex digits. When they became `prefix + 11 Base58`, every id stopped
+/// parsing, the fallback answered 0, and the jitter — a share of the period —
+/// silently became zero for every job. A digest has no such coupling to how an
+/// id is spelled, so the next encoding change cannot re-introduce it.
+pub(crate) fn fraction(id: &str) -> f64 {
+    let digest: [u8; 32] = sha2::Sha256::digest(id.as_bytes()).into();
+    let head = u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 is 32 bytes"));
+    f64::from(head) / (f64::from(u32::MAX) + 1.0)
 }
 
 pub(crate) fn create_file(
@@ -126,6 +156,19 @@ mod tests {
         assert_eq!(encode_digest(prefix_only), encode_digest(changed_tail));
         changed_tail[15] ^= 1;
         assert_ne!(encode_digest(prefix_only), encode_digest(changed_tail));
+    }
+
+    #[test]
+    fn a_fraction_reads_the_whole_id_and_stays_in_range() {
+        let low = fraction("job-11111111111");
+        let high = fraction("job-11111111112");
+        assert_ne!(low, high, "ids sharing a prefix must not share a fraction");
+        for (id, value) in [("job-11111111111", low), ("job-11111111112", high)] {
+            assert!((0.0..1.0).contains(&value), "{id}: {value}");
+            // A zero fraction is exactly how the old decode-by-prefix basis
+            // failed: every id answered 0 and every scheduled job fired at once.
+            assert!(value > 0.0, "{id}: {value}");
+        }
     }
 
     #[test]

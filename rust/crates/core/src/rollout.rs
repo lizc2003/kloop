@@ -1246,9 +1246,16 @@ impl SessionRead {
         &self.repair.stats
     }
 
-    /// Perform the only on-disk recovery operation: truncate an intact prefix
-    /// and, when necessary, append one canonical pairing marker.
-    pub fn recover(self) -> io::Result<ResumedSession> {
+    /// Take this session's writer lease, then perform the only on-disk recovery
+    /// operation: truncate an intact prefix and, when necessary, append one
+    /// canonical pairing marker.
+    ///
+    /// The lease is why this can fail on a transcript that reads perfectly
+    /// well: one writer at a time, so a session another process currently has
+    /// open comes back as an error rather than as a second writer. Read-only
+    /// callers ([`load_session`], [`load_session_snapshot`], [`inspect_session`])
+    /// are the ones that work on a live session.
+    pub fn recover_for_writing(self) -> io::Result<ResumedSession> {
         let lease = crate::state_lock::StateLock::try_acquire(&self.path.with_extension("lock"))
             .map_err(|error| {
                 io::Error::other(format!(
@@ -1347,9 +1354,11 @@ pub struct ResumedSession {
 }
 
 /// Open a session for continuation. Unlike the read-only load functions this
-/// explicitly truncates torn tail bytes and persists canonical pairing repair.
+/// explicitly truncates torn tail bytes and persists canonical pairing repair —
+/// and it takes the session's writer lease, so a session another process
+/// currently has open cannot be resumed here.
 pub fn resume_session(path: &Path) -> io::Result<ResumedSession> {
-    inspect_session(path)?.recover()
+    inspect_session(path)?.recover_for_writing()
 }
 
 /// Fork a session: copy lines `#1..=#{cut}` of `src` into a brand-new
@@ -3679,7 +3688,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         drop(rollout);
-        let resumed = inspected.recover().unwrap();
+        let resumed = inspected.recover_for_writing().unwrap();
         assert_eq!(resumed.repair.inserted_tool_results, 1);
         let lines = raw_lines(&path);
         assert_eq!(lines.last().unwrap()["type"], "repaired");
@@ -3695,7 +3704,7 @@ mod tests {
                 ..PairingRepairStats::default()
             }
         );
-        let resumed = inspected.recover().unwrap();
+        let resumed = inspected.recover_for_writing().unwrap();
         assert_eq!(
             resumed.repair,
             PairingRepairStats {

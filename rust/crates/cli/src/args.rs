@@ -589,7 +589,7 @@ pub(crate) fn open_history(
     };
     let id = session_id_of(&resume_path);
     let resumed = resume_session(&resume_path)
-        .with_context(|| format!("cannot read session file {}", resume_path.display()))?;
+        .with_context(|| format!("cannot resume session {}", resume_path.display()))?;
     println!(
         "[resumed session {id}: {} message(s)]",
         resumed.messages.len()
