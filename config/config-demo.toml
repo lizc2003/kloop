@@ -6,7 +6,7 @@
 #   mkdir -p ~/.kloop && chmod 700 ~/.kloop
 #   cp config/config-demo.toml ~/.kloop/config.toml && chmod 600 ~/.kloop/config.toml
 
-provider = "k-claude"                                   # which one this session starts on
+provider = "k-flash"                                   # which one this session starts on
 
 
 # messages → POST {base_url}/v1/messages    ← base_url carries NO /v1 on this rail
