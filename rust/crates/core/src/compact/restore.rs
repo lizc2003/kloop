@@ -72,6 +72,9 @@ pub(super) async fn restore_files(
             continue;
         }
         let ranges = uncovered(read.range, in_tail.get(&path).cloned().unwrap_or_default());
+        let minimum_chars = format!("\n\n{} (lines 1-1 of 1):\n1\t", path.display())
+            .chars()
+            .count();
         let mut file_chars = 0;
         for range in ranges {
             if cancel.is_cancelled() {
@@ -82,10 +85,14 @@ pub(super) async fn restore_files(
             if remaining_chars == 0 || remaining_tokens == 0 {
                 break 'candidates;
             }
+            let remaining_file_chars = FILE_CHARS.saturating_sub(file_chars);
+            if remaining_file_chars < minimum_chars {
+                break;
+            }
             let Some(page) = fit_page(
                 &path,
                 range,
-                remaining_chars.min(FILE_CHARS.saturating_sub(file_chars)),
+                remaining_chars.min(remaining_file_chars),
                 remaining_tokens,
             ) else {
                 continue;
@@ -471,6 +478,68 @@ mod tests {
                 )),
                 vec![newer]
             )
+        );
+    }
+
+    fn write_split_file_with_remaining_budget(path: &Path, remaining: usize) -> String {
+        let prefix = format!("\n\n{} (lines 1-1 of 3):\n1\t", path.display());
+        let suffix = "\n\n[showing lines 1-1 of 3; call read_file with offset=2 to continue]";
+        let body =
+            "界".repeat(FILE_CHARS - remaining - prefix.chars().count() - suffix.chars().count());
+        std::fs::write(path, format!("{body}\nalready in tail\n")).unwrap();
+        format!("{prefix}{body}{suffix}")
+    }
+
+    #[tokio::test]
+    async fn a_spent_file_budget_skips_more_ranges_but_restores_the_next_file() {
+        let (dir, cfg) = setup("spent-file-budget");
+        let older = dir.join("older.txt");
+        let path = dir.join("范围.txt");
+        std::fs::write(&older, "older body").unwrap();
+        let last = format!("\n\n{} (lines 3-3 of 3):\n3\t", path.display());
+        let older_section = format!("\n\n{} (lines 1-1 of 1):\n1\tolder body", older.display());
+
+        for remaining in [last.chars().count() - 1, 0] {
+            let first = write_split_file_with_remaining_budget(&path, remaining);
+            let folded = read_of(&[&older, &path]);
+            let tail = paged_read(&path, "tail", 2, 1);
+
+            let (restored, sized_paths) =
+                restore_with_sized_paths(&cfg, &folded, &tail, u64::MAX).await;
+
+            assert_eq!(sized_paths, vec![path.clone(), older.clone()]);
+            assert_eq!(
+                restored,
+                Some(Message::injected(
+                    Injected::RestoredFiles,
+                    format!("{HEADER}{first}{older_section}")
+                ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_minimum_remaining_file_budget_can_still_restore_an_empty_line() {
+        let (dir, cfg) = setup("minimum-file-budget");
+        let older = dir.join("older.txt");
+        let path = dir.join("范围.txt");
+        std::fs::write(&older, "older body").unwrap();
+        let last = format!("\n\n{} (lines 3-3 of 3):\n3\t", path.display());
+        let first = write_split_file_with_remaining_budget(&path, last.chars().count());
+        let older_section = format!("\n\n{} (lines 1-1 of 1):\n1\tolder body", older.display());
+        let folded = read_of(&[&older, &path]);
+        let tail = paged_read(&path, "tail", 2, 1);
+
+        let (restored, sized_paths) =
+            restore_with_sized_paths(&cfg, &folded, &tail, u64::MAX).await;
+
+        assert_eq!(sized_paths, vec![path.clone(), path, older]);
+        assert_eq!(
+            restored,
+            Some(Message::injected(
+                Injected::RestoredFiles,
+                format!("{HEADER}{first}{last}{older_section}")
+            ))
         );
     }
 
