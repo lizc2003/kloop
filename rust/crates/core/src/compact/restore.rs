@@ -72,9 +72,7 @@ pub(super) async fn restore_files(
             continue;
         }
         let ranges = uncovered(read.range, in_tail.get(&path).cloned().unwrap_or_default());
-        let minimum_chars = format!("\n\n{} (lines 1-1 of 1):\n1\t", path.display())
-            .chars()
-            .count();
+        let minimum_chars = minimum_section_chars(&path);
         let mut file_chars = 0;
         for range in ranges {
             if cancel.is_cancelled() {
@@ -219,6 +217,12 @@ struct Page {
     text: String,
 }
 
+fn minimum_section_chars(path: &Path) -> usize {
+    format!("\n\n{} (lines 1-1 of 1):\n1\t", path.display())
+        .chars()
+        .count()
+}
+
 /// Only sizes the read — the content that reaches the model is what the
 /// dispatched `read_file` returns. A path that is gone, is not a regular file,
 /// is not text, or is empty has nothing to restore.
@@ -228,6 +232,9 @@ fn fit_page(
     char_budget: usize,
     token_budget: u64,
 ) -> Option<Page> {
+    if char_budget < minimum_section_chars(path) {
+        return None;
+    }
     #[cfg(test)]
     let _ = tests::SIZED_PATHS.try_with(|paths| paths.borrow_mut().push(path.to_path_buf()));
     if !std::fs::metadata(path).ok()?.is_file() {
@@ -423,24 +430,30 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn the_total_character_budget_stops_before_sizing_older_files() {
-        let (dir, cfg) = setup("exhausted-chars");
-        let older = dir.join("older.txt");
-        std::fs::write(&older, "older body").unwrap();
+    fn write_files_leaving_total_chars(dir: &Path, remaining: usize) -> (Vec<PathBuf>, String) {
+        let target = TOTAL_CHARS - remaining;
         let mut expected = HEADER.to_owned();
         let mut paths = Vec::new();
         for index in 0..4 {
             let path = dir.join(format!("f{index}.txt"));
             let prefix = format!("\n\n{} (lines 1-1 of 1):\n1\t", path.display());
-            let chars = FILE_CHARS.min(TOTAL_CHARS - expected.chars().count());
+            let chars = FILE_CHARS.min(target - expected.chars().count());
             let body = "x".repeat(chars - prefix.chars().count());
             std::fs::write(&path, &body).unwrap();
             expected.push_str(&prefix);
             expected.push_str(&body);
             paths.push(path);
         }
-        assert_eq!(expected.chars().count(), TOTAL_CHARS);
+        assert_eq!(expected.chars().count(), target);
+        (paths, expected)
+    }
+
+    #[tokio::test]
+    async fn the_total_character_budget_stops_before_sizing_older_files() {
+        let (dir, cfg) = setup("exhausted-chars");
+        let older = dir.join("older.txt");
+        std::fs::write(&older, "older body").unwrap();
+        let (paths, expected) = write_files_leaving_total_chars(&dir, 0);
         let refs: Vec<&Path> = std::iter::once(older.as_path())
             .chain(paths.iter().rev().map(PathBuf::as_path))
             .collect();
@@ -451,6 +464,79 @@ mod tests {
         assert_eq!(
             restored,
             Some(Message::injected(Injected::RestoredFiles, expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_small_total_character_remainder_skips_disk_reads_for_unfit_ranges() {
+        let (dir, cfg) = setup("small-total-remainder");
+        let older: Vec<PathBuf> = (0..3)
+            .map(|index| dir.join(format!("older-{index}.txt")))
+            .collect();
+        let remaining = 34;
+        let mut tail = Vec::new();
+        for (index, path) in older.iter().enumerate() {
+            std::fs::write(path, "first\nkept\nlast").unwrap();
+            tail.extend(paged_read(path, &format!("tail{index}"), 2, 1));
+            assert!(
+                format!("\n\n{} (lines 1-1 of 1):\n1\t", path.display())
+                    .chars()
+                    .count()
+                    > remaining
+            );
+        }
+        let (paths, expected) = write_files_leaving_total_chars(&dir, remaining);
+        let refs: Vec<&Path> = older
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(paths.iter().rev().map(PathBuf::as_path))
+            .collect();
+        let folded = read_of(&refs);
+
+        let (restored, sized_paths) =
+            restore_with_sized_paths(&cfg, &folded, &tail, u64::MAX).await;
+
+        assert_eq!(sized_paths, paths);
+        assert_eq!(
+            restored,
+            Some(Message::injected(Injected::RestoredFiles, expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shorter_path_can_still_fit_after_a_candidate_exceeds_the_total_remainder() {
+        let (dir, cfg) = setup("shorter-path");
+        let short = dir.join("s");
+        let long = dir.join("longer-candidate-name.txt");
+        std::fs::write(&short, "ok").unwrap();
+        std::fs::write(&long, "first\nkept\nlast").unwrap();
+        let short_section = format!("\n\n{} (lines 1-1 of 1):\n1\tok", short.display());
+        let remaining = short_section.chars().count();
+        assert!(
+            format!("\n\n{} (lines 1-1 of 1):\n1\t", long.display())
+                .chars()
+                .count()
+                > remaining
+        );
+        let (mut paths, expected) = write_files_leaving_total_chars(&dir, remaining);
+        let refs: Vec<&Path> = [short.as_path(), long.as_path()]
+            .into_iter()
+            .chain(paths.iter().rev().map(PathBuf::as_path))
+            .collect();
+        let folded = read_of(&refs);
+        let tail = paged_read(&long, "tail", 2, 1);
+
+        let (restored, sized_paths) =
+            restore_with_sized_paths(&cfg, &folded, &tail, u64::MAX).await;
+
+        paths.push(short);
+        assert_eq!(sized_paths, paths);
+        assert_eq!(
+            restored,
+            Some(Message::injected(
+                Injected::RestoredFiles,
+                format!("{expected}{short_section}")
+            ))
         );
     }
 
