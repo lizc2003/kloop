@@ -960,6 +960,7 @@ impl Turn<'_> {
             ui: self.ui.clone(),
             cancel: self.cancel.clone(),
             stop: self.options.stop.clone(),
+            turn_reply: Arc::new(std::sync::Mutex::new(None)),
             depth: self.depth,
             enclosing_execution: self.enclosing_execution.cloned(),
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -995,6 +996,45 @@ impl Turn<'_> {
             return RoundStep::Stop(Ending {
                 reason: EndReason::Aborted,
                 text: None,
+                rounds: round + 1,
+                structured: None,
+            });
+        }
+        let reply = ctx
+            .turn_reply
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(text) = reply {
+            self.history
+                .record(Message::assistant(vec![ContentBlock::Text {
+                    text: text.clone(),
+                }]));
+            if self.stream_text {
+                let id = format!("handoff-{}", self.item_seq);
+                self.item_seq += 1;
+                self.ui.emit(&Event::ItemStarted {
+                    id: id.clone(),
+                    item: crate::event::Item::AssistantMessage {
+                        text: String::new(),
+                        status: crate::event::ItemStatus::InProgress,
+                    },
+                });
+                self.ui.emit(&Event::ItemDelta {
+                    id: id.clone(),
+                    delta: crate::event::Delta::Text(text.clone()),
+                });
+                self.ui.emit(&Event::ItemCompleted {
+                    id,
+                    item: crate::event::Item::AssistantMessage {
+                        text: text.clone(),
+                        status: crate::event::ItemStatus::Completed,
+                    },
+                });
+            }
+            return RoundStep::Stop(Ending {
+                reason: EndReason::Completed,
+                text: Some(text),
                 rounds: round + 1,
                 structured: None,
             });

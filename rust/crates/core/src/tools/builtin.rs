@@ -519,10 +519,7 @@ impl Builtin {
             // classifies them; a well-formed one was rewritten to the inner
             // tool at dispatch entry and is judged as that tool.
             Self::CallTool => false,
-            // skill only reads a skill file and returns its expanded body —
-            // pure, no shared-state races (side effects come from tools the
-            // returned instructions later prompt, gated individually).
-            Self::Skill => true,
+            Self::Skill => false,
             Self::Bash => {
                 input["command"]
                     .as_str()

@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review a commit, a diff, or working-tree changes for defects — correctness, regressions, contract drift, test gaps. Use whenever the user asks to review, audit, or check over code, including a bare "review <sha>". Not for writing code, and not for re-reading edits you just made yourself.
+description: Review a PR, a commit, a diff, or working-tree changes for defects — correctness, regressions, contract drift, test gaps. Use whenever the user asks to review, audit, or check over code, including a PR URL or a bare "review <sha>". Not for writing code, and not for re-reading edits you just made yourself.
 ---
 
 # Code review
@@ -8,9 +8,52 @@ description: Review a commit, a diff, or working-tree changes for defects — co
 Target: $ARGUMENTS
 
 With no target, review the working tree against HEAD. A bare revision means that
-commit against its parent. Read the whole diff first, then the surrounding code
-the diff does not show — most real defects live in what the change stopped
-doing, not in the lines it added.
+commit against its parent. A PR means its head against the merge-base with its
+actual target branch. Resolve that range before reading the diff.
+
+## Resolve the target once
+
+For a PR, follow these steps in order:
+
+1. Batch the local remote, status, relevant refs and available hosting-client
+   checks. Use an already authenticated hosting CLI or API if available. Do not
+   search for credentials. The local Git remote is an existing authentication
+   route for a head-ref lookup.
+2. Identify the head and actual target branch from metadata. The forge's PR ref
+   can establish the head, but **a head ref does not identify the target branch**.
+   Fetch only missing objects or refs; leave the checked-out branch and local
+   edits alone.
+3. If the target is still unknown after the first anonymous page or API 404 and
+   no authenticated metadata is available, **stop the lookup and ask one question
+   for the target branch**. Do not start reading the diff until it is answered.
+   Do not try alternate URLs or IPs, inspect environment tokens, credential
+   config or netrc, or compute merge-bases against candidate branches. Branch
+   names, default-branch refs and merge commit messages do not establish a PR's
+   actual target.
+
+An anonymous 404 does not establish that a private repository is missing, and a
+DNS error alone does not establish a sandbox denial. Read the failure and use
+the available authentication or permission route; do not cycle through guessed
+URLs, IP overrides or credential-file searches. **A sensitive-path refusal is a
+hard stop for that access**, not an invitation to retry it with different shell
+syntax. Keep a failing network command separate from successful diagnostics so
+its exit status survives: a pipeline to `tail` or a later command can hide the
+failure from the executor's sandbox detection. Use the Bash tool's
+`timeout_ms` rather than assuming an external `timeout` program exists.
+
+Record the frozen head, target tip and merge-base for a PR, or the revision and
+parent for a commit. Use these SHAs throughout; do not silently refresh the
+range midway. **Read and search the frozen revision** with `git show <sha>:<path>`
+and `git grep -n -e <pattern> <sha> -- <paths>`. Read old behavior at the frozen
+baseline. A working-tree file is evidence for a revision only after checking it
+matches that revision, including uncommitted edits. A missing symbol in another
+checkout says nothing about whether it exists in the reviewed revision.
+
+## Read the change
+
+Start with the complete changed-file list and diff stat. Read the whole diff
+first, then the surrounding code the diff does not show — most real defects
+live in what the change stopped doing, not in the lines it added.
 
 Take that diff with enough context that it answers the next question on its
 own — tens of lines on each side, not the default three. Opening the whole file
@@ -19,6 +62,12 @@ is unrelated to the change. When the change is large, take the diff a few files
 at a time rather than in one piece: everything already in context is carried
 into every round that follows, and the rounds after a summary are the expensive
 ones.
+
+Batch independent reads of known files in the same round; keep follow-up reads
+that depend on a result sequential. Track which files and hunks were actually
+read. **Truncated output is not coverage**: reduce the file batch or read the
+remaining hunks explicitly, rather than piping a large diff to `head` and
+treating its first lines as the whole change.
 
 The change's own file list is the minimum you have to cover: every file in it
 gets opened, the documentation it touches included. A doc the change writes is a
@@ -120,7 +169,9 @@ somewhere writable to hold it, turns one question into a full build. One
 question is worth one small program, not a second checkout.
 
 Before isolating a revision to run it, check whether the file even changed
-since then. Usually it did not, and the working tree answers the same question.
+since then, including local edits. Use the working tree only when the relevant
+files match the frozen revision; otherwise use that revision's contents without
+creating a second checkout just to read them.
 
 Reserve "not enough evidence" for a claim that genuinely turns on an outside
 fact **and** whose local consequences you have already traced to the end. It is
@@ -141,8 +192,8 @@ an upstream's docs.
 
 How to verify a claim:
 
-- When the claim is a regression, read the parent revision and prove the old
-  behavior differed.
+- When the claim is a regression, read the frozen baseline — the parent for a
+  commit, the merge-base for a PR — and prove the old behavior differed.
 - Follow an error or return value to where the caller observes it — the status
   code, the message, the log — not just to the return statement.
 - Grep for other producers and consumers before calling anything dead,

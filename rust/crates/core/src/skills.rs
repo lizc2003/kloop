@@ -903,6 +903,7 @@ mod tests {
             .find(|s| s.name == "code-review")
             .expect("code-review ships")
             .body;
+        let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
         for clause in [
             // A finding needs a concrete input reaching a concrete wrong output.
             "failure scenario",
@@ -963,6 +964,18 @@ mod tests {
             // where a real defect (a doc the change made untrue) sat among
             // "checked, not a defect" lines and read as one of them.
             "not a softer word for excluded",
+            "a head ref does not identify the target branch",
+            "stop the lookup and ask one question",
+            "Do not start reading the diff until it is answered",
+            "An anonymous 404 does not establish",
+            "DNS error alone does not establish a sandbox denial",
+            "hard stop for that access",
+            "exit status survives",
+            "timeout_ms",
+            "Read and search the frozen revision",
+            "including uncommitted edits",
+            "Truncated output is not coverage",
+            "Batch independent reads",
         ] {
             assert!(
                 body.contains(clause),

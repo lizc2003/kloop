@@ -13,6 +13,7 @@ use super::str_arg;
 use crate::config::EffectiveWorkspace;
 use crate::skills::Skill;
 use crate::skills::SkillContext;
+use crate::skills::SkillSource;
 use crate::skills::expand_body;
 use kloop_protocol::ToolDef;
 
@@ -62,6 +63,15 @@ pub(super) async fn skill_tool(
     // sub-agent sees the resolved output; a blocked/failed `!cmd` propagates as
     // an is_error tool_result. This is the same expansion the slash path runs.
     let body = super::inject::expand(&body, ctx, workspace).await?;
+    let body = if skill.source == SkillSource::Builtin
+        && skill.name == "code-review"
+        && ctx.depth == 0
+        && !ctx.from_program
+    {
+        super::review::prepare(args, body, ctx).await?
+    } else {
+        body
+    };
     match skill.context {
         SkillContext::Inline => Ok(body),
         SkillContext::Fork => fork_skill(ctx, workspace, skill, body).await,
