@@ -28,7 +28,6 @@ mod sampling;
 use crate::request_reduction::RequestReduction;
 pub use crate::rollout::TurnError;
 use crate::rollout::TurnTerminal;
-pub(crate) use sampling::MAX_ATTEMPTS;
 use sampling::SampleOk;
 use sampling::Sampled;
 pub(crate) use sampling::retry_delay;

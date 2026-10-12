@@ -2506,24 +2506,33 @@ async fn context_size_is_published_each_round_and_only_at_depth_zero() {
     );
 }
 
-/// Transient provider errors are retried in place and the turn still completes.
-#[tokio::test]
-async fn retry_recovers_from_transient_errors() {
-    use kloop_provider::MockTurn;
-    let provider = Provider::mock_scripted(vec![
-        MockTurn::Error("blip 1".into()),
-        MockTurn::Error("blip 2".into()),
-        MockTurn::Blocks(text("made it")),
-    ]);
+/// 瞬时错误重试到第十次成功时，任务仍能完成。
+#[tokio::test(start_paused = true)]
+async fn retry_recovers_on_tenth_attempt() {
+    let script = (1..10)
+        .map(|attempt| MockTurn::Error(format!("blip {attempt}")))
+        .chain([MockTurn::Blocks(text("made it"))])
+        .collect();
+    let (provider, seen) = Provider::mock_recording(script);
     let cfg = compaction_cfg(provider, 200_000, "retry");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
     history.record(Message::user_text("hello"));
+    let started = tokio::time::Instant::now();
 
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.final_text, "made it");
+    let elapsed = tokio::time::Instant::now() - started;
+    assert!(elapsed >= std::time::Duration::from_millis(123_750));
+    assert!(elapsed <= std::time::Duration::from_millis(126_000));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 10);
+    assert!(
+        seen.iter()
+            .all(|request| request.messages == seen[0].messages)
+    );
 }
 
 /// The gap that used to end a turn on a transient upstream error: reasoning
@@ -2904,16 +2913,76 @@ async fn retry_after_overrides_local_backoff_without_real_waiting() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
-/// Three failures with no fallback exhaust the retry budget and surface
-/// the error.
-#[tokio::test]
+#[test]
+fn retry_delay_grows_exponentially_and_caps_at_sixty_seconds() {
+    let failure = ProviderFailure::transport("upstream unavailable");
+    for (attempt, base_millis) in [250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000]
+        .into_iter()
+        .enumerate()
+    {
+        let minimum = std::time::Duration::from_millis(base_millis);
+        let maximum = (minimum + std::time::Duration::from_millis(249))
+            .min(std::time::Duration::from_secs(60));
+        let actual = super::sampling::retry_delay(attempt as u32, &failure);
+        assert!(
+            (minimum..=maximum).contains(&actual),
+            "attempt {attempt}: {actual:?}"
+        );
+    }
+    assert_eq!(
+        super::sampling::retry_delay(u32::MAX, &failure),
+        std::time::Duration::from_secs(60)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn extended_retry_backoff_can_be_cancelled() {
+    struct CancelOnFourthRetryUi(CancellationToken);
+    impl Ui for CancelOnFourthRetryUi {
+        fn emit(&self, event: &Event) {
+            if matches!(event, Event::Note(note) if note.contains("sampling failed (attempt 4/10)"))
+            {
+                self.0.cancel();
+            }
+        }
+    }
+
+    let (provider, seen) = Provider::mock_recording(
+        (1..=10)
+            .map(|attempt| {
+                MockTurn::Failure(ProviderFailure::http(
+                    503,
+                    format!("down {attempt}"),
+                    Some(std::time::Duration::from_secs(60)),
+                ))
+            })
+            .collect(),
+    );
+    let cfg = compaction_cfg(provider, 200_000, "cancel-extended-retry");
+    let cancel = CancellationToken::new();
+    let ui: Arc<dyn Ui> = Arc::new(CancelOnFourthRetryUi(cancel.clone()));
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("hello"));
+    let started = tokio::time::Instant::now();
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Aborted);
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        std::time::Duration::from_secs(180)
+    );
+}
+
+/// 没有备用模型时，第十次失败耗尽预算并返回最后一次错误。
+#[tokio::test(start_paused = true)]
 async fn retries_exhausted_error_out() {
-    use kloop_provider::MockTurn;
-    let provider = Provider::mock_scripted(vec![
-        MockTurn::Error("down 1".into()),
-        MockTurn::Error("down 2".into()),
-        MockTurn::Error("down 3".into()),
-    ]);
+    let script = (1..=10)
+        .map(|attempt| MockTurn::Error(format!("down {attempt}")))
+        .chain([MockTurn::Blocks(text("must not be reached"))])
+        .collect();
+    let (provider, seen) = Provider::mock_recording(script);
     let cfg = compaction_cfg(provider, 200_000, "exhausted");
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -2922,10 +2991,11 @@ async fn retries_exhausted_error_out() {
     let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
 
     assert!(
-        matches!(&outcome.reason, EndReason::Error(e) if e.contains("down 3")),
+        matches!(&outcome.reason, EndReason::Error(e) if e.contains("down 10")),
         "expected the last error surfaced, got {:?}",
         outcome.reason
     );
+    assert_eq!(seen.lock().unwrap().len(), 10);
 }
 
 /// A model that never stops calling tools is cut off at max_rounds, with

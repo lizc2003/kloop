@@ -79,19 +79,18 @@ enum SampleError {
     },
 }
 
-/// Attempts per request, the first one included. The summary request
-/// (`compact.rs`) retries under the same budget.
-pub(crate) const MAX_ATTEMPTS: u32 = 3;
+/// 普通采样请求的总尝试次数，包含首次。
+const MAX_ATTEMPTS: u32 = 10;
 
-/// How long to wait after failed attempt `attempt` (0-based) before the next
-/// one: exponential backoff with sub-ms jitter from the clock's nanoseconds. A
-/// bounded provider Retry-After takes precedence.
+/// 第 `attempt` 次失败后的等待（从 0 计数）：指数退避加不足一秒的抖动，
+/// 单次最多 60 秒；优先采用 provider 已限幅的 Retry-After。
 pub(crate) fn retry_delay(attempt: u32, error: &ProviderFailure) -> Duration {
     let jitter = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()) % 250)
         .unwrap_or(0);
-    let local_delay = Duration::from_millis((250 << attempt) + jitter);
+    let base_delay = Duration::from_millis(250).saturating_mul(2_u32.saturating_pow(attempt));
+    let local_delay = (base_delay + Duration::from_millis(jitter)).min(Duration::from_secs(60));
     error.retry_after().unwrap_or(local_delay)
 }
 

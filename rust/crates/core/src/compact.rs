@@ -709,11 +709,11 @@ fn shrink_to_newest(request: &mut Vec<Message>, target: u64) -> usize {
     keep_from
 }
 
-/// The summary request under the same transient-retry policy as a sampling
-/// round: a retryable provider failure is retried with the same backoff and
-/// `Retry-After`. Nothing is shown before the summary is complete, so a retry
-/// never replays anything the user saw. An overflow is not retried here — the
-/// caller answers that one by shrinking the request.
+const MAX_SUMMARY_ATTEMPTS: u32 = 3;
+
+/// 摘要持有独立的尝试预算，复用普通采样的瞬时错误分类、退避和 Retry-After。
+/// 摘要完成前没有可见输出，重试不会重复用户已看到的内容。
+/// 超长错误交由调用方缩小请求，不在这里重试。
 async fn sample_summary_with_retry(
     provider_attempt: &FrozenProviderAttempt,
     cache_key: Option<&str>,
@@ -727,7 +727,7 @@ async fn sample_summary_with_retry(
             Err(error) => error,
         };
         let Some(delay) = transient_failure(&error)
-            .filter(|_| attempt + 1 < crate::agent::MAX_ATTEMPTS)
+            .filter(|_| attempt + 1 < MAX_SUMMARY_ATTEMPTS)
             .map(|failure| crate::agent::retry_delay(attempt, failure))
         else {
             return Err(error);
@@ -1084,9 +1084,7 @@ mod tests {
         assert!(seen[1].messages.len() < seen[0].messages.len());
     }
 
-    /// A non-overflow failure must not be answered by shrinking — the fold window
-    /// has nothing to do with a dropped connection. It is retried under the
-    /// sampling budget instead, and surfaces once that is spent.
+    /// 非超长失败不能靠缩小摘要窗口解决；在独立的摘要预算内重试，耗尽后报错。
     #[tokio::test(start_paused = true)]
     async fn a_transport_failure_is_not_treated_as_too_large() {
         let reset = || {
@@ -1126,7 +1124,7 @@ mod tests {
         );
         // Three identical requests: retried whole, never shrunk.
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), crate::agent::MAX_ATTEMPTS as usize);
+        assert_eq!(seen.len(), 3);
         assert!(
             seen.iter()
                 .all(|request| request.messages == seen[0].messages)
