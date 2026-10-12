@@ -18,6 +18,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::KEEP_RECENT_TOKENS;
+use super::SUMMARY_BOUNDARY;
 use super::SUMMARY_PREFIX;
 use super::plan_compaction;
 use super::run_compaction;
@@ -98,9 +99,16 @@ fn reads(ids_and_paths: &[(&str, &Path)]) -> [Message; 2] {
         Message::tool_results(
             ids_and_paths
                 .iter()
-                .map(|(id, _)| ContentBlock::ToolResult {
+                .map(|(id, path)| ContentBlock::ToolResult {
                     tool_use_id: id.to_string(),
-                    content: "(earlier read)".into(),
+                    content: std::fs::read_to_string(path)
+                        .unwrap_or_else(|_| "(earlier read)".into())
+                        .split('\n')
+                        .enumerate()
+                        .map(|(index, line)| format!("{}\t{line}", index + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .into(),
                     is_error: false,
                 })
                 .collect(),
@@ -153,7 +161,7 @@ lexer\n\nLater messages (oldest first):\n- also keep the old API"
             ),
             Message::injected(
                 Injected::ContextSummary,
-                format!("{SUMMARY_PREFIX}Work continued."),
+                format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}Work continued."),
             ),
             Message::user_text("still in the tail"),
         ]

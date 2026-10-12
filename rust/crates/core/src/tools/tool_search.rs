@@ -1688,6 +1688,8 @@ mod tests {
 
     #[tokio::test]
     async fn same_session_compaction_preserves_deferred_unlock() {
+        use crate::compact::{SUMMARY_BOUNDARY, SUMMARY_PREFIX};
+
         let source = Arc::new(OwnedSrv::new("srv__mutate", "mutated"));
         let ctx = with_provider(
             deferred_ctx_with_source("compaction-preserves-unlock", source.clone()),
@@ -1720,7 +1722,7 @@ mod tests {
             history.messages()[1],
             kloop_protocol::Message::injected(
                 kloop_protocol::Injected::ContextSummary,
-                format!("{}summary", crate::compact::SUMMARY_PREFIX),
+                format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}summary"),
             )
         );
         assert_eq!(

@@ -60,6 +60,10 @@ context window]\n";
 pub const SUMMARY_PREFIX: &str =
     "[Context summary of the earlier part of this session — earlier messages were compacted]\n";
 
+pub(crate) const SUMMARY_BOUNDARY: &str = "[Summary boundary: this covers only the earlier messages sent \
+for summarization. Progress and next steps below describe the end of that segment. Original \
+messages after this summary are newer; use them to update the state and remaining work.]\n\n";
+
 /// The summary request carries this system prompt and no tools (see
 /// [`sample_summary`]), so it shares no cached prefix with the session and its
 /// input is billed in full. The no-tools rule still leads, and names the
@@ -135,8 +139,10 @@ from one this work introduced.
 are already established must not be re-derived.
 8. Verification state — what has been checked and what has not. Do not imply a check passed \
 when it was skipped or blocked.
-9. Work in progress and next step — what was happening immediately before this summary, and \
-what to do next, with a direct quote from the recent conversation showing where the work left \
+9. Work in progress and next step at the end of the summarized segment — what was happening \
+at the end of the conversation above, and what was next at that point. The runtime retains \
+newer messages separately; they are outside this request, so do not infer their progress. \
+Use a direct quote from the recent conversation showing where the work left \
 off. When several independent things are waiting — files to open, symbols to trace, checks to \
 run — name them all, not just the first: they can be started in one round, and a summary that \
 names a single next action is read as an instruction to take one step at a time.
@@ -377,6 +383,8 @@ fn canonicalize_summary(raw: &str) -> Result<String> {
             summary = rest.trim();
         } else if let Some(rest) = summary.strip_prefix(marker) {
             summary = rest.trim();
+        } else if let Some(rest) = summary.strip_prefix(SUMMARY_BOUNDARY.trim_end()) {
+            summary = rest.trim();
         } else {
             break;
         }
@@ -454,7 +462,10 @@ fn build_replacement(
     }
     items.push(Message::injected(
         Injected::ContextSummary,
-        format!("{SUMMARY_PREFIX}{summary}{}", pointer.unwrap_or("")),
+        format!(
+            "{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}{summary}{}",
+            pointer.unwrap_or("")
+        ),
     ));
     items.extend(restored);
     items.extend_from_slice(&plan.tail);
@@ -958,7 +969,8 @@ mod tests {
         let ContentBlock::Text { text } = &without[0].content[0] else {
             panic!("summary is text")
         };
-        assert_eq!(text, &format!("{SUMMARY_PREFIX}S"));
+        assert_eq!(text, &format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}S"));
+        assert_eq!(without.last(), Some(&Message::user_text("recent")));
     }
 
     /// The prompt's load-bearing clauses, asserted by intent rather than wording
@@ -980,6 +992,8 @@ mod tests {
             "Sub-agent results",
             "must not be re-derived",
             "direct quote",
+            "at the end of the summarized segment",
+            "do not infer their progress",
             // Plan 128: "the single best next action" was doing exactly what it
             // said — one action per round, for the 45 rounds after a compaction.
             "name them all, not just the first",
@@ -1310,7 +1324,7 @@ compactions]\n\nOriginal request:\n  old request",
             msgs[1],
             Message::injected(
                 Injected::ContextSummary,
-                format!("{SUMMARY_PREFIX}what happened so far"),
+                format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}what happened so far"),
             )
         );
         assert_eq!(msgs.last().unwrap(), &Message::user_text("current request"));
@@ -1437,7 +1451,7 @@ compactions]\n\nOriginal request:\n  old request",
         assert_eq!(
             history.messages()[1].content[0],
             ContentBlock::Text {
-                text: format!("{SUMMARY_PREFIX}summary"),
+                text: format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}summary"),
             }
         );
     }
@@ -1728,7 +1742,15 @@ compactions]\n\nOriginal request:\n  old request",
                 .unwrap(),
             "summary text"
         );
+        assert_eq!(
+            canonicalize_summary(&format!(
+                "{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}summary text"
+            ))
+            .unwrap(),
+            "summary text"
+        );
         assert!(canonicalize_summary(&format!(" {SUMMARY_PREFIX} ")).is_err());
+        assert!(canonicalize_summary(&format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}")).is_err());
     }
 
     #[test]
@@ -1804,7 +1826,7 @@ compactions]\n\nOriginal request:\n  old request",
             history.messages()[0],
             Message::injected(
                 Injected::ContextSummary,
-                format!("{SUMMARY_PREFIX}new summary")
+                format!("{SUMMARY_PREFIX}{SUMMARY_BOUNDARY}new summary")
             )
         );
         assert_eq!(

@@ -14,7 +14,8 @@
 //! head of the prompt, where content re-read from disk would break the prompt
 //! cache from the first byte whenever a file changed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Injected;
 use kloop_protocol::Message;
+use kloop_protocol::ToolResultContent;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +37,7 @@ const MAX_FILES: usize = 5;
 const FILE_CHARS: usize = 12_000;
 const TOTAL_CHARS: usize = 40_000;
 
-/// Re-read the files most recently read in `folded` that `tail` does not
+/// Re-read the ranges most recently read in `folded` that `tail` does not
 /// already carry. `token_budget` is the caller's share of the window left
 /// after compaction. `None` when nothing qualifies.
 pub(super) async fn restore_files(
@@ -46,16 +48,22 @@ pub(super) async fn restore_files(
     cancel: &CancellationToken,
 ) -> Option<Message> {
     let workspace = cfg.effective_workspace();
-    let in_tail: HashSet<PathBuf> = read_paths(tail, &workspace.cwd).into_iter().collect();
+    let mut in_tail: HashMap<PathBuf, Vec<Range<usize>>> = HashMap::new();
+    for read in successful_reads(tail, &workspace.cwd) {
+        in_tail.entry(read.path).or_default().push(read.range);
+    }
     let ctx = ToolCtx::harness(Arc::clone(cfg), cancel.clone());
     let mut sections = Vec::new();
-    let mut chars = HEADER.len();
+    let mut chars = HEADER.chars().count();
     let mut tokens = estimate_text_tokens(HEADER);
-    for path in read_paths(folded, &workspace.cwd) {
-        if sections.len() == MAX_FILES || cancel.is_cancelled() {
+    let mut seen = HashSet::new();
+    let mut files = 0;
+    for read in successful_reads(folded, &workspace.cwd) {
+        if files == MAX_FILES || cancel.is_cancelled() {
             break;
         }
-        if in_tail.contains(&path)
+        let path = read.path;
+        if !seen.insert(path.clone())
             || path
                 .extension()
                 .is_some_and(|extension| extension == "ipynb")
@@ -63,55 +71,137 @@ pub(super) async fn restore_files(
         {
             continue;
         }
-        let Some(page) = first_page(&path) else {
-            continue;
-        };
-        // Sized before the read, not after: a read leaves the lines it covered
-        // registered as in context, and lines that are then left out would
-        // make the reread advisory tell the model it has what it does not.
-        let predicted = section(&path, &page, &page.text);
-        let predicted_tokens = estimate_text_tokens(&predicted);
-        if chars + predicted.len() > TOTAL_CHARS || tokens + predicted_tokens > token_budget {
-            break;
+        let ranges = uncovered(read.range, in_tail.get(&path).cloned().unwrap_or_default());
+        let mut file_chars = 0;
+        for range in ranges {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let Some(page) = fit_page(
+                &path,
+                range,
+                (TOTAL_CHARS.saturating_sub(chars)).min(FILE_CHARS.saturating_sub(file_chars)),
+                token_budget.saturating_sub(tokens),
+            ) else {
+                continue;
+            };
+            let Some(text) = read_through_dispatch(&ctx, &path, &page).await else {
+                continue;
+            };
+            let rendered = format!("\n\n{}", section(&path, &page, &text));
+            let rendered_chars = rendered.chars().count();
+            chars += rendered_chars;
+            file_chars += rendered_chars;
+            tokens += estimate_text_tokens(&rendered);
+            sections.push(rendered);
         }
-        let Some(text) = read_through_dispatch(&ctx, &path, page.lines).await else {
-            continue;
-        };
-        let rendered = section(&path, &page, &text);
-        chars += rendered.len();
-        tokens += estimate_text_tokens(&rendered);
-        sections.push(rendered);
+        files += usize::from(file_chars > 0);
     }
     if sections.is_empty() {
         return None;
     }
     Some(Message::injected(
         Injected::RestoredFiles,
-        format!("{HEADER}\n\n{}", sections.join("\n\n")),
+        format!("{HEADER}{}", sections.concat()),
     ))
 }
 
-/// Paths passed to `read_file`, newest first, each once.
-fn read_paths(messages: &[Message], cwd: &Path) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    messages
+struct ReadSpan {
+    path: PathBuf,
+    range: Range<usize>,
+}
+
+fn successful_reads(messages: &[Message], cwd: &Path) -> Vec<ReadSpan> {
+    let mut results = HashMap::new();
+    let mut reads = Vec::new();
+    for block in messages
         .iter()
         .rev()
         .flat_map(|message| message.content.iter().rev())
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { name, input, .. } if name == "read_file" => {
-                input["path"].as_str()
+    {
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                content,
+            } => {
+                let text = match content {
+                    ToolResultContent::Text(text) if !is_error => Some(text.as_str()),
+                    _ => None,
+                };
+                results.insert(tool_use_id.as_str(), text);
             }
-            _ => None,
-        })
-        .map(|raw| normalize_absolute_path(cwd, Path::new(raw)))
-        .filter(|path| seen.insert(path.clone()))
-        .collect()
+            ContentBlock::ToolUse { id, name, input } if name == "read_file" => {
+                let Some(text) = results.remove(id.as_str()).flatten() else {
+                    continue;
+                };
+                let (Some(raw), Some(range)) = (input["path"].as_str(), displayed_range(text))
+                else {
+                    continue;
+                };
+                reads.push(ReadSpan {
+                    path: normalize_absolute_path(cwd, Path::new(raw)),
+                    range,
+                });
+            }
+            _ => {}
+        }
+    }
+    reads
 }
 
-/// How much of a file's head fits the per-file cap, as `read_file` will
-/// render it.
+fn displayed_range(text: &str) -> Option<Range<usize>> {
+    let first = text
+        .lines()
+        .next()?
+        .split_once('\t')?
+        .0
+        .parse::<usize>()
+        .ok()?;
+    let mut count = 0;
+    for line in text.lines() {
+        let numbered = line
+            .split_once('\t')
+            .and_then(|(number, _)| number.parse::<usize>().ok());
+        if numbered != first.checked_add(count) {
+            break;
+        }
+        count += 1;
+    }
+    if text
+        .lines()
+        .any(|line| line.starts_with("[read output truncated within line "))
+    {
+        count = count.saturating_sub(1);
+    }
+    let start = first.saturating_sub(1);
+    (count > 0).then(|| start..start.saturating_add(count))
+}
+
+fn uncovered(range: Range<usize>, mut covered: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    covered.sort_by_key(|range| range.start);
+    let mut start = range.start;
+    let mut ranges = Vec::new();
+    for seen in covered {
+        if start < seen.start {
+            let end = seen.start.min(range.end);
+            if start < end {
+                ranges.push(start..end);
+            }
+        }
+        start = start.max(seen.end);
+        if start >= range.end {
+            break;
+        }
+    }
+    if start < range.end {
+        ranges.push(start..range.end);
+    }
+    ranges
+}
+
 struct Page {
+    offset: usize,
     lines: usize,
     total_lines: usize,
     text: String,
@@ -120,7 +210,12 @@ struct Page {
 /// Only sizes the read — the content that reaches the model is what the
 /// dispatched `read_file` returns. A path that is gone, is not a regular file,
 /// is not text, or is empty has nothing to restore.
-fn first_page(path: &Path) -> Option<Page> {
+fn fit_page(
+    path: &Path,
+    range: Range<usize>,
+    char_budget: usize,
+    token_budget: u64,
+) -> Option<Page> {
     if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
@@ -131,13 +226,18 @@ fn first_page(path: &Path) -> Option<Page> {
     let total_lines = content.split('\n').count();
     let mut text = String::new();
     let mut chars = 0usize;
-    let mut lines = 0usize;
-    for line in content.split('\n') {
+    let mut ends = Vec::new();
+    for (relative, line) in content
+        .split('\n')
+        .skip(range.start)
+        .take(range.end - range.start)
+        .enumerate()
+    {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let rendered = format!("{}\t{line}", lines + 1);
-        let separator = usize::from(lines > 0);
+        let rendered = format!("{}\t{line}", range.start + relative + 1);
+        let separator = usize::from(relative > 0);
         let rendered_chars = rendered.chars().count();
-        if chars + separator + rendered_chars > FILE_CHARS {
+        if chars + separator + rendered_chars > char_budget {
             break;
         }
         if separator == 1 {
@@ -145,35 +245,48 @@ fn first_page(path: &Path) -> Option<Page> {
         }
         text.push_str(&rendered);
         chars += separator + rendered_chars;
-        lines += 1;
+        ends.push(text.len());
     }
-    if lines == 0 {
-        return None;
+    while let Some(end) = ends.pop() {
+        text.truncate(end);
+        let lines = ends.len() + 1;
+        let last = range.start + lines;
+        let mut shown = text.clone();
+        if last < total_lines {
+            shown.push_str(&format!(
+                "\n\n[showing lines {}-{last} of {total_lines}; call read_file with offset={} to continue]",
+                range.start + 1, last + 1
+            ));
+        }
+        let page = Page {
+            offset: range.start + 1,
+            lines,
+            total_lines,
+            text: shown,
+        };
+        let rendered = format!("\n\n{}", section(path, &page, &page.text));
+        if rendered.chars().count() <= char_budget
+            && estimate_text_tokens(&rendered) <= token_budget
+        {
+            return Some(page);
+        }
     }
-    if lines < total_lines {
-        text.push_str(&format!(
-            "\n\n[showing lines 1-{lines} of {total_lines}; call read_file with offset={} to continue]",
-            lines + 1
-        ));
-    }
-    Some(Page {
-        lines,
-        total_lines,
-        text,
-    })
+    None
 }
 
 fn section(path: &Path, page: &Page, text: &str) -> String {
     format!(
-        "{} (lines 1-{} of {}):\n{text}",
+        "{} (lines {}-{} of {}):\n{text}",
         path.display(),
-        page.lines,
+        page.offset,
+        page.offset + page.lines - 1,
         page.total_lines
     )
 }
 
-async fn read_through_dispatch(ctx: &ToolCtx, path: &Path, lines: usize) -> Option<String> {
-    let input = json!({ "path": path.to_string_lossy(), "limit": lines });
+async fn read_through_dispatch(ctx: &ToolCtx, path: &Path, page: &Page) -> Option<String> {
+    let input =
+        json!({ "path": path.to_string_lossy(), "offset": page.offset, "limit": page.lines });
     let results = crate::tools::dispatch_tools(
         vec![("compaction-restore".into(), "read_file".into(), input)],
         ctx,
@@ -215,17 +328,37 @@ mod tests {
     }
 
     fn read_of(paths: &[&Path]) -> Vec<Message> {
-        vec![Message::assistant(
-            paths
-                .iter()
-                .enumerate()
-                .map(|(index, path)| ContentBlock::ToolUse {
-                    id: format!("r{index}"),
-                    name: "read_file".into(),
-                    input: json!({"path": path.to_str().unwrap()}),
-                })
-                .collect(),
-        )]
+        vec![
+            Message::assistant(
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| ContentBlock::ToolUse {
+                        id: format!("r{index}"),
+                        name: "read_file".into(),
+                        input: json!({"path": path.to_str().unwrap()}),
+                    })
+                    .collect(),
+            ),
+            Message::tool_results(
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| ContentBlock::ToolResult {
+                        tool_use_id: format!("r{index}"),
+                        content: std::fs::read_to_string(path)
+                            .unwrap()
+                            .split('\n')
+                            .enumerate()
+                            .map(|(index, line)| format!("{}\t{line}", index + 1))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .into(),
+                        is_error: false,
+                    })
+                    .collect(),
+            ),
+        ]
     }
 
     async fn restore(cfg: &Arc<Config>, folded: &[Message], budget: u64) -> Option<String> {
@@ -251,15 +384,20 @@ mod tests {
 
         let text = restore(&cfg, &read_of(&[&path]), u64::MAX).await.unwrap();
 
-        // Whole numbered lines, newline-separated, up to the cap.
         let mut shown = 0;
-        let mut chars = 0;
         for number in 1..=1_000usize {
-            let rendered = number.to_string().len() + 1 + line.len() + usize::from(number > 1);
-            if chars + rendered > FILE_CHARS {
+            let numbered = (1..=number)
+                .map(|index| format!("{index}\t{line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rendered = format!(
+                "\n\n{} (lines 1-{number} of 1000):\n{numbered}\n\n[showing lines 1-{number} of 1000; call read_file with offset={} to continue]",
+                path.display(),
+                number + 1
+            );
+            if rendered.chars().count() > FILE_CHARS {
                 break;
             }
-            chars += rendered;
             shown = number;
         }
         assert!(
@@ -279,10 +417,8 @@ offset={} to continue]",
         );
     }
 
-    /// Files go in newest first until the next would pass the total character
-    /// cap; the rest stay out.
     #[tokio::test]
-    async fn the_total_character_cap_stops_the_list() {
+    async fn the_total_character_cap_shrinks_the_last_file() {
         let (dir, cfg) = setup("total");
         let paths: Vec<PathBuf> = (0..4).map(|i| dir.join(format!("f{i}.txt"))).collect();
         for path in &paths {
@@ -292,13 +428,16 @@ offset={} to continue]",
 
         let text = restore(&cfg, &read_of(&refs), u64::MAX).await.unwrap();
 
-        // Each section is ~11,200 characters: three fit under 40,000, four do not.
-        assert!(text.len() <= TOTAL_CHARS);
+        assert!(text.chars().count() <= TOTAL_CHARS);
         let listed: Vec<bool> = paths
             .iter()
             .map(|path| text.contains(&format!("{} (lines", path.display())))
             .collect();
-        assert_eq!(listed, [false, true, true, true]);
+        assert_eq!(listed, [true, true, true, true]);
+        assert!(
+            !text.contains(&format!("{} (lines 1-108", paths[0].display())),
+            "{text}"
+        );
     }
 
     /// The window share is the other cap: a budget that holds one section holds
@@ -313,7 +452,7 @@ offset={} to continue]",
         let folded = read_of(&[&older, &newer]);
         let one = estimate_text_tokens(HEADER)
             + estimate_text_tokens(&format!(
-                "{} (lines 1-1 of 1):\n1\tnewer body",
+                "\n\n{} (lines 1-1 of 1):\n1\tnewer body",
                 newer.display()
             ));
 
@@ -343,5 +482,171 @@ offset={} to continue]",
         let restored =
             restore_files(&cfg, &folded, &tail, u64::MAX, &CancellationToken::new()).await;
         assert_eq!(restored, None);
+    }
+
+    fn paged_read(path: &Path, id: &str, offset: usize, limit: usize) -> Vec<Message> {
+        let text = std::fs::read_to_string(path).unwrap();
+        let result = text
+            .split('\n')
+            .skip(offset.saturating_sub(1))
+            .take(limit)
+            .enumerate()
+            .map(|(index, line)| format!("{}\t{line}", offset + index))
+            .collect::<Vec<_>>()
+            .join("\n");
+        vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "read_file".into(),
+                input: json!({"path": path, "offset": offset, "limit": limit}),
+            }]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: result.into(),
+                is_error: false,
+            }]),
+        ]
+    }
+
+    #[test]
+    fn displayed_ranges_follow_actual_output_including_zero_offset_and_truncation() {
+        let cases = [
+            (
+                "11\ta\n12\tb\n\n[showing lines 11-12 of 100; call read_file with offset=13 to continue]",
+                Some(10..12),
+            ),
+            ("0\ta\n1\tb", Some(0..2)),
+            (
+                "1\tpartial\n\n[read output truncated within line 1 of 10; use grep or a narrower reader to inspect it]",
+                None,
+            ),
+            (
+                "<system-reminder>Warning: shorter than offset</system-reminder>",
+                None,
+            ),
+            ("Full result saved to a file", None),
+            ("1\ta\n3\tb", Some(0..1)),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(displayed_range(text), expected, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_latest_successful_page_wins_over_an_older_file_head() {
+        let (dir, cfg) = setup("latest-page");
+        let path = dir.join("notes.md");
+        std::fs::write(
+            &path,
+            (1..=300)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut folded = paged_read(&path, "old", 1, 200);
+        folded.extend(paged_read(&dir.join("./notes.md"), "new", 250, 2));
+        let mut failed = paged_read(&path, "failed", 1, 1);
+        let ContentBlock::ToolResult { is_error, .. } = &mut failed[1].content[0] else {
+            panic!()
+        };
+        *is_error = true;
+        folded.extend(failed);
+        folded.push(Message::assistant(vec![ContentBlock::ToolUse {
+            id: "pending".into(),
+            name: "read_file".into(),
+            input: json!({"path": path}),
+        }]));
+
+        assert_eq!(
+            restore(&cfg, &folded, u64::MAX).await,
+            Some(format!(
+                "{HEADER}\n\n{} (lines 250-251 of 300):\n250\tline 250\n251\tline 251\n\n[showing lines 250-251 of 300; call read_file with offset=252 to continue]",
+                path.display()
+            ))
+        );
+        assert_eq!(
+            cfg.effective_file_state()
+                .observation(&path)
+                .unwrap()
+                .read_range(),
+            Some(249..251)
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_tail_pages_are_subtracted_without_losing_other_ranges() {
+        let (dir, cfg) = setup("tail-pages");
+        let path = dir.join("notes.md");
+        std::fs::write(
+            &path,
+            (1..=30)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let folded = paged_read(&path, "folded", 11, 10);
+        let mut tail = paged_read(&path, "tail1", 13, 3);
+        tail.extend(paged_read(&path, "tail2", 14, 3));
+        tail.extend(paged_read(&path, "tail3", 18, 2));
+        let mut failed = paged_read(&path, "failed", 11, 10);
+        let ContentBlock::ToolResult { is_error, .. } = &mut failed[1].content[0] else {
+            panic!()
+        };
+        *is_error = true;
+        tail.extend(failed);
+
+        let expected = [(11, 12), (17, 17), (20, 20)].map(|(start, end)| {
+            let numbered = (start..=end).map(|index| format!("{index}\tline {index}")).collect::<Vec<_>>().join("\n");
+            format!("{} (lines {start}-{end} of 30):\n{numbered}\n\n[showing lines {start}-{end} of 30; call read_file with offset={} to continue]", path.display(), end + 1)
+        });
+        assert_eq!(
+            restore_files(&cfg, &folded, &tail, u64::MAX, &CancellationToken::new()).await,
+            Some(Message::injected(
+                Injected::RestoredFiles,
+                format!("{HEADER}\n\n{}", expected.join("\n\n"))
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_recent_file_does_not_hide_a_smaller_candidate() {
+        let (dir, cfg) = setup("oversized");
+        let small = dir.join("small.txt");
+        let big = dir.join("big.txt");
+        std::fs::write(&small, "保留").unwrap();
+        std::fs::write(&big, "界".repeat(FILE_CHARS)).unwrap();
+        let folded = read_of(&[&small, &big]);
+        let expected = format!("{HEADER}\n\n{} (lines 1-1 of 1):\n1\t保留", small.display());
+        let budget = estimate_text_tokens(HEADER)
+            + estimate_text_tokens(expected.strip_prefix(HEADER).unwrap());
+        assert_eq!(restore(&cfg, &folded, budget).await, Some(expected));
+        assert!(cfg.effective_file_state().observation(&big).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_token_budget_shrinks_a_non_head_page_before_dispatch() {
+        let (dir, cfg) = setup("shrink-page");
+        let path = dir.join("notes.txt");
+        let line = "界".repeat(64);
+        std::fs::write(&path, vec![line.as_str(); 100].join("\n")).unwrap();
+        let folded = paged_read(&path, "page", 3, 30);
+        let expected_section = format!(
+            "\n\n{} (lines 3-3 of 100):\n3\t{line}\n\n[showing lines 3-3 of 100; call read_file with offset=4 to continue]",
+            path.display()
+        );
+        let budget = estimate_text_tokens(HEADER) + estimate_text_tokens(&expected_section);
+        assert_eq!(
+            restore(&cfg, &folded, budget).await,
+            Some(format!("{HEADER}{expected_section}"))
+        );
+        assert_eq!(
+            cfg.effective_file_state()
+                .observation(&path)
+                .unwrap()
+                .read_range(),
+            Some(2..3)
+        );
     }
 }
