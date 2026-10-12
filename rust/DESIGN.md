@@ -152,7 +152,7 @@ the five architectural bets below; it is now ten crates, and every bet held.
    and one a gateway chokes on costs more than a missing one. The chat rail
    spells it as Responses does.
 
-provider 采样有界且保留错误类型：每次尝试有一个终态，三条协议都受连接打开（300s）、
+Provider 采样有界且保留错误类型：每次尝试有一个终态，三条协议都受连接打开（300s）、
 块空闲（15m）、总时长（30m）、响应体（10 MiB）和 SSE 帧（1 MiB）的限制。可安全重试的
 传输、打开、读取、HTTP 和不完整 EOF 失败，普通采样请求最多尝试 10 次（含首次）；
 已有可回放输出时仍走既有的续传边界。没有服务端等待提示时，指数退避从 250ms 开始

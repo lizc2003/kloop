@@ -2529,9 +2529,11 @@ async fn retry_recovers_on_tenth_attempt() {
     assert!(elapsed <= std::time::Duration::from_millis(126_000));
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 10);
+    // Every attempt sends the same request, `system` and `tools` included: the
+    // request view is built once per round, outside the retry loop.
     assert!(
-        seen.iter()
-            .all(|request| request.messages == seen[0].messages)
+        seen.iter().all(|request| *request == seen[0]),
+        "attempts differ: {seen:?}"
     );
 }
 

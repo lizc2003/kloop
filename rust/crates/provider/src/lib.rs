@@ -55,7 +55,7 @@ pub(crate) fn http_client() -> reqwest::Client {
 
 /// What the Mock provider saw in one `stream()` call; lets core tests assert
 /// the request shape (e.g. injected context messages) without a wire.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MockRequest {
     pub model: String,
     pub system: String,

@@ -82,7 +82,7 @@ enum SampleError {
 /// 普通采样请求的总尝试次数，包含首次。
 const MAX_ATTEMPTS: u32 = 10;
 
-/// 第 `attempt` 次失败后的等待（从 0 计数）：指数退避加不足一秒的抖动，
+/// 第 `attempt` 次失败后的等待（从 0 计数）：指数退避加 0–249ms 抖动，
 /// 单次最多 60 秒；优先采用 provider 已限幅的 Retry-After。
 pub(crate) fn retry_delay(attempt: u32, error: &ProviderFailure) -> Duration {
     let jitter = SystemTime::now()
