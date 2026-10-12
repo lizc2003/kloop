@@ -58,7 +58,7 @@ pub(super) async fn restore_files(
     let mut tokens = estimate_text_tokens(HEADER);
     let mut seen = HashSet::new();
     let mut files = 0;
-    for read in successful_reads(folded, &workspace.cwd) {
+    'candidates: for read in successful_reads(folded, &workspace.cwd) {
         if files == MAX_FILES || cancel.is_cancelled() {
             break;
         }
@@ -77,11 +77,16 @@ pub(super) async fn restore_files(
             if cancel.is_cancelled() {
                 break;
             }
+            let remaining_chars = TOTAL_CHARS.saturating_sub(chars);
+            let remaining_tokens = token_budget.saturating_sub(tokens);
+            if remaining_chars == 0 || remaining_tokens == 0 {
+                break 'candidates;
+            }
             let Some(page) = fit_page(
                 &path,
                 range,
-                (TOTAL_CHARS.saturating_sub(chars)).min(FILE_CHARS.saturating_sub(file_chars)),
-                token_budget.saturating_sub(tokens),
+                remaining_chars.min(FILE_CHARS.saturating_sub(file_chars)),
+                remaining_tokens,
             ) else {
                 continue;
             };
@@ -216,6 +221,8 @@ fn fit_page(
     char_budget: usize,
     token_budget: u64,
 ) -> Option<Page> {
+    #[cfg(test)]
+    let _ = tests::SIZED_PATHS.try_with(|paths| paths.borrow_mut().push(path.to_path_buf()));
     if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
@@ -304,12 +311,17 @@ async fn read_through_dispatch(ctx: &ToolCtx, path: &Path, page: &Page) -> Optio
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::tools::testutil::TestConfig;
 
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    tokio::task_local! {
+        pub(super) static SIZED_PATHS: RefCell<Vec<PathBuf>>;
+    }
 
     fn setup(tag: &str) -> (PathBuf, Arc<Config>) {
         let dir = std::env::temp_dir().join(format!(
@@ -371,6 +383,95 @@ mod tests {
                     other => panic!("{other:?}"),
                 }
             })
+    }
+
+    async fn restore_with_sized_paths(
+        cfg: &Arc<Config>,
+        folded: &[Message],
+        tail: &[Message],
+        budget: u64,
+    ) -> (Option<Message>, Vec<PathBuf>) {
+        SIZED_PATHS
+            .scope(RefCell::new(Vec::new()), async {
+                let restored =
+                    restore_files(cfg, folded, tail, budget, &CancellationToken::new()).await;
+                let paths = SIZED_PATHS.with(|paths| paths.borrow().clone());
+                (restored, paths)
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_initial_token_budget_stops_before_sizing_files() {
+        let (dir, cfg) = setup("empty-budget");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "body").unwrap();
+        let folded = read_of(&[&path]);
+
+        for budget in [0, estimate_text_tokens(HEADER)] {
+            assert_eq!(
+                restore_with_sized_paths(&cfg, &folded, &[], budget).await,
+                (None, Vec::new())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_total_character_budget_stops_before_sizing_older_files() {
+        let (dir, cfg) = setup("exhausted-chars");
+        let older = dir.join("older.txt");
+        std::fs::write(&older, "older body").unwrap();
+        let mut expected = HEADER.to_owned();
+        let mut paths = Vec::new();
+        for index in 0..4 {
+            let path = dir.join(format!("f{index}.txt"));
+            let prefix = format!("\n\n{} (lines 1-1 of 1):\n1\t", path.display());
+            let chars = FILE_CHARS.min(TOTAL_CHARS - expected.chars().count());
+            let body = "x".repeat(chars - prefix.chars().count());
+            std::fs::write(&path, &body).unwrap();
+            expected.push_str(&prefix);
+            expected.push_str(&body);
+            paths.push(path);
+        }
+        assert_eq!(expected.chars().count(), TOTAL_CHARS);
+        let refs: Vec<&Path> = std::iter::once(older.as_path())
+            .chain(paths.iter().rev().map(PathBuf::as_path))
+            .collect();
+        let folded = read_of(&refs);
+
+        let (restored, sized_paths) = restore_with_sized_paths(&cfg, &folded, &[], u64::MAX).await;
+        assert_eq!(sized_paths, paths);
+        assert_eq!(
+            restored,
+            Some(Message::injected(Injected::RestoredFiles, expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_token_budget_stops_before_sizing_more_ranges_or_files() {
+        let (dir, cfg) = setup("exhausted-tokens");
+        let older = dir.join("older.txt");
+        let newer = dir.join("newer.txt");
+        std::fs::write(&older, "older body").unwrap();
+        std::fs::write(&newer, "newer body\nalready in tail\nunrestored body").unwrap();
+        let folded = read_of(&[&older, &newer]);
+        let tail = paged_read(&newer, "tail", 2, 1);
+        let section = format!(
+            "\n\n{} (lines 1-1 of 3):\n1\tnewer body\n\n[showing lines 1-1 of 3; call read_file with offset=2 to continue]",
+            newer.display()
+        );
+        let budget = estimate_text_tokens(HEADER) + estimate_text_tokens(&section);
+
+        assert_eq!(
+            restore_with_sized_paths(&cfg, &folded, &tail, budget).await,
+            (
+                Some(Message::injected(
+                    Injected::RestoredFiles,
+                    format!("{HEADER}{section}")
+                )),
+                vec![newer]
+            )
+        );
     }
 
     /// Past the per-file cap the head comes back with the same continuation
