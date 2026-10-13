@@ -1,8 +1,10 @@
 # Plan 211 — 先补基础编辑，再做可靠撤销
 
 > 来源：2026-09-24 调研 Pi 的输入框编辑机制，见 `refs/README.md`「Pi 全面复查」第 9 条。
-> **2026-10-13 第一阶段已实现**（见第九节）：基础行/词编辑已落地。撤销是后续独立任务、
-> 启动时另立 plan；高级剪切暂缓。第二至五节是第一阶段依据，第六、七节仍是后续边界。
+> **2026-10-13 定稿并回退**：最终只保留**移动键**（Ctrl+A/E/B/F、Alt+B/F、Alt/`Ctrl+←/→`）。
+> 用户判定**不做撤销**，因此第一阶段一度实现的破坏性删除（Ctrl+W/U/K、Alt+D、Meta
+> Backspace/Delete）已整体退回未绑定；Backspace/Delete 只在无修饰时删除。详见第九节。
+> 撤销（第六节）与高级剪切（第七节）均不实施。第二至五节是当时的实施依据，第六、七节仅存档。
 
 ## 一、当前缺口与已修的旧前提
 
@@ -135,7 +137,11 @@ Fragment、ring、yank 区间、轮转索引或预留字段。
 这类功能是确定性的键盘编辑契约，**不需要真实模型 A/B**。新动作单测 + 真实字节到提交文本
 的 PTY 证据承担验收，真实终端/平台没有执行的部分如实声明，不借 macOS 结果声称 Windows 已跑。
 
-## 六、后续阶段备忘：可靠撤销（另立 plan，不随第一阶段实施）
+## 六、后续阶段备忘：可靠撤销（**已取消，不实施**）
+
+> **2026-10-13 用户决议：不做撤销。** 相应地，第一阶段一度绑定的破坏性编辑键
+> （Ctrl+W/U/K、Alt+D、Meta Backspace/Delete）已整体退回未绑定。本节以下内容仅存档，
+> 不是待办。
 
 撤销值得做，但下面只是后续任务的边界，**不是已经定稿的实现方案**。
 
@@ -207,29 +213,29 @@ String（`rust/crates/protocol/src/lib.rs:407`）。直接 clone 会在编辑普
 
 ## 九、完成记录
 
-✅ 2026-10-13，`0c14028`（`feat(plan211): give the composer shell-style line and word
-editing`）。**第一阶段（第二节：基础行编辑与按词
-编辑）已完成；撤销（第六节）与高级剪切（第七节）未实现，按各自边界另立 plan。**
+✅ 2026-10-13。**最终只保留移动键**（`0c14028` 实现，随后回退破坏性编辑）。
+**撤销（第六节）与高级剪切（第七节）都不实施**——用户判定撤销不做，故第一阶段一度
+实现的破坏性删除一并回退。
 
-- **第四节问与答（2026-10-13）**：用户同意推荐——**词按字符类切**：字母数字（含 `_`）一段、
-  标点一段、空白跳过，`\n` 当空白。汉字属字母数字类，连续中文到空白/标点为止算一段，
-  所以 Ctrl+W 一次删掉整段中文；不采用 UAX#29。
-- **实现落点**：`composer.rs` 新增 `Cell` 词扫描、`ComposerDocument::delete_covering`
-  （范围先扩到完整原子再整体删）、`ComposerAction` 与 `Composer::apply`；`app.rs` 新增穷尽
-  映射 `composer_action`，区分 Ctrl / Alt / Ctrl+Alt，未绑定 Meta 键不插入字符。
-- **验证**：
-  - composer 单测：`foo  bar.baz` 逐落点词移动/删除、跨硬行、CJK/ZWJ 字素安全、paste atom
-    整体（含相邻原子）、Ctrl+U/K 硬行与边缘 `\n`、空文档与两端无操作。
-  - app 单测：表驱动断言整张键位（普通/Ctrl/Alt/Shift/Ctrl+Alt），保留键（Ctrl+D/H/J/N/P/V/R/C、
-    Tab/Esc/Enter）不误触；打开补全菜单后 Ctrl+W/Ctrl+U 正确重过滤或关闭。
-  - 真实 PTY（`tui_pty.rs`）：三条用例用原始字节发送 `ESC DEL`、`ESC b/f`、CSI `1;3D/C`、
-    `1;5D/C`、`127;5u` 与 C0 字节 `0x01/0x05/0x0b/0x15/0x17`，断言本地假 provider 实际收到
-    的完整用户文本。
-  - `make check` 全绿（fmt + clippy + workspace debug 全量测试 + 本机 parity）。
-  - 平台边界：PTY 证据只在 macOS 上跑，Windows 未执行，不借 macOS 结果声称 Windows 已跑。
-- 未运行 `make check-release`（按约定不属提交门禁）。
+**已实现并对最终代码成立的**：Ctrl+A/E（硬行首尾）、Ctrl+B/F（一个字素）、Alt+B/F 与
+Alt/`Ctrl+←/→`（按词移动）。词按**字符类**切（第四节，用户 2026-10-13 同意推荐）：字母
+数字（含 `_`）一段、标点一段、空白跳过，`\n` 当空白，因此连续中文到空白/标点算一段；
+不采用 UAX#29。路由集中在 `app.rs` 的穷尽 `composer_action`（Ctrl 与 Alt 分开、未绑定
+Meta 键吞掉），词边界与原子状态在 `Composer`。
 
-**后续小修（2026-10-13，`21e983c`)**：纵向视觉导航不再把光标停进标签内部——`up`/`down` 的落点
-吸附到原子边缘（up→原子 start、down→原子 end），原先"从标签内部起步"的入口关闭，
-词动作里的内部吸附分支随之删除；回归 `navigation_never_rests_inside_a_paste_atom`
-（旧实现复现"cursor rested inside the label"）。纯本地，无真实模型。
+**已回退的**：Ctrl+W / Ctrl+U / Ctrl+K、Alt+D、Alt+Backspace、Ctrl+Backspace、Alt+Delete
+全部退回未绑定；Backspace/Delete 只在无修饰时删除。理由是没有撤销兜底，就不留会丢内容
+的键。实现期用过的 `delete_covering`、`word_*_delete`、`kill_to_line_*` 已删除。
+
+**纵向导航不变量（`0c14028` 的实现里是缺陷，`21e983c` 修复）**：视觉布局只读显示文本，
+`offset_at_column` 能把光标放进 `[Pasted #N: …]` 标签内部；修复后 `up`/`down` 落点吸附
+到原子边缘（up→原子 start、down→原子 end），光标不再停进标签内部，词动作里"以防万一"
+的内部吸附分支随之删除。回归 `navigation_never_rests_inside_a_paste_atom`（旧实现复现
+`cursor rested inside the label`）。见 HANDOFF 教训 229。
+
+**验证**（最终代码）：composer 单测（词移动落点、跨硬行、CJK/ZWJ 字素安全、原子当一个
+cell、空/两端无操作、导航不落标签内部）；app 单测（表驱动断言整张键位含被回退项映射为
+`None`、保留键不误触、移动键重同步补全菜单）；真实 PTY 两条（`ESC b/f`、CSI `1;3D/C`、
+`1;5D/C`、C0 `0x01/0x02/0x05/0x06`）断言假 provider 收到的完整用户文本；`make check`
+全绿（fmt + clippy + workspace debug 全量测试 + 本机 parity）。未运行 `make check-release`。
+平台边界：PTY 证据只在 macOS 上跑，Windows 未执行。

@@ -1507,18 +1507,15 @@ Alt+char (Alt+Q) is swallowed rather than typed, and an `AltGr` letter (which
 reaches Windows as Ctrl+Alt) is swallowed too (plan 213).
 
 **Ctrl+A / Ctrl+E** jump to the hard line start / end and **Ctrl+B / Ctrl+F**
-step one grapheme, matching the arrows and Home/End. Readline word motion is
-bound: **Alt+B / Alt+F**, **Alt+←/→** and **Ctrl+←/→** move by word; **Ctrl+W**,
-**Alt+Backspace** and a distinguishable **Ctrl+Backspace** delete the previous
-word (Ctrl+H is *not* an alias — legacy terminals send it for a plain
-Backspace); **Alt+D / Alt+Delete** delete the next word; **Ctrl+U / Ctrl+K**
-delete to the hard line start / end, and at the edge take the adjacent `\n`. A
-**word** here is a character class, not a dictionary one: letters, digits and `_`
-are one run, punctuation another, the whitespace between them is skipped, and
-`\n` counts as whitespace so motion crosses hard lines. A CJK run is therefore a
-single word — Ctrl+W removes it whole, up to the next space or punctuation — and
-every step stays on a grapheme boundary. These deletes are deletes: no kill ring,
-no yank, no undo yet.
+step one grapheme, matching the arrows and Home/End. Readline **word motion** is
+bound: **Alt+B / Alt+F**, **Alt+←/→** and **Ctrl+←/→**. A **word** here is a
+character class, not a dictionary one: letters, digits and `_` are one run,
+punctuation another, the whitespace between them is skipped, and `\n` counts as
+whitespace so motion crosses hard lines. A CJK run is therefore a single word, and
+every step stays on a grapheme boundary. **Nothing here deletes**: with no undo,
+no key removes more than the grapheme Backspace/Delete already did — Ctrl+W, Ctrl+U,
+Ctrl+K, Alt+D, and the Meta Backspace/Delete chords are left unbound, and the kill
+ring is out of scope.
 
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
 stable ID. Its `[Pasted #N: M chars · <preview>]` label shows the payload's first
@@ -1534,13 +1531,12 @@ affordance only — once the turn is sent, the transcript echoes the expanded te
 in full (the same text a resumed session replays out of history). Bracketed paste canonicalizes
 CRLF and CR line endings to the Composer's LF logical newline at the TUI ingress;
 other characters, surrounding spaces, and trailing newlines are preserved (no
-trim). Word and line scans treat an atom as one cell, so a scan never stops on
-the spaces or punctuation inside its label; adjacent Backspace/Delete removes it
-whole, and a word or line delete that touches one removes its label and payload
-together. The cursor never rests inside a label: the visual layout reads the
-display text alone and can draw such a byte, so `up`/`down` land on the atom's
-edge (start when stepping up, end when stepping down). A range edit that cuts one
-— completion accept — materializes its payload before editing.
+trim). Word scans treat an atom as one cell, so a word step never stops on the
+spaces or punctuation inside its label; adjacent Backspace/Delete removes it
+whole. The cursor never rests inside a label: the visual layout reads the display
+text alone and can draw such a byte, so `up`/`down` land on the atom's edge (start
+when stepping up, end when stepping down). A range edit that cuts one — completion
+accept — materializes its payload before editing.
 **Ctrl+V / Alt+V** pastes an image straight off the OS clipboard (a screenshot,
 browser copy, or Finder-copied file); a pasted or dragged single-line
 **image-file path** attaches too, while ordinary bracketed paste remains text.
