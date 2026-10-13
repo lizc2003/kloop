@@ -130,32 +130,32 @@ fn sha(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn repository_path(path: &str) -> &str {
+    let path = path.trim_matches('/');
+    path.strip_suffix(".git").unwrap_or(path)
+}
+
 fn same_repository(remote: &str, target: &PullRequest) -> bool {
     let remote = remote.trim();
     let remote = if remote.contains("://") {
         url::Url::parse(remote).ok().and_then(|url| {
             Some((
                 url.host_str()?.to_owned(),
-                url.path()
-                    .trim_end_matches('/')
-                    .trim_end_matches(".git")
-                    .trim_start_matches('/')
-                    .to_owned(),
+                repository_path(url.path()).to_owned(),
             ))
         })
     } else {
         remote.split_once(':').map(|(host, path)| {
             (
                 host.rsplit('@').next().unwrap_or(host).to_owned(),
-                path.trim_end_matches(".git")
-                    .trim_start_matches('/')
-                    .to_owned(),
+                repository_path(path).to_owned(),
             )
         })
     };
     let path = target
         .url
         .path()
+        .trim_end_matches('/')
         .rsplit_once('/')
         .and_then(|(path, _)| path.rsplit_once('/'))
         .map(|(path, _)| path.trim_start_matches('/'));
@@ -213,7 +213,7 @@ async fn packet(
             let number = target
                 .url
                 .path_segments()
-                .and_then(|mut parts| parts.next_back())
+                .and_then(|parts| parts.rev().find(|part| !part.is_empty()))
                 .ok_or_else(|| anyhow!("missing PR number"))?;
             let head_ref = format!("refs/pull/{number}/head");
             let target_ref = format!("refs/heads/{branch}");
@@ -478,7 +478,7 @@ impl Flow {
                 }
                 let end = start + count - 1;
                 format!(
-                    "set -o pipefail; git show {} | sed -n '{start},{end}p'",
+                    "set -o pipefail; git show {} | awk 'NR >= {start} && NR <= {end} {{ printf \"%d\\t%s\\n\", NR, $0 }}'",
                     quote(&format!("{revision}:{path}"))
                 )
             }

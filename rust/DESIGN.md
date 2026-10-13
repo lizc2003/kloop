@@ -2709,10 +2709,14 @@ network-free, reqwest lives only in provider and web):
   and checked on every hop), same-site redirects followed (max 5), cross-host
   redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text.
   非成功 HTTP 响应保持工具失败，保留状态码和请求地址，按状态补充原因与下一步：
-  401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性，
-  410 建议确认当前位置，429 与常见暂时性服务错误提示稍后重试。其余状态不猜原因。
+  401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性；
+  对仓库 / PR 地址提示先对照当前 Git remotes，匹配才使用已有 Git 访问查询 PR refs、
+  fetch 缺失对象，提醒 head ref 不提供实际目标分支、`git pull` 会改动当前分支和工作区。
+  这只是通用失败指引，网络工具不读取本地仓库或自动执行 Git；原生 review 的缺失
+  目标交还也不会因此自动继续。410 建议确认当前位置，429 与常见暂时性服务错误
+  提示稍后重试。其余状态不猜原因。
   不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
-  DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227）。
+  DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227、228）。
   Download truncation is reported. There is **no model-text cap**: the body is a
   fetched artifact, and clipping one deletes evidence that the offload seam would
   otherwise keep on disk (bet 1). Everything downloaded is handed to core, which
@@ -3973,18 +3977,21 @@ skill 调用成为调度顺序边界；交还问题时其后未开始的工具�
 turn 已交还问题，不能解释为 review 已完成。无 PR 参数、提交 / 工作区、用户覆盖
 skill、Program 桥接、slash 展开和未支持的入口不进入此预处理；不声称约束了所有审查路径。
 用户补齐明确分支后，在下一次模型采样前通过已有 Bash 门禁校验 origin 与 PR 身份；
+PR URL 尾斜杠不影响身份或 head ref 解析；remote 路径只去掉一个克隆用 `.git` 后缀，
+保留仓库名自身的 `.git`，避免不同仓库被归为同一身份。
 使用固定托管 head ref 和新读取的远端目标 ref 解析 SHA，不能复用陈旧的本地目标 tip。
 有完整 API 元数据则保持其固定 SHA。只获取缺失对象，计算 merge-base、列完整文件表，
 逐文件准备 `--unified=12` 差异；不检出或修改工作区。最多 128 份文件、120,000 字符；
 截断、不可读或超预算逐项记录缺口，范围解析失败停止交还，禁止模型接着猜范围。
-正文阶段仅提供 `review_read` 结构化入口，读取 / 字面搜索都绑定 head 或 base，
+正文阶段仅提供 `review_read` 结构化入口，读取 / 字面搜索都绑定 head 或 base；
+文件区间逐行附原始行号，空行也编号，便于 finding 引用准确位置。
 下层生成固定 Bash 命令并经过原有 hook、权限、沙箱与超时；自由 shell、网页、委派和
 写操作不提供。最多 16 个补查调用（失败与未允许调用也计数），耗尽后只请求报告；
 显式轮次上限的最后一轮同样只请求报告，不增加外层预算。收尾继续调用工具或给出
 空结果均算失败，运行时不能合成 finding。正常模型报告后追加原生范围、差异准备
 缺口及补查失败事实；“准备完整差异”与“审查完整”分开表述。原生状态和准备材料
 随会话保存、恢复和压缩保留；用户切换任务或新的 steering 退出该阶段，取消 / 拒绝
-仍优先。此阶段限根 turn 的非 structured 内置 PR 路径（plan 227）。
+仍优先。此阶段限根 turn 的非 structured 内置 PR 路径（plan 227、228）。
 A finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
 (confirmed / downgraded / excluded) so none disappears silently — a downgraded

@@ -115,6 +115,29 @@ fn target_input_and_repository_identity_are_bounded() {
         "git@forge.example:team/different.git",
         &target
     ));
+    for remote in [
+        "git@forge.example:team/project.git.git",
+        "https://forge.example/team/project.git.git/",
+    ] {
+        assert!(!same_repository(remote, &target));
+        assert!(same_repository(
+            remote,
+            &PullRequest::parse("https://forge.example/team/project.git/pulls/42").unwrap()
+        ));
+    }
+}
+
+#[tokio::test]
+async fn trailing_slash_pr_url_resolves_the_same_frozen_range() {
+    let fixture = Fixture::new();
+    let ctx = fixture.ctx("review-trailing-slash", Provider::mock(vec![]), None);
+    let (prepared, _) = packet(&ctx, &format!("{PR}/"), "release", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (prepared.head, prepared.tip, prepared.base),
+        (fixture.head, fixture.tip, fixture.base)
+    );
 }
 
 #[tokio::test]
@@ -178,6 +201,38 @@ fn report() -> MockTurn {
     MockTurn::Blocks(vec![AssistantBlock::Text {
         text: "Review report: no confirmed finding; supplied changes checked.".into(),
     }])
+}
+
+#[tokio::test]
+async fn file_reads_preserve_source_line_numbers_and_blank_lines() {
+    let fixture = Fixture::new();
+    run(&fixture.cwd, &["checkout", "feature"]);
+    std::fs::write(fixture.cwd.join("code.rs"), "first\nsecond\n\nfourth\n").unwrap();
+    run(&fixture.cwd, &["add", "."]);
+    run(&fixture.cwd, &["commit", "-m", "numbered source"]);
+    let head = run(&fixture.cwd, &["rev-parse", "HEAD"]);
+    run(&fixture.cwd, &["update-ref", "refs/pull/42/head", &head]);
+    run(&fixture.cwd, &["checkout", "main"]);
+    let ctx = fixture.ctx("review-numbered-file", Provider::mock(vec![]), None);
+    let (prepared, _) = packet(&ctx, PR, "release", None).await.unwrap();
+    let mut flow = Flow {
+        state: State::Prepared(prepared),
+    };
+    for (revision, path, start, count, expected) in [
+        ("head", "code.rs", 2, 2, vec!["2\tsecond", "3\t"]),
+        ("base", "old.txt", 1, 1, vec!["1\told"]),
+    ] {
+        let query = flow
+            .command(
+                "review_read",
+                &json!({"operation":"file","revision":revision,"path":path,"start_line":start,"line_count":count}),
+                &fixture.cwd,
+            )
+            .unwrap();
+        let (text, error) = run_tool("bash", query, &ctx).await;
+        assert!(!error, "{text}");
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+    }
 }
 
 #[tokio::test]

@@ -57,7 +57,7 @@ pub(crate) async fn fetch_url(
                     "The server refused this request. Use an already authorized access route or ask for access; do not bypass the refusal."
                 }
                 404 => {
-                    "The resource may be missing or hidden from unauthenticated requests. This response alone does not establish that a private resource is missing. Use an existing authenticated client or ask for the exact resource; do not guess alternate URLs or IPs."
+                    "The resource may be missing or hidden from unauthenticated requests.\nFor a repository or PR URL, compare it with the current checkout's Git remotes. A matching remote may provide existing authenticated access: use git ls-remote to query PR refs and git fetch for missing objects.\nPR head refs do not establish the target branch. Avoid git pull, which can modify the current branch and working tree.\nOtherwise use an existing authenticated client or ask for the missing information. Do not guess alternate URLs or IPs, or search credential files."
                 }
                 410 => {
                     "The server reports that this resource is gone. Ask for its current location instead of repeatedly fetching this URL."
@@ -503,12 +503,24 @@ mod tests {
             .await;
 
         for &(route, status, guidance) in &cases {
-            let err = fetch_private(&format!("{}{route}", server.uri()))
-                .await
-                .unwrap_err();
+            let url = format!("{}{route}", server.uri());
+            let err = fetch_private(&url).await.unwrap_err();
             let message = format!("{err:#}");
             assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            assert!(message.contains(&url), "{message}");
             assert!(message.contains(guidance), "{message}");
+            if status == 404 {
+                for hint in [
+                    "compare it with the current checkout's Git remotes",
+                    "A matching remote",
+                    "git ls-remote",
+                    "git fetch for missing objects",
+                    "PR head refs do not establish the target branch",
+                    "Avoid git pull",
+                ] {
+                    assert!(message.contains(hint), "{message}");
+                }
+            }
             assert!(!message.contains("error body must not become review evidence"));
         }
 
