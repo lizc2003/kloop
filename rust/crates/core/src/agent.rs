@@ -518,9 +518,6 @@ struct Turn<'a> {
     /// rule is now uniform: an early exit never spells its result `String::new()`.
     /// (Exits *before* the loop legitimately do — nothing has been produced yet.)
     produced_text: String,
-    review: crate::tools::review::Flow,
-    review_enabled: bool,
-    review_reporting: bool,
 }
 
 impl Turn<'_> {
@@ -877,16 +874,6 @@ impl Turn<'_> {
                     return Some(step);
                 }
                 let round_text = text_content(blocks);
-                if matches!(self.review.state, crate::tools::review::State::Prepared(_))
-                    && round_text.trim().is_empty()
-                {
-                    return Some(RoundStep::Stop(Ending {
-                        reason: EndReason::Error("review ended without a report".into()),
-                        text: None,
-                        rounds: round + 1,
-                        structured: None,
-                    }));
-                }
                 let final_text = if self.truncated_prefix.is_empty() {
                     round_text
                 } else {
@@ -953,8 +940,7 @@ impl Turn<'_> {
         invalid: &[(String, String)],
         round: usize,
     ) -> RoundStep {
-        let mut invalid = invalid.to_vec();
-        let mut tool_uses: Vec<(String, String, Value)> = blocks
+        let tool_uses: Vec<(String, String, Value)> = blocks
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse { id, name, input } => {
@@ -968,33 +954,12 @@ impl Turn<'_> {
                 | ContentBlock::ToolResult { .. } => None,
             })
             .collect();
-        if matches!(self.review.state, crate::tools::review::State::Prepared(_)) {
-            self.review.reject_invalid_calls(invalid.len());
-            tool_uses = tool_uses
-                .into_iter()
-                .filter_map(|(id, name, input)| {
-                    match self
-                        .review
-                        .command(&name, &input, &self.cfg.effective_workspace().cwd)
-                    {
-                        Ok(input) => Some((id, "bash".into(), input)),
-                        Err(error) => {
-                            invalid.push((id, error.to_string()));
-                            None
-                        }
-                    }
-                })
-                .collect();
-        }
         let (tool_started, started_notes) = ToolStartedSink::channel();
         let ctx = ToolCtx {
             cfg: self.cfg.clone(),
             ui: self.ui.clone(),
             cancel: self.cancel.clone(),
             stop: self.options.stop.clone(),
-            turn_reply: Arc::new(std::sync::Mutex::new(None)),
-            review_update: Arc::new(std::sync::Mutex::new(None)),
-            review_targets: self.history.review_targets(),
             depth: self.depth,
             enclosing_execution: self.enclosing_execution.cloned(),
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1016,24 +981,10 @@ impl Turn<'_> {
         };
         let (results, structured_output) =
             journal_tool_starts(self.history, started_notes, dispatch).await;
-        let results = merge_invalid_results(blocks, &invalid, results);
+        let results = merge_invalid_results(blocks, invalid, results);
         // Record results BEFORE checking cancellation so every tool_use has a
         // paired tool_result and history stays legal for the next request.
-        self.review.observe(&results);
         self.history.record(Message::tool_results(results));
-        if matches!(self.review.state, crate::tools::review::State::Prepared(_)) {
-            self.review.save(self.history);
-        }
-        if self.review_enabled
-            && let Some(state) = ctx
-                .review_update
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take()
-        {
-            self.review.state = state;
-            self.review.save(self.history);
-        }
         // Tool-hook stdout follows the results it commented on, as extra
         // user-message context.
         for text in std::mem::take(&mut *ctx.hook_context.lock().unwrap_or_else(|e| e.into_inner()))
@@ -1048,45 +999,6 @@ impl Turn<'_> {
                 structured: None,
             });
         }
-        let reply = ctx
-            .turn_reply
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(text) = reply {
-            self.history
-                .record(Message::assistant(vec![ContentBlock::Text {
-                    text: text.clone(),
-                }]));
-            if self.stream_text {
-                let id = format!("handoff-{}", self.item_seq);
-                self.item_seq += 1;
-                self.ui.emit(&Event::ItemStarted {
-                    id: id.clone(),
-                    item: crate::event::Item::AssistantMessage {
-                        text: String::new(),
-                        status: crate::event::ItemStatus::InProgress,
-                    },
-                });
-                self.ui.emit(&Event::ItemDelta {
-                    id: id.clone(),
-                    delta: crate::event::Delta::Text(text.clone()),
-                });
-                self.ui.emit(&Event::ItemCompleted {
-                    id,
-                    item: crate::event::Item::AssistantMessage {
-                        text: text.clone(),
-                        status: crate::event::ItemStatus::Completed,
-                    },
-                });
-            }
-            return RoundStep::Stop(Ending {
-                reason: EndReason::Completed,
-                text: Some(text),
-                rounds: round + 1,
-                structured: None,
-            });
-        }
         if let Some(value) = structured_output {
             if let Some(step) = self.keep_going_for_late_work() {
                 return step;
@@ -1096,16 +1008,6 @@ impl Turn<'_> {
                 text: None,
                 rounds: round + 1,
                 structured: Some(value),
-            });
-        }
-        if self.review_reporting {
-            return RoundStep::Stop(Ending {
-                reason: EndReason::Error(
-                    "review report required after investigation closed".into(),
-                ),
-                text: None,
-                rounds: round + 1,
-                structured: None,
             });
         }
         if self.options.structured_schema.is_some() {
@@ -1140,28 +1042,6 @@ async fn turn_rounds(
     };
     history.compaction_breaker().begin_turn();
     let active_attempt = cfg.provider_route.primary_attempt();
-    let review_enabled = depth == 0
-        && options.structured_schema.is_none()
-        && cfg.skills.iter().any(|skill| {
-            skill.name == "code-review" && skill.source == crate::skills::SkillSource::Builtin
-        });
-    let mut review = if review_enabled {
-        crate::tools::review::Flow::load(history)
-    } else {
-        crate::tools::review::Flow {
-            state: crate::tools::review::State::Idle,
-        }
-    };
-    if !matches!(review.state, crate::tools::review::State::Idle) && cancel.is_cancelled() {
-        return TurnOutcome {
-            reason: EndReason::Aborted,
-            final_text: String::new(),
-            rounds: 0,
-            structured_output: None,
-        };
-    }
-    let input = history.review_input();
-    review.input(input.as_deref(), history);
     let mut turn = Turn {
         cfg,
         history,
@@ -1183,9 +1063,6 @@ async fn turn_rounds(
         rounds: 0,
         structured_failures: 0,
         produced_text: String::new(),
-        review,
-        review_enabled,
-        review_reporting: false,
     };
     let ending = 'turn: loop {
         // A No answered during the last batch ends the turn here, before the
@@ -1225,55 +1102,6 @@ async fn turn_rounds(
         remind_todos(cfg, turn.history, depth);
         remind_changed_reads(cfg, turn.history);
         remind_background_shells(cfg, turn.history);
-        if matches!(
-            turn.review.state,
-            crate::tools::review::State::Resolve { .. }
-        ) {
-            let mut ctx = ToolCtx::harness(cfg.clone(), cancel.clone());
-            ctx.ui = ui.clone();
-            ctx.stop = options.stop.clone();
-            if let Err(error) = turn.review.prepare(&ctx, turn.history).await {
-                let text = format!(
-                    "无法准备固定版本的 PR 审查证据：{error}。请核对目标分支、仓库 origin 和 Git 访问权限后继续。"
-                );
-                if !cancel.is_cancelled() && !options.stop.is_cancelled() {
-                    turn.history
-                        .record(Message::assistant(vec![ContentBlock::Text {
-                            text: text.clone(),
-                        }]));
-                    emit_native_text(ui, &mut turn.item_seq, &text);
-                }
-                break 'turn Ending {
-                    reason: if cancel.is_cancelled() {
-                        EndReason::Aborted
-                    } else if options.stop.is_cancelled() {
-                        EndReason::Stopped
-                    } else {
-                        EndReason::Error(error.to_string().into())
-                    },
-                    text: Some(text),
-                    rounds: turn.rounds,
-                    structured: None,
-                };
-            }
-            for text in std::mem::take(
-                &mut *ctx
-                    .hook_context
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()),
-            ) {
-                turn.history.record(Message::injected(Injected::Hook, text));
-            }
-        }
-        turn.review_reporting = false;
-        if let Some(tools) = turn.review.tools(
-            turn.history,
-            cfg.max_rounds
-                .map(|limit| limit.saturating_sub(turn.rounds)),
-        ) {
-            turn.review_reporting = tools.is_empty();
-            turn.tools = tools;
-        }
         // Without an anchor the system prompt, this round's tools and the
         // injected context are estimated here; a dynamic MCP refresh may have
         // replaced the tools or the deferred-tool notice since last round.
@@ -1346,47 +1174,12 @@ async fn turn_rounds(
     // exit that says nothing about text hands back what the turn produced instead
     // of an empty string. Exits *before* the loop still return directly: nothing
     // has been produced yet, and there is nothing to lose.
-    let mut final_text = ending.text.unwrap_or(turn.produced_text);
-    if ending.reason == EndReason::Completed
-        && let Some(note) = turn.review.finish(turn.history)
-    {
-        turn.history
-            .record(Message::assistant(vec![ContentBlock::Text {
-                text: note.clone(),
-            }]));
-        emit_native_text(ui, &mut turn.item_seq, &note);
-        final_text.push_str("\n\n");
-        final_text.push_str(&note);
-    }
     TurnOutcome {
         reason: ending.reason,
-        final_text,
+        final_text: ending.text.unwrap_or(turn.produced_text),
         rounds: ending.rounds,
         structured_output: ending.structured,
     }
-}
-
-fn emit_native_text(ui: &Arc<dyn Ui>, sequence: &mut u64, text: &str) {
-    let id = format!("native-{}", *sequence);
-    *sequence += 1;
-    ui.emit(&Event::ItemStarted {
-        id: id.clone(),
-        item: crate::event::Item::AssistantMessage {
-            text: String::new(),
-            status: crate::event::ItemStatus::InProgress,
-        },
-    });
-    ui.emit(&Event::ItemDelta {
-        id: id.clone(),
-        delta: crate::event::Delta::Text(text.into()),
-    });
-    ui.emit(&Event::ItemCompleted {
-        id,
-        item: crate::event::Item::AssistantMessage {
-            text: text.into(),
-            status: crate::event::ItemStatus::Completed,
-        },
-    });
 }
 
 /// Put the failed results for unreadable calls back where their calls were.

@@ -601,16 +601,6 @@ impl History {
         &self.items
     }
 
-    pub(crate) fn review_input(&self) -> Option<String> {
-        crate::tools::review::latest_user_text(&self.staged)
-            .or_else(|| crate::tools::review::latest_user_text(&self.items))
-            .map(str::to_owned)
-    }
-
-    pub(crate) fn review_targets(&self) -> Vec<(String, String)> {
-        crate::tools::review::known_targets(self.items.iter().chain(&self.staged))
-    }
-
     pub fn provider_usage(&self) -> &UsageLedger {
         &self.provider_usage
     }
@@ -704,8 +694,7 @@ impl History {
     ///
     /// Every applied compaction lands here, whatever triggered it, so this is
     /// also where the compaction breaker learns of a success.
-    pub fn replace_all(&mut self, mut items: Vec<Message>) {
-        crate::tools::review::carry(&self.items, &mut items);
+    pub fn replace_all(&mut self, items: Vec<Message>) {
         self.persist(|rollout| rollout.append_compacted(&items));
         self.items = items;
         self.usage_anchor = None;

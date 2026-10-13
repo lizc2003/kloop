@@ -2712,8 +2712,7 @@ network-free, reqwest lives only in provider and web):
   401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性；
   对仓库 / PR 地址提示先对照当前 Git remotes，匹配才使用已有 Git 访问查询 PR refs、
   fetch 缺失对象，提醒 head ref 不提供实际目标分支、`git pull` 会改动当前分支和工作区。
-  这只是通用失败指引，网络工具不读取本地仓库或自动执行 Git；原生 review 在
-  自身门禁内复用明确目标或尝试固定地址的认证恢复。410 建议确认当前位置，
+  这只是通用失败指引，网络工具不读取本地仓库或自动执行 Git。410 建议确认当前位置，
   429 与常见暂时性服务错误提示稍后重试。其余状态不猜原因。
   不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
   DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227、228）。
@@ -3957,52 +3956,7 @@ warning, never an error.
 
 **Builtin skills** ship inside the binary, so a repository that has never heard
 of kloop still gets them: `code-review` (plan 119), an inline skill carrying the
-review contract. PR 入口先从已有认证渠道确认 head 和实际目标分支，只取所缺对象；
-PR head ref 不能证明目标分支，匿名 404 与 DNS 错误也不能各自证明仓库不存在或沙箱拒绝。
-第一次匿名页面或 API 404 后，若目标仍未知且没有可用的已认证元数据，停止定位并只问
-目标分支；回答前不读 diff，不再猜 URL / IP、查凭据或对候选分支算 merge-base。
-敏感路径拒绝终止该访问，联网命令保留自身退出码，超时使用 Bash 工具参数。
-审查固定 head、目标分支 tip 与 merge-base；单提交固定 revision 与 parent。
-后续差异、搜索和正文都绑定对应 SHA，工作区文件须连同未提交修改核对一致才可作证据。
-完整文件清单先于分批读取，独立读取同轮提交；截断结果不算覆盖，须补齐剩余 hunks。
-提交 / 工作区等入口的版本读取与覆盖要求仍是模型可见指令；内置 PR 的原生阶段
-见下文。准备完整差异不证明模型已逐项审查，也不证明减少调用或漏报（plan 226、227）。
-模型激活内置 skill 且参数包含一个支持的 PR URL 时，先复用当前历史中用户已明确
-给同一 PR 的目标分支，直接记录待准备状态，不重复询问。只认普通用户消息中的
-明确目标陈述，按 PR 绑定；模型、仓库正文和注入消息不能提供这项事实，当前分支
-也不作为目标证据。没有该事实才通过现有 `web_fetch` 来源做一次固定元数据查询
-（GitHub PR、Gitea / Forgejo `/pulls/<number>`，含路径前缀），复用来源、hook、
-权限、超时和地址限制。
-查询失败或字段不足时，先通过 Bash 校验 origin 与请求仓库一致，匹配才尝试
-现有 `gh api` 对同一完整 API 地址做一次只读认证查询，禁用交互登录；没有客户端
-或没有有效认证就记录失败，不扫描凭据、不安装客户端、不猜备用地址。
-合法 head、实际目标分支与目标 tip 作为固定字段随正文返回，并记录待准备状态。
-恢复仍失败且用户未给目标时，才显示访问失败原因和一个缺失事实请求及待回答状态，
-配对所有工具结果后直接结束 turn，不再请求模型选择动作；用户取消优先。
-skill 调用成为调度顺序边界；交还问题或确定待准备状态后，其后排队工具都不执行，
-避免在固定版本材料准备前读取工作区；确定目标不结束 turn，直接准备并继续审查。
-`completed` 在交还时表示当前 turn 已交还问题，不能解释为 review 已完成。
-无 PR 参数、提交 / 工作区、用户覆盖
-skill、Program 桥接、slash 展开和未支持的入口不进入此预处理；不声称约束了所有审查路径。
-目标已明确后，在下一次模型采样前通过已有 Bash 门禁校验 origin 与 PR 身份；
-PR URL 尾斜杠不影响身份或 head ref 解析；remote 路径只去掉一个克隆用 `.git` 后缀，
-保留仓库名自身的 `.git`，避免不同仓库被归为同一身份。
-使用固定托管 head ref 和新读取的远端目标 ref 解析 SHA，不能复用陈旧的本地目标 tip。
-有完整 API 元数据则保持其固定 SHA。只获取缺失对象，计算 merge-base、列完整文件表，
-逐文件准备 `--unified=12` 差异；不检出或修改工作区。最多 128 份文件、120,000 字符；
-截断、不可读或超预算逐项记录缺口，范围解析失败停止交还，禁止模型接着猜范围。
-正文阶段仅提供 `review_read` 结构化入口，读取 / 字面搜索都绑定 head 或 base；
-文件区间逐行附原始行号，空行也编号，便于 finding 引用准确位置。
-`review_read` 的定义跨轮字节稳定：补查额度不写进描述（缓存是约束），额度随注入的
-状态消息到达模型。
-下层生成固定 Bash 命令并经过原有 hook、权限、沙箱与超时；自由 shell、网页、委派和
-写操作不提供。最多 16 个补查调用（失败与未允许调用也计数），耗尽后只请求报告；
-显式轮次上限的最后一轮同样只请求报告，不增加外层预算。收尾继续调用工具或给出
-空结果均算失败，运行时不能合成 finding。正常模型报告后追加原生范围、差异准备
-缺口及补查失败事实；“准备完整差异”与“审查完整”分开表述。原生状态和准备材料
-随会话保存、恢复和压缩保留；用户切换任务或新的 steering 退出该阶段，取消 / 拒绝
-仍优先。此阶段限根 turn 的非 structured 内置 PR 路径（plan 227—229）。
-A finding needs `file:line`, a one-sentence claim and a
+review contract — a finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
 (confirmed / downgraded / excluded) so none disappears silently — a downgraded
 candidate is still a defect someone acts on, so it rides in the findings list at
@@ -4024,8 +3978,8 @@ plus a second reviewer).
 They come last in precedence: writing `.kloop/skills/code-review/SKILL.md` replaces the
 shipped one. A builtin has no directory (so its body cannot use
 `${CLAUDE_SKILL_DIR}`), and `skills/list` reports it with `scope: "builtin"` and
-an empty `path`. `--mock` 保留内置条目并跳过磁盘发现，不注册网络工具来源；PR
-预处理也无法因此产生真实联网请求，缺少元数据时按同一交还规则处理。
+an empty `path`. `--mock` skips disk discovery but keeps the builtins — they
+touch no filesystem, so hermetic runs are unaffected.
 
 Two ways to trigger a skill, both expanding the **same** body:
 
@@ -4044,9 +3998,10 @@ Two ways to trigger a skill, both expanding the **same** body:
 
 A skill runs one of two ways (its `context` frontmatter field):
 
-- **`inline`** (default): 展开正文作为 `skill` 结果进入对话，通常继续模型轮次；
-  内置 PR 预处理缺少目标时直接交还问题。正文仍通过工具结果进入历史，不排入
-  另一条用户消息。
+- **`inline`** (default): the expanded body becomes the `skill` tool's result,
+  so the instructions enter the conversation and the turn continues — kloop
+  returns the body as a tool result rather than queueing a separate user message
+  like cc's SkillTool.
 - **`fork`**: the body runs as an **isolated sub-agent** (reusing the `run_agent`
   machinery), and only its final result comes back — the skill's intermediate
   work (tool calls, scratch output) stays out of the delegating model's context.
@@ -4061,10 +4016,12 @@ Expansion substitutes `$ARGUMENTS` (the whole argument string), `$N` (the Nth
 shell-split word, 0-indexed), and `${CLAUDE_SKILL_DIR}` (the skill's directory,
 so a skill can point at its own bundled `scripts/*`). When the body has no
 argument placeholder but arguments were given, they are appended as an
-`ARGUMENTS:` line. 模板变量替换本身不执行脚本。脚本可由模型通过常规 `bash`
-调用执行，显式命令注入见后文；内置 PR 元数据预处理见上文。激活 `skill` 本身
-仍按只读操作处理，预处理查询、命令注入、fork 子代理以及正文引导的后续工具
-分别面对自己的权限门，激活一个 skill 不授予其后续操作权限。
+`ARGUMENTS:` line. A skill **does not execute anything itself**: to run a bundled
+script the model issues a normal `bash` call on the `${CLAUDE_SKILL_DIR}` path,
+which faces the permission gate like any command. The `skill` tool is read-only
+(activating a skill has no system side effect — cc never prompts for it); a fork
+skill's sub-agent and any tool an inline skill's instructions later prompt are
+each gated on their own.
 
 Plan 54's exact 2.1.220 fixtures confirm this as the same model-visible,
 progressively disclosed capability, with an intentional surface/lifecycle

@@ -1817,12 +1817,10 @@ dependencies = [
  "serde_yaml_ng",
  "sha2 0.11.0",
  "similar 3.2.0",
- "tempfile",
  "tokio",
  "tokio-util",
  "tree-sitter",
  "tree-sitter-bash",
- "url",
  "windows-sys 0.61.2",
 ]
 

@@ -35,7 +35,6 @@ mod plan_mode;
 mod powershell;
 mod provenance_store;
 mod question;
-pub(crate) mod review;
 mod run_store;
 mod scheduler;
 mod search;
@@ -443,12 +442,12 @@ pub struct ToolCtx {
     pub cfg: Arc<Config>,
     pub ui: Arc<dyn Ui>,
     pub cancel: CancellationToken,
-    /// 拒绝审批或原生交还后停止接纳调用；与 `cancel` 不同，已开始的调用完成，
-    /// 未开始的不运行，当前批次结束后交还。前台调用树共享此信号，后台执行独立持有。
+    /// The user answered an approval No (plan 216). Unlike `cancel` nothing is
+    /// interrupted: calls already running finish, calls not yet started do not
+    /// run, and the turn ends after this batch. Shared down the foreground turn
+    /// tree — a No inside a foreground sub-agent stops its parent too — while a
+    /// background agent or program carries its own.
     pub stop: CancellationToken,
-    pub(crate) turn_reply: Arc<std::sync::Mutex<Option<String>>>,
-    pub(crate) review_update: Arc<std::sync::Mutex<Option<review::State>>>,
-    pub(crate) review_targets: Vec<(String, String)>,
     pub depth: u8,
     /// The execution enclosing this tool call. Root turns have none; admitted
     /// Agent turns and Program/Workflow bridges replace it with their fixed ref.
@@ -484,17 +483,6 @@ pub struct ToolCtx {
 }
 
 impl ToolCtx {
-    pub(crate) fn return_to_user(&self, text: String) {
-        let mut reply = self
-            .turn_reply
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if reply.is_none() && !self.stop.is_cancelled() {
-            *reply = Some(text);
-            self.stop.cancel();
-        }
-    }
-
     /// A top-level context for a command the harness runs on its own — a
     /// `/name` `!cmd` injection, a scheduled `check` — rather than one the
     /// model called. It streams nothing: the permission prompt, which rides the
@@ -505,9 +493,6 @@ impl ToolCtx {
             ui: Arc::new(SilentHarnessUi),
             cancel,
             stop: CancellationToken::new(),
-            turn_reply: Arc::new(std::sync::Mutex::new(None)),
-            review_update: Arc::new(std::sync::Mutex::new(None)),
-            review_targets: Vec::new(),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -975,8 +960,6 @@ pub async fn dispatch_tools(
         let batch = &tool_uses[i..j];
         if ctx.cancel.is_cancelled() {
             results.extend(batch.iter().map(|(id, _, _)| interrupted(id)));
-        } else if preparing_review(ctx) {
-            results.extend(batch.iter().map(|(id, _, _)| pending_review(id)));
         } else if safe {
             // One permit per call in flight. join_all still yields results in
             // request order, and a finished call drops its permit at once, so
@@ -1008,8 +991,6 @@ pub async fn dispatch_tools(
             for (id, name, input) in batch {
                 if ctx.cancel.is_cancelled() {
                     results.push(interrupted(id));
-                } else if preparing_review(ctx) {
-                    results.push(pending_review(id));
                 } else {
                     results.push(
                         run_one(
@@ -1029,23 +1010,6 @@ pub async fn dispatch_tools(
     results
 }
 
-fn preparing_review(ctx: &ToolCtx) -> bool {
-    matches!(
-        *ctx.review_update
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
-        Some(review::State::Resolve { .. })
-    )
-}
-
-fn pending_review(id: &str) -> ContentBlock {
-    ContentBlock::ToolResult {
-        tool_use_id: id.into(),
-        content: "Not run: native PR preparation must finish before further tools.".into(),
-        is_error: true,
-    }
-}
-
 /// The in-process cancellation result: the call knows how far it got. A killed
 /// session's orphans get their own two texts from rollout repair instead.
 pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
@@ -1056,8 +1020,9 @@ pub(crate) fn interrupted(tool_use_id: &str) -> ContentBlock {
     }
 }
 
-/// 当前 turn 已停止接纳调用，此调用尚未开始或仍在等待审批。
-pub(super) const NOT_RUN_STOPPED: &str = "Not run: the turn stopped before this call ran.";
+/// A call the user's stop reached before it ran: never started, or its
+/// approval was still waiting when another one was answered No.
+pub(super) const NOT_RUN_STOPPED: &str = "Not run: the user stopped the turn before this call ran.";
 
 fn not_run(tool_use_id: &str) -> ContentBlock {
     ContentBlock::ToolResult {
@@ -2184,9 +2149,6 @@ pub(crate) mod testutil {
             ui: Arc::new(SilentUi),
             cancel: CancellationToken::new(),
             stop: CancellationToken::new(),
-            turn_reply: Arc::new(std::sync::Mutex::new(None)),
-            review_update: Arc::new(std::sync::Mutex::new(None)),
-            review_targets: Vec::new(),
             depth,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4488,9 +4450,6 @@ mod tests {
             ui: Arc::new(NullUi),
             cancel,
             stop: CancellationToken::new(),
-            turn_reply: Arc::new(std::sync::Mutex::new(None)),
-            review_update: Arc::new(std::sync::Mutex::new(None)),
-            review_targets: Vec::new(),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
