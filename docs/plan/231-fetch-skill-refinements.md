@@ -47,6 +47,14 @@
   的顺序屏障，已随 plan 230 回退；但分类本身的理由与 review 无关，仍然成立，因此这次
   按分类本身改回 `false`。
 
+第二轮复核又一条，也成立：把标记换成精确类型名单时**收窄了原先能读的类型**——
+`application/x-ndjson`、`application/json-seq`、`application/x-javascript` 原先靠
+`json` / `javascript` 标记通过，改后既不在名单里也不满足结构化后缀，会退回
+"unsupported content type"。改为：剥参数后按**子类型**判断，结构化后缀与安全标记各自
+判断，只有二进制也会含的标记（`x-sh`、`sql`）整体匹配。按同一判据排查发现 `sql` 会命中
+`application/x-sqlite3`（二进制），一并整体匹配，并补上 `x-ndjson` / `json-seq` /
+`x-javascript` 正例与 `x-sqlite3`、`application/octet-stream; x=json` 反例。
+
 ## 验证
 
 - `cargo test -p kloop-web`：31 项通过（含新增的同站跳转标注、`Retry-After` 合法与

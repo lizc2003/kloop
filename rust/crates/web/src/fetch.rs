@@ -171,34 +171,52 @@ fn same_site(from: &Url, to: &Url) -> bool {
 
 /// Content types this tool treats as text.
 ///
-/// The type is matched as a whole, never by substring: a substring test accepts
-/// `application/x-sharedlib` and `application/x-shockwave-flash` as text and
-/// hands the model lossy-decoded noise where it used to get an unsupported-type
-/// error. Parameters (`;charset=…`) are dropped first, and the structured
-/// `+json` / `+xml` / … suffix is checked on what is left.
+/// Parameters (`;charset=…`) are dropped and the decision is made on the
+/// **subtype**, never on a substring of the whole type. Markers a binary can
+/// also contain are matched whole (`x-sh` vs `application/x-sharedlib` and
+/// `application/x-shockwave-flash`; `sql` vs `application/x-sqlite3`), and the
+/// rest (json, xml, javascript, …) stay markers because naming exact spellings
+/// would drop `application/x-ndjson`, `application/json-seq` and
+/// `application/x-javascript`. Matching the subtype rather than the raw type is
+/// also what stops a parameter from carrying a marker in.
 fn is_text_content_type(content_type: &str) -> bool {
     let essence = content_type.split(';').next().unwrap_or_default().trim();
     if essence.is_empty() || essence.starts_with("text/") {
         return true;
     }
-    const EXACT: &[&str] = &[
-        "application/json",
-        "application/xml",
-        "application/javascript",
-        "application/ecmascript",
-        "application/yaml",
-        "application/x-yaml",
-        "application/toml",
-        "application/x-toml",
-        "application/x-sh",
-        "application/x-shellscript",
-        "application/sql",
-        "application/csv",
-        "application/markdown",
-    ];
-    const SUFFIXES: &[&str] = &["+json", "+xml", "+text", "+yaml", "+toml"];
-    EXACT.contains(&essence) || SUFFIXES.iter().any(|suffix| essence.ends_with(suffix))
+    let Some((_, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    // The structured-syntax suffix of a text format: `+json`, `+xml`, `+yaml`…
+    if STRUCTURED_SUFFIXES
+        .iter()
+        .any(|suffix| subtype.ends_with(suffix))
+    {
+        return true;
+    }
+    // Markers a binary spelling can also contain — `x-sharedlib`,
+    // `x-shockwave-flash`, `x-sqlite3` — so these are matched whole.
+    if matches!(subtype, "x-sh" | "x-shellscript" | "sql" | "x-sql") {
+        return true;
+    }
+    TEXT_SUBTYPE_MARKERS
+        .iter()
+        .any(|marker| subtype.contains(marker))
 }
+
+const TEXT_SUBTYPE_MARKERS: &[&str] = &[
+    "json",
+    "xml",
+    "javascript",
+    "ecmascript",
+    "yaml",
+    "toml",
+    "csv",
+    "markdown",
+    "shellscript",
+];
+
+const STRUCTURED_SUFFIXES: &[&str] = &["+json", "+xml", "+text", "+yaml", "+toml"];
 
 async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -> Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
@@ -400,14 +418,20 @@ mod tests {
         }
     }
 
-    /// The text-type decision is made on the whole type, parameters stripped: a
-    /// substring test would accept a binary that merely contains a marker.
+    /// The text-type decision is made on the subtype, parameters stripped: a
+    /// substring test over the whole type accepts a binary that merely contains
+    /// a marker, and an exact list loses the JSON-ish spellings.
     #[test]
-    fn text_content_types_match_the_whole_type() {
+    fn text_content_types_match_the_subtype() {
         for content_type in [
             "text/plain",
             "application/json",
+            "application/x-ndjson",
+            "application/json-seq",
+            "application/x-javascript",
             "application/x-yaml; charset=utf-8",
+            "application/x-sh",
+            "application/sql",
             "application/schema+json",
             "image/svg+xml",
             "",
@@ -417,7 +441,10 @@ mod tests {
         for content_type in [
             "application/x-sharedlib",
             "application/x-shockwave-flash",
+            "application/x-sqlite3",
             "application/octet-stream",
+            // A parameter must not be able to smuggle a marker in.
+            "application/octet-stream; x=json",
             "application/pdf",
             "image/png",
         ] {
@@ -653,6 +680,9 @@ mod tests {
             ("/script.sh", "application/x-sh"),
             ("/notes.toml", "application/toml; charset=utf-8"),
             ("/schema.json", "application/schema+json"),
+            ("/rows.ndjson", "application/x-ndjson"),
+            ("/seq.json", "application/json-seq"),
+            ("/legacy.js", "application/x-javascript"),
         ] {
             Mock::given(method("GET"))
                 .and(path(route))
@@ -668,11 +698,12 @@ mod tests {
                 .unwrap();
             assert_eq!(out, "key: value", "{content_type}");
         }
-        // Both of these contain "x-sh" as a substring but are binary: they keep
+        // These contain a text marker as a substring but are binary: they keep
         // the unsupported-type answer rather than arriving as lossy noise.
         for (route, content_type) in [
             ("/sharedlib", "application/x-sharedlib"),
             ("/flash", "application/x-shockwave-flash"),
+            ("/sqlite", "application/x-sqlite3"),
         ] {
             Mock::given(method("GET"))
                 .and(path(route))
