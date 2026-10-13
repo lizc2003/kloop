@@ -1,8 +1,8 @@
 # Plan 211 — 先补基础编辑，再做可靠撤销
 
 > 来源：2026-09-24 调研 Pi 的输入框编辑机制，见 `refs/README.md`「Pi 全面复查」第 9 条。
-> **2026-10-10 修订，待实现。** 本次只修改计划，用户会在新会话实现；没有新增任何按键功能。
-> **下一会话默认只做第一阶段。** 撤销是后续独立任务，启动时另立 plan；高级剪切功能暂缓。
+> **2026-10-13 第一阶段已实现**（见第九节）：基础行/词编辑已落地。撤销是后续独立任务、
+> 启动时另立 plan；高级剪切暂缓。第二至五节是第一阶段依据，第六、七节仍是后续边界。
 
 ## 一、当前缺口与已修的旧前提
 
@@ -204,3 +204,26 @@ String（`rust/crates/protocol/src/lib.rs:407`）。直接 clone 会在编辑普
   文档差异与 `git diff --check`，暂存后再跑 `git diff --cached --check`；按纯文档规则不运行
   `make check`、release 检查或其他编译测试。
   文档修订提交 SHA 以本条所在提交为准，不能当成第一阶段的实现提交。
+
+## 九、完成记录
+
+✅ 2026-10-13，提交见下（`feat(plan211): ...`）。**第一阶段（第二节：基础行编辑与按词
+编辑）已完成；撤销（第六节）与高级剪切（第七节）未实现，按各自边界另立 plan。**
+
+- **第四节问与答（2026-10-13）**：用户同意推荐——**词按字符类切**：字母数字（含 `_`）一段、
+  标点一段、空白跳过，`\n` 当空白。汉字属字母数字类，连续中文到空白/标点为止算一段，
+  所以 Ctrl+W 一次删掉整段中文；不采用 UAX#29。
+- **实现落点**：`composer.rs` 新增 `Cell` 词扫描、`ComposerDocument::delete_covering`
+  （范围先扩到完整原子再整体删）、`ComposerAction` 与 `Composer::apply`；`app.rs` 新增穷尽
+  映射 `composer_action`，区分 Ctrl / Alt / Ctrl+Alt，未绑定 Meta 键不插入字符。
+- **验证**：
+  - composer 单测：`foo  bar.baz` 逐落点词移动/删除、跨硬行、CJK/ZWJ 字素安全、paste atom
+    整体（含相邻原子、从标签内部起步）、Ctrl+U/K 硬行与边缘 `\n`、空文档与两端无操作。
+  - app 单测：表驱动断言整张键位（普通/Ctrl/Alt/Shift/Ctrl+Alt），保留键（Ctrl+D/H/J/N/P/V/R/C、
+    Tab/Esc/Enter）不误触；打开补全菜单后 Ctrl+W/Ctrl+U 正确重过滤或关闭。
+  - 真实 PTY（`tui_pty.rs`）：三条用例用原始字节发送 `ESC DEL`、`ESC b/f`、CSI `1;3D/C`、
+    `1;5D/C`、`127;5u` 与 C0 字节 `0x01/0x05/0x0b/0x15/0x17`，断言本地假 provider 实际收到
+    的完整用户文本。
+  - `make check` 全绿（fmt + clippy + workspace debug 全量测试 + 本机 parity）。
+  - 平台边界：PTY 证据只在 macOS 上跑，Windows 未执行，不借 macOS 结果声称 Windows 已跑。
+- 未运行 `make check-release`（按约定不属提交门禁）。

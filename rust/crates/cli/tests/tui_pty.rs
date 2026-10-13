@@ -34,6 +34,22 @@ const RIGHT: &[u8] = b"\x1b[C";
 const BACKSPACE: &[u8] = b"\x7f";
 const DELETE: &[u8] = b"\x1b[3~";
 const ENTER: &[u8] = b"\r";
+// Composer editing chords (plan 211), in the raw encodings a terminal sends:
+// C0 control bytes for the Ctrl letters, `ESC`+byte for Meta chords, and
+// CSI modifier forms for the modified arrows / Ctrl+Backspace.
+const CTRL_A: &[u8] = b"\x01";
+const CTRL_E: &[u8] = b"\x05";
+const CTRL_K: &[u8] = b"\x0b";
+const CTRL_U: &[u8] = b"\x15";
+const CTRL_W: &[u8] = b"\x17";
+const ALT_BACKSPACE: &[u8] = b"\x1b\x7f";
+const ALT_B: &[u8] = b"\x1bb";
+const ALT_F: &[u8] = b"\x1bf";
+const ALT_LEFT: &[u8] = b"\x1b[1;3D";
+const ALT_RIGHT: &[u8] = b"\x1b[1;3C";
+const CTRL_LEFT: &[u8] = b"\x1b[1;5D";
+const CTRL_RIGHT: &[u8] = b"\x1b[1;5C";
+const CTRL_BACKSPACE: &[u8] = b"\x1b[127;5u";
 const SHIFT_ENTER_CSI_U: &[u8] = b"\x1b[13;2u";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
@@ -470,6 +486,98 @@ async fn unicode_input_round_trips_through_real_binary_editing() -> Result<()> {
         Some(expected)
     );
 
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// Press Enter and assert the fake provider received exactly `expected` as the
+/// user text, so the assertion is about what editing produced, not the screen.
+fn submit_and_expect(
+    harness: &mut PtyHarness,
+    fixture: &ChatFixture,
+    ack: &str,
+    expected: &str,
+) -> Result<()> {
+    harness.write(ENTER)?;
+    harness.wait_for("edited turn", Duration::from_secs(8), |frame| {
+        frame.contains(ack) && !frame.contains("Working")
+    })?;
+    let requests = fixture.requests();
+    let request = requests.last().expect("one OpenAI request");
+    assert_eq!(request.model, "tui-pty-model");
+    assert_eq!(
+        request.user_texts.last().map(String::as_str),
+        Some(expected)
+    );
+    Ok(())
+}
+
+/// Word motion and word deletion driven by the raw Meta encodings: `ESC`+`b`/`f`
+/// (what macOS Terminal sends for Option+letter), `ESC DEL` for Option+Backspace,
+/// and the CSI modifier forms for Option/Control+arrow and Ctrl+Backspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_word_keys_round_trip_through_real_terminal_bytes() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("META_ACK")]).await;
+    let mut harness = spawn(&fixture, 24, 100)?;
+    wait_for_boot(&mut harness)?;
+
+    harness.write(b"one two three")?;
+    harness.write(ALT_BACKSPACE)?; // delete "three" -> "one two "
+    harness.write(ALT_B)?; // start of "two"
+    harness.write(ALT_B)?; // start of "one"
+    harness.write(ALT_F)?; // end of "one"
+    harness.write(b"X")?; // "oneX two "
+    harness.write(CTRL_LEFT)?; // start of "oneX"
+    harness.write(CTRL_RIGHT)?; // end of "oneX"
+    harness.write(ALT_LEFT)?; // start of "oneX"
+    harness.write(ALT_RIGHT)?; // end of "oneX"
+    harness.write(CTRL_BACKSPACE)?; // delete "oneX" -> " two "
+    harness.write(b"Z")?; // "Z two "
+
+    submit_and_expect(&mut harness, &fixture, "META_ACK", "Z two ")?;
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// Ctrl+A/E (hard line ends), Ctrl+W (word delete) and Ctrl+U (kill to line
+/// start), sent as their C0 control bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_base_editing_keys_round_trip_through_real_terminal_bytes() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("CTRL_ACK")]).await;
+    let mut harness = spawn(&fixture, 24, 100)?;
+    wait_for_boot(&mut harness)?;
+
+    harness.write(b"head tail")?;
+    harness.write(CTRL_A)?; // line start
+    harness.write(b"Z")?; // "Zhead tail"
+    harness.write(CTRL_E)?; // line end
+    harness.write(CTRL_W)?; // delete "tail" -> "Zhead "
+    harness.write(b"tail")?; // "Zhead tail"
+    harness.write(CTRL_U)?; // kill to line start -> ""
+
+    harness.write(b"final")?;
+    submit_and_expect(&mut harness, &fixture, "CTRL_ACK", "final")?;
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// Ctrl+K kills to the hard line end after Ctrl+Right moved to a word boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_kill_to_line_end_round_trips_through_real_terminal_bytes() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("KILL_ACK")]).await;
+    let mut harness = spawn(&fixture, 24, 100)?;
+    wait_for_boot(&mut harness)?;
+
+    harness.write(b"alpha beta delta")?;
+    harness.write(CTRL_A)?; // line start
+    harness.write(CTRL_RIGHT)?; // end of "alpha"
+    harness.write(CTRL_K)?; // kill to line end -> "alpha"
+    harness.write(b"!")?; // "alpha!"
+
+    submit_and_expect(&mut harness, &fixture, "KILL_ACK", "alpha!")?;
     graceful_exit(&mut harness)?;
     Ok(())
 }

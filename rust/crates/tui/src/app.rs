@@ -38,6 +38,7 @@ use kloop_protocol::RoutePickerStage;
 use tokio::sync::oneshot;
 
 use crate::composer::Composer;
+use crate::composer::ComposerAction;
 use crate::events::AgentEvent;
 use crate::menu;
 
@@ -62,6 +63,49 @@ fn is_composer_newline_key(key: &KeyEvent) -> bool {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     (key.code == KeyCode::Enter && (shift || alt)) || (key.code == KeyCode::Char('j') && ctrl)
+}
+
+/// The composer edit a key performs, or `None` for anything else. Ctrl and Alt
+/// are told apart (`Ctrl+B` moves a grapheme, `Alt+B` a word) so a combined
+/// chord — AltGr reaches Windows as Ctrl+Alt — cannot trip a single-modifier
+/// action, and an unbound Meta chord is `None`, not typed text.
+fn composer_action(key: &KeyEvent) -> Option<ComposerAction> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        // Ctrl chords: line ends, one grapheme, word motion and the line kills.
+        KeyCode::Char('a') if ctrl && !alt => Some(ComposerAction::MoveLineStart),
+        KeyCode::Char('e') if ctrl && !alt => Some(ComposerAction::MoveLineEnd),
+        KeyCode::Char('b') if ctrl && !alt => Some(ComposerAction::MoveLeft),
+        KeyCode::Char('f') if ctrl && !alt => Some(ComposerAction::MoveRight),
+        KeyCode::Char('w') if ctrl && !alt => Some(ComposerAction::DeleteWordBefore),
+        KeyCode::Char('u') if ctrl && !alt => Some(ComposerAction::KillToLineStart),
+        KeyCode::Char('k') if ctrl && !alt => Some(ComposerAction::KillToLineEnd),
+        // Meta chords. macOS Terminal sends Option+← as `ESC b`, which crossterm
+        // parses as Alt+'b', so the letter and the arrow both mean word motion.
+        KeyCode::Char('b') if alt && !ctrl => Some(ComposerAction::MoveWordLeft),
+        KeyCode::Char('f') if alt && !ctrl => Some(ComposerAction::MoveWordRight),
+        KeyCode::Char('d') if alt && !ctrl => Some(ComposerAction::DeleteWordAfter),
+        // Word motion also answers Ctrl+←/→; Ctrl+Backspace deletes the previous
+        // word only where the terminal distinguishes it from a plain Backspace
+        // (Ctrl+H is NOT an alias — legacy terminals send it for Backspace).
+        KeyCode::Left if ctrl || alt => Some(ComposerAction::MoveWordLeft),
+        KeyCode::Right if ctrl || alt => Some(ComposerAction::MoveWordRight),
+        KeyCode::Backspace if ctrl || alt => Some(ComposerAction::DeleteWordBefore),
+        KeyCode::Delete if alt => Some(ComposerAction::DeleteWordAfter),
+        // Plain editing keys.
+        KeyCode::Left => Some(ComposerAction::MoveLeft),
+        KeyCode::Right => Some(ComposerAction::MoveRight),
+        KeyCode::Up => Some(ComposerAction::MoveUp),
+        KeyCode::Down => Some(ComposerAction::MoveDown),
+        KeyCode::Home => Some(ComposerAction::MoveLineStart),
+        KeyCode::End => Some(ComposerAction::MoveLineEnd),
+        KeyCode::Backspace => Some(ComposerAction::DeleteBackward),
+        KeyCode::Delete => Some(ComposerAction::DeleteForward),
+        // Only an unmodified (Shift aside, for capitals) character types.
+        KeyCode::Char(character) if !ctrl && !alt => Some(ComposerAction::Insert(character)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1554,25 +1598,15 @@ impl App {
                 self.mode = self.mode.cycled();
                 return Command::SetMode(self.mode);
             }
-            // Up/Down move the composer cursor, or step through input history at
-            // the first/last line (plan 38 slice 3).
-            (KeyCode::Up, _) => self.composer.up(composer_width),
-            (KeyCode::Down, _) => self.composer.down(composer_width),
-            // Alt+letter is a Meta chord (macOS Terminal sends Option+← as
-            // `ESC b`, which crossterm parses as Alt+'b'), not text: it falls to
-            // the swallowing arm below instead of typing the letter.
-            (KeyCode::Char(c), false) if !alt => self.composer.insert_char(c),
-            (KeyCode::Backspace, _) => self.composer.backspace(),
-            (KeyCode::Delete, _) => self.composer.delete(),
-            (KeyCode::Left, _) => self.composer.left(),
-            (KeyCode::Right, _) => self.composer.right(),
-            (KeyCode::Home, _) => self.composer.home(),
-            (KeyCode::End, _) => self.composer.end(),
-            // Scrolling the transcript is the terminal's job now (inline
-            // viewport, plan 38 slice 0): history lives in native scrollback,
-            // so the mouse wheel / PageUp reach it directly. The old in-app
-            // scroll keys are retired.
-            _ => return Command::None,
+            // Everything else that edits the composer goes through
+            // `composer_action`; a key it does not know is consumed silently —
+            // this is where an unbound Meta chord is swallowed and where the
+            // retired in-app scroll keys (the terminal's native scrollback owns
+            // scrolling now) land.
+            _ => match composer_action(&key) {
+                Some(action) => self.composer.apply(action, composer_width),
+                None => return Command::None,
+            },
         }
         // A composer-editing key ran: re-sync the completion popup from the new
         // text/cursor (open/refilter a `/`/`@` menu, request a file search, or
@@ -2559,6 +2593,10 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     fn front_confirm_cursor(app: &App) -> usize {
@@ -3971,21 +4009,22 @@ mod tests {
         assert_eq!(app.composer.text(), "v");
     }
 
-    /// Alt (or Ctrl+Alt, AltGr on Windows) + a letter types nothing: terminals
-    /// that treat Option as Meta send such chords for word motion.
+    /// Alt (or Ctrl+Alt, AltGr on Windows) + an unbound letter types nothing:
+    /// terminals that treat Option as Meta send such chords for word motion.
     #[test]
     fn alt_letter_does_not_type_the_letter() {
         let mut app = App::new("s".into());
-        let alt_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT);
-        assert_eq!(app.on_key(80, alt_b), Command::None);
+        type_str(&mut app, "hello");
+        assert_eq!(app.on_key(80, alt('q')), Command::None);
         let ctrl_alt_q = KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
         assert_eq!(app.on_key(80, ctrl_alt_q), Command::None);
-        assert_eq!(app.composer.text(), "");
+        assert_eq!(app.composer.text(), "hello");
+        assert_eq!(app.composer.cursor().get(), 5);
         app.on_key(80, key(KeyCode::Char('b')));
-        assert_eq!(app.composer.text(), "b");
+        assert_eq!(app.composer.text(), "hellob");
     }
 
     /// Esc is a two-tap clear while the composer holds anything (CC parity: the
@@ -5118,5 +5157,156 @@ mod tests {
             ]
         );
         assert_eq!(app.composer.text(), "a question");
+    }
+
+    /// The whole key table, asserted through the pure mapper so a terminal is
+    /// not needed: Ctrl and Alt are told apart, AltGr (Ctrl+Alt) and unbound
+    /// Meta chords map to nothing, and Ctrl+H is left as plain Backspace.
+    #[test]
+    fn composer_key_table_is_exhaustive_about_modifiers() {
+        let shift_char = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        let ctrl_alt =
+            |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let cases = vec![
+            (key(KeyCode::Char('a')), Some(ComposerAction::Insert('a'))),
+            (shift_char, Some(ComposerAction::Insert('A'))),
+            (alt('q'), None),
+            (ctrl_alt('b'), None),
+            (ctrl_alt('q'), None),
+            (ctrl('a'), Some(ComposerAction::MoveLineStart)),
+            (ctrl('e'), Some(ComposerAction::MoveLineEnd)),
+            (ctrl('b'), Some(ComposerAction::MoveLeft)),
+            (ctrl('f'), Some(ComposerAction::MoveRight)),
+            (ctrl('w'), Some(ComposerAction::DeleteWordBefore)),
+            (ctrl('u'), Some(ComposerAction::KillToLineStart)),
+            (ctrl('k'), Some(ComposerAction::KillToLineEnd)),
+            (alt('b'), Some(ComposerAction::MoveWordLeft)),
+            (alt('f'), Some(ComposerAction::MoveWordRight)),
+            (alt('d'), Some(ComposerAction::DeleteWordAfter)),
+            (
+                KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+                Some(ComposerAction::MoveWordLeft),
+            ),
+            (
+                KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+                Some(ComposerAction::MoveWordRight),
+            ),
+            (
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+                Some(ComposerAction::MoveWordLeft),
+            ),
+            (
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+                Some(ComposerAction::DeleteWordBefore),
+            ),
+            (
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+                Some(ComposerAction::DeleteWordBefore),
+            ),
+            (
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT),
+                Some(ComposerAction::DeleteWordAfter),
+            ),
+            (key(KeyCode::Left), Some(ComposerAction::MoveLeft)),
+            (key(KeyCode::Right), Some(ComposerAction::MoveRight)),
+            (key(KeyCode::Up), Some(ComposerAction::MoveUp)),
+            (key(KeyCode::Down), Some(ComposerAction::MoveDown)),
+            (key(KeyCode::Home), Some(ComposerAction::MoveLineStart)),
+            (key(KeyCode::End), Some(ComposerAction::MoveLineEnd)),
+            (
+                key(KeyCode::Backspace),
+                Some(ComposerAction::DeleteBackward),
+            ),
+            (key(KeyCode::Delete), Some(ComposerAction::DeleteForward)),
+            // Reserved keys stay unbound: Ctrl+D never quits here, Ctrl+H is
+            // not a word-delete alias, and Ctrl+J/P/N/T/V/R/C are handled (or
+            // ignored) elsewhere.
+            (ctrl('d'), None),
+            (ctrl('h'), None),
+            (ctrl('j'), None),
+            (ctrl('n'), None),
+            (ctrl('p'), None),
+            (ctrl('v'), None),
+            (ctrl('r'), None),
+            (ctrl('c'), None),
+            (key(KeyCode::Tab), None),
+            (key(KeyCode::Esc), None),
+            (key(KeyCode::Enter), None),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(composer_action(&event), expected, "{event:?}");
+        }
+    }
+
+    /// The new chords edit the composer through `on_key`, including the hard-line
+    /// Ctrl+U/K that cross a newline only at the line edge.
+    #[test]
+    fn word_and_line_chords_edit_the_composer() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "foo  bar.baz");
+        assert_eq!(app.on_key(80, ctrl('w')), Command::None);
+        assert_eq!(app.composer.text(), "foo  bar.");
+        assert_eq!(app.on_key(80, ctrl('u')), Command::None);
+        assert_eq!(app.composer.text(), "");
+
+        type_str(&mut app, "foo  bar.baz");
+        assert_eq!(app.on_key(80, ctrl('a')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 0);
+        assert_eq!(app.on_key(80, alt('f')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 3);
+        assert_eq!(app.on_key(80, alt('f')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 8);
+        assert_eq!(app.on_key(80, ctrl('e')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 12);
+        assert_eq!(app.on_key(80, alt('b')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 9);
+        assert_eq!(app.on_key(80, alt('b')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 8);
+        assert_eq!(app.on_key(80, alt('d')), Command::None);
+        assert_eq!(app.composer.text(), "foo  barbaz");
+
+        // Ctrl+A/Ctrl+U are hard-line edits: at the start of the second line
+        // the kill takes the newline separator before it.
+        let mut app = App::new("s".into());
+        type_str(&mut app, "ab");
+        app.on_key(80, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_str(&mut app, "cd");
+        assert_eq!(app.on_key(80, ctrl('a')), Command::None);
+        assert_eq!(app.composer.cursor().get(), 3);
+        assert_eq!(app.on_key(80, ctrl('u')), Command::None);
+        assert_eq!(app.composer.text(), "abcd");
+        assert_eq!(app.composer.cursor().get(), 2);
+
+        // Ctrl+K at the end of the first line removes the newline after it.
+        let mut app = App::new("s".into());
+        type_str(&mut app, "ab");
+        app.on_key(80, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_str(&mut app, "cd");
+        assert_eq!(app.on_key(80, ctrl('a')), Command::None);
+        assert_eq!(app.on_key(80, key(KeyCode::Left)), Command::None);
+        assert_eq!(app.composer.cursor().get(), 2);
+        assert_eq!(app.on_key(80, ctrl('k')), Command::None);
+        assert_eq!(app.composer.text(), "abcd");
+        assert_eq!(app.composer.cursor().get(), 2);
+    }
+
+    /// The new editing keys re-sync an open completion menu like any other edit.
+    #[test]
+    fn editing_keys_refilter_or_close_the_completion_menu() {
+        let mut app = app_with_commands();
+        type_str(&mut app, "/co");
+        assert!(app.popup.is_some());
+        // Ctrl+W removes the query word in place, so the popup refilters down
+        // to the bare `/` menu rather than closing.
+        assert_eq!(app.on_key(80, ctrl('w')), Command::None);
+        assert_eq!(app.composer.text(), "/");
+        assert!(
+            app.popup.is_some(),
+            "the bare slash menu replaces the filtered one"
+        );
+        // Ctrl+U clears the line, which leaves no trigger and closes the menu.
+        assert_eq!(app.on_key(80, ctrl('u')), Command::None);
+        assert_eq!(app.composer.text(), "");
+        assert!(app.popup.is_none());
     }
 }

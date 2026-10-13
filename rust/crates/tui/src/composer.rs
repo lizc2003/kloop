@@ -71,6 +71,47 @@ impl ComposerDocument {
         expanded
     }
 
+    /// The display split into word-scan cells: one per grapheme, but a paste
+    /// atom is a single cell, so a scan never stops inside a label.
+    fn cells(&self) -> Vec<Cell> {
+        let mut cells = Vec::new();
+        let mut copied = 0;
+        for atom in &self.atoms {
+            push_text_cells(
+                &mut cells,
+                &self.display[copied..atom.range.start().get()],
+                copied,
+            );
+            cells.push(Cell {
+                range: atom.range,
+                class: CellClass::Atom,
+            });
+            copied = atom.range.end().get();
+        }
+        push_text_cells(&mut cells, &self.display[copied..], copied);
+        cells
+    }
+
+    /// Delete `range` without splitting a paste atom: any atom it touches is
+    /// extended to its full range and removed with its label and payload, rather
+    /// than materialized. Unlike [`ComposerDocument::replace`] this never runs a
+    /// word scan over expanded payload. Returns the resulting cursor.
+    fn delete_covering(&mut self, mut range: TextRange) -> ByteOffset {
+        self.assert_range(range);
+        for atom in &self.atoms {
+            if atom.range.intersects(range) {
+                range = TextRange::new(
+                    range.start().min(atom.range.start()),
+                    range.end().max(atom.range.end()),
+                );
+            }
+        }
+        self.atoms.retain(|atom| !atom.range.intersects(range));
+        let cursor = self.replace_raw(range, "");
+        self.assert_invariants();
+        cursor
+    }
+
     fn atom_ending_at(&self, offset: ByteOffset) -> Option<usize> {
         self.atoms
             .iter()
@@ -224,6 +265,65 @@ impl ComposerDocument {
             previous_end = atom.range.end();
         }
     }
+}
+
+/// The indivisible units a word scan steps over: one cell per grapheme, and
+/// one cell for a whole paste atom however long its label is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellClass {
+    Whitespace,
+    Word,
+    Punct,
+    Atom,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Cell {
+    range: TextRange,
+    class: CellClass,
+}
+
+/// A grapheme is a word when it starts with an alphanumeric or `_`, whitespace
+/// when it starts with a whitespace character (so `\n` is a word-scan
+/// separator, and word motion crosses hard lines), and punctuation otherwise.
+/// Classifying by the first scalar keeps decomposed clusters like `e`+U+0301 in
+/// the same class as their precomposed form.
+fn grapheme_class(grapheme: &str) -> CellClass {
+    match grapheme.chars().next() {
+        Some(character) if character == '_' || character.is_alphanumeric() => CellClass::Word,
+        Some(character) if character.is_whitespace() => CellClass::Whitespace,
+        _ => CellClass::Punct,
+    }
+}
+
+fn push_text_cells(cells: &mut Vec<Cell>, text: &str, base: usize) {
+    for (range, grapheme) in grapheme_ranges(text) {
+        cells.push(Cell {
+            range: TextRange::new(
+                ByteOffset::new(base + range.start().get()),
+                ByteOffset::new(base + range.end().get()),
+            ),
+            class: grapheme_class(grapheme),
+        });
+    }
+}
+
+/// The index of the cell strictly containing `offset`. Grapheme cells never do
+/// — the cursor only lands on their boundaries — so this only finds an atom the
+/// cursor was placed inside (e.g. by visual-row navigation).
+fn cell_containing(cells: &[Cell], offset: ByteOffset) -> Option<usize> {
+    cells
+        .iter()
+        .position(|cell| cell.range.start() < offset && offset < cell.range.end())
+}
+
+/// The index of the first cell starting at or after `offset`; `cells.len()` when
+/// `offset` is at or past the end.
+fn cell_boundary(cells: &[Cell], offset: ByteOffset) -> usize {
+    cells
+        .iter()
+        .position(|cell| cell.range.start() >= offset)
+        .unwrap_or(cells.len())
 }
 
 fn shift_range(range: TextRange, removed: usize, inserted: usize) -> TextRange {
@@ -415,6 +515,28 @@ pub struct Submission {
     pub images: Vec<ContentBlock>,
 }
 
+/// One composer edit reachable from a key. `app.rs` owns which key maps to which
+/// action; `Composer` owns what the action does, so the key table can be
+/// asserted exhaustively without a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposerAction {
+    Insert(char),
+    MoveLeft,
+    MoveRight,
+    MoveWordLeft,
+    MoveWordRight,
+    MoveLineStart,
+    MoveLineEnd,
+    MoveUp,
+    MoveDown,
+    DeleteBackward,
+    DeleteForward,
+    DeleteWordBefore,
+    DeleteWordAfter,
+    KillToLineStart,
+    KillToLineEnd,
+}
+
 pub struct Composer {
     document: ComposerDocument,
     cursor: ByteOffset,
@@ -576,6 +698,144 @@ impl Composer {
             previous_grapheme_boundary(self.text(), ByteOffset::new(raw + 1))
         };
         self.goal_column = None;
+    }
+
+    pub fn word_left(&mut self) {
+        self.cursor = self.word_left_offset();
+        self.goal_column = None;
+    }
+
+    pub fn word_right(&mut self) {
+        self.cursor = self.word_right_offset();
+        self.goal_column = None;
+    }
+
+    /// Delete from the cursor back to the start of the previous word: skip any
+    /// whitespace, then the whole run of the class found there. A paste atom is
+    /// one cell, so adjacent atoms go in one step and a scan started inside a
+    /// label never sees the label's own spaces or punctuation.
+    pub fn delete_word_before(&mut self) {
+        self.begin_edit();
+        let start = self.word_left_offset();
+        self.cursor = self
+            .document
+            .delete_covering(TextRange::new(start, self.cursor));
+        self.goal_column = None;
+    }
+
+    /// Mirror of [`Composer::delete_word_before`] towards the hard end.
+    pub fn delete_word_after(&mut self) {
+        self.begin_edit();
+        let end = self.word_right_offset();
+        self.cursor = self
+            .document
+            .delete_covering(TextRange::new(self.cursor, end));
+        self.goal_column = None;
+    }
+
+    /// Delete to the hard line start; already there, remove the `\n` before.
+    pub fn kill_to_line_start(&mut self) {
+        self.begin_edit();
+        let line_start = self.text()[..self.cursor.get()]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let range = if self.cursor.get() > line_start {
+            TextRange::new(ByteOffset::new(line_start), self.cursor)
+        } else if self.cursor > ByteOffset::ZERO {
+            TextRange::new(
+                previous_grapheme_boundary(self.text(), self.cursor),
+                self.cursor,
+            )
+        } else {
+            TextRange::empty(self.cursor)
+        };
+        self.cursor = self.document.delete_covering(range);
+        self.goal_column = None;
+    }
+
+    /// Delete to the hard line end; already there, remove the `\n` after.
+    pub fn kill_to_line_end(&mut self) {
+        self.begin_edit();
+        let line_end = self.text()[self.cursor.get()..]
+            .find('\n')
+            .map(|index| self.cursor.get() + index)
+            .unwrap_or_else(|| self.text().len());
+        let range = if self.cursor.get() < line_end {
+            TextRange::new(self.cursor, ByteOffset::new(line_end))
+        } else if self.cursor.get() < self.text().len() {
+            TextRange::new(
+                self.cursor,
+                next_grapheme_boundary(self.text(), self.cursor),
+            )
+        } else {
+            TextRange::empty(self.cursor)
+        };
+        self.cursor = self.document.delete_covering(range);
+        self.goal_column = None;
+    }
+
+    /// The offset a leftward word step lands on. A cursor sitting inside a paste
+    /// atom (only reachable through visual-row navigation) snaps to that atom's
+    /// start instead of a position within its label.
+    fn word_left_offset(&self) -> ByteOffset {
+        let cells = self.document.cells();
+        if let Some(index) = cell_containing(&cells, self.cursor) {
+            return cells[index].range.start();
+        }
+        let mut index = cell_boundary(&cells, self.cursor);
+        while index > 0 && cells[index - 1].class == CellClass::Whitespace {
+            index -= 1;
+        }
+        if index == 0 {
+            return ByteOffset::ZERO;
+        }
+        let class = cells[index - 1].class;
+        while index > 0 && cells[index - 1].class == class {
+            index -= 1;
+        }
+        cells[index].range.start()
+    }
+
+    /// The offset a rightward word step lands on; symmetric to
+    /// [`Composer::word_left_offset`], snapping a cursor inside an atom to its end.
+    fn word_right_offset(&self) -> ByteOffset {
+        let cells = self.document.cells();
+        if let Some(index) = cell_containing(&cells, self.cursor) {
+            return cells[index].range.end();
+        }
+        let mut index = cell_boundary(&cells, self.cursor);
+        while index < cells.len() && cells[index].class == CellClass::Whitespace {
+            index += 1;
+        }
+        if index == cells.len() {
+            return ByteOffset::new(self.text().len());
+        }
+        let class = cells[index].class;
+        while index < cells.len() && cells[index].class == class {
+            index += 1;
+        }
+        cells[index - 1].range.end()
+    }
+
+    pub(crate) fn apply(&mut self, action: ComposerAction, width: usize) {
+        match action {
+            ComposerAction::Insert(character) => self.insert_char(character),
+            ComposerAction::MoveLeft => self.left(),
+            ComposerAction::MoveRight => self.right(),
+            ComposerAction::MoveWordLeft => self.word_left(),
+            ComposerAction::MoveWordRight => self.word_right(),
+            ComposerAction::MoveLineStart => self.home(),
+            ComposerAction::MoveLineEnd => self.end(),
+            ComposerAction::MoveUp => self.up(width),
+            ComposerAction::MoveDown => self.down(width),
+            ComposerAction::DeleteBackward => self.backspace(),
+            ComposerAction::DeleteForward => self.delete(),
+            ComposerAction::DeleteWordBefore => self.delete_word_before(),
+            ComposerAction::DeleteWordAfter => self.delete_word_after(),
+            ComposerAction::KillToLineStart => self.kill_to_line_start(),
+            ComposerAction::KillToLineEnd => self.kill_to_line_end(),
+        }
     }
 
     pub fn up(&mut self, width: usize) {
@@ -1069,5 +1329,187 @@ mod tests {
             }
         }
         assert_eq!(reconstructed, composer.text());
+    }
+
+    #[test]
+    fn word_motion_and_deletion_follow_character_classes() {
+        let mut composer = typed("foo  bar.baz");
+        // Words are alphanumeric runs, punctuation is its own class, and
+        // whitespace is skipped: baz → . → bar → foo → start.
+        for expected in [9, 8, 5, 0, 0] {
+            composer.word_left();
+            assert_eq!(composer.cursor(), ByteOffset::new(expected));
+        }
+        // Symmetric on the way forward: foo → bar → . → baz → end.
+        for expected in [3, 8, 9, 12] {
+            composer.word_right();
+            assert_eq!(composer.cursor(), ByteOffset::new(expected));
+        }
+
+        let mut composer = typed("foo  bar.baz");
+        for expected in ["foo  bar.", "foo  bar", "foo  ", ""] {
+            composer.delete_word_before();
+            assert_eq!(composer.text(), expected);
+        }
+
+        let mut composer = typed("foo  bar.baz");
+        composer.home();
+        for expected in ["  bar.baz", ".baz", "baz", ""] {
+            composer.delete_word_after();
+            assert_eq!(composer.text(), expected);
+        }
+    }
+
+    #[test]
+    fn word_motion_crosses_hard_lines_as_whitespace() {
+        let mut composer = typed("ab\ncd");
+        composer.word_left();
+        assert_eq!(composer.cursor(), ByteOffset::new(3));
+        composer.word_left();
+        assert_eq!(composer.cursor(), ByteOffset::ZERO);
+        composer.word_right();
+        assert_eq!(composer.cursor(), ByteOffset::new(2));
+        composer.word_right();
+        assert_eq!(composer.cursor(), ByteOffset::new(5));
+    }
+
+    #[test]
+    fn word_deletion_keeps_cjk_runs_and_emoji_graphemes_whole() {
+        // A character-class word is every CJK run up to the next space or
+        // punctuation, so one Ctrl+W removes all four characters.
+        let mut composer = typed("你好世界 abc");
+        composer.delete_word_before();
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("你好世界 ", 13)
+        );
+        composer.delete_word_before();
+        assert_eq!(composer.text(), "");
+
+        let mut composer = typed("a 👩🏽‍💻");
+        composer.delete_word_before();
+        assert_eq!(composer.text(), "a ");
+        assert!(is_grapheme_boundary(composer.text(), composer.cursor()));
+    }
+
+    #[test]
+    fn word_edits_cross_a_paste_atom_as_one_cell() {
+        let big = "x".repeat(500);
+        let pasted = |tail: &str| {
+            let mut composer = Composer::new();
+            composer.paste("alpha ");
+            composer.paste(&big);
+            composer.paste(tail);
+            composer
+        };
+
+        let mut composer = pasted(" beta");
+        let label_end = composer.document.atoms[0].range.end();
+        // Backward: beta → (the space before "beta", then the atom as one cell).
+        composer.word_left();
+        assert_eq!(composer.cursor(), ByteOffset::new(label_end.get() + 1));
+        composer.word_left();
+        assert_eq!(composer.cursor(), composer.document.atoms[0].range.start());
+        composer.word_left();
+        assert_eq!(composer.cursor(), ByteOffset::ZERO);
+
+        let mut composer = pasted(" beta");
+        composer.delete_word_before();
+        assert_eq!(composer.document.atoms.len(), 1);
+        composer.delete_word_before();
+        assert_eq!(composer.text(), "alpha ");
+        assert!(composer.document.atoms.is_empty());
+        composer.delete_word_before();
+        assert_eq!((composer.text(), composer.cursor().get()), ("", 0));
+
+        // Two adjacent atoms are one run: a single step crosses both.
+        let mut composer = Composer::new();
+        composer.paste(&big);
+        composer.paste(&big);
+        assert_eq!(composer.document.atoms.len(), 2);
+        composer.word_left();
+        assert_eq!(composer.cursor(), ByteOffset::ZERO);
+    }
+
+    #[test]
+    fn a_word_edit_started_inside_a_label_keeps_the_atom_whole() {
+        let big = "x".repeat(500);
+        let atom_of = |composer: &Composer| composer.document.atoms[0].range;
+        let width = 12;
+
+        let mut composer = Composer::new();
+        composer.paste(&big);
+        let atom = atom_of(&composer);
+        composer.up(width);
+        let inside = composer.cursor();
+        assert!(
+            atom.start() < inside && inside < atom.end(),
+            "visual-row navigation should land inside the label"
+        );
+        composer.word_left();
+        assert_eq!(composer.cursor(), atom.start());
+        composer.word_right();
+        assert_eq!(composer.cursor(), atom.end());
+
+        for kill in [Composer::delete_word_before, Composer::kill_to_line_start] {
+            let mut composer = Composer::new();
+            composer.paste(&big);
+            composer.up(width);
+            assert!(composer.cursor() > ByteOffset::ZERO);
+            kill(&mut composer);
+            assert_eq!(composer.text(), "", "{kill:?}");
+            assert!(composer.document.atoms.is_empty(), "{kill:?}");
+        }
+    }
+
+    #[test]
+    fn line_kills_use_hard_lines_not_visual_rows() {
+        // The composer wraps these at width 6; Ctrl+U/K still edit the hard line.
+        let mut composer = typed("abcdefghij");
+        composer.kill_to_line_start();
+        assert_eq!(composer.text(), "");
+        let mut composer = typed("abcdefghij");
+        composer.home();
+        composer.kill_to_line_end();
+        assert_eq!(composer.text(), "");
+
+        // At a hard line start Ctrl+U removes the newline before it.
+        let mut composer = typed("ab\ncd");
+        composer.end();
+        composer.kill_to_line_start();
+        assert_eq!(composer.text(), "ab\n");
+        composer.kill_to_line_start();
+        assert_eq!(composer.text(), "ab");
+
+        // At a hard line end Ctrl+K removes the newline after it.
+        let mut composer = typed("ab\n");
+        composer.left();
+        composer.kill_to_line_end();
+        assert_eq!(composer.text(), "ab");
+    }
+
+    #[test]
+    fn word_and_line_kills_are_no_ops_on_empty_and_at_edges() {
+        let mut composer = Composer::new();
+        composer.word_left();
+        composer.word_right();
+        composer.delete_word_before();
+        composer.delete_word_after();
+        composer.kill_to_line_start();
+        composer.kill_to_line_end();
+        assert_eq!((composer.text(), composer.cursor().get()), ("", 0));
+
+        let mut composer = typed("abc");
+        composer.home();
+        composer.word_left();
+        composer.delete_word_before();
+        composer.kill_to_line_start();
+        assert_eq!((composer.text(), composer.cursor().get()), ("abc", 0));
+
+        composer.end();
+        composer.word_right();
+        composer.delete_word_after();
+        composer.kill_to_line_end();
+        assert_eq!((composer.text(), composer.cursor().get()), ("abc", 3));
     }
 }
