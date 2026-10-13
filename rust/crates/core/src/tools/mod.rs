@@ -35,7 +35,7 @@ mod plan_mode;
 mod powershell;
 mod provenance_store;
 mod question;
-mod review;
+pub(crate) mod review;
 mod run_store;
 mod scheduler;
 mod search;
@@ -447,6 +447,7 @@ pub struct ToolCtx {
     /// 未开始的不运行，当前批次结束后交还。前台调用树共享此信号，后台执行独立持有。
     pub stop: CancellationToken,
     pub(crate) turn_reply: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) review_update: Arc<std::sync::Mutex<Option<review::State>>>,
     pub depth: u8,
     /// The execution enclosing this tool call. Root turns have none; admitted
     /// Agent turns and Program/Workflow bridges replace it with their fixed ref.
@@ -504,6 +505,7 @@ impl ToolCtx {
             cancel,
             stop: CancellationToken::new(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
+            review_update: Arc::new(std::sync::Mutex::new(None)),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2160,6 +2162,7 @@ pub(crate) mod testutil {
             cancel: CancellationToken::new(),
             stop: CancellationToken::new(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
+            review_update: Arc::new(std::sync::Mutex::new(None)),
             depth,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4462,6 +4465,7 @@ mod tests {
             cancel,
             stop: CancellationToken::new(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
+            review_update: Arc::new(std::sync::Mutex::new(None)),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),

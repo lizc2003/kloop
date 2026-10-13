@@ -49,7 +49,30 @@ pub(crate) async fn fetch_url(
             continue;
         }
         if !resp.status().is_success() {
-            bail!("web_fetch: HTTP {} for {url}", resp.status());
+            let guidance = match resp.status().as_u16() {
+                401 => {
+                    "Authentication is required. Use an existing authenticated client or ask for access; do not search credential files."
+                }
+                403 => {
+                    "The server refused this request. Use an already authorized access route or ask for access; do not bypass the refusal."
+                }
+                404 => {
+                    "The resource may be missing or hidden from unauthenticated requests. This response alone does not establish that a private resource is missing. Use an existing authenticated client or ask for the exact resource; do not guess alternate URLs or IPs."
+                }
+                410 => {
+                    "The server reports that this resource is gone. Ask for its current location instead of repeatedly fetching this URL."
+                }
+                429 => {
+                    "The server rate-limited this request. Respect Retry-After if available and retry later; changing URLs does not resolve rate limiting."
+                }
+                500 | 502 | 503 | 504 => {
+                    "The server reported a failure; a later retry may help. Do not infer a missing resource or change the URL from this status alone."
+                }
+                _ => {
+                    "The server returned an unsuccessful HTTP response. Confirm the requested resource and access route before retrying."
+                }
+            };
+            bail!("web_fetch: HTTP {} for {url}\n{guidance}", resp.status());
         }
         let content_type = resp
             .headers()
@@ -449,15 +472,24 @@ mod tests {
     async fn errors_on_status_and_binary_content() {
         let server = MockServer::start().await;
         let cases = [
-            ("/unauthorized", 401),
-            ("/forbidden", 403),
-            ("/missing", 404),
-            ("/error", 500),
+            ("/unauthorized", 401, "Authentication is required"),
+            ("/forbidden", 403, "do not bypass the refusal"),
+            ("/missing", 404, "hidden from unauthenticated requests"),
+            ("/gone", 410, "resource is gone"),
+            ("/limited", 429, "rate-limited"),
+            ("/error", 500, "a later retry may help"),
+            ("/gateway", 502, "a later retry may help"),
+            ("/unavailable", 503, "a later retry may help"),
+            ("/timeout", 504, "a later retry may help"),
+            ("/method", 405, "Confirm the requested resource"),
         ];
-        for &(route, status) in &cases {
+        for &(route, status, _) in &cases {
             Mock::given(method("GET"))
                 .and(path(route))
-                .respond_with(ResponseTemplate::new(status))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_string("error body must not become review evidence"),
+                )
                 .mount(&server)
                 .await;
         }
@@ -470,11 +502,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        for &(route, status) in &cases {
+        for &(route, status, guidance) in &cases {
             let err = fetch_private(&format!("{}{route}", server.uri()))
                 .await
                 .unwrap_err();
-            assert!(format!("{err:#}").contains(&format!("HTTP {status}")));
+            let message = format!("{err:#}");
+            assert!(message.contains(&format!("HTTP {status}")), "{message}");
+            assert!(message.contains(guidance), "{message}");
+            assert!(!message.contains("error body must not become review evidence"));
         }
 
         let err = fetch_private(&format!("{}/blob", server.uri()))

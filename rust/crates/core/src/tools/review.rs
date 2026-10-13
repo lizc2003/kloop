@@ -10,6 +10,9 @@ use url::Url;
 
 use super::ToolCtx;
 
+mod flow;
+pub(crate) use flow::{Flow, State, carry, latest_user_text};
+
 #[cfg(test)]
 mod tests;
 
@@ -135,6 +138,13 @@ pub(super) async fn prepare(arguments: &str, body: String, ctx: &ToolCtx) -> Res
         _ => None,
     };
     if let Some(metadata) = metadata {
+        *ctx.review_update
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(State::Resolve {
+            pr: target.url.to_string(),
+            branch: metadata.base.branch.clone(),
+            revisions: Some((metadata.head.sha.clone(), metadata.base.sha.clone())),
+        });
         let resolved = json!({
             "pr": target.url.as_str(),
             "head": metadata.head.sha,
@@ -145,6 +155,11 @@ pub(super) async fn prepare(arguments: &str, body: String, ctx: &ToolCtx) -> Res
             "{body}\n\nResolved PR metadata (read-only lookup):\n{resolved}\nVerify the repository remote matches this PR, compute the merge-base against these frozen SHAs, and read that revision throughout."
         ));
     }
+    *ctx.review_update
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(State::Awaiting {
+        pr: target.url.to_string(),
+    });
     ctx.return_to_user(format!(
         "无法从 PR 元数据确认实际目标分支：{}。这个 PR 的目标分支是哪个？",
         target.url,

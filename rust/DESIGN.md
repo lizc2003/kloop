@@ -2708,6 +2708,11 @@ network-free, reqwest lives only in provider and web):
   (loopback/private/link-local/CGNAT/metadata ranges refused, DNS names resolved
   and checked on every hop), same-site redirects followed (max 5), cross-host
   redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text.
+  非成功 HTTP 响应保持工具失败，保留状态码和请求地址，按状态补充原因与下一步：
+  401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性，
+  410 建议确认当前位置，429 与常见暂时性服务错误提示稍后重试。其余状态不猜原因。
+  不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
+  DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227）。
   Download truncation is reported. There is **no model-text cap**: the body is a
   fetched artifact, and clipping one deletes evidence that the offload seam would
   otherwise keep on disk (bet 1). Everything downloaded is handed to core, which
@@ -3956,16 +3961,30 @@ PR head ref 不能证明目标分支，匿名 404 与 DNS 错误也不能各自�
 审查固定 head、目标分支 tip 与 merge-base；单提交固定 revision 与 parent。
 后续差异、搜索和正文都绑定对应 SHA，工作区文件须连同未提交修改核对一致才可作证据。
 完整文件清单先于分批读取，独立读取同轮提交；截断结果不算覆盖，须补齐剩余 hunks。
-版本读取与覆盖要求仍是模型可见指令，不证明模型已经减少调用或漏报（plan 226）。
+提交 / 工作区等入口的版本读取与覆盖要求仍是模型可见指令；内置 PR 的原生阶段
+见下文。准备完整差异不证明模型已逐项审查，也不证明减少调用或漏报（plan 226、227）。
 模型激活内置 skill 且参数包含一个支持的 PR URL 时，先由运行时通过现有 `web_fetch`
 来源做一次固定元数据查询（GitHub PR、Gitea / Forgejo `/pulls/<number>`，含路径前缀）。
 复用来源、hook、权限、超时和地址限制，不读取凭据或自动调用托管 CLI。
-合法 head、实际目标分支与目标 tip 作为固定字段随正文返回；后续仍需确认 remote
-并计算 merge-base。查询失败或字段不足则由运行时记录并显示一个缺失目标问题，
+合法 head、实际目标分支与目标 tip 作为固定字段随正文返回，并记录待准备状态。
+查询失败或字段不足则由运行时记录并显示一个缺失目标问题及待回答状态，
 配对所有工具结果后直接结束 turn，不再请求模型选择动作；用户取消优先。
-skill 调用成为调度顺序边界，其后未开始的工具不执行。`completed` 在此表示当前
+skill 调用成为调度顺序边界；交还问题时其后未开始的工具不执行。`completed` 在此表示当前
 turn 已交还问题，不能解释为 review 已完成。无 PR 参数、提交 / 工作区、用户覆盖
 skill、Program 桥接、slash 展开和未支持的入口不进入此预处理；不声称约束了所有审查路径。
+用户补齐明确分支后，在下一次模型采样前通过已有 Bash 门禁校验 origin 与 PR 身份；
+使用固定托管 head ref 和新读取的远端目标 ref 解析 SHA，不能复用陈旧的本地目标 tip。
+有完整 API 元数据则保持其固定 SHA。只获取缺失对象，计算 merge-base、列完整文件表，
+逐文件准备 `--unified=12` 差异；不检出或修改工作区。最多 128 份文件、120,000 字符；
+截断、不可读或超预算逐项记录缺口，范围解析失败停止交还，禁止模型接着猜范围。
+正文阶段仅提供 `review_read` 结构化入口，读取 / 字面搜索都绑定 head 或 base，
+下层生成固定 Bash 命令并经过原有 hook、权限、沙箱与超时；自由 shell、网页、委派和
+写操作不提供。最多 16 个补查调用（失败与未允许调用也计数），耗尽后只请求报告；
+显式轮次上限的最后一轮同样只请求报告，不增加外层预算。收尾继续调用工具或给出
+空结果均算失败，运行时不能合成 finding。正常模型报告后追加原生范围、差异准备
+缺口及补查失败事实；“准备完整差异”与“审查完整”分开表述。原生状态和准备材料
+随会话保存、恢复和压缩保留；用户切换任务或新的 steering 退出该阶段，取消 / 拒绝
+仍优先。此阶段限根 turn 的非 structured 内置 PR 路径（plan 227）。
 A finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
 (confirmed / downgraded / excluded) so none disappears silently — a downgraded
