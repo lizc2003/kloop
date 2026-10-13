@@ -56,8 +56,11 @@ pub(crate) async fn fetch_url(
                 403 => {
                     "The server refused this request. Use an already authorized access route or ask for access; do not bypass the refusal."
                 }
+                404 if pull_request_url(&url) => {
+                    "This looks like a pull request URL. The resource may be missing or hidden from unauthenticated requests.\nCompare it with the current checkout's Git remotes; a matching remote may provide existing authenticated access — use git ls-remote to query PR refs and git fetch for missing objects. Avoid git pull, which can modify the current branch and working tree. PR head refs do not establish the target branch.\nOtherwise use an existing authenticated client or ask for the missing information. Do not guess alternate URLs or IPs, or search credential files."
+                }
                 404 => {
-                    "The resource may be missing or hidden from unauthenticated requests.\nFor a repository or PR URL, compare it with the current checkout's Git remotes. A matching remote may provide existing authenticated access: use git ls-remote to query PR refs and git fetch for missing objects.\nPR head refs do not establish the target branch. Avoid git pull, which can modify the current branch and working tree.\nOtherwise use an existing authenticated client or ask for the missing information. Do not guess alternate URLs or IPs, or search credential files."
+                    "The resource may be missing or hidden from unauthenticated requests. Use an existing authenticated client or ask for the missing information. Do not guess alternate URLs or IPs, or search credential files."
                 }
                 410 => {
                     "The server reports that this resource is gone. Ask for its current location instead of repeatedly fetching this URL."
@@ -83,6 +86,25 @@ pub(crate) async fn fetch_url(
         return read_body(resp, &content_type, &url).await;
     }
     bail!("web_fetch: too many redirects (more than {MAX_REDIRECTS})")
+}
+
+/// Whether the URL has the shape of a pull-request page:
+/// `<host>/[…/]<owner>/<repo>/pull|pulls/<number>`, with or without a trailing
+/// slash. Only this shape earns the Git hints on a 404 — a forge allowlist
+/// would age, and without one a two-segment repository path is
+/// indistinguishable from any other URL. The hints stay host-agnostic so a
+/// self-hosted forge is covered too.
+fn pull_request_url(url: &Url) -> bool {
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments: Vec<&str> = segments.filter(|part| !part.is_empty()).collect();
+    let [.., kind, number] = segments.as_slice() else {
+        return false;
+    };
+    matches!(*kind, "pull" | "pulls")
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Parse + static hygiene: length cap, no embedded credentials, http→https
@@ -293,6 +315,33 @@ fn ip_is_public(ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Only the recognisable pull-request shape earns the Git hints: a
+    /// self-hosted path prefix and a trailing slash still count, while a bare
+    /// repository path or a non-numeric suffix does not.
+    #[test]
+    fn pull_request_shape_is_recognised_narrowly() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        for text in [
+            "https://forge.example/team/project/pulls/42",
+            "https://forge.example/team/project/pulls/42/",
+            "https://forge.example/git/team/project/pulls/42#comment",
+            "https://github.com/team/project/pull/7",
+        ] {
+            assert!(super::pull_request_url(&url(text)), "{text}");
+        }
+        for text in [
+            "https://forge.example/team/project",
+            "https://forge.example/team/project.git",
+            "https://forge.example/team/project/pulls",
+            "https://forge.example/team/project/pulls/latest",
+            "https://forge.example/team/project/issues/42",
+            "https://forge.example/team/project/pull/42/files",
+            "https://forge.example/",
+        ] {
+            assert!(!super::pull_request_url(&url(text)), "{text}");
+        }
+    }
 
     /// Three signals must agree, so this never fires on a short static page.
     #[test]
@@ -510,18 +559,33 @@ mod tests {
             assert!(message.contains(&url), "{message}");
             assert!(message.contains(guidance), "{message}");
             if status == 404 {
-                for hint in [
-                    "compare it with the current checkout's Git remotes",
-                    "A matching remote",
-                    "git ls-remote",
-                    "git fetch for missing objects",
-                    "PR head refs do not establish the target branch",
-                    "Avoid git pull",
-                ] {
-                    assert!(message.contains(hint), "{message}");
-                }
+                // Git advice is keyed on the URL shape, not on every 404: a
+                // path that is not PR-shaped gets the generic text only.
+                assert!(!message.contains("Git remotes"), "{message}");
+                assert!(!message.contains("git ls-remote"), "{message}");
             }
             assert!(!message.contains("error body must not become review evidence"));
+        }
+
+        // The PR shape is the case the Git hints exist for.
+        Mock::given(method("GET"))
+            .and(path("/team/project/pulls/42"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let err = fetch_private(&format!("{}/team/project/pulls/42", server.uri()))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        for hint in [
+            "This looks like a pull request URL",
+            "current checkout's Git remotes",
+            "git ls-remote",
+            "git fetch for missing objects",
+            "PR head refs do not establish the target branch",
+            "Avoid git pull",
+        ] {
+            assert!(message.contains(hint), "{message}");
         }
 
         let err = fetch_private(&format!("{}/blob", server.uri()))

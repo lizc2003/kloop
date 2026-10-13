@@ -2710,9 +2710,11 @@ network-free, reqwest lives only in provider and web):
   redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text.
   非成功 HTTP 响应保持工具失败，保留状态码和请求地址，按状态补充原因与下一步：
   401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性；
-  对仓库 / PR 地址提示先对照当前 Git remotes，匹配才使用已有 Git 访问查询 PR refs、
+  只有可识别的 PR 形状地址（`<owner>/<repo>/pull|pulls/<number>`，含自托管路径前缀与
+  尾斜杠）才附 Git 提示：先对照当前 Git remotes，匹配才使用已有 Git 访问查询 PR refs、
   fetch 缺失对象，提醒 head ref 不提供实际目标分支、`git pull` 会改动当前分支和工作区。
-  这只是通用失败指引，网络工具不读取本地仓库或自动执行 Git。410 建议确认当前位置，
+  没有 forge 名单时两段的仓库路径与普通 URL 无法区分，所以其他 404 只给通用指引。
+  这不读取本地仓库、不自动执行 Git。410 建议确认当前位置，
   429 与常见暂时性服务错误提示稍后重试。其余状态不猜原因。
   不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
   DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227、228）。
