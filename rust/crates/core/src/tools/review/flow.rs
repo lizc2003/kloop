@@ -423,9 +423,9 @@ impl Flow {
         }
         Some(vec![ToolDef {
             name: "review_read".into(),
-            description: format!(
-                "Read/search the frozen PR revision. {remaining} supplementary calls remain, then a report is required. file: path, start_line and line_count (up to 200); search: literal pattern and optional path. revision is head or base. No checkout, web, free shell or writes."
-            ),
+            // 跨轮字节稳定：额度计数写进描述会改写 tools+system 前缀缓存
+            // （额度仍随注入的状态消息到达模型）。
+            description: "Read/search the frozen PR revision. A report is required once the investigation closes. file: path, start_line and line_count (up to 200); search: literal pattern and optional path. revision is head or base. No checkout, web, free shell or writes.".into(),
             schema: json!({"type":"object","properties":{"operation":{"type":"string","enum":["file","search"]},"revision":{"type":"string","enum":["head","base"]},"path":{"type":"string"},"pattern":{"type":"string"},"start_line":{"type":"integer","minimum":1},"line_count":{"type":"integer","minimum":1,"maximum":200}},"required":["operation"],"additionalProperties":false}),
         }])
     }
