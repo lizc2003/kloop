@@ -2715,9 +2715,14 @@ network-free, reqwest lives only in provider and web):
   fetch 缺失对象，提醒 head ref 不提供实际目标分支、`git pull` 会改动当前分支和工作区。
   没有 forge 名单时两段的仓库路径与普通 URL 无法区分，所以其他 404 只给通用指引。
   这不读取本地仓库、不自动执行 Git。410 建议确认当前位置，
-  429 与常见暂时性服务错误提示稍后重试。其余状态不猜原因。
+  429 提示稍后重试并把 `Retry-After` 的值带到模型面前（合法值只有秒数或 HTTP 日期，
+  过长或为空的不重复，避免把不可信值当成事实）；其余暂时性服务错误不猜原因。
   不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
   DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227、228）。
+  正文类型除 `text/*` 与空类型外，接受常见 `application/*` 文本（json / xml / yaml /
+  toml / x-sh / sql / csv / markdown 等）；二进制仍拒绝，不用有损解码冒充文本。
+  跟随同站跳转后，正文尾部标注最终落地的地址——跳转是静默的，登录页或中间页
+  否则会以“就是被请求的文档”的样子送达（假成功，比它掩盖的 404 更危险，plan 231）。
   Download truncation is reported. There is **no model-text cap**: the body is a
   fetched artifact, and clipping one deletes evidence that the offload seam would
   otherwise keep on disk (bet 1). Everything downloaded is handed to core, which
@@ -4011,7 +4016,9 @@ A skill runs one of two ways (its `context` frontmatter field):
   `allowed-tools` restricts its tool set (a YAML list or space/comma string; cc
   tool names like `Read`/`Bash` are mapped to kloop's, kloop-native and MCP
   names pass through) — a capability limit, not a permission grant, so the tools
-  still face the gate. A sub-agent can't spawn one, so a fork skill triggered at
+  still face the gate. 名字没有对应工具时（cc 独有的工具、拼写错误）启动 fork 会
+  用一条 note 点出来：这是收窄而不是授权，全是这样的名字时子代理几乎无工具可用，
+  作者不该靠调试猜。 A sub-agent can't spawn one, so a fork skill triggered at
   depth ≥ 1 degrades to inline.
 
 Expansion substitutes `$ARGUMENTS` (the whole argument string), `$N` (the Nth

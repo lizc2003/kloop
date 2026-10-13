@@ -967,7 +967,9 @@ mod tests {
             "a head ref does not identify the target branch",
             "stop the lookup and ask one question",
             "Do not start reading the diff until it is answered",
-            "An anonymous 404 does not establish",
+            // The anonymous-404 rule itself now lives in the web_fetch error
+            // text (plan 231), which prints it at the failure instead of
+            // leaving a second copy in the body.
             "DNS error alone does not establish a sandbox denial",
             "hard stop for that access",
             "exit status survives",

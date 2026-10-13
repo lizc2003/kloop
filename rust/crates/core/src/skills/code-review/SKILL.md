@@ -31,14 +31,13 @@ For a PR, follow these steps in order:
    names, default-branch refs and merge commit messages do not establish a PR's
    actual target.
 
-An anonymous 404 does not establish that a private repository is missing, and a
-DNS error alone does not establish a sandbox denial. Read the failure and use
-the available authentication or permission route; do not cycle through guessed
-URLs, IP overrides or credential-file searches. **A sensitive-path refusal is a
-hard stop for that access**, not an invitation to retry it with different shell
-syntax. Keep a failing network command separate from successful diagnostics so
-its exit status survives: a pipeline to `tail` or a later command can hide the
-failure from the executor's sandbox detection. Use the Bash tool's
+A DNS error alone does not establish a sandbox denial. Read the failure and use
+the available authentication or permission route; the `web_fetch` error text
+carries the per-status guidance. **A sensitive-path refusal is a hard stop for
+that access**, not an invitation to retry it with different shell syntax. Keep a
+failing network command separate from successful diagnostics so its exit status
+survives: a pipeline to `tail` or a later command can hide the failure from the
+executor's sandbox detection. Use the Bash tool's
 `timeout_ms` rather than assuming an external `timeout` program exists.
 
 Record the frozen head, target tip and merge-base for a PR, or the revision and

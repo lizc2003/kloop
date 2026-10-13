@@ -20,6 +20,7 @@ pub(crate) async fn fetch_url(
     allow_private: bool,
 ) -> Result<String> {
     let mut url = normalize_url(raw_url, /*upgrade_http*/ !allow_private)?;
+    let requested = url.clone();
     for _ in 0..=MAX_REDIRECTS {
         guard(&url, allow_private).await?;
         let resp = client
@@ -75,7 +76,21 @@ pub(crate) async fn fetch_url(
                     "The server returned an unsuccessful HTTP response. Confirm the requested resource and access route before retrying."
                 }
             };
-            bail!("web_fetch: HTTP {} for {url}\n{guidance}", resp.status());
+            let mut message = format!("web_fetch: HTTP {} for {url}\n{guidance}", resp.status());
+            // The 429 guidance asks the model to respect Retry-After, so the
+            // value has to reach it.
+            if resp.status().as_u16() == 429
+                && let Some(value) = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+            {
+                message.push_str(&match usable_retry_after(value) {
+                    Some(value) => format!("\nRetry-After: {value}"),
+                    None => "\nRetry-After: (value too long to be one; ignored)".into(),
+                });
+            }
+            bail!("{message}");
         }
         let content_type = resp
             .headers()
@@ -83,9 +98,24 @@ pub(crate) async fn fetch_url(
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        return read_body(resp, &content_type, &url).await;
+        let mut text = read_body(resp, &content_type, &url).await?;
+        // A same-site redirect is followed silently, so without this the body
+        // of a login or interstitial page arrives looking like the document
+        // that was asked for — a false success, worse than the 404 it hides.
+        if url != requested {
+            text.push_str(&format!("\n\n[followed same-site redirect to {url}]"));
+        }
+        return Ok(text);
     }
     bail!("web_fetch: too many redirects (more than {MAX_REDIRECTS})")
+}
+
+/// The `Retry-After` value as it should reach the model. `to_str` has already
+/// restricted it to visible ASCII; a legal value is delta-seconds or an
+/// HTTP-date, both far inside this width, so anything longer is not a value
+/// worth repeating (and truncating it would invent a different one).
+fn usable_retry_after(value: &str) -> Option<&str> {
+    (!value.is_empty() && value.len() <= 64).then_some(value)
 }
 
 /// Whether the URL has the shape of a pull-request page:
@@ -139,6 +169,26 @@ fn same_site(from: &Url, to: &Url) -> bool {
         && to.password().is_none()
 }
 
+/// Content types this tool treats as text. `text/*` and a missing type are
+/// accepted outright; these markers catch the common `application/*` spellings
+/// of text (yaml, shell, sql…) that a raw-file host serves. Binary types must
+/// stay refused — an unsupported-type error is the honest answer for a body
+/// this tool cannot read.
+const TEXT_LIKE_MARKERS: &[&str] = &[
+    "json",
+    "xml",
+    "javascript",
+    "ecmascript",
+    "yaml",
+    "toml",
+    "x-sh",
+    "shellscript",
+    "sql",
+    "csv",
+    "markdown",
+    "+text",
+];
+
 async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -> Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut download_truncated = false;
@@ -162,10 +212,10 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
         || content_type.contains("application/xhtml")
         || (content_type.is_empty() && raw.trim_start().starts_with('<'));
     let is_text = content_type.starts_with("text/")
-        || content_type.contains("json")
-        || content_type.contains("xml")
-        || content_type.contains("javascript")
-        || content_type.is_empty();
+        || content_type.is_empty()
+        || TEXT_LIKE_MARKERS
+            .iter()
+            .any(|marker| content_type.contains(marker));
     if !is_html && !is_text {
         bail!(
             "web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)"
@@ -509,12 +559,82 @@ mod tests {
         let out = fetch_private(&format!("{}/from", server.uri()))
             .await
             .unwrap();
-        assert_eq!(out, "landed");
+        // A followed redirect is reported: the body came from /to, and the
+        // caller has to be able to tell that from the URL it asked for.
+        assert!(
+            out.starts_with("landed") && out.contains("/to]"),
+            "expected the redirect target to be reported: {out}"
+        );
+        // The same URL fetched directly carries no such note.
+        let direct = fetch_private(&format!("{}/to", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(direct, "landed");
 
         let err = fetch_private(&format!("{}/loop", server.uri()))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("too many redirects"));
+    }
+
+    /// The 429 text asks the model to respect Retry-After, so the header value
+    /// has to reach it — and a value that cannot be one (a legal one is
+    /// delta-seconds or an HTTP-date) is reported as ignored rather than
+    /// repeated as fact.
+    #[tokio::test]
+    async fn rate_limit_reports_retry_after_and_rejects_an_unusable_value() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/limited"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/absurd"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "9".repeat(200)))
+            .mount(&server)
+            .await;
+
+        let err = fetch_private(&format!("{}/limited", server.uri()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Retry-After: 120"));
+
+        let err = fetch_private(&format!("{}/absurd", server.uri()))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Retry-After: (value too long to be one; ignored)"),
+            "{message}"
+        );
+        assert!(!message.contains(&"9".repeat(8)), "{message}");
+    }
+
+    /// Text-ish `application/*` types are read; a genuinely binary one is still
+    /// refused rather than decoded lossily.
+    #[tokio::test]
+    async fn application_text_types_are_read_and_binary_is_not() {
+        let server = MockServer::start().await;
+        for (route, content_type) in [
+            ("/config.yaml", "application/x-yaml"),
+            ("/script.sh", "application/x-sh"),
+            ("/notes.toml", "application/toml"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", content_type)
+                        .set_body_string("key: value"),
+                )
+                .mount(&server)
+                .await;
+            let out = fetch_private(&format!("{}{route}", server.uri()))
+                .await
+                .unwrap();
+            assert_eq!(out, "key: value", "{content_type}");
+        }
     }
 
     #[tokio::test]

@@ -698,6 +698,23 @@ pub(crate) async fn fork_skill(
     // tools) — a capability limit, not a permission grant; coordination tools stay
     // available regardless (see `agent_type::tool_available`).
     if let Some(tools) = &skill.allowed_tools {
+        // A name kloop has no tool for (a cc-only name, or a typo) grants
+        // nothing: it narrows the sub-agent's set instead, and a list made only
+        // of such names leaves the skill with almost nothing to work with.
+        // Say so, rather than leaving the author with a skill that silently
+        // cannot run.
+        let unknown: Vec<&str> = tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !tool_name_exists(ctx, name))
+            .collect();
+        if !unknown.is_empty() {
+            ctx.ui.emit(&Event::Note(format!(
+                "skill {}: allowed-tools names no kloop tool: {}",
+                skill.name,
+                unknown.join(", ")
+            )));
+        }
         sub.tool_allowlist = Some(Arc::new(tools.iter().cloned().collect()));
     }
     let receipt = mint_agent_receipt(
@@ -726,6 +743,21 @@ pub(crate) async fn fork_skill(
     )
     .await?
     .value)
+}
+
+/// Whether kloop can offer a tool by this name at all: a built-in, or a tool an
+/// external source (MCP) provides. The sources are the same live set the
+/// sub-agent's own tool list is filtered from, so this answers "will the
+/// allowlist entry actually reach anything".
+fn tool_name_exists(ctx: &ToolCtx, name: &str) -> bool {
+    super::builtin::ALL
+        .iter()
+        .any(|builtin| builtin.name() == name)
+        || ctx
+            .cfg
+            .tool_sources
+            .iter()
+            .any(|source| source.defs().iter().any(|def| def.name == name))
 }
 
 /// Fire-and-forget spawn (plan 26): register the agent, launch a DETACHED tokio
@@ -1679,6 +1711,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fork skill's `allowed-tools` is a capability limit, so a name kloop has
+    /// no tool for narrows the sub-agent instead of granting anything — and a
+    /// list made only of such names leaves the skill unable to run. The author
+    /// hears which names missed rather than debugging that silently.
+    #[tokio::test]
+    async fn fork_skill_reports_allowed_tools_names_kloop_does_not_have() {
+        let skill = |names: &[&str]| crate::skills::Skill {
+            name: "scoped".into(),
+            description: "d".into(),
+            body: "Do the thing.".into(),
+            dir: "/skills/scoped".into(),
+            context: crate::skills::SkillContext::Fork,
+            allowed_tools: Some(names.iter().map(|name| (*name).to_string()).collect()),
+            source: crate::skills::SkillSource::Skill,
+            ..Default::default()
+        };
+        for (names, unknown) in [
+            (vec!["read_file", "MultiEdit"], Some("MultiEdit")),
+            (vec!["read_file", "grep"], None),
+        ] {
+            let rec = std::sync::Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+            let mut ctx = test_ctx(0, "fork-allowlist");
+            let mut cfg = ctx.cfg.test_clone();
+            cfg.skills = std::sync::Arc::new(vec![skill(&names)]);
+            ctx = with_provider(
+                ToolCtx {
+                    cfg: std::sync::Arc::new(cfg),
+                    ui: rec.clone(),
+                    ..ctx
+                },
+                Provider::mock(vec![vec![AssistantBlock::Text {
+                    text: "done".into(),
+                }]]),
+            );
+            let _ = run_tool("skill", json!({"name": "scoped"}), &ctx).await;
+            let notes: Vec<String> = rec
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.starts_with("note "))
+                .cloned()
+                .collect();
+            match unknown {
+                Some(name) => {
+                    assert_eq!(notes.len(), 1, "{notes:?}");
+                    assert!(notes[0].contains(name), "{notes:?}");
+                    assert!(!notes[0].contains("read_file"), "{notes:?}");
+                }
+                None => assert!(notes.is_empty(), "{notes:?}"),
+            }
+        }
+    }
+
     /// Records the sub-agent lifecycle notifications.
     struct RecUi(std::sync::Mutex<Vec<String>>);
     impl Ui for RecUi {
@@ -1705,6 +1791,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(format!("message {} {:?}", update.id, update.status)),
+                Event::Note(text) => self.0.lock().unwrap().push(format!("note {text}")),
                 _ => {}
             }
         }

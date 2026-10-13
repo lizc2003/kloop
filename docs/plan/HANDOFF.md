@@ -1,5 +1,14 @@
 # HANDOFF — 当前状态与会话交接
 
+**fetch 与 skill 的六项收紧（2026-10-13，plan 231）**：沿用回退后的边界，只做与共享
+路径无关的收紧。`web_fetch`：跟随同站跳转后在正文尾标注最终地址（否则登录页/中间
+页会以被请求文档的样子送达）；429 把 `Retry-After` 的值带出来（过长或为空标为
+ignored，不截断）；正文类型放宽到常见 `application/*` 文本，二进制仍拒绝。内置
+`code-review` 正文删掉与 fetch 文案重复的网络规则，只在 fetch 层打印（DNS≠沙箱拒绝、
+敏感路径硬停、退出码独立、`timeout_ms` 四条保留，fetch 层没有对应文案）。契约表同步
+少一条断言。fork skill 的 `allowed-tools` 出现 kloop 没有的工具名时发一条 note——
+那是收窄而不是授权，全是这样的名字时子代理几乎无工具可用。重复激活不去重（不做）。
+
 **原生 PR 审查阶段已回退（2026-10-13，plan 230）**：用户判定宁可完全回退，也不
 接受 review 阶段侵入共享调度。226–229 的原生预检与状态机整体撤回：
 `agent.rs`、`history.rs`、`tools/mod.rs`、`tools/skill.rs`、`tools/builtin.rs`、
