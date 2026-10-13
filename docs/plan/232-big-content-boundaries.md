@@ -48,10 +48,23 @@
 - bash 前台输出上限 `FOREGROUND_OUTPUT_CAP_CHARS`：另一个工具，其标记本就量化了省略量。
 - 模型可见字符上限、摘要模型（与 bet 1 冲突，只作对照）。
 
+## 复核后修订（2026-10-13）
+
+- **形状行未限制键名长度，指针本身会超上限**：`MAX_KEYS` 只限数量，`keys.join(", ")`
+  仍完整复制每个键，而键名是任意长度的对端文本。一个键名长达 20 万字符的 JSON 对象
+  能通过 4 MiB 解析门槛，产出的落盘指针远超 32,000 字符；`spill()` 直接接受它，它又低于
+  128,000 的轮预算，于是整段进入历史——**指针取代的正是因超限才落盘的那个结果，反而
+  突破了那个上限**，而 request reduction 还会因它是 offload 指针而跳过缩减。修法：单键
+  40 字符 + 整行 600 字符两道界（新增 `clipped`），并补两条回归——长键对象的形状行在界内、
+  以及落盘指针自身必须低于 `OFFLOAD_CAP_CHARS`。
+- 该回归里我最初把断言写成"长键排在首位"，实测失败：serde_json 的 map 是排序的
+  （BTreeMap），改为不依赖键顺序的断言。
+
 ## 验证
 
-- `cargo test -p kloop-core history::`：31 项通过（新增指针首行的 chars/lines/path 断言、
-  `shape_hint` 的数组/对象/键名上限/非 JSON/超限不解析用例）。
+- `cargo test -p kloop-core history::`：32 项通过（新增指针首行的 chars/lines/path 断言、
+  `shape_hint` 的数组/对象/键名上限/非 JSON/超限不解析用例，以及复核后补的长键对象与
+  "指针低于触发上限"两条回归）。
 - `cargo test -p kloop-web`：32 项通过、1 项 `#[ignore]`。20 MiB 的端到端用例（传输截断）
   改为按需显式运行——`cargo test -p kloop-web -- --ignored`，已单独跑过一次通过；门禁不再
   为它付 20 MiB 的代价。"标记随常量生成、不漂移"这条件由新的纯函数用例

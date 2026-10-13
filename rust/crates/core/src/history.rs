@@ -895,9 +895,15 @@ fn preview(content: &str) -> String {
 /// pointer's line count is its record count. The parse is bounded, and a body
 /// that does not parse as JSON (truncated mid-value, or simply not JSON) yields
 /// no line at all — the header already says it was truncated.
+///
+/// Every bound here exists because a key name is attacker-controlled text of any
+/// length: this line *replaces* the result that overflowed the per-result cap, so
+/// it must stay far below that cap rather than becoming a second oversized body.
 fn shape_hint(content: &str) -> Option<String> {
     const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
     const MAX_KEYS: usize = 12;
+    const MAX_KEY_CHARS: usize = 40;
+    const MAX_HINT_CHARS: usize = 600;
     if content.len() > MAX_PARSE_BYTES {
         return None;
     }
@@ -905,23 +911,32 @@ fn shape_hint(content: &str) -> Option<String> {
     if !trimmed.starts_with(['{', '[']) {
         return None;
     }
-    match serde_json::from_str::<serde_json::Value>(trimmed).ok()? {
-        serde_json::Value::Array(items) => Some(format!("JSON array: {} items", items.len())),
+    let hint = match serde_json::from_str::<serde_json::Value>(trimmed).ok()? {
+        serde_json::Value::Array(items) => format!("JSON array: {} items", items.len()),
         serde_json::Value::Object(map) => {
-            let keys: Vec<&str> = map.keys().take(MAX_KEYS).map(String::as_str).collect();
+            let keys: Vec<String> = map
+                .keys()
+                .take(MAX_KEYS)
+                .map(|key| clipped(key, MAX_KEY_CHARS))
+                .collect();
             let rest = map.len().saturating_sub(keys.len());
             let more = if rest == 0 {
                 String::new()
             } else {
                 format!(", … +{rest}")
             };
-            Some(format!(
-                "JSON object: {} keys: {}{more}",
-                map.len(),
-                keys.join(", ")
-            ))
+            format!("JSON object: {} keys: {}{more}", map.len(), keys.join(", "))
         }
-        _ => None,
+        _ => return None,
+    };
+    Some(clipped(&hint, MAX_HINT_CHARS))
+}
+
+/// `text` cut to at most `max` characters, marked when anything was dropped.
+fn clipped(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
     }
 }
 
@@ -1346,6 +1361,41 @@ mod tests {
         let huge = format!("[{}]", "1,".repeat(3 * 1024 * 1024));
         assert!(huge.len() > 4 * 1024 * 1024);
         assert!(super::shape_hint(&huge).is_none());
+
+        // A key is attacker-controlled text of any length. Naming it without
+        // clipping would put a body-sized line into the pointer that replaces an
+        // oversized result — over the very cap that caused the spill.
+        let hostile = format!(r#"{{"{}":1,"b":2}}"#, "k".repeat(5_000));
+        let hint = super::shape_hint(&hostile).unwrap();
+        assert!(hint.chars().count() <= 600, "{}", hint.chars().count());
+        // (serde_json's map is sorted, so the clipped key is not necessarily
+        // first — the assertion does not depend on that.)
+        assert!(hint.starts_with("JSON object: 2 keys: "), "{hint}");
+        assert!(hint.contains("kkk"), "{hint}");
+        assert!(hint.contains('…'), "{hint}");
+        assert!(!hint.contains(&"k".repeat(41)), "{hint}");
+    }
+
+    /// The pointer *replaces* a result that overflowed the per-result cap, so it
+    /// must itself stay under it — for every shape, including a hostile one.
+    #[test]
+    fn a_spilled_result_stays_under_the_cap_that_triggered_it() {
+        let dir = temp_dir("spill-shape-bound");
+        let mut h = History::new(dir.clone());
+        let hostile = format!(r#"{{"{}":1}}"#, "k".repeat(200_000));
+        assert!(hostile.chars().count() > OFFLOAD_CAP_CHARS);
+        h.record(tool_result(hostile));
+
+        let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
+            panic!("expected tool result");
+        };
+        let content = content.as_text();
+        assert!(
+            content.chars().count() < OFFLOAD_CAP_CHARS,
+            "pointer is {} chars",
+            content.chars().count()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// One round's tool results, in request order.
