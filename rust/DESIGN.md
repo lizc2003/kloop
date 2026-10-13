@@ -1537,10 +1537,10 @@ other characters, surrounding spaces, and trailing newlines are preserved (no
 trim). Word and line scans treat an atom as one cell, so a scan never stops on
 the spaces or punctuation inside its label; adjacent Backspace/Delete removes it
 whole, and a word or line delete that touches one removes its label and payload
-together. Visual-row navigation can still place the cursor inside a label
-(`offset_at_column` reads the display text alone), and the word motions snap such
-a cursor to the atom's edge; a range edit that cuts one — completion accept —
-materializes its payload before editing.
+together. The cursor never rests inside a label: the visual layout reads the
+display text alone and can draw such a byte, so `up`/`down` land on the atom's
+edge (start when stepping up, end when stepping down). A range edit that cuts one
+— completion accept — materializes its payload before editing.
 **Ctrl+V / Alt+V** pastes an image straight off the OS clipboard (a screenshot,
 browser copy, or Finder-copied file); a pasted or dragged single-line
 **image-file path** attaches too, while ordinary bracketed paste remains text.

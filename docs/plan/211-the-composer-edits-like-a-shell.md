@@ -219,7 +219,7 @@ editing`）。**第一阶段（第二节：基础行编辑与按词
   映射 `composer_action`，区分 Ctrl / Alt / Ctrl+Alt，未绑定 Meta 键不插入字符。
 - **验证**：
   - composer 单测：`foo  bar.baz` 逐落点词移动/删除、跨硬行、CJK/ZWJ 字素安全、paste atom
-    整体（含相邻原子、从标签内部起步）、Ctrl+U/K 硬行与边缘 `\n`、空文档与两端无操作。
+    整体（含相邻原子）、Ctrl+U/K 硬行与边缘 `\n`、空文档与两端无操作。
   - app 单测：表驱动断言整张键位（普通/Ctrl/Alt/Shift/Ctrl+Alt），保留键（Ctrl+D/H/J/N/P/V/R/C、
     Tab/Esc/Enter）不误触；打开补全菜单后 Ctrl+W/Ctrl+U 正确重过滤或关闭。
   - 真实 PTY（`tui_pty.rs`）：三条用例用原始字节发送 `ESC DEL`、`ESC b/f`、CSI `1;3D/C`、
@@ -228,3 +228,8 @@ editing`）。**第一阶段（第二节：基础行编辑与按词
   - `make check` 全绿（fmt + clippy + workspace debug 全量测试 + 本机 parity）。
   - 平台边界：PTY 证据只在 macOS 上跑，Windows 未执行，不借 macOS 结果声称 Windows 已跑。
 - 未运行 `make check-release`（按约定不属提交门禁）。
+
+**后续小修（2026-10-13）**：纵向视觉导航不再把光标停进标签内部——`up`/`down` 的落点
+吸附到原子边缘（up→原子 start、down→原子 end），原先"从标签内部起步"的入口关闭，
+词动作里的内部吸附分支随之删除；回归 `navigation_never_rests_inside_a_paste_atom`
+（旧实现复现"cursor rested inside the label"）。纯本地，无真实模型。

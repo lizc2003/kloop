@@ -308,15 +308,6 @@ fn push_text_cells(cells: &mut Vec<Cell>, text: &str, base: usize) {
     }
 }
 
-/// The index of the cell strictly containing `offset`. Grapheme cells never do
-/// — the cursor only lands on their boundaries — so this only finds an atom the
-/// cursor was placed inside (e.g. by visual-row navigation).
-fn cell_containing(cells: &[Cell], offset: ByteOffset) -> Option<usize> {
-    cells
-        .iter()
-        .position(|cell| cell.range.start() < offset && offset < cell.range.end())
-}
-
 /// The index of the first cell starting at or after `offset`; `cells.len()` when
 /// `offset` is at or past the end.
 fn cell_boundary(cells: &[Cell], offset: ByteOffset) -> usize {
@@ -775,14 +766,9 @@ impl Composer {
         self.goal_column = None;
     }
 
-    /// The offset a leftward word step lands on. A cursor sitting inside a paste
-    /// atom (only reachable through visual-row navigation) snaps to that atom's
-    /// start instead of a position within its label.
+    /// The offset a leftward word step lands on.
     fn word_left_offset(&self) -> ByteOffset {
         let cells = self.document.cells();
-        if let Some(index) = cell_containing(&cells, self.cursor) {
-            return cells[index].range.start();
-        }
         let mut index = cell_boundary(&cells, self.cursor);
         while index > 0 && cells[index - 1].class == CellClass::Whitespace {
             index -= 1;
@@ -798,12 +784,9 @@ impl Composer {
     }
 
     /// The offset a rightward word step lands on; symmetric to
-    /// [`Composer::word_left_offset`], snapping a cursor inside an atom to its end.
+    /// [`Composer::word_left_offset`].
     fn word_right_offset(&self) -> ByteOffset {
         let cells = self.document.cells();
-        if let Some(index) = cell_containing(&cells, self.cursor) {
-            return cells[index].range.end();
-        }
         let mut index = cell_boundary(&cells, self.cursor);
         while index < cells.len() && cells[index].class == CellClass::Whitespace {
             index += 1;
@@ -844,7 +827,14 @@ impl Composer {
             self.history_prev();
         } else {
             let goal = self.goal_column.unwrap_or(layout.cursor_column);
-            self.cursor = layout.offset_at_column(self.text(), layout.cursor_row - 1, goal);
+            let landed = layout.offset_at_column(self.text(), layout.cursor_row - 1, goal);
+            // The visual layout reads only the display text, so a row inside a
+            // wrapped paste-atom label is a position it will happily draw. The
+            // cursor must never rest there (it is not a byte any edit can use),
+            // so stepping up snaps to the atom's start.
+            self.cursor = self
+                .atom_containing(landed)
+                .map_or(landed, |atom| atom.start());
             self.goal_column = Some(goal);
         }
     }
@@ -855,9 +845,23 @@ impl Composer {
             self.history_next();
         } else {
             let goal = self.goal_column.unwrap_or(layout.cursor_column);
-            self.cursor = layout.offset_at_column(self.text(), layout.cursor_row + 1, goal);
+            let landed = layout.offset_at_column(self.text(), layout.cursor_row + 1, goal);
+            self.cursor = self
+                .atom_containing(landed)
+                .map_or(landed, |atom| atom.end());
             self.goal_column = Some(goal);
         }
+    }
+
+    /// The range of the paste atom strictly containing `offset`, if any. The
+    /// cursor is never left there: a label is one indivisible unit, and the
+    /// label-only visual layout is the one place that can invent such a byte.
+    fn atom_containing(&self, offset: ByteOffset) -> Option<TextRange> {
+        self.document
+            .atoms
+            .iter()
+            .map(|atom| atom.range)
+            .find(|range| range.start() < offset && offset < range.end())
     }
 
     fn history_prev(&mut self) {
@@ -1432,34 +1436,42 @@ mod tests {
     }
 
     #[test]
-    fn a_word_edit_started_inside_a_label_keeps_the_atom_whole() {
+    fn navigation_never_rests_inside_a_paste_atom() {
         let big = "x".repeat(500);
-        let atom_of = |composer: &Composer| composer.document.atoms[0].range;
         let width = 12;
-
         let mut composer = Composer::new();
         composer.paste(&big);
-        let atom = atom_of(&composer);
-        composer.up(width);
-        let inside = composer.cursor();
-        assert!(
-            atom.start() < inside && inside < atom.end(),
-            "visual-row navigation should land inside the label"
-        );
-        composer.word_left();
-        assert_eq!(composer.cursor(), atom.start());
-        composer.word_right();
+        let atom = composer.document.atoms[0].range;
+
+        // The label wraps over several rows; stepping up through it must land on
+        // an atom edge, never on a byte the label-only layout drew.
+        for _ in 0..4 {
+            composer.up(width);
+            let cursor = composer.cursor();
+            assert!(
+                cursor <= atom.start() || cursor >= atom.end(),
+                "cursor rested inside the label at {}",
+                cursor.get()
+            );
+            composer.document.assert_invariants();
+        }
+        assert_eq!(composer.cursor(), ByteOffset::ZERO);
+
+        // Down from the start snaps forward to the end, not into the label.
+        let mut composer = Composer::new();
+        composer.paste(&big);
+        composer.home();
+        composer.down(width);
         assert_eq!(composer.cursor(), atom.end());
 
-        for kill in [Composer::delete_word_before, Composer::kill_to_line_start] {
-            let mut composer = Composer::new();
-            composer.paste(&big);
-            composer.up(width);
-            assert!(composer.cursor() > ByteOffset::ZERO);
-            kill(&mut composer);
-            assert_eq!(composer.text(), "", "{kill:?}");
-            assert!(composer.document.atoms.is_empty(), "{kill:?}");
-        }
+        // With the cursor on an edge a plain edit is safe: no payload splay.
+        let mut composer = Composer::new();
+        composer.paste(&big);
+        composer.up(width);
+        composer.insert_char('z');
+        composer.document.assert_invariants();
+        assert_eq!(composer.document.atoms.len(), 1);
+        assert_eq!(composer.submit().unwrap().text, format!("z{big}"));
     }
 
     #[test]
