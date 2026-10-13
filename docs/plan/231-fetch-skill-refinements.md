@@ -55,6 +55,14 @@
 `application/x-sqlite3`（二进制），一并整体匹配，并补上 `x-ndjson` / `json-seq` /
 `x-javascript` 正例与 `x-sqlite3`、`application/octet-stream; x=json` 反例。
 
+第三轮同一条的继续：即使按子类型匹配，**标记子串仍然推不出文本**——
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document`（IANA 登记为
+二进制）子类型含 `xml`，会被放行。至此三次都是同一个根因（x-sh、sqlite3、OOXML），
+所以彻底放弃标记方案：改为**明确类型名单 + `x-` 别名/旧拼写 + 结构化后缀**，名单之外
+一律拒绝；并把这份名单写进 DESIGN，附上三个二进制反例。这正是第二轮"只列精确类型会
+丢别名"那条教训的解：不是回到子串，而是把别名补齐（x-json / json5 / ndjson /
+xml-dtd / x-javascript / x-ecmascript / x-sql / x-csv / x-markdown 等）。
+
 ## 验证
 
 - `cargo test -p kloop-web`：31 项通过（含新增的同站跳转标注、`Retry-After` 合法与

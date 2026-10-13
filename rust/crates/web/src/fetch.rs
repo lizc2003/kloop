@@ -171,52 +171,60 @@ fn same_site(from: &Url, to: &Url) -> bool {
 
 /// Content types this tool treats as text.
 ///
-/// Parameters (`;charset=…`) are dropped and the decision is made on the
-/// **subtype**, never on a substring of the whole type. Markers a binary can
-/// also contain are matched whole (`x-sh` vs `application/x-sharedlib` and
-/// `application/x-shockwave-flash`; `sql` vs `application/x-sqlite3`), and the
-/// rest (json, xml, javascript, …) stay markers because naming exact spellings
-/// would drop `application/x-ndjson`, `application/json-seq` and
-/// `application/x-javascript`. Matching the subtype rather than the raw type is
-/// also what stops a parameter from carrying a marker in.
+/// Text is named exactly — the spellings servers actually send, including the
+/// `x-` aliases — or through its structured-syntax suffix. It is never inferred
+/// from a marker inside the type, because a marker does not imply text: `xml`
+/// appears in the binary OOXML documents
+/// (`application/vnd.openxmlformats-officedocument.wordprocessingml.document`),
+/// `sql` in `application/x-sqlite3`, `x-sh` in `application/x-sharedlib`. Each
+/// of those reached the model as lossy-decoded bytes under a marker test.
+/// Parameters (`;charset=…`) are dropped first, so they cannot carry one in.
 fn is_text_content_type(content_type: &str) -> bool {
     let essence = content_type.split(';').next().unwrap_or_default().trim();
     if essence.is_empty() || essence.starts_with("text/") {
         return true;
     }
-    let Some((_, subtype)) = essence.split_once('/') else {
-        return false;
-    };
     // The structured-syntax suffix of a text format: `+json`, `+xml`, `+yaml`…
-    if STRUCTURED_SUFFIXES
-        .iter()
-        .any(|suffix| subtype.ends_with(suffix))
-    {
+    if TEXT_SUFFIXES.iter().any(|suffix| essence.ends_with(suffix)) {
         return true;
     }
-    // Markers a binary spelling can also contain — `x-sharedlib`,
-    // `x-shockwave-flash`, `x-sqlite3` — so these are matched whole.
-    if matches!(subtype, "x-sh" | "x-shellscript" | "sql" | "x-sql") {
-        return true;
-    }
-    TEXT_SUBTYPE_MARKERS
-        .iter()
-        .any(|marker| subtype.contains(marker))
+    TEXT_TYPES.contains(&essence)
 }
 
-const TEXT_SUBTYPE_MARKERS: &[&str] = &[
-    "json",
-    "xml",
-    "javascript",
-    "ecmascript",
-    "yaml",
-    "toml",
-    "csv",
-    "markdown",
-    "shellscript",
+/// Text media types worth naming: the registered spellings plus the `x-` aliases
+/// and legacy names hosts still serve. A type that is neither here nor a
+/// structured suffix is refused — for a body this tool cannot tell from binary,
+/// the unsupported-type answer is the honest one.
+const TEXT_TYPES: &[&str] = &[
+    "application/json",
+    "application/x-json",
+    "application/json5",
+    "application/ndjson",
+    "application/x-ndjson",
+    "application/json-seq",
+    "application/xml",
+    "application/x-xml",
+    "application/xml-dtd",
+    "application/javascript",
+    "application/x-javascript",
+    "application/ecmascript",
+    "application/x-ecmascript",
+    "application/yaml",
+    "application/x-yaml",
+    "application/toml",
+    "application/x-toml",
+    "application/sh",
+    "application/x-sh",
+    "application/x-shellscript",
+    "application/sql",
+    "application/x-sql",
+    "application/csv",
+    "application/x-csv",
+    "application/markdown",
+    "application/x-markdown",
 ];
 
-const STRUCTURED_SUFFIXES: &[&str] = &["+json", "+xml", "+text", "+yaml", "+toml"];
+const TEXT_SUFFIXES: &[&str] = &["+json", "+xml", "+text", "+yaml", "+toml"];
 
 async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -> Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
@@ -418,19 +426,23 @@ mod tests {
         }
     }
 
-    /// The text-type decision is made on the subtype, parameters stripped: a
-    /// substring test over the whole type accepts a binary that merely contains
-    /// a marker, and an exact list loses the JSON-ish spellings.
+    /// Text is named, never inferred from a marker: a marker does not imply
+    /// text, and a list that only names the common spellings loses the aliases
+    /// hosts still send.
     #[test]
-    fn text_content_types_match_the_subtype() {
+    fn text_content_types_are_named_not_inferred() {
         for content_type in [
             "text/plain",
             "application/json",
             "application/x-ndjson",
             "application/json-seq",
             "application/x-javascript",
+            "application/xml",
+            "application/xml-dtd",
             "application/x-yaml; charset=utf-8",
+            "application/toml",
             "application/x-sh",
+            "application/x-shellscript",
             "application/sql",
             "application/schema+json",
             "image/svg+xml",
@@ -439,9 +451,12 @@ mod tests {
             assert!(super::is_text_content_type(content_type), "{content_type}");
         }
         for content_type in [
+            // Binary despite containing "xml" / "sql" / "x-sh".
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/x-sqlite3",
             "application/x-sharedlib",
             "application/x-shockwave-flash",
-            "application/x-sqlite3",
             "application/octet-stream",
             // A parameter must not be able to smuggle a marker in.
             "application/octet-stream; x=json",
@@ -698,12 +713,17 @@ mod tests {
                 .unwrap();
             assert_eq!(out, "key: value", "{content_type}");
         }
-        // These contain a text marker as a substring but are binary: they keep
-        // the unsupported-type answer rather than arriving as lossy noise.
+        // These are binary (or carry a marker in a parameter): they keep the
+        // unsupported-type answer rather than arriving as lossy noise.
         for (route, content_type) in [
             ("/sharedlib", "application/x-sharedlib"),
             ("/flash", "application/x-shockwave-flash"),
             ("/sqlite", "application/x-sqlite3"),
+            (
+                "/docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            ("/octet", "application/octet-stream; x=json"),
         ] {
             Mock::given(method("GET"))
                 .and(path(route))

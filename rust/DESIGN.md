@@ -2719,13 +2719,15 @@ network-free, reqwest lives only in provider and web):
   过长或为空的不重复，避免把不可信值当成事实）；其余暂时性服务错误不猜原因。
   不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
   DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227、228）。
-  正文类型除 `text/*` 与空类型外，先剥掉参数、再按**子类型**判断：命中结构化后缀
-  （`+json` / `+xml` / `+yaml` / `+toml` / `+text`）或文本标记（json / xml / javascript /
-  ecmascript / yaml / toml / csv / markdown / shellscript）即为文本；`x-sh` / `x-shellscript`
-  / `sql` / `x-sql` 必须整体匹配，因为二进制子串也含它们（`application/x-sharedlib`、
-  `application/x-shockwave-flash`、`application/x-sqlite3`）。反过来也不能只列精确类型：
-  `application/x-ndjson`、`application/json-seq`、`application/x-javascript` 会被拒。
-  比子类型而不是比整串（含参数）也让参数无法夹带标记。二进制仍拒绝，不用有损解码冒充文本。
+  正文类型除 `text/*` 与空类型外，先剥掉参数，再按**明确类型名单**（含 `x-` 别名与旧
+  拼写：json / x-json / json5 / ndjson / x-ndjson / json-seq / xml / x-xml / xml-dtd /
+  javascript / x-javascript / ecmascript / yaml / toml / sh / x-sh / x-shellscript /
+  sql / x-sql / csv / markdown 等）或**结构化后缀**（`+json` / `+xml` / `+yaml` / `+toml`
+  / `+text`）判断。**不按标记子串判断**：标记不蕴含文本——`xml` 出现在二进制的 OOXML
+  文档里（`…openxmlformats…wordprocessingml.document`）、`sql` 出现在
+  `application/x-sqlite3`、`x-sh` 出现在 `application/x-sharedlib` 与
+  `application/x-shockwave-flash`，这三种都曾被当作文本送进模型。名单之外的类型仍拒绝；
+  参数先剥掉，所以也不能靠参数夹带标记。二进制一律拒绝，不用有损解码冒充文本。
   跟随同站跳转后，正文尾部标注最终落地的地址——跳转是静默的，登录页或中间页
   否则会以“就是被请求的文档”的样子送达（假成功，比它掩盖的 404 更危险，plan 231）。
   Download truncation is reported. There is **no model-text cap**: the body is a
