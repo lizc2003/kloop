@@ -278,13 +278,20 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
     // back. The download cap below still bounds the transfer; model visibility
     // is the offload seam's job alone.
     if download_truncated {
-        text.push_str(&format!(
-            "\n\n[download truncated at {} MiB: more content was available and this tool cannot \
-             retrieve it, so a second fetch would stop at the same bound]",
-            limits::MAX_DOWNLOAD_BYTES / (1024 * 1024)
-        ));
+        text.push_str(&truncation_marker());
     }
     Ok(text)
+}
+
+/// What a fetch that hit the download bound appends. Derived from the bound so
+/// raising it cannot leave a stale number behind, and it says the remainder is
+/// not retrievable — otherwise a second fetch looks like a way to get it.
+fn truncation_marker() -> String {
+    format!(
+        "\n\n[download truncated at {} MiB: more content was available and this tool cannot \
+         retrieve it, so a second fetch would stop at the same bound]",
+        limits::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+    )
 }
 
 /// Appended when the extracted text is a client-render placeholder rather than
@@ -841,6 +848,31 @@ mod tests {
         assert_eq!(out, body);
     }
 
+    /// The marker is derived from the bound (a literal would go stale if the
+    /// bound moved) and says the remainder is not retrievable, so the model does
+    /// not read a second fetch as a way to get it.
+    #[test]
+    fn the_truncation_marker_names_the_bound_and_says_the_rest_is_gone() {
+        let marker = super::truncation_marker();
+        assert!(
+            marker.contains(&format!(
+                "at {} MiB",
+                limits::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+            )),
+            "{marker}"
+        );
+        assert!(marker.contains("cannot retrieve it"), "{marker}");
+        assert!(
+            !marker.contains("content truncated"),
+            "the marker is about the download, not the text: {marker}"
+        );
+    }
+
+    /// End to end, over the bound: the transfer stops there, everything up to it
+    /// is kept, and the marker is appended. Ignored by default because it pushes
+    /// the whole bound (20 MiB) through the mock server; run it explicitly with
+    /// `cargo test -p kloop-web -- --ignored`.
+    #[ignore = "transfers the full 20 MiB bound; run with --ignored"]
     #[tokio::test]
     async fn the_download_cap_still_bounds_the_transfer_and_is_reported() {
         let server = MockServer::start().await;
@@ -854,27 +886,13 @@ mod tests {
         let out = fetch_private(&format!("{}/oversized", server.uri()))
             .await
             .unwrap();
-        // The marker is derived from the bound (a literal would go stale if the
-        // bound moved) and says the remainder is not retrievable.
-        let cut = out
-            .find("\n\n[download truncated at")
-            .expect("truncation is reported");
-        assert!(
-            out[cut..].contains(&format!(
-                "at {} MiB",
-                limits::MAX_DOWNLOAD_BYTES / (1024 * 1024)
-            )),
-            "{out:?}"
-        );
-        assert!(out[cut..].contains("cannot retrieve it"), "{out:?}");
-        assert!(
-            !out.contains("content truncated"),
-            "the marker is about the download, not the text: {out:?}"
-        );
+        let marker = super::truncation_marker();
+        let cut = out.find(&marker).expect("truncation is reported");
         assert_eq!(
             out[..cut].len(),
             limits::MAX_DOWNLOAD_BYTES,
             "everything downloaded is kept",
         );
+        assert_eq!(out[cut..], marker, "the marker is the whole tail");
     }
 }

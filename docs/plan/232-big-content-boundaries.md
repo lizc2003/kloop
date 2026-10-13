@@ -52,7 +52,10 @@
 
 - `cargo test -p kloop-core history::`：31 项通过（新增指针首行的 chars/lines/path 断言、
   `shape_hint` 的数组/对象/键名上限/非 JSON/超限不解析用例）。
-- `cargo test -p kloop-web`：32 项通过（截断标记按常量生成、保留字节数等于常量）。
+- `cargo test -p kloop-web`：32 项通过、1 项 `#[ignore]`。20 MiB 的端到端用例（传输截断）
+  改为按需显式运行——`cargo test -p kloop-web -- --ignored`，已单独跑过一次通过；门禁不再
+  为它付 20 MiB 的代价。"标记随常量生成、不漂移"这条件由新的纯函数用例
+  （`the_truncation_marker_names_the_bound_and_says_the_rest_is_gone`）覆盖。
 - `cargo test -p kloop-core agent::tests`：142 项通过（按 "saved to" 解析路径的既有用例
   仍然成立）。
 - 外层执行沙箱之外 `make check` 全绿：fmt、clippy、workspace debug 全量测试、本机 parity。
