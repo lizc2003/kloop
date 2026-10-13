@@ -2712,9 +2712,9 @@ network-free, reqwest lives only in provider and web):
   401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性；
   对仓库 / PR 地址提示先对照当前 Git remotes，匹配才使用已有 Git 访问查询 PR refs、
   fetch 缺失对象，提醒 head ref 不提供实际目标分支、`git pull` 会改动当前分支和工作区。
-  这只是通用失败指引，网络工具不读取本地仓库或自动执行 Git；原生 review 的缺失
-  目标交还也不会因此自动继续。410 建议确认当前位置，429 与常见暂时性服务错误
-  提示稍后重试。其余状态不猜原因。
+  这只是通用失败指引，网络工具不读取本地仓库或自动执行 Git；原生 review 在
+  自身门禁内复用明确目标或尝试固定地址的认证恢复。410 建议确认当前位置，
+  429 与常见暂时性服务错误提示稍后重试。其余状态不猜原因。
   不把错误响应正文作为页面内容或审查证据；不自动重试、不改换 URL、不探查凭据。
   DNS、传输、地址限制和权限门仍保留各自失败来源（plan 227、228）。
   Download truncation is reported. There is **no model-text cap**: the body is a
@@ -3967,16 +3967,24 @@ PR head ref 不能证明目标分支，匿名 404 与 DNS 错误也不能各自�
 完整文件清单先于分批读取，独立读取同轮提交；截断结果不算覆盖，须补齐剩余 hunks。
 提交 / 工作区等入口的版本读取与覆盖要求仍是模型可见指令；内置 PR 的原生阶段
 见下文。准备完整差异不证明模型已逐项审查，也不证明减少调用或漏报（plan 226、227）。
-模型激活内置 skill 且参数包含一个支持的 PR URL 时，先由运行时通过现有 `web_fetch`
-来源做一次固定元数据查询（GitHub PR、Gitea / Forgejo `/pulls/<number>`，含路径前缀）。
-复用来源、hook、权限、超时和地址限制，不读取凭据或自动调用托管 CLI。
+模型激活内置 skill 且参数包含一个支持的 PR URL 时，先复用当前历史中用户已明确
+给同一 PR 的目标分支，直接记录待准备状态，不重复询问。只认普通用户消息中的
+明确目标陈述，按 PR 绑定；模型、仓库正文和注入消息不能提供这项事实，当前分支
+也不作为目标证据。没有该事实才通过现有 `web_fetch` 来源做一次固定元数据查询
+（GitHub PR、Gitea / Forgejo `/pulls/<number>`，含路径前缀），复用来源、hook、
+权限、超时和地址限制。
+查询失败或字段不足时，先通过 Bash 校验 origin 与请求仓库一致，匹配才尝试
+现有 `gh api` 对同一完整 API 地址做一次只读认证查询，禁用交互登录；没有客户端
+或没有有效认证就记录失败，不扫描凭据、不安装客户端、不猜备用地址。
 合法 head、实际目标分支与目标 tip 作为固定字段随正文返回，并记录待准备状态。
-查询失败或字段不足则由运行时记录并显示一个缺失目标问题及待回答状态，
+恢复仍失败且用户未给目标时，才显示访问失败原因和一个缺失事实请求及待回答状态，
 配对所有工具结果后直接结束 turn，不再请求模型选择动作；用户取消优先。
-skill 调用成为调度顺序边界；交还问题时其后未开始的工具不执行。`completed` 在此表示当前
-turn 已交还问题，不能解释为 review 已完成。无 PR 参数、提交 / 工作区、用户覆盖
+skill 调用成为调度顺序边界；交还问题或确定待准备状态后，其后排队工具都不执行，
+避免在固定版本材料准备前读取工作区；确定目标不结束 turn，直接准备并继续审查。
+`completed` 在交还时表示当前 turn 已交还问题，不能解释为 review 已完成。
+无 PR 参数、提交 / 工作区、用户覆盖
 skill、Program 桥接、slash 展开和未支持的入口不进入此预处理；不声称约束了所有审查路径。
-用户补齐明确分支后，在下一次模型采样前通过已有 Bash 门禁校验 origin 与 PR 身份；
+目标已明确后，在下一次模型采样前通过已有 Bash 门禁校验 origin 与 PR 身份；
 PR URL 尾斜杠不影响身份或 head ref 解析；remote 路径只去掉一个克隆用 `.git` 后缀，
 保留仓库名自身的 `.git`，避免不同仓库被归为同一身份。
 使用固定托管 head ref 和新读取的远端目标 ref 解析 SHA，不能复用陈旧的本地目标 tip。
@@ -3991,7 +3999,7 @@ PR URL 尾斜杠不影响身份或 head ref 解析；remote 路径只去掉一�
 空结果均算失败，运行时不能合成 finding。正常模型报告后追加原生范围、差异准备
 缺口及补查失败事实；“准备完整差异”与“审查完整”分开表述。原生状态和准备材料
 随会话保存、恢复和压缩保留；用户切换任务或新的 steering 退出该阶段，取消 / 拒绝
-仍优先。此阶段限根 turn 的非 structured 内置 PR 路径（plan 227、228）。
+仍优先。此阶段限根 turn 的非 structured 内置 PR 路径（plan 227—229）。
 A finding needs `file:line`, a one-sentence claim and a
 concrete failure scenario; every candidate investigated gets a written verdict
 (confirmed / downgraded / excluded) so none disappears silently — a downgraded

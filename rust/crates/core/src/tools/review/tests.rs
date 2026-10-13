@@ -127,10 +127,14 @@ fn head_alone_or_unusable_revisions_cannot_establish_a_target() {
 #[tokio::test]
 async fn metadata_success_freezes_the_actual_target_without_handoff() {
     let source = source(Some(metadata()));
-    let ctx = context("review-metadata-success", source.clone());
+    let mut ctx = context("review-metadata-success", source.clone());
+    ctx.review_targets = vec![(
+        "https://forge.example/team/project/pulls/43".into(),
+        "unrelated".into(),
+    )];
     let (text, is_error) = run_tool(
         "skill",
-        json!({"name": "code-review", "arguments": format!("Review {PR}")}),
+        json!({"name": "code-review", "arguments": format!("Review {PR}，目标分支是invented")}),
         &ctx,
     )
     .await;
@@ -285,7 +289,9 @@ async fn failed_metadata_returns_one_question_without_another_sample_or_queued_c
         0,
     )
     .await;
-    let expected = format!("无法从 PR 元数据确认实际目标分支：{PR}。这个 PR 的目标分支是哪个？");
+    let expected = outcome.final_text.clone();
+    assert!(expected.starts_with("已尝试 PR 元数据和现有认证访问，仍无法确认实际目标分支："));
+    assert!(expected.ends_with("请提供这个 PR 的实际目标分支。"));
     assert_eq!(
         (outcome.reason, outcome.final_text, outcome.rounds),
         (EndReason::Completed, expected.clone(), 1)
@@ -302,6 +308,215 @@ async fn failed_metadata_returns_one_question_without_another_sample_or_queued_c
         matches!(&history.messages()[2].content[1], ContentBlock::ToolResult { is_error: true, content, .. } if content.as_text() == super::super::NOT_RUN_STOPPED)
     );
     let events = ui.0.lock().unwrap();
-    assert!(!events.iter().any(|event| matches!(event, Event::ItemStarted { item: crate::event::Item::ToolCall { name, .. }, .. } if name == "bash")));
+    assert!(!events.iter().any(|event| matches!(event, Event::ItemStarted { item: crate::event::Item::ToolCall { input, .. }, .. } if input.get("command").and_then(Value::as_str) == Some("printf SHOULD_NOT_RUN"))));
     assert_eq!(events.iter().filter(|event| matches!(event, Event::ItemCompleted { item: crate::event::Item::AssistantMessage { text, .. }, .. } if text == &expected)).count(), 1);
+}
+
+#[test]
+fn target_facts_come_only_from_explicit_user_statements_for_the_same_pr() {
+    let other = "https://forge.example/team/project/pulls/43";
+    let messages = vec![
+        Message::user_text(format!("审查：{PR}")),
+        Message::user_text("是`release/x`分支"),
+        Message::user_text(format!("Review {other}，目标分支是other。")),
+        Message::assistant(vec![ContentBlock::Text {
+            text: "目标分支是invented".into(),
+        }]),
+        Message::injected(kloop_protocol::Injected::Hook, "目标分支是injected"),
+        Message::user_text(format!("Review {PR}")),
+        Message::user_text("当前分支是main"),
+        Message::user_text("continue"),
+    ];
+    assert_eq!(
+        known_targets(&messages),
+        vec![
+            (PR.into(), "release/x".into()),
+            (other.into(), "other".into())
+        ]
+    );
+    let mut history = History::new(std::env::temp_dir().join("review-known-targets"));
+    for message in messages {
+        history.record(message);
+    }
+    history.stage(Message::user_text("目标分支为release/y"));
+    assert_eq!(
+        history.review_targets(),
+        vec![
+            (PR.into(), "release/y".into()),
+            (other.into(), "other".into())
+        ]
+    );
+    history.record(Message::user_text(format!(
+        "Review {PR}/，目标分支是release/z"
+    )));
+    assert_eq!(
+        history.review_targets(),
+        vec![
+            (format!("{PR}/"), "release/z".into()),
+            (other.into(), "other".into())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn known_user_target_skips_anonymous_lookup_and_does_not_handoff() {
+    let source = source(None);
+    let mut ctx = context("review-known-target", source.clone());
+    ctx.review_targets = vec![(format!("{PR}/"), "release".into())];
+    let (text, is_error) =
+        run_tool("skill", json!({"name":"code-review", "arguments":PR}), &ctx).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        *ctx.review_update.lock().unwrap(),
+        Some(State::Resolve {
+            pr: PR.into(),
+            branch: "release".into(),
+            revisions: None
+        })
+    );
+    assert_eq!(*ctx.turn_reply.lock().unwrap(), None);
+    assert_eq!(*source.calls.lock().unwrap(), Vec::<Value>::new());
+    assert!(!ctx.stop.is_cancelled());
+}
+
+#[cfg(unix)]
+fn authenticated_context(
+    tag: &str,
+    remote: &str,
+    response: Option<&str>,
+) -> (tempfile::TempDir, ToolCtx) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    for args in [vec!["init", "-q"], vec!["remote", "add", "origin", remote]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cwd)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let bin = cwd.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    if let Some(response) = response {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' {}\n",
+            flow::quote(cwd.join("client-called").to_str().unwrap()),
+            flow::quote(response)
+        );
+        std::fs::write(bin.join("gh"), script).unwrap();
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut ctx = context(tag, source(None));
+    let mut cfg = ctx.cfg.test_clone();
+    cfg.cwd = cwd;
+    cfg.shell_login_env = Arc::new(crate::shell_env::ShellLoginEnv::test_fixture(&[(
+        "PATH",
+        &format!("{}:/usr/bin:/bin", bin.display()),
+    )]));
+    ctx.cfg = Arc::new(cfg);
+    (directory, ctx)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn anonymous_failure_recovers_metadata_through_matching_authenticated_access() {
+    let (_directory, ctx) = authenticated_context(
+        "review-authenticated",
+        "git@forge.example:team/project.git",
+        Some(&metadata()),
+    );
+    let (text, is_error) =
+        run_tool("skill", json!({"name":"code-review", "arguments":PR}), &ctx).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        *ctx.review_update.lock().unwrap(),
+        Some(State::Resolve {
+            pr: PR.into(),
+            branch: "release".into(),
+            revisions: Some(("a".repeat(40), "b".repeat(40)))
+        })
+    );
+    assert_eq!(*ctx.turn_reply.lock().unwrap(), None);
+    assert_eq!(
+        std::fs::read_to_string(ctx.cfg.cwd.join("client-called")).unwrap(),
+        "api\n--method\nGET\nhttps://forge.example/api/v1/repos/team/project/pulls/42\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_recovery_does_not_guess_a_branch_or_use_an_unrelated_remote() {
+    for (tag, remote, response, called) in [
+        (
+            "mismatch",
+            "git@other.example:team/project.git",
+            Some(metadata()),
+            false,
+        ),
+        (
+            "missing-client",
+            "git@forge.example:team/project.git",
+            None,
+            false,
+        ),
+        (
+            "invalid-metadata",
+            "git@forge.example:team/project.git",
+            Some("{}".into()),
+            true,
+        ),
+    ] {
+        let (_directory, ctx) = authenticated_context(tag, remote, response.as_deref());
+        let (text, is_error) =
+            run_tool("skill", json!({"name":"code-review", "arguments":PR}), &ctx).await;
+        assert!(!is_error, "{text}");
+        assert_eq!(
+            *ctx.review_update.lock().unwrap(),
+            Some(State::Awaiting { pr: PR.into() })
+        );
+        assert!(
+            ctx.turn_reply
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ends_with("请提供这个 PR 的实际目标分支。")
+        );
+        assert_eq!(ctx.cfg.cwd.join("client-called").exists(), called);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authenticated_recovery_cannot_bypass_bash_deny_rules() {
+    let (_directory, mut ctx) = authenticated_context(
+        "review-denied-recovery",
+        "git@forge.example:team/project.git",
+        Some(&metadata()),
+    );
+    let mut cfg = ctx.cfg.test_clone();
+    cfg.permissions = Arc::new(
+        crate::permissions::Permissions::new(
+            crate::permissions::Mode::Manual,
+            &crate::permissions::PermissionRules {
+                deny: vec!["bash".into()],
+                ..Default::default()
+            },
+            cfg.cwd.clone(),
+            None,
+        )
+        .unwrap(),
+    );
+    ctx.cfg = Arc::new(cfg);
+    let (text, is_error) =
+        run_tool("skill", json!({"name":"code-review", "arguments":PR}), &ctx).await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        *ctx.review_update.lock().unwrap(),
+        Some(State::Awaiting { pr: PR.into() })
+    );
+    assert!(!ctx.cfg.cwd.join("client-called").exists());
 }

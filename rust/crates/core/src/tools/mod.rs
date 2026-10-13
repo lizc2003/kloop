@@ -448,6 +448,7 @@ pub struct ToolCtx {
     pub stop: CancellationToken,
     pub(crate) turn_reply: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) review_update: Arc<std::sync::Mutex<Option<review::State>>>,
+    pub(crate) review_targets: Vec<(String, String)>,
     pub depth: u8,
     /// The execution enclosing this tool call. Root turns have none; admitted
     /// Agent turns and Program/Workflow bridges replace it with their fixed ref.
@@ -506,6 +507,7 @@ impl ToolCtx {
             stop: CancellationToken::new(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
             review_update: Arc::new(std::sync::Mutex::new(None)),
+            review_targets: Vec::new(),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -973,6 +975,8 @@ pub async fn dispatch_tools(
         let batch = &tool_uses[i..j];
         if ctx.cancel.is_cancelled() {
             results.extend(batch.iter().map(|(id, _, _)| interrupted(id)));
+        } else if preparing_review(ctx) {
+            results.extend(batch.iter().map(|(id, _, _)| pending_review(id)));
         } else if safe {
             // One permit per call in flight. join_all still yields results in
             // request order, and a finished call drops its permit at once, so
@@ -1004,6 +1008,8 @@ pub async fn dispatch_tools(
             for (id, name, input) in batch {
                 if ctx.cancel.is_cancelled() {
                     results.push(interrupted(id));
+                } else if preparing_review(ctx) {
+                    results.push(pending_review(id));
                 } else {
                     results.push(
                         run_one(
@@ -1021,6 +1027,23 @@ pub async fn dispatch_tools(
         i = j;
     }
     results
+}
+
+fn preparing_review(ctx: &ToolCtx) -> bool {
+    matches!(
+        *ctx.review_update
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        Some(review::State::Resolve { .. })
+    )
+}
+
+fn pending_review(id: &str) -> ContentBlock {
+    ContentBlock::ToolResult {
+        tool_use_id: id.into(),
+        content: "Not run: native PR preparation must finish before further tools.".into(),
+        is_error: true,
+    }
 }
 
 /// The in-process cancellation result: the call knows how far it got. A killed
@@ -2163,6 +2186,7 @@ pub(crate) mod testutil {
             stop: CancellationToken::new(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
             review_update: Arc::new(std::sync::Mutex::new(None)),
+            review_targets: Vec::new(),
             depth,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4466,6 +4490,7 @@ mod tests {
             stop: CancellationToken::new(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
             review_update: Arc::new(std::sync::Mutex::new(None)),
+            review_targets: Vec::new(),
             depth: 0,
             enclosing_execution: None,
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),

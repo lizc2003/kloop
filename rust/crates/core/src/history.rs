@@ -607,6 +607,10 @@ impl History {
             .map(str::to_owned)
     }
 
+    pub(crate) fn review_targets(&self) -> Vec<(String, String)> {
+        crate::tools::review::known_targets(self.items.iter().chain(&self.staged))
+    }
+
     pub fn provider_usage(&self) -> &UsageLedger {
         &self.provider_usage
     }

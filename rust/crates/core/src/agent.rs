@@ -994,6 +994,7 @@ impl Turn<'_> {
             stop: self.options.stop.clone(),
             turn_reply: Arc::new(std::sync::Mutex::new(None)),
             review_update: Arc::new(std::sync::Mutex::new(None)),
+            review_targets: self.history.review_targets(),
             depth: self.depth,
             enclosing_execution: self.enclosing_execution.cloned(),
             hook_context: Arc::new(std::sync::Mutex::new(Vec::new())),

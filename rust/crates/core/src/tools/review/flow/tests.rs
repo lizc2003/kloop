@@ -236,6 +236,74 @@ async fn file_reads_preserve_source_line_numbers_and_blank_lines() {
 }
 
 #[tokio::test]
+async fn previously_confirmed_target_prepares_without_a_question_or_unpinned_queued_reads() {
+    let fixture = Fixture::new();
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Blocks(vec![
+            AssistantBlock::ToolUse {
+                id: "activate".into(),
+                name: "skill".into(),
+                input: json!({"name":"code-review", "arguments":PR}),
+            },
+            AssistantBlock::ToolUse {
+                id: "queued-write".into(),
+                name: "bash".into(),
+                input: json!({"command":"printf WRONG > unpinned-read"}),
+            },
+            AssistantBlock::ToolUse {
+                id: "queued-read".into(),
+                name: "read".into(),
+                input: json!({"file_path":"old.txt"}),
+            },
+        ]),
+        report(),
+    ]);
+    let ctx = fixture.ctx("review-prior-target", provider, Some(4));
+    let mut history = History::new(ctx.cfg.offload_dir.clone());
+    history.record(Message::user_text(format!("Review {PR}")));
+    history.record(Message::user_text("是release分支"));
+    history.stage(Message::user_text(format!("Review {PR}")));
+    let outcome = crate::agent::run_turn(&ctx.cfg, &mut history, &ctx.ui, &ctx.cancel, 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert!(!fixture.cwd.join("unpinned-read").exists());
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["review_read"]
+    );
+    assert_eq!(state(history.messages()), State::Idle);
+    assert!(outcome.final_text.contains(&fixture.head));
+    let skipped = history
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: true,
+            } if tool_use_id.starts_with("queued-") => {
+                Some((tool_use_id.as_str(), content.as_text().into_owned()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let reason = "Not run: native PR preparation must finish before further tools.";
+    assert_eq!(
+        skipped,
+        vec![
+            ("queued-write", reason.into()),
+            ("queued-read", reason.into())
+        ]
+    );
+}
+
+#[tokio::test]
 async fn persisted_target_answer_prepares_before_sampling_and_finishes_with_facts() {
     let fixture = Fixture::new();
     let (provider, seen) = Provider::mock_recording(vec![report()]);

@@ -100,7 +100,7 @@ pub(crate) fn latest_user_text(messages: &[Message]) -> Option<&str> {
     })
 }
 
-fn branch(text: &str) -> Option<String> {
+pub(super) fn branch(text: &str) -> Option<String> {
     let text = text.trim().trim_end_matches(['。', '.']);
     if matches!(text, "继续" | "continue" | "取消" | "停止" | "stop") {
         return None;
@@ -122,7 +122,7 @@ fn branch(text: &str) -> Option<String> {
     .then(|| text.to_owned())
 }
 
-fn quote(text: &str) -> String {
+pub(super) fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
@@ -135,7 +135,7 @@ fn repository_path(path: &str) -> &str {
     path.strip_suffix(".git").unwrap_or(path)
 }
 
-fn same_repository(remote: &str, target: &PullRequest) -> bool {
+pub(super) fn same_repository(remote: &str, target: &PullRequest) -> bool {
     let remote = remote.trim();
     let remote = if remote.contains("://") {
         url::Url::parse(remote).ok().and_then(|url| {
@@ -162,7 +162,7 @@ fn same_repository(remote: &str, target: &PullRequest) -> bool {
     matches!((remote, path), (Some((host, remote_path)), Some(path)) if Some(host.as_str()) == target.url.host_str() && remote_path == path)
 }
 
-async fn git(ctx: &ToolCtx, command: String) -> Result<String> {
+pub(super) async fn git(ctx: &ToolCtx, command: String) -> Result<String> {
     let result = super::super::run_one(
         format!("review-git-{}", super::NEXT_LOOKUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
         "bash".into(), json!({"command": command, "description": "Prepare pinned PR review evidence", "timeout_ms": 60_000}), ctx.clone(), None,
