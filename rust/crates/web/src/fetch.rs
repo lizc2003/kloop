@@ -169,25 +169,36 @@ fn same_site(from: &Url, to: &Url) -> bool {
         && to.password().is_none()
 }
 
-/// Content types this tool treats as text. `text/*` and a missing type are
-/// accepted outright; these markers catch the common `application/*` spellings
-/// of text (yaml, shell, sql…) that a raw-file host serves. Binary types must
-/// stay refused — an unsupported-type error is the honest answer for a body
-/// this tool cannot read.
-const TEXT_LIKE_MARKERS: &[&str] = &[
-    "json",
-    "xml",
-    "javascript",
-    "ecmascript",
-    "yaml",
-    "toml",
-    "x-sh",
-    "shellscript",
-    "sql",
-    "csv",
-    "markdown",
-    "+text",
-];
+/// Content types this tool treats as text.
+///
+/// The type is matched as a whole, never by substring: a substring test accepts
+/// `application/x-sharedlib` and `application/x-shockwave-flash` as text and
+/// hands the model lossy-decoded noise where it used to get an unsupported-type
+/// error. Parameters (`;charset=…`) are dropped first, and the structured
+/// `+json` / `+xml` / … suffix is checked on what is left.
+fn is_text_content_type(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    if essence.is_empty() || essence.starts_with("text/") {
+        return true;
+    }
+    const EXACT: &[&str] = &[
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/ecmascript",
+        "application/yaml",
+        "application/x-yaml",
+        "application/toml",
+        "application/x-toml",
+        "application/x-sh",
+        "application/x-shellscript",
+        "application/sql",
+        "application/csv",
+        "application/markdown",
+    ];
+    const SUFFIXES: &[&str] = &["+json", "+xml", "+text", "+yaml", "+toml"];
+    EXACT.contains(&essence) || SUFFIXES.iter().any(|suffix| essence.ends_with(suffix))
+}
 
 async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -> Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
@@ -211,11 +222,7 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
     let is_html = content_type.contains("text/html")
         || content_type.contains("application/xhtml")
         || (content_type.is_empty() && raw.trim_start().starts_with('<'));
-    let is_text = content_type.starts_with("text/")
-        || content_type.is_empty()
-        || TEXT_LIKE_MARKERS
-            .iter()
-            .any(|marker| content_type.contains(marker));
+    let is_text = is_text_content_type(content_type);
     if !is_html && !is_text {
         bail!(
             "web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)"
@@ -390,6 +397,31 @@ mod tests {
             "https://forge.example/",
         ] {
             assert!(!super::pull_request_url(&url(text)), "{text}");
+        }
+    }
+
+    /// The text-type decision is made on the whole type, parameters stripped: a
+    /// substring test would accept a binary that merely contains a marker.
+    #[test]
+    fn text_content_types_match_the_whole_type() {
+        for content_type in [
+            "text/plain",
+            "application/json",
+            "application/x-yaml; charset=utf-8",
+            "application/schema+json",
+            "image/svg+xml",
+            "",
+        ] {
+            assert!(super::is_text_content_type(content_type), "{content_type}");
+        }
+        for content_type in [
+            "application/x-sharedlib",
+            "application/x-shockwave-flash",
+            "application/octet-stream",
+            "application/pdf",
+            "image/png",
+        ] {
+            assert!(!super::is_text_content_type(content_type), "{content_type}");
         }
     }
 
@@ -619,7 +651,8 @@ mod tests {
         for (route, content_type) in [
             ("/config.yaml", "application/x-yaml"),
             ("/script.sh", "application/x-sh"),
-            ("/notes.toml", "application/toml"),
+            ("/notes.toml", "application/toml; charset=utf-8"),
+            ("/schema.json", "application/schema+json"),
         ] {
             Mock::given(method("GET"))
                 .and(path(route))
@@ -634,6 +667,27 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(out, "key: value", "{content_type}");
+        }
+        // Both of these contain "x-sh" as a substring but are binary: they keep
+        // the unsupported-type answer rather than arriving as lossy noise.
+        for (route, content_type) in [
+            ("/sharedlib", "application/x-sharedlib"),
+            ("/flash", "application/x-shockwave-flash"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(vec![0u8, 159, 146, 150], content_type),
+                )
+                .mount(&server)
+                .await;
+            let err = fetch_private(&format!("{}{route}", server.uri()))
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("unsupported content type"),
+                "{content_type}: {err:#}"
+            );
         }
     }
 

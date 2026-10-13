@@ -4358,6 +4358,17 @@ mod tests {
         );
     }
 
+    /// A skill activation is not "just reading a file": the body's `!cmd` /
+    /// `@file` injections expand inside the call (each gated on its own), and a
+    /// `fork` skill runs a sub-agent. So it is neither batched beside a
+    /// concurrent read nor treated as having done nothing after a crash.
+    #[test]
+    fn skill_activation_is_effectful() {
+        let input = json!({"name": "x"});
+        assert!(!super::is_concurrency_safe("skill", &input, &[]));
+        assert!(super::may_have_effects("skill", &input, &[]));
+    }
+
     #[test]
     fn concurrency_safety_by_name_and_input() {
         fn is_concurrency_safe(name: &str, input: &Value) -> bool {

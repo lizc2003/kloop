@@ -30,6 +30,23 @@
    也不必为它给 `Skill` 加字段并改 CLI 警告通道；代价是提示只在 skill 真被激活时出现。
 7. 同一 skill 重复激活的正文去重**不做**（省的是 token，风险是模型误以为丢了指令）。
 
+## 复核后修订（2026-10-13）
+
+六项提交后复核提出两条，都成立，已修：
+
+- **正文类型按子串匹配会放进二进制**：`contains("x-sh")` 同时命中
+  `application/x-sharedlib` 与 `application/x-shockwave-flash`，两者会被
+  `from_utf8_lossy` 之后当成功正文送出（此前是"不支持的内容类型"）。改为剥掉 MIME
+  参数后按完整类型匹配、结构化后缀单独判断，并补这两条拒绝用例与一个纯函数用例。
+- **`skill` 被归为并发安全，忽略了激活时的副作用**：正文的 `!cmd` / `@file` 注入在
+  调用内执行（`inject::expand`），fork 技能还会跑子代理；与并发读并行会让注入命令的
+  写入与读取竞争。该分类还使 `may_have_effects` 为假（它由 `is_concurrency_safe`
+  推出），跳过 ToolStarted 记录，崩溃恢复会把跑过命令的调用说成"未运行"。改回串行
+  分类，注释换成真实理由。
+  归属说明：`true` 是 pre-range 的长期状态，范围里那次改成 `false` 的理由是 review
+  的顺序屏障，已随 plan 230 回退；但分类本身的理由与 review 无关，仍然成立，因此这次
+  按分类本身改回 `false`。
+
 ## 验证
 
 - `cargo test -p kloop-web`：31 项通过（含新增的同站跳转标注、`Retry-After` 合法与
