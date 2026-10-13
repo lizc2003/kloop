@@ -278,7 +278,11 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
     // back. The download cap below still bounds the transfer; model visibility
     // is the offload seam's job alone.
     if download_truncated {
-        text.push_str("\n\n[download truncated at 5MB]");
+        text.push_str(&format!(
+            "\n\n[download truncated at {} MiB: more content was available and this tool cannot \
+             retrieve it, so a second fetch would stop at the same bound]",
+            limits::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+        ));
     }
     Ok(text)
 }
@@ -850,11 +854,25 @@ mod tests {
         let out = fetch_private(&format!("{}/oversized", server.uri()))
             .await
             .unwrap();
-        assert!(out.ends_with("[download truncated at 5MB]"), "{out:?}");
-        assert!(!out.contains("content truncated"), "{out:?}");
+        // The marker is derived from the bound (a literal would go stale if the
+        // bound moved) and says the remainder is not retrievable.
+        let cut = out
+            .find("\n\n[download truncated at")
+            .expect("truncation is reported");
+        assert!(
+            out[cut..].contains(&format!(
+                "at {} MiB",
+                limits::MAX_DOWNLOAD_BYTES / (1024 * 1024)
+            )),
+            "{out:?}"
+        );
+        assert!(out[cut..].contains("cannot retrieve it"), "{out:?}");
+        assert!(
+            !out.contains("content truncated"),
+            "the marker is about the download, not the text: {out:?}"
+        );
         assert_eq!(
-            out.trim_end_matches("\n\n[download truncated at 5MB]")
-                .len(),
+            out[..cut].len(),
             limits::MAX_DOWNLOAD_BYTES,
             "everything downloaded is kept",
         );

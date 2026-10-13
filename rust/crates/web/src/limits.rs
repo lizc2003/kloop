@@ -1,6 +1,12 @@
 //! Shared response bounds for model-visible web content.
 
-pub(crate) const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// Safety bound on one fetch, not a visibility decision: everything inside it is
+/// handed to core, which owns the single seam that keeps an artifact (the
+/// offload store). Set well above what a normal target needs, so this is not
+/// what clips a page. Raise it together with `FETCH_TIMEOUT` — a slow link then
+/// fails as a timeout, which loses the whole body, where truncation keeps a
+/// prefix.
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 /// Bound on formatted `web_search` output only. `web_fetch` deliberately has no
 /// text cap: its body is a fetched artifact, and clipping one destroys evidence

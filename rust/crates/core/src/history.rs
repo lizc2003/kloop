@@ -788,10 +788,11 @@ impl History {
     }
 
     /// Write the whole result to the offload store and return what the model
-    /// sees instead — the head/tail preview plus the file's path — together
-    /// with that path, so a caller that decides against the trade can take the
-    /// file back out. `Err` means nothing was written and the caller still
-    /// holds the only copy.
+    /// sees instead — a header line with the scale and the file's path, an
+    /// optional shape line, then the head/tail preview — together with that
+    /// path, so a caller that decides against the trade can take the file back
+    /// out. `Err` means nothing was written and the caller still holds the only
+    /// copy.
     fn spill_to_disk(&self, content: &str) -> std::io::Result<(String, PathBuf)> {
         let path = write_offload_file(&self.offload_dir, content)?;
         // cc's shape: hand over a path and let the general tools work on it, rather
@@ -802,13 +803,20 @@ impl History {
         // context. Sandboxed bash can read this directory (the private state root
         // is denied for its credential, with the offload store carved back out)
         // but still cannot write it.
+        // The scale comes *first* (chars, line count, path): a reader learns how
+        // much was lost and how big the artifact is before reading a line of it,
+        // which is what makes the line count usable for slicing in place.
         let pointer = format!(
-            "{preview}\n[full output saved to {path} ({chars} chars). Query it in place instead \
-             of reading it back: bash with `python3 -c '...'` over that path, printing only the \
-             fields you need, {POINTER_END}",
-            preview = preview(content),
+            "[output truncated: {chars} chars, {lines} lines; full output saved to {path}]\n\
+             {shape}{preview}\n[Query it in place instead of reading it back: bash with \
+             `python3 -c '...'` over that path, printing only the fields you need, {POINTER_END}",
             chars = content.chars().count(),
+            lines = content.lines().count(),
             path = path.display(),
+            shape = shape_hint(content)
+                .map(|hint| format!("[{hint}]\n"))
+                .unwrap_or_default(),
+            preview = preview(content),
         );
         Ok((pointer, path))
     }
@@ -868,13 +876,53 @@ impl StubStore for SessionStubStore<'_> {
 }
 
 /// The head and tail a spilled result keeps in the history, with the middle
-/// marked as dropped. Shared by both spill outcomes so a failed offload reads
-/// the same as a successful one up to the pointer.
+/// marked as dropped and *how much* was dropped, so a reader can judge whether
+/// the file is worth querying. Shared by both spill outcomes so a failed
+/// offload reads the same as a successful one up to the pointer.
 fn preview(content: &str) -> String {
     let head: String = content.chars().take(HEAD_CHARS).collect();
     let tail_rev: Vec<char> = content.chars().rev().take(TAIL_CHARS).collect();
     let tail: String = tail_rev.into_iter().rev().collect();
-    format!("{head}\n…[truncated]…\n{tail}")
+    let omitted = content
+        .chars()
+        .count()
+        .saturating_sub(head.chars().count() + tail.chars().count());
+    format!("{head}\n…[{omitted} chars truncated]…\n{tail}")
+}
+
+/// A one-line description of a structured artifact, so a preview of head and
+/// tail is not all the reader gets. Line-oriented data needs nothing here: the
+/// pointer's line count is its record count. The parse is bounded, and a body
+/// that does not parse as JSON (truncated mid-value, or simply not JSON) yields
+/// no line at all — the header already says it was truncated.
+fn shape_hint(content: &str) -> Option<String> {
+    const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_KEYS: usize = 12;
+    if content.len() > MAX_PARSE_BYTES {
+        return None;
+    }
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with(['{', '[']) {
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed).ok()? {
+        serde_json::Value::Array(items) => Some(format!("JSON array: {} items", items.len())),
+        serde_json::Value::Object(map) => {
+            let keys: Vec<&str> = map.keys().take(MAX_KEYS).map(String::as_str).collect();
+            let rest = map.len().saturating_sub(keys.len());
+            let more = if rest == 0 {
+                String::new()
+            } else {
+                format!(", … +{rest}")
+            };
+            Some(format!(
+                "JSON object: {} keys: {}{more}",
+                map.len(),
+                keys.join(", ")
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1220,7 +1268,7 @@ mod tests {
         };
         let content = content.as_text();
         assert!(content.chars().count() < OFFLOAD_CAP_CHARS);
-        assert!(content.contains("…[truncated]…"));
+        assert!(content.contains("chars truncated]…"));
         assert!(content.contains("saved to"));
         let id = pointer_id(&content);
         let on_disk = std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap();
@@ -1243,18 +1291,61 @@ mod tests {
         };
         let content = content.as_text();
         let path = dir.join(format!("{}.txt", pointer_id(&content)));
+        // The scale leads: chars, the line count (what makes slicing in place
+        // possible), and where the artifact is.
         assert!(
-            content.contains(&format!("({} chars)", big.chars().count())),
+            content.starts_with(&format!(
+                "[output truncated: {} chars, 1 lines; full output saved to {}]",
+                big.chars().count(),
+                path.display()
+            )),
             "{content}"
         );
-        assert!(content.contains(&path.display().to_string()), "{content}");
+        assert!(content.contains("chars truncated]…"), "{content}");
         assert!(content.contains("python3 -c"), "{content}");
         assert!(content.contains("Query it in place"), "{content}");
+        // `is_offload_pointer` is how request reduction recognises a result that
+        // is already a preview: the sentence that ends the pointer must stay last.
+        assert!(super::is_offload_pointer(&content), "{content}");
         // The retired vocabulary must not come back: no id, no reader tool.
         assert!(!content.contains("read_offloaded"), "{content}");
         assert!(!content.contains("id=off-"), "{content}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A JSON artifact says what it is: head and tail alone cannot show how many
+    /// records there are, and a line count says nothing for a single-line array.
+    #[test]
+    fn a_structured_spill_describes_its_shape() {
+        assert_eq!(
+            super::shape_hint(r#"[{"id":1},{"id":2},{"id":3}]"#).unwrap(),
+            "JSON array: 3 items"
+        );
+        assert_eq!(
+            super::shape_hint(r#"{"a":1,"b":2}"#).unwrap(),
+            "JSON object: 2 keys: a, b"
+        );
+        let wide: String = format!(
+            "{{{}}}",
+            (0..20)
+                .map(|i| format!(r#""k{i}":{i}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let hint = super::shape_hint(&wide).unwrap();
+        assert!(hint.starts_with("JSON object: 20 keys: k0"), "{hint}");
+        assert!(hint.ends_with("… +8"), "{hint}");
+
+        // Truncated JSON parses as nothing, and neither does prose; both get no
+        // shape line rather than a guess.
+        assert!(super::shape_hint("[{\"id\":1},{\"id").is_none());
+        assert!(super::shape_hint("just some text").is_none());
+        assert!(super::shape_hint("\"a quoted string\"").is_none());
+        // Past the parse bound the line is skipped without parsing at all.
+        let huge = format!("[{}]", "1,".repeat(3 * 1024 * 1024));
+        assert!(huge.len() > 4 * 1024 * 1024);
+        assert!(super::shape_hint(&huge).is_none());
     }
 
     /// One round's tool results, in request order.
@@ -1440,7 +1531,7 @@ mod tests {
 
         let big = "result".repeat(OFFLOAD_CAP_CHARS / 6 + 200);
         let preview = history.offload_text(big.clone());
-        assert!(preview.contains("…[truncated]…"), "{preview}");
+        assert!(preview.contains("chars truncated]…"), "{preview}");
         assert!(preview.contains("saved to"), "{preview}");
         assert_eq!(
             std::fs::read_to_string(dir.join(format!("{}.txt", pointer_id(&preview)))).unwrap(),

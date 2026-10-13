@@ -15,8 +15,13 @@ the five architectural bets below; it is now ten crates, and every bet held.
    appended — a turn's input waits outside it until the turn produces something
    (see *A turn that never happened*), and once in, nothing is rewritten except
    by compaction. A tool result over `OFFLOAD_CAP_CHARS` (32000) is spilled to the
-   session store when recorded; the history keeps a head/tail preview plus the
-   spilled file's **absolute path** and character count.
+   session store when recorded; the history keeps a **scale-first** header
+   (character count, line count, the spilled file's **absolute path**), an
+   optional one-line shape for a JSON body (`N items` / `N keys: …`), and a
+   head/tail preview whose middle marker states how many characters it dropped.
+   The line count is what makes in-place slicing with `sed`/`python3 -c` possible,
+   and the shape line is what a head/tail of a single-line array cannot show
+   (codex's `Total output lines` and item-aware truncation, cut down to one line).
 
    **One round of results has its own cap.** A per-result cap only ever judges
    one call, so ten results of 31999 chars each pass it untouched and put
@@ -2707,7 +2712,8 @@ network-free, reqwest lives only in provider and web):
   HTTPS, embedded credentials and 2000-char URLs rejected, SSRF guard
   (loopback/private/link-local/CGNAT/metadata ranges refused, DNS names resolved
   and checked on every hop), same-site redirects followed (max 5), cross-host
-  redirects reported for an explicit re-fetch, 5 MiB download cap, HTML→text.
+  redirects reported for an explicit re-fetch, 20 MiB download cap (paired with
+  the 90s whole-request timeout), HTML→text.
   非成功 HTTP 响应保持工具失败，保留状态码和请求地址，按状态补充原因与下一步：
   401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性；
   只有可识别的 PR 形状地址（`<owner>/<repo>/pull|pulls/<number>`，含自托管路径前缀与
@@ -2739,6 +2745,15 @@ network-free, reqwest lives only in provider and web):
   saved to a file is queried in place rather than fetched again. That
   split matters — while both hints stood unscoped, a live run re-downloaded the
   same 2.1 MB on every retry.
+
+  **The download cap is a safety bound, not the visibility decision** (plan 232):
+  三处尺寸边界里只有 core 的 offload 层保留工件——工具内联上限（fetch 的
+  `MAX_DOWNLOAD_BYTES`、bash 的前台输出上限）会裁掉，search 的 50k 上限裁的是就地
+  合成的结果（没有工件可失）。所以 fetch 的上限设在正常目标之上（20 MiB），并**与
+  `FETCH_TIMEOUT` 成对**（90s）：只抬字节会让慢链路变成超时，超时丢掉的是整个正文，
+  比分页截断更差；90s 仍在 core 给外部工具的 300s 预算内。截断时提示写明上限、
+  说明**剩余内容这个工具取不回**、不要重复抓取；要取回 20 MiB 以上的目标需要 Range
+  续传（新增 schema 字段 + 每个区间重走 SSRF 门禁），暂不做。
 - **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
   at least two characters; allow/block lists are mutually exclusive) —
   pluggable `SearchBackend` trait with Tavily (default) and Brave. The backend

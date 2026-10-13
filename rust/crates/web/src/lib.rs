@@ -21,7 +21,12 @@ pub use search::SearchBackend;
 pub use search::SearchHit;
 pub use search::Tavily;
 
-const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// One fetch's whole-request budget, body included. Paired with
+/// [`limits::MAX_DOWNLOAD_BYTES`]: these two move together, because raising the
+/// byte bound alone turns a slow link into a timeout, which loses the entire
+/// body where truncation would have kept a prefix. Comfortably under core's
+/// per-call budget for a source tool (300s).
+const FETCH_TIMEOUT: Duration = Duration::from_secs(90);
 const SEARCH_RESULTS_DEFAULT: usize = 5;
 
 #[derive(Debug, Deserialize)]
