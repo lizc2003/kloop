@@ -229,7 +229,7 @@ editing`）。**第一阶段（第二节：基础行编辑与按词
   - 平台边界：PTY 证据只在 macOS 上跑，Windows 未执行，不借 macOS 结果声称 Windows 已跑。
 - 未运行 `make check-release`（按约定不属提交门禁）。
 
-**后续小修（2026-10-13）**：纵向视觉导航不再把光标停进标签内部——`up`/`down` 的落点
+**后续小修（2026-10-13，`21e983c`)**：纵向视觉导航不再把光标停进标签内部——`up`/`down` 的落点
 吸附到原子边缘（up→原子 start、down→原子 end），原先"从标签内部起步"的入口关闭，
 词动作里的内部吸附分支随之删除；回归 `navigation_never_rests_inside_a_paste_atom`
 （旧实现复现"cursor rested inside the label"）。纯本地，无真实模型。
