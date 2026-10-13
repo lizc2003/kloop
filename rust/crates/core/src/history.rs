@@ -1378,13 +1378,19 @@ mod tests {
 
     /// The pointer *replaces* a result that overflowed the per-result cap, so it
     /// must itself stay under it — for every shape, including a hostile one.
+    ///
+    /// The key is sized to leave the buggy pointer *between* the two caps: a
+    /// longer one puts the pointer over `ROUND_OFFLOAD_CAP_CHARS`, and the round
+    /// budget then spills the pointer again and hands back a short preview of it,
+    /// which makes this test pass on the very code it is meant to catch.
     #[test]
     fn a_spilled_result_stays_under_the_cap_that_triggered_it() {
         let dir = temp_dir("spill-shape-bound");
         let mut h = History::new(dir.clone());
-        let hostile = format!(r#"{{"{}":1}}"#, "k".repeat(200_000));
+        let hostile = format!(r#"{{"{}":1}}"#, "k".repeat(40_000));
         assert!(hostile.chars().count() > OFFLOAD_CAP_CHARS);
-        h.record(tool_result(hostile));
+        assert!(hostile.chars().count() < ROUND_OFFLOAD_CAP_CHARS);
+        h.record(tool_result(hostile.clone()));
 
         let ContentBlock::ToolResult { content, .. } = &h.messages()[0].content[0] else {
             panic!("expected tool result");
@@ -1395,6 +1401,11 @@ mod tests {
             "pointer is {} chars",
             content.chars().count()
         );
+        // And the pointer still names the *artifact*: a second spill under the
+        // round budget would leave this file holding a pointer instead.
+        let on_disk =
+            std::fs::read_to_string(dir.join(format!("{}.txt", pointer_id(&content)))).unwrap();
+        assert_eq!(on_disk, hostile);
         let _ = std::fs::remove_dir_all(dir);
     }
 
