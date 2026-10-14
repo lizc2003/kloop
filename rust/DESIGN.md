@@ -580,8 +580,14 @@ Consequences worth knowing:
   `.kloop` directory below the working directory; everything else kloop reads
   from there (`rules/`, `skills/`, `commands/`) is input it never creates.
 
-Every session is persisted to `{project store}/sessions/{id}.jsonl`
-(`crates/core/src/rollout.rs`), one JSON line per recorded message or
+`crates/core/src/rollout.rs` 保留追加写入器及公开门面；`rollout/line.rs` 定义
+JSONL 行、快照与错误的序列化表示；`rollout/validate.rs` 负责完整行读取、格式版本、
+信封链、provider 路由与消息来源校验，以及单次解析重放；`rollout/sessions.rs`
+负责只读检查、显式恢复、配对修复、fork、摘要与目录查询。实现子模块均为私有，
+原有 `rollout::` 公开路径不变；读取入口仍沿用各自原有的校验与写入边界。
+
+Every session is persisted to `{project store}/sessions/{id}.jsonl`,
+one JSON line per recorded message or
 provider-usage record, written through as the history records — so a killed
 process loses at most the line being written. The file appears at startup: it
 is created empty, with create-new, as the one step that picks the id, so a
@@ -5063,9 +5069,10 @@ crates/core/        kloop-core — the agent, network-free
   src/compact.rs    predictive threshold math + compaction rewrite
   src/context.rs    pure prompt assembly: system + env block + git snapshot,
                     instruction-file concatenation under a byte budget
-  src/rollout.rs    append-only session persistence: message/provider-usage/
-                    compacted + runtime/turn-terminal records, snapshots,
-                    resume/fork
+  src/rollout.rs    JSONL 追加写入器、写租约、空会话清理与公开门面
+  src/rollout/line.rs JSONL 行与信封、快照、错误的序列化表示
+  src/rollout/validate.rs 完整行读取、格式/信封/provider 校验与单次解析重放
+  src/rollout/sessions.rs 只读检查、恢复与配对修复、fork、摘要、目录查询与 id/path
   src/session_store.rs where transcripts and offload live: global, partitioned
                     by ProjectId, owner-only; hermetic cwd-local for --mock
   src/agent.rs      run_turn loop, retry/fallback/truncation recovery, Ui

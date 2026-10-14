@@ -1,4 +1,4 @@
-# Plan 182 — 往文件尾巴追加一行,和读一个会话目录,不是一件事
+# Plan 182 ✅ — 往文件尾巴追加一行,和读一个会话目录,不是一件事
 
 > 本批判据与统一纪律见 `HANDOFF.md` 第〇节。**本批最大的一条之一**,建议排在 177–181 之后。
 
@@ -51,3 +51,53 @@
 
 - `make check` 全绿;`rollout::` 的对外符号表一个不少不多(用开工时列的那张表对)。
 - `rollout.rs` 降到 ≈500。
+
+## 五、✅ 完成（2026-10-14）
+
+实现提交：本节所在提交（`refactor(plan182): separate rollout format, validation, and sessions`）。
+提交号可用 `git log -1 --format=%h --grep='^refactor(plan182):'` 查询。
+
+开工时文件已增至 **1715 生产 code 行 / 4128 总行，63 条测试**。此前新增的格式
+版本、provider 路由校验、写租约、原子 id 占用、request stub 与 `tool_started`
+均保留；第一节的旧行号不再作为切片依据。
+
+| 文件 | 职责 | 生产 code 行 / 总行 | 原有测试 |
+|---|---|---|---|
+| `rollout.rs` | 追加写入器、写租约、空会话清理与公开门面 | 334 / 727 | 10 |
+| `rollout/line.rs` | JSONL 行、信封、快照、错误 serde 与同步判据 | 371 / 487 | 2 |
+| `rollout/validate.rs` | 完整行读取、格式/信封/provider 校验与解析重放 | 338 / 820 | 12 |
+| `rollout/sessions.rs` | 检查、恢复与配对修复、fork、摘要、目录查询、id/path | 697 / 2088 | 39 |
+| `rollout/testutil.rs` | 七个共用测试夹具 | 仅测试 / 74 | 共用夹具 |
+
+- 三个实现子模块均保持私有，原有 30 个公开符号全部从父模块保留或重导出；
+  `civil_from_days`、`timestamp_id` 的 crate 内路径也保留，CLI/server/TUI 调用点未改。
+- `SessionRead` 随会话 API 迁入 `sessions.rs`。确认 `repair_pairing` 只由
+  `inspect_session` 调用后，与内部 `PairingRepair`、`unfinished_result` 一起搬入该模块；
+  `PairingRepairStats` 是行格式的一部分，留在 `line.rs`。
+- `LineMeta`、`RolloutLine` 与共用方法、`ParsedSession` 与解析结果字段、
+  `ClaimedSession.path`、writer 需要的修复字段只提至 `pub(super)`。
+  writer 原有私有字段和方法仍可由子模块访问，不增加新的公开接口。
+- 63 条测试的名称、属性与正文全部保留，祖先模块仍只在测试时编译；路径检查中的
+  Unix symlink 分支保持原条件。共用夹具供三个测试模块使用，fork 夹具留在会话测试内。
+- 161 个函数逐一核对签名和正文；唯一正文差异是 id 占用函数通过
+  `super::timestamp_id` 使用保留的 crate 内门面，其余 160 个函数一致。
+  数据类型、serde 属性与 provider 校验条件均未改。
+
+在外层执行沙箱之外运行完整 `make check`，fmt、clippy、workspace debug 全量测试
+与本机 parity 全绿；core 1124 条测试通过，含全部 63 条 rollout 测试。
+本机语料未修改。另核对完整差异，运行 `git diff --check` 与
+`git diff --cached --check`；设计与能力清单已同步，交接见 HANDOFF 教训 236。
+
+Windows 验证使用独立临时 workspace 与 target，钉住工具链 `1.98.1`，检查真实
+core 与测试目标，不对 Rust 接口做 stub：
+
+```sh
+cargo +1.98.1 check --offline --locked -p kloop-core \
+  --target x86_64-pc-windows-msvc --all-targets --all-features
+```
+
+先在五份迁移文件的测试或夹具中各注入一个未定义名字，检查报告预期的五个
+E0425；移除探针、逐字节核对副本与工作区一致，清理 core 产物后复验通过。
+沿用教训 201，仅为 Windows triple 的 C 编译与归档生成空产物；检查覆盖 Rust
+类型、名字解析与测试目标，不代表 C 代码、链接或 Windows 上执行通过。
+另有已有 `TestConfig::login_env` dead_code 告警，定义所在文件未改动。
