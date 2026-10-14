@@ -3,14 +3,18 @@
 > 本批判据与统一纪律见 `HANDOFF.md` 第〇节。**本批最大的三条之一,建议放最后**——
 > 它的语义风险最高,前面九条做完之后手感最好。
 
+> **2026-10-14 现状校准（仅修订，拆分仍待实施；修订提交以本条所在提交为准）**：
+> bypass 已移到 deny、敏感读取硬拦截与 plan gate 之后，跳过后续工具审批。
+> 当前层级按执行顺序编号；下文行号与规模是起草时的快照，实施前须重新核对。
+
 ## 一、现状
 
 `rust/crates/core/src/permissions.rs`,**1632 code 行 / 4177 总行**。
 模块 doc 开头就写清了它的本体是一条管线:
 
-> deny rules → sensitive-read hard block → plan-mode read-only gate → safety checks →
-> ask rules → session scheduler controls → sandbox auto-allow → bypass →
-> read-only self-verdict → acceptEdits → allow rules → session cache → ask the user
+> deny rules → sensitive-read hard block → plan-mode read-only gate → bypass → safety checks →
+> ask rules → session scheduler controls → sandbox auto-allow →
+> read-only self-verdict → contained writes → allow rules → session cache → ask the user
 
 但文件里另外还住着四样:
 

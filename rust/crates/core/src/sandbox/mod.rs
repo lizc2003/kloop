@@ -33,8 +33,8 @@ const SEATBELT_LOOPBACK_POLICY: &str = include_str!("seatbelt_loopback.sbpl");
 pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file writes limited \
     to the workspace and temp directories; no network beyond this machine, though loopback — a test \
     server of your own — still works) and the failure looks like a sandbox denial. If the command \
-    legitimately needs the blocked access, retry with disable_sandbox: true — that run requires \
-    user approval.]";
+    legitimately needs the blocked access, retry with disable_sandbox: true. The retry still passes \
+    the permission gate; bypass mode does not ask for user approval.]";
 
 /// Prepended to an escalated (re-run without the sandbox) result so the
 /// model sees the earlier sandboxed failure was resolved by escalation, not

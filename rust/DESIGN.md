@@ -3023,8 +3023,8 @@ disables network), there are two escalation paths:
   the failure and steers the model to a different approach. This is the default.
 - **Model-driven** (fallback when `escalate = false`, or when there is no
   approver): the result is annotated with guidance and the model retries
-  that one call with `disable_sandbox: true`, which faces the permission
-  gate like any call and is tagged `[no sandbox]` in the approval prompt.
+  that one call with `disable_sandbox: true`。重试仍先过权限门；bypass 直接放行，
+  不弹审批。其他模式沿用权限判定，实际需要弹出审批时才显示 `[no sandbox]` 标记。
 
 The escalation ask says **what** was refused — `file write`, `network`, or
 `unclassified`, plus the failure line that proves it. A blocked socket and a

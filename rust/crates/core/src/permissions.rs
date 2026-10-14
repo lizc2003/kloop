@@ -995,11 +995,12 @@ impl Permissions {
             )));
         }
 
+        // 4. Bypass — 用户显式选择工具免审批，前面的硬限制仍优先。
         if self.mode() == Mode::Bypass {
             return Ok(None);
         }
 
-        // 4. Safety checks — manual 下直接询问用户。
+        // 5. Safety checks — manual 下直接询问用户。
         if let Some(hazard) = call.hazard(name) {
             return self
                 .ask_user(
@@ -1013,14 +1014,14 @@ impl Permissions {
                 .await;
         }
 
-        // 5. Explicit ask rules — "always confirm this"; never remembered.
+        // 6. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
             return self
                 .ask_user(name, approval_input, preview_context, depth, None, None)
                 .await;
         }
 
-        // Safe session scheduler controls mutate only kloop's owner-scoped
+        // 7. Safe session scheduler controls mutate only kloop's owner-scoped
         // registry/private store. Deny, plan mode, hazards and explicit ask
         // rules above retain priority; ordinary manual/accept/bypass modes do
         // not prompt for these controls.
@@ -1028,19 +1029,19 @@ impl Permissions {
             return Ok(None);
         }
 
-        // 6. Sandbox auto-allow — the OS sandbox will contain this call, so
+        // 8. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
         if sandbox_auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
             return Ok(None);
         }
 
-        // 8. Read-only self-verdict.
+        // 9. Read-only self-verdict.
         if call.is_readonly(name) {
             return Ok(None);
         }
 
-        // 9. Contained writes: a structured file write whose target lands
+        // 10. Contained writes: a structured file write whose target lands
         // inside the working directory. Dispatch resolved and froze that target
         // before the gate ran, so the call is contained the way a sandboxed
         // bash call is — and containment, not a trust level, is what replaces
@@ -1054,12 +1055,12 @@ impl Permissions {
             return Ok(None);
         }
 
-        // 10. Allow rules.
+        // 11. Allow rules.
         if self.matches_allow(name, &call) {
             return Ok(None);
         }
 
-        // 11. Session cache.
+        // 12. Session cache.
         let remember = remember_payload(name, &call);
         if let Some(remember) = &remember {
             let caches = self.session.cache.lock().unwrap();
@@ -1076,7 +1077,7 @@ impl Permissions {
             }
         }
 
-        // 12. Ask.
+        // 13. Ask.
         self.ask_user(name, approval_input, preview_context, depth, None, remember)
             .await
     }
@@ -2495,7 +2496,7 @@ mod tests {
         json!({"path": path, "content": "x"})
     }
 
-    // ── layer 8: read-only self-verdict ────────────────────────────────
+    // ── layer 9: read-only self-verdict ────────────────────────────────
 
     #[tokio::test]
     async fn read_only_calls_skip_the_approver() {
@@ -2658,7 +2659,7 @@ mod tests {
         assert!(!ok(&p, "run_agent", json!({"prompt": "x"})).await);
     }
 
-    // ── layer 4: manual 的风险审批 ────────────────────────────────────
+    // ── layer 5: manual 的风险审批 ────────────────────────────────────
 
     #[tokio::test]
     async fn destructive_commands_ask_in_manual_even_over_allowlist() {
@@ -3091,7 +3092,7 @@ mod tests {
         assert_eq!(approver.ask_count(), 1);
     }
 
-    // ── layer 5: ask rules ──────────────────────────────────────────────
+    // ── layer 6: ask rules ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn ask_rules_override_allow_and_are_not_cached() {
@@ -3271,7 +3272,7 @@ mod tests {
         assert_eq!(approver.ask_count(), 4);
     }
 
-    // ── layer 11: session cache and remember payloads ──────────────────
+    // ── layer 12: session cache and remember payloads ──────────────────
 
     #[tokio::test]
     async fn allow_session_caches_two_word_prefix() {

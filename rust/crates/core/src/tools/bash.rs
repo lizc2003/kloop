@@ -1598,12 +1598,46 @@ mod tests {
 
         #[tokio::test]
         async fn disable_sandbox_escapes_per_call() {
-            let (ctx, _) = sandbox_ctx("escape");
+            let (mut ctx, _) = sandbox_ctx("escape");
+            let mut cfg = ctx.cfg.test_clone();
+            Arc::make_mut(cfg.sandbox.as_mut().unwrap()).escalate = false;
+            cfg.permissions = Arc::new(
+                crate::permissions::Permissions::new(
+                    crate::permissions::Mode::Bypass,
+                    &Default::default(),
+                    cfg.cwd.clone(),
+                    None,
+                )
+                .unwrap(),
+            );
+            ctx.cfg = Arc::new(cfg);
             let target = outside_dir("escape").join("escaped.txt");
+            let _ = std::fs::remove_file(&target);
+            let command = format!("echo freed > {}", target.display());
+            let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+            assert!(!is_error, "{out}");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(
+                out.contains("bypass mode does not ask for user approval"),
+                "{out}"
+            );
+            assert!(!out.contains("requires user approval"), "{out}");
+            assert!(!target.exists());
+
+            let definition = crate::tools::tool_defs(ctx.depth, &ctx.cfg.shell_programs)
+                .into_iter()
+                .find(|definition| definition.name == "bash")
+                .unwrap();
+            let description = definition.schema["properties"]["disable_sandbox"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("bypass mode does not ask for user approval"));
+            assert!(!description.contains("requires user approval"));
+
             let (out, is_error) = run_tool(
                 "bash",
                 json!({
-                    "command": format!("echo freed > {}", target.display()),
+                    "command": command,
                     "disable_sandbox": true
                 }),
                 &ctx,
@@ -1611,6 +1645,7 @@ mod tests {
             .await;
             assert!(!is_error, "{out}");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "freed\n");
+            let _ = std::fs::remove_file(target);
         }
 
         /// The denied network is a boundary around the machine, not around the
