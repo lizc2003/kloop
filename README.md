@@ -1,49 +1,25 @@
 # kloop
 
-A terminal coding agent written in Rust from scratch. Give it a sentence and it
-reads the code, edits files, runs commands and looks things up until the job is done.
-
-> Status: in daily use by its author, not a release. Configuration and interfaces
-> still change, and nothing here is a compatibility promise.
+A terminal coding agent built from scratch in Rust. Describe a task in plain
+language, and kloop explores your codebase, edits files and runs commands.
 
 ## What it does
 
-- **Talks to any gateway** — a complete implementation of each of the three wire
-  protocols (messages / responses / chat); a provider is one profile in one file.
-  Model, effort and context window are stated in that config; nothing is discovered
-  at runtime.
-- **A full set of tools** — read/write/edit files, bash (interruptible in the
-  foreground, pollable in the background), grep/glob, notebooks, web fetch and
-  search. On Windows that is native PowerShell, not an emulated bash.
-- **Asks before it acts** — every tool call goes through a permission decision:
-  reads pass, destructive things ask you, and an approval can be remembered. On
-  macOS a seatbelt sandbox sits underneath: writes land only inside an allow-list,
-  and the network can be shut off entirely.
-- **Sessions you can go back into** — everything is persisted. `-c` continues the
-  last one, `-r` picks one from a list, and `--fork <id>#<line>` branches from a
-  step in the middle and runs it differently.
-- **Not one model doing the work** — sub-agents (dispatched synchronously or run in
-  the background), an MCP client (stdio / HTTP / OAuth login), skills, and code mode,
-  where the model writes a little JavaScript to orchestrate tools so that a
-  hundred-item loop comes back as one result.
-- **More than a TUI** — `--headless` runs a single turn for scripts (optionally
-  emitting an NDJSON event stream), `--plain` is a line-based REPL, and `app-server`
-  turns it into an agent service speaking over stdio.
+A coding workflow similar to Claude Code, with permissions, resumable sessions,
+sub-agents, MCP and skills. Supports configurable messages / responses / chat
+gateways and runs interactively, headlessly or as an agent service.
 
 ## Install
 
-Rust 1.98+. macOS is the primary platform (the sandbox has a macOS backend only);
-Linux and Windows build and run, but only macOS is exercised routinely — there is
-no CI, so full code-change validation runs locally with `make check` (see below).
+Requires Rust 1.98+. Primarily tested on macOS; Linux and Windows also build and
+run. Sandboxing is macOS-only.
 
 ```sh
-make install          # release build, installed into ~/.local/bin (override PREFIX=)
+make install          # installs to ~/.local/bin
 ```
 
-The first install also copies `config/config-demo.toml` to `~/.kloop/config.toml`
-(directory 0700, file 0600) and **you have to edit it before the first run** — every
-key in the demo says `REPLACE-ME`, and kloop has no fallback. If a config is already
-there, it is not touched: only the binary is replaced.
+Edit the generated `~/.kloop/config.toml` with your provider settings before the
+first run. Existing configuration is preserved.
 
 ## Use it
 
@@ -58,45 +34,22 @@ kloop --help                   # every flag
 
 ## Configuration
 
-One file: `~/.kloop/config.toml`. No environment variable decides which gateway a run
-talks to, so the answer cannot change with the shell that started it.
+Configure your provider in `~/.kloop/config.toml`:
 
 ```toml
 provider = "my-gateway"
 
 [providers.my-gateway]
-wire_api    = "messages"                                # messages | responses | chat
-base_url    = "https://gateway.example.com"
-auth_header = { Authorization = "Bearer ..." }          # or { x-api-key = "..." }
-model       = "claude-opus-4-8"
-effort      = "high"
+wire_api       = "responses"
+base_url       = "https://gateway.example.com/v1"
+auth_header    = { Authorization = "Bearer ..." }
+model          = "deepseek-v4.1-flash"
+effort         = "xhigh"
+context_window = 1000000
 ```
 
-Permissions, sandbox, MCP, hooks, skills, sub-agents and code mode are configured in
-that same file; the full field reference is
-[`config/config-demo.toml`](config/config-demo.toml).
+See [`config/config-demo.toml`](config/config-demo.toml) for all settings.
 
-## What is in the repository
+## Thanks
 
-| Path | What it is |
-|---|---|
-| `rust/` | The cargo workspace, 10 crates: `core` is the engine, `cli` the binary entry point, `tui` / `server` two other front ends |
-| `rust/DESIGN.md` | Design and behaviour in detail — why each trade-off is what it is. Long, and the only authority |
-| `docs/plan/` | One numbered file per development task, including what went wrong; `HANDOFF.md` is the current state (written in Chinese) |
-| `config/` | Configuration example |
-
-`make help` lists every build target. Code, dependency, configuration, script,
-test/fixture/snapshot, and built-in prompt or skill changes require `make check`
-(fmt + clippy + workspace debug tests + parity). Pure documentation that changes
-no build, runtime, or test inputs needs content/reference review and
-`git diff --check`, plus `git diff --cached --check` after staging — not compilation
-or tests. A Markdown runtime asset is not documentation-only; mixed or uncertain
-changes require the full gate. `make check` always runs the full checks, regardless
-of which files changed. The complete policy is in [`AGENTS.md`](AGENTS.md).
-
-Run `make test` and the containing `make check` outside the agent executor's outer
-sandbox, with any required approval: the tests exercise the macOS sandbox, and
-nesting it can fail with `sandbox_apply: Operation not permitted`. This does not
-mean disabling kloop's own sandbox or weakening assertions. `make check-release`
-remains a manual, optional check with release clippy and workspace release tests,
-plus fmt and parity; its tests need the same outer-sandbox-free environment.
+Thanks to the [Linux.do](https://linux.do/) community for its support.
