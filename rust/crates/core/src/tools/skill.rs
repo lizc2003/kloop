@@ -23,7 +23,7 @@ use kloop_protocol::ToolDef;
 pub(crate) fn skill_tool_def() -> ToolDef {
     ToolDef {
         name: "skill".into(),
-        description: "Activate one of the available skills, loading its full instructions into the conversation so you can carry them out. The available skills are listed by name and description in the context; pick the one whose description matches the task. Pass any relevant user input as `arguments`.".into(),
+        description: "Activate one of the skills listed in the context by loading its full instructions. If the user asks to use a skill or the task matches its description, you MUST call this tool first. In that response, call only matching skills; wait for their results before other tools or a substantive answer, then follow the returned instructions. Pass relevant user input as `arguments`.".into(),
         schema: json!({
             "type": "object",
             "properties": {

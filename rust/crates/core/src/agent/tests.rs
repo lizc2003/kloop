@@ -3759,19 +3759,46 @@ async fn skill_catalog_injected_and_tool_expands_body_inline() {
     let seen = seen.lock().unwrap();
     // The skill tool is advertised, and the catalog (name+description, not
     // the body) rides the injected first user message.
-    assert!(seen[0].tools.iter().any(|t| t.name == "skill"));
-    let injected = match &seen[0].messages[0].content[0] {
-        ContentBlock::Text { text } => text,
-        other => panic!("expected injected text, got {other:?}"),
-    };
-    assert!(
-        injected.contains("- greet: Greet a person by name."),
-        "{injected}"
-    );
-    assert!(
-        !injected.contains("greet $ARGUMENTS"),
-        "body must not leak: {injected}"
-    );
+    for request in seen.iter() {
+        let skill_tool = request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "skill")
+            .expect("skill tool must be advertised");
+        assert!(
+            skill_tool.description.contains("MUST call this tool first"),
+            "{}",
+            skill_tool.description
+        );
+        for clause in [
+            "call only matching skills",
+            "wait for their results before other tools",
+        ] {
+            assert!(
+                skill_tool.description.contains(clause),
+                "missing {clause}: {}",
+                skill_tool.description
+            );
+        }
+        let injected = match &request.messages[0].content[0] {
+            ContentBlock::Text { text } => text,
+            other => panic!("expected injected text, got {other:?}"),
+        };
+        for clause in [
+            "- greet: Greet a person by name.",
+            "MUST call the `skill` tool as your first tool call",
+            "call only matching skills",
+            "wait for their results before other tools",
+            "Naming a skill or planning to use it does not activate it.",
+            "If no skill matches, proceed normally.",
+        ] {
+            assert!(injected.contains(clause), "missing {clause}: {injected}");
+        }
+        assert!(
+            !injected.contains("greet $ARGUMENTS"),
+            "body must not leak: {injected}"
+        );
+    }
     // The trigger's tool_result is the expanded body — the second request
     // carries it back to the model.
     let expanded = seen[1].messages.iter().flat_map(|m| &m.content).any(|b| {

@@ -375,11 +375,14 @@ pub fn skills_catalog(skills: &[Skill]) -> Option<String> {
         return None;
     }
     let mut out = String::from(
-        "<system-reminder>\nThe following skills are available — reusable instruction \
-         packs you can activate when a task matches one. Only a name and description are \
-         shown here; a skill's full instructions load only when you activate it by calling \
-         the `skill` tool with its name. Activate a skill when the task matches its \
-         description; otherwise ignore this list.\n",
+        "<system-reminder>\nThe following skills are available. Before starting a task, \
+         match the user's request against their descriptions. If the user asks to use a \
+         skill or the task matches a description, you MUST call the `skill` tool as your \
+         first tool call. In that response, call only matching skills; wait for their \
+         results before other tools or a substantive answer, then follow the returned \
+         instructions. Naming a skill or planning to use it does not activate it. \
+         Only names and descriptions are shown here; full instructions load through the \
+         tool. If no skill matches, proceed normally.\n",
     );
     for s in listed {
         out.push_str(&format!("\n- {}: {}", s.name, s.description));

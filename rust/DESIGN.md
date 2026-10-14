@@ -4027,13 +4027,14 @@ touch no filesystem, so hermetic runs are unaffected.
 
 Two ways to trigger a skill, both expanding the **same** body:
 
-- **The model selects it** by description. Only `name` + `description` ride the
-  injected context (progressive disclosure — the body stays out until triggered),
-  alongside the deferred-tools notice and session-stable for the prompt cache.
-  When a task matches, the model calls the built-in **`skill`** tool
-  (`skill({"name": ..., "arguments": ...})`), which — like `run_agent` — exists only
-  at depth 0 and only when skills are loaded (a sub-agent gets a focused task,
-  not the whole catalog).
+- **模型按描述选择**。上下文只注入 `name` + `description`，正文到激活时才加载；
+  目录与延迟工具提示一起注入，在会话内保持稳定以复用 prompt cache。目录和 `skill`
+  工具说明要求：开始任务前先匹配；用户要求使用某个 skill，或任务符合其描述时，
+  **第一个工具调用必须是 `skill({"name": ..., "arguments": ...})`；该轮响应只调用匹配
+  的 skill，等结果返回后再使用其他工具或给出实质答复**，随后遵循返回的指令。
+  只提到 skill 或打算使用它不算激活；没有匹配项则正常继续。这是模型指令，运行时
+  不解析自然语言，也不保证自动调用。`skill` 与 `run_agent` 一样只在 depth 0 且有已加载
+  skill 时提供；子代理接收聚焦任务，不带整个目录。
 - **The user invokes it** as `/name args` — the same slash seam as the built-in
   commands (`core/src/commands/`). An unknown `/name` lists skills alongside the
   built-ins. The expansion runs as a turn (recorded as a user message), in all
