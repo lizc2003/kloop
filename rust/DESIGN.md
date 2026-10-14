@@ -5029,8 +5029,11 @@ crates/core/        kloop-core — the agent, network-free
                     definition, gate, concurrency and read-only verdicts,
                     dispatch arm and panel title the compiler makes you
                     write for a new variant
-    bash.rs         foreground + background Bash execution, the
-                    BackgroundShells registry, bash_output/stop_bash
+    bash.rs         Bash 工具入口、前台执行与共用的 shell 启动配置；
+                    有界管道读取只供前台使用，重导出原有后台接口
+    bash/background.rs 会话级 BackgroundShells 注册表、监控与 Drop，
+                    bash_output/stop_bash；复用父模块的启动配置与回收超时
+    bash/testutil.rs 前台、后台测试共用的进程树、事件与沙箱夹具
     powershell.rs   foreground-only fixed EncodedCommand PowerShell executor
     fs.rs           read/write/edit file: what the tools mean — input parsing,
                     the mutation/commit pipeline, read qualification, paging.
