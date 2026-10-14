@@ -50,6 +50,6 @@ context_window = 1000000
 
 See [`config/config-demo.toml`](config/config-demo.toml) for all settings.
 
-## Thanks
+## Community
 
-Thanks to the [Linux.do](https://linux.do/) community for its support.
+Share ideas and discuss kloop with the [Linux.do](https://linux.do/) community.
