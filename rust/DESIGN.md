@@ -977,14 +977,16 @@ Every tool call passes a layered gate before executing
 pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
-global deny → sensitive-read hard block → plan-mode read-only gate → safety checks →
-global ask → session scheduler controls → sandbox auto-allow → bypass →
+global deny → sensitive-read hard block → plan-mode read-only gate → bypass →
+safety checks → global ask → session scheduler controls → sandbox auto-allow →
 read-only self-verdict → contained writes → project allow → WorkspaceId-scoped session
 cache → ask the user
 ```
 
-Two invariants carried over from claude-code: **deny always beats allow**,
-and **safety checks are immune to bypass mode**. Credential-bearing/read-sensitive
+**deny 始终优先于 allow 与 bypass**。`bypass` 是用户显式选择的免审批模式：
+危险命令、敏感路径写入、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
+普通调用仍使用已配置的 OS 沙箱；只有调用主动脱沙箱或失败后升级才脱离沙箱。
+Credential-bearing/read-sensitive
 paths (`.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
 boundary: `read_file` refuses them, grep/glob filter them before reading, and
 Bash checks literal plus canonical paths before sandbox/read-only/bypass. The
@@ -1011,16 +1013,17 @@ tree-sitter-bash): a script qualifies only when every node is a plain
 word-only command joined by `&&`/`||`/`;`/`|`/newline; `bash -c "…"` is
 unwrapped and analyzed recursively. Subshells, command/process substitution,
 expansions, variable-assignment prefixes, and any redirect that reads or writes
-a file (`> f`, `< f`, heredocs) make the script *opaque* — never auto-approved,
-never allow-rule-matchable, never cached; it always goes to the human.
+a file (`> f`, `< f`, heredocs) make the script *opaque*：不能靠解析结果或
+allow 规则自动放行；manual 下由沙箱自动放行、已批准的会话记忆或用户本次审批决定，
+bypass 下直接放行。
 Stream-only redirects are the exception: `2>&1`, `>&2` and `…>/dev/null` move a
 stream around without naming a file, so `go test ./x 2>&1 | tail -3` still
 decomposes into `go test` and `tail` and a `bash(go test *)` rule still covers
 it. The read-only classifier vets options, not just
 names (`find -delete`, `rg --pre`, `git -C`/`--git-dir`/`log --output`,
 `base64 -o`, `sed` beyond `-n Np` all disqualify), and the independent
-dangerous classifier forces a confirmation even when an allow rule or bypass
-mode would otherwise pass — wrappers (`sudo`, `env`, `timeout`, `nice`,
+dangerous classifier 在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
+Wrappers (`sudo`, `env`, `timeout`, `nice`,
 `xargs`) are stripped before deny/danger matching so they can't smuggle a
 command past a rule. That classifier is a blocklist, so what it holds is chosen
 by one rule rather than by how alarming a command looks: **the damage is
@@ -1028,8 +1031,7 @@ irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
 `shred`, and any of them behind `sudo`. `git clean -fdx` and `git reset --hard`
 are deliberately absent: inside a repository those are the recovery path. A
 redirect onto a device (`… > /dev/sda`) needs no entry either — a redirect onto a
-file makes the whole script opaque, and an opaque script never gets an automatic
-verdict.
+file makes the whole script opaque；manual 下不能靠内容分类获得自动裁决。
 
 **Rules** are split by lifetime. Global `~/.kloop/config.toml` provides only
 process-wide constraints:
@@ -1037,7 +1039,7 @@ process-wide constraints:
 ```toml
 [permissions]
 deny = ["bash(git push *)", "read_file(**/*.pem)"]
-ask = ["bash(cargo publish *)"]   # always confirm, even if project-approved
+ask = ["bash(cargo publish *)"]   # manual 下始终确认，即使项目已批准
 ```
 
 Durable allow rules live instead in the user-private, per-project
@@ -1056,9 +1058,9 @@ rule form at all (see **Asking** below); `write_file(<glob>)` /
 their cwd-relative form), with `**` globs.
 
 **File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
-directories, shell/git rc files, and `.env*` are sensitive — confirmed every
-time, immune to allow rules, the contained-writes layer, and bypass. A write
-escaping the working directory is not contained and never auto-passes.
+directories, shell/git rc files, and `.env*` are sensitive：manual 下每次确认，
+allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批。
+目录外写入不享有 contained-writes 自动放行，仍可由 bypass 或对应批准放行。
 
 **Asking**: `y` allows once. `a` allows for this session in the current
 workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
@@ -1074,11 +1076,9 @@ them). The prompt echoes `only this exact command text` rather than reprinting
 the command already on screen. Which run was consented to is part of the key: a
 call carrying `disable_sandbox` is a separate entry, so a contained grant never
 covers the escape; and a whole-tool `bash` allow vouches for no opaque script at
-all, since it was written without anyone having read this one. A script whose
-*raw text* mentions a sensitive path is caught by the safety layer above every
-rule, so it keeps asking however it was remembered. Opaque *PowerShell* is
-remembered by nothing at all: bash is parsed and only then gives up, while
-PowerShell gets no analysis, so asking every time is the only net it has. `p`
+all, since it was written without anyone having read this one. Bash 的原文或规范路径
+命中敏感读取时直接硬拦截，bypass 与会话批准都不能覆盖。Opaque *PowerShell* 不进入会话记忆：
+manual 下每次询问或匹配 whole-tool allow；bypass 下直接放行。`p`
 allows for the current `ProjectId` across sessions and linked
 worktrees, persisting the suggested rule (for example `bash(cargo build *)`) to
 `~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails, only
@@ -1148,8 +1148,8 @@ apart for a frontend that lays a prompt out over several lines.
 
 **Modes**: one flag `--permission-mode <mode>` picks the gate mode — `manual`
 (the default when the flag is omitted — ask for anything the gate cannot vouch
-for on its own), `bypass` (everything passes *except* deny rules, safety
-checks, and a bash call that asked to leave the OS sandbox — see below), or
+for on its own), `bypass`（跳过全部工具权限审批，保留 deny 与敏感读取硬拦截，
+默认仍在已配置的 OS 沙箱内执行）, or
 `plan` (read-only until the plan is approved, below). `--mock` disables the gate
 entirely — nobody is at the keyboard. In the TUI, **shift+Tab** cycles the mode
 live (manual ⇄ plan; the status bar shows the current one), while bypass stays
@@ -2625,13 +2625,13 @@ post-tool hooks and is never held around `run_program`, `run_agent`, `skill`,
 
 Permissions treat every PowerShell script as `PowerShellOpaque`; the Bash AST
 and read-only classifier are never applied. Plan mode rejects it without asking;
-manual and bypass ask every time unless the current project policy
-already contains a whole-tool `powershell` allow rule. `deny` and `ask` whole-tool rules
-retain their usual precedence, `powershell(...)` prefix rules are rejected, and
+manual 每次询问，除非当前项目已有 whole-tool `powershell` allow；bypass 直接放行。
+whole-tool `deny` 在所有模式下直接拒绝，`ask` 在 manual 下优先于 allow；
+`powershell(...)` prefix rules are rejected, and
 interactive approvals authorize only that one call — no opaque script is cached or
 persisted by a PowerShell prompt. Prompts are labeled
-`[unclassified PowerShell]` and an additional raw matcher keeps obvious Windows
-secret paths bypass-immune; this matcher is not a PowerShell data-flow analysis.
+`[unclassified PowerShell]`；额外的原文匹配器让明显的 Windows 敏感路径在 manual
+下强制确认，bypass 跳过确认。这不是 PowerShell 数据流分析，也不是敏感读取硬拦截。
 
 ## Scheduler (Plan 58)
 
@@ -3001,16 +3001,11 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   The accepted trade-off: a contained command can still modify the workspace
   without a prompt — protected `.git` internals aside, git history is the
   recovery path. `trust_sandboxed = false` reverts to pure containment (approve
-  first, then run sandboxed). `--permission-mode bypass` bypasses approvals but
-  not the sandbox — and not a call that removes the sandbox itself: a bash call
-  carrying `disable_sandbox` still reaches you under bypass, because what the
-  mode trusts is what the model is *doing*, not its decision to take the
-  containment off first. (A read-only escaped command still auto-passes, and an
-  ordinary command on a host with no sandbox at all is unaffected — refusing
-  that one would retire the mode wherever there is no sandbox to begin with.)
-  Bypass does not vet the command itself beyond the destructive check above,
-  which is a short blocklist by construction — so where there is no containment,
-  what stands between the model and the filesystem is that list and nothing else.
+  first, then run sandboxed). `--permission-mode bypass` 跳过全部工具权限审批，
+  包括复杂脚本、危险命令和带 `disable_sandbox: true` 的主动脱沙箱调用。
+  它不关闭已配置的 OS 沙箱；普通调用仍先在沙箱内执行，模型主动脱沙箱和程序失败后
+  自动升级则都免审批。用户选择该模式即接受这些调用的执行代价；deny 与敏感读取
+  硬拦截仍优先，权限模式本身不提供命令内容或文件系统隔离保证。
 
 On platforms without an OS shell sandbox, worktree separation still anchors
 ordinary relative paths and parallel edits, but it cannot contain a model that
@@ -4655,7 +4650,7 @@ cargo run -- --fork <id>       # branch off a session at its end
 # project approvals persist in ~/.kloop/projects/v1/<ProjectId>/permissions.json
 # in-cwd file writes are contained and never ask; [permissions].ask =
 # ["edit_file(**)"] brings a confirmation back for every edit
-cargo run -- --permission-mode bypass              # bypass (deny/safety still apply)
+cargo run -- --permission-mode bypass              # 免审批，deny/敏感读取硬拦截仍生效
 
 # OS sandbox (macOS Seatbelt; see OS sandbox above): [sandbox] enabled = false
 # turns it off. This never disables Unix process groups or Windows Job Objects.
@@ -4786,8 +4781,8 @@ control / treatment：两臂版本与唯一被测差异。
   unwrapping, opaque-construct rejection, stream-only redirects kept parseable
   while file redirects still sink the script, `bash -c` unwrap, read-only option
   vetting, git option-injection, dangerous-through-wrappers); permission
-  pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass-immune
-  safety checks, sensitive paths never cached, ask-rules-over-allow,
+  pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass 全部工具免审批、
+  manual safety checks, sensitive paths never cached, ask-rules-over-allow,
   contained-writes cwd boundary, glob rules, WorkspaceId-partitioned session cache,
   ProjectId identity and durable ProjectStore publication/RMW, legacy
   `[permissions].allow` rejection, opaque scripts cacheable for the

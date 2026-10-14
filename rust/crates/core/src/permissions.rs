@@ -1,15 +1,15 @@
 //! permissions — the layered gate run before every tool execution, shaped
 //! after claude-code's `hasPermissionsToUseToolInner` pipeline:
 //!
-//! deny rules → sensitive-read hard block → plan-mode read-only gate →
+//! deny rules → sensitive-read hard block → plan-mode read-only gate → bypass →
 //! safety checks → ask rules → session scheduler controls → sandbox
-//! auto-allow → bypass → read-only self-verdict → contained writes → allow
+//! auto-allow → read-only self-verdict → contained writes → allow
 //! rules → session cache → ask the user.
 //!
-//! Two invariants carried over from cc: **deny always beats allow**, and
-//! **safety checks (destructive commands, sensitive paths) are immune to
-//! bypass mode**. A denial becomes an is_error tool_result — the model can
-//! take another approach; the turn does not end.
+//! deny 与敏感读取硬拦截优先于所有模式，不能通过审批解除。
+//! bypass 是用户显式选择的工具免审批模式：危险命令、敏感写入、ask 规则、
+//! 复杂脚本与主动脱沙箱全部跳过审批。拒绝转换为 is_error tool_result，模型可改道，
+//! 不会因此结束当前 turn。
 //!
 //! Plan mode ([`Mode::Plan`], cc's `plan` permission mode) sits below deny and
 //! the credential-read hard block: a write/mutating call is refused outright —
@@ -19,15 +19,9 @@
 //! whose yes would break the read-only promise. `exit_plan_mode` counts as
 //! read-only here (it only shows the plan and flips the mode), so it passes.
 //!
-//! Bypass mode ([`Mode::Bypass`]) waives the rule/ask layers but not the two
-//! things above it, and not a call that gave up containment itself: a bash
-//! call carrying `disable_sandbox` still reaches the user, because bypass
-//! trusts what the model is doing rather than its decision to remove the
-//! sandbox first. Beyond the safety checks above it does NOT vet the command:
-//! [`crate::shell::argv_is_dangerous`] is a blocklist by construction, holding
-//! only what is irreversible and outside git's reach, so on a host with no
-//! sandbox that short list is the whole command-level net. Containment is the
-//! real one.
+//! Bypass mode ([`Mode::Bypass`]) 不改变 OS 沙箱配置：普通调用仍在配置的沙箱内执行，
+//! 主动 `disable_sandbox` 与失败后自动升级都免审批。选择该模式即接受执行代价；
+//! 权限免审批本身不提供命令内容或文件系统隔离保证。
 //!
 //! The contained-writes layer is the file-tool counterpart of sandbox
 //! auto-allow, and the reason kloop has no `acceptEdits` mode. `write_file` /
@@ -35,9 +29,9 @@
 //! runs, so a path landing inside the working directory is contained by
 //! construction — the same argument that lets a sandboxed bash call skip the
 //! human. Containment is a property of the call, not a trust level, so the
-//! layer is unconditional instead of a mode. Everything above it keeps its
-//! say: deny rules; the safety layer, under which `.git`, `.kloop`, `.ssh`,
-//! `.env*` and friends ask every time even in-cwd; and explicit ask rules —
+//! layer is unconditional instead of a mode. Manual 模式下，上方的 deny、
+//! safety 与显式 ask 仍优先；`.git`、`.kloop`、`.ssh`、`.env*` 即使在 cwd 内也每次问。
+//! Explicit ask rules —
 //! one `ask = ["edit_file(**)"]` restores review-every-edit exactly, which is
 //! why that behavior never needed a mode of its own. A write that
 //! escapes the working directory is not contained and keeps asking.
@@ -48,15 +42,13 @@
 //! layers below it, opaque scripts included. Everything above it still has
 //! its say: deny rules, sensitive reads, safety checks, and — deliberately
 //! stricter than cc — explicit ask rules ("always confirm this" is the user's
-//! automation outranks it). Dispatch feeds the verdict in per call, so an
-//! escaped call (`disable_sandbox: true`) faces the gate like any other.
+//! automation outranks it). Bypass 在这些审批层之前放行。
+//! Dispatch feeds the verdict in per call.
 //!
 //! Bash content decisions run on the tree-sitter analysis in [`crate::shell`]:
-//! a script the parser cannot fully vouch for is *opaque* — it can never be
-//! auto-approved, never match an allow rule, and never enter the session
-//! cache; outside a contained sandbox it always goes to the user. Native
-//! Windows PowerShell is always opaque: it never enters the Bash parser,
-//! bypass still asks, and only an explicit whole-tool rule can auto-decide it.
+//! a script the parser cannot fully vouch for is *opaque*：不能靠解析或 allow 规则放行，
+//! 但沙箱、bypass 与逐字批准的会话记忆可放行。Native Windows PowerShell 不进 Bash
+//! parser：manual 下询问或匹配 whole-tool allow，不进入会话记忆；bypass 直接放行。
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -196,8 +188,7 @@ pub enum Mode {
     /// leaving nothing for a mode to hold.
     #[default]
     Manual,
-    /// Everything is approved except deny rules and safety checks (cc
-    /// `bypassPermissions` semantics — those two layers are immune).
+    /// 跳过全部工具权限审批，保留 deny 与敏感读取硬拦截；不改变 OS 沙箱配置。
     Bypass,
     /// Read-only exploration only: every write/mutating call is refused so the
     /// agent plans first and acts only after the user approves the plan via the
@@ -1004,7 +995,11 @@ impl Permissions {
             )));
         }
 
-        // 4. Safety checks — bypass-immune, straight to the user.
+        if self.mode() == Mode::Bypass {
+            return Ok(None);
+        }
+
+        // 4. Safety checks — manual 下直接询问用户。
         if let Some(hazard) = call.hazard(name) {
             return self
                 .ask_user(
@@ -1037,49 +1032,6 @@ impl Permissions {
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
         if sandbox_auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
-            return Ok(None);
-        }
-
-        // 7. Bypass mode — auto-run, with two exceptions.
-        //
-        // NOT an opaque bash script. Bypass waives the rule/ask layers, not the
-        // safety promise: an unparseable command (subshell, redirect,
-        // substitution…) could hide an `rm -rf` the destructive check never got
-        // to see, so it falls through to the user like everywhere else opaque
-        // scripts are refused an auto-verdict (deny/allow skip Opaque, and the
-        // cache below can only hold one the user already read and approved
-        // verbatim; the sandbox layer above may still auto-allow it because the
-        // sandbox *contains* it — this can't).
-        //
-        // And NOT a call that gave up containment itself. A bash call reaches
-        // this layer for one of three reasons, and only the first is the
-        // model's own decision: it asked for `disable_sandbox`; the session has
-        // no sandbox at all (disabled, or an unsupported platform); or the
-        // policy set `auto_allow = false`. Bypass means "I trust what you are
-        // doing" — not "I trust you to remove the containment first", which is
-        // why `describe_parts` has always had a notice ready for it. The other
-        // two reasons stay auto-run: the second is every bash call on a host
-        // without a sandbox, so refusing it would retire the mode rather than
-        // close a hole, and the third is the user's own two settings
-        // disagreeing, which bypass is defined to win.
-        //
-        // A blocked call is not denied — it falls to the read-only self-verdict
-        // (an escaped `ls` is still harmless), then allow rules, the session
-        // cache, and finally the user.
-        //
-        // What this layer does NOT do is vet the command. `argv_is_dangerous`
-        // (layer 4, above and bypass-immune) holds only what is irreversible
-        // and outside git's reach, so on a host with no sandbox at all that
-        // short list is the entire command-level net. That is the accepted
-        // position, not an oversight — containment is the real net, and where
-        // there is none the mode's name is the warning.
-        if self.mode() == Mode::Bypass
-            && !call.escapes_sandbox
-            && !matches!(
-                call.shell,
-                Some(ShellFacts::Bash(BashAnalysis::Opaque) | ShellFacts::PowerShellOpaque)
-            )
-        {
             return Ok(None);
         }
 
@@ -1223,8 +1175,7 @@ impl Permissions {
     ///
     /// deny and the sensitive list survive every mode but `allow_all`
     /// (tests/`--mock`, where nothing is gated); `--permission-mode bypass` still
-    /// filters, mirroring the gate where deny and safety checks are
-    /// bypass-immune.
+    /// filters，与权限门的 deny 和敏感读取硬拦截一致。
     pub fn read_path_blocked(&self, path: &Path) -> bool {
         self.read_path_blocked_with_resolved_path(path, None)
     }
@@ -1263,9 +1214,7 @@ impl Permissions {
         if self.allow_everything {
             return EscalationOutcome::NotAttempted;
         }
-        // Bypass (`--permission-mode bypass`) means "don't ask" — escalate as the model-driven
-        // disable_sandbox retry already would (it auto-passes the bypass
-        // layer of the gate).
+        // Bypass 的程序升级与模型主动 disable_sandbox 都免审批。
         if self.mode() == Mode::Bypass {
             return EscalationOutcome::Approved;
         }
@@ -1529,10 +1478,6 @@ pub(crate) struct CallFacts {
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     pub(crate) removing_worktree: bool,
-    /// This bash call asked to run outside the OS sandbox (`disable_sandbox`).
-    /// Kept as a fact of the call because bypass mode reads it: giving up
-    /// containment is the model's own decision, not a property of the command.
-    escapes_sandbox: bool,
     /// Present only when the bash analysis gave up: with no argv to key on, the
     /// script's own text is what rules and session memories are written about.
     opaque_script: Option<OpaqueScript>,
@@ -1590,13 +1535,12 @@ impl CallFacts {
                     }));
         let powershell_sensitive =
             name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
-        let escapes_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
         let opaque_script = match (&shell, shell_command) {
             (Some(ShellFacts::Bash(BashAnalysis::Opaque)), Some(command)) => {
                 let command = command.trim();
                 (!command.is_empty()).then(|| OpaqueScript {
                     command: command.to_string(),
-                    no_sandbox: escapes_sandbox,
+                    no_sandbox: input["disable_sandbox"].as_bool().unwrap_or(false),
                 })
             }
             _ => None,
@@ -1611,7 +1555,6 @@ impl CallFacts {
                 && input.get("path").is_some_and(Value::is_string),
             removing_worktree: name == "exit_worktree"
                 && input["action"].as_str() == Some("remove"),
-            escapes_sandbox,
             opaque_script,
         }
     }
@@ -2615,12 +2558,12 @@ mod tests {
         assert_eq!(approver.ask_count(), 0);
 
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
-        let asked_in_bypass = gate(
-            Mode::Bypass,
+        let asked_in_manual = gate(
+            Mode::Manual,
             rules(&[], &[], &["read_mcp_resource"]),
             approver.clone(),
         );
-        assert!(!ok(&asked_in_bypass, "read_mcp_resource", read.clone()).await);
+        assert!(!ok(&asked_in_manual, "read_mcp_resource", read.clone()).await);
         assert_eq!(approver.ask_count(), 1);
 
         let approver = ScriptedApprover::new(vec![]);
@@ -2715,23 +2658,19 @@ mod tests {
         assert!(!ok(&p, "run_agent", json!({"prompt": "x"})).await);
     }
 
-    // ── layer 4: safety checks are bypass-immune ───────────────────────
+    // ── layer 4: manual 的风险审批 ────────────────────────────────────
 
     #[tokio::test]
-    async fn destructive_commands_ask_even_in_bypass_and_over_allowlist() {
+    async fn destructive_commands_ask_in_manual_even_over_allowlist() {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(
-            Mode::Bypass,
+            Mode::Manual,
             rules(&["bash(rm *)"], &[], &[]),
             approver.clone(),
         );
         assert!(ok(&p, "bash", bash("rm -rf build")).await);
         let asked = approver.asked();
-        assert_eq!(
-            asked.len(),
-            1,
-            "allow rule and bypass must not silence the check"
-        );
+        assert_eq!(asked.len(), 1, "manual 下 allow 规则不能跳过危险操作审批");
         assert!(asked[0].description.contains("[destructive]"));
         assert_eq!(asked[0].approval_scopes, vec![ApprovalScope::Once]);
         assert_eq!(asked[0].remember_rules, None);
@@ -2740,13 +2679,8 @@ mod tests {
         assert!(!ok(&p, "bash", bash("rm -rf build")).await);
     }
 
-    /// The destructive list is short on purpose — "irreversible, and git is not
-    /// the way back" — but everything on it has to reach this layer, which is
-    /// the one bypass cannot waive. The negative half matters just as much:
-    /// `git reset --hard` is how work gets recovered here, and turning it into
-    /// a prompt would be the blocklist growing by vibe.
     #[tokio::test]
-    async fn irreversible_commands_reach_the_bypass_immune_layer() {
+    async fn irreversible_commands_require_approval_in_manual() {
         for command in [
             "dd if=/dev/zero of=/dev/sda",
             "mkfs.ext4 /dev/sdb1",
@@ -2754,7 +2688,7 @@ mod tests {
             "sudo dd of=/dev/sda",
         ] {
             let approver = ScriptedApprover::new(vec![Decision::Deny]);
-            let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+            let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
             assert!(!ok(&p, "bash", bash(command)).await, "{command}");
             assert_eq!(approver.ask_count(), 1, "{command}");
             assert!(
@@ -2773,19 +2707,11 @@ mod tests {
         assert_eq!(approver.ask_count(), 0);
     }
 
-    /// An opaque bash script (here a redirect onto a file) can't be vetted by
-    /// the deny or destructive-safety layers, so bypass mode must NOT auto-run
-    /// it: it falls through to the user like every other opaque call. A
-    /// parseable command in the same mode still auto-runs. Regression — a
-    /// one-token redirect used to slip `rm -rf …` past the deny rule, the
-    /// destructive check, AND the bypass short-circuit, running unprompted;
-    /// since plan 144 the stream-only half of that shape hides nothing, so it
-    /// is denied outright instead of merely reaching the user.
     #[tokio::test]
-    async fn opaque_bash_is_not_auto_run_in_bypass() {
+    async fn opaque_bash_is_not_auto_run_in_manual() {
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
         let p = gate(
-            Mode::Bypass,
+            Mode::Manual,
             rules(&[], &["bash(rm *)"], &[]),
             approver.clone(),
         );
@@ -2795,7 +2721,7 @@ mod tests {
         assert_eq!(
             approver.ask_count(),
             1,
-            "opaque bash must reach the user in bypass, not auto-run"
+            "manual 下无法分析的 Bash 必须由用户批准"
         );
         // Its stream-only twin is parsed, so the deny rule sees the `rm` itself
         // and nobody is asked at all — the stricter end of the same story.
@@ -2810,7 +2736,7 @@ mod tests {
         assert_eq!(
             approver.ask_count(),
             1,
-            "parseable bash still auto-runs in bypass"
+            "manual 下已知只读的 Bash 仍直接放行"
         );
     }
 
@@ -3034,59 +2960,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // ── bypass: what it is actually trusting ───────────────────────────
-
-    /// What lets bypass auto-run a bash call is that the call is still
-    /// contained — not that the command happens to miss `argv_is_dangerous`,
-    /// a blocklist that knows only `rm` and `sudo`. A call reaches this layer
-    /// for three reasons and only one of them is the model's own decision.
     #[tokio::test]
-    async fn bypass_stops_at_a_call_that_gave_up_containment() {
-        let escaping = json!({"command": "make install", "disable_sandbox": true});
+    async fn bypass_skips_all_tool_approval_prompts() {
+        let cases = [
+            ("bash", bash("make install")),
+            (
+                "bash",
+                json!({"command": "make install", "disable_sandbox": true}),
+            ),
+            (
+                "bash",
+                json!({
+                    "command": "export QUERY=\"${TOOLS_HOME:-$HOME/.tools}/query\"\n\"$QUERY\" rename",
+                    "disable_sandbox": true
+                }),
+            ),
+            ("bash", bash("echo result > output.txt")),
+            ("bash", bash("rm -rf build")),
+            ("bash", bash("dd if=/dev/zero of=/dev/sda")),
+            ("bash", bash("mkfs.ext4 /dev/sdb1")),
+            ("bash", bash("shred output.txt")),
+            ("write_file", file(".git/config")),
+            (
+                "edit_file",
+                json!({"path": ".env.local", "old_string": "a", "new_string": "b"}),
+            ),
+            ("notebook_edit", json!({"notebook_path": ".aws/note.ipynb"})),
+            ("enter_worktree", json!({"path": "existing"})),
+            ("exit_worktree", json!({"action": "remove"})),
+            ("powershell", json!({"command": "Set-Content x y"})),
+            (
+                "powershell",
+                json!({"command": r"Get-Content $env:USERPROFILE\.ssh\id_rsa"}),
+            ),
+            ("run_agent", json!({"prompt": "work"})),
+            ("memory__create_entities", json!({})),
+            (
+                "read_mcp_resource",
+                json!({"server": "fixture", "uri": "fixture://note"}),
+            ),
+        ];
+        for ask_rules in [
+            vec![],
+            vec![
+                "bash",
+                "write_file",
+                "edit_file",
+                "notebook_edit",
+                "enter_worktree",
+                "exit_worktree",
+                "powershell",
+                "run_agent",
+                "memory__create_entities",
+                "read_mcp_resource",
+            ],
+        ] {
+            let approver = ScriptedApprover::new(vec![]);
+            for approver_available in [true, false] {
+                let permissions = Permissions::new(
+                    Mode::Bypass,
+                    &rules(&[], &[], &ask_rules),
+                    test_cwd(),
+                    approver_available.then(|| approver.clone() as Arc<dyn Approver>),
+                )
+                .unwrap();
+                for (name, input) in &cases {
+                    for sandbox_auto_allow in [false, true] {
+                        assert_eq!(
+                            permissions
+                                .check_call(name, input, 1, sandbox_auto_allow)
+                                .await,
+                            Ok(None),
+                            "{name}: {input}, ask={ask_rules:?}, approver={approver_available}, sandbox={sandbox_auto_allow}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(approver.asked(), vec![]);
+        }
+    }
 
-        // The model asked to leave the sandbox: bypass no longer answers for it.
+    #[tokio::test]
+    async fn bypass_cannot_override_whole_tool_deny_for_opaque_shells() {
+        let approver = ScriptedApprover::new(vec![]);
+        let permissions = gate(
+            Mode::Bypass,
+            rules(
+                &["bash", "powershell"],
+                &["bash", "powershell"],
+                &["bash", "powershell"],
+            ),
+            approver.clone(),
+        );
+        for (name, input) in [
+            (
+                "bash",
+                json!({"command": "echo ${VALUE:-default} > output.txt", "disable_sandbox": true}),
+            ),
+            ("powershell", json!({"command": "Set-Content x y"})),
+        ] {
+            let error = permissions.check(name, &input, 0).await.unwrap_err();
+            assert!(
+                error.contains("blocked by a deny permission rule"),
+                "{error}"
+            );
+        }
+        assert_eq!(approver.asked(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn manual_sandbox_escape_still_asks_and_describes_the_risk() {
+        let escaping = json!({"command": "make install", "disable_sandbox": true});
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
-        let asked = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
-        assert!(!ok(&asked, "bash", escaping.clone()).await);
+        let asked = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(!ok(&asked, "bash", escaping).await);
         assert_eq!(approver.ask_count(), 1);
         let notice = approver.asked()[0]
             .notice
             .clone()
             .expect("an escaping call carries a notice");
         assert!(notice.contains("no OS sandbox"), "{notice}");
-
-        // Same mode, same (sandbox-less) session: an ordinary command still
-        // runs untouched. Refusing this one would retire the mode on every
-        // host without a sandbox rather than close a hole.
-        let approver = ScriptedApprover::new(vec![]);
-        let running = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
-        assert!(ok(&running, "bash", bash("make install")).await);
-
-        // Escaping but read-only: the read-only self-verdict below still takes
-        // it. An `ls` outside the sandbox is not worth interrupting anyone for.
         assert!(
             ok(
-                &running,
+                &asked,
                 "bash",
                 json!({"command": "ls -la", "disable_sandbox": true})
             )
             .await
         );
-
-        // And a call the sandbox will contain never reaches this layer at all.
-        assert!(
-            running
-                .check_call("bash", &bash("make install"), 0, true)
-                .await
-                .is_ok()
-        );
-        assert_eq!(approver.ask_count(), 0);
-
-        // Outside bypass nothing changed: manual asks about this command
-        // whether or not it escapes.
-        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
-        let manual = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(ok(&manual, "bash", escaping).await);
         assert_eq!(approver.ask_count(), 1);
     }
 
@@ -4170,11 +4171,11 @@ mod tests {
         assert!(error.contains("plan mode"), "{error}");
         assert_eq!(approver.ask_count(), 0);
 
-        for mode in [Mode::Manual, Mode::Bypass] {
+        {
             let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
-            let permissions = gate(mode, rules(&[], &[], &[]), approver.clone());
+            let permissions = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
             assert!(permissions.check("powershell", &input, 0).await.is_ok());
-            assert_eq!(approver.ask_count(), 1, "{mode:?} must ask");
+            assert_eq!(approver.ask_count(), 1, "manual 必须审批");
             let request = &approver.asked()[0];
             assert_eq!(request.remember_rules, None);
             assert!(
@@ -4247,7 +4248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn powershell_sensitive_windows_paths_force_bypass_immune_confirmation() {
+    async fn powershell_sensitive_windows_paths_require_approval_in_manual() {
         for command in [
             r"Get-Content $env:USERPROFILE\.ssh\id_rsa",
             r"Get-Content $HOME/.aws/credentials",
@@ -4258,7 +4259,7 @@ mod tests {
         ] {
             let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
             let permissions = gate(
-                Mode::Bypass,
+                Mode::Manual,
                 rules(&["powershell"], &[], &[]),
                 approver.clone(),
             );

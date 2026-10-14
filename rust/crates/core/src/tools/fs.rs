@@ -3599,7 +3599,7 @@ mod tests {
             ..Default::default()
         };
         let permissions = crate::permissions::Permissions::new(
-            crate::permissions::Mode::Bypass,
+            crate::permissions::Mode::Manual,
             &ask,
             root.clone(),
             Some(Arc::new(ChannelApprover { tx })),
@@ -3632,6 +3632,30 @@ mod tests {
         assert!(is_error, "{out}");
         assert!(out.contains("declined"), "{out}");
         assert!(!real.join("asked.txt").exists());
+
+        ask_ctx
+            .cfg
+            .permissions
+            .set_mode(crate::permissions::Mode::Bypass);
+        let (out, is_error) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_tool(
+                "write_file",
+                json!({"path": "inside-link/bypassed.txt", "content": "bypassed"}),
+                &ask_ctx,
+            ),
+        )
+        .await
+        .expect("bypass must not wait for alias ask approval");
+        assert!(!is_error, "{out}");
+        assert_eq!(
+            std::fs::read_to_string(real.join("bypassed.txt")).unwrap(),
+            "bypassed"
+        );
+        assert_eq!(
+            approvals.try_recv().err(),
+            Some(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

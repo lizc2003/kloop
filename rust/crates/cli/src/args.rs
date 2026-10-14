@@ -63,7 +63,7 @@ pub(crate) struct CliArgs {
     /// (the default when the flag is omitted — ask for anything the gate
     /// cannot vouch for; a file write landing inside the cwd is contained and
     /// never asks, which is why there is no `accept-edits` mode), `bypass`
-    /// (approve all but deny rules + safety checks), `plan` (read-only until
+    /// （工具免审批，保留 deny 与敏感读取硬拦截）, `plan` (read-only until
     /// the model's plan is approved via exit_plan_mode). `--mock` ignores it
     /// (no gate at all).
     pub(crate) permission_mode: Mode,

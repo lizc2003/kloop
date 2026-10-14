@@ -9,7 +9,8 @@
 //! subshells, command/process substitution, expansions, variable assignments,
 //! control flow, and any redirect that reads or writes a file — makes the
 //! whole script [`BashAnalysis::Opaque`]: no classifier can vouch for what it
-//! runs, so it can never be auto-approved. Stream-only redirects (`2>&1`,
+//! runs；manual 下不能靠内容分类自动放行，沙箱、bypass 与逐字会话批准另行决定。
+//! Stream-only redirects (`2>&1`,
 //! `>/dev/null`) are the exception: they add nothing the argv does not
 //! already say ([`redirect_is_stream_only`]).
 
@@ -49,10 +50,8 @@ fn analyze_at_depth(script: &str, depth: u8) -> BashAnalysis {
                 BashAnalysis::Opaque => return BashAnalysis::Opaque,
             },
             // A `bash -c` wrapper past the unwrap limit must NOT be kept as a
-            // trusted plain command: its inner script stays unvetted, so
-            // `argv_is_dangerous(["bash", …])` and deny prefixes never see the
-            // `rm -rf` inside it, and bypass mode would auto-run it. Opaque
-            // keeps it out of every auto-allow path (falls through to ask).
+            // trusted plain command：其正文未经分析，危险命令与 deny 前缀都看不到它。
+            // Opaque 让 manual 不会靠内容分类自动放行；沙箱与 bypass 的决定另行保留。
             Some(_) => return BashAnalysis::Opaque,
             None => flattened.push(argv),
         }
@@ -340,12 +339,9 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
 /// `git clean -fdx` and `git reset --hard`, which inside a repository are the
 /// recovery path rather than the threat. Device clobbering through a redirect
 /// (`… > /dev/sda`) needs no entry either: a redirect onto a file makes the
-/// whole script [`BashAnalysis::Opaque`], which never gets an automatic verdict
-/// anywhere.
+/// whole script [`BashAnalysis::Opaque`]，manual 下不能靠内容分类获得自动裁决。
 ///
-/// Because it is a blocklist, it is not the containment story — see the bypass
-/// layer in [`crate::permissions`]. It is the short list of things worth one
-/// question even when the user has said "stop asking".
+/// 这是 manual 下需要强制审批的短名单，不提供 OS containment 保证；bypass 跳过它。
 pub fn argv_is_dangerous(argv: &[String]) -> bool {
     let Some(cmd0) = argv.first() else {
         return false;
@@ -636,7 +632,7 @@ mod tests {
         // Nesting past the unwrap limit stays a `bash -c` wrapper: it must be
         // Opaque, not a trusted plain command. `whoami` stands in for the real
         // payload (`rm -rf /`); if this returned Commands, the inner command
-        // would escape the danger/deny checks and bypass mode would auto-run it.
+        // would escape the danger/deny checks and manual could trust a whole-tool rule.
         assert_eq!(
             analyze_bash("bash -c \"bash -c 'bash -c whoami'\""),
             BashAnalysis::Opaque
@@ -732,7 +728,7 @@ mod tests {
         assert!(!argv_is_dangerous(&argv(&["git", "reset", "--hard"])));
 
         // A redirect onto a device needs no entry: it makes the whole script
-        // opaque, and an opaque script never gets an automatic verdict.
+        // opaque，manual 下不能靠内容分类获得自动裁决。
         assert_eq!(analyze_bash("cat x > /dev/sda"), BashAnalysis::Opaque);
     }
 
