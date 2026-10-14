@@ -2635,6 +2635,13 @@ persisted by a PowerShell prompt. Prompts are labeled
 
 ## Scheduler (Plan 58)
 
+实现按职责分在 `core/src/scheduler.rs` 与两个私有子模块（plan 181）：父模块保留
+时钟、任务数据类型、调度策略与 check 生命周期；`scheduler/cron.rs` 负责五字段解析、
+时区转换、字段跳跃与 DST offset 折半；`scheduler/store.rs` 负责私有文件、跨进程锁、
+存储校验与原子持久化，加载时仍调用 cron 解析器校验表达式。三个原有公开类型
+`CronSpec`、`SchedulerTimeZone`、`DurableStore` 从父模块重导出，调用方路径不变。
+私有存储与 CLI 的 `private_store` 仍各自维护，未作跨 crate 合并。
+
 The scheduler is an in-process, depth-zero, owner-scoped surface. Its model-visible
 tools are strict `cron_create`, `cron_delete`, `cron_list`, and `schedule_wakeup`;
 `/loop` translates fixed intervals into cron instructions and uses dynamic wakeups when

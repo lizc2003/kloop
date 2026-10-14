@@ -1,5 +1,18 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 181 ✅（2026-10-14）**：Scheduler 按职责拆分。`scheduler.rs` 保留时钟、任务
+数据类型、调度策略与 check 生命周期，生产代码 1295 → 781 行（1490 总行）；
+`scheduler/cron.rs` 为解析、时区与 DST 跳跃（264 code / 445 总行），
+`scheduler/store.rs` 为私有文件、跨进程锁与原子持久化（264 code / 342 总行），
+共用测试夹具放在 `scheduler/testutil.rs`。三个公开类型从父模块重导出；store 加载时
+对 cron 的校验依赖原样保留，不与 CLI 私有存储合并。21 条原测试全部通过，名称、
+属性及 98 个函数正文核对一致；15 秒轮询和 DST offset 折半实现未改。
+外层执行沙箱之外的完整 `make check` 全绿，含本机 parity；core 1124 条测试通过，
+本机语料未修改。另在独立临时 workspace 与 target 中钉住 `1.98.1`，对真实 core
+执行 Windows `--all-targets --all-features` 类型检查并通过，只有已有 `login_env`
+dead_code 告警；C 依赖按教训 201 生成空产物，不代表链接或 Windows 执行通过。
+实现提交为 plan 181 完成记录所在提交，教训 235。
+
 **bypass 自动升级归因（2026-10-14）**：升级结果的 `Approved` 携带实际授权来源，
 区分用户点头、bypass 自动放行与已有升级授权。Bash 把来源传入结果前缀；bypass
 写明自动升级，只有本次确实获用户批准才写 `after user approval`，各来源都保留
@@ -537,14 +550,14 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 | **178 ✅** 私有存储:一个文件里住着三套系统调用 | `cli/src/private_store.rs` 1291 → **78 + 测试** | `unix.rs` 342 + `windows.rs` 485 + `fallback.rs` 184 | 中,已做(2026-09-22) |
 | **179 ✅** 平台分支已经盖好半间房子了 | `core/src/tools/fs.rs` | `fs/unix.rs` 232 + `fs/fallback.rs` 94 + `fs/windows.rs` 637→747 | 中,已做(2026-09-23) |
 | **180 ✅** 前台跑完就结束,后台要活一整个会话 | `core/src/tools/bash.rs` 1064 → **446** | `bash/background.rs` 644 + 共用测试夹具 | 中,已做(2026-10-14) |
-| **181** 一个 cron 解析器、一把文件锁、一个调度器 | `core/src/scheduler.rs` 1187 | `scheduler/{cron,store}.rs` | 中 |
+| **181 ✅** 一个 cron 解析器、一把文件锁、一个调度器 | `core/src/scheduler.rs` 1295 → **781** | `scheduler/{cron,store}.rs` + 共用测试夹具 | 中,已做(2026-10-14) |
 | **182** 追加一行,和读一个会话目录,不是一件事 | `core/src/rollout.rs` 1500 | `rollout/{sessions,line,validate}.rs` | 大 |
 | **183** main.rs 里藏着一个完整的 REPL | `cli/src/main.rs` 833 | `plain.rs` | 中 |
 | **184** 配置、生命周期、两个 ToolSource,一个文件 | `cli/src/mcp.rs` 1909 | `mcp/{config,lifecycle,tools,resources}.rs` | 大 |
 | **185** 二十二个方法排成一张表,表在一个 impl 里 | `server/src/lib.rs` 1910 | `{dto,params,worker,thread_ui}.rs` + `methods/{threads,query,turn}.rs` | 大 |
 | **186** 管线才是本体,另外四样只是邻居 | `core/src/permissions.rs` 1632 | `permissions/{rule,policy,facts,describe}.rs` | 大,**建议放最后** |
 
-顺序建议:177 ✅ → 178 ✅/179(同一个形状做两遍)→ 180 ✅/181/183 → 182/184/185 → 186。
+顺序建议:177 ✅ → 178 ✅/179(同一个形状做两遍)→ 180 ✅/181 ✅/183 → 182/184/185 → 186。
 177 最小,做完一次就知道这批的节奏对不对;186 语义风险最高,前面九条做完手感最好。
 
 **177 做完的节奏读数(2026-09-22)**:整条是纯搬运,`use` 之外的改动只有三处可见性
@@ -995,6 +1008,7 @@ Plan 56/57/58 native、scripted provider、sensitive information **将近四周�
 > 分配真实 turn ID，headless 有界 shutdown。CC exact fixture 仅裁决 schema/store/gate；timed fire、
 > DST/clock jump、effective recurring jitter、restart/re-arm 与 enabled dynamic-loop path 仍为 `unknown`，
 > 不得以原生行为外推 exact runtime。
+> 当前实现按 plan 181 分在 `core/src/scheduler.rs`、`scheduler/cron.rs` 与 `scheduler/store.rs`。
 >
 > **Plan 59 已完成（2026-08-03）**：`59-tool-parity-acceptance.md` 对 exact Claude Code 2.1.220、
 > darwin-arm64 local CLI、`team=false`、`remote=false` 的 14 个已执行 profile 做最终受限验收。
@@ -2552,3 +2566,11 @@ C 依赖空产物的边界、告警与未执行 Windows 测试均记入 plan 180
 结果前缀却无法如实归因。授权来源应在决策时记录，并随结果传给输出层；不能在异步
 调用结束后再读当前模式猜来源。回归既要核对无人审批的自动升级，也要保留用户实际
 点头的标记与拒绝证据。批量同步层号时还要同时查 `layer` 与 `layers`，避免漏掉组合标题。
+
+235. **按职责拆分，不等于把既有的校验依赖也拆断。** plan 181 立项时把 cron、文件锁、
+调度器写成“互相不需要认识”，但当前 store 加载时本来就调用 cron 解析器校验任务；
+调度器的动态唤醒和 jitter 也要读取本地时间的 minute/hour。迁移前沿真实调用链核对
+边界，保留这些小依赖，只对父模块需要的类型、字段和方法提 `pub(super)`，不要为
+满足旧描述抽象新接口或放宽整个内部结构。测试同样按契约归属：经过 create 校验、
+owner 分区或 check 生命周期的测试留在调度器一侧；纯解析与存储测试才随模块迁移。
+计划的行数估算也须按当前实现解释，不能为了追旧数字再切碎后来加入的内聚逻辑。
