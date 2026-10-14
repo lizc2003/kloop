@@ -44,8 +44,7 @@
 
 ## 五、✅ 完成（2026-10-14）
 
-提交：本节所属的 `refactor(plan180)` 提交；提交号可用
-`git log -1 --format=%h --grep='^refactor(plan180):'` 查询。
+实现提交：`0648d75`（`refactor(plan180): separate session background shell lifecycle`）。
 
 开工时 `bash.rs` 已从计划中的 2731 总行增至 3480 总行，生产代码约 1064 行。
 按生命周期拆分，行为、权限和沙箱策略保持原样：
@@ -72,3 +71,35 @@
 Windows 条件测试原样保留，未在 Windows 上执行。另逐一核对全部 52 条测试的
 属性与祖先模块的平台条件、111 个函数正文，以及拆分前后的整块生产代码；
 除必要的可见性和模块路径调整外，生产代码保持一致。
+
+## 六、审查后补验与清单修正（2026-10-14）
+
+实现提交漏了教训 166/183 要求的 Windows 类型检查。上节的本机门禁和文本核对
+都没有编译 Windows 条件代码；本次补齐验证，并修正 HANDOFF 能力清单的落点。
+
+从 `0648d75` 导出独立的临时 Rust workspace，使用单独的 target 目录；检查真实
+core 和测试目标，未对 Rust 接口做 stub。工具链钉住 `1.98.1`，确认对应工具链已
+安装 `x86_64-pc-windows-msvc` target。实际命令：
+
+```sh
+cargo +1.98.1 check --offline --locked -p kloop-core \
+  --target x86_64-pc-windows-msvc --all-targets --all-features
+```
+
+构建环境沿用教训 201：`CARGO_TARGET_DIR` 指向临时副本自己的产物目录，仅为
+Windows triple 设置 `CC_x86_64_pc_windows_msvc`、`CXX_x86_64_pc_windows_msvc`
+与 `AR_x86_64_pc_windows_msvc`，由临时脚本生成空 C 编译、归档产物。
+
+- 先在临时副本的 Windows 夹具构造函数、前台 MSIX 测试和后台 shutdown 测试各
+  注入一个未定义名字。交叉 check 在 `lib test` 中报告预期的 3 个 E0425，确认
+  夹具和两处测试调用面确实进入了 Windows 编译；被 ignore 的测试也参与编译。
+- 移除三个故意错误，逐字节确认三份 Bash 源码与原工作区一致，再用同一工具链
+  清理临时 target 中的 core 产物并重新检查。最终 check 通过；编译器另报告一条
+  `TestConfig::login_env` 的 dead_code 告警，定义所在的 `tools/mod.rs` 未改动。
+- 验证覆盖 Rust 类型、名字解析与测试目标，不证明 C 代码、链接或 Windows 上的
+  执行结果。6 条 Windows 条件测试仍未执行；原有 macOS 门禁结果不变。
+- HANDOFF 能力清单的“后台 bash”文件指针补上 `core/src/tools/bash/background.rs`，
+  与实际注册表、monitor、Drop 的位置一致。
+
+仓库本次仅改文档，按纯文档规则核对完整差异、引用与状态，并运行
+`git diff --check` 与 `git diff --cached --check`；临时副本、脚本和产物不进入提交。
