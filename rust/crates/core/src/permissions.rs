@@ -152,12 +152,18 @@ pub struct ConfirmRequest {
     pub preview: Option<ConfirmPreview>,
 }
 
-/// The outcome of [`Permissions::escalate_sandbox`] — the code-level
-/// escalation loop's consent step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalationApproval {
+    User,
+    Bypass,
+    Remembered,
+}
+
+/// [`Permissions::escalate_sandbox`] 的结果，同时保留脱沙箱重试的授权来源。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EscalationOutcome {
-    /// Approved (or bypass mode): re-run the command without the sandbox.
-    Approved,
+    /// 已获准裸跑；结果必须标明实际授权来源。
+    Approved(EscalationApproval),
     /// The user was asked and declined: keep the sandboxed failure and do
     /// not invite a disable_sandbox retry.
     Declined,
@@ -1217,7 +1223,7 @@ impl Permissions {
         }
         // Bypass 的程序升级与模型主动 disable_sandbox 都免审批。
         if self.mode() == Mode::Bypass {
-            return EscalationOutcome::Approved;
+            return EscalationOutcome::Approved(EscalationApproval::Bypass);
         }
         // A remembered escalation answers before the ask, exactly as a durable
         // allow rule does for the ordinary gate. Opaque scripts produce no
@@ -1229,7 +1235,7 @@ impl Permissions {
                 .as_ref()
                 .is_some_and(|remember| self.escalation_remembered(remember))
         {
-            return EscalationOutcome::Approved;
+            return EscalationOutcome::Approved(EscalationApproval::Remembered);
         }
         let Some(approver) = &self.session.approver else {
             return EscalationOutcome::NotAttempted;
@@ -1266,14 +1272,14 @@ impl Permissions {
             return EscalationOutcome::Declined;
         }
         match scope {
-            ApprovalScope::Once => EscalationOutcome::Approved,
+            ApprovalScope::Once => EscalationOutcome::Approved(EscalationApproval::User),
             ApprovalScope::WorkspaceSession => {
                 let signatures = remember.map_or_else(
                     || vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
                     |remember| remember.signatures,
                 );
                 self.remember_in_session(signatures);
-                EscalationOutcome::Approved
+                EscalationOutcome::Approved(EscalationApproval::User)
             }
             ApprovalScope::Project => {
                 let Some(remember) = remember else {
@@ -1286,7 +1292,7 @@ impl Permissions {
                 // said yes. It just will not be remembered, same as the
                 // ordinary gate's project scope.
                 let _ = self.project.persist(additions).await;
-                EscalationOutcome::Approved
+                EscalationOutcome::Approved(EscalationApproval::User)
             }
         }
     }
@@ -3115,7 +3121,7 @@ mod tests {
         assert!(approver.asked().iter().all(|r| r.remember_rules.is_none()));
     }
 
-    // ── layers 9/10: contained writes and allow rules ───────────────────
+    // ── layers 10/11: contained writes and allow rules ──────────────────
 
     /// The contained-writes layer is not a mode: plain `manual` runs a
     /// structured write that lands inside the cwd without asking, because
@@ -3740,7 +3746,7 @@ mod tests {
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("npm install", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert_eq!(
             p.escalate_sandbox("git push", None, 0).await,
@@ -3762,7 +3768,7 @@ mod tests {
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("curl x", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::Bypass)
         );
         assert_eq!(approver.ask_count(), 0, "bypass does not prompt");
 
@@ -3786,6 +3792,11 @@ mod tests {
             p.escalate_sandbox("touch x", None, 0).await,
             EscalationOutcome::NotAttempted
         );
+        p.set_mode(Mode::Bypass);
+        assert_eq!(
+            p.escalate_sandbox("touch x", None, 0).await,
+            EscalationOutcome::Approved(EscalationApproval::Bypass)
+        );
     }
 
     /// The escalation ask is remember-able like any other: answering with the
@@ -3800,7 +3811,7 @@ mod tests {
 
         assert_eq!(
             p.escalate_sandbox("go test ./pkg -run X", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert_eq!(approver.ask_count(), 1);
         assert_eq!(
@@ -3817,7 +3828,7 @@ mod tests {
         // Same two-word prefix, different arguments: covered, no second ask.
         assert_eq!(
             p.escalate_sandbox("go test ./other", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::Remembered)
         );
         assert_eq!(approver.ask_count(), 1, "remembered, so not asked again");
 
@@ -3839,7 +3850,7 @@ mod tests {
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("go test ./pkg", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert!(p.sandbox_escalation_remembered("go test ./other"));
         p.set_mode(Mode::Bypass);
@@ -3875,7 +3886,7 @@ mod tests {
 
         assert_eq!(
             p.escalate_sandbox(opaque, None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert_eq!(
             approver.asked()[0].approval_scopes,
@@ -3891,11 +3902,11 @@ mod tests {
         // Blanket consent covers another opaque script and a parseable one.
         assert_eq!(
             p.escalate_sandbox("x=$(date) && echo $x", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::Remembered)
         );
         assert_eq!(
             p.escalate_sandbox("go test ./pkg", None, 0).await,
-            EscalationOutcome::Approved
+            EscalationOutcome::Approved(EscalationApproval::Remembered)
         );
         assert_eq!(approver.ask_count(), 1, "asked once for the whole session");
 

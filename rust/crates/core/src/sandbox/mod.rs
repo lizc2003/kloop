@@ -17,6 +17,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::permissions::EscalationApproval;
+
 /// Hardcoded absolute path (codex does the same): resolving `sandbox-exec`
 /// through PATH would let an attacker-controlled directory supply the
 /// "sandbox".
@@ -36,26 +38,24 @@ pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file 
     legitimately needs the blocked access, retry with disable_sandbox: true. The retry still passes \
     the permission gate; bypass mode does not ask for user approval.]";
 
-/// Prepended to an escalated (re-run without the sandbox) result so the
-/// model sees the earlier sandboxed failure was resolved by escalation, not
-/// left hanging.
-pub const ESCALATED_PREFIX: &str = "[Re-ran without the sandbox after user approval.]\n";
-
 /// Prepended when a remembered `sandbox_escalate(...)` rule let the command run
-/// uncontained from the start. Distinct from [`ESCALATED_PREFIX`]: nothing was
+/// uncontained from the start. Distinct from [`escalated_prefix`]: nothing was
 /// denied this time and nobody was asked, so saying "after user approval" would
 /// misdescribe both. The model still has to be told the sandbox was not in
 /// force — otherwise it reads a plain success and assumes containment held.
 pub const REMEMBERED_ESCALATION_PREFIX: &str =
     "[Ran without the sandbox: a remembered sandbox_escalate rule already covers this command.]\n";
 
-/// The same marker carrying what the sandbox had refused. The unsandboxed run
-/// replaces the contained one, so without this line the only record of *why*
-/// containment was removed is gone — which is what made one 107-minute
-/// escalation impossible to attribute afterwards.
-pub fn escalated_prefix(denial: &SandboxDenial) -> String {
+/// 升级结果保留实际放行来源、沙箱拒绝类型与证据。
+/// 裸跑结果会替换原来的沙箱输出；没有这些信息，事后无法追溯为何移除了遏制。
+pub fn escalated_prefix(denial: &SandboxDenial, approval: EscalationApproval) -> String {
+    let source = match approval {
+        EscalationApproval::User => "after user approval",
+        EscalationApproval::Bypass => "automatically in bypass mode",
+        EscalationApproval::Remembered => "under a remembered sandbox_escalate rule",
+    };
     format!(
-        "[Re-ran without the sandbox after user approval; it had been denied ({}): {}]\n",
+        "[Re-ran without the sandbox {source}; it had been denied ({}): {}]\n",
         denial.kind.label(),
         denial.evidence
     )
@@ -811,12 +811,25 @@ mod tests {
     /// containment was removed.
     #[test]
     fn the_escalated_marker_carries_the_denial() {
-        let marker = escalated_prefix(&SandboxDenial {
+        let denial = SandboxDenial {
             kind: DenialKind::Network,
             evidence: "bind: operation not permitted".to_string(),
-        });
-        assert!(marker.contains("(network)"), "{marker}");
-        assert!(marker.contains("bind: operation not permitted"), "{marker}");
+        };
+        for (approval, source) in [
+            (EscalationApproval::User, "after user approval"),
+            (EscalationApproval::Bypass, "automatically in bypass mode"),
+            (
+                EscalationApproval::Remembered,
+                "under a remembered sandbox_escalate rule",
+            ),
+        ] {
+            assert_eq!(
+                escalated_prefix(&denial, approval),
+                format!(
+                    "[Re-ran without the sandbox {source}; it had been denied (network): bind: operation not permitted]\n"
+                )
+            );
+        }
     }
 
     /// The toolchain cache is the one writable root that exists for a compiler

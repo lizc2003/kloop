@@ -302,7 +302,7 @@ pub(crate) async fn run_foreground_bash(
                 .await
                 .unwrap_or(EscalationOutcome::Declined);
             match outcome {
-                EscalationOutcome::Approved => {
+                EscalationOutcome::Approved(approval) => {
                     let raw = run_foreground(command, &cwd, None, bash, timeout_ms, ctx).await?;
                     // What the sandbox refused is the only record of why this
                     // ran uncontained, and the sandboxed output is about to be
@@ -311,7 +311,7 @@ pub(crate) async fn run_foreground_bash(
                     return Ok(ForegroundRun {
                         text: format!(
                             "{}{}",
-                            sandbox::escalated_prefix(&denial),
+                            sandbox::escalated_prefix(&denial, approval),
                             format_output(&raw)
                         ),
                         success: raw.status.success(),
@@ -1697,13 +1697,48 @@ mod tests {
             )
             .await;
             assert!(!is_error, "{out}");
-            assert!(out.contains("Re-ran without the sandbox"), "{out}");
+            assert!(
+                out.contains("Re-ran without the sandbox after user approval"),
+                "{out}"
+            );
             assert!(
                 !out.contains("looks like a sandbox"),
                 "no dangling hint: {out}"
             );
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
             assert_eq!(asked.load(Ordering::SeqCst), 1, "asked exactly once: {out}");
+        }
+
+        #[tokio::test]
+        async fn escalation_in_bypass_attributes_the_retry_without_an_approver() {
+            let (mut ctx, _) = sandbox_ctx("esc-bypass");
+            let mut cfg = ctx.cfg.test_clone();
+            Arc::make_mut(cfg.sandbox.as_mut().unwrap()).escalate = true;
+            cfg.permissions = Arc::new(
+                crate::permissions::Permissions::new(
+                    crate::permissions::Mode::Bypass,
+                    &Default::default(),
+                    cfg.cwd.clone(),
+                    None,
+                )
+                .unwrap(),
+            );
+            ctx.cfg = Arc::new(cfg);
+            let target = outside_dir("esc-bypass").join("climbed.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo climbed > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
+            let _ = std::fs::remove_file(target);
+            assert!(out.contains("automatically in bypass mode"), "{out}");
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(!out.contains("after user approval"), "{out}");
+            assert!(!out.contains("looks like a sandbox"), "{out}");
         }
 
         /// A remembered escalation skips the contained attempt entirely: the

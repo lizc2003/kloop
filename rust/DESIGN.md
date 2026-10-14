@@ -3017,10 +3017,11 @@ When a sandboxed command fails and the failure looks like a sandbox denial
 disables network), there are two escalation paths:
 
 - **Code-level loop** (`escalate`, default on — codex's retry-on-denial):
-  the tool asks once ("run this without the sandbox?") and, on approval,
-  re-runs the command unsandboxed within the same tool call — one fewer
-  model round-trip. `--permission-mode bypass` auto-approves it; declining keeps
-  the failure and steers the model to a different approach. This is the default.
+  沙箱拒绝后，在同一次工具调用内决定是否脱沙箱重跑，省去一次模型往返。
+  非 bypass 模式下先查已有升级授权，再询问用户；用户拒绝则保留失败并引导换法，
+  没有 approver 则回退模型驱动指引。`--permission-mode bypass` 自动放行。
+  升级结果携带实际放行来源；前缀区分用户批准、bypass 自动放行与已有升级授权，
+  同时保留拒绝类型和证据。无人被询问时不写成“用户批准后重跑”。
 - **Model-driven** (fallback when `escalate = false`, or when there is no
   approver): the result is annotated with guidance and the model retries
   that one call with `disable_sandbox: true`。重试仍先过权限门；bypass 直接放行，
