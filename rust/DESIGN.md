@@ -5112,10 +5112,14 @@ crates/codemode/    kloop-codemode — the QuickJS engine for code mode (owns rq
                     the tools/agent/log/parallel prelude, resource limits
 
 crates/cli/         kloop — the binary
-  src/main.rs       arg parsing + dispatch (TUI default, --plain REPL,
-                    app-server/--serve), StdoutUi, CliApprover, --mock demo,
-                    session selection (--continue, --resume, --list-sessions
-                    [--all])
+  src/main.rs       进程/会话初始化与前端分派（TUI、plain、headless、server）；
+                    保留 headless 的管道输入与单次 Ctrl+C watcher
+  src/plain.rs      行式 REPL 与 --mock demo；会话级 Ctrl+C、按需 stdin
+                    线程、Inbox 唤醒、命令/turn 运行与退出清理
+  src/ui.rs         StdoutUi、CliApprover 与 plain 交互呈现
+  src/headless.rs   单 turn 输出与退出码契约
+  src/args.rs       参数解析、版本串与会话选择（--continue、--resume、
+                    --list-sessions [--all]）
   src/user_config.rs one global TOML read and strict root schema
   src/private_store.rs private I/O: atomic replace, directory durability,
                     reparse/symlink rejection, file locks. This file holds only
