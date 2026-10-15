@@ -1,7 +1,7 @@
 # HANDOFF — 当前状态与会话交接
 
 **Plan 182 ✅（2026-10-14）**：Rollout 按职责拆分。父模块保留追加写入器与公开
-门面，生产代码 1715 → 334 行（727 总行）；`rollout/line.rs` 为行格式、快照、错误
+门面，生产代码 1715 → 336 行（727 总行）；`rollout/line.rs` 为行格式、快照、错误
 serde 与同步判据（371 code / 487 总行），`rollout/validate.rs` 为完整行读取、格式/
 信封/provider 校验与单次解析（338 code / 820 总行），`rollout/sessions.rs` 为检查、
 恢复与配对修复、fork、摘要、目录查询和 id/path（697 code / 2088 总行）。七个共用
@@ -566,7 +566,7 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 | **179 ✅** 平台分支已经盖好半间房子了 | `core/src/tools/fs.rs` | `fs/unix.rs` 232 + `fs/fallback.rs` 94 + `fs/windows.rs` 637→747 | 中,已做(2026-09-23) |
 | **180 ✅** 前台跑完就结束,后台要活一整个会话 | `core/src/tools/bash.rs` 1064 → **446** | `bash/background.rs` 644 + 共用测试夹具 | 中,已做(2026-10-14) |
 | **181 ✅** 一个 cron 解析器、一把文件锁、一个调度器 | `core/src/scheduler.rs` 1295 → **781** | `scheduler/{cron,store}.rs` + 共用测试夹具 | 中,已做(2026-10-14) |
-| **182 ✅** 追加一行,和读一个会话目录,不是一件事 | `core/src/rollout.rs` 1715 → **334** | `rollout/{sessions,line,validate}.rs` + 共用测试夹具 | 大,已做(2026-10-14) |
+| **182 ✅** 追加一行,和读一个会话目录,不是一件事 | `core/src/rollout.rs` 1715 → **336** | `rollout/{sessions,line,validate}.rs` + 共用测试夹具 | 大,已做(2026-10-14) |
 | **183** main.rs 里藏着一个完整的 REPL | `cli/src/main.rs` 833 | `plain.rs` | 中 |
 | **184** 配置、生命周期、两个 ToolSource,一个文件 | `cli/src/mcp.rs` 1909 | `mcp/{config,lifecycle,tools,resources}.rs` | 大 |
 | **185** 二十二个方法排成一张表,表在一个 impl 里 | `server/src/lib.rs` 1910 | `{dto,params,worker,thread_ui}.rs` + `methods/{threads,query,turn}.rs` | 大 |
@@ -602,6 +602,9 @@ facade 里还剩两个:一个藏在共用函数 `validate_private_file` 的**函
 3. **新文件瞄准 ≤800 code 行。** 这是判断切得够不够的手感,不是门禁——体积棘轮
    2026-09-21 已整体删除(见教训 172 后记),现在没有任何机器在量这个数。
    切法仍要一次切到位:**判据是"拆完每块都能用一句话说清自己是什么"**,不是行数。
+   Plan 181/182 完成记录的 code 行按同一朴素物理行口径统计：取
+   `#[cfg(test)] mod tests` 之前的非空、非 `//` 注释行；其他单独的 `#[cfg(test)]`
+   项及其模块声明照计，不展开条件编译。因此 `scheduler.rs` 为 781，`rollout.rs` 为 336。
 4. **可见性只提到够用为止。** 文件私有的项搬进子模块后父模块要用,提 `pub(super)`;
    跨模块才提 `pub(crate)`。别顺手改 `pub`——那会把内部形状变成 crate 的 API。
 5. **对外符号表一个不少不多。** 几条 `pub` 面大的(182 的 `rollout::`、184 的 `mcp::`、
