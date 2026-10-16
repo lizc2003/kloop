@@ -1630,7 +1630,16 @@ this was being written. A run of thinking blocks (no timing survives on disk, so
 each renders the same bare `∗ Thought`) folds into one row, keeping every block's
 text behind it.
 
-`kloop app-server` (alias `kloop --serve`) speaks the provider-aware native agent protocol over stdio. The breaking native wire version is `2.0`; model-only `2.0` clients are rejected without downgrade. The core still emits one shared Event stream for every front-end.
+`kloop app-server`（别名 `kloop --serve`）通过 stdio 提供 JSON-RPC 2.0 原生 agent
+协议，协议版本为 `1.0`；`initialize` 拒绝其他版本，不做降级。core 向所有前端
+发送同一套 Event 流。
+
+服务端根模块保留 serve/write loop、私有 `Server` 与线程/交互状态、握手、完整
+方法分发表和交互响应路由。`dto.rs` 承载公开 DTO 与注入回调，并从根模块重导出；
+`params.rs` 负责参数解析、运行时映射与错误分类。`methods/{threads,query,turn}.rs`
+分别实现线程生命周期、查询/provider 切换入队和 turn 操作，共享原来的私有字段；
+`methods.rs` 仅声明三个子模块。`worker.rs` 拥有每线程 History、操作串行化及
+turn/命令执行，`thread_ui.rs` 适配事件、审批和提问；两者共用原来的状态与交互回执。
 
 **Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
 
@@ -5093,7 +5102,16 @@ crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
 
 crates/server/      kloop-server — native agent protocol frontend (JSON-RPC 2.0)
   src/wire.rs       envelopes + Event→notification projection (project_event)
-  src/lib.rs        serve loop, handshake, per-thread workers, approval routing
+  src/events.rs     generation-scoped event projection, recovery and snapshots
+  src/lib.rs        serve/write loop、私有状态、握手、完整方法分发表与交互响应路由
+  src/dto.rs        公开配置/发现 DTO 与注入回调，从 lib.rs 重导出
+  src/params.rs     参数解析、会话运行时映射与错误分类
+  src/methods.rs    仅声明 threads/query/turn 三个子模块
+  src/methods/threads.rs 线程创建/恢复/fork、查询、事件同步与工作者启动
+  src/methods/query.rs 配置/目录读取、作用域与 provider 切换入队
+  src/methods/turn.rs turn 启动、条件 steering 与中断
+  src/worker.rs     每线程 History、操作串行化与 turn/命令执行
+  src/thread_ui.rs  事件投影与审批/提问反向请求适配
 
 crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAuth (protocol + reqwest)
   src/lib.rs        wire types, the Transport trait, and McpClient: handshake,
