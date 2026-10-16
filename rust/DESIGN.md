@@ -1899,7 +1899,12 @@ the HTTP transport and the OAuth wire — PKCE/discovery/token exchange/refresh 
 `oauth.rs` — but core never depends on it); the CLI glues them (config parsing,
 secret resolution, namespacing, the adapter, and the OAuth login command + token
 store in `mcp_auth.rs`, so nothing with a terminal/config-file side-effect
-leaks into the wire crate).
+leaks into the wire crate). CLI 内部由 `mcp.rs` 保留启动编排和原有公开门面；
+`mcp/config.rs` 负责配置、脱敏与命名，`mcp/lifecycle.rs` 负责就绪回执、健康监控
+与生命周期所有权，`mcp/tools.rs` 持有每个服务的运行期状态、目录与刷新，
+`mcp/resources.rs` 实现三个资源工具。资源工具继续复用对应工具源的就绪状态和
+调用/刷新锁；配置层不依赖连接或生命周期。拆分不改变回执字段、故障分类和
+启动状态快照的语义。
 
 ### MCP resources
 
@@ -5133,9 +5138,12 @@ crates/cli/         kloop — the binary
                     cwd-bound Project/Session/Workspace wiring
   src/web.rs        [web] config + ToolSource adapter binding core contracts
                     to kloop-web network operations
-  src/mcp.rs        [mcp.servers] config, startup connection with
-                    degrade-to-warning, {server}__{tool} namespacing,
-                    the ToolSource adapter
+  src/mcp.rs        MCP startup connection with degrade-to-warning and facade
+  src/mcp/config.rs [mcp.servers] parsing, redacted transport Debug, namespacing
+  src/mcp/lifecycle.rs readiness receipts, health monitor, process-level owner
+  src/mcp/tools.rs  per-server ToolSource, runtime state, catalog and refresh
+  src/mcp/resources.rs resource ToolSource: list, read, directory read
+  src/mcp/testutil.rs shared duplex-server test fixture
   src/mcp_auth.rs   MCP OAuth: `kloop mcp login`, the 0600 token store,
                     connect-time OAuthSession build (plan 34b)
   src/context.rs    project-context IO: instruction-file discovery

@@ -77,6 +77,8 @@ content 数组渲染给人看/转成 `ContentBlock`。
    ——私有 `use` 对子模块可见,所以一行没改。
 2. 集成测试一行没改,全绿。
 3. `supported_image_mime` 在 CLI 那份**没动**,按 plan 记一笔:跨 crate 去重等 184 之后另算。
+   Plan 184 后两份分别位于 CLI 的 `mcp/resources.rs` 与本 crate 的 `render.rs`；
+   只迁移落点，尚未去重。
 4. **可见性只提了三个符号**:`StdioTransport` 与它的 `spawn` / `over` 提到 `pub(crate)`
    ——因为调用方 `McpClient` 在父模块。`publish_transport_state` / `fail_pending` /
    `write_line` / `read_bounded_line` 确认只有 stdio 用,全部保持模块私有;反方向
