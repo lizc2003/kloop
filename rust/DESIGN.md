@@ -989,6 +989,13 @@ read-only self-verdict → contained writes → project allow → WorkspaceId-sc
 cache → ask the user
 ```
 
+`permissions.rs` 保留公开类型、门面和完整 `impl Permissions`；管线与审批、升级、
+模式切换的顺序集中在同一处。`permissions/rule.rs` 负责规则语法与 allow/deny/ask
+的匹配，`policy.rs` 持有全局约束、项目策略与工作区会话状态，`facts.rs` 采集调用的
+shell、路径和危险特征，`describe.rs` 构造审批记忆载荷与展示文案。规则匹配读取
+调用事实，项目策略复用规则匹配；事实模块不依赖 `Permissions`。所有原有公开路径
+由父模块保留，内部状态与帮助项仅向实际调用者开放。
+
 **deny 始终优先于 allow 与 bypass**。`bypass` 是用户显式选择的免审批模式：
 危险命令、敏感路径写入、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
 普通调用仍使用已配置的 OS 沙箱；只有调用主动脱沙箱或失败后升级才脱离沙箱。
@@ -5076,9 +5083,12 @@ crates/core/        kloop-core — the agent, network-free
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
   src/project.rs   machine-local ProjectId/WorkspaceId resolution
-  src/permissions.rs the layered execution gate: global deny/ask,
-                    ProjectStore durable allow, WorkspaceId session cache,
-                    scoped approvals, safety checks, and modes
+  src/permissions.rs 公开门面、完整权限管线、审批/升级与模式切换
+  src/permissions/rule.rs 规则语言、解析与 allow/deny/ask 两个方向的匹配
+  src/permissions/policy.rs 全局约束、项目策略、工作区会话状态与 epoch 发布
+  src/permissions/facts.rs shell/路径事实、敏感读取、危险特征与路径豁免
+  src/permissions/describe.rs 审批记忆载荷、拒绝说明与展示文案
+  src/permissions/testutil.rs 策略与管线测试共用的项目存储夹具
   src/diff.rs       write/edit change previews for the approval prompt
   src/compact.rs    predictive threshold math + compaction rewrite
   src/context.rs    pure prompt assembly: system + env block + git snapshot,

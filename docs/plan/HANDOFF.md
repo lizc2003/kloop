@@ -1,5 +1,22 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 186 ✅（2026-10-16）**：权限门按职责拆分，父模块保留公开类型与完整
+`impl Permissions`，生产代码 **1674 → 703 行**（2842 总行）。规则、策略状态、
+调用事实、记忆载荷与文案分别迁入 `permissions/{rule,policy,facts,describe}.rs`，
+为 163 / 199 / 457 / 224 code 行；共用存储夹具放在测试专用 `testutil.rs`。
+`impl Permissions` 逐字节不变，175 个函数签名与正文、43 个类型/常量/trait
+词法核对一致，20 个公开符号和 4 个 crate 内符号保持原路径与可见性。61 条
+原测试全部保留，8 条直接测试随模块迁移，53 条完整权限门测试留在父模块。
+规则继续读取事实、策略继续复用规则匹配，事实不依赖 `Permissions`。敏感路径
+文档检查仅更新路径。外层执行沙箱之外的完整 `make check` 全绿，含本机 parity；
+权限 61、core 1124、CLI 154、plain/TUI PTY 7/20、server 单测/协议 26/40 通过。
+独立临时 workspace/target 钉住 `1.98.1`，真实 core Windows
+`--all-targets --all-features` 类型检查通过；九处模块/迁移单测/夹具探针先红，
+恢复全部 crate 输入并逐字节核对、清理 core 产物后通过，仅有原先 `login_env`
+dead_code 告警。C 依赖按教训 201 生成空产物，不代表链接或 Windows 执行通过。
+本机七条 kloop 证据位置修订已备候选，待单独批准，语料尚未修改、不进提交。
+实现提交为 plan 186 完成记录所在提交，教训 240；架构重整 177–186 十条均完成。
+
 **Plan 185 ✅（2026-10-16）**：原生 server 按职责拆分。`lib.rs` 保留
 serve/write loop、私有状态、握手、完整分发表、交互响应与公开门面，生产代码
 **1958 → 376 行**（454 总行）；立项时的 1910 / 2194 为旧读数。
@@ -569,7 +586,7 @@ JSON 对象，谁都不报错;两个 writer 若都在对方写入前建好，都
 退出照删),fork、`/clear`、server 的 thread/start 都走它。旧二进制同一秒起 6 个 headless:1 个文件、30 行里 6 行
 解析不了;新二进制:6 个文件、各 5 行。教训 212。
 
-## 〇、当前这一批:架构重整 plan 177–186(2026-09-21 排定)
+## 〇、架构重整 plan 177–186(2026-09-21 排定，十条均已完成)
 
 来源:plan 176 的体积棘轮落地当天,用户看了现状后一句「我要的是现有文件的架构重整啊」。
 棘轮只是把债冻住,这一批是把债还掉。**十条互相独立、可任意顺序,一条一个新会话**,
@@ -619,7 +636,7 @@ plan 文件里写够了开工所需的一切(行号、code 行数、切法、坑
 | **183 ✅** main.rs 里藏着一个完整的 REPL | `cli/src/main.rs` 924 → **542** | `plain.rs` 400 | 中,已做(2026-10-16) |
 | **184 ✅** 配置、生命周期、两个 ToolSource,一个文件 | `cli/src/mcp.rs` 1950 → **250** | `mcp/{config,lifecycle,tools,resources}.rs` + 共用测试夹具 | 大,已做(2026-10-16) |
 | **185 ✅** 二十二个方法排成一张表,表在一个 impl 里 | `server/src/lib.rs` 1958 → **376** | `{dto,params,worker,thread_ui}.rs` + `methods/{threads,query,turn}.rs` | 大,已做(2026-10-16) |
-| **186** 管线才是本体,另外四样只是邻居 | `core/src/permissions.rs` 1632 | `permissions/{rule,policy,facts,describe}.rs` | 大,**建议放最后** |
+| **186 ✅** 管线才是本体,另外四样只是邻居 | `core/src/permissions.rs` 1674 → **703** | `permissions/{rule,policy,facts,describe}.rs` + 共用测试夹具 | 大,已做(2026-10-16) |
 
 顺序建议:177 ✅ → 178 ✅/179(同一个形状做两遍)→ 180 ✅/181 ✅/183 ✅ → 182 ✅/184 ✅/185 ✅ → 186。
 177 最小,做完一次就知道这批的节奏对不对;186 语义风险最高,前面九条做完手感最好。
@@ -1303,7 +1320,7 @@ Plan 56/57/58 native、scripted provider、sensitive information **将近四周�
 - 压缩双防线:predictive(采样前预判 当前+增长预留 是否爆窗,增长 = min(输出上限,20k)+15k,**窗口≤预留时跳过**)+ reactive(溢出错误 downcast OverflowError,每 turn 压缩一次重试)。压缩 = 模型写交接摘要 + 保留约 2k token 近期原文,边界绝不切开 tool_use/tool_result 对,失败不动历史。
 - 恢复语义:流式重试 10 次(指数退避 + 0–249ms 抖动,单次等待封顶 60s)、摘要请求独立保留 3 次、fallback 模型(KLOOP_FALLBACK_MODEL,每 turn 切一次)、截断续跑(stop_reason=max_tokens/length 且无 tool_use 时注入续跑提示,限 3 次;这是 stop_reason 的唯一合法用途)、中断孤儿修补、EndReason 四态。**sampling round 默认不限**(对齐 codex 的无计数 turn loop):主 agent/task/fork skill 都自然跑到完成/中断/错误;`Config.max_rounds: Option<usize>` 只由 headless `--max-rounds` 或显式 `run_agent.max_rounds` 设置,保留 MaxRounds 终态作 caller guardrail。
 - token 状态分两层：context estimate 继续用最后一次 provider usage `total()` 锚点 + 后续消息 chars/4，resume/fork/compaction 后锚点失效；durable provider ledger 则逐条保留 validated terminal sampling 与 accepted compaction 的四分类、实际 model/operation，append-only 写 rollout，resume/fork/clear 按 transcript 历史语义恢复。`/cost` 展示两层但不把四分类伪装成 billable total。
-- 权限门(`core/src/permissions.rs` + `core/src/shell.rs`)：global deny → sensitive-read hard block → plan → bypass → safety → global ask → session scheduler controls → sandbox auto-allow → readonly → contained writes → project allow → `(PermissionSession, WorkspaceId)` cache → approval。bypass 跳过全部工具审批，deny 与敏感读取硬拦截仍优先，普通调用保留已配置的 OS 沙箱。
+- 权限门(`core/src/permissions.rs` + `core/src/permissions/{rule,policy,facts,describe}.rs` + `core/src/shell.rs`)：父模块保留完整管线与公开门面，四个子模块分别负责规则、策略状态、调用事实、审批记忆载荷与文案。global deny → sensitive-read hard block → plan → bypass → safety → global ask → session scheduler controls → sandbox auto-allow → readonly → contained writes → project allow → `(PermissionSession, WorkspaceId)` cache → approval。bypass 跳过全部工具审批，deny 与敏感读取硬拦截仍优先，普通调用保留已配置的 OS 沙箱。
   deny/ask 来自 immutable `GlobalPermissionPolicy`；durable allow 来自 shared `ProjectPermissionPolicy`；mode/pre-plan/approver/cache 属于 `PermissionSession`。Bash 用 tree-sitter-bash word-only 白名单遍历；子 shell/文件重定向/替换/赋值 → Opaque，不能靠解析或 allow 规则自动放行，但沙箱、bypass 与逐字批准的会话记忆可放行；`bash -c` 递归解包，deny/危险匹配前剥 wrapper，只读分类器审查选项。
   全局 `~/.kloop/config.toml` `[permissions]` 只收 deny/ask，`KLOOP_DENY`/`KLOOP_ASK` 作进程覆盖；project allow 位于用户私有 `~/.kloop/projects/v1/<ProjectId>/permissions.json`。legacy `[permissions].allow` 与非空 `KLOOP_ALLOW` 启动即拒绝，不迁移。CLI 统一 `--permission-mode manual|bypass|plan`，默认 manual；`--mock` 才是完全无门。
   询问只展示 request 广告的 scope：Once、当前 WorkspaceId 的会话批准、当前 ProjectId 的持久批准；opaque Bash 可逐字记到当前会话但不持久化，脱沙箱标志参与 key；sandbox escalation 有独立批准与会话 blanket consent；hazard、explicit ask、PowerShell 与 plan exit 只广告 Once。ProjectStore durable-first 发布，失败只让本 call Once 成功并报告未保存。共享子 agent 沿用 mode/cache，isolated worktree 用新 WorkspaceId partition，server thread 各有独立 PermissionSession。
@@ -2677,3 +2694,12 @@ plan 184 原稿把工具源与资源源写成只通过连接集合相认；实�
 `read_scope` 继续私有。判据是逐个沿真实调用者找共同祖先，不以“同一个 struct”
 推断方法天然可见。拆实现也不拆目录：握手、普通分发表及两种带结构化错误的特殊
 分支留在同一处，执行与状态仍走原来的路径。
+
+240. **审批记忆载荷包含授权语义，不能因为和 UI 文案放在一起就只按展示层核对。**
+plan 186 的 `Remember` 同时持有持久规则、展示回显、会话键与升级匹配所用的 argv；
+这四项分别决定能否落盘、用户看到的范围、缓存命中与脱沙箱授权。拆分时只盯住
+`impl Permissions` 原文不变，还不足以守住这些邻接契约：规则匹配的两个方向、
+opaque 命令的逐字会话键与脱沙箱标志、项目发布的锁和 epoch 也要核对。调用事实
+同样不是无 I/O 的字符串解析，仍须保留原文路径与规范路径、最近存在祖先解析和
+内置工具只读判据；独立模块不等于删掉现有依赖。测试按实际调用分：直接测载荷、
+解析、事实和策略的随模块走，经过完整权限门的留在管线一侧。

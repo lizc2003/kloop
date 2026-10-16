@@ -85,7 +85,7 @@ fn the_context_estimate_keeps_its_own_documentation() {
 
 #[test]
 fn the_sensitive_path_list_keeps_its_own_documentation() {
-    let permissions = source("core", "permissions.rs");
+    let permissions = source("core", "permissions/facts.rs");
     assert_documented_by(&permissions, "fn path_is_sensitive", "privilege escalation");
     assert_not_documented_by(
         &permissions,
