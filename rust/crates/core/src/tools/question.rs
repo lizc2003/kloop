@@ -13,6 +13,23 @@ use crate::interaction::QuestionOutcome;
 use crate::interaction::QuestionRequest;
 use kloop_protocol::ToolDef;
 
+/// 仅修正模型工具入参；共享交互类型和前端协议仍严格使用 snake_case。
+pub(super) fn normalize_arguments(input: &mut Value) {
+    let Some(questions) = input.get_mut("questions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for question in questions {
+        let Some(question) = question.as_object_mut() else {
+            continue;
+        };
+        if !question.contains_key("multi_select")
+            && let Some(value) = question.remove("multiSelect")
+        {
+            question.insert("multi_select".into(), value);
+        }
+    }
+}
+
 pub(super) fn ask_user_question_def() -> ToolDef {
     ToolDef {
         name: "ask_user_question".into(),
@@ -220,6 +237,145 @@ mod tests {
                 "multi_select": false
             }]
         })
+    }
+
+    #[test]
+    fn question_flag_normalization_is_scoped_and_idempotent() {
+        let definition = ask_user_question_def();
+        let properties = &definition.schema["properties"]["questions"]["items"]["properties"];
+        assert_eq!(
+            properties["multi_select"],
+            json!({"type": "boolean", "default": false})
+        );
+        assert!(properties.get("multiSelect").is_none());
+        let alias = json!({
+            "questions": [
+                {"multiSelect": false, "options": [{"multiSelect": true}]},
+                {"multiSelect": true},
+                null
+            ],
+            "metadata": {"multiSelect": true}
+        });
+        let canonical = json!({
+            "questions": [
+                {"multi_select": false, "options": [{"multiSelect": true}]},
+                {"multi_select": true},
+                null
+            ],
+            "metadata": {"multiSelect": true}
+        });
+        let calls = vec![
+            ("direct".into(), "ask_user_question".into(), alias.clone()),
+            (
+                "wrapped".into(),
+                "call_tool".into(),
+                json!({"tool_name": "ask_user_question", "params": alias}),
+            ),
+            ("external".into(), "srv__question".into(), alias.clone()),
+            ("other".into(), "edit_file".into(), alias.clone()),
+            (
+                "malformed".into(),
+                "ask_user_question".into(),
+                json!({"questions": {"multiSelect": true}}),
+            ),
+        ];
+        let mut expected = calls.clone();
+        expected[0].2 = canonical.clone();
+        expected[1].1 = "ask_user_question".into();
+        expected[1].2 = canonical;
+        let normalized = crate::tools::normalize_tool_uses(calls);
+        assert_eq!(normalized, expected);
+        assert_eq!(crate::tools::normalize_tool_uses(normalized), expected);
+    }
+
+    #[tokio::test]
+    async fn camel_case_flags_support_single_and_multi_select_questions() {
+        let mut value = input();
+        let first = value["questions"][0].as_object_mut().unwrap();
+        let flag = first.remove("multi_select").unwrap();
+        first.insert("multiSelect".into(), flag);
+        let second = json!({
+            "question": "Which colors?",
+            "header": "Colors",
+            "options": [
+                {"label": "Red", "description": "warm"},
+                {"label": "Blue", "description": "cool"}
+            ],
+            "multiSelect": true
+        });
+        value["questions"].as_array_mut().unwrap().push(second);
+        assert!(serde_json::from_value::<QuestionRequest>(value.clone()).is_err());
+        let ctx = ctx_with(QuestionOutcome::Answered(vec![
+            QuestionAnswer {
+                question_index: 0,
+                selected: vec![1],
+                other: None,
+            },
+            QuestionAnswer {
+                question_index: 1,
+                selected: vec![0, 1],
+                other: None,
+            },
+        ]));
+        for (name, input) in [
+            ("ask_user_question", value.clone()),
+            (
+                "call_tool",
+                json!({"tool_name": "ask_user_question", "params": value}),
+            ),
+        ] {
+            let (out, is_error) = run_tool(name, input, &ctx).await;
+            assert!(!is_error, "{out}");
+            assert_eq!(
+                out,
+                "Your questions have been answered: \"Which layout?\"=\"Columns\" selected preview:\nCOL, \"Which colors?\"=\"Red, Blue\". You can now continue with these answers in mind."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn camel_case_flags_preserve_strict_input_validation() {
+        let ctx = ctx_with(QuestionOutcome::Cancelled);
+        for (canonical, alias, expected) in [
+            (
+                Some(json!(false)),
+                json!(false),
+                "unknown field `multiSelect`",
+            ),
+            (
+                Some(json!(false)),
+                json!(true),
+                "unknown field `multiSelect`",
+            ),
+            (
+                Some(json!(true)),
+                json!(false),
+                "unknown field `multiSelect`",
+            ),
+            (None, Value::Null, "expected a boolean"),
+            (None, json!("true"), "expected a boolean"),
+            (None, json!(1), "expected a boolean"),
+            (None, json!(true), "cannot use previews with multi_select"),
+        ] {
+            let mut value = input();
+            let question = value["questions"][0].as_object_mut().unwrap();
+            question.remove("multi_select");
+            if let Some(canonical) = canonical {
+                question.insert("multi_select".into(), canonical);
+            }
+            question.insert("multiSelect".into(), alias);
+            let (out, is_error) = run_tool("ask_user_question", value, &ctx).await;
+            assert!(is_error, "{out}");
+            assert!(out.contains(expected), "{out}");
+        }
+        let mut value = input();
+        let question = value["questions"][0].as_object_mut().unwrap();
+        question.remove("multi_select");
+        question.insert("multiSelect".into(), json!(false));
+        question.insert("multi_select_typo".into(), json!(false));
+        let (out, is_error) = run_tool("ask_user_question", value, &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("unknown field `multi_select_typo`"), "{out}");
     }
 
     #[tokio::test]

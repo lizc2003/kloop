@@ -123,27 +123,23 @@ the five architectural bets below; it is now ten crates, and every bet held.
    invalid call — recorded as an ordinary `tool_use` with empty input, never
    dispatched, and answered with a failed `tool_result` carrying the parser's
    complaint and the model's own text, so the turn keeps its other calls and
-   the model rewrites that one next round. A *well-formed* call naming the wrong
-   argument is the same judgment one level up. Every mainstream harness spells the
-   same file arguments differently and a model carries whichever spelling its
-   training saw most, so `normalize_tool_uses` renames the known ones onto the
-   names kloop implements — `file_path` for `path`, `old_str`/`new_str`/`file_text`
-   for `old_string`/`new_string`/`content`, and `path`/`file_path` for the
-   `notebook_path` kloop inflicts on itself — for the four file builtins only,
-   never for an external tool whose argument names are its own. It happens at the
-   same seam that unwraps a `call_tool` envelope and for the same reason:
-   concurrency batching, hooks, the permission gate, the approval preview and the
-   executor must all read one shape, and a path that arrived as `file_path` has to
-   be the path the gate matches its rules against. The rename only ever fills a
-   gap — a canonical key that is present is left alone whatever its type, so a call
-   that used the real name is never second-guessed, and synonyms carrying different
-   values pass through untouched rather than being resolved by a guess. Every
-   consumed synonym is removed, so an allow-list tool is not tripped by the
-   spelling it was just forgiven. The schema still advertises exactly one name per
-   argument, so nothing new is taught; a name that is nobody's spelling still
-   refuses, and that refusal names the canonical key **and the other keys the call
-   did carry**, since the file tools take no allow-list and would otherwise drop an
-   unknown key in silence. Responses
+   the model rewrites that one next round.
+
+   合法 JSON 中错用参数名，也只修正已知且无歧义的拼写。
+   `normalize_tool_uses` 在解包 `call_tool` 的同一入口归一化参数，让并发分批、
+   hooks、权限门、审批预览和执行器读取同一个形状；以 `file_path` 送来的路径必须
+   就是权限规则匹配的路径。四个文件内置工具继续接受既定同义词：`file_path` →
+   `path`，`old_str`/`new_str`/`file_text` → `old_string`/`new_string`/`content`，
+   以及 notebook 的 `path`/`file_path` → `notebook_path`。归一化只填缺席的标准键，
+   标准键已存在时无论类型都不改；多个同义词值不同时也不猜。被采用的别名会删除，
+   后续仍由各工具自己的解析器校验；文件工具缺参时同时报告标准名和实际收到的键。
+
+   `ask_user_question` 在同一入口只把 `questions[]` 每项的 `multiSelect` 改成
+   `multi_select`，不递归改写其他位置。两种拼写同时出现时保留原输入，交给严格
+   解析器拒绝，即使值相同也不合并；别名值不作类型转换，null、字符串、数字仍拒绝，
+   多选禁止 preview 等领域约束也照常执行。模型 schema 和共享 `Question` /
+   `QuestionRequest` 的序列化、反序列化仍只认 snake_case，前端协议不增加别名。
+   这些规则只作用于指定内置工具，外部工具的参数不改。Responses
    requests also carry `prompt_cache_key` — the session id, shared by this
    session's sampling and compaction — so the growing prefix keeps landing on a
    backend that already holds it; a sub-agent sends its own `{parent}-{agent-*}`

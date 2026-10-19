@@ -923,6 +923,9 @@ pub(crate) fn normalize_tool_uses(
         .map(|(id, name, input)| {
             let (name, mut input) = tool_search::unwrap_call_tool(name, input);
             rename_argument_synonyms(&name, &mut input);
+            if name == "ask_user_question" {
+                question::normalize_arguments(&mut input);
+            }
             (id, name, input)
         })
         .collect()
