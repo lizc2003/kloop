@@ -2799,12 +2799,26 @@ network-free, reqwest lives only in provider and web):
   比分页截断更差；90s 仍在 core 给外部工具的 300s 预算内。截断时提示写明上限、
   说明**剩余内容这个工具取不回**、不要重复抓取；要取回 20 MiB 以上的目标需要 Range
   续传（新增 schema 字段 + 每个区间重走 SSRF 门禁），暂不做。
-- **web_search** `{query, allowed_domains?, blocked_domains?}` (strict; query is
-  at least two characters; allow/block lists are mutually exclusive) —
-  pluggable `SearchBackend` trait with Tavily (default) and Brave. The backend
-  result count is an internal fixed bound, result URLs must be HTTP(S), domain
-  matching uses exact-host/subdomain boundaries, provider JSON responses are
-  capped at 5 MiB, and formatted model output is capped at 50k characters.
+- **web_search**（plan 233）输入为严格的 `{query, allowed_domains?,
+  blocked_domains?, start_date?, end_date?, exact_match?}`。去掉首尾空白后 query
+  至少两个字符，允许/排除域名列表仍互斥；域名在请求前规范化为 host，兼容 URL、
+  `*.` 前缀和尾点，非法项、非 HTTP(S) URL 与嵌入凭据明确拒绝。日期必须为真实的
+  `YYYY-MM-DD` 日历日期，起始不得晚于结束；`exact_match` 默认 false，true 时
+  query 必须至少含一个双引号内的非空短语，且引号成对，标点不保证逐字匹配。
+  `SearchBackend` 收到完整 `SearchRequest` 与内部固定五条限制。Tavily（默认）
+  保持 basic：域名传 `include_domains`（restrict）或 `exclude_domains`；日期传
+  同名字段并开启 `filter_by_published_date`，要求服务端移除日期未知来源；精确
+  匹配传 `exact_match`，始终请求 `include_published_date`，不请求生成回答或正文。
+  Brave 把域名转成 `site:` / `OR` / `NOT site:`，多个允许域名各带完整 query，
+  短语沿用原有引号；日期经 `freshness` 传区间，单边日期在发请求前说明适配器
+  限制。操作符是服务端实验能力，发出条件不等于本地证明了引擎的严格执行。
+  返回 URL 继续按 HTTP(S)、精确 host/子域边界复核；非空候选全部被本地移除时
+  写明候选被筛掉，与服务端空数组的 `No results found` 区分。结果信封或数组错型、
+  缺失数组和畸形条目均为响应错误，不以默认空数组掩盖。
+  `SearchHit.date` 保留 Tavily `published_date` / Brave `page_age`，输出标为
+  服务端估计的发布或更新时间；缺失/null/空白不编造。provider JSON 响应用独立
+  常量限 5 MiB（修复原先共用 fetch 20 MiB 常量却报 5 MB 的漂移），合成模型输出
+  仍限 50k 字符；语言参数、条数调整、多查询、缓存和自动后端切换不在本批。
   `[web]` in the global `~/.kloop/config.toml` holds both halves —
   `search_provider` selects the backend, `api_key` carries its key — and is the
   only source: no environment variable is read, because every other credential

@@ -7,16 +7,86 @@ use std::pin::Pin;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use chrono::NaiveDate;
 use reqwest::Url;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::limits;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub exact_match: bool,
+}
+
+impl SearchRequest {
+    pub(crate) fn validate(&mut self) -> Result<()> {
+        if self.query.trim().chars().count() < 2 {
+            bail!("web_search: query must contain at least 2 non-padding characters");
+        }
+        if !self.allowed_domains.is_empty() && !self.blocked_domains.is_empty() {
+            bail!(
+                "web_search: cannot specify both allowed_domains and blocked_domains in the same request"
+            );
+        }
+        for (field, value) in [
+            ("start_date", &self.start_date),
+            ("end_date", &self.end_date),
+        ] {
+            if let Some(value) = value {
+                let valid_shape = value.len() == 10
+                    && value.bytes().enumerate().all(|(i, ch)| match i {
+                        4 | 7 => ch == b'-',
+                        _ => ch.is_ascii_digit(),
+                    });
+                if !valid_shape
+                    || value.starts_with("0000")
+                    || NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err()
+                {
+                    bail!("web_search: {field} must be a valid YYYY-MM-DD date");
+                }
+            }
+        }
+        if let (Some(start), Some(end)) = (&self.start_date, &self.end_date)
+            && start > end
+        {
+            bail!("web_search: start_date must not be after end_date");
+        }
+        if self.exact_match {
+            let parts: Vec<_> = self.query.split('"').collect();
+            if parts.len().is_multiple_of(2)
+                || !parts
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .any(|part| !part.trim().is_empty())
+            {
+                bail!(
+                    "web_search: exact_match requires a non-empty phrase in paired double quotes in query"
+                );
+            }
+        }
+        self.allowed_domains = normalize_domains(&self.allowed_domains)?;
+        self.blocked_domains = normalize_domains(&self.blocked_domains)?;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    pub date: Option<String>,
 }
 
 pub trait SearchBackend: Send + Sync {
@@ -25,7 +95,7 @@ pub trait SearchBackend: Send + Sync {
     fn search<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        query: &'a str,
+        request: &'a SearchRequest,
         count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>>;
 }
@@ -38,13 +108,19 @@ pub fn format_hits(hits: &[SearchHit]) -> String {
         .iter()
         .enumerate()
         .map(|(i, hit)| {
-            format!(
+            let mut text = format!(
                 "{}. {}\n   {}\n   {}",
                 i + 1,
                 hit.title,
                 hit.url,
                 hit.snippet
-            )
+            );
+            if let Some(date) = &hit.date {
+                text.push_str(&format!(
+                    "\n   Date (published or updated; provider estimate): {date}"
+                ));
+            }
+            text
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -63,8 +139,6 @@ pub(crate) fn filter_hits(
     blocked_domains: &[String],
 ) -> Vec<SearchHit> {
     let restrict_to_allowed = !allowed_domains.is_empty();
-    let allowed_domains = normalize_domains(allowed_domains);
-    let blocked_domains = normalize_domains(blocked_domains);
     hits.into_iter()
         .filter(|hit| {
             let Ok(url) = Url::parse(&hit.url) else {
@@ -91,25 +165,32 @@ pub(crate) fn filter_hits(
         .collect()
 }
 
-fn normalize_domains(raw_domains: &[String]) -> Vec<String> {
-    raw_domains
-        .iter()
-        .filter_map(|raw_domain| {
-            let raw_domain = raw_domain.trim().trim_start_matches("*.");
-            if raw_domain.is_empty() {
-                return None;
-            }
-            let parsed = if raw_domain.contains("://") {
-                Url::parse(raw_domain).ok()
-            } else {
-                Url::parse(&format!("https://{raw_domain}")).ok()
-            }?;
-            parsed
-                .host_str()
-                .map(|domain| domain.trim_end_matches('.').to_ascii_lowercase())
-                .filter(|domain| !domain.is_empty())
-        })
-        .collect()
+fn normalize_domains(raw_domains: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for raw_domain in raw_domains {
+        let raw_domain = raw_domain.trim().trim_start_matches("*.");
+        let parsed = if raw_domain.contains("://") {
+            Url::parse(raw_domain)
+        } else {
+            Url::parse(&format!("https://{raw_domain}"))
+        }
+        .context("web_search: invalid domain filter")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            bail!("web_search: domain filters require an HTTP(S) host without credentials");
+        }
+        let host = parsed
+            .host_str()
+            .map(|domain| domain.trim_end_matches('.').to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty())
+            .context("web_search: invalid domain filter")?;
+        if !normalized.contains(&host) {
+            normalized.push(host);
+        }
+    }
+    Ok(normalized)
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -136,8 +217,9 @@ async fn send_and_parse(req: reqwest::RequestBuilder, name: &str) -> Result<Valu
         let Some(chunk) = next else {
             break;
         };
-        if body.len().saturating_add(chunk.len()) > limits::MAX_DOWNLOAD_BYTES {
-            bail!("web_search: {name} response exceeded 5MB");
+        if body.len().saturating_add(chunk.len()) > limits::MAX_SEARCH_DOWNLOAD_BYTES {
+            let limit = limits::MAX_SEARCH_DOWNLOAD_BYTES;
+            bail!("web_search: {name} response exceeded {limit} bytes");
         }
         body.extend_from_slice(&chunk);
     }
@@ -151,14 +233,40 @@ async fn send_and_parse(req: reqwest::RequestBuilder, name: &str) -> Result<Valu
 
 /// Map a backend's result array to hits. `snippet_field` is the per-backend
 /// key holding the summary ("description" for Brave, "content" for Tavily).
-fn hits_from(results: &[Value], count: usize, snippet_field: &str) -> Vec<SearchHit> {
+fn hits_from(
+    results: &Value,
+    count: usize,
+    snippet_field: &str,
+    date_field: &str,
+    name: &str,
+) -> Result<Vec<SearchHit>> {
+    let results = results.as_array().with_context(|| {
+        format!("web_search: {name} returned invalid search response (expected results array)")
+    })?;
     results
         .iter()
         .take(count)
-        .map(|r| SearchHit {
-            title: crate::html::strip_inline_tags(r["title"].as_str().unwrap_or("(untitled)")),
-            url: r["url"].as_str().unwrap_or("").to_string(),
-            snippet: crate::html::strip_inline_tags(r[snippet_field].as_str().unwrap_or("")),
+        .map(|r| {
+            let invalid = || {
+                format!(
+                    "web_search: {name} returned invalid search response (malformed result item)"
+                )
+            };
+            let url = r["url"].as_str().with_context(invalid)?;
+            let text = |field: &str| -> Result<Option<String>> {
+                match r.get(field) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(value)) => Ok(Some(crate::html::strip_inline_tags(value))
+                        .filter(|s| !s.trim().is_empty())),
+                    _ => bail!("{}", invalid()),
+                }
+            };
+            Ok(SearchHit {
+                title: text("title")?.unwrap_or_else(|| "(untitled)".into()),
+                url: url.to_string(),
+                snippet: text(snippet_field)?.unwrap_or_default(),
+                date: text(date_field)?,
+            })
         })
         .collect()
 }
@@ -192,18 +300,49 @@ impl SearchBackend for Brave {
     fn search<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        query: &'a str,
+        request: &'a SearchRequest,
         count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
         Box::pin(async move {
-            let req = client
+            let mut query = if request.allowed_domains.is_empty() {
+                request.query.clone()
+            } else {
+                request
+                    .allowed_domains
+                    .iter()
+                    .map(|domain| format!("{} site:{domain}", request.query))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            };
+            for domain in &request.blocked_domains {
+                query.push_str(&format!(" NOT site:{domain}"));
+            }
+            let mut req = client
                 .get(format!("{}/res/v1/web/search", self.base))
-                .query(&[("q", query), ("count", &count.to_string())])
+                .query(&[
+                    ("q", query.as_str()),
+                    ("count", &count.to_string()),
+                    ("operators", "true"),
+                ])
                 .header("X-Subscription-Token", &self.key)
                 .header("Accept", "application/json");
+            match (&request.start_date, &request.end_date) {
+                (Some(start), Some(end)) => {
+                    req = req.query(&[("freshness", format!("{start}to{end}"))])
+                }
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => bail!(
+                    "web_search: brave requires both start_date and end_date for a date range"
+                ),
+            }
             let json = send_and_parse(req, "brave").await?;
-            let results = json["web"]["results"].as_array().map(Vec::as_slice);
-            Ok(hits_from(results.unwrap_or_default(), count, "description"))
+            hits_from(
+                &json["web"]["results"],
+                count,
+                "description",
+                "page_age",
+                "brave",
+            )
         })
     }
 }
@@ -238,21 +377,45 @@ impl SearchBackend for Tavily {
     fn search<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        query: &'a str,
+        request: &'a SearchRequest,
         count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
         Box::pin(async move {
+            let mut payload = serde_json::json!({
+                "query": request.query,
+                "max_results": count,
+                "search_depth": "basic",
+                "include_published_date": true,
+                "exact_match": request.exact_match,
+            });
+            if !request.allowed_domains.is_empty() {
+                payload["include_domains"] = serde_json::json!(request.allowed_domains);
+                payload["include_domains_mode"] = "restrict".into();
+            }
+            if !request.blocked_domains.is_empty() {
+                payload["exclude_domains"] = serde_json::json!(request.blocked_domains);
+            }
+            if let Some(start) = &request.start_date {
+                payload["start_date"] = start.clone().into();
+            }
+            if let Some(end) = &request.end_date {
+                payload["end_date"] = end.clone().into();
+            }
+            if request.start_date.is_some() || request.end_date.is_some() {
+                payload["filter_by_published_date"] = true.into();
+            }
             let req = client
                 .post(format!("{}/search", self.base))
                 .bearer_auth(&self.key)
-                .json(&serde_json::json!({
-                    "query": query,
-                    "max_results": count,
-                    "search_depth": "basic",
-                }));
+                .json(&payload);
             let json = send_and_parse(req, "tavily").await?;
-            let results = json["results"].as_array().map(Vec::as_slice);
-            Ok(hits_from(results.unwrap_or_default(), count, "content"))
+            hits_from(
+                &json["results"],
+                count,
+                "content",
+                "published_date",
+                "tavily",
+            )
         })
     }
 }
@@ -292,7 +455,14 @@ mod tests {
 
         let client = crate::testutil::client();
         let hits = brave_at(&server)
-            .search(&client, "rust agent", 2)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "rust agent".into(),
+                    ..Default::default()
+                },
+                2,
+            )
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -327,7 +497,17 @@ mod tests {
         let client = crate::testutil::client();
         let tavily = Tavily::with_base("tvly-test".into(), server.uri());
         assert_eq!(tavily.name(), "tavily");
-        let hits = tavily.search(&client, "rust agent", 2).await.unwrap();
+        let hits = tavily
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "rust agent".into(),
+                    ..Default::default()
+                },
+                2,
+            )
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "The Rust Book");
         assert_eq!(hits[0].snippet, "Learn Rust");
@@ -344,7 +524,14 @@ mod tests {
             .await;
         let client = crate::testutil::client();
         let err = Tavily::with_base("bad".into(), server.uri())
-            .search(&client, "q", 5)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "q".into(),
+                    ..Default::default()
+                },
+                5,
+            )
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -360,7 +547,14 @@ mod tests {
             .mount(&server)
             .await;
         let hits = Tavily::with_base("k".into(), server.uri())
-            .search(&client, "nothing", 5)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "nothing".into(),
+                    ..Default::default()
+                },
+                5,
+            )
             .await
             .unwrap();
         assert_eq!(format_hits(&hits), "No results found");
@@ -384,7 +578,14 @@ mod tests {
 
         let client = crate::testutil::client();
         let err = brave_at(&server)
-            .search(&client, "quota", 5)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "quota".into(),
+                    ..Default::default()
+                },
+                5,
+            )
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -394,7 +595,14 @@ mod tests {
         );
 
         let hits = brave_at(&server)
-            .search(&client, "nothing", 5)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "nothing".into(),
+                    ..Default::default()
+                },
+                5,
+            )
             .await
             .unwrap();
         assert_eq!(format_hits(&hits), "No results found");
@@ -406,6 +614,7 @@ mod tests {
             title: url.into(),
             url: url.into(),
             snippet: String::new(),
+            date: None,
         };
         let hits = vec![
             hit("https://example.com/a"),
@@ -416,8 +625,8 @@ mod tests {
         ];
         let filtered = filter_hits(
             hits,
-            &["*.EXAMPLE.com.".into()],
-            &["https://blocked.example.com/path".into()],
+            &normalize_domains(&["*.EXAMPLE.com.".into()]).unwrap(),
+            &normalize_domains(&["https://blocked.example.com/path".into()]).unwrap(),
         );
         assert_eq!(
             filtered
@@ -435,6 +644,7 @@ mod tests {
             title: "界".repeat(60_000),
             url: "https://example.com".into(),
             snippet: "tail".into(),
+            date: None,
         }]);
         assert!(
             output.ends_with("[search results truncated at 50000 characters]"),
@@ -448,18 +658,25 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/search"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                vec![b'x'; limits::MAX_DOWNLOAD_BYTES + 1],
-                "application/json",
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![b'x'; 5 * 1024 * 1024 + 1], "application/json"),
+            )
             .mount(&server)
             .await;
         let client = crate::testutil::client();
         let err = Tavily::with_base("k".into(), server.uri())
-            .search(&client, "oversized", 5)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "oversized".into(),
+                    ..Default::default()
+                },
+                5,
+            )
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("response exceeded 5MB"));
+        assert!(format!("{err:#}").contains("response exceeded 5242880 bytes"));
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -468,7 +685,14 @@ mod tests {
             .mount(&server)
             .await;
         let err = Tavily::with_base("k".into(), server.uri())
-            .search(&client, "invalid", 5)
+            .search(
+                &client,
+                &SearchRequest {
+                    query: "invalid".into(),
+                    ..Default::default()
+                },
+                5,
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("invalid JSON"));

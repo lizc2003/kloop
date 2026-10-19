@@ -8,6 +8,9 @@
 /// prefix.
 pub(crate) const MAX_DOWNLOAD_BYTES: usize = 20 * 1024 * 1024;
 
+// 搜索响应是少量结构化条目，不随抓取整页正文的上限一起增长。
+pub(crate) const MAX_SEARCH_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
+
 /// Bound on formatted `web_search` output only. `web_fetch` deliberately has no
 /// text cap: its body is a fetched artifact, and clipping one destroys evidence
 /// that core's offload seam would otherwise keep on disk. Search output is

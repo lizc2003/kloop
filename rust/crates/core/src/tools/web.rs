@@ -33,7 +33,7 @@ pub fn tool_defs(search_backend: Option<&str>) -> Vec<ToolDef> {
         defs.push(ToolDef {
             name: WEB_SEARCH.into(),
             description: format!(
-                "Search the web (via {backend}). Returns bounded results as title, URL and snippet; fetch a result with web_fetch for the full page. Optional domain lists restrict the returned URLs."
+                "Search the web (via {backend}). Returns bounded titles, URLs, snippets and optional provider-estimated publication/update dates; use web_fetch for the full page. Domain filters are sent to the provider and returned URLs are checked again locally. Optional dates constrain publication/update time; Brave requires both date bounds. Set exact_match to require quoted phrases in query (punctuation may be ignored)."
             ),
             schema: json!({
                 "type": "object",
@@ -52,6 +52,21 @@ pub fn tool_defs(search_backend: Option<&str>) -> Vec<ToolDef> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Never include results from these domains"
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "Start date as YYYY-MM-DD. Brave requires end_date too."
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "End date as YYYY-MM-DD. Brave requires start_date too."
+                    },
+                    "exact_match": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Require non-empty phrases enclosed in paired double quotes in query"
                     }
                 },
                 "required": ["query"],
@@ -92,7 +107,7 @@ mod tests {
                 fetch,
                 ToolDef {
                     name: "web_search".into(),
-                    description: "Search the web (via tavily). Returns bounded results as title, URL and snippet; fetch a result with web_fetch for the full page. Optional domain lists restrict the returned URLs.".into(),
+                    description: "Search the web (via tavily). Returns bounded titles, URLs, snippets and optional provider-estimated publication/update dates; use web_fetch for the full page. Domain filters are sent to the provider and returned URLs are checked again locally. Optional dates constrain publication/update time; Brave requires both date bounds. Set exact_match to require quoted phrases in query (punctuation may be ignored).".into(),
                     schema: json!({
                         "type": "object",
                         "properties": {
@@ -110,6 +125,21 @@ mod tests {
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": "Never include results from these domains"
+                            },
+                            "start_date": {
+                                "type": "string",
+                                "format": "date",
+                                "description": "Start date as YYYY-MM-DD. Brave requires end_date too."
+                            },
+                            "end_date": {
+                                "type": "string",
+                                "format": "date",
+                                "description": "End date as YYYY-MM-DD. Brave requires start_date too."
+                            },
+                            "exact_match": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Require non-empty phrases enclosed in paired double quotes in query"
                             }
                         },
                         "required": ["query"],

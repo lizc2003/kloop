@@ -301,16 +301,25 @@ mod tests {
         fn search<'a>(
             &'a self,
             _client: &'a reqwest::Client,
-            query: &'a str,
+            request: &'a kloop_web::SearchRequest,
             count: usize,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<kloop_web::SearchHit>>> + Send + 'a>> {
             Box::pin(async move {
-                assert_eq!(query, "rust agent");
+                assert_eq!(
+                    request,
+                    &kloop_web::SearchRequest {
+                        query: "rust agent".into(),
+                        allowed_domains: vec!["rust-lang.org".into()],
+                        start_date: Some("2026-01-01".into()),
+                        ..Default::default()
+                    }
+                );
                 assert_eq!(count, 5);
                 Ok(vec![kloop_web::SearchHit {
                     title: "Rust".into(),
                     url: "https://www.rust-lang.org/".into(),
                     snippet: "A language".into(),
+                    date: Some("2026-10-01".into()),
                 }])
             })
         }
@@ -328,12 +337,13 @@ mod tests {
 
         let input = serde_json::json!({
             "query": "rust agent",
-            "allowed_domains": ["rust-lang.org"]
+            "allowed_domains": ["rust-lang.org"],
+            "start_date": "2026-01-01"
         });
         let output = source.call("web_search", &input).await.unwrap();
         assert_eq!(
             output.text,
-            "1. Rust\n   https://www.rust-lang.org/\n   A language"
+            "1. Rust\n   https://www.rust-lang.org/\n   A language\n   Date (published or updated; provider estimate): 2026-10-01"
         );
         assert!(output.blocks.is_none());
         assert!(output.structured.is_none());

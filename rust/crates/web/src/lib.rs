@@ -19,6 +19,7 @@ use serde_json::Value;
 pub use search::Brave;
 pub use search::SearchBackend;
 pub use search::SearchHit;
+pub use search::SearchRequest;
 pub use search::Tavily;
 
 /// One fetch's whole-request budget, body included. Paired with
@@ -33,16 +34,6 @@ const SEARCH_RESULTS_DEFAULT: usize = 5;
 #[serde(deny_unknown_fields)]
 struct FetchRequest {
     url: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SearchRequest {
-    query: String,
-    #[serde(default)]
-    allowed_domains: Vec<String>,
-    #[serde(default)]
-    blocked_domains: Vec<String>,
 }
 
 pub struct WebTools {
@@ -80,19 +71,18 @@ impl WebTools {
         let Some(search) = &self.search else {
             bail!("web_search is not enabled (no search backend configured)");
         };
-        let request: SearchRequest = parse_input(input, "web_search")?;
-        if request.query.chars().count() < 2 {
-            bail!("web_search: query must contain at least 2 characters");
-        }
-        if !request.allowed_domains.is_empty() && !request.blocked_domains.is_empty() {
-            bail!(
-                "web_search: cannot specify both allowed_domains and blocked_domains in the same request"
-            );
-        }
+        let mut request: SearchRequest = parse_input(input, "web_search")?;
+        request.validate()?;
         let hits = search
-            .search(&self.client, &request.query, SEARCH_RESULTS_DEFAULT)
+            .search(&self.client, &request, SEARCH_RESULTS_DEFAULT)
             .await?;
+        let candidates = hits.len();
         let hits = search::filter_hits(hits, &request.allowed_domains, &request.blocked_domains);
+        if candidates > 0 && hits.is_empty() {
+            return Ok(format!(
+                "No results remain: all {candidates} returned candidates were removed by local URL/domain validation. This does not establish that the requested sites have no matches."
+            ));
+        }
         Ok(search::format_hits(&hits))
     }
 }
@@ -146,11 +136,14 @@ mod tests {
         fn search<'a>(
             &'a self,
             _client: &'a reqwest::Client,
-            query: &'a str,
+            request: &'a SearchRequest,
             count: usize,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
             Box::pin(async move {
-                self.calls.lock().unwrap().push((query.to_string(), count));
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((request.query.clone(), count));
                 Ok(self.hits.clone())
             })
         }
@@ -235,21 +228,25 @@ mod tests {
                 title: "Allowed".into(),
                 url: "https://example.com/a".into(),
                 snippet: "A".into(),
+                date: None,
             },
             SearchHit {
                 title: "Blocked subdomain".into(),
                 url: "https://blocked.example.com/b".into(),
                 snippet: "B".into(),
+                date: None,
             },
             SearchHit {
                 title: "Suffix trap".into(),
                 url: "https://badexample.com/c".into(),
                 snippet: "C".into(),
+                date: None,
             },
             SearchHit {
                 title: "Invalid".into(),
                 url: "javascript:alert(1)".into(),
                 snippet: "D".into(),
+                date: None,
             },
         ];
         let (tools, calls) = static_tools(hits);
