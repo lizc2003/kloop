@@ -21,14 +21,14 @@ use kloop_core::tools::web::WEB_FETCH;
 use kloop_core::tools::web::WEB_SEARCH;
 use kloop_protocol::ToolDef;
 use kloop_web::Brave;
+use kloop_web::DeepSeek;
 use kloop_web::SearchBackend;
 use kloop_web::Tavily;
 use kloop_web::WebTools;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct WebConfig {
-    /// Which SearchBackend to construct: "tavily" (default; free tier needs
-    /// no card) or "brave".
+    /// 搜索后端：tavily（默认）、brave 或 deepseek。
     pub search_provider: String,
     /// The selected backend's key, and `[web].api_key` in the global config
     /// is the only place it can come from. No environment variable: every
@@ -96,10 +96,11 @@ pub fn build_web_source(cfg: &WebConfig, warn: &dyn Fn(&str)) -> Option<Arc<dyn 
     let search: Option<Box<dyn SearchBackend>> = match cfg.search_provider.as_str() {
         "tavily" => keyed(cfg, |key| Box::new(Tavily::new(key))),
         "brave" => keyed(cfg, |key| Box::new(Brave::new(key))),
+        "deepseek" => keyed(cfg, |key| Box::new(DeepSeek::new(key))),
         other => {
             warn(&format!(
                 "web_search disabled: unknown [web].search_provider '{other}' \
-                 (supported: tavily, brave)"
+                 (supported: tavily, brave, deepseek)"
             ));
             None
         }
@@ -200,6 +201,15 @@ mod tests {
                 api_key: Some("tvly-x".into()),
             }
         );
+
+        let root = config("[web]\nsearch_provider = \"deepseek\"\napi_key = \"test-key\"\n");
+        assert_eq!(
+            load_web_config(&root).unwrap(),
+            WebConfig {
+                search_provider: "deepseek".into(),
+                api_key: Some("test-key".into()),
+            }
+        );
     }
 
     /// The struct carries a credential, so the derived Debug had to go.
@@ -254,6 +264,10 @@ mod tests {
                 let warn = |s: &str| warnings.lock().unwrap().push(s.to_string());
                 let source = build_web_source(&cfg, &warn).expect("web source");
                 assert!(source.is_readonly("web_fetch"));
+                if let Some(search) = source.defs().iter().find(|def| def.name == "web_search") {
+                    let provider = &cfg.search_provider;
+                    assert!(search.description.contains(&format!("via {provider}")));
+                }
                 source
                     .defs()
                     .iter()
@@ -263,12 +277,21 @@ mod tests {
             (names, warnings.into_inner().unwrap())
         };
 
-        let (names, warnings) = build(WebConfig {
-            search_provider: "tavily".into(),
-            api_key: Some("tvly-k".into()),
-        });
-        assert_eq!(names, ["web_fetch", "web_search"]);
-        assert_eq!(warnings, [] as [String; 0]);
+        for provider in ["tavily", "brave", "deepseek"] {
+            let (names, warnings) = build(WebConfig {
+                search_provider: provider.into(),
+                api_key: Some("test-key".into()),
+            });
+            assert_eq!(names, ["web_fetch", "web_search"], "{provider}");
+            assert_eq!(warnings, [] as [String; 0]);
+
+            let (names, warnings) = build(WebConfig {
+                search_provider: provider.into(),
+                api_key: None,
+            });
+            assert_eq!(names, ["web_fetch"], "{provider} without a key");
+            assert_eq!(warnings, [] as [String; 0]);
+        }
 
         // No key is not a misconfiguration — nothing to say about it.
         let (names, warnings) = build(WebConfig::default());
@@ -286,7 +309,7 @@ mod tests {
             warnings,
             [
                 "web_search disabled: unknown [web].search_provider 'duckduckgo' \
-              (supported: tavily, brave)"
+              (supported: tavily, brave, deepseek)"
             ]
         );
     }

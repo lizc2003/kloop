@@ -30,10 +30,16 @@ pub fn tool_defs(search_backend: Option<&str>) -> Vec<ToolDef> {
         }),
     }];
     if let Some(backend) = search_backend {
+        let provider_limit = match backend {
+            "deepseek" => {
+                " DeepSeek limits the final query, including generated domain/date operators, to 128 Unicode characters; keep queries and domain lists short. DeepSeek date and quoted-phrase matching is best effort; verify returned dates and phrases."
+            }
+            _ => "",
+        };
         defs.push(ToolDef {
             name: WEB_SEARCH.into(),
             description: format!(
-                "Search the web (via {backend}). Returns bounded titles, URLs, snippets and optional provider-estimated publication/update dates; use web_fetch for the full page. Domain filters are sent to the provider and returned URLs are checked again locally. Optional dates constrain publication/update time; Brave requires both date bounds. Set exact_match to require quoted phrases in query (punctuation may be ignored)."
+                "Search the web (via {backend}). Returns bounded titles, URLs, snippets and optional provider-estimated publication/update dates; use web_fetch for the full page. Domain filters are sent to the provider and returned URLs are checked again locally. Optional dates constrain publication/update time; Brave requires both date bounds. Set exact_match to require quoted phrases in query (punctuation may be ignored).{provider_limit}"
             ),
             schema: json!({
                 "type": "object",
@@ -148,5 +154,9 @@ mod tests {
                 }
             ]
         );
+
+        let mut expected = tool_defs(Some("tavily"));
+        expected[1].description = "Search the web (via deepseek). Returns bounded titles, URLs, snippets and optional provider-estimated publication/update dates; use web_fetch for the full page. Domain filters are sent to the provider and returned URLs are checked again locally. Optional dates constrain publication/update time; Brave requires both date bounds. Set exact_match to require quoted phrases in query (punctuation may be ignored). DeepSeek limits the final query, including generated domain/date operators, to 128 Unicode characters; keep queries and domain lists short. DeepSeek date and quoted-phrase matching is best effort; verify returned dates and phrases.".into();
+        assert_eq!(tool_defs(Some("deepseek")), expected);
     }
 }

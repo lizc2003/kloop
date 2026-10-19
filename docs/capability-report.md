@@ -247,7 +247,8 @@ Plan 55 将 corpus 扩至 145 captures/180 static evidence；WebSearch clean/all
 10 same）。CC WebFetch strict `{url,prompt}` 和 domain-safety ordering 已固定，但全部 loopback transport
 case 都是 zero request，executor 不越权升级。CC WebSearch allow profile 则真正到达本地 fake provider，
 固定 `web_search_20250305` side query 的 success/empty/error。kloop 保留 strict `{url}` 纯抓取、逐跳
-SSRF/DNS/credential/redirect/5 MiB/50k 防线，以及按 Tavily/Brave key 条件注册的 bounded text search。
+SSRF/DNS/credential/redirect 防线（fetch 正文 20 MiB；搜索响应 5 MiB、输出 50k），
+以及按 `[web]` 配置与 key 注册的 Tavily/Brave/DeepSeek 搜索（plan 233、234）。
 remote 只证明 gate false 时 worktree/local fallback；remote=true/cloud lifecycle 继续 unknown。
 
 Plan 56 将 corpus 扩至 190 captures / 188 static evidence，并按 clean、worktree headless、

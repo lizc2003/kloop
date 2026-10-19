@@ -94,7 +94,7 @@ context_window = 272000                                 # same as sol, 872000 ma
 # needs no key, carries on.
 
 [web]
-search_provider = "tavily"                              # or "brave"
+search_provider = "tavily"                              # 也可选 "brave" 或 "deepseek"
 # api_key       = "tvly-..."                            # tavily free tier: no card
 
 

@@ -420,6 +420,81 @@ impl SearchBackend for Tavily {
     }
 }
 
+/// DeepSeek 的独立搜索 API，不调用模型，也不下载网页正文。
+/// <https://api-docs.deepseek.com/zh-cn/guides/search/>
+pub struct DeepSeek {
+    key: String,
+    base: String,
+}
+
+impl DeepSeek {
+    pub fn new(key: String) -> Self {
+        Self {
+            key,
+            base: "https://api.deepseek.com".into(),
+        }
+    }
+
+    pub fn with_base(key: String, base: String) -> Self {
+        Self { key, base }
+    }
+}
+
+impl SearchBackend for DeepSeek {
+    fn name(&self) -> &'static str {
+        "deepseek"
+    }
+
+    fn search<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        request: &'a SearchRequest,
+        count: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SearchHit>>> + Send + 'a>> {
+        Box::pin(async move {
+            if !(1..=50).contains(&count) {
+                bail!("web_search: deepseek result count must be between 1 and 50");
+            }
+            let mut terms = request.query.clone();
+            for domain in &request.blocked_domains {
+                terms.push_str(&format!(" -site:{domain}"));
+            }
+            if let Some(start) = &request.start_date {
+                terms.push_str(&format!(" after:{start}"));
+            }
+            if let Some(end) = &request.end_date {
+                terms.push_str(&format!(" before:{end}"));
+            }
+            let query = if request.allowed_domains.is_empty() {
+                terms
+            } else {
+                // 每个 OR 分支都带关键词和日期，避免约束只落到其中一个站点。
+                request
+                    .allowed_domains
+                    .iter()
+                    .map(|domain| format!("{terms} site:{domain}"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            };
+            if query.chars().count() > 128 {
+                bail!(
+                    "web_search: deepseek query must not exceed 128 Unicode characters including search operators; shorten the query or domain list"
+                );
+            }
+            let req = client
+                .post(format!("{}/v1/tools/search", self.base))
+                .bearer_auth(&self.key)
+                .json(&serde_json::json!({
+                    "query": query,
+                    "count": count,
+                    "need_content": false,
+                }));
+            let json = send_and_parse(req, "deepseek").await?;
+            hits_from(&json["results"], count, "summary", "date", "deepseek")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

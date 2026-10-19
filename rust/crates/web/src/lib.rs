@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub use search::Brave;
+pub use search::DeepSeek;
 pub use search::SearchBackend;
 pub use search::SearchHit;
 pub use search::SearchRequest;

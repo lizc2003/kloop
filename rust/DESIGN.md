@@ -2799,7 +2799,7 @@ network-free, reqwest lives only in provider and web):
   比分页截断更差；90s 仍在 core 给外部工具的 300s 预算内。截断时提示写明上限、
   说明**剩余内容这个工具取不回**、不要重复抓取；要取回 20 MiB 以上的目标需要 Range
   续传（新增 schema 字段 + 每个区间重走 SSRF 门禁），暂不做。
-- **web_search**（plan 233）输入为严格的 `{query, allowed_domains?,
+- **web_search**（plan 233、234）输入为严格的 `{query, allowed_domains?,
   blocked_domains?, start_date?, end_date?, exact_match?}`。去掉首尾空白后 query
   至少两个字符，允许/排除域名列表仍互斥；域名在请求前规范化为 host，兼容 URL、
   `*.` 前缀和尾点，非法项、非 HTTP(S) URL 与嵌入凭据明确拒绝。日期必须为真实的
@@ -2812,15 +2812,24 @@ network-free, reqwest lives only in provider and web):
   Brave 把域名转成 `site:` / `OR` / `NOT site:`，多个允许域名各带完整 query，
   短语沿用原有引号；日期经 `freshness` 传区间，单边日期在发请求前说明适配器
   限制。操作符是服务端实验能力，发出条件不等于本地证明了引擎的严格执行。
+  DeepSeek 使用独立的 `/v1/tools/search`，Bearer 鉴权，显式发送最终 `query`、
+  `count`（内部仍固定五条）与 `need_content: false`，不调用模型或下载正文。
+  允许域名转成各带完整查询的 `site:` / `OR` 分支，排除域名用 `-site:`，日期
+  用 `after:` / `before:` 并进入每个分支，短语保留查询引号。日期沿用服务端
+  before/after 语义，不在本地承诺日期或短语的严格匹配。包含生成操作符的最终
+  查询最多 128 个 Unicode 字符，超限在请求前报错，不能截断查询或丢掉过滤；
+  工具说明提示该限制及日期/短语需复核：真实样本出现 UTC 日期跨日前移、随机
+  精确短语仍返回无关候选。响应取面向模型的 `summary`，不重复拼接短摘要或正文。
   返回 URL 继续按 HTTP(S)、精确 host/子域边界复核；非空候选全部被本地移除时
   写明候选被筛掉，与服务端空数组的 `No results found` 区分。结果信封或数组错型、
   缺失数组和畸形条目均为响应错误，不以默认空数组掩盖。
-  `SearchHit.date` 保留 Tavily `published_date` / Brave `page_age`，输出标为
+  `SearchHit.date` 保留 Tavily `published_date` / Brave `page_age` / DeepSeek `date`，输出标为
   服务端估计的发布或更新时间；缺失/null/空白不编造。provider JSON 响应用独立
   常量限 5 MiB（修复原先共用 fetch 20 MiB 常量却报 5 MB 的漂移），合成模型输出
   仍限 50k 字符；语言参数、条数调整、多查询、缓存和自动后端切换不在本批。
   `[web]` in the global `~/.kloop/config.toml` holds both halves —
-  `search_provider` selects the backend, `api_key` carries its key — and is the
+  `search_provider` selects `tavily` (default), `brave`, or `deepseek`, and
+  `api_key` carries the selected backend's key — this table is the
   only source: no environment variable is read, because every other credential
   kloop uses is already written in that one 0600 file, and a key that only an
   exported variable can carry works for whoever knows the variable's name and
