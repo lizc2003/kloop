@@ -62,5 +62,4 @@
   已纳入完整复核；CLI 154、core 1127、plain/TUI PTY 7/20、server 协议 40、
   TUI 275 条测试通过。
 - 完整差异已核对，`git diff --check` 与 `git diff --cached --check` 通过。实现提交
-  为本文件所在的 `feat(plan234): add DeepSeek search provider` 提交
-  （`git log -- docs/plan/234-deepseek-search-provider.md` 可查提交号）。
+  为 `da3343b`（`feat(plan234): add DeepSeek search provider`）。
