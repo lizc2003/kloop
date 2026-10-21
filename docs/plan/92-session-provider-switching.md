@@ -1,6 +1,8 @@
 # Plan 92 — CodeWhale 借鉴：会话内 provider/model 热切换
 
-> 状态：🚧 核心实现完成；跨面/真实 rail 验收收口中（2026-08-19）
+> 状态：✅ 核心实现与当前契约的本机验收完成（2026-10-21）；三 rail 真实闭环沿用 2026-08-19 记录，本次没有重新请求真实 API。
+>
+> 下文保留初始设计基线。当前验收以末节为准：Plan 132 已替换重开会话的 route 选择，Plan 158 已删除 fallback，Plan 159 已合并 provider/model/effort 控制；不要把已删除的行为重新列为待验收。
 >
 > 依赖：Plan 39、Plan 40、Plan 77、Plan 81、Plan 85、Plan 86、Plan 89；完成后纳入 Plan 91 跨面验收；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 >
@@ -162,3 +164,52 @@ CodeWhale 已提供目标 UX：`/provider` 打开 picker，`/provider <name>` �
 核心实现与本地 deterministic/mock 链路已收口：immutable provider catalog、session route revision、frozen route/attempt、durable route receipts、origin-bound provenance、唯一 request-view seam、递归 reasoning final guard、provider-aware usage、CLI/plain/TUI/native provider control surface 与 protocol 2.0 均已更新。native public route 统一携带 bounded continuity，server switch 错误带稳定 `data.kind`，旧无 route timeline rollout 在 inspect/resume/fork 时 fail closed，child model override 在 inherited frozen provider 上显式校验。
 
 已执行 focused protocol/provider/core/server/TUI/codemode 测试、workspace fmt/check、server/TUI 集成测试与 mock smoke。2026-08-19 首轮真实复测中，Anthropic `claude-sonnet-4-6` 同一 session 连续两轮 sampling 与 local Agent mailbox 合约通过；primitive evaluator 曾因模型违背提示主动调用 `wait_for_activity` 未通过。Responses `gpt-5.5` evaluator 曾推进至 Program resume 第二阶段，随后最小 sampling 连续三次收到上游 503 `all_channels_unavailable` / circuit-open；Chat 同期收到 502 transient unavailable。再次复测时，Anthropic primitive 完整合约 64.97 秒通过，Responses primitive 完整合约 116.68 秒通过，Chat primitive 完整合约 74.95 秒通过，Chat local Agent mailbox 56.93 秒通过。新增 credential 只驻内存的 ignored native-server evaluator，在同一 session 完成 Anthropic→Chat→Responses→Anthropic 四轮真实 sampling（11.21 秒），严格验证 route revision `1→2→3→4`、durable timeline、assistant provenance、四条 usage record、response/event/read 一致性、Chat history 无 reasoning 与 public secret-negative。实际 continuity 为 `preserved→preserved→preserved`，该次四轮样本无需过滤；Chat history 无 reasoning 的真实约束与跨 rail reasoning 过滤分别由该 evaluator 和 deterministic request-view 回归覆盖。三条 rail 的真实独立合约与同 session 热切换闭环均已完成；Linux/Windows/Desktop/物理终端及完整并发/child/compaction/fallback 矩阵仍未执行或未逐项 witness，继续如实标记。三 rail 验收还暴露并修复 rollout validator 将所有带 provenance 的 Chat 文本误判为 reasoning-shape 错误的问题，并增加无 reasoning Chat provenance read 回归。凭据、endpoint、raw provider response 与完整 transcript 均未打印、落盘到测试配置或提交。
+
+## ✅ 当前契约验收收口（2026-10-21）
+
+首批实现与三 rail 真实验收提交 `685971b`；本次验收提交号以本节所在提交为准。
+本次只新增/扩展测试、校正设计及验收记录，没有恢复 fallback 或增加生产开关。
+
+### 先剔除过期要求
+
+- Plan 132：resume/fork 使用当前配置默认 route，并在需要时持久化 `reopened`；进程内
+  rewind 沿用当前会话 route。旧的“恢复最后一次 `/provider` 选择”不再是验收目标。
+- Plan 158：`fallback_model`、fallback attempt 和自动换模型已删除。历史 fallback
+  witness 不再代表当前测试；不能为关闭旧清单重新实现它。
+- Plan 159：provider/model/effort 作为一次用户决定提交一个 revision，保持现有
+  reasoning continuity；model 知识与预算按目标路由重算。
+- native 协议按后续决定保持当前 `1.0`，没有 v1/v2 双栈。
+- Linux/Windows/Desktop/物理终端 E2E 在本计划“非目标”中；继续记录未执行，
+  不能冒充本机通过，也不作为本计划未实现项挂账。
+
+### 当前本机矩阵及证据
+
+表内为契约维度的证据组合；42 组矩阵明确验证的是 core request view，不能把它写成
+42 次真实 API 请求或 42 组 wire 序列化验证。adapter 的 bytes/HTTP 契约由各自测试守住。
+
+| 契约维度 | 当前证据 | 实际覆盖边界 |
+|---|---|---|
+| catalog、模型集合、目标不可用 | `provider_route::tests::catalog_deduplicates_models_and_validates_defaults`；`unavailable_switch_targets_never_commit_or_change_session_state`；CLI `provider_config` 回归 | 有序去重、未知/退役字段、模型成员关系；缺 key/工厂失败均不进入 commit、不改 session state |
+| 并发 switch CAS、冻结快照 | `concurrent_switches_commit_one_revision_and_leave_frozen_routes_unchanged` | barrier 同时释放两个 switch；恰好一个 revision 提交，另一个 stale；旧 frozen route 不变 |
+| active turn/manual compact、线程隔离、NoOp/stale | server `provider_switch_rejects_busy_operations_and_keeps_threads_isolated` | 用显式 Gate 挂住两类 operation；同 thread 拒绝，另一 thread 可切；旧 operation 请求仍走 A，下一 turn 走 B；NoOp/stale 的 rollout 字节不变 |
+| strict 持久化 | history `route_append_failure_keeps_memory_state_and_remembered_model`；`failed_commit_and_noop_are_zero_mutation` | route append 失败不发布 memory state、remembered model 或新 receipt |
+| 前景/背景 child | `tools::subagent::tests::background_child_keeps_old_provider_while_new_children_inherit_the_switch`；既有 `run_agent_model_override_is_allowlisted_and_does_not_mutate_parent_route` | A 的后台 child 在父切 B 后继续两轮 A；新前景 child 使用 B；旧 child 唯一结果仍送到同一父 inbox；继承/override 不回写父 route |
+| 三 rail、不同 profile/model、A→B→A | history `rail_switch_matrix_preserves_tool_pairs_and_restores_compatible_reasoning` | 每 rail 两个 profile，36 组 profile 组合加 6 组同 profile 换 model；Thinking/签名/Anthropic redacted 与 tool pair 保真，Chat 不重放 reasoning，切回恢复兼容 view |
+| 坏 provenance 不可被 switch 洗白 | history `switch_cannot_authorize_malformed_reasoning_provenance`；rollout `validate` 负向回归 | 缺失、零/future revision、provider/model/endpoint 不符、区间前/迟到 origin；拒绝后 history、timeline、route、remembered model 不变，零采样 |
+| compaction 前后切换、NoOp、usage/replay | `compact::tests::compaction_across_a_model_switch_preserves_tail_routes_and_usage` | 两次真实 `compact_once` 分别使用 revision 1/2；旧 tail 保真、目标请求滤除不兼容 reasoning、summary 无 assistant provenance、usage 整对象与重放一致、NoOp 零请求 |
+| resume/fork/rewind 与公共投影 | history `a_reopened_session_starts_on_the_route_it_is_opened_with`；server `reopening_a_thread_starts_on_the_configured_default`、`early_prefix_fork_restores_route_and_runtime_at_the_cut`；rewind/rollout/protocol 回归 | 当前默认 route、durable timeline、fork cut 与 public secret-negative 各由 owner 测试守住；不回到已被 132 废止的恢复规则 |
+| CLI/plain/TUI/native/headless | PTY `provider_switch_reaches_the_next_request_in_plain_and_tui`；server `provider_switch_commits_revision_before_next_turn_and_emits_event`；TUI frozen-route 回归；headless NDJSON contract | plain 与 TUI 都经真实二进制/PTY、两个本地 HTTP fixture 完成 A→B→A，切换本身零请求、下一请求实际模型正确且保留旧用户输入；native event/read/snapshot 同 route；headless 保持既有投影回归 |
+
+本机验收按以上当前契约收口，不把所有终态、scheduler/autowake、Program/Workflow、
+压缩触发器和控制面的笛卡尔积声称为逐项实测。它们沿用共同的 operation single-flight、
+冻结 Config/child admission 和各 owner 的回归；本次新增的跨生命周期证据如上。
+
+### 验证与环境
+
+- 新增的 native busy/隔离与 plain/TUI A→B→A 定向验收通过。
+- core switch 与 todo 请求前缀回归均纳入外层执行沙箱之外的最终完整 `make check`，
+  全绿且包含本机 parity；core 1133、server 协议 41、plain/TUI PTY 8/21、TUI 280 条通过。
+- 真实三 rail 闭环只引用 2026-08-19 已执行记录，本次未重跑；该批真实样本没有遇到
+  需要过滤的 opaque reasoning，过滤仍由确定性 request-view/adapter 回归证明。
+- Linux/Windows/Desktop/实体终端：未执行。本机 PTY 是 macOS 上的二进制与终端协议测试，
+  不替代其他平台编译或实体终端手验。

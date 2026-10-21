@@ -1691,9 +1691,15 @@ be used unescaped as a filename, an HTTP header value, and a log field.
 `input` is a string or an array of content parts
 (`{type:"text",text}` / `{type:"image",source:{…}}`).
 
-**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcp_server_status/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
+**Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcp_server_status/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 
-Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, fallback, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable route change — an explicit switch, or the `reopened` revision a session writes when it opens on a different route than it was written on — may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. `thread/resume` and `thread/fork` take no provider/model of their own and carry none into the config factory: a reopened thread is built on the configured default and adopts it, advancing the recorded timeline instead of rebuilding it as a fresh initial route (which would refuse every session that had switched providers). Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
+Every thread is its own tokio task owning a History and a session provider state. Turns, manual compaction, and child admission freeze a `FrozenProviderRoute`/`FrozenProviderAttempt`; later switches cannot change an in-flight request or a running child. Canonical history is never rewritten by a switch. Only a durable route change — an explicit switch, or the `reopened` revision a session writes when it opens on a different route than it was written on — may authorize a lossy reasoning request view; exact-compatible A→B→A replay remains byte-preserving. `thread/resume` and `thread/fork` take no provider/model of their own and carry none into the config factory: a reopened thread is built on the configured default and adopts it, advancing the recorded timeline instead of rebuilding it as a fresh initial route (which would refuse every session that had switched providers). Public snapshots/events never expose endpoints, credentials, route history, signatures, or encrypted/redacted reasoning.
+
+Plan 92 的 2026-10-21 本机验收覆盖并发 switch CAS、turn/manual compact 的 busy 门、
+独立 thread、旧背景 child 与新前景 child、压缩后的 tail/usage/replay，以及三 rail 的
+42 组历史 request-view 组合；plain/TUI 另经真实二进制和本地 HTTP/PTY 完成 A→B→A。
+42 组是 core 投影测试，真实三 rail 网络闭环仍以 2026-08-19 记录为准。fallback 已由
+Plan 158 删除，不能继续列为 catalog 字段或运行中的 attempt。
 **Events** stream per active thread. Every public notification carries
 `thread_id`, one opaque `event_generation`, and a decimal-string `seq`; `seq`
 starts at `"1"`, increases strictly across turns in that generation, and never
@@ -3250,16 +3256,14 @@ as a user message wrapping a `<system-reminder>` block, and that block is a
 direct projection of the snapshot — one renderer, so the panel, the tool result
 and the reminder cannot disagree about what the list says.
 
-**Where it lands is the whole design.** It is appended at the *end* of history,
-after the cache prefix, where it costs one small increment. It must never join
-the synthetic first user message (project instructions, skills catalog,
-deferred-tools notice), which is session-stable precisely because it sits at the
-*head* of the prefix: a table that changes per round put there would break the
-prefix for the rest of the session — plan 120's usage sampling measured a 97%
-median hit rate for rounds adding 0–2k and 14% above 20k, with the miss
-spilling into the rounds after it. The round boundary is also what makes the
-append safe: it is never mid-request, so a sampling in flight never sees a
-partial write and no `tool_result` block is interleaved.
+**提醒的位置决定前缀是否稳定。** 提醒追加在历史末尾，不进入会话稳定的首条
+合成 user 消息（项目指示、skills、延迟工具目录）；改写后者会使其后的历史前缀失配，
+它之前的 system/tools 仍可能命中。不能把大增量造成的命中率分母变化写成缓存失效，
+plan 120 第六、七节已经纠正早期解释。round 边界保证请求期间不做部分写入，
+不插进同一轮的 `tool_result` 块中。Mock 端到端回归逐轮检查旧 messages 的序列化
+字节仍是下次请求的前缀，并检查 system/tools/cache key 不变；它证明请求形状，
+不保证真实网关的缓存行为。Plan 190 的追加记录另列多模型真实使用观察与仍待执行的
+同任务受控对照。
 
 Due means the list has stood still for 8 boundaries **and** this revision has
 not been announced yet — one rule, no second clock. A write resets the count,

@@ -1,6 +1,6 @@
 # Plan 91 — CodeWhale 借鉴：agent boundary acceptance/conformance
 
-> 状态：✅ 已完成（2026-08-18；Plan 87–90 deterministic acceptance 与 Plan 92 provider route/switch 跨面验收已实施；提交 `da6f7f3`）
+> 状态：✅ 已完成（2026-10-21；Plan 87–90 先行验收提交 `6908dce`，Plan 92 当前契约的本机跨面验收见末节；本次提交号以追加记录所在提交为准）
 >
 > 依赖：Plan 87、Plan 88、Plan 89、Plan 90、Plan 92；复用 Plan 54、Plan 63、Plan 68、Plan 77、Plan 81、Plan 85、Plan 86；参考快照 `refs/codewhale` 当前观察 HEAD `5e3ac84c5cb925b4c90c34dfe582b75f04605cb1`，固定历史审计基线 `b494236312ef3ac36489c83706a0b11ab73935a1`
 
@@ -55,16 +55,16 @@ Plan 91 必须在领域契约稳定后才能收口；如果提前合并，验收
 
 ## Plan 87–90 deterministic acceptance（2026-08-17）
 
-- **Plan 92 provider-route cells**: Plan 92 的 deterministic/core/server/TUI witness 已部分落地并持续收口；尚未逐项证明的并发、child/background、compaction/fallback、plain/headless/native continuity 组合继续标为 `pending(plan92)`，不能由 Plan 89 fallback/reasoning continuity 代替。真实 provider、真实第三方 MCP/OAuth 和平台/UI 项使用 `not-executed`，不与 pending 混淆。
+- **Plan 92 provider-route cells（2026-10-21 更新）**：按当前契约的本机证据已收口，逐项对应见 Plan 92 末节。新增实际并发 CAS、turn/compact busy 与线程隔离、前景/背景 child、compaction/replay、42 组 request-view 及 plain/TUI HTTP+PTY witness；不把旧 Plan 89 的独立 reasoning 测试当成这些组合已经测过。fallback 已被 Plan 158 删除；跨平台/UI 和本次未重跑的真实 API 继续单列。
 
 | canonical owner / consumer boundary | happy / typed state | stale、deny、failure | duplicate、late、terminal | resume、fork、compaction、child、worktree | bounded public projection | evidence status |
 |---|---|---|---|---|---|---|
 | Deferred capability — owner `core::tools::tool_search`；consumer `ToolSource` dispatch | `search_returns_schema_and_generation_from_one_source_snapshot`；`same_response_search_then_readonly_call_observes_request_order` | `readiness_revision_invalidates_discovery_without_calling_source`；`wire_call_rejects_readiness_refresh_after_dispatch_validation`；`same_name_winner_change_cannot_reuse_or_hop_an_unlock`；`receipt_field_mutations_fail_before_permission_and_source`；`tools::tests::unavailable_source_route_fails_before_call_and_is_not_unknown` | stale/deny 均断言 permission/source call 为零；失败 wire call 不 mint 新 receipt | `same_session_compaction_preserves_deferred_unlock`；`worktree_transitions_require_rediscovery_even_after_returning_to_base`；`subagent_has_fresh_receipts_and_cannot_use_a_shared_parent_receipt`；`conversation_reset_revokes_live_receipts` | receipt 不进入 history/rollout；`notice_lists_every_deferred_name_and_stays_static_across_unlocks` 固定 provider tool array | `witnessed-local` |
 | Execution provenance — owner `core::execution_provenance`；consumers background registries | `canonical_execution_ids_are_typed_and_strict`；`parent_reference_is_flat`；`provenance_history_appends_valid_attempts_and_preserves_bad_input` | `non_agents_cannot_claim_mailbox_identity`；`persisted_receipt_revalidates_kind_combinations` | `typed_registration_rejects_a_stale_receipt_handle` 同时断言 canonical receipt、Agent kind、`BackgroundExecutions/ParentInboxBody`；`stop_wins_the_terminal_race_and_suppresses_delivery`；`completion_wins_before_stop_and_finishes_only_once` | Program/Workflow `provenance.json`、journal v3、sub-agent worktree tests 保留 typed parent/workspace evidence；坏 evidence 只 safe miss | `receipt_is_bounded_and_omits_free_form_secrets`；receipt 不进入 Event/Inbox/provider/history/Task/usage | `witnessed-local` |
-| Provider terminal/reasoning/usage — owners provider adapter → agent/History/Rollout | 三 rail typed stop/outcome fixtures；`every_valid_terminal_outcome_keeps_reported_usage`；`validated_terminal_usage_is_recorded_before_assistant_message` | `semantic_error_outcomes_record_content_without_retry_or_fallback`；`partial_stream_error_completes_open_item_without_retry`；`fallback_fails_closed_on_incompatible_reasoning_history`；`failures_and_missing_usage_do_not_create_records` | accepted terminal usage only once；`server::partial_stream_is_recoverable_with_error_terminal` 锁定单 terminal | `reasoning_provenance_and_typed_terminal_survive_resume_and_fork`；`compaction_keeps_reasoning_provenance_on_the_verbatim_tail`；usage fork/compaction tests | protocol `public_projection_strips_provider_and_opaque_reasoning`；server `snapshots_project_reasoning_without_replay_secrets` / `thread_read_strips_reasoning_replay_secrets` | `witnessed-local` |
+| Provider terminal/reasoning/usage — owners provider adapter → agent/History/Rollout | 三 rail typed stop/outcome fixtures；`every_valid_terminal_outcome_keeps_reported_usage`；`validated_terminal_usage_is_recorded_before_assistant_message` | `semantic_error_outcomes_record_content_without_retry`；partial failure 与无 usage 回归；旧 fallback 测试已随 Plan 158 删除 | accepted terminal usage only once；server partial-stream 回归锁定单 terminal | `reasoning_provenance_and_typed_terminal_survive_resume_and_fork`；`compaction_keeps_reasoning_provenance_on_the_verbatim_tail`；usage fork/compaction tests | protocol public-projection 回归；server `thread_read_strips_reasoning_replay_secrets` | `witnessed-local` |
 | MCP readiness — owner CLI `McpToolSource`；consumers MCP transport/core `ToolSource` | `readiness_receipt_is_typed_monotonic_and_secret_free`；stdio/HTTP handshake、tool/resource fixtures | `static_bearer_availability_tracks_missing_and_rejected_credentials`；`configured_failed_resource_server_is_unavailable_not_missing`；`refresh_failure_retains_catalog_but_blocks_until_recovery`；`session_reinitialize_updates_capabilities_and_requires_revalidation` | `closed_receipt_cannot_be_overwritten_by_late_refresh_or_request`；pending drain/drop、health-close tests | `program_manifest_rejects_readiness_revision_change` 阻断 sampling ABA；refresh 恢复 generation+1 并要求 rediscovery；lifecycle owner explicit shutdown | native `mcpServerStatus/list` 继续 immutable protocol 1.0 startup snapshot；readiness receipt、endpoint/credential 不进入 public wire | `witnessed-local` |
 | Public projection — owners protocol/server wire；consumers headless/TUI | `outgoing_shapes_carry_the_jsonrpc_field`；`mock_headless_json_is_ndjson_only`；TUI `history_replays_into_cells_with_tool_status_pairing` | strict cursor/generation/sequence 与 malformed input tests | background/message lifecycle 以 id upsert；partial terminal 只投影一次 | `event_sync_replays_then_resume_changes_generation_and_snapshots_history`；`thread_read_list_resume_and_fork_preserve_runtime` | snapshot/read/headless 只消费 `Message::into_public_projection` / `wire::project_event`，无 receipt、secret、opaque reasoning 或第二真值 | `witnessed-local` |
-| Provider route transition — Plan 92 owner | catalog/frozen route、typed timeline、request view、provider-aware usage 已实现 | switch CAS、persist failure、bad provenance、fallback fail closed 已有 focused witness；busy/typed error 与跨面组合仍在补齐 | route-aware late terminal/usage、switch 前后 child/resume/fork/compaction 部分接通，尚无完整逐项 witness | provider-aware public route revision、native route event/snapshot 已接通；continuity surface 已统一，跨面 snapshot/read/fork 仍需更多证据 | `partial-witnessed-local` / `pending(plan92)` |
+| Provider route transition — Plan 92 owner | catalog/frozen route、typed timeline、42 组 request view、provider-aware usage | 并发 CAS、strict persist failure、8 类坏 provenance、target unavailable、turn/compact busy、NoOp/stale 均有直接 witness | running background child 保持旧 route，新前景 child 用新 route；compaction usage/tail/replay、重开默认 route、fork cut 各有对应 witness | native changed/read/snapshot、TUI selected/frozen 与 plain/TUI 实际 A→B→A 请求保持同一契约；详见 Plan 92 当前矩阵 | `witnessed-local`；三 rail `witnessed-real(2026-08-19)`，其他平台/UI `not-executed` |
 
 ### 本轮新增的最小 gap tests
 
@@ -83,3 +83,14 @@ Plan 91 必须在领域契约稳定后才能收口；如果提前合并，验收
 - 代表性数量：CLI 118 + headless contract 3、MCP 31 + client 14、protocol 15、provider 33 + Anthropic 18 + Chat 14 + Responses 17、server 25 + integration 33、TUI 167。
 - `cargo run --locked -p kloop -- --mock` 与 `--mock --plain` 均完成 7 rounds；`--mock --headless` 输出最终答案；`--mock --headless --json` 输出同一 `threadId` 的 NDJSON 并以唯一 `turn/completed` 收口。
 - `git diff --check` 通过；未新增依赖、production runtime、public schema、Desktop 改动或 push。
+
+## 2026-10-21 追加验收
+
+原文件抬头已写完成，正文和 capability report 却仍使用 `pending(plan92)`；引用的旧
+提交号在当前历史中也无法解析。本次按当前可解析的先行验收提交 `6908dce` 和 Plan 92
+新增 witness 对齐状态，不把旧记录的测试数量、协议版本和已删除的 fallback 当成今天的事实。
+
+完整本机门禁结果见本次 HANDOFF 记录。真实 API 只沿用 2026-08-19 的已执行闭环，
+没有重新执行；Program/Workflow、scheduler/autowake 等沿用共同冻结/调度 seam 与 owner
+回归，不声称本次逐项跑过所有控制面和生命周期的组合。Linux/Windows/Desktop/实体终端
+未执行的边界保持不变。

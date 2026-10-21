@@ -2058,6 +2058,123 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn background_child_keeps_old_provider_while_new_children_inherit_the_switch() {
+        use crate::provider_route::{
+            EffortRequest, ProviderCatalog, ProviderCatalogEntry, SessionProviderState,
+        };
+        use kloop_protocol::{ProviderApiFamily, ProviderAvailabilityCode};
+        use kloop_provider::MockTurn;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (old_provider, old_seen) = Provider::mock_recording(vec![
+            MockTurn::Gate {
+                started: started_tx,
+                release: release_rx,
+                blocks: vec![AssistantBlock::ToolUse {
+                    id: "old-work".into(),
+                    name: "bash".into(),
+                    input: json!({"command": "true"}),
+                }],
+            },
+            MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "old child result".into(),
+            }]),
+        ]);
+        let (new_provider, new_seen) =
+            Provider::mock_recording(vec![MockTurn::Blocks(vec![AssistantBlock::Text {
+                text: "new child result".into(),
+            }])]);
+        let entries = [("old", old_provider), ("new", new_provider)]
+            .into_iter()
+            .map(|(id, provider)| {
+                let fingerprint = provider.endpoint_fingerprint();
+                let provider = std::sync::Mutex::new(Some(provider));
+                ProviderCatalogEntry {
+                    id: id.into(),
+                    api_family: ProviderApiFamily::Mock,
+                    endpoint_fingerprint: fingerprint,
+                    default_model: "shared".into(),
+                    models: vec!["shared".into()],
+                    context_window: None,
+                    max_output_tokens: None,
+                    availability: ProviderAvailabilityCode::Ready,
+                    default_effort: None,
+                    factory: Arc::new(move || {
+                        provider
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .ok_or(ProviderAvailabilityCode::InvalidConfiguration)
+                    }),
+                }
+            })
+            .collect();
+        let catalog = Arc::new(ProviderCatalog::new(entries).unwrap());
+        let mut cfg = test_ctx(0, "child-provider-switch").cfg.test_clone();
+        cfg.provider_route = catalog.initial_route("old", None).unwrap();
+        cfg.provider_catalog = Arc::clone(&catalog);
+        let state = SessionProviderState::from_route(catalog, cfg.provider_route.clone());
+        let cfg = Arc::new(cfg);
+        let ctx = test_ctx_with_cfg(0, Arc::clone(&cfg));
+        let mut history = History::new(cfg.offload_dir.clone());
+        history
+            .ensure_initial_provider_route(&cfg.provider_route)
+            .unwrap();
+        let (output, is_error) = run_tool(
+            "run_agent",
+            json!({"prompt": "old work", "background": true}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        history
+            .switch_provider(&state, 1, "new", None, EffortRequest::Inherit)
+            .unwrap();
+        let switched = Arc::new(cfg.clone_with_provider_route(state.freeze()));
+        let next_ctx = test_ctx_with_cfg(0, Arc::clone(&switched));
+        let (output, is_error) =
+            run_tool("run_agent", json!({"prompt": "new work"}), &next_ctx).await;
+        assert!(!is_error, "{output}");
+        assert_eq!(output, "new child result");
+        assert_eq!(old_seen.lock().unwrap().len(), 1);
+        assert_eq!(new_seen.lock().unwrap().len(), 1);
+        release_tx.send(()).unwrap();
+        let (output, is_error) = run_tool(
+            "wait_for_activity",
+            json!({"timeout_ms": 10_000}),
+            &next_ctx,
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(switched.background_executions.running_count(), 0);
+        let delivered = switched.inbox.drain();
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            serde_json::to_string(&delivered[0].clone().into_message())
+                .unwrap()
+                .contains("old child result")
+        );
+        let old_seen = old_seen.lock().unwrap();
+        assert_eq!(old_seen.len(), 2);
+        let provenance = old_seen[1]
+            .messages
+            .iter()
+            .find_map(|message| message.provider_provenance.as_ref())
+            .unwrap();
+        assert_eq!(provenance.provider_id, "old");
+        assert_eq!(provenance.route_revision, 1);
+        assert_eq!(cfg.provider_route.provider_id(), "old");
+        assert_eq!(switched.provider_route.provider_id(), "new");
+        assert_eq!(state.active_route().revision, 2);
+        assert_eq!(history.provider_routes().len(), 2);
+    }
+
+    #[tokio::test]
     async fn unknown_agent_type_errors_with_available_list() {
         let types = vec![AgentType {
             name: "researcher".into(),

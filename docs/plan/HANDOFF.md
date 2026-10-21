@@ -1,5 +1,27 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 92 本机验收收口、Plan 190 追加观察（2026-10-21）**：92 按当前契约标 ✅，
+补上并发 switch CAS、不可用 target 零提交、turn/manual compact busy 与 thread 隔离、
+旧背景 child/新前景 child、压缩前后 model 切换的 tail/usage/replay、三 rail 两 profile
+共 42 组 request view，以及 plain/TUI 真实二进制 + 两个本地 HTTP fixture 的 A→B→A。
+8 类坏 provenance 不能被显式 switch 洗白。没有改变生产行为；fallback 已被 158 删除，
+重开默认 route 按 132，协议维持当前 1.0。Plan 91 抬头、正文与 capability report 的
+旧 pending 状态同步修正；不宣称把所有 scheduler/autowake、Program/Workflow、终态和
+控制面的组合逐项实测。真实三 rail 网络闭环沿用 2026-08-19 记录，本次未发新请求；
+Linux/Windows/Desktop/实体终端未执行。
+
+190 扩展实际请求捕获，逐轮检查旧 messages 字节前缀及 system/tools/cache key 不变；
+只读扫描本机 435 个 rollout，得到三组模型的 250 次提醒。主样本停滞提醒 104 次，
+其中 99 次之后有不同内容的成功写表，等待中位 2 轮；缓存按同会话/同 route、近似
+前缀和增量配对，94 对的提醒/对照命中率中位数为 99.53%/99.48%。这是观察性回看，
+没有新旧构建随机对照，不能据此断言提醒改善行为或对所有模型没有缓存回退。
+其余小样本与未配对项见 plan 190；同任务受控 A/B 仍需用户提供真实 API 代理与 key。
+实现保持 ✅，效果对照欠账保留。同步删去 DESIGN 中从 plan 120 早期解释带来的错误
+缓存归因；分析只输出统计，原始会话、provider 名和凭据未进入仓库。
+最终在外层执行沙箱之外的完整 `make check` 全绿，含本机 parity；core 1133、CLI 154、
+server 协议 41、plain/TUI PTY 8/21、TUI 280 条通过。17 个具名验收 witness 均能在
+当前源码找到，完整差异与暂存差异检查通过。提交号以本条所在提交为准，教训 246。
+
 **问答自由输入编辑（2026-10-21）**：修复 `Your answer` 只能末尾追加/退格、长文本只显示
 开头的问题。自由回答使用独立 `Composer`，沿用字素安全的光标、词移动和删除键；粘贴
 插在光标处，长粘贴保留可编辑正文，换行键与主输入框一致。前缀宽度同时用于渲染和
@@ -800,7 +822,8 @@ work 可捎带」的那一刻把**开列**也禁了。现在分成两句:**计�
 `f90ace5` 那个旧构建把建表**捆在第一轮工作里**、之后再没更新,turn 结束时表是过期的。
 方向对上了第六节点名的两个数。**但 n=1/组、同一个模型,不算第六节要求的那次对照**;
 另外**空表提醒对一个不想记清单的模型没用**(会话 1 读到后照样没建)。
-**还欠**:多跑几组 + 换一个模型档位;缓存侧按 plan 120 的口径取 usage 对照。
+**后续状态（2026-10-21）**：已追加三组模型的真实使用观察与配对缓存用量；同任务、
+同代码基线的新旧受控对照仍欠，见 plan 190 末节。上面是 2026-09-21 首批记录。
 
 ## 〇之二、上一批:plan 149–156(2026-09-15 排定)+ 158(2026-09-17)+ 176
 
@@ -984,7 +1007,7 @@ Plan 56/57/58 native、scripted provider、sensitive information **将近四周�
 >
 > **Plan 90 教训**：catalog continuity 与 live readiness 是两条独立版本轴；last-known-good schema 可以为恢复保留，却不能继续充当 Ready。等待 notification 的 detached task 若又经 source→client 强持 notification sender，会把 Drop/Closed 变成不可达的自保活环；长期 transport 必须由外层 supervisor 持 cancel/task/client ownership，并用独立 health signal把 EOF 与 pending failure送出。configured-but-failed 的准确错误也不要求全局 registry：让原 source 保留 bounded prefix claim，即可在 exact route 上区分 unavailable 与 missing；generic keyword discovery仍不能凭空发明未知 schema。HTTP wire session重建只证明 transport恢复，不证明 capability/catalog连续，必须另做 catalog revalidation。
 >
-> **Plan 91 先行验收（2026-08-17；完整收口等待 Plan 92）**：Plan 87–90 的 owner-by-owner deterministic matrix 已实施；补齐 same-session compaction 保留 exact unlock receipt，以及普通 direct call 在 final wire gate 的 readiness revision race，并把 background winner callback 锁定到 canonical typed receipt。其余 cell 复用既有 owner-local typed/bytes/lineage/terminal/secret-negative witness；完整矩阵、测试名、数量与实际命令见 `91-agent-boundary-acceptance.md`。Plan 92 的 provider route/switch 全部保持 `pending(plan92)`，Plan 91 不标 ✅；真实 provider、第三方 MCP/OAuth、Linux/Windows/Desktop/物理 terminal 本轮未执行。
+> **Plan 91 先行验收（2026-08-17；Plan 92 本机收口已于 2026-10-21 补齐）**：Plan 87–90 的 owner-by-owner deterministic matrix 已实施；补齐 same-session compaction 保留 exact unlock receipt，以及普通 direct call 在 final wire gate 的 readiness revision race，并把 background winner callback 锁定到 canonical typed receipt。其余 cell 复用既有 owner-local typed/bytes/lineage/terminal/secret-negative witness；完整矩阵、测试名、数量与实际命令见 `91-agent-boundary-acceptance.md`。当时的 `pending(plan92)` 已由本文件顶部的当前验收记录替代，Plan 91/92 均标 ✅；2026-08-17 这批未执行真实 provider、第三方 MCP/OAuth、Linux/Windows/Desktop/物理 terminal。
 >
 > **Plan 91 先行验收教训**：acceptance 应先按事实 owner 建矩阵，只给跨生命周期真实缺口新增 witness。session-memory receipt 在 compaction 内应整对象保留，resume/fork则由 fresh Config边界保证不持久化；不能为了测试把 receipt 塞进 rollout。测试 filter必须先以 `--list` 证明命中，再用完整 test path `--exact`，否则 `0 passed` 的成功退出码是假绿。
 >
@@ -1664,7 +1687,7 @@ Plan 56/57/58 native、scripted provider、sensitive information **将近四周�
 - **plan 50(✅ 完成,2026-07-30)** 前台 Bash exact parity：新增 schema/output/timeout-tree/cancel-tree determinism pairs 与 input-dependent concurrency singleton，精确 bundle anchors 走完 schema→parser→spawn/permission/sandbox→timeout/cancel→result/output→concurrency。kloop 保留原生参数/文案与严格安全策略，新增双 pipe 有界 drain（每 fd 150k bytes、模型合并文本 30k chars）、独立 process group、timeout/cancel 同步 SIGKILL + direct-child reap + residual-group 确认，dispatch 等清理后才返 interrupted。CC stubborn timeout 会转后台、SIGINT cancel 会 abort，fixture 均观察到结果后 TERM-ignoring descendants 存活，因此不追求字面一致。该提交时 corpus 82 captures/109 evidence/56 rows/448 cells = 70 compatible、90 intentional-diff、20 missing、236 unknown、22 n/a、10 same；4 个 executable contracts 覆盖全部 same，新 `bash-batching` 证明 read-only 并发与 opaque 串行。后台 lifecycle 已由 Plan 51 完成；自动后台化/stall/逐事件 Monitor 保留为产品边界。详见 plan 50 完成记录。
 - **plan 51(✅ 完成,2026-07-30)** 后台任务与 Monitor exact parity：corpus 扩至 83 captures/116 static evidence；`bash-background` + 新 `bash-background-failure` 固定 start→terminal update→notification→`origin:task-notification`。bundle 证明 Monitor 是 `tengu_amber_sentinel` 默认关闭、要求 Bash available 的 model-visible tool，command/WebSocket 二选一、逐 line/frame live notification、支持 persistent/TaskStop/session cleanup；true profile 无法由 harness 权威开启，matrix 八格保守为 unknown，kloop 不新增伪 Monitor。kloop 为 shell/agent/program 增加无 turn owner 的统一 `BackgroundTaskUpdated`，shell terminal pointer 进入 step-boundary inbox，TUI idle autowake、plain/server 下一 turn 交付；两套 registry 保持分离但各自原子裁决一次终态，shutdown 先 cooperative cancel、deadline 后 abort/SIGKILL，再完成后台 registry teardown；session active worktree 无 remove intent 时保留。自动后台化、stall、逐事件 Monitor 明确保留。详见 plan 51 完成记录。
 
-> **Plan 92（核心实现完成；验收收口中，2026-08-19）**：provider runtime 已从单个 `Config.provider/model/fallback_model` 替换为 immutable `ProviderCatalog`、session-owned route revision/remembered models、operation-owned `FrozenProviderRoute` 与 attempt-owned `FrozenProviderAttempt`。新 canonical provider schema 强制 default/model allowlist/fallback membership；环境变量只能选择 catalog 内 initial route；未选 profile 的 credential 缺失以 bounded availability 保留，按需 lazy instantiate。
+> **Plan 92（2026-08-19 首批实现记录；当前本机验收已于 2026-10-21 收口）**：下述是当时的实现基线，fallback、协议版本及重开 route 规则已有后续计划替换，当前状态见本文件顶部与 plan 92 末节。provider runtime 已从单个 `Config.provider/model/fallback_model` 替换为 immutable `ProviderCatalog`、session-owned route revision/remembered models、operation-owned `FrozenProviderRoute` 与 attempt-owned `FrozenProviderAttempt`。新 canonical provider schema 强制 default/model allowlist/fallback membership；环境变量只能选择 catalog 内 initial route；未选 profile 的 credential 缺失以 bounded availability 保留，按需 lazy instantiate。
 >
 > rollout/history 已写 initial 与 explicit-switch typed route receipt，并将 provider assistant provenance 绑定 producing revision、origin rollout boundary、endpoint fingerprint、API family、exact model、attempt kind。restore/inspect/recovery/fork/rewind/compaction 对缺失、重复、倒退、future、unknown source、越界 origin、late old revision 与 API block shape fail closed；旧 model-only rollout 不迁移。History owner 的唯一 `provider_request_view` 验证 source interval，只有 durable explicit primary switch 才能过滤完整 reasoning unit；fallback/retry 不借用授权，A→B→A exact replay 保留。当前已补递归 reasoning final guard、Chat request-view boundary、strict envelope parent/sequence 与 child inherited-model admission。
 >
@@ -2800,3 +2823,13 @@ HTTP 请求包含条件，不能只验证最终留下的链接恰好符合条件
 写入没有生产消费者的 `Layout.more_below`，并不参与 hint，单测里只缩小编辑窗口也
 不能证明提示行守卫生效。追踪真实故障时先核对入口校验与状态迁移，再区分可达故障
 与面板层的防御性约束。
+
+246. **验收欠账先按当前契约拆开，再决定补测或销账。** Plan 92 的旧矩阵仍挂着已被
+Plan 158 删除的 fallback，又把原本排除的平台 E2E 混成完成阻碍；Plan 91 的抬头已完成，
+正文和 capability report 却仍 pending。不能只改一个 ✅：要核对后续决策、可解析提交与
+实际存在的测试名，并把共享 owner 的回归和新跨生命周期 witness 分清。
+42 组 core request view、真实二进制的本地 HTTP/PTY、历史真实 API、未执行平台是四种
+不同证据，不能互相冒充。Mock 前缀字节稳定也不等于网关缓存保证；真实使用中“提醒后
+有改表”有任务选择和长会话偏差，缓存要在同 provider/model、相近前缀与增量下配对，
+仍须保留受控新旧对照的欠账。plan 120 已纠正的缓存解释也不能继续在 DESIGN 和后续
+plan 里当作新结论引用。

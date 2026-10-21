@@ -347,8 +347,10 @@ async fn the_reminder_arrives_between_rounds_of_a_real_turn() {
         text: "done".into(),
     }]);
 
+    let (provider, seen) =
+        Provider::mock_recording(script.into_iter().map(MockTurn::Blocks).collect());
     let cfg = crate::tools::testutil::TestConfig::new("agent-todo-reminder-loop")
-        .provider(Provider::mock(script))
+        .provider(provider)
         .max_rounds(Some(rounds + 4))
         .build();
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
@@ -395,6 +397,34 @@ async fn the_reminder_arrives_between_rounds_of_a_real_turn() {
         messages[reminders[0] - 1]
     );
     assert_eq!(messages[reminders[0] + 1].role, Role::Assistant);
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), rounds + 2);
+    let first = &requests[0];
+    for pair in requests.windows(2) {
+        let previous = &pair[0];
+        let next = &pair[1];
+        assert_eq!(next.system, first.system);
+        assert_eq!(next.tools, first.tools);
+        assert_eq!(next.cache_key, first.cache_key);
+        assert!(next.messages.len() > previous.messages.len());
+        assert_eq!(
+            serde_json::to_vec(&next.messages[..previous.messages.len()]).unwrap(),
+            serde_json::to_vec(&previous.messages).unwrap(),
+        );
+    }
+    let first_reminded = requests
+        .iter()
+        .position(|request| request.messages.contains(reminder))
+        .unwrap();
+    assert!(first_reminded > 0);
+    assert!(requests[first_reminded..].iter().all(|request| {
+        request
+            .messages
+            .iter()
+            .filter(|message| *message == reminder)
+            .count()
+            == 1
+    }));
 }
 
 /// Plan 197 from the loop: a read, then a `bash` round that rewrites the file

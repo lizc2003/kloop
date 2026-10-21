@@ -362,13 +362,30 @@ fn switch_factory(
     seen_a: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
     seen_b: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
 ) -> ConfigFactory {
+    scripted_switch_factory(offload, seen_a, seen_b, Vec::new())
+}
+
+fn scripted_switch_factory(
+    offload: PathBuf,
+    seen_a: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
+    seen_b: Arc<Mutex<Vec<kloop_provider::MockRequest>>>,
+    scripts: Vec<Vec<kloop_provider::MockTurn>>,
+) -> ConfigFactory {
     let inner = factory(Vec::new(), offload, false);
+    let scripts = Mutex::new(std::collections::VecDeque::from(scripts));
     Arc::new(move |options, catalog, approver, questioner, notify| {
         let selected_provider = options.provider_id.clone().unwrap_or_else(|| "a".into());
         let selected_model = options.model.clone().unwrap_or_else(|| "shared".into());
         let mut cfg = inner(options, catalog, approver, questioner, notify)?;
         let provider_a = Provider::Mock {
-            turns: Mutex::new(vec![kloop_provider::MockTurn::Blocks(vec![text("from a")])].into()),
+            turns: Mutex::new(
+                scripts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| vec![kloop_provider::MockTurn::Blocks(vec![text("from a")])])
+                    .into(),
+            ),
             seen: Arc::clone(&seen_a),
         };
         let provider_b = Provider::Mock {
@@ -1301,6 +1318,165 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
     );
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn provider_switch_rejects_busy_operations_and_keeps_threads_isolated() {
+    for operation in ["sampling", "compaction"] {
+        let dirs = test_dirs(&format!("provider-switch-busy-{operation}"));
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut script = Vec::new();
+        if operation == "compaction" {
+            script.extend([
+                kloop_provider::MockTurn::Blocks(vec![text(&"old work ".repeat(40_000))]),
+                kloop_provider::MockTurn::Blocks(vec![text("recent work")]),
+            ]);
+        }
+        script.push(kloop_provider::MockTurn::Gate {
+            started: started_tx,
+            release: release_rx,
+            blocks: if operation == "sampling" {
+                vec![tool_use("todo", "todo_write", json!({"todos": []}))]
+            } else {
+                vec![text("summary")]
+            },
+        });
+        script.push(kloop_provider::MockTurn::Blocks(vec![text("from a")]));
+        let mut client = start_server(
+            scripted_switch_factory(
+                dirs.offload.clone(),
+                Arc::clone(&seen_a),
+                Arc::clone(&seen_b),
+                vec![script],
+            ),
+            &dirs,
+        );
+        let thread_id = client.init_and_start().await;
+        let sibling_start = client.request("thread/start", json!({})).await;
+        let sibling = client.recv().await;
+        assert_eq!(sibling["id"], sibling_start);
+        let sibling_id = sibling["result"]["thread"]["id"].as_str().unwrap();
+        if operation == "compaction" {
+            for input in ["earlier request", "current request"] {
+                client
+                    .request(
+                        "turn/start",
+                        json!({"thread_id": thread_id, "input": input}),
+                    )
+                    .await;
+                client
+                    .recv_until(|message| message["method"] == "turn/completed")
+                    .await;
+            }
+        }
+        client
+            .request(
+                "turn/start",
+                json!({"thread_id": thread_id, "input": if operation == "sampling" { "work" } else { "/compact" }}),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let busy = client
+            .request(
+                "thread/provider/switch",
+                json!({"thread_id": thread_id, "provider_id": "b", "expected_route_revision": 1}),
+            )
+            .await;
+        let messages = client.recv_until(|message| message["id"] == busy).await;
+        assert_eq!(messages.last().unwrap()["error"]["data"]["kind"], "busy");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["method"] != "thread/provider/changed")
+        );
+
+        let sibling_switch = client
+            .request(
+                "thread/provider/switch",
+                json!({"thread_id": sibling_id, "provider_id": "b", "expected_route_revision": 1}),
+            )
+            .await;
+        let messages = client
+            .recv_until(|message| message["id"] == sibling_switch)
+            .await;
+        assert_eq!(messages.last().unwrap()["result"]["route"]["revision"], 2);
+        let changes: Vec<_> = messages
+            .iter()
+            .filter(|message| message["method"] == "thread/provider/changed")
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["params"]["thread_id"], sibling_id);
+        assert!(seen_b.lock().unwrap().is_empty());
+        client
+            .request("thread/read", json!({"thread_id": thread_id}))
+            .await;
+        let before = client.recv().await;
+        assert_eq!(before["result"]["thread"]["route"]["provider_id"], "a");
+        assert_eq!(before["result"]["thread"]["route"]["revision"], 1);
+
+        release_tx.send(()).unwrap();
+        let messages = client
+            .recv_until(|message| message["method"] == "turn/completed")
+            .await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["method"] == "turn/completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            seen_a.lock().unwrap().len(),
+            if operation == "sampling" { 2 } else { 3 }
+        );
+        assert!(seen_b.lock().unwrap().is_empty());
+        let switch = client
+            .request(
+                "thread/provider/switch",
+                json!({"thread_id": thread_id, "provider_id": "b", "expected_route_revision": 1}),
+            )
+            .await;
+        let messages = client.recv_until(|message| message["id"] == switch).await;
+        assert_eq!(messages.last().unwrap()["result"]["route"]["revision"], 2);
+        let path = kloop_core::rollout::session_path(&dirs.sessions, &thread_id);
+        let committed = std::fs::read(&path).unwrap();
+        for (revision, kind) in [(1, Some("stale_revision")), (2, None)] {
+            let request = client
+                .request(
+                    "thread/provider/switch",
+                    json!({"thread_id": thread_id, "provider_id": "b", "expected_route_revision": revision}),
+                )
+                .await;
+            let messages = client.recv_until(|message| message["id"] == request).await;
+            assert_eq!(messages.len(), 1);
+            match kind {
+                Some(kind) => assert_eq!(messages[0]["error"]["data"]["kind"], kind),
+                None => assert_eq!(messages[0]["result"]["route"]["revision"], 2),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), committed);
+        }
+        client
+            .request(
+                "turn/start",
+                json!({"thread_id": thread_id, "input": "after switch"}),
+            )
+            .await;
+        client
+            .recv_until(|message| message["method"] == "turn/completed")
+            .await;
+        assert_eq!(seen_b.lock().unwrap().len(), 1);
+        client.shutdown().await;
+        let restored = kloop_core::rollout::resume_session(&path).unwrap();
+        assert_eq!(restored.snapshot.provider_routes.len(), 2);
+        assert_eq!(restored.snapshot.provider_routes[1].provider_id, "b");
+        let _ = std::fs::remove_dir_all(&dirs.root);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

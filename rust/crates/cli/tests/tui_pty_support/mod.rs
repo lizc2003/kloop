@@ -199,6 +199,7 @@ pub fn sse_tool_call(id: &str, name: &str, arguments: &Value) -> String {
 #[derive(Default)]
 pub struct PtyOptions<'a> {
     pub args: &'a [&'a str],
+    pub provider_config: Option<&'a str>,
     /// Seeded into the workspace before the binary starts, as (path relative to
     /// the workspace, contents) — a tool scenario needs something to act on.
     pub files: &'a [(&'a str, &'a str)],
@@ -467,18 +468,20 @@ impl PtyHarness {
         let kloop_home = home.join(".kloop");
         std::fs::create_dir_all(&kloop_home).context("create PTY ~/.kloop")?;
         let config = kloop_home.join("config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "provider = \"openai-compat\"\n\n\
+        let provider_config = options
+            .provider_config
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "provider = \"openai-compat\"\n\n\
                  [providers.openai-compat]\n\
                  wire_api = \"chat\"\n\
                  base_url = \"{base_url}\"\n\
                  auth_header = {{ Authorization = \"Bearer synthetic-tui-pty-key\" }}\n\
                  model = \"tui-pty-model\"\n"
-            ),
-        )
-        .context("write PTY config.toml")?;
+                )
+            });
+        std::fs::write(&config, provider_config).context("write PTY config.toml")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

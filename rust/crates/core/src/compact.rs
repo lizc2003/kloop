@@ -1388,6 +1388,164 @@ compactions]\n\nOriginal request:\n  old request",
     }
 
     #[tokio::test]
+    async fn compaction_across_a_model_switch_preserves_tail_routes_and_usage() {
+        use crate::provider_route::{EffortRequest, SessionProviderState};
+        use crate::rollout::{Rollout, resume_session};
+
+        let (provider, seen) = kloop_provider::Provider::mock_recording(
+            [10, 20]
+                .into_iter()
+                .map(|input| kloop_provider::MockTurn::Response {
+                    blocks: vec![AssistantBlock::Text {
+                        text: format!("summary {input}"),
+                    }],
+                    outcome: AssistantOutcome::EndTurn,
+                    usage: usage(input),
+                })
+                .collect(),
+        );
+        let cfg = compact_test_cfg(provider, "provider-switch");
+        let root = cfg
+            .offload_dir
+            .with_file_name("kloop-compact-provider-switch-rollout");
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("session.jsonl");
+        let mut history = History::new(cfg.offload_dir.clone());
+        history.attach_rollout(
+            Rollout::new_with_initial_route(path.clone(), &cfg.provider_route).unwrap(),
+        );
+        for message in seeded_history(cfg.offload_dir.clone()).messages() {
+            history.record(message.clone());
+        }
+        let initial = cfg.provider_route.primary_attempt();
+        let state = SessionProviderState::from_route(
+            Arc::clone(&cfg.provider_catalog),
+            cfg.provider_route.clone(),
+        );
+        let thinking = vec![ContentBlock::Thinking {
+            thinking: "old reasoning".into(),
+            signature: "old signature".into(),
+        }];
+        history.record_provider_assistant(thinking.clone(), &initial);
+        let first = compact_once(
+            &cfg,
+            &initial,
+            CompactionTrigger::Manual,
+            None,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first, CompactionOutcome::Applied(_)));
+        history.record(Message::user_text("more work"));
+        history.record_provider_assistant(
+            vec![ContentBlock::Text {
+                text: "more old work ".repeat(KEEP_RECENT_TOKENS as usize),
+            }],
+            &initial,
+        );
+        history.record(Message::user_text("latest request"));
+        history.record_provider_assistant(thinking, &initial);
+        let tail = history.messages().last().unwrap().clone();
+        history
+            .switch_provider(
+                &state,
+                1,
+                "test",
+                Some("actual-model"),
+                EffortRequest::Inherit,
+            )
+            .unwrap();
+        let switched = Arc::new(cfg.clone_with_provider_route(state.freeze()));
+        let next_attempt = switched.provider_route.primary_attempt();
+        let second = compact_once(
+            &switched,
+            &next_attempt,
+            CompactionTrigger::Manual,
+            None,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second, CompactionOutcome::Applied(_)));
+        assert_eq!(history.messages().last(), Some(&tail));
+        let expected_usage = vec![
+            ProviderUsageRecord::from_attempt(
+                initial.identity(),
+                UsageOperation::Compaction,
+                usage(10),
+            ),
+            ProviderUsageRecord::from_attempt(
+                next_attempt.identity(),
+                UsageOperation::Compaction,
+                usage(20),
+            ),
+        ];
+        assert_eq!(history.provider_usage().records(), expected_usage);
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].model, "mock");
+            assert_eq!(requests[1].model, "actual-model");
+            assert!(
+                requests[1]
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .all(|block| !matches!(block, ContentBlock::Thinking { .. }))
+            );
+        }
+        let projected = history.provider_request_view(&next_attempt).unwrap();
+        assert_eq!(
+            projected.last(),
+            Some(&Message::user_text("latest request"))
+        );
+        assert!(!projected.contains(&tail));
+        assert!(
+            history
+                .messages()
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .all(|message| message.provider_provenance.is_none())
+        );
+        let messages = history.messages().to_vec();
+        let noop = compact_once(
+            &switched,
+            &next_attempt,
+            CompactionTrigger::Manual,
+            None,
+            &mut history,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(noop, CompactionOutcome::NoOp(_)));
+        assert_eq!(history.messages(), messages);
+        assert_eq!(history.provider_usage().records(), expected_usage);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        history
+            .switch_provider(&state, 2, "test", Some("mock"), EffortRequest::Inherit)
+            .unwrap();
+        assert_eq!(
+            history
+                .provider_request_view(&state.freeze().primary_attempt())
+                .unwrap()
+                .last(),
+            Some(&tail)
+        );
+        let expected_messages = history.messages().to_vec();
+        let expected_routes = history.provider_routes().to_vec();
+        drop(history);
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(resumed.messages, expected_messages);
+        assert_eq!(resumed.provider_usage.records(), expected_usage);
+        assert_eq!(resumed.snapshot.provider_routes, expected_routes);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn accepted_summary_records_usage_before_compacted_marker() {
         let dir = std::env::temp_dir().join(format!("kloop-compact-usage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

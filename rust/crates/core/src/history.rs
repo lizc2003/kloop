@@ -2140,6 +2140,222 @@ mod tests {
     }
 
     #[test]
+    fn rail_switch_matrix_preserves_tool_pairs_and_restores_compatible_reasoning() {
+        use crate::provider_route::{
+            EffortRequest, ProviderCatalog, ProviderCatalogEntry, SessionProviderState,
+        };
+        use kloop_protocol::ProviderAvailabilityCode;
+        use kloop_provider::{Credential, Provider};
+        use std::sync::Arc;
+
+        let mut entries = Vec::new();
+        for (name, family) in [
+            ("messages", ProviderApiFamily::AnthropicMessages),
+            ("responses", ProviderApiFamily::OpenAiResponses),
+            ("chat", ProviderApiFamily::OpenAiChatCompletions),
+        ] {
+            for profile in 0..2 {
+                let id = format!("{name}-{profile}");
+                let base = format!("https://{id}.invalid");
+                let make_provider = move || match family {
+                    ProviderApiFamily::AnthropicMessages => Provider::Anthropic {
+                        cred: Credential::api_key("synthetic"),
+                        base: base.clone(),
+                        prompt_cache: true,
+                    },
+                    ProviderApiFamily::OpenAiResponses => Provider::OpenAiResponses {
+                        cred: Credential::bearer("synthetic"),
+                        base: base.clone(),
+                    },
+                    ProviderApiFamily::OpenAiChatCompletions => Provider::OpenAiCompat {
+                        cred: Credential::bearer("synthetic"),
+                        base: base.clone(),
+                    },
+                    ProviderApiFamily::Mock => unreachable!(),
+                };
+                entries.push(ProviderCatalogEntry {
+                    id,
+                    api_family: family,
+                    endpoint_fingerprint: make_provider().endpoint_fingerprint(),
+                    default_model: "shared".into(),
+                    models: vec!["shared".into(), "alternate".into()],
+                    context_window: None,
+                    max_output_tokens: None,
+                    availability: ProviderAvailabilityCode::Ready,
+                    default_effort: None,
+                    factory: Arc::new(move || Ok(make_provider())),
+                });
+            }
+        }
+        let catalog = Arc::new(ProviderCatalog::new(entries).unwrap());
+        let profiles = catalog.descriptors();
+        let mut cases = 0;
+        for source in &profiles {
+            let targets = profiles
+                .iter()
+                .map(|target| (target.id.as_str(), "shared"))
+                .chain(std::iter::once((source.id.as_str(), "alternate")));
+            for (target, model) in targets {
+                let state =
+                    SessionProviderState::new(Arc::clone(&catalog), &source.id, None).unwrap();
+                let initial = state.freeze();
+                let mut history = History::new(temp_dir("rail-switch-matrix"));
+                history.ensure_initial_provider_route(&initial).unwrap();
+                history.record(Message::user_text("question"));
+                let mut blocks = vec![ContentBlock::Thinking {
+                    thinking: "readable reasoning".into(),
+                    signature: if source.api_family == ProviderApiFamily::OpenAiChatCompletions {
+                        String::new()
+                    } else {
+                        "opaque reasoning".into()
+                    },
+                }];
+                if source.api_family == ProviderApiFamily::AnthropicMessages {
+                    blocks.push(ContentBlock::RedactedThinking {
+                        data: "redacted reasoning".into(),
+                    });
+                }
+                blocks.extend([
+                    ContentBlock::Text {
+                        text: "keep this text".into(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "pair".into(),
+                        name: "read_file".into(),
+                        input: serde_json::json!({"path": "notes.txt"}),
+                    },
+                ]);
+                history.record_provider_assistant(blocks, &initial.primary_attempt());
+                history.record(Message::tool_results(vec![ContentBlock::ToolResult {
+                    tool_use_id: "pair".into(),
+                    content: ToolResultContent::Text("keep this result".into()),
+                    is_error: false,
+                }]));
+                let canonical = history.messages().to_vec();
+                let mut stripped = canonical.clone();
+                stripped[1].content.retain(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                    )
+                });
+                stripped[1].provider_provenance = None;
+                let original_view = history
+                    .provider_request_view(&initial.primary_attempt())
+                    .unwrap();
+                history
+                    .switch_provider(&state, 1, target, Some(model), EffortRequest::Inherit)
+                    .unwrap();
+                let next = state.freeze();
+                let view = history
+                    .provider_request_view(&next.primary_attempt())
+                    .unwrap();
+                let expected = if next.same_route(&initial)
+                    && next.api_family() != ProviderApiFamily::OpenAiChatCompletions
+                {
+                    &canonical
+                } else {
+                    &stripped
+                };
+                assert_eq!(&view, expected, "{} -> {target}/{model}", source.id);
+                assert_eq!(history.messages(), canonical);
+                history
+                    .switch_provider(
+                        &state,
+                        next.revision(),
+                        &source.id,
+                        Some("shared"),
+                        EffortRequest::Inherit,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    history
+                        .provider_request_view(&state.freeze().primary_attempt())
+                        .unwrap(),
+                    original_view
+                );
+                assert_eq!(history.messages(), canonical);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 42);
+    }
+
+    #[test]
+    fn switch_cannot_authorize_malformed_reasoning_provenance() {
+        use crate::provider_route::{EffortRequest, SessionProviderState};
+
+        let (provider, seen) = kloop_provider::Provider::mock_recording(Vec::new());
+        let cfg = crate::tools::testutil::TestConfig::new("switch-invalid-provenance")
+            .provider(provider)
+            .models("mock", &["mock", "other"])
+            .build();
+        for case in [
+            "missing", "zero", "future", "provider", "model", "endpoint", "before", "late",
+        ] {
+            let state = SessionProviderState::from_route(
+                std::sync::Arc::clone(&cfg.provider_catalog),
+                cfg.provider_route.clone(),
+            );
+            let mut history = History::new(cfg.offload_dir.clone());
+            history
+                .ensure_initial_provider_route(&cfg.provider_route)
+                .unwrap();
+            history.record(Message::user_text("question"));
+            history.record_provider_assistant(
+                vec![ContentBlock::Thinking {
+                    thinking: "reasoning".into(),
+                    signature: "signature".into(),
+                }],
+                &cfg.provider_route.primary_attempt(),
+            );
+            let initial_boundary = history.provider_routes()[0].route_boundary;
+            let switch_boundary = history.next_memory_boundary;
+            let message = history.items.last_mut().unwrap();
+            if case == "missing" {
+                message.provider_provenance = None;
+            } else {
+                let provenance = message.provider_provenance.as_mut().unwrap();
+                match case {
+                    "zero" => provenance.route_revision = 0,
+                    "future" => provenance.route_revision = 2,
+                    "provider" => provenance.provider_id = "other".into(),
+                    "model" => provenance.model = "other".into(),
+                    "endpoint" => provenance.endpoint_fingerprint = "other-endpoint".into(),
+                    "before" => provenance.route_boundary = initial_boundary,
+                    "late" => provenance.route_boundary = switch_boundary,
+                    _ => unreachable!(),
+                }
+            }
+            let messages = history.messages().to_vec();
+            let routes = history.provider_routes().to_vec();
+            let remembered = state.remembered_models();
+            assert!(
+                matches!(
+                    history.switch_provider(
+                        &state,
+                        1,
+                        "test",
+                        Some("other"),
+                        EffortRequest::Inherit
+                    ),
+                    Err(ProviderSwitchError::History(_))
+                ),
+                "{case}"
+            );
+            assert_eq!(history.messages(), messages, "{case}");
+            assert_eq!(history.provider_routes(), routes, "{case}");
+            assert_eq!(
+                state.active_route(),
+                cfg.provider_route.public_route(),
+                "{case}"
+            );
+            assert_eq!(state.remembered_models(), remembered, "{case}");
+            assert!(seen.lock().unwrap().is_empty(), "{case}");
+        }
+    }
+
+    #[test]
     fn route_append_failure_keeps_memory_state_and_remembered_model() {
         use std::sync::Arc;
 

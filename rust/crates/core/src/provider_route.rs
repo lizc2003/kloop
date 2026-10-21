@@ -1930,6 +1930,108 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_switches_commit_one_revision_and_leave_frozen_routes_unchanged() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let catalog = Arc::new(
+            ProviderCatalog::new(vec![
+                mock_entry("a", "a1", &["a1"]),
+                mock_entry("b", "b1", &["b1"]),
+                mock_entry("c", "c1", &["c1"]),
+            ])
+            .unwrap(),
+        );
+        let state = Arc::new(SessionProviderState::new(catalog, "a", None).unwrap());
+        let frozen = state.freeze();
+        let barrier = Arc::new(Barrier::new(3));
+        let commits = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for target in ["b", "c"] {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let commits = Arc::clone(&commits);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                state.switch_with(1, target, None, EffortRequest::Inherit, |previous, next| {
+                    assert_eq!(previous.revision(), 1);
+                    assert_eq!(next.revision(), 2);
+                    commits.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(ReasoningContinuity::Preserved)
+                })
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Ok(SwitchOutcome::Changed { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    Err(SwitchCommitError::Switch(SwitchError::StaleRevision {
+                        expected: 1,
+                        actual: 2
+                    }))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.active_route().revision, 2);
+        assert_eq!(state.remembered_models().len(), 2);
+        assert_eq!(frozen.provider_id(), "a");
+        assert_eq!(frozen.revision(), 1);
+        assert_eq!(frozen.primary_attempt().identity().model, "a1");
+    }
+
+    #[test]
+    fn unavailable_switch_targets_never_commit_or_change_session_state() {
+        for availability in [
+            ProviderAvailabilityCode::MissingCredential,
+            ProviderAvailabilityCode::InvalidConfiguration,
+        ] {
+            let catalog = Arc::new(
+                ProviderCatalog::new(vec![
+                    mock_entry("a", "a1", &["a1"]),
+                    ProviderCatalogEntry {
+                        availability: ProviderAvailabilityCode::Ready,
+                        factory: Arc::new(move || Err(availability)),
+                        ..mock_entry("b", "b1", &["b1"])
+                    },
+                ])
+                .unwrap(),
+            );
+            let state = SessionProviderState::new(catalog, "a", None).unwrap();
+            let active = state.active_route();
+            let remembered = state.remembered_models();
+            let outcome = state.switch_with(
+                1,
+                "b",
+                None,
+                EffortRequest::Inherit,
+                |_, _| -> Result<ReasoningContinuity, ()> {
+                    panic!("an unavailable target must not reach commit");
+                },
+            );
+            assert!(
+                matches!(outcome, Err(SwitchCommitError::Switch(SwitchError::Unavailable { code, .. })) if code == availability)
+            );
+            assert_eq!(state.active_route(), active);
+            assert_eq!(state.remembered_models(), remembered);
+        }
+    }
+
+    #[test]
     fn failed_commit_and_noop_are_zero_mutation() {
         let catalog = Arc::new(
             ProviderCatalog::new(vec![
