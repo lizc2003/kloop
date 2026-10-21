@@ -1302,6 +1302,14 @@ concurrent tool batch queue and are answered in order; a No stops the turn tree
 that asked (see Permissions), and that tree's prompts still in the queue are
 withdrawn by core and leave it unasked.
 
+问答面板进入 `Type something else` 后，用独立的 `Composer` 维护自由回答与字素光标。
+左右、Home/End、Ctrl+A/E/B/F 和按词移动沿用主输入框键位，Backspace/Delete 在光标处
+按完整字素删除；普通 Enter 提交，Shift+Enter、Alt+Enter、Ctrl+J 换行，Esc 取消。
+渲染和上下移动共用扣除 `Your answer > ` 前缀后的视觉行宽；长回答软折行，先按八行
+窗口跟随光标，再按面板剩余高度围绕光标裁剪，不能只截取开头或把光标落到提示行。
+粘贴插在当前光标处，长粘贴也保留可编辑正文；换行归一化沿用入口规则。提交仍去掉
+回答首尾空白，空回答不提交；每题独立清空编辑状态，主输入草稿与其历史不参与问答。
+
 Notices — a retry, a mode switch, a resumed session, a failed turn, a turn a
 No ended (`stopped — tell kloop what to do differently`, since nothing else on
 screen says whose move it is) — render as
@@ -1487,8 +1495,8 @@ to exit" hint, the second quits, any other key disarms) — the same everywhere,
 including inside a choice panel, so it is the single quit path (Ctrl+D is
 disabled); Ctrl+R (idle) opens the rewind picker (see
 [Fork](#fork-and-rewind)). Scrolling back through history is the terminal's job
-now (native scrollback). While a choice panel is up it captures the keyboard,
-with the same keys on every surface: ↑↓ (or j/k) move, 1–9 pick a row, Enter
+now (native scrollback). While a choice panel is selecting an option it captures
+the keyboard, with the same keys on every surface: ↑↓ (or j/k) move, 1–9 pick a row, Enter
 takes the cursor row, Esc is the last row (No / cancel), and PgUp/PgDn scroll
 a tall preview. Approvals also answer to y/a/p/n.
 `--plain` keeps the old line-based REPL; `--mock` stays on plain output.

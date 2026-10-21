@@ -487,6 +487,105 @@ async fn unicode_input_round_trips_through_real_binary_editing() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn question_answer_scrolls_edits_and_submits_the_complete_text() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let question = "What should change?";
+    let fixture = ChatFixture::start(vec![
+        sse_tool_call(
+            "question-edit",
+            "ask_user_question",
+            &serde_json::json!({
+                "questions": [{
+                    "header": "Edit answer",
+                    "question": question,
+                    "options": [
+                        {"label": "A", "description": "first"},
+                        {"label": "B", "description": "second"}
+                    ],
+                    "multi_select": false
+                }]
+            }),
+        ),
+        sse_text("QUESTION_EDIT_ACK"),
+    ])
+    .await;
+    let mut harness = spawn(&fixture, 24, 80)?;
+    wait_for_boot(&mut harness)?;
+    harness.write(b"ask me")?;
+    harness.write(ENTER)?;
+    harness.wait_for("question options", Duration::from_secs(8), |frame| {
+        frame.contains("Type something else")
+    })?;
+    harness.write(b"3")?;
+    harness.wait_for("answer editor", Duration::from_secs(3), |frame| {
+        frame.contains("Your answer >")
+    })?;
+    let middle = "中文e\u{301} ".repeat(91);
+    let pasted = format!("HEAD{middle}尾巴👩🏽‍💻Z");
+    harness.write(BRACKETED_PASTE_START)?;
+    harness.write(pasted.as_bytes())?;
+    harness.write(BRACKETED_PASTE_END)?;
+    harness.wait_for_quiescent("long answer tail", Duration::from_secs(4), QUIET, |frame| {
+        frame.contains("尾巴") && frame.contains("Z")
+    })?;
+    // vt100 按码点推进 emoji 的列宽；字形输出核对原始字节，编辑结果核对完整工具回答。
+    assert!(contains_bytes(&harness.raw(), "👩🏽‍💻".as_bytes()));
+    harness.write(LEFT)?;
+    harness.write(BACKSPACE)?;
+    harness.write(LEFT)?;
+    harness.write(DELETE)?;
+    harness.write("改".as_bytes())?;
+    let frame = harness.wait_for_quiescent(
+        "edit tail in place",
+        Duration::from_secs(4),
+        QUIET,
+        |frame| frame.contains("尾改Z"),
+    )?;
+    let tail_row = frame
+        .text
+        .lines()
+        .position(|line| line.contains("尾改Z"))
+        .unwrap();
+    assert_eq!(usize::from(frame.cursor.0), tail_row);
+    assert!(frame.cursor.1 < frame.cols);
+
+    harness.resize(16, 40)?;
+    harness.wait_for_quiescent(
+        "narrow answer tail",
+        Duration::from_secs(4),
+        QUIET,
+        |frame| frame.cols == 40 && frame.contains("尾改Z"),
+    )?;
+    harness.write(CTRL_A)?;
+    harness.write(b"X")?;
+    harness.wait_for_quiescent("answer start", Duration::from_secs(4), QUIET, |frame| {
+        frame.contains("Your answer > XHEAD")
+    })?;
+    harness.write(CTRL_E)?;
+    harness.write(ALT_B)?;
+    harness.write(ALT_F)?;
+    harness.write(SHIFT_ENTER_CSI_U)?;
+    harness.write(b"END")?;
+    harness.write(ENTER)?;
+    harness.wait_for(
+        "question answer received",
+        Duration::from_secs(8),
+        |frame| frame.contains("QUESTION_EDIT_ACK") && !frame.contains("Working"),
+    )?;
+    let expected = format!("XHEAD{middle}尾改Z\nEND");
+    let quoted = serde_json::to_string(&expected)?;
+    let expected_result = format!(
+        "The user answered: \"{question}\"={quoted}. Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say."
+    );
+    assert_eq!(
+        fixture.requests().last().unwrap().tool_texts,
+        vec![expected_result]
+    );
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
 /// Press Enter and assert the fake provider received exactly `expected` as the
 /// user text, so the assertion is about what editing produced, not the screen.
 fn submit_and_expect(

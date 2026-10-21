@@ -1334,11 +1334,12 @@ fn question_panel(question: &PendingQuestion, width: usize) -> choice::Panel {
         ),
         QuestionPhase::Select => ("Enter select · ↑↓ move · 1-9 pick · Esc cancel", None),
         QuestionPhase::Other => (
-            "Enter submit · Esc cancel",
-            Some(choice::Editor {
-                prefix: "Your answer > ".to_string(),
-                text: question.editor.clone(),
-            }),
+            "Enter submit · Shift+Enter newline · Esc cancel",
+            Some(question.editor.view_with_prefix(
+                width,
+                choice::QUESTION_PREFIX,
+                Style::new().fg(BRAND),
+            )),
         ),
     };
     choice::Panel {

@@ -13,6 +13,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
+use crate::composer::View;
 use crate::render::BRAND;
 use crate::render::DIM;
 use crate::text_layout::display_width;
@@ -22,6 +23,8 @@ use crate::text_layout::wrap;
 /// A `detail` never grows past this many rows, so one verbose option cannot
 /// push the rest of the list off screen.
 const DETAIL_ROWS: usize = 2;
+
+pub(crate) const QUESTION_PREFIX: &str = "Your answer > ";
 
 /// One selectable row: a label, plus an optional dim explanation under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,15 +70,8 @@ pub struct Panel {
     pub multi_select: bool,
     /// The dim key hint, the panel's only such line (the footer stays still).
     pub hint: String,
-    /// An editor row shown in place of the options (a question's Other
-    /// phase): the prefix, then the live text. The caller places the cursor.
-    pub editor: Option<Editor>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Editor {
-    pub prefix: String,
-    pub text: String,
+    /// 问答自由输入的折行视图；行预算不足时继续围绕光标裁剪。
+    pub editor: Option<View>,
 }
 
 /// A laid-out panel: the rows to draw, the clamped body scroll offset (written
@@ -127,8 +123,19 @@ pub fn panel_lines(panel: &Panel, width: usize, max_rows: usize, scroll: usize) 
     // fewer. Everything held back that a block does not use returns to the body.
     let reserved = (usize::from(!panel.header.is_empty()) + usize::from(!panel.subject.is_empty()))
         .min(budget);
-    let (choices, choices_clipped) =
-        window_choices(&choice_rows(panel, width), panel.cursor, budget - reserved);
+    let choice_budget = budget - reserved;
+    let (choices, choices_clipped, editor_position) = if let Some(editor) = &panel.editor {
+        let cursor_row = usize::from(editor.cursor_row);
+        let start = cursor_row.saturating_sub(choice_budget.saturating_sub(1));
+        let (rows, start, above, below) = window_lines(&editor.rows, start, choice_budget);
+        let position =
+            (!rows.is_empty()).then_some((cursor_row - start, usize::from(editor.cursor_col)));
+        (vec![rows], above || below, position)
+    } else {
+        let (choices, clipped) =
+            window_choices(&choice_rows(panel, width), panel.cursor, choice_budget);
+        (choices, clipped, None)
+    };
     let choice_height: usize = choices.iter().map(Vec::len).sum();
     budget -= choice_height;
     let header =
@@ -169,10 +176,7 @@ pub fn panel_lines(panel: &Panel, width: usize, max_rows: usize, scroll: usize) 
     if prompt_rows > 0 {
         sections.push(prompt.into_iter().take(prompt_rows).collect());
     }
-    let editor_section = panel.editor.as_ref().map(|editor| {
-        let column = display_width(&editor.prefix) + display_width(&editor.text);
-        (sections.len(), column.min(width.saturating_sub(1)))
-    });
+    let editor_section = editor_position.map(|position| (sections.len(), position));
     if choice_height > 0 {
         sections.push(choices.into_iter().flatten().collect());
     }
@@ -193,10 +197,10 @@ pub fn panel_lines(panel: &Panel, width: usize, max_rows: usize, scroll: usize) 
         if index > 0 && separate {
             lines.push(Line::default());
         }
-        if let Some((section_index, column)) = editor_section
+        if let Some((section_index, (row, column))) = editor_section
             && section_index == index
         {
-            editor_cursor = Some((lines.len(), column));
+            editor_cursor = Some((lines.len() + row, column));
         }
         lines.extend(section);
     }
@@ -223,16 +227,8 @@ fn header_line(header: &str, width: usize) -> Line<'static> {
     ])
 }
 
-/// The option list (or, in an editor phase, the single editor row) as one row
-/// group per entry, so windowing never splits an option from its detail.
+/// 选项与说明组成一组，窗口化时不拆散。
 fn choice_rows(panel: &Panel, width: usize) -> Vec<Vec<Line<'static>>> {
-    if let Some(editor) = &panel.editor {
-        let prefix_w = display_width(&editor.prefix);
-        return vec![vec![Line::from(vec![
-            Span::styled(editor.prefix.clone(), Style::new().fg(BRAND)),
-            Span::raw(truncate(&editor.text, width.saturating_sub(prefix_w))),
-        ])]];
-    }
     panel
         .items
         .iter()
@@ -556,10 +552,9 @@ mod tests {
     fn an_editor_panel_places_the_cursor_after_the_text() {
         let mut panel = panel();
         panel.body.clear();
-        panel.editor = Some(Editor {
-            prefix: "Your answer > ".into(),
-            text: "abc".into(),
-        });
+        let mut editor = crate::composer::Composer::new();
+        editor.insert_text("abc");
+        panel.editor = Some(editor.view_with_prefix(40, QUESTION_PREFIX, Style::new().fg(BRAND)));
         let layout = panel_lines(&panel, 40, 30, 0);
         let rows = texts(&layout);
         let (row, column) = layout.editor_cursor.expect("an editor takes the cursor");
@@ -567,6 +562,52 @@ mod tests {
         assert_eq!(column, "Your answer > abc".len());
         // The options are gone: the panel is taking text, not a choice.
         assert!(!rows.iter().any(|row| row.contains("1. Yes")), "{rows:?}");
+    }
+
+    #[test]
+    fn a_long_answer_keeps_the_edited_row_and_cursor_visible_when_cramped() {
+        let mut panel = panel();
+        panel.body.clear();
+        let mut editor = crate::composer::Composer::new();
+        editor.insert_text(&format!("{}尾巴!", "中文👩🏽‍💻e\u{301}".repeat(80)));
+        editor.left();
+        for width in [20, 40, 80] {
+            for height in [1, 2, 3, 4, 8, 20] {
+                panel.editor =
+                    Some(editor.view_with_prefix(width, QUESTION_PREFIX, Style::new().fg(BRAND)));
+                let layout = panel_lines(&panel, width, height, 0);
+                assert!(layout.lines.len() <= height);
+                if height >= 4 {
+                    let (row, column) = layout.editor_cursor.expect("编辑位置必须可见");
+                    let rows = texts(&layout);
+                    assert!(rows[row].ends_with('!'), "{rows:?}");
+                    assert_eq!(display_width(&rows[row]) - 1, column);
+                    assert!(column < width);
+                    assert!(!rows[row].contains('…'));
+                } else if let Some((row, _)) = layout.editor_cursor {
+                    assert!(row < layout.lines.len());
+                    assert!(!texts(&layout)[row].starts_with("Enter"));
+                }
+            }
+        }
+
+        editor.home();
+        editor.right();
+        panel.editor = Some(editor.view_with_prefix(40, QUESTION_PREFIX, Style::new().fg(BRAND)));
+        let layout = panel_lines(&panel, 40, 4, 0);
+        let (row, column) = layout.editor_cursor.unwrap();
+        assert!(texts(&layout)[row].starts_with("Your answer > 中文"));
+        assert_eq!(column, display_width(QUESTION_PREFIX) + 2);
+
+        let mut full_row = crate::composer::Composer::new();
+        full_row.insert_text("abcdef");
+        panel.editor = Some(full_row.view_with_prefix(20, QUESTION_PREFIX, Style::new().fg(BRAND)));
+        let layout = panel_lines(&panel, 20, 4, 0);
+        let (row, column) = layout.editor_cursor.unwrap();
+        assert_eq!(
+            (texts(&layout)[row].as_str(), column),
+            ("              ", 14)
+        );
     }
 
     /// A one-row terminal still shows the one thing that can be acted on.

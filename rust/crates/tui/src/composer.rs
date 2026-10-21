@@ -25,7 +25,6 @@ use crate::text_layout::snap_grapheme_boundary;
 use crate::text_layout::truncate;
 
 const PROMPT: &str = "› ";
-const CONT: &str = "  ";
 const GUTTER_W: usize = 2;
 const MAX_ROWS: usize = 8;
 const PASTE_CHARS: usize = 400;
@@ -475,6 +474,7 @@ impl ComposerLayout {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     pub rows: Vec<Line<'static>>,
     pub cursor_row: u16,
@@ -504,6 +504,7 @@ pub(crate) enum ComposerAction {
     DeleteForward,
 }
 
+#[derive(Debug)]
 pub struct Composer {
     document: ComposerDocument,
     cursor: ByteOffset,
@@ -546,10 +547,12 @@ impl Composer {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        self.insert_text(&character.to_string());
+    }
+
+    pub(crate) fn insert_text(&mut self, text: &str) {
         self.begin_edit();
-        self.cursor = self
-            .document
-            .replace(TextRange::empty(self.cursor), &character.to_string());
+        self.cursor = self.document.replace(TextRange::empty(self.cursor), text);
         self.goal_column = None;
     }
 
@@ -728,6 +731,14 @@ impl Composer {
         }
     }
 
+    pub(crate) fn apply_with_prefix(&mut self, action: ComposerAction, width: usize, prefix: &str) {
+        let prefix = truncate(prefix, width.saturating_sub(1));
+        self.apply(
+            action,
+            width.saturating_sub(display_width(&prefix)) + GUTTER_W,
+        );
+    }
+
     pub fn up(&mut self, width: usize) {
         let layout = ComposerLayout::new(self.text(), self.cursor, width);
         if layout.cursor_row == 0 {
@@ -869,7 +880,21 @@ impl Composer {
             };
         }
 
-        let layout = ComposerLayout::new(self.text(), self.cursor, width);
+        self.view_with_prefix(width, PROMPT, Style::new().fg(Color::Cyan))
+    }
+
+    pub(crate) fn view_with_prefix(&self, width: usize, prefix: &str, style: Style) -> View {
+        if width == 0 {
+            return View {
+                rows: Vec::new(),
+                cursor_row: 0,
+                cursor_col: 0,
+            };
+        }
+        let prefix = truncate(prefix, width - 1);
+        let gutter_width = display_width(&prefix);
+        let continuation = " ".repeat(gutter_width);
+        let layout = ComposerLayout::new(self.text(), self.cursor, width - gutter_width + GUTTER_W);
         let start = layout.cursor_row.saturating_sub(MAX_ROWS - 1);
         let end = (start + MAX_ROWS).min(layout.rows.len());
         let rows = layout.rows[start..end]
@@ -878,9 +903,9 @@ impl Composer {
             .map(|(visible_index, row)| {
                 let is_first = start + visible_index == 0;
                 let (gutter, style) = if is_first {
-                    (PROMPT, Style::new().fg(Color::Cyan))
+                    (prefix.as_str(), style)
                 } else {
-                    (CONT, Style::default())
+                    (continuation.as_str(), Style::default())
                 };
                 Line::from(vec![
                     Span::styled(gutter.to_string(), style),
@@ -890,7 +915,7 @@ impl Composer {
                 ])
             })
             .collect();
-        let cursor_col = (layout.cursor_column + GUTTER_W).min(width - 1);
+        let cursor_col = (layout.cursor_column + gutter_width).min(width - 1);
         View {
             rows,
             cursor_row: (layout.cursor_row - start) as u16,
@@ -925,6 +950,31 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn prefixed_editor_navigation_uses_the_same_rows_as_rendering() {
+        let mut editor = typed("abcdef界Z");
+        let prefix = "Your answer > ";
+        let view = editor.view_with_prefix(20, prefix, Style::default());
+        assert_eq!(
+            row_texts(&view),
+            vec!["Your answer > abcdef", "              界Z"]
+        );
+        assert_eq!((view.cursor_row, view.cursor_col), (1, 17));
+        editor.apply_with_prefix(ComposerAction::MoveUp, 20, prefix);
+        assert_eq!((editor.text(), editor.cursor().get()), ("abcdef界Z", 3));
+        editor.apply_with_prefix(ComposerAction::MoveDown, 20, prefix);
+        assert_eq!((editor.text(), editor.cursor().get()), ("abcdef界Z", 10));
+        for width in 0..=20 {
+            let view = editor.view_with_prefix(width, prefix, Style::default());
+            if width == 0 {
+                assert!(view.rows.is_empty());
+            } else {
+                assert!(usize::from(view.cursor_row) < view.rows.len());
+                assert!(usize::from(view.cursor_col) < width);
+            }
+        }
     }
 
     fn image() -> ContentBlock {

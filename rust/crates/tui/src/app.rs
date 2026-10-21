@@ -37,6 +37,7 @@ use kloop_protocol::Role;
 use kloop_protocol::RoutePickerStage;
 use tokio::sync::oneshot;
 
+use crate::choice::QUESTION_PREFIX;
 use crate::composer::Composer;
 use crate::composer::ComposerAction;
 use crate::events::AgentEvent;
@@ -295,7 +296,7 @@ pub struct PendingQuestion {
     pub selected: Vec<usize>,
     pub answers: Vec<QuestionAnswer>,
     pub phase: QuestionPhase,
-    pub editor: String,
+    pub editor: Composer,
     reply: oneshot::Sender<QuestionOutcome>,
 }
 
@@ -308,7 +309,7 @@ impl PendingQuestion {
             selected: Vec::new(),
             answers: Vec::new(),
             phase: QuestionPhase::Select,
-            editor: String::new(),
+            editor: Composer::new(),
             reply,
         }
     }
@@ -1529,7 +1530,7 @@ impl App {
         }
         // A pending interaction captures the keyboard.
         if !self.interactions.is_empty() {
-            return self.on_interaction_key(key);
+            return self.on_interaction_key(composer_width, key);
         }
         if self.provider_picker.is_some() {
             return self.on_provider_key(key);
@@ -1856,7 +1857,7 @@ impl App {
         if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut()
             && question.phase == QuestionPhase::Other
         {
-            question.editor.push_str(&text);
+            question.editor.insert_text(&text);
             return Command::None;
         }
         self.composer.paste(&text);
@@ -1877,10 +1878,10 @@ impl App {
         )
     }
 
-    fn on_interaction_key(&mut self, key: KeyEvent) -> Command {
+    fn on_interaction_key(&mut self, width: usize, key: KeyEvent) -> Command {
         match self.interactions.front() {
             Some(PendingInteraction::Confirm { .. }) => self.on_confirm_key(key),
-            Some(PendingInteraction::Question(_)) => self.on_question_key(key),
+            Some(PendingInteraction::Question(_)) => self.on_question_key(width, key),
             None => Command::None,
         }
     }
@@ -1958,8 +1959,8 @@ impl App {
         Command::None
     }
 
-    fn on_question_key(&mut self, key: KeyEvent) -> Command {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+    fn on_question_key(&mut self, width: usize, key: KeyEvent) -> Command {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && !self.question_editor_active() {
             return Command::None;
         }
         if key.code == KeyCode::Esc {
@@ -2050,19 +2051,22 @@ impl App {
                     _ => {}
                 }
             }
-            QuestionPhase::Other => match key.code {
-                KeyCode::Char(c) => question.editor.push(c),
-                KeyCode::Backspace => {
-                    question.editor.pop();
-                }
-                KeyCode::Enter => {
-                    let value = question.editor.trim().to_string();
+            QuestionPhase::Other => {
+                if is_composer_newline_key(&key) {
+                    question.editor.insert_newline();
+                } else if key.code == KeyCode::Enter
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    let value = question.editor.text().trim().to_string();
                     if !value.is_empty() {
                         outcome = finish_question(question, Some(value));
                     }
+                } else if let Some(action) = composer_action(&key) {
+                    question
+                        .editor
+                        .apply_with_prefix(action, width, QUESTION_PREFIX);
                 }
-                _ => {}
-            },
+            }
         }
         if let Some(outcome) = outcome {
             self.resolve_question(outcome);
@@ -4605,6 +4609,92 @@ mod tests {
                 selected: vec![0],
                 other: Some("custom".into()),
             }])
+        );
+    }
+
+    #[tokio::test]
+    async fn question_other_edits_at_the_cursor_and_keeps_graphemes_whole() {
+        let mut app = App::new("s".into());
+        let (reply, mut rx) = oneshot::channel();
+        app.apply(AgentEvent::Question {
+            req: question_request(false, None),
+            reply,
+        });
+        app.on_key(80, key(KeyCode::Char('3')));
+        app.paste_text("Ae\u{301}界👩🏽‍💻Z");
+        app.on_key(80, key(KeyCode::Left));
+        app.on_key(80, key(KeyCode::Backspace));
+        app.on_key(80, key(KeyCode::Left));
+        app.on_key(80, key(KeyCode::Delete));
+        app.paste_text("中");
+        app.on_key(80, key(KeyCode::Backspace));
+        app.on_key(80, key(KeyCode::Backspace));
+        app.on_key(80, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_key(80, key(KeyCode::Char('X')));
+        app.on_key(80, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        app.on_key(80, key(KeyCode::Char('!')));
+        app.on_key(80, key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            QuestionOutcome::Answered(vec![QuestionAnswer {
+                question_index: 0,
+                selected: vec![],
+                other: Some("XAZ!".into()),
+            }])
+        );
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[tokio::test]
+    async fn question_other_supports_word_motion_newlines_and_resets_for_the_next_question() {
+        let mut app = App::new("s".into());
+        let (reply, mut rx) = oneshot::channel();
+        let mut req = question_request(false, None);
+        req.questions.push(req.questions[0].clone());
+        app.apply(AgentEvent::Question { req, reply });
+        app.on_key(80, key(KeyCode::Char('3')));
+        app.paste_text("one two");
+        app.on_key(80, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        app.paste_text("new ");
+        app.on_key(80, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+        app.on_key(80, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.on_key(80, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.on_key(80, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        app.on_key(80, key(KeyCode::Enter));
+        let Some(PendingInteraction::Question(question)) = app.interactions.front() else {
+            panic!("下一题仍待回答");
+        };
+        assert_eq!(
+            (
+                question.question_index,
+                question.editor.text(),
+                question.editor.cursor().get()
+            ),
+            (1, "", 0)
+        );
+        app.on_key(80, key(KeyCode::Char('3')));
+        app.paste_text(&"界".repeat(450));
+        app.on_key(80, key(KeyCode::Home));
+        app.on_key(80, key(KeyCode::Right));
+        app.on_key(80, key(KeyCode::Delete));
+        app.on_key(80, key(KeyCode::Char('中')));
+        app.on_key(80, key(KeyCode::End));
+        app.on_key(80, key(KeyCode::Char('!')));
+        app.on_key(80, key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            QuestionOutcome::Answered(vec![
+                QuestionAnswer {
+                    question_index: 0,
+                    selected: vec![],
+                    other: Some("one new \n\ntwo".into()),
+                },
+                QuestionAnswer {
+                    question_index: 1,
+                    selected: vec![],
+                    other: Some(format!("界中{}!", "界".repeat(448))),
+                },
+            ])
         );
     }
 

@@ -40,6 +40,7 @@ const RAW_LIMIT: usize = 512 * 1024;
 pub struct RecordedRequest {
     pub model: String,
     pub user_texts: Vec<String>,
+    pub tool_texts: Vec<String>,
 }
 
 #[derive(Default)]
@@ -71,8 +72,21 @@ impl Respond for QueueResponder {
             .filter_map(|message| message.get("content"))
             .map(content_text)
             .collect();
+        let tool_texts = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|message| message.get("content"))
+            .map(content_text)
+            .collect();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.requests.push(RecordedRequest { model, user_texts });
+        state.requests.push(RecordedRequest {
+            model,
+            user_texts,
+            tool_texts,
+        });
         let Some(response) = state.responses.pop_front() else {
             return ResponseTemplate::new(500).set_body_string("no synthetic response queued");
         };
