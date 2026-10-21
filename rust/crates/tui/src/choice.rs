@@ -183,9 +183,8 @@ pub fn panel_lines(panel: &Panel, width: usize, max_rows: usize, scroll: usize) 
         sections.push(choices.into_iter().flatten().collect());
     }
     if hint_rows == 1 {
-        // The body's scroll affordance rides on the hint rather than a border:
-        // the panel has none. Only a list phase binds PgUp/PgDn, so the editor
-        // never advertises them even when the preview body is clipped.
+        // 通用面板的防御性契约：即使调用方组合 editor 与 body，也不能在
+        // 不绑定 PgUp/PgDn 的编辑阶段因 body 裁剪而宣告翻页键。
         let hint = if panel.editor.is_none() && (more_above || more_below) {
             format!("{} · PgUp/PgDn scroll", panel.hint)
         } else {
@@ -613,14 +612,14 @@ mod tests {
         );
     }
 
-    /// The Other phase binds no page keys, so a clipped editor — and the
-    /// preview body a multi-select can leave behind — must not advertise them.
+    /// 手工组合 editor 与 body 检验通用面板的防御性契约，不代表合法问答路径。
     #[test]
-    fn the_editor_hint_never_advertises_page_scrolling() {
+    fn editor_panels_hide_page_hints_even_with_synthetic_body_overflow() {
         let mut panel = panel();
         panel.body.clear();
         panel.subject.clear();
         panel.prompt = None;
+        panel.hint = "Enter submit · Esc cancel".into();
         let mut editor = crate::composer::Composer::new();
         editor.insert_text(&"长回答 ".repeat(40));
         panel.editor = Some(editor.view_with_prefix(40, QUESTION_PREFIX, Style::new().fg(BRAND)));
@@ -632,13 +631,12 @@ mod tests {
                 "height {height}: {rows:?}"
             );
         }
-        // A roomy panel clips the preview body instead: same answer.
+        // 合法问答不会在编辑阶段留下预览；此处直接构造 body，单测只约束渲染层。
         panel.body = (1..=20).map(|i| Line::from(format!("line {i}"))).collect();
-        let rows = texts(&panel_lines(&panel, 40, 20, 0));
-        assert!(
-            !rows.iter().any(|row| row.contains("PgUp/PgDn")),
-            "{rows:?}"
-        );
+        let layout = panel_lines(&panel, 40, 20, 0);
+        assert_eq!((layout.more_above, layout.more_below), (false, true));
+        let rows = texts(&layout);
+        assert_eq!(rows.last().map(String::as_str), Some(panel.hint.as_str()));
     }
 
     /// A one-row terminal still shows the one thing that can be acted on.
