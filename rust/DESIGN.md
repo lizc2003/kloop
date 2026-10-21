@@ -1865,9 +1865,14 @@ fallback are out of scope (see the plan).
 目标条目，再原子替换；不同实例更新不同服务不会互相覆盖。此锁只保护文件更新，
 不把远端 refresh 请求包进同一个事务。
 
-Servers are planned and connected once at startup; the handshake remains
-`initialize` → `notifications/initialized` → `tools/list` (with bounded
-`nextCursor` pagination). A process-owned lifecycle supervisor then owns every
+Servers are planned and connected once at startup, and they connect
+concurrently: each one's spawn → `initialize` → `notifications/initialized` →
+`tools/list` (with bounded `nextCursor` pagination) runs alongside every other
+server's, so startup waits for the slowest server rather than the sum, and a
+per-server hang costs only that server's own timeout. Sources, statuses and
+warnings are folded back in configuration order, because tool-name collision
+precedence and the startup warning stream depend on it. A process-owned
+lifecycle supervisor then owns every
 stdio child, transport-health monitor, and refresh worker, performs explicit
 shutdown/reap on every frontend exit, and uses Drop only as an error-path abort
 fallback. Stdio EOF/read/write failure and request timeout publish a bounded

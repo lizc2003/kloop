@@ -17,6 +17,8 @@ kloop-web = { workspace = true }
 
 anyhow = { workspace = true }
 crossterm = { workspace = true }
+# `join_all` runs every configured MCP server's startup handshake concurrently.
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # MCP OAuth token store (plan 34b): serde derives the on-disk credential record,

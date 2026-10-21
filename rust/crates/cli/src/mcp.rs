@@ -14,8 +14,10 @@ use anyhow::Result;
 use kloop_core::tools::ToolSource;
 use kloop_mcp::McpAuthenticationError;
 use kloop_mcp::McpClient;
+use kloop_mcp::McpNotification;
 use kloop_mcp::McpServerCapabilities;
 use kloop_mcp::McpSessionReinitialized;
+use kloop_mcp::McpTransportHealth;
 use kloop_mcp::oauth::OAuthSession;
 use kloop_protocol::ToolDef;
 use kloop_server::McpServerState;
@@ -106,19 +108,92 @@ fn classify_startup_failure(
     (failed_auth, failure)
 }
 
-/// Spawn + handshake + tool discovery for every configured server. A failing
-/// server degrades to a warning but retains a source-owned unavailable route.
+/// Planning state for one server plus the result of its concurrent connect.
+struct ServerStartup {
+    server: McpServerConfig,
+    source: Arc<McpToolSource>,
+    oauth_capable: bool,
+    startup_auth: Option<McpAuthAvailability>,
+    oauth_status_session: Option<Arc<OAuthSession>>,
+    outcome: Result<ConnectedServer>,
+}
+
+/// What a successful connection hands to the ordered post-processing pass.
+struct ConnectedServer {
+    client: Arc<McpClient>,
+    oauth: Option<Arc<OAuthSession>>,
+    capabilities: McpServerCapabilities,
+    notifications: Option<tokio::sync::broadcast::Receiver<McpNotification>>,
+    health: Option<tokio::sync::watch::Receiver<McpTransportHealth>>,
+    advertised: Vec<ToolDef>,
+}
+
+/// Spawn + handshake + tool discovery for one planned server.
+async fn connect_one(
+    server: McpServerConfig,
+    source: Arc<McpToolSource>,
+    oauth_capable: bool,
+    startup_auth: Option<McpAuthAvailability>,
+    oauth_status_session: Option<Arc<OAuthSession>>,
+    oauth_session: Result<Option<Arc<OAuthSession>>>,
+) -> ServerStartup {
+    let outcome = async {
+        let (client, oauth) = match &server.transport {
+            McpTransport::Stdio { command, env } => (McpClient::spawn(command, env)?, None),
+            McpTransport::Http {
+                url,
+                bearer_token,
+                http_headers,
+                ..
+            } => {
+                let headers = http_headers_for(bearer_token, http_headers);
+                let oauth = oauth_session?;
+                (McpClient::http(url.clone(), headers, oauth.clone())?, oauth)
+            }
+        };
+        let client = Arc::new(client);
+        let health = client.subscribe_health();
+        let mut capabilities = client.initialize().await?;
+        let advertised = initial_tool_catalog(&client, &mut capabilities).await?;
+        let notifications = capabilities
+            .tools_list_changed
+            .then(|| client.subscribe_notifications())
+            .flatten();
+        anyhow::Ok(ConnectedServer {
+            client,
+            oauth,
+            capabilities,
+            notifications,
+            health,
+            advertised,
+        })
+    }
+    .await;
+    ServerStartup {
+        server,
+        source,
+        oauth_capable,
+        startup_auth,
+        oauth_status_session,
+        outcome,
+    }
+}
+
+/// Spawn + handshake + tool discovery for every configured server. Servers are
+/// connected concurrently, so a slow or hanging one costs only its own timeout
+/// instead of every later server's too. Results are folded back in
+/// configuration order because tool-name collision precedence and the warning
+/// stream depend on it. A failing server degrades to a warning but retains a
+/// source-owned unavailable route.
 pub async fn connect_servers(
     servers: Vec<McpServerConfig>,
     warn: &dyn Fn(&str),
 ) -> Result<McpConnections> {
     let store = Arc::new(CredentialStore::default_path()?);
     let lifecycle = McpLifecycleOwner::default();
-    let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
     let mut resource_servers = Vec::new();
-    let mut statuses = Vec::new();
+    let mut startups = Vec::new();
     for server in servers {
-        let transport = server.transport.kind();
         let source = McpToolSource::planned(&server);
         lifecycle.register_source(source.clone());
         source.starting();
@@ -157,39 +232,36 @@ pub async fn connect_servers(
             .ok()
             .and_then(Option::as_ref)
             .cloned();
-        let connect = async {
-            let (client, oauth) = match &server.transport {
-                McpTransport::Stdio { command, env } => (McpClient::spawn(command, env)?, None),
-                McpTransport::Http {
-                    url,
-                    bearer_token,
-                    http_headers,
-                    ..
-                } => {
-                    let headers = http_headers_for(bearer_token, http_headers);
-                    let oauth = oauth_session?;
-                    (McpClient::http(url.clone(), headers, oauth.clone())?, oauth)
-                }
-            };
-            let client = Arc::new(client);
-            let health = client.subscribe_health();
-            let mut capabilities = client.initialize().await?;
-            let advertised = initial_tool_catalog(&client, &mut capabilities).await?;
-            let notifications = capabilities
-                .tools_list_changed
-                .then(|| client.subscribe_notifications())
-                .flatten();
-            anyhow::Ok((
+        startups.push(connect_one(
+            server,
+            source,
+            oauth_capable,
+            startup_auth,
+            oauth_status_session,
+            oauth_session,
+        ));
+    }
+    let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+    let mut statuses = Vec::new();
+    for startup in futures::future::join_all(startups).await {
+        let ServerStartup {
+            server,
+            source,
+            oauth_capable,
+            startup_auth,
+            oauth_status_session,
+            outcome,
+        } = startup;
+        let transport = server.transport.kind();
+        match outcome {
+            Ok(ConnectedServer {
                 client,
                 oauth,
                 capabilities,
                 notifications,
                 health,
                 advertised,
-            ))
-        };
-        match connect.await {
-            Ok((client, oauth, capabilities, notifications, health, advertised)) => {
+            }) => {
                 let count = advertised.len();
                 let has_notifications = notifications.is_some();
                 source.ready(
@@ -424,6 +496,122 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         assert!(capabilities.resources);
+    }
+
+    #[cfg(unix)]
+    async fn delayed_http_server(delay: std::time::Duration) -> wiremock::MockServer {
+        use wiremock::Mock;
+        use wiremock::MockServer;
+        use wiremock::ResponseTemplate;
+        use wiremock::matchers::body_partial_json;
+        use wiremock::matchers::method;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("mcp-session-id", "sess-1")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "fixture", "version": "1"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"tools": []}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[cfg(unix)]
+    fn static_bearer_server(name: &str, url: String) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            transport: McpTransport::Http {
+                url,
+                bearer_token: Some("fixture-token".into()),
+                http_headers: BTreeMap::new(),
+                oauth_client_id: None,
+                oauth_scopes: Vec::new(),
+            },
+            readonly_tools: Vec::new(),
+        }
+    }
+
+    /// Each server's handshake is `initialize` + `tools/list`, both delayed, so
+    /// serializing two servers costs four delays. Running them at once costs
+    /// two; the ordering assertions pin the deterministic fold-back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn servers_connect_concurrently_and_report_in_config_order() {
+        use std::time::Duration;
+        use std::time::Instant;
+
+        const DELAY: Duration = Duration::from_millis(750);
+        let first = delayed_http_server(DELAY).await;
+        let second = delayed_http_server(DELAY).await;
+        let warnings = std::sync::Mutex::new(Vec::new());
+        let warn = |warning: &str| warnings.lock().unwrap().push(warning.to_string());
+
+        let started = Instant::now();
+        let connections = connect_servers(
+            vec![
+                static_bearer_server("alpha", first.uri()),
+                static_bearer_server("beta", second.uri()),
+            ],
+            &warn,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < DELAY * 3,
+            "two {DELAY:?}-delay servers took {elapsed:?}; startup still looks serial"
+        );
+        assert_eq!(
+            connections
+                .statuses
+                .iter()
+                .map(|status| status.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(
+            *warnings.lock().unwrap(),
+            vec![
+                "mcp server 'alpha': connected, 0 tool(s)".to_string(),
+                "mcp server 'beta': connected, 0 tool(s)".to_string(),
+            ]
+        );
+        connections.lifecycle.shutdown().await;
     }
 
     #[test]

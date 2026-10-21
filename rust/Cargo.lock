@@ -1748,6 +1748,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "futures",
  "insta",
  "kloop-core",
  "kloop-mcp",
