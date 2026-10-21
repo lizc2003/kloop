@@ -2429,6 +2429,112 @@ async fn unknown_non_codex_event_still_fails_closed() {
     );
 }
 
+#[tokio::test]
+async fn response_metadata_preserves_streamed_output_and_usage() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.metadata", "response_id": "r", "metadata": {}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "in_progress",
+                "role": "assistant", "content": []
+            }}),
+            json!({"type": "response.content_part.added", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": ""}}),
+            json!({"type": "response.output_text.delta", "output_index": 0,
+                "item_id": "m", "content_index": 0, "delta": "hi"}),
+            json!({"type": "response.metadata", "sequence_number": 7,
+                "response_id": "r", "metadata": {"transport_hint": "synthetic"}}),
+            json!({"type": "response.output_text.done", "output_index": 0,
+                "item_id": "m", "content_index": 0, "text": "hi"}),
+            json!({"type": "response.content_part.done", "output_index": 0,
+                "item_id": "m", "content_index": 0,
+                "part": {"type": "output_text", "text": "hi"}}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "message", "id": "m", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }}),
+            json!({"type": "response.completed", "response": {"id": "r", "status": "completed",
+                "usage": {"input_tokens": 20, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 12}}}}),
+        ]),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        events,
+        [
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::BlockDone(AssistantBlock::Text { text: "hi".into() }),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::EndTurn,
+                usage: Some(Usage {
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 12,
+                    cache_creation_input_tokens: 0,
+                }),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn response_metadata_rejects_invalid_identity_and_payload() {
+    for (created, metadata, expected) in [
+        (
+            false,
+            json!({"response_id": "r", "metadata": {}}),
+            "unknown response",
+        ),
+        (
+            true,
+            json!({"response_id": "other", "metadata": {}}),
+            "unknown response",
+        ),
+        (true, json!({"metadata": {}}), "metadata response id"),
+        (
+            true,
+            json!({"response_id": "", "metadata": {}}),
+            "metadata response id",
+        ),
+        (
+            true,
+            json!({"response_id": "r"}),
+            "metadata was not an object",
+        ),
+        (
+            true,
+            json!({"response_id": "r", "metadata": []}),
+            "metadata was not an object",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let mut events = Vec::new();
+        if created {
+            events.push(json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}));
+        }
+        let mut metadata = metadata;
+        metadata["type"] = json!("response.metadata");
+        events.push(metadata);
+        mount_sse(&server, sse_body(&events)).await;
+
+        let events = collect(responses(&server)).await;
+        assert_eq!(events.len(), 1);
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
 /// A hostile or runaway event name cannot turn the error into an unbounded
 /// echo of provider bytes.
 #[tokio::test]

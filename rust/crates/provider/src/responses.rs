@@ -997,6 +997,17 @@ impl ResponseStream {
         Ok(())
     }
 
+    fn on_metadata(&self, value: &Value) -> Result<(), ProviderFailure> {
+        let id = required_non_empty(&value["response_id"], "metadata response id")?;
+        if self.response_id.as_deref() != Some(id) {
+            return Err(protocol("metadata referenced an unknown response"));
+        }
+        if !value["metadata"].is_object() {
+            return Err(protocol("metadata was not an object"));
+        }
+        Ok(())
+    }
+
     /// `response.output_item.added`: an item opens.
     fn on_item_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
         if self.response_id.is_none() {
@@ -1354,6 +1365,7 @@ pub(super) async fn stream(
         }
         match event {
             "response.created" | "response.in_progress" => state.on_lifecycle(event, &value)?,
+            "response.metadata" => state.on_metadata(&value)?,
             "response.output_item.added" => state.on_item_added(&value)?,
             "response.content_part.added" => state.on_content_part_added(&value)?,
             "response.output_text.delta" | "response.refusal.delta" => {

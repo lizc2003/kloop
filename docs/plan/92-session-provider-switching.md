@@ -213,3 +213,33 @@ CodeWhale 已提供目标 UX：`/provider` 打开 picker，`/provider <name>` �
   需要过滤的 opaque reasoning，过滤仍由确定性 request-view/adapter 回归证明。
 - Linux/Windows/Desktop/实体终端：未执行。本机 PTY 是 macOS 上的二进制与终端协议测试，
   不替代其他平台编译或实体终端手验。
+
+## 追加真实复测与兼容修复（2026-10-21）
+
+用户授权读取 `~/.kloop/config.toml`，不改配置，凭据只在执行进程内使用。实测在临时
+工作目录运行；本节提交号以所在提交为准，开始验证的代码基线为 `bfacfa2`。
+
+- 真实原生 server 完成默认模型 A→同 profile 的模型 B→A 三轮，逐轮核对独立回复、
+  changed event、route revision、持久化 assistant provenance、usage 与公开读回。
+  revision 为 `1→2→3`；该次 continuity 为 `preserved→filtered→filtered`，
+  这次真实样本确实走到了 reasoning 过滤，与前一节仅引用的历史样本不同。
+- 初次跨 provider 测试中，目标 Responses 上游在正文 delta 后、正文 done 前发送
+  `response.metadata`，原适配器将其作为未知语义事件拒绝，turn 以 protocol error
+  终止。这是本次实测发现的兼容问题，不能记成切换成功后的完整回复。
+- 修复只接纳这个具名事件：`response_id` 必须匹配已经建立的响应，`metadata` 必须
+  是对象；校验后丢弃，不写入正文、reasoning、工具、终态或 usage。它不能建立/切换
+  响应身份，其他未知事件仍拒绝。新增一条完整输出与 usage 回归先在旧实现失败，
+  修复后通过；另一条覆盖六类身份与载荷错误。夹具均为合成内容，不保存真实捕获。
+- 修复后的真实二进制完成 A→B→另一 provider 的模型 C→A 四轮，四条独立回复均匹配，
+  response/event/read 一致，revision、assistant provenance 与 usage 均为 `1→2→3→4`。
+  该次 continuity 为 `preserved→preserved→filtered→filtered`；公开读回不含任何配置
+  endpoint 或凭据。没有新增 provider 配置或自动重路由。
+- 新三轨复测在首个 Messages 请求收到 HTTP 401，未进入 Chat/Responses 阶段。
+  因此本次不能宣称三轨新一轮全绿：当前可用配置的同 rail 换模型、跨 provider 与
+  切回已通过；Messages 鉴权需另行恢复，Chat 本次没有真实采样。2026-08-19 的
+  三轨记录保持历史证据，不拿它覆盖这次失败。
+
+本机矩阵的 ✅ 保持有效；本次真实外部限制和适配器修复分别记录，不恢复已删除的
+fallback，也不把未执行平台写成通过。
+兼容修复的最终完整 `make check` 在外层执行沙箱之外全绿，含本机 parity；Responses
+HTTP 合约 53 条、core 1133 条、server 协议 41 条、plain/TUI PTY 8/21 条通过。

@@ -106,11 +106,11 @@ the five architectural bets below; it is now ten crates, and every bet held.
 5. **Provider seam.** Internals speak Anthropic Messages shape only; adapters
    translate Anthropic native SSE and OpenAI-compat `tool_calls` streaming
    into one `StreamEvent` enum. A Mock provider enables keyless end-to-end
-   runs. The Responses adapter passes Codex-style vendor out-of-band
-   events — `codex.*` telemetry (e.g. `codex.rate_limits`) and the `keepalive`
-   heartbeat such a proxy emits while the model is thinking — through as a no-op
-   both before and after the terminal, mirroring Anthropic's `ping`. Every
-   other unknown SSE event still fails closed, naming the event. Responses function-call
+   runs. Responses 将已知带外事件 `codex.*`、`responsesapi.*` 与 `keepalive`
+   作为无操作处理。响应内的 `response.metadata` 必须携带当前已建立的 `response_id`
+   和对象型 `metadata`；校验后丢弃，不产生正文、工具、reasoning、终态或 usage，
+   也不能借它建立或更换响应身份。其他未知 SSE 事件继续拒绝并给出事件名。
+   Responses function-call
    arguments are reconciled by JSON value (the proxy may stream compact deltas
    but echo a pretty-printed `.done`), and a call whose arguments were never
    streamed — a relay delivering the whole object only in `.done` — takes that
@@ -3262,8 +3262,8 @@ and the reminder cannot disagree about what the list says.
 plan 120 第六、七节已经纠正早期解释。round 边界保证请求期间不做部分写入，
 不插进同一轮的 `tool_result` 块中。Mock 端到端回归逐轮检查旧 messages 的序列化
 字节仍是下次请求的前缀，并检查 system/tools/cache key 不变；它证明请求形状，
-不保证真实网关的缓存行为。Plan 190 的追加记录另列多模型真实使用观察与仍待执行的
-同任务受控对照。
+不保证真实网关的缓存行为。Plan 190 分别记录多模型真实使用观察、同任务新旧对照
+和固定轨迹的真实 usage；输入前缀稳定也不等于模型一定会建表或及时更新。
 
 Due means the list has stood still for 8 boundaries **and** this revision has
 not been announced yet — one rule, no second clock. A write resets the count,
