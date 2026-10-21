@@ -127,10 +127,12 @@ pub fn panel_lines(panel: &Panel, width: usize, max_rows: usize, scroll: usize) 
     let (choices, choices_clipped, editor_position) = if let Some(editor) = &panel.editor {
         let cursor_row = usize::from(editor.cursor_row);
         let start = cursor_row.saturating_sub(choice_budget.saturating_sub(1));
-        let (rows, start, above, below) = window_lines(&editor.rows, start, choice_budget);
+        let (rows, start, ..) = window_lines(&editor.rows, start, choice_budget);
         let position =
             (!rows.is_empty()).then_some((cursor_row - start, usize::from(editor.cursor_col)));
-        (vec![rows], above || below, position)
+        // Editor rows are not the body: the window follows the cursor, and the
+        // Other phase binds no page keys, so their clipping is not a scroll cue.
+        (vec![rows], false, position)
     } else {
         let (choices, clipped) =
             window_choices(&choice_rows(panel, width), panel.cursor, choice_budget);
@@ -182,8 +184,9 @@ pub fn panel_lines(panel: &Panel, width: usize, max_rows: usize, scroll: usize) 
     }
     if hint_rows == 1 {
         // The body's scroll affordance rides on the hint rather than a border:
-        // the panel has none.
-        let hint = if more_above || more_below {
+        // the panel has none. Only a list phase binds PgUp/PgDn, so the editor
+        // never advertises them even when the preview body is clipped.
+        let hint = if panel.editor.is_none() && (more_above || more_below) {
             format!("{} · PgUp/PgDn scroll", panel.hint)
         } else {
             panel.hint.clone()
@@ -607,6 +610,34 @@ mod tests {
         assert_eq!(
             (texts(&layout)[row].as_str(), column),
             ("              ", 14)
+        );
+    }
+
+    /// The Other phase binds no page keys, so a clipped editor — and the
+    /// preview body a multi-select can leave behind — must not advertise them.
+    #[test]
+    fn the_editor_hint_never_advertises_page_scrolling() {
+        let mut panel = panel();
+        panel.body.clear();
+        panel.subject.clear();
+        panel.prompt = None;
+        let mut editor = crate::composer::Composer::new();
+        editor.insert_text(&"长回答 ".repeat(40));
+        panel.editor = Some(editor.view_with_prefix(40, QUESTION_PREFIX, Style::new().fg(BRAND)));
+        // Cramped panels clip the editor window itself around the cursor.
+        for height in 2..=15 {
+            let rows = texts(&panel_lines(&panel, 40, height, 0));
+            assert!(
+                !rows.iter().any(|row| row.contains("PgUp/PgDn")),
+                "height {height}: {rows:?}"
+            );
+        }
+        // A roomy panel clips the preview body instead: same answer.
+        panel.body = (1..=20).map(|i| Line::from(format!("line {i}"))).collect();
+        let rows = texts(&panel_lines(&panel, 40, 20, 0));
+        assert!(
+            !rows.iter().any(|row| row.contains("PgUp/PgDn")),
+            "{rows:?}"
         );
     }
 
