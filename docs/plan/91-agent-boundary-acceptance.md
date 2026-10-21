@@ -6,17 +6,20 @@
 
 ## Context
 
-Plan 87–90 与 Plan 92 分别收口 deferred capability binding、child route provenance、provider terminal/reasoning continuity、MCP readiness 和显式 session provider route transition。它们完成后仍需要一个只做跨面验收的计划，证明这些内部契约在 resume、fork、compaction、worktree 切换、child lifecycle、tool refresh、provider fallback 和 provider switch 后保持一致，并且 CLI、TUI、plain、headless、native server 不各自重新解释内部状态。
+Plan 87–90 与 Plan 92 分别收口 deferred capability binding、child route provenance、provider terminal/reasoning continuity、MCP readiness 和显式 session provider route transition。它们完成后仍需要一个只做跨面验收的计划，证明这些内部契约在 resume、fork、compaction、worktree 切换、child lifecycle、tool refresh 和 provider switch 后保持一致，并且 CLI、TUI、plain、headless、native server 不各自重新解释内部状态。
 
 本计划不承载新的领域实现，只建立 deterministic conformance 和 public-boundary acceptance；不把未执行的真实 provider、Linux sandbox、Windows、Desktop 或物理终端写成通过。
 
 ## 契约与范围
 
+本节与完成标准按当前契约验收：Plan 158 已删除 fallback，历史验收记录中的 fallback
+只保留为当时基线，不再列为待验收项，也不为满足旧清单恢复实现或 witness。
+
 ### 本次吸收
 
 1. 验证 discovery/unlock receipt 的 Workspace/worktree/policy/authority/source-generation binding，在 refresh、workspace switch、fork、resume、compaction、child clone 后 stale 时 fail closed。
 2. 验证 Agent/Program/Workflow/mailbox/background execution 的 route/provenance identity 与 terminal owner 不混淆；late delivery、duplicate terminal、resume/fork lineage 和 root Task ownership 不回归。
-3. 验证 provider typed terminal、incomplete/reasoning continuity、tool pairing、fallback/continuation、显式 provider route transition 和 Plan 81 usage record 边界一致；incomplete 不成为成功 history，只有 durable user switch 可生成 lossy request view，usage 不重复记账。
+3. 验证 provider typed terminal、incomplete/reasoning continuity、tool pairing、retry/continuation、显式 provider route transition 和 Plan 81 usage record 边界一致；incomplete 不成为成功 history，只有 durable user switch 可生成 lossy request view，usage 不重复记账。
 4. 验证 MCP configured/planned/starting/ready/degraded/failed/stale receipt、catalog generation、auth availability、resource read 和 tool call 的 failure semantics 一致；MCP failure 不伪装成 missing tool。
 5. CLI/TUI/plain/headless/native server 只消费 bounded stable projection，不暴露 raw receipt、secret、opaque reasoning 或内部 registry；公共 protocol、snapshot、generation/sequence shape 不扩张。
 
@@ -48,7 +51,7 @@ Plan 91 必须在领域契约稳定后才能收口；如果提前合并，验收
 
 ## 完成标准
 
-- Plan 87–90、92 的跨面负契约在 resume/fork/compaction/worktree/child/refresh/fallback/provider-switch 生命周期全覆盖。
+- Plan 87–90、92 的跨面负契约在 resume/fork/compaction/worktree/child/refresh/provider-switch 生命周期全覆盖。
 - capability、execution provenance、provider terminal、provider route、MCP readiness 五类内部事实的 owner、scope、generation/revision、terminal、failure 和 public projection 不互相冒充。
 - CLI/TUI/plain/headless/native server wire shape 保持既有边界；无 secret/raw reasoning/second truth。
 - 完成记录准确区分 Darwin 本地、mock、真实 provider、Linux/Windows/Desktop/物理 terminal 未执行项；不新增依赖、不修改 Desktop、不 push。
@@ -94,3 +97,9 @@ Plan 91 必须在领域契约稳定后才能收口；如果提前合并，验收
 没有重新执行；Program/Workflow、scheduler/autowake 等沿用共同冻结/调度 seam 与 owner
 回归，不声称本次逐项跑过所有控制面和生命周期的组合。Linux/Windows/Desktop/实体终端
 未执行的边界保持不变。
+
+### 文档一致性修订（2026-10-21）
+
+从 Context、契约范围和完成标准中移除已被 Plan 158 删除的 fallback 要求，与 Plan 92
+当前验收口径一致；历史记录保留。仅修订文档，核对完整差异、工作区和暂存区 diff check，
+不编译、不跑测试。修订提交号以本节所在提交为准，原验收结论和未执行边界不变。
