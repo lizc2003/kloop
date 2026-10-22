@@ -1005,8 +1005,11 @@ Bash checks literal plus canonical paths before sandbox/read-only/bypass.
 才免于被当作读取目标；支持 find 的括号、否定、与/或、隐式与和多个模式，以及
 grep/rg 的 `-e`/`--regexp` 与 `-f`/`--file` 两种模式来源。搜索根（含 BSD `-f`）、
 模式文件（`-f`/`--file`）、`--ignore-file`、`--exclude-from`、`--files0-from`、
-`--fromfile`、`-newer`/`-samefile` 的参考文件等仍走原文与规范路径检查；附着在
-`--opt=value` 或 `-Xvalue` 里的值按同一角色处理。`echo`/`printf` 的参数只是文本，
+`-newer`/`-samefile` 的参考文件等仍走原文与规范路径检查。`tree --fromfile` 是
+无参数开关，启用后所有位置参数仍作为输入路径检查，不消耗其后的选项或 `--`。
+附着在 `--opt=value` 或 `-Xvalue` 里的值按命令支持的语法与角色处理；tree 的
+`-L<n>` 接受十进制数字，其它带操作数的短选项若后面仍有字符，整条调用退回逐参数
+检查，避免把 `-Ia` 误当成附着模式。`echo`/`printf` 的参数只是文本，
 不参与路径检查。未知命令、未知选项、缺参、不完整表达式或执行/写入动作不获豁免，
 退回逐参数检查；`sed`/`awk`/解释器的程序文本继续整体扫描。整条 Bash 原文的敏感
 路径匹配也保留优先级。该区分不改变 deny、ask 或只读分类器，不是通用 shell

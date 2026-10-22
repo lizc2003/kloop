@@ -1605,6 +1605,9 @@ mod tests {
                 "rg --glob='!**/.git/*' TODO .",
                 "du -sh --exclude=./.git .",
                 "tree -I .git",
+                "tree -aI .git",
+                "tree -L2 -I .git",
+                "tree --fromfile -I .git paths.txt",
                 "echo .env",
             ] {
                 for sandbox_auto_allow in [false, true] {
@@ -1612,6 +1615,32 @@ mod tests {
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
                         Ok(None),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tree_option_boundaries_keep_sensitive_inputs_blocked() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "tree --fromfile -I -P .env",
+                "tree --fromfile README.md -Ia -P .env",
+                "tree --fromfile -- -P .env",
+                "tree --fromfile -I .git README.md .env",
+                "tree -Ia -P .git",
+                "tree --fromfile README.md -La 1 -I -P .env",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Err("bash: reading this sensitive path is blocked. Do not retry or work around the protection.".to_string()),
                         "{mode:?}: {command}"
                     );
                 }

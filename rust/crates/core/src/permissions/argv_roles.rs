@@ -48,9 +48,16 @@ enum Operand {
     NoPattern,
 }
 
+enum ShortOperands {
+    AttachedOrNext,
+    /// tree 只有 -L 接受附着的十进制数字；其它带操作数的组合退回全参数检查。
+    Tree,
+}
+
 struct Spec {
     short: fn(char) -> Option<Operand>,
     long: fn(&str) -> Option<Operand>,
+    short_operands: ShortOperands,
     /// grep 的 `-5` 是 `-C 5` 的简写：纯数字短参数不消耗操作数。
     digits_are_context: bool,
 }
@@ -149,7 +156,15 @@ fn option_paths<'a>(
                 consumed_next = true;
                 argv.get(index + 1)?.as_str()
             } else {
-                rest
+                match spec.short_operands {
+                    ShortOperands::AttachedOrNext => rest,
+                    ShortOperands::Tree
+                        if ch == 'L' && rest.chars().all(|c| c.is_ascii_digit()) =>
+                    {
+                        rest
+                    }
+                    ShortOperands::Tree => return None,
+                }
             };
             pattern_source |= matches!(role, Operand::Pattern | Operand::PatternPath);
             if matches!(role, Operand::Path | Operand::PatternPath) {
@@ -284,6 +299,7 @@ fn is_find_optimization_level(arg: &str) -> bool {
 const GREP: Spec = Spec {
     short: grep_short,
     long: grep_long,
+    short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: true,
 };
 
@@ -350,6 +366,7 @@ fn grep_long(name: &str) -> Option<Operand> {
 const RG: Spec = Spec {
     short: rg_short,
     long: rg_long,
+    short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: false,
 };
 
@@ -471,6 +488,7 @@ fn rg_long(name: &str) -> Option<Operand> {
 const DU: Spec = Spec {
     short: du_short,
     long: du_long,
+    short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: false,
 };
 
@@ -500,6 +518,7 @@ fn du_long(name: &str) -> Option<Operand> {
 const TREE: Spec = Spec {
     short: tree_short,
     long: tree_long,
+    short_operands: ShortOperands::Tree,
     digits_are_context: false,
 };
 
@@ -517,10 +536,10 @@ fn tree_long(name: &str) -> Option<Operand> {
     match name {
         "ignore" | "match" | "level" | "title" | "baseHREF" | "charset" | "filelimit"
         | "timefmt" | "sort" => Some(Operand::Literal),
-        "fromfile" | "outfile" => Some(Operand::Path),
+        "outfile" => Some(Operand::Path),
         "all" | "ansi" | "color" | "device" | "dirs-only" | "dirsfirst" | "du" | "full-path"
-        | "gitignore" | "help" | "inodes" | "json" | "no-indent" | "nocolor" | "noreport"
-        | "prune" | "quote" | "version" | "xml" => Some(Operand::None),
+        | "fromfile" | "gitignore" | "help" | "inodes" | "json" | "no-indent" | "nocolor"
+        | "noreport" | "prune" | "quote" | "version" | "xml" => Some(Operand::None),
         _ => None,
     }
 }
@@ -642,6 +661,36 @@ mod tests {
             Some(&["./.git/config"]),
         );
         assert_paths(&["tree", "-o", "out.txt", "."], None);
+    }
+
+    #[test]
+    fn tree_fromfile_preserves_input_paths_and_option_boundaries() {
+        assert_paths(&["tree", "--fromfile"], Some(&[]));
+        assert_paths(&["tree", "--fromfile", "-I", "-P", ".env"], Some(&[".env"]));
+        assert_paths(
+            &["tree", "--fromfile", "--", "-P", ".env"],
+            Some(&["-P", ".env"]),
+        );
+        assert_paths(
+            &["tree", "--fromfile", "-I", ".git", "paths.txt", ".env"],
+            Some(&["paths.txt", ".env"]),
+        );
+        assert_paths(&["tree", "--fromfile", "-I"], None);
+    }
+
+    #[test]
+    fn tree_short_operands_do_not_use_getopt_attachment_rules() {
+        assert_paths(&["tree", "-aI", ".git", "src"], Some(&["src"]));
+        assert_paths(&["tree", "-L2", "-I", ".git", "src"], Some(&["src"]));
+        for words in [
+            vec!["tree", "-Ia", "-P", ".git"],
+            vec!["tree", "--fromfile", "paths.txt", "-Ia", "-P", ".env"],
+            vec!["tree", "-La", "1", "-I", "-P", ".env"],
+            vec!["tree", "-I.git", "src"],
+            vec!["tree", "-L2a", "src"],
+        ] {
+            assert_paths(&words, None);
+        }
     }
 
     #[test]
