@@ -968,7 +968,11 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     // The mode badge carries the brand accent (CC's brand-coloured mode line);
     // the hints stay dim so only the badge draws the eye.
     let badge = format!("[{}]  ", app.mode.label());
-    let mut hints = if app.running {
+    let mut hints = if let Some(startup) = &app.startup {
+        // Startup owns the keyboard: the line says what is still pending and
+        // that quitting is the one live action.
+        format!("{startup} · Ctrl+C to exit")
+    } else if app.running {
         format!("{} · Ctrl+C to exit", esc_action(app))
     } else {
         "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
@@ -2751,6 +2755,26 @@ mod tests {
                 ("⋮".to_string(), DIM),
             ]
         );
+    }
+
+    /// Startup owns the footer until it finishes: the pending line replaces the
+    /// idle hints, still after the mode badge, and quitting stays advertised.
+    #[test]
+    fn footer_shows_startup_line_until_it_clears() {
+        let mut app = App::new("sess".into());
+        app.startup = Some("MCP connecting 1/2 · memory ready".into());
+
+        let footer = line_text(&footer_line(&app, 100));
+        assert!(footer.starts_with("[manual]  "), "{footer}");
+        assert!(
+            footer.contains("MCP connecting 1/2 · memory ready"),
+            "{footer}"
+        );
+        assert!(footer.contains("Ctrl+C to exit"), "{footer}");
+        assert!(!footer.contains("shift+Tab"), "{footer}");
+
+        app.startup = None;
+        assert!(line_text(&footer_line(&app, 100)).contains("shift+Tab"));
     }
 
     /// The footer leads with the mode badge and names shift+Tab when idle; the

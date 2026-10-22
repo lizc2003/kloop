@@ -1,5 +1,16 @@
 # HANDOFF — 当前状态与会话交接
 
+**TUI 先绘制、MCP 启动期间显示进度（2026-10-21）**：Plan 235 之后最慢那台
+MCP 仍让 TUI 黑屏。Plan 236 把握手挪到 `setup_terminal` 之后：首帧就画 banner
+和 `MCP connecting k/N · name`，连接期间除 Ctrl+C/Ctrl+D 外丢弃输入，第一轮
+turn 只在全部 server settle 后开始，因此首轮目录、`mcp_server_status/list`
+与就绪回执语义不变。resource 工具源改在 plan 阶段进入 sources，警告改走 note，
+启动任务退出时 abort。PTY 验收证明启动期间提交的输入没有到达 provider；
+`--plain/--headless/--serve` 路径未改。外层沙箱之外 `make check` 全绿（含本机
+parity；CLI 156、core 1133、TUI 282、TUI PTY 22）。首轮全量时 core 的
+hooks/shell_env 11 条在并行负载下失败，单跑与复跑均绿，与本改动无调用关系。
+提交号以本条所在提交为准，教训 249。
+
 **MCP 启动并发连接（2026-10-21）**：用户反馈配置多台 MCP 后启动慢。根因是
 `connect_servers` 逐台 `await`（`initialize` 与 `tools/list` 各有 30s 上限），
 且连接在任何前端启动之前完成，总时延是各台握手时间的累加。改为 `join_all`
@@ -2892,3 +2903,17 @@ push 会把它们变成不确定的。验证要用“先红后绿”：两个各
 串行实测 2.03s、并发约 1.0s；只断言“能连上”没有区分力。边界也要说清：并发后
 总时延 = 最慢一台，单台慢 server（如 `npx` 冷启动）仍占它自己的握手时间；
 后台懒连接会改变首轮工具目录与 `mcp_server_status/list` 启动快照的语义，是另一件事。
+
+249. **感知延迟和语义延迟要分开处理：先画出界面，不等于先开 turn。** Plan 235
+把 N 台 MCP 的握手从求和变成取最大值，但最慢那台仍让 TUI 黑屏等待。Plan 236 把
+握手挪到 `setup_terminal` 之后：先画 banner 和 `MCP connecting k/N`，但给输入加
+一道门——启动行存在时除 Ctrl+C/Ctrl+D 外全部丢弃，第一轮 turn 只能在所有 server
+settle 后开始。这样首轮工具目录仍是完整快照，`mcp_server_status/list` 与就绪回执
+的语义一个都不用动。实现上有三个容易漏的点：(a) 提前构建的 `Config` 拿的是
+sources 的 Vec 快照，晚到的源不会自己进来——resource 工具源必须在 plan 阶段就
+加进去，server 源则靠 Arc 的内部状态在连接后变 ready；(b) 启动行用 watch 通道
+而不是事件队列，任务结束或发送端被丢弃就是“完成”，panic 也不会把键盘永久锁死；
+(c) 连接移到 viewport 之后，警告不能再走 eprintln，必须转成前端 note，否则会写坏
+界面。验收要断言“启动期间提交的输入没有到达 provider”，只看屏幕上出现过启动行
+区分不出是否真的挡住了 turn；PTY 里用户消息会带注入的 reminder，断言应匹配输入
+子串而不是整段相等。边界照旧：慢 server 仍让会话晚可用，只是可见、可退出。

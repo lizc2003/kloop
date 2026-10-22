@@ -194,6 +194,69 @@ pub fn sse_tool_call(id: &str, name: &str, arguments: &Value) -> String {
     format!("data: {delta}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
 }
 
+/// A minimal MCP HTTP server whose handshake can be delayed, so a PTY test can
+/// watch the TUI's startup line while the client is still connecting.
+pub struct McpFixture {
+    server: MockServer,
+}
+
+impl McpFixture {
+    pub async fn start(delay: Duration) -> Self {
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "initialize"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("mcp-session-id", "pty-session")
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": {"name": "pty-fixture", "version": "1"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "tools/list"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "result": {"tools": []}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Self { server }
+    }
+
+    pub fn uri(&self) -> String {
+        self.server.uri()
+    }
+}
+
 /// What a spawn varies beyond size. [`PtyHarness::spawn`] and
 /// [`PtyHarness::spawn_with_args`] stay the short forms for the common cases.
 #[derive(Default)]

@@ -93,6 +93,10 @@ struct ProcessState {
     runtime: Arc<RuntimeSettings>,
     tool_sources: Vec<Arc<dyn ToolSource>>,
     mcp_statuses: Vec<kloop_server::McpServerStatus>,
+    /// Set only by the TUI path: sources exist and read as starting, but the
+    /// handshakes run after the terminal owns the screen. Every other
+    /// front-end connects before it starts.
+    mcp_startup: Option<mcp::McpStartup>,
 }
 
 impl ProcessState {
@@ -106,11 +110,18 @@ impl ProcessState {
         for warning in runtime.shell_warnings() {
             eprintln!("\x1b[2m[{warning}]\x1b[0m");
         }
-        // MCP servers connect once per process (before any UI owns the terminal)
-        // and are shared into every Config — including all server-mode threads.
-        // --mock stays hermetic: no child processes, no network-backed tools.
-        let (tool_sources, mcp_statuses, mcp_lifecycle) = if args.mock {
-            (Vec::new(), Vec::new(), mcp::McpLifecycleOwner::default())
+        // MCP servers connect once per process and are shared into every
+        // Config — including all server-mode threads. --mock stays hermetic: no
+        // child processes, no network-backed tools. The TUI defers the
+        // handshakes so it can paint its banner and a progress line first;
+        // plain/headless/serve have nothing to show until the catalog settles.
+        let (tool_sources, mcp_statuses, mcp_lifecycle, mcp_startup) = if args.mock {
+            (
+                Vec::new(),
+                Vec::new(),
+                mcp::McpLifecycleOwner::default(),
+                None,
+            )
         } else {
             let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
             // Web tools ride the same ToolSource seam, registered before MCP so
@@ -119,20 +130,32 @@ impl ProcessState {
             let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
             sources.extend(web::build_web_source(&web_cfg, &warn));
             let servers = mcp::load_mcp_servers(user_config.table())?;
-            let mcp::McpConnections {
-                sources: mcp_sources,
-                statuses,
-                lifecycle,
-            } = mcp::connect_servers(servers, &warn).await?;
-            sources.extend(mcp_sources);
-            for warning in tool_merge_warnings(
-                &sources,
-                runtime.defer_threshold(),
-                runtime.shell_programs(),
-            ) {
-                warn(&warning);
+            if args.serve || args.plain || args.headless {
+                let mcp::McpConnections {
+                    sources: mcp_sources,
+                    statuses,
+                    lifecycle,
+                } = mcp::connect_servers(servers, &warn).await?;
+                sources.extend(mcp_sources);
+                for warning in tool_merge_warnings(
+                    &sources,
+                    runtime.defer_threshold(),
+                    runtime.shell_programs(),
+                ) {
+                    warn(&warning);
+                }
+                (sources, statuses, lifecycle, None)
+            } else if servers.is_empty() {
+                // No MCP servers: nothing to defer, so no startup gate either.
+                (sources, Vec::new(), mcp::McpLifecycleOwner::default(), None)
+            } else {
+                let startup = mcp::McpStartup::plan(servers)?;
+                let lifecycle = startup.lifecycle();
+                // The merge warnings need the settled catalogs, so the TUI task
+                // runs them after connecting; here the sources are only planned.
+                sources.extend(startup.sources());
+                (sources, Vec::new(), lifecycle, Some(startup))
             }
-            (sources, statuses, lifecycle)
         };
         Ok((
             Self {
@@ -140,6 +163,7 @@ impl ProcessState {
                 runtime,
                 tool_sources,
                 mcp_statuses,
+                mcp_startup,
             },
             mcp_lifecycle,
         ))
@@ -568,18 +592,72 @@ async fn run_tui(
         session_dirs,
         pending_images,
     } = session;
+    let ProcessState {
+        provider,
+        runtime,
+        tool_sources,
+        mcp_statuses: _,
+        mcp_startup,
+    } = process;
     let factory_session_id = session_id.clone();
     let worktree = args.worktree.clone();
+    // The TUI paints first and connects MCP afterwards, so its label appears on
+    // the opening frame. Warnings become notes (stderr would fight the
+    // viewport); the deferred merge pass runs only once the catalogs exist.
+    let startup = mcp_startup.map(|startup| {
+        let server_count = startup.server_count();
+        let merge_sources = tool_sources.clone();
+        let defer_threshold = runtime.defer_threshold();
+        let shell_programs = runtime.shell_programs().clone();
+        kloop_tui::StartupTask {
+            label: format!("MCP connecting {server_count} server(s)…"),
+            run: Box::new(move |reporter| {
+                Box::pin(async move {
+                    let warn_reporter = reporter.clone();
+                    let warn = move |line: &str| warn_reporter.note(line);
+                    let progress_reporter = reporter.clone();
+                    let progress = move |progress: mcp::McpStartupProgress<'_>| {
+                        progress_reporter.line(Some(format!(
+                            "MCP connecting {}/{total} · {} {}",
+                            progress.done,
+                            progress.name,
+                            if progress.connected {
+                                "ready"
+                            } else {
+                                "failed"
+                            },
+                            total = progress.total,
+                        )));
+                    };
+                    match startup.connect(&warn, Some(&progress)).await {
+                        Ok(_) => {
+                            for warning in tool_merge_warnings(
+                                &merge_sources,
+                                defer_threshold,
+                                &shell_programs,
+                            ) {
+                                reporter.note(&warning);
+                            }
+                        }
+                        Err(error) => {
+                            reporter.note(&format!("MCP startup failed: {error:#}"));
+                        }
+                    }
+                    reporter.line(None);
+                })
+            }),
+        }
+    });
     kloop_tui::run(
         move |approver, questioner, notify| {
             let mut cfg = config_from_settings(
                 &args,
-                &process.provider,
-                &process.runtime,
+                &provider,
+                &runtime,
                 approver,
                 Some(questioner),
                 notify,
-                &process.tool_sources,
+                &tool_sources,
                 &project,
                 sandbox.clone(),
                 skills.clone(),
@@ -590,6 +668,7 @@ async fn run_tui(
             cfg.bind_session(factory_session_id.clone())?;
             Ok(cfg)
         },
+        startup,
         history,
         session_id,
         pending_images,

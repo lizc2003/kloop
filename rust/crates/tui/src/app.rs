@@ -539,6 +539,9 @@ pub struct App {
     /// because `ContentBlock` isn't `Eq` (Command derives it).
     submit_images: Vec<ContentBlock>,
     pub running: bool,
+    /// A startup task still owns the keyboard; the footer shows this line
+    /// instead of the idle hints, and input is ignored except for quitting.
+    pub startup: Option<String>,
     pub interactions: VecDeque<PendingInteraction>,
     /// Scroll offset (in display lines) into the active choice panel's body, so
     /// a diff or plan taller than the panel can be read in full. Reset to 0 when
@@ -628,6 +631,7 @@ impl App {
             composer: Composer::new(),
             submit_images: Vec::new(),
             running: false,
+            startup: None,
             interactions: VecDeque::new(),
             panel_scroll: 0,
             last_note: None,

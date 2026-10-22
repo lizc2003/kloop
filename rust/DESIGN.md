@@ -1879,6 +1879,19 @@ fallback. Stdio EOF/read/write failure and request timeout publish a bounded
 health transition, fail all pending requests, and close the matching refresh
 worker; dropping a cancelled request also removes its pending route immediately.
 
+The TUI splits "the screen is up" from "the first turn may run". Its `Config` is
+built over planned sources (each server source plus the shared resource helpers,
+which read `Starting` until their handshake settles), the first frame carries a
+`MCP connecting k/N` footer line, and the handshakes run against the live
+terminal so a slow server is visible instead of a blank start. Input is ignored
+while that line is present — except the quit chords — so no turn or slash
+command can run against a half-known catalog: the first turn still sees the
+complete snapshot, and `mcp_server_status/list` keeps its startup-snapshot
+contract. Warnings from the deferred connect go to the transcript as notes
+(stderr would fight the viewport), and the tool-merge pass runs once the
+catalogs exist. Plain, headless and server mode still connect before they start,
+because they have nothing to show until the catalog settles.
+
 Each configured server has one source-owned, in-memory readiness receipt. It
 binds the server identity and a secret-free endpoint digest to auth availability,
 capability summary, catalog generation, monotonic readiness revision, refresh

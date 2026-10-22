@@ -108,7 +108,8 @@ fn classify_startup_failure(
     (failed_auth, failure)
 }
 
-/// Planning state for one server plus the result of its concurrent connect.
+/// One configured server's startup work: the immutable planning state (built in
+/// config order) plus whatever the concurrent connect produced.
 struct ServerStartup {
     server: McpServerConfig,
     source: Arc<McpToolSource>,
@@ -116,6 +117,28 @@ struct ServerStartup {
     startup_auth: Option<McpAuthAvailability>,
     oauth_status_session: Option<Arc<OAuthSession>>,
     outcome: Result<ConnectedServer>,
+}
+
+/// Everything one server needs before its handshake can start. Split from the
+/// connect so a front-end can build its config from the planned sources first
+/// and only then wait for the network.
+struct ServerPlan {
+    server: McpServerConfig,
+    source: Arc<McpToolSource>,
+    oauth_capable: bool,
+    startup_auth: Option<McpAuthAvailability>,
+    oauth_status_session: Option<Arc<OAuthSession>>,
+    oauth_session: Result<Option<Arc<OAuthSession>>>,
+}
+
+/// One server reaching a terminal startup state, in completion order. The TUI
+/// renders this as its startup line; `done` counts settlements, not tools.
+#[derive(Clone, Copy, Debug)]
+pub struct McpStartupProgress<'a> {
+    pub done: usize,
+    pub total: usize,
+    pub name: &'a str,
+    pub connected: bool,
 }
 
 /// What a successful connection hands to the ordered post-processing pass.
@@ -128,15 +151,24 @@ struct ConnectedServer {
     advertised: Vec<ToolDef>,
 }
 
+/// Shared progress sink for concurrently polled connects: completion order is
+/// the order servers settle, so a single atomic counter is enough.
+struct ProgressSink<'a> {
+    callback: &'a (dyn Fn(McpStartupProgress<'_>) + Sync),
+    done: &'a std::sync::atomic::AtomicUsize,
+    total: usize,
+}
+
 /// Spawn + handshake + tool discovery for one planned server.
-async fn connect_one(
-    server: McpServerConfig,
-    source: Arc<McpToolSource>,
-    oauth_capable: bool,
-    startup_auth: Option<McpAuthAvailability>,
-    oauth_status_session: Option<Arc<OAuthSession>>,
-    oauth_session: Result<Option<Arc<OAuthSession>>>,
-) -> ServerStartup {
+async fn connect_one(plan: ServerPlan, progress: Option<&ProgressSink<'_>>) -> ServerStartup {
+    let ServerPlan {
+        server,
+        source,
+        oauth_capable,
+        startup_auth,
+        oauth_status_session,
+        oauth_session,
+    } = plan;
     let outcome = async {
         let (client, oauth) = match &server.transport {
             McpTransport::Stdio { command, env } => (McpClient::spawn(command, env)?, None),
@@ -169,6 +201,18 @@ async fn connect_one(
         })
     }
     .await;
+    if let Some(progress) = progress {
+        let done = progress
+            .done
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        (progress.callback)(McpStartupProgress {
+            done,
+            total: progress.total,
+            name: &server.name,
+            connected: outcome.is_ok(),
+        });
+    }
     ServerStartup {
         server,
         source,
@@ -179,171 +223,243 @@ async fn connect_one(
     }
 }
 
-/// Spawn + handshake + tool discovery for every configured server. Servers are
-/// connected concurrently, so a slow or hanging one costs only its own timeout
-/// instead of every later server's too. Results are folded back in
-/// configuration order because tool-name collision precedence and the warning
-/// stream depend on it. A failing server degrades to a warning but retains a
-/// source-owned unavailable route.
-pub async fn connect_servers(
-    servers: Vec<McpServerConfig>,
-    warn: &dyn Fn(&str),
-) -> Result<McpConnections> {
-    let store = Arc::new(CredentialStore::default_path()?);
-    let lifecycle = McpLifecycleOwner::default();
-    let mut resource_servers = Vec::new();
-    let mut startups = Vec::new();
-    for server in servers {
-        let source = McpToolSource::planned(&server);
-        lifecycle.register_source(source.clone());
-        source.starting();
-        resource_servers.push(McpResourceServer {
-            name: server.name.clone(),
-            source: source.clone(),
-        });
-        // A remote server with no static bearer takes the OAuth path: use a
-        // stored token if the user has logged in; else connect unauthenticated
-        // and, if that's rejected, point them at the login command.
-        let oauth_capable = matches!(
-            &server.transport,
-            McpTransport::Http {
-                bearer_token: None,
-                ..
-            }
-        );
-        let oauth_session = match &server.transport {
-            McpTransport::Http {
-                url,
-                bearer_token: None,
-                ..
-            } => store.session_for(&server.name, url),
-            _ => Ok(None),
-        };
-        let startup_auth = if oauth_capable {
-            Some(match &oauth_session {
-                Ok(Some(_)) => McpAuthAvailability::OAuthAvailable,
-                Ok(None) | Err(_) => McpAuthAvailability::LoginRequired,
-            })
-        } else {
-            None
-        };
-        let oauth_status_session = oauth_session
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .cloned();
-        startups.push(connect_one(
-            server,
-            source,
-            oauth_capable,
-            startup_auth,
-            oauth_status_session,
-            oauth_session,
-        ));
+/// Planned MCP startup: sources exist and read as `Starting`, but no process or
+/// request has been started yet. A front-end can build a `Config` over these
+/// sources immediately and connect afterwards; the same `Arc`s become ready in
+/// place, so later rounds see the catalog without rebuilding the config.
+pub struct McpStartup {
+    lifecycle: McpLifecycleOwner,
+    plans: Vec<ServerPlan>,
+    sources: Vec<Arc<dyn ToolSource>>,
+}
+
+impl McpStartup {
+    pub fn plan(servers: Vec<McpServerConfig>) -> Result<Self> {
+        let store = Arc::new(CredentialStore::default_path()?);
+        let lifecycle = McpLifecycleOwner::default();
+        let mut resource_servers = Vec::new();
+        let mut plans = Vec::new();
+        let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+        for server in servers {
+            let source = McpToolSource::planned(&server);
+            lifecycle.register_source(source.clone());
+            source.starting();
+            resource_servers.push(McpResourceServer {
+                name: server.name.clone(),
+                source: source.clone(),
+            });
+            sources.push(source.clone());
+            // A remote server with no static bearer takes the OAuth path: use a
+            // stored token if the user has logged in; else connect
+            // unauthenticated and, if that's rejected, point them at the login
+            // command.
+            let oauth_capable = matches!(
+                &server.transport,
+                McpTransport::Http {
+                    bearer_token: None,
+                    ..
+                }
+            );
+            let oauth_session = match &server.transport {
+                McpTransport::Http {
+                    url,
+                    bearer_token: None,
+                    ..
+                } => store.session_for(&server.name, url),
+                _ => Ok(None),
+            };
+            let startup_auth = if oauth_capable {
+                Some(match &oauth_session {
+                    Ok(Some(_)) => McpAuthAvailability::OAuthAvailable,
+                    Ok(None) | Err(_) => McpAuthAvailability::LoginRequired,
+                })
+            } else {
+                None
+            };
+            let oauth_status_session = oauth_session
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .cloned();
+            plans.push(ServerPlan {
+                server,
+                source,
+                oauth_capable,
+                startup_auth,
+                oauth_status_session,
+                oauth_session,
+            });
+        }
+        if !resource_servers.is_empty() {
+            sources.push(Arc::new(McpResourceSource::new(resource_servers)));
+        }
+        Ok(Self {
+            lifecycle,
+            plans,
+            sources,
+        })
     }
-    let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
-    let mut statuses = Vec::new();
-    for startup in futures::future::join_all(startups).await {
-        let ServerStartup {
-            server,
-            source,
-            oauth_capable,
-            startup_auth,
-            oauth_status_session,
-            outcome,
-        } = startup;
-        let transport = server.transport.kind();
-        match outcome {
-            Ok(ConnectedServer {
-                client,
-                oauth,
-                capabilities,
-                notifications,
-                health,
-                advertised,
-            }) => {
-                let count = advertised.len();
-                let has_notifications = notifications.is_some();
-                source.ready(
+
+    /// The sources a `Config` built before connecting must hold: one per server
+    /// in configuration order, then the resource helpers. Pre-creating the
+    /// resource source is what lets a pre-connect config keep its routes.
+    pub fn sources(&self) -> Vec<Arc<dyn ToolSource>> {
+        self.sources.clone()
+    }
+
+    pub fn server_count(&self) -> usize {
+        self.plans.len()
+    }
+
+    pub fn lifecycle(&self) -> McpLifecycleOwner {
+        self.lifecycle.clone()
+    }
+
+    /// Spawn + handshake + tool discovery for every planned server. Servers are
+    /// connected concurrently, so a slow or hanging one costs only its own
+    /// timeout instead of every later server's too. Results are folded back in
+    /// configuration order because tool-name collision precedence and the
+    /// warning stream depend on it; `progress` fires in completion order for
+    /// front-ends that show startup movement. A failing server degrades to a
+    /// warning but retains a source-owned unavailable route.
+    pub async fn connect(
+        self,
+        warn: &(dyn Fn(&str) + Sync),
+        progress: Option<&(dyn Fn(McpStartupProgress<'_>) + Sync)>,
+    ) -> Result<McpConnections> {
+        let Self {
+            lifecycle,
+            plans,
+            sources,
+        } = self;
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let total = plans.len();
+        let sink = progress.map(|callback| ProgressSink {
+            callback,
+            done: &done,
+            total,
+        });
+        let startups = plans
+            .into_iter()
+            .map(|plan| connect_one(plan, sink.as_ref()));
+        let mut statuses = Vec::new();
+        for startup in futures::future::join_all(startups).await {
+            let ServerStartup {
+                server,
+                source,
+                oauth_capable,
+                startup_auth,
+                oauth_status_session,
+                outcome,
+            } = startup;
+            let transport = server.transport.kind();
+            match outcome {
+                Ok(ConnectedServer {
                     client,
                     oauth,
-                    capabilities.clone(),
+                    capabilities,
+                    notifications,
+                    health,
                     advertised,
-                    has_notifications,
-                    warn,
-                );
-                let tools = source
-                    .state
-                    .read()
-                    .unwrap()
-                    .catalog
-                    .defs
-                    .iter()
-                    .map(|def| McpToolInfo {
-                        name: def.name.clone(),
-                        description: def.description.clone(),
-                    })
-                    .collect();
-                let dynamic_message =
-                    dynamic_catalog_message(&capabilities, has_notifications).map(str::to_string);
-                if let Some(message) = &dynamic_message {
-                    warn(&format!("mcp server '{}': {message}", server.name));
+                }) => {
+                    let count = advertised.len();
+                    let has_notifications = notifications.is_some();
+                    source.ready(
+                        client,
+                        oauth,
+                        capabilities.clone(),
+                        advertised,
+                        has_notifications,
+                        warn,
+                    );
+                    let tools = source
+                        .state
+                        .read()
+                        .unwrap()
+                        .catalog
+                        .defs
+                        .iter()
+                        .map(|def| McpToolInfo {
+                            name: def.name.clone(),
+                            description: def.description.clone(),
+                        })
+                        .collect();
+                    let dynamic_message = dynamic_catalog_message(&capabilities, has_notifications)
+                        .map(str::to_string);
+                    if let Some(message) = &dynamic_message {
+                        warn(&format!("mcp server '{}': {message}", server.name));
+                    }
+                    warn(&format!(
+                        "mcp server '{}': connected, {count} tool(s)",
+                        server.name
+                    ));
+                    statuses.push(McpServerStatus {
+                        name: server.name.clone(),
+                        transport,
+                        state: McpServerState::Connected,
+                        tools,
+                        message: dynamic_message,
+                    });
+                    let source_closed = CancellationToken::new();
+                    if let Some(health) = health {
+                        spawn_health_monitor(
+                            &lifecycle,
+                            source.clone(),
+                            health,
+                            source_closed.clone(),
+                        );
+                    }
+                    if let Some(notifications) = notifications {
+                        spawn_tool_refresh(
+                            &lifecycle,
+                            source.clone(),
+                            notifications,
+                            source_closed,
+                        );
+                    }
                 }
-                warn(&format!(
-                    "mcp server '{}': connected, {count} tool(s)",
-                    server.name
-                ));
-                statuses.push(McpServerStatus {
-                    name: server.name.clone(),
-                    transport,
-                    state: McpServerState::Connected,
-                    tools,
-                    message: dynamic_message,
-                });
-                let source_closed = CancellationToken::new();
-                if let Some(health) = health {
-                    spawn_health_monitor(&lifecycle, source.clone(), health, source_closed.clone());
+                Err(error) => {
+                    let (failed_auth, failure) = classify_startup_failure(
+                        &server,
+                        &error,
+                        oauth_status_session.as_ref(),
+                        startup_auth,
+                    );
+                    source.startup_failed(failed_auth, failure);
+                    let hint = if oauth_capable {
+                        format!("; if it needs OAuth, run: kloop mcp login {}", server.name)
+                    } else {
+                        String::new()
+                    };
+                    warn(&format!("mcp server '{}' unavailable{hint}", server.name));
+                    statuses.push(McpServerStatus {
+                        name: server.name.clone(),
+                        transport,
+                        state: McpServerState::Unavailable,
+                        tools: Vec::new(),
+                        // Never reflect the raw anyhow chain onto the protocol or
+                        // warning stream: Desktop forwards stderr into the WebView,
+                        // and errors may quote URL credentials, commands, or env.
+                        message: Some("connection or tool discovery failed; see engine log".into()),
+                    });
                 }
-                if let Some(notifications) = notifications {
-                    spawn_tool_refresh(&lifecycle, source.clone(), notifications, source_closed);
-                }
-            }
-            Err(error) => {
-                let (failed_auth, failure) = classify_startup_failure(
-                    &server,
-                    &error,
-                    oauth_status_session.as_ref(),
-                    startup_auth,
-                );
-                source.startup_failed(failed_auth, failure);
-                let hint = if oauth_capable {
-                    format!("; if it needs OAuth, run: kloop mcp login {}", server.name)
-                } else {
-                    String::new()
-                };
-                warn(&format!("mcp server '{}' unavailable{hint}", server.name));
-                statuses.push(McpServerStatus {
-                    name: server.name.clone(),
-                    transport,
-                    state: McpServerState::Unavailable,
-                    tools: Vec::new(),
-                    // Never reflect the raw anyhow chain onto the protocol or
-                    // warning stream: Desktop forwards stderr into the WebView,
-                    // and errors may quote URL credentials, commands, or env.
-                    message: Some("connection or tool discovery failed; see engine log".into()),
-                });
             }
         }
-        sources.push(source);
+        Ok(McpConnections {
+            sources,
+            statuses,
+            lifecycle,
+        })
     }
-    if !resource_servers.is_empty() {
-        sources.push(Arc::new(McpResourceSource::new(resource_servers)));
-    }
-    Ok(McpConnections {
-        sources,
-        statuses,
-        lifecycle,
-    })
+}
+
+/// Plan and connect in one step, for front-ends that have nothing to show until
+/// the catalog is settled.
+pub async fn connect_servers(
+    servers: Vec<McpServerConfig>,
+    warn: &(dyn Fn(&str) + Sync),
+) -> Result<McpConnections> {
+    McpStartup::plan(servers)?.connect(warn, None).await
 }
 
 #[cfg(test)]
@@ -610,6 +726,63 @@ mod tests {
                 "mcp server 'alpha': connected, 0 tool(s)".to_string(),
                 "mcp server 'beta': connected, 0 tool(s)".to_string(),
             ]
+        );
+        connections.lifecycle.shutdown().await;
+    }
+
+    /// Plan first, connect later: the sources a pre-connect `Config` holds
+    /// already include the resource helpers, and progress follows completion
+    /// order while the folded statuses keep config order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planned_startup_publishes_progress_in_completion_order() {
+        use std::time::Duration;
+
+        const FAST: Duration = Duration::from_millis(150);
+        const SLOW: Duration = Duration::from_millis(600);
+        let slow = delayed_http_server(SLOW).await;
+        let fast = delayed_http_server(FAST).await;
+        let progress = std::sync::Mutex::new(Vec::new());
+        let record = |event: McpStartupProgress<'_>| {
+            progress.lock().unwrap().push((
+                event.done,
+                event.total,
+                event.name.to_string(),
+                event.connected,
+            ));
+        };
+
+        let startup = McpStartup::plan(vec![
+            static_bearer_server("slow", slow.uri()),
+            static_bearer_server("fast", fast.uri()),
+        ])
+        .unwrap();
+        assert_eq!(startup.server_count(), 2);
+        let planned_sources = startup.sources();
+        assert_eq!(
+            planned_sources.len(),
+            3,
+            "two server sources plus the shared resource helpers"
+        );
+
+        let connections = startup.connect(&|_| {}, Some(&record)).await.unwrap();
+        let progress = progress.lock().unwrap().clone();
+        assert_eq!(progress.len(), 2);
+        assert_eq!((progress[0].0, progress[0].2.as_str()), (1, "fast"));
+        assert_eq!((progress[1].0, progress[1].2.as_str()), (2, "slow"));
+        assert!(
+            progress
+                .iter()
+                .all(|(_, total, _, connected)| *total == 2 && *connected)
+        );
+        assert_eq!(
+            connections
+                .statuses
+                .iter()
+                .map(|status| status.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["slow", "fast"],
+            "statuses fold in config order, not completion order"
         );
         connections.lifecycle.shutdown().await;
     }

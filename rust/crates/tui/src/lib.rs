@@ -23,8 +23,10 @@ mod terminal;
 mod text_layout;
 mod toolrow;
 
+use std::future::Future;
 use std::io::Write as _;
 use std::ops::ControlFlow;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -45,6 +47,7 @@ use ratatui::Viewport;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use kloop_core::agent::EndReason;
@@ -81,6 +84,40 @@ use crate::terminal::insert_scrollback_blocks;
 /// CLI's plain mode prints these to stderr, the TUI routes them into the
 /// transcript as notes.
 pub type NoteFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// What a startup task's body returns: one owned future, run on its own task.
+pub type StartupFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Work the front-end must finish before it accepts input. It runs only after
+/// the terminal is set up, so the banner and [`Self::label`] are on screen while
+/// it works: a slow handshake reads as progress instead of a blank start.
+pub struct StartupTask {
+    /// The footer line shown from the first frame until the task reports or
+    /// finishes.
+    pub label: String,
+    /// The body. It reports through [`StartupReporter`] and must call
+    /// `line(None)` when it is done; dropping the reporter also releases the
+    /// keyboard, so an early return cannot leave the UI gated.
+    pub run: Box<dyn FnOnce(StartupReporter) -> StartupFuture + Send>,
+}
+
+/// The startup task's two outputs: notes join the transcript, a line replaces
+/// the footer status. `line(None)` clears it and hands the keyboard to the user.
+#[derive(Clone)]
+pub struct StartupReporter {
+    note: NoteFn,
+    line: Arc<dyn Fn(Option<String>) + Send + Sync>,
+}
+
+impl StartupReporter {
+    pub fn note(&self, message: &str) {
+        (self.note)(message);
+    }
+
+    pub fn line(&self, message: Option<String>) {
+        (self.line)(message);
+    }
+}
 
 struct Turn {
     text: String,
@@ -125,10 +162,13 @@ enum WorkerMsg {
 /// Run the TUI until the user quits. `make_config` is called once with the
 /// TUI's approver (the y/a/p/n popup) and note sink, so the caller can wire
 /// them into `Permissions` without this crate knowing about rule loading.
+/// `startup` is work that must settle before the first turn (the CLI uses it
+/// for MCP handshakes); it runs against the already-painted UI and gates input.
 /// `version` is the caller's build stamp for the banner (plan 161) — the binary
 /// knows which commit it came from, this crate does not.
 pub async fn run(
     make_config: impl FnOnce(Arc<dyn Approver>, Arc<dyn Questioner>, NoteFn) -> Result<Config>,
+    startup: Option<StartupTask>,
     history: History,
     session_id: String,
     pending_images: Vec<ContentBlock>,
@@ -137,11 +177,14 @@ pub async fn run(
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let channel_ui = Arc::new(ChannelUi::new(event_tx.clone()));
-    let note_ui = channel_ui.clone();
+    let notes: NoteFn = {
+        let note_ui = channel_ui.clone();
+        Arc::new(move |s: &str| note_ui.emit(&CoreEvent::Note(s.to_string())))
+    };
     let cfg = Arc::new(make_config(
         channel_ui.clone(),
         channel_ui.clone(),
-        Arc::new(move |s: &str| note_ui.emit(&CoreEvent::Note(s.to_string()))),
+        notes.clone(),
     )?);
     // `--worktree`: enter an isolated tree for the whole session before any
     // turn runs (plan 35 slice 2). Fail-closed — the user asked for isolation,
@@ -196,6 +239,10 @@ pub async fn run(
     // that has not arrived yet.
     channel_ui.emit(&CoreEvent::TodoUpdated(cfg.todos.snapshot()));
     let cwd = effective_cwd;
+    // The first frame already carries this line, so a slow startup task is
+    // visible from the moment the terminal takes over.
+    let startup_label = startup.as_ref().map(|task| task.label.clone());
+    app.startup = startup_label.clone();
 
     let shutdown_ui: Arc<dyn Ui> = channel_ui.clone();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
@@ -245,16 +292,36 @@ pub async fn run(
         pending_images,
     ));
 
+    // Startup gets a watch channel rather than an event: the loop only needs
+    // the latest line, and dropping the sender (normal return, panic, or a
+    // future that forgot `line(None)`) is itself the "done" signal.
+    let (startup_line_tx, startup_line_rx) = watch::channel::<Option<String>>(startup_label);
+    let startup_task = startup.map(|task| {
+        let line = Arc::new(move |line: Option<String>| {
+            let _ = startup_line_tx.send(line);
+        });
+        tokio::spawn((task.run)(StartupReporter {
+            note: notes.clone(),
+            line,
+        }))
+    });
+
     let result = ui_loop(
         &mut terminal.terminal,
         event_rx,
         msg_tx,
         Arc::clone(&current),
         permissions,
-        app,
+        UiBoot {
+            app,
+            startup_line: startup_line_rx,
+        },
         cwd,
     )
     .await;
+    if let Some(task) = startup_task {
+        task.abort();
+    }
     terminal.restore();
     let cfg = current_cfg();
     let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
@@ -1080,6 +1147,13 @@ fn event_cwd(event: &AgentEvent) -> Option<std::path::PathBuf> {
     }
 }
 
+/// What the loop starts with: the seeded [`App`] and the startup task's line
+/// channel (whose sender dropping means the task finished).
+struct UiBoot {
+    app: App,
+    startup_line: watch::Receiver<Option<String>>,
+}
+
 /// What the event loop owns next to the pure [`App`]: the handles a key command
 /// acts on, the cancel token of whatever is in flight, and the wall clocks the
 /// animated HUD reads (the `App` has no clock of its own).
@@ -1135,6 +1209,21 @@ impl UiState {
 
     /// One terminal input event. `Break` ends the loop (the input channel died).
     async fn on_input(&mut self, input: Option<Event>, viewport_width: usize) -> ControlFlow<()> {
+        // A startup task (MCP handshakes) owns the keyboard until it settles:
+        // no turn and no slash command may run against a half-known tool
+        // catalog. The quit chords stay live so a hung server is escapable.
+        if self.app.startup.is_some() {
+            return match input {
+                None => ControlFlow::Break(()),
+                Some(Event::Key(k))
+                    if k.kind != KeyEventKind::Release && startup_allows_key(&k) =>
+                {
+                    let command = self.app.on_key(viewport_width, k);
+                    self.on_command(command).await
+                }
+                _ => ControlFlow::Continue(()),
+            };
+        }
         match input {
             Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                 let command = self.app.on_key(viewport_width, k);
@@ -1328,15 +1417,30 @@ where
     cleared
 }
 
+/// The only keys a pending startup passes through: quit. Ctrl+C is the usual
+/// two-tap exit (handled by `App::on_key`), Ctrl+D the immediate one.
+fn startup_allows_key(key: &crossterm::event::KeyEvent) -> bool {
+    key.modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('d')
+        )
+}
+
 async fn ui_loop(
     terminal: &mut Terminal,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     msgs: mpsc::UnboundedSender<WorkerMsg>,
     session: Arc<std::sync::Mutex<Arc<Config>>>,
     permissions: Arc<kloop_core::permissions::Permissions>,
-    mut app: App,
+    boot: UiBoot,
     cwd: std::path::PathBuf,
 ) -> Result<()> {
+    let UiBoot {
+        mut app,
+        mut startup_line,
+    } = boot;
     let inbox = Arc::clone(&session.lock().unwrap().inbox);
     // Seed the status-bar badge from the real starting mode (e.g. plan). The
     // App is built in `run` (transcript replay + `/` menu catalog); a resumed
@@ -1404,6 +1508,15 @@ async fn ui_loop(
                 Some(event) => state.on_agent_events(event, &mut events),
                 None => ControlFlow::Break(()),
             },
+            // The startup task publishing its latest line, or releasing the
+            // keyboard by dropping the sender when it finishes.
+            line = startup_line.changed(), if state.app.startup.is_some() => {
+                match line {
+                    Ok(()) => state.app.startup = startup_line.borrow_and_update().clone(),
+                    Err(_) => state.app.startup = None,
+                }
+                ControlFlow::Continue(())
+            },
             // Frame tick: only armed while animating, so an idle loop never wakes
             // here. Firing just redraws (elapsed/spinner advance at the top).
             _ = tokio::time::sleep(Duration::from_millis(tick_ms)), if animating => {
@@ -1440,6 +1553,28 @@ mod tests {
     use ratatui::layout::Size;
 
     use super::*;
+
+    #[test]
+    fn a_pending_startup_only_passes_the_quit_chords() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        for (code, modifiers, allowed) in [
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, true),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, true),
+            (KeyCode::Char('c'), KeyModifiers::NONE, false),
+            (KeyCode::Enter, KeyModifiers::NONE, false),
+            (KeyCode::Esc, KeyModifiers::NONE, false),
+            (KeyCode::Char('x'), KeyModifiers::CONTROL, false),
+        ] {
+            assert_eq!(
+                startup_allows_key(&KeyEvent::new(code, modifiers)),
+                allowed,
+                "{code:?} with {modifiers:?}"
+            );
+        }
+    }
 
     struct StagedSizeBackend {
         inner: TestBackend,

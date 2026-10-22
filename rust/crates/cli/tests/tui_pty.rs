@@ -10,6 +10,7 @@ use anyhow::bail;
 use tokio::sync::Mutex;
 
 use tui_pty_support::ChatFixture;
+use tui_pty_support::McpFixture;
 use tui_pty_support::PtyHarness;
 use tui_pty_support::PtyOptions;
 use tui_pty_support::contains_bytes;
@@ -126,6 +127,93 @@ async fn boot_answers_cpr_without_alternate_screen() -> Result<()> {
     assert!(contains_bytes(&raw, KEYBOARD_ENHANCEMENT_POP));
     assert_no_alternate_screen(&raw);
     assert!(!harness.emergency_killed());
+    Ok(())
+}
+
+/// The TUI paints before the MCP handshake and shows the pending server in its
+/// footer; input during that window must not start a turn, so the first turn
+/// still sees the full catalog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_paints_mcp_progress_and_gates_input_until_connected() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("after-startup")]).await;
+    // initialize and tools/list each wait: long enough to type into the gated
+    // window, short enough to keep the suite quick.
+    let mcp = McpFixture::start(Duration::from_millis(800)).await;
+    let provider_config = format!(
+        "provider = \"openai-compat\"\n\n\
+         [providers.openai-compat]\n\
+         wire_api = \"chat\"\n\
+         base_url = \"{}\"\n\
+         auth_header = {{ Authorization = \"Bearer synthetic-tui-pty-key\" }}\n\
+         model = \"tui-pty-model\"\n\n\
+         [mcp.servers.slow]\n\
+         url = \"{}\"\n\
+         bearer_token = \"synthetic-mcp-token\"\n",
+        fixture.uri(),
+        mcp.uri(),
+    );
+    let mut harness = PtyHarness::spawn_with_options(
+        Path::new(env!("CARGO_BIN_EXE_kloop")),
+        &fixture.uri(),
+        30,
+        100,
+        &PtyOptions {
+            provider_config: Some(&provider_config),
+            ..PtyOptions::default()
+        },
+    )?;
+
+    harness.wait_for("MCP startup line", Duration::from_secs(10), |frame| {
+        frame.contains("MCP connecting 1 server(s)")
+    })?;
+    assert!(
+        fixture.requests().is_empty(),
+        "the provider was called before the MCP catalog settled"
+    );
+
+    // Typing and submitting during the handshake must be dropped: the composer
+    // stays empty and no turn reaches the provider.
+    harness.write(b"too early")?;
+    harness.write(ENTER)?;
+    harness.wait_for_quiescent(
+        "startup finished",
+        Duration::from_secs(15),
+        QUIET,
+        |frame| !frame.contains("MCP connecting"),
+    )?;
+
+    harness.write(b"after ready")?;
+    harness.write(ENTER)?;
+    harness.wait_for("reply after startup", Duration::from_secs(15), |frame| {
+        frame.contains("after-startup")
+    })?;
+    let requests = fixture.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the post-startup turn may reach the provider: {requests:?}"
+    );
+    // The turn carries injected reminders, so match the input rather than the
+    // whole block; a leaked pre-startup submit would show up here too.
+    assert!(
+        requests[0]
+            .user_texts
+            .iter()
+            .any(|text| text.contains("after ready")),
+        "post-startup input missing: {:?}",
+        requests[0].user_texts
+    );
+    assert!(
+        !requests[0]
+            .user_texts
+            .iter()
+            .any(|text| text.contains("too early")),
+        "input submitted during startup leaked into a turn: {:?}",
+        requests[0].user_texts
+    );
+
+    graceful_exit(&mut harness)?;
     Ok(())
 }
 
