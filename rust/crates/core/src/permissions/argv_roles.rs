@@ -50,7 +50,7 @@ enum Operand {
 
 enum ShortOperands {
     AttachedOrNext,
-    /// tree 只有 -L 接受附着的十进制数字；其它带操作数的组合退回全参数检查。
+    /// tree 的 -L 数字后只接受已知无参开关；其它带操作数的组合退回全参数检查。
     Tree,
 }
 
@@ -158,11 +158,7 @@ fn option_paths<'a>(
             } else {
                 match spec.short_operands {
                     ShortOperands::AttachedOrNext => rest,
-                    ShortOperands::Tree
-                        if ch == 'L' && rest.chars().all(|c| c.is_ascii_digit()) =>
-                    {
-                        rest
-                    }
+                    ShortOperands::Tree if ch == 'L' => tree_depth_operand(rest)?,
                     ShortOperands::Tree => return None,
                 }
             };
@@ -522,12 +518,23 @@ const TREE: Spec = Spec {
     digits_are_context: false,
 };
 
+fn tree_depth_operand(rest: &str) -> Option<&str> {
+    let depth_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (depth, flags) = rest.split_at(depth_len);
+    // 后缀仍按开关解释；只有全部不消耗操作数，后续 token 才能保持原角色。
+    (!depth.is_empty()
+        && flags
+            .chars()
+            .all(|ch| matches!(tree_short(ch), Some(Operand::None))))
+    .then_some(depth)
+}
+
 fn tree_short(ch: char) -> Option<Operand> {
     match ch {
         'H' | 'I' | 'L' | 'P' | 'T' => Some(Operand::Literal),
         'o' => Some(Operand::Path),
-        'A' | 'C' | 'F' | 'J' | 'N' | 'Q' | 'R' | 'S' | 'X' | 'a' | 'd' | 'f' | 'i' | 'l' | 'n'
-        | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' => Some(Operand::None),
+        'A' | 'C' | 'F' | 'J' | 'N' | 'Q' | 'R' | 'S' | 'U' | 'X' | 'a' | 'd' | 'f' | 'h' | 'i'
+        | 'l' | 'n' | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' => Some(Operand::None),
         _ => None,
     }
 }
@@ -687,9 +694,19 @@ mod tests {
             vec!["tree", "--fromfile", "paths.txt", "-Ia", "-P", ".env"],
             vec!["tree", "-La", "1", "-I", "-P", ".env"],
             vec!["tree", "-I.git", "src"],
-            vec!["tree", "-L2a", "src"],
         ] {
             assert_paths(&words, None);
+        }
+    }
+
+    #[test]
+    fn tree_depth_suffixes_preserve_patterns_and_input_paths() {
+        for flags in ["-L2a", "-L2h", "-L2U", "-L12ahU", "-aL12hU"] {
+            assert_paths(&["tree", flags, "-I", ".git", "src"], Some(&["src"]));
+            assert_paths(&["tree", flags, ".env"], Some(&[".env"]));
+        }
+        for flags in ["-L2P", "-L2aP", "-L2ao", "-L2aL3", "-L2Z", "-L2a3", "-La2"] {
+            assert_paths(&["tree", flags, ".git", "src"], None);
         }
     }
 

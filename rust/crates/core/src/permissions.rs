@@ -1624,6 +1624,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tree_depth_suffixes_keep_match_patterns_exempt() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "tree -L2a -I .git .",
+                "tree -L2h -I .git .",
+                "tree -L2U -I .git .",
+                "tree -L12ahU -I .git .",
+                "tree -aL12hU -I .git .",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Ok(None),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
     async fn tree_option_boundaries_keep_sensitive_inputs_blocked() {
         let approver = ScriptedApprover::new(vec![]);
         for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
@@ -1635,6 +1660,11 @@ mod tests {
                 "tree --fromfile -I .git README.md .env",
                 "tree -Ia -P .git",
                 "tree --fromfile README.md -La 1 -I -P .env",
+                "tree -L2a .git",
+                "tree --fromfile -L2ahU -I .git .env",
+                "tree -L2P .git .",
+                "tree --fromfile -L2aP .git .env",
+                "tree --fromfile -L2ao .git .env",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
