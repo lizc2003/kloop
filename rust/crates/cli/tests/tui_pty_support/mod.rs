@@ -210,10 +210,49 @@ pub fn sse_tool_call(id: &str, name: &str, arguments: &Value) -> String {
     format!("data: {delta}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
 }
 
-/// A minimal MCP HTTP server whose handshake can be delayed, so a PTY test can
-/// watch the TUI's startup line while the client is still connecting.
+#[derive(Default)]
+struct McpHandshakeGate {
+    entered: tokio::sync::Notify,
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+impl McpHandshakeGate {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+struct GatedMcpResponse {
+    gate: Arc<McpHandshakeGate>,
+    response: ResponseTemplate,
+}
+
+impl Respond for GatedMcpResponse {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.gate.entered.notify_one();
+        // wiremock 的 Respond 是同步接口；只阻塞这台 MCP 的独立服务线程，
+        // 放行和 provider 观察都不读取它持有的 server 锁。
+        let mut released = self.gate.released.lock().unwrap();
+        while !*released {
+            released = self.gate.release.wait(released).unwrap();
+        }
+        self.response.clone()
+    }
+}
+
+/// 可延迟握手或由测试显式放行的 MCP HTTP 夹具。
 pub struct McpFixture {
     server: MockServer,
+    handshake_gate: Option<Arc<McpHandshakeGate>>,
+}
+
+impl Drop for McpFixture {
+    fn drop(&mut self) {
+        // 断言失败或 future 被取消时也先放行，避免 MockServer 析构等待其锁。
+        self.release_handshake();
+    }
 }
 
 impl McpFixture {
@@ -224,6 +263,24 @@ impl McpFixture {
     /// Advertise `(name, description)` tools from `tools/list`, so a test can
     /// prove the model's first request already carries the namespaced MCP tool.
     pub async fn start_with_tools(delay: Duration, tools: &[(&str, &str)]) -> Self {
+        Self::start_with_gate(delay, tools, None).await
+    }
+
+    /// tools/list 到达后保持阻塞，直到测试显式放行。
+    pub async fn start_gated_with_tools(tools: &[(&str, &str)]) -> Self {
+        Self::start_with_gate(
+            Duration::ZERO,
+            tools,
+            Some(Arc::new(McpHandshakeGate::default())),
+        )
+        .await
+    }
+
+    async fn start_with_gate(
+        delay: Duration,
+        tools: &[(&str, &str)],
+        handshake_gate: Option<Arc<McpHandshakeGate>>,
+    ) -> Self {
         use wiremock::matchers::body_partial_json;
 
         let advertised: Vec<serde_json::Value> = tools
@@ -265,23 +322,49 @@ impl McpFixture {
             .respond_with(ResponseTemplate::new(202))
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(body_partial_json(
-                serde_json::json!({"method": "tools/list"}),
-            ))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(delay)
-                    .insert_header("content-type", "application/json")
-                    .set_body_json(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "result": {"tools": advertised}
-                    })),
-            )
-            .mount(&server)
-            .await;
-        Self { server }
+        let tools_response = ResponseTemplate::new(200)
+            .set_delay(delay)
+            .insert_header("content-type", "application/json")
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": advertised}
+            }));
+        let tools_mock = Mock::given(method("POST")).and(body_partial_json(
+            serde_json::json!({"method": "tools/list"}),
+        ));
+        let tools_mock = match &handshake_gate {
+            Some(gate) => tools_mock.respond_with(GatedMcpResponse {
+                gate: Arc::clone(gate),
+                response: tools_response,
+            }),
+            None => tools_mock.respond_with(tools_response),
+        };
+        tools_mock.mount(&server).await;
+        Self {
+            server,
+            handshake_gate,
+        }
+    }
+
+    pub async fn wait_for_handshake(&self) -> Result<()> {
+        let gate = self
+            .handshake_gate
+            .as_ref()
+            .context("MCP fixture has no handshake gate")?;
+        tokio::time::timeout(
+            scaled_timeout(Duration::from_secs(10)),
+            gate.entered.notified(),
+        )
+        .await
+        .context("MCP tools/list did not reach the handshake gate")?;
+        Ok(())
+    }
+
+    pub fn release_handshake(&self) {
+        if let Some(gate) = &self.handshake_gate {
+            gate.release();
+        }
     }
 
     pub fn uri(&self) -> String {

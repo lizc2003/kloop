@@ -228,8 +228,7 @@ async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
 
     let _guard = PTY_TEST_LOCK.lock().await;
     let fixture = ChatFixture::start(vec![sse_text("timer delivered")]).await;
-    let mcp =
-        McpFixture::start_with_tools(Duration::from_millis(800), &[("echo", "echo back")]).await;
+    let mcp = McpFixture::start_gated_with_tools(&[("echo", "echo back")]).await;
     const SESSION_ID: &str = "20260101-000000-sched";
     let provider_config = format!(
         "provider = \"openai-compat\"\n\n\
@@ -298,7 +297,7 @@ async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
                 "prompt": "timer work",
                 "created_at_ms": now - 120_000,
                 "next_fire_at_ms": now - 5_000,
-                "recurring": true,
+                "recurring": false,
                 "durable": true,
                 "kind": "cron",
                 "generation": 1
@@ -326,14 +325,16 @@ async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
     harness.wait_for("MCP startup line", Duration::from_secs(10), |frame| {
         frame.contains("MCP connecting 1 server(s)")
     })?;
-    // The scheduler fires within milliseconds of binding. Give it a window
-    // inside the handshake to (wrongly) start the wake turn.
+    mcp.wait_for_handshake().await?;
+    // 观察期间 tools/list 一直由屏障阻塞；即使测试恢复较晚，也不会把握手
+    // 完成后的合法唤醒误判成提前请求。一次性任务避免等待跨分钟时重复投递。
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         fixture.requests().is_empty(),
         "the scheduled wake ran before MCP settled: {:?}",
         fixture.requests()
     );
+    mcp.release_handshake();
 
     harness.wait_for("timer reply", Duration::from_secs(20), |frame| {
         frame.contains("timer delivered")

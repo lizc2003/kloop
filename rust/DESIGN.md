@@ -1896,6 +1896,11 @@ from the deferred connect go to the transcript as notes
 catalogs exist. Plain, headless and server mode still connect before they start,
 because they have nothing to show until the catalog settles.
 
+启动门的 PTY 回归用显式屏障阻塞 MCP `tools/list` 响应：先确认请求已到达，
+在屏障关闭期间观察 provider 零请求，再由测试放行并核对首请求含定时 prompt
+与 MCP 工具。观察时长不决定握手何时完成；预置一次性任务避免跨分钟重投递，
+夹具析构也会放行屏障，防止失败路径等待 server 锁。
+
 Each configured server has one source-owned, in-memory readiness receipt. It
 binds the server identity and a secret-free endpoint digest to auth availability,
 capability summary, catalog generation, monotonic readiness revision, refresh

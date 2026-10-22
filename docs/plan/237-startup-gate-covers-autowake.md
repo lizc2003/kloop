@@ -1,8 +1,8 @@
-# Plan 237 — 启动门约束自动唤醒
+# Plan 237 — 启动门约束自动唤醒 ✅
 
 > 2026-10-21。Plan 236 的审查发现（P2）：启动门只拦键盘，autowake 能在 MCP
 > 握手窗口内提前启动首轮。
-> 状态：已实现；待外层执行沙箱之外的完整门禁与提交。
+> 状态：✅ 已完成，实现提交 `6ac9e11`；测试时序审查修复见文末。
 
 ## 问题
 
@@ -29,11 +29,13 @@ scheduler worker。任务在连接窗口内到期时，`Inbox` 的 activity 分�
   能立刻发出 `Wake`。
 - PTY 回归 `restored_scheduled_wake_waits_for_the_mcp_startup`：预置带
   `provider_route_initial` 的 session 录音与 `scheduled_tasks.json`（due、
-  durable、owner=session id、`kind: "cron"`），用 `--resume` 启动并配置 800ms
-  延迟的 MCP server（广告 `echo`）。断言：
-  - 屏幕出现 `MCP connecting 1 server(s)`；
-  - 握手窗口内（500ms）provider 收到 0 个请求；
-  - 放开后定时任务触发一次，首请求带 `timer work` 与 `slow__echo`。
+  durable、owner=session id、`kind: "cron"`），用 `--resume` 启动并配置广告
+  `echo` 的 MCP server。2026-10-22 的时序修复将原来的两段 800ms 延迟改为
+  `tools/list` 显式屏障，预置任务改为一次性，避免等待跨分钟时重复投递。断言：
+  - 屏幕出现 `MCP connecting 1 server(s)`，且 `tools/list` 已到达屏障；
+  - 屏障保持关闭期间观察 500ms，provider 收到 0 个请求；这个时间仅提供观察
+    窗口，不负责决定握手何时结束；
+  - 测试显式放行后定时任务触发一次，首请求带 `timer work` 与 `slow__echo`。
 - 为支持该回归，PTY 夹具增加 `PtyOptions.prepare`（在子进程启动前拿到
   home/workspace 写私有状态）、`McpFixture::start_with_tools`，并在
   `RecordedRequest` 里记录 `tools[].function.name`。
@@ -56,4 +58,21 @@ scheduler worker。任务在连接窗口内到期时，`Inbox` 的 activity 分�
   `slow__echo`。
 - 外层执行沙箱之外 `make check` 全绿，含本机 parity：CLI 156、core 1133、
   server 41、TUI 283、TUI PTY 23。
-- 提交号以本条所在提交为准。
+- 原实现提交：`6ac9e11`。审查修复提交记录见下。
+
+## 2026-10-22 测试时序审查修复
+
+- 原用例用 500ms sleep 推断两段 800ms 握手仍未完成；测试恢复较晚时，握手后的
+  合法请求也会触发“提前请求”的误报。现在由 `tools/list` responder 发出到达
+  信号并阻塞响应，测试完成零请求断言后才显式放行。
+- 夹具在析构时也放行屏障，断言失败或 future 被取消不会让 MockServer 等锁挂住。
+  同步 responder 仅阻塞该 MCP 的独立服务线程，provider 的请求观察不受影响。
+- 定向验证：临时撤掉 autowake 启动守卫时，新屏障用例在关闭期间发现 provider
+  请求且缺少 `slow__echo`，按预期失败并正常退出；恢复守卫后通过。
+- 临时将观察时间从 500ms 延长至 2.1s（超过旧的两段 800ms 握手总时长），
+  屏障关闭期间仍是零请求，放行后首请求含定时 prompt 与 `slow__echo`，通过。
+  提交版本恢复 500ms 观察时间，生产代码已逐字恢复。
+- 外层执行沙箱之外完整 `make check` 全绿：fmt、workspace all-target/all-feature
+  clippy `-D warnings`、workspace debug 全量测试与本机 parity；CLI 156、core
+  1133、TUI 283、TUI PTY 23、plain PTY 8 条通过。真实 API 用例按原设置忽略。
+- 修复提交号以本段所在提交为准。

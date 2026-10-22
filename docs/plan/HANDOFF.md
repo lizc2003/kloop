@@ -1,5 +1,15 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 237 PTY 握手窗口改为显式屏障（2026-10-22）**：审查指出 500ms sleep
+不能保证两段 800ms MCP 握手仍未结束，测试恢复较晚会把合法 autowake 误判为
+提前请求。现在确认 `tools/list` 到达后由 responder 阻塞，零请求观察完成才
+显式放行；夹具析构也放行，预置任务改为一次性，避免跨分钟重复投递。临时撤掉
+启动守卫时新用例按预期红（提前请求且缺少 `slow__echo`），失败清理正常退出；
+恢复守卫后绿，延长至 2.1s 观察也绿。提交版本保留 500ms 观察，生产代码逐字
+恢复。外层沙箱之外完整 `make check` 全绿（含本机 parity；CLI 156、core 1133、
+TUI 283、TUI PTY 23、plain PTY 8）。原实现 `6ac9e11`；本轮修复提交号以本条
+所在提交为准，教训 251。
+
 **启动门补齐自动唤醒（2026-10-21）**：Plan 236 的启动门只拦了键盘；审查发现
 恢复会话的持久定时任务可在 MCP 握手窗口经 autowake 提前发首轮。现在
 `autowake_ready` 把 startup 并入条件，门打开时主动再查一次 inbox（否则等待期间
@@ -2941,3 +2951,12 @@ provider 请求），再恢复修法跑绿，断言放开后的首请求同时�
 开头，第二行是 `provider_route_initial`（`route_boundary` 必须等于该行 seq），
 scheduler store 的 `kind` 序列化是 `cron`/`loop_wakeup`，job id 必须是
 `job-<resource suffix>`。
+
+251. **否定断言的观察窗口要由协议状态界定，不能靠两个 sleep 比长短。**
+Plan 237 的 PTY 用例用 500ms 等待推断两段 800ms MCP 握手仍未完成，但 sleep
+只保证最短等待：测试恢复较晚时，握手后的合法 autowake 请求也会被误判。应在
+`tools/list` 响应前设显式屏障，确认请求已到达，完成零请求观察后才放行。
+500ms 只保留为给错误路径发请求的观察时间，不承担握手结束时刻的同步职责。
+夹具失败或取消时也要放行；wiremock 的同步 responder 持有 server 锁，因此
+放行和 provider 观察必须走独立状态，不能反过来读被阻塞的 MCP server。
+预置任务只需验证一次交付时应使用一次性任务，避免屏障等待跨分钟又投递一轮。
