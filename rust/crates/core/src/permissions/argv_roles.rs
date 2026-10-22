@@ -1,0 +1,660 @@
+//! 命令参数的角色：哪些值会被命令当作文件打开，哪些只是匹配模式或字面量。
+//!
+//! 只认识下面列出的命令与选项。任何未识别的命令、选项、缺参或不完整表达式都
+//! 返回 `None`，由调用方退回逐参数路径检查——角色表只能减少误报，不能放宽未知
+//! 语法。读取类参数（模式文件、参考文件、搜索根）永远留在检查一侧；执行/写入类
+//! 选项由 [`argv_is_readonly`] 提前排除。
+
+use crate::shell::argv_is_readonly;
+
+/// `argv` 里会被命令当作文件打开或遍历的值，可能是整 token，也可能是
+/// `--opt=value` / `-Xvalue` 中 `=` 或短选项之后的那一段。
+///
+/// 返回 `None` 表示未识别：调用方必须检查 `argv[1..]` 的每个参数。
+pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<&str>> {
+    let command = argv.first()?.rsplit('/').next()?;
+    // echo/printf 的参数只是文本，也没有会打开文件的选项。
+    if matches!(command, "echo" | "printf") {
+        return Some(Vec::new());
+    }
+    if !argv_is_readonly(argv) {
+        return None;
+    }
+    match command {
+        "find" => find_paths(argv),
+        "grep" => option_paths(argv, &GREP, Positionals::PatternThenPaths),
+        "rg" => option_paths(argv, &RG, Positionals::PatternThenPaths),
+        "du" => option_paths(argv, &DU, Positionals::AllPaths),
+        "tree" => option_paths(argv, &TREE, Positionals::AllPaths),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operand {
+    /// 没有操作数。
+    None,
+    /// 只接受附着值（`--color=always`），值是字面量。
+    Optional,
+    /// 操作数是匹配模式或字面量，不是路径。
+    Literal,
+    /// 操作数会被命令打开。
+    Path,
+    /// 操作数是模式，且出现后位置参数全是路径（`-e` / `--regexp`）。
+    Pattern,
+    /// 操作数是模式文件，且出现后位置参数全是路径（`-f` / `--file`）。
+    PatternPath,
+    /// 没有操作数，但命令进入“没有模式”的模式（`rg --files`）。
+    NoPattern,
+}
+
+struct Spec {
+    short: fn(char) -> Option<Operand>,
+    long: fn(&str) -> Option<Operand>,
+    /// grep 的 `-5` 是 `-C 5` 的简写：纯数字短参数不消耗操作数。
+    digits_are_context: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Positionals {
+    AllPaths,
+    PatternThenPaths,
+}
+
+fn option_paths<'a>(
+    argv: &'a [String],
+    spec: &Spec,
+    positionals: Positionals,
+) -> Option<Vec<&'a str>> {
+    let mut paths = Vec::new();
+    let mut pattern_source = false;
+    // 第一个位置参数可能是模式，也可能是路径：`-f`/`--file` 可以出现在它后面
+    // （getopt 会把选项换到前面），所以推迟到解析结束再决定。
+    let mut first_positional: Option<&'a str> = None;
+    let mut options_done = false;
+    let mut index = 1;
+    while let Some(raw) = argv.get(index) {
+        let arg = raw.as_str();
+        if options_done || !arg.starts_with('-') || arg == "-" {
+            match positionals {
+                Positionals::AllPaths => paths.push(arg),
+                Positionals::PatternThenPaths => {
+                    if first_positional.is_none() && !pattern_source {
+                        first_positional = Some(arg);
+                    } else {
+                        paths.push(arg);
+                    }
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            options_done = true;
+            index += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let role = (spec.long)(name)?;
+            match (role, attached) {
+                (Operand::None | Operand::Optional, _) => index += 1,
+                (Operand::NoPattern, _) => {
+                    pattern_source = true;
+                    index += 1;
+                }
+                (Operand::Literal | Operand::Pattern, Some(_)) => {
+                    pattern_source |= role == Operand::Pattern;
+                    index += 1;
+                }
+                (Operand::Literal | Operand::Pattern, None) => {
+                    argv.get(index + 1)?;
+                    pattern_source |= role == Operand::Pattern;
+                    index += 2;
+                }
+                (Operand::Path | Operand::PatternPath, Some(value)) => {
+                    pattern_source |= role == Operand::PatternPath;
+                    paths.push(value);
+                    index += 1;
+                }
+                (Operand::Path | Operand::PatternPath, None) => {
+                    pattern_source |= role == Operand::PatternPath;
+                    paths.push(argv.get(index + 1)?.as_str());
+                    index += 2;
+                }
+            }
+            continue;
+        }
+        let body = &arg[1..];
+        if spec.digits_are_context && !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
+            index += 1;
+            continue;
+        }
+        let mut consumed_next = false;
+        for (offset, ch) in body.char_indices() {
+            let role = (spec.short)(ch)?;
+            match role {
+                Operand::None | Operand::Optional => continue,
+                Operand::NoPattern => {
+                    pattern_source = true;
+                    continue;
+                }
+                _ => {}
+            }
+            let rest = &arg[1 + offset + ch.len_utf8()..];
+            let value = if rest.is_empty() {
+                consumed_next = true;
+                argv.get(index + 1)?.as_str()
+            } else {
+                rest
+            };
+            pattern_source |= matches!(role, Operand::Pattern | Operand::PatternPath);
+            if matches!(role, Operand::Path | Operand::PatternPath) {
+                paths.push(value);
+            }
+            break;
+        }
+        index += if consumed_next { 2 } else { 1 };
+    }
+    if positionals == Positionals::PatternThenPaths
+        && pattern_source
+        && let Some(first) = first_positional
+    {
+        paths.push(first);
+    }
+    Some(paths)
+}
+
+fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
+    let mut paths = Vec::new();
+    let mut index = 1;
+    // GNU 的前置选项与 BSD 的 `-f` 根：它们把“表达式从哪开始”往后推。
+    while let Some(arg) = argv.get(index) {
+        match arg.as_str() {
+            "-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x" => index += 1,
+            "-f" => {
+                // BSD `-f` 后面是搜索根，即使它恰好叫 `-path` 也不是谓词。
+                paths.push(argv.get(index + 1)?.as_str());
+                index += 2;
+            }
+            "-D" => {
+                argv.get(index + 1)?;
+                index += 2;
+            }
+            _ if is_find_optimization_level(arg) => index += 1,
+            _ => break,
+        }
+    }
+    while let Some(arg) = argv.get(index) {
+        if arg.starts_with('-') || matches!(arg.as_str(), "(" | r"\(" | "!" | r"\!") {
+            break;
+        }
+        paths.push(arg.as_str());
+        index += 1;
+    }
+
+    let mut depth = 0_usize;
+    let mut needs_operand = true;
+    while let Some(arg) = argv.get(index) {
+        match arg.as_str() {
+            "(" | r"\(" => {
+                depth += 1;
+                needs_operand = true;
+            }
+            ")" | r"\)" => {
+                if needs_operand || depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            "!" | r"\!" | "-not" => needs_operand = true,
+            "-a" | "-and" | "-o" | "-or" | "," => {
+                if needs_operand {
+                    return None;
+                }
+                needs_operand = true;
+            }
+            // 匹配模式：不打开文件。
+            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
+            | "-iregex" | "-lname" | "-ilname" => {
+                index += 1;
+                argv.get(index)?;
+                needs_operand = false;
+            }
+            // 参考文件：会被打开，必须检查。
+            "-anewer" | "-cnewer" | "-mnewer" | "-Bnewer" | "-samefile" | "-files0-from" => {
+                index += 1;
+                paths.push(argv.get(index)?.as_str());
+                needs_operand = false;
+            }
+            _ if arg.starts_with("-newer") => {
+                index += 1;
+                paths.push(argv.get(index)?.as_str());
+                needs_operand = false;
+            }
+            // 字面量操作数：类型、大小、模式、格式串……都不是路径。
+            "-type" | "-xtype" | "-size" | "-perm" | "-flags" | "-fstype" | "-user" | "-group"
+            | "-uid" | "-gid" | "-inum" | "-links" | "-amin" | "-atime" | "-cmin" | "-ctime"
+            | "-mmin" | "-mtime" | "-Bmin" | "-Btime" | "-used" | "-maxdepth" | "-mindepth"
+            | "-regextype" | "-xattrname" | "-printf" => {
+                index += 1;
+                argv.get(index)?;
+                needs_operand = false;
+            }
+            "-true"
+            | "-false"
+            | "-empty"
+            | "-nouser"
+            | "-nogroup"
+            | "-readable"
+            | "-writable"
+            | "-executable"
+            | "-acl"
+            | "-sparse"
+            | "-xattr"
+            | "-depth"
+            | "-d"
+            | "-xdev"
+            | "-mount"
+            | "-follow"
+            | "-daystart"
+            | "-noleaf"
+            | "-ignore_readdir_race"
+            | "-noignore_readdir_race"
+            | "-print"
+            | "-print0"
+            | "-ls"
+            | "-prune"
+            | "-quit" => needs_operand = false,
+            _ => return None,
+        }
+        index += 1;
+    }
+    (depth == 0 && !needs_operand).then_some(paths)
+}
+
+fn is_find_optimization_level(arg: &str) -> bool {
+    arg.strip_prefix("-O")
+        .is_some_and(|level| !level.is_empty() && level.chars().all(|c| c.is_ascii_digit()))
+}
+
+const GREP: Spec = Spec {
+    short: grep_short,
+    long: grep_long,
+    digits_are_context: true,
+};
+
+fn grep_short(ch: char) -> Option<Operand> {
+    match ch {
+        'e' => Some(Operand::Pattern),
+        'f' => Some(Operand::PatternPath),
+        'A' | 'B' | 'C' | 'D' | 'd' | 'm' => Some(Operand::Literal),
+        'E' | 'F' | 'G' | 'H' | 'I' | 'L' | 'P' | 'R' | 'T' | 'U' | 'Z' | 'a' | 'b' | 'c' | 'h'
+        | 'i' | 'l' | 'n' | 'o' | 'q' | 'r' | 's' | 'u' | 'v' | 'w' | 'x' | 'y' | 'z' => {
+            Some(Operand::None)
+        }
+        _ => None,
+    }
+}
+
+fn grep_long(name: &str) -> Option<Operand> {
+    match name {
+        "regexp" => Some(Operand::Pattern),
+        "file" => Some(Operand::PatternPath),
+        "include" | "exclude" | "exclude-dir" => Some(Operand::Literal),
+        "exclude-from" => Some(Operand::Path),
+        "max-count" | "after-context" | "before-context" | "context" | "binary-files"
+        | "directories" | "devices" | "label" | "group-separator" => Some(Operand::Literal),
+        "color" | "colour" => Some(Operand::Optional),
+        "extended-regexp"
+        | "fixed-strings"
+        | "basic-regexp"
+        | "perl-regexp"
+        | "ignore-case"
+        | "no-ignore-case"
+        | "invert-match"
+        | "word-regexp"
+        | "line-regexp"
+        | "files-with-matches"
+        | "files-without-match"
+        | "count"
+        | "line-number"
+        | "with-filename"
+        | "no-filename"
+        | "only-matching"
+        | "quiet"
+        | "silent"
+        | "no-messages"
+        | "byte-offset"
+        | "text"
+        | "binary"
+        | "unix-byte-offsets"
+        | "recursive"
+        | "dereference-recursive"
+        | "line-buffered"
+        | "null"
+        | "null-data"
+        | "initial-tab"
+        | "no-group-separator"
+        | "no-mmap"
+        | "mmap"
+        | "help"
+        | "version" => Some(Operand::None),
+        _ => None,
+    }
+}
+
+const RG: Spec = Spec {
+    short: rg_short,
+    long: rg_long,
+    digits_are_context: false,
+};
+
+fn rg_short(ch: char) -> Option<Operand> {
+    match ch {
+        'e' => Some(Operand::Pattern),
+        'f' => Some(Operand::PatternPath),
+        'A' | 'B' | 'C' | 'E' | 'M' | 'T' | 'd' | 'g' | 'j' | 'm' | 'r' | 't' => {
+            Some(Operand::Literal)
+        }
+        'F' | 'H' | 'I' | 'L' | 'N' | 'P' | 'S' | 'U' | 'V' | 'a' | 'b' | 'c' | 'h' | 'i' | 'l'
+        | 'n' | 'o' | 'p' | 'q' | 's' | 'u' | 'v' | 'w' | 'x' | 'z' | '0' => Some(Operand::None),
+        _ => None,
+    }
+}
+
+fn rg_long(name: &str) -> Option<Operand> {
+    match name {
+        "regexp" => Some(Operand::Pattern),
+        "file" => Some(Operand::PatternPath),
+        "glob" | "iglob" | "pre-glob" => Some(Operand::Literal),
+        "ignore-file" | "pre" | "hostname-bin" => Some(Operand::Path),
+        "after-context"
+        | "before-context"
+        | "context"
+        | "max-count"
+        | "max-depth"
+        | "threads"
+        | "max-filesize"
+        | "max-columns"
+        | "type"
+        | "type-not"
+        | "type-add"
+        | "type-clear"
+        | "sort"
+        | "sortr"
+        | "replace"
+        | "encoding"
+        | "path-separator"
+        | "field-match-separator"
+        | "field-context-separator"
+        | "context-separator"
+        | "engine"
+        | "dfa-size-limit"
+        | "regex-size-limit" => Some(Operand::Literal),
+        "color" | "colour" | "colors" => Some(Operand::Optional),
+        "files" => Some(Operand::NoPattern),
+        "hidden"
+        | "no-hidden"
+        | "no-ignore"
+        | "no-ignore-vcs"
+        | "no-ignore-parent"
+        | "no-ignore-global"
+        | "no-ignore-dot"
+        | "no-ignore-files"
+        | "no-require-git"
+        | "no-messages"
+        | "no-mmap"
+        | "mmap"
+        | "heading"
+        | "no-heading"
+        | "line-number"
+        | "no-line-number"
+        | "column"
+        | "no-column"
+        | "with-filename"
+        | "no-filename"
+        | "only-matching"
+        | "count"
+        | "count-matches"
+        | "files-with-matches"
+        | "files-without-match"
+        | "json"
+        | "quiet"
+        | "text"
+        | "binary"
+        | "null"
+        | "null-data"
+        | "crlf"
+        | "trim"
+        | "passthru"
+        | "stats"
+        | "no-stats"
+        | "sort-files"
+        | "follow"
+        | "no-follow"
+        | "one-file-system"
+        | "no-one-file-system"
+        | "no-unicode"
+        | "unicode"
+        | "pcre2"
+        | "no-pcre2"
+        | "smart-case"
+        | "ignore-case"
+        | "case-sensitive"
+        | "invert-match"
+        | "word-regexp"
+        | "line-regexp"
+        | "multiline"
+        | "no-multiline"
+        | "multiline-dotall"
+        | "glob-case-insensitive"
+        | "no-glob-case-insensitive"
+        | "no-ignore-messages"
+        | "no-context-separator"
+        | "no-group-separator"
+        | "no-max-columns"
+        | "debug"
+        | "trace"
+        | "no-color"
+        | "help"
+        | "version"
+        | "generate"
+        | "complete" => Some(Operand::None),
+        _ => None,
+    }
+}
+
+const DU: Spec = Spec {
+    short: du_short,
+    long: du_long,
+    digits_are_context: false,
+};
+
+fn du_short(ch: char) -> Option<Operand> {
+    match ch {
+        'B' | 'd' => Some(Operand::Literal),
+        'X' => Some(Operand::Path),
+        '0' | 'H' | 'L' | 'P' | 'a' | 'b' | 'c' | 'h' | 'k' | 'm' | 's' | 'x' => {
+            Some(Operand::None)
+        }
+        _ => None,
+    }
+}
+
+fn du_long(name: &str) -> Option<Operand> {
+    match name {
+        "exclude" => Some(Operand::Literal),
+        "exclude-from" | "files0-from" => Some(Operand::Path),
+        "block-size" | "max-depth" | "threshold" | "time-style" => Some(Operand::Literal),
+        "all" | "apparent-size" | "bytes" | "count-links" | "dereference" | "no-dereference"
+        | "human-readable" | "inodes" | "null" | "one-file-system" | "separate-dirs" | "si"
+        | "summarize" | "sync" | "time" | "total" | "help" | "version" => Some(Operand::None),
+        _ => None,
+    }
+}
+
+const TREE: Spec = Spec {
+    short: tree_short,
+    long: tree_long,
+    digits_are_context: false,
+};
+
+fn tree_short(ch: char) -> Option<Operand> {
+    match ch {
+        'H' | 'I' | 'L' | 'P' | 'T' => Some(Operand::Literal),
+        'o' => Some(Operand::Path),
+        'A' | 'C' | 'F' | 'J' | 'N' | 'Q' | 'R' | 'S' | 'X' | 'a' | 'd' | 'f' | 'i' | 'l' | 'n'
+        | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' => Some(Operand::None),
+        _ => None,
+    }
+}
+
+fn tree_long(name: &str) -> Option<Operand> {
+    match name {
+        "ignore" | "match" | "level" | "title" | "baseHREF" | "charset" | "filelimit"
+        | "timefmt" | "sort" => Some(Operand::Literal),
+        "fromfile" | "outfile" => Some(Operand::Path),
+        "all" | "ansi" | "color" | "device" | "dirs-only" | "dirsfirst" | "du" | "full-path"
+        | "gitignore" | "help" | "inodes" | "json" | "no-indent" | "nocolor" | "noreport"
+        | "prune" | "quote" | "version" | "xml" => Some(Operand::None),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_paths(words: &[&str], expected: Option<&[&str]>) {
+        let argv: Vec<String> = words.iter().map(|word| (*word).to_string()).collect();
+        let actual = path_arguments(&argv)
+            .map(|paths| paths.into_iter().map(str::to_string).collect::<Vec<_>>());
+        let expected = expected.map(|values| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(actual, expected, "{words:?}");
+    }
+
+    #[test]
+    fn find_collects_roots_and_reference_files_only() {
+        assert_paths(
+            &[
+                "find", ".", "src", "-path", "./.git", "-prune", "-o", "-print",
+            ],
+            Some(&[".", "src"]),
+        );
+        assert_paths(
+            &["find", "-f", "src", "tests", "-name", "*.rs"],
+            Some(&["src", "tests"]),
+        );
+        assert_paths(
+            &["find", ".", "-name", "x", "-newer", "./.git/config"],
+            Some(&[".", "./.git/config"]),
+        );
+        assert_paths(
+            &["find", ".", "-newermt", "2024-01-01"],
+            Some(&[".", "2024-01-01"]),
+        );
+        assert_paths(
+            &["find", ".", "-files0-from", "roots"],
+            Some(&[".", "roots"]),
+        );
+        assert_paths(&["find", ".", "-printf", "%p\n"], Some(&["."]));
+    }
+
+    #[test]
+    fn find_accepts_known_options_and_rejects_unknown_syntax() {
+        assert_paths(
+            &["find", "-O2", ".", "-path", "./.git", "-print"],
+            Some(&["."]),
+        );
+        assert_paths(&["find", "-D", "tree", ".", "-print"], Some(&["."]));
+        assert_paths(&["find", ".", "-unknown"], None);
+        assert_paths(&["find", ".", "-name"], None);
+        assert_paths(&["find", ".", "-exec", "cat", "{}", ";"], None);
+        assert_paths(&["find", ".", "-prune", "-o"], None);
+        assert_paths(&["find", ".", "-newer", "-path", "./.git"], None);
+    }
+
+    #[test]
+    fn grep_patterns_are_not_paths() {
+        assert_paths(&["grep", "-rn", ".env", "src"], Some(&["src"]));
+        assert_paths(&["grep", "-e", "./.git/config", "src"], Some(&["src"]));
+        assert_paths(&["grep", "-rn", "--", ".env", "src"], Some(&["src"]));
+        assert_paths(&["grep", "-A", "3", ".env", "src"], Some(&["src"]));
+        assert_paths(&["grep", "-5", ".env", "src"], Some(&["src"]));
+        assert_paths(
+            &["grep", "--include=*.rs", "-rn", ".env", "."],
+            Some(&["."]),
+        );
+        assert_paths(
+            &["grep", "-f", "./.git/config", "src"],
+            Some(&["./.git/config", "src"]),
+        );
+        assert_paths(
+            &["grep", "--exclude-from=./.git/config", ".env", "src"],
+            Some(&["./.git/config", "src"]),
+        );
+        assert_paths(&["grep", "--color=always", ".env", "."], Some(&["."]));
+        assert_paths(
+            &["grep", "src", "-f", "./.git/config"],
+            Some(&["./.git/config", "src"]),
+        );
+        assert_paths(&["grep", "--future-flag", ".env"], None);
+    }
+
+    #[test]
+    fn ripgrep_globs_are_not_paths() {
+        assert_paths(&["rg", "-g", "!**/.git/*", "TODO", "."], Some(&["."]));
+        assert_paths(&["rg", "--glob=!**/.git/*", "TODO", "."], Some(&["."]));
+        assert_paths(&["rg", "-n", ".env", "."], Some(&["."]));
+        assert_paths(
+            &["rg", "--ignore-file", "./.git/config", "TODO", "."],
+            Some(&["./.git/config", "."]),
+        );
+        assert_paths(&["rg", "--type-add", "ts:*.ts", "TODO", "."], Some(&["."]));
+        assert_paths(&["rg", "--files", ".env"], Some(&[".env"]));
+        assert_paths(&["rg", "--pre", "cat", "TODO", "."], None);
+    }
+
+    #[test]
+    fn du_and_tree_match_values_are_not_paths() {
+        assert_paths(&["du", "-sh", "--exclude=./.git", "."], Some(&["."]));
+        assert_paths(&["du", "--exclude", "./.git", "."], Some(&["."]));
+        assert_paths(
+            &["du", "-X", "./.git/config", "."],
+            Some(&["./.git/config", "."]),
+        );
+        assert_paths(
+            &["du", "--files0-from=./.git/config"],
+            Some(&["./.git/config"]),
+        );
+        assert_paths(&["tree", "-I", ".git", "."], Some(&["."]));
+        assert_paths(
+            &["tree", "--fromfile", "./.git/config"],
+            Some(&["./.git/config"]),
+        );
+        assert_paths(&["tree", "-o", "out.txt", "."], None);
+    }
+
+    #[test]
+    fn text_commands_have_no_paths() {
+        assert_paths(&["echo", ".env", "./.git/config"], Some(&[]));
+        assert_paths(&["printf", "%s\n", ".env"], Some(&[]));
+    }
+
+    #[test]
+    fn unmodeled_commands_and_wrappers_fall_back() {
+        assert_paths(&["cat", "./.git/config"], None);
+        assert_paths(&["sudo", "find", ".", "-path", "./.git"], None);
+        assert_paths(&["xargs", "find", ".", "-path", "./.git"], None);
+        assert_paths(&["grep", "-z", ".env"], None);
+    }
+}

@@ -988,7 +988,8 @@ cache → ask the user
 `permissions.rs` 保留公开类型、门面和完整 `impl Permissions`；管线与审批、升级、
 模式切换的顺序集中在同一处。`permissions/rule.rs` 负责规则语法与 allow/deny/ask
 的匹配，`policy.rs` 持有全局约束、项目策略与工作区会话状态，`facts.rs` 采集调用的
-shell、路径和危险特征，`describe.rs` 构造审批记忆载荷与展示文案。规则匹配读取
+shell、路径和危险特征，`argv_roles.rs` 持有各命令的参数角色表，`describe.rs`
+构造审批记忆载荷与展示文案。规则匹配读取
 调用事实，项目策略复用规则匹配；事实模块不依赖 `Permissions`。所有原有公开路径
 由父模块保留，内部状态与帮助项仅向实际调用者开放。
 
@@ -999,12 +1000,17 @@ Credential-bearing/read-sensitive
 paths (`.git`, `.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
 boundary: `read_file` refuses them, grep/glob filter them before reading, and
 Bash checks literal plus canonical paths before sandbox/read-only/bypass.
-`find` 参数按角色检查：只有完整识别为只读目录/元数据查询时，`-path`、`-name`、
-`-regex` 等匹配谓词的模式参数才免于被当作读取目标；支持括号、否定、与/或、
-隐式与和多个模式。搜索根（含 BSD `-f`）、`-newer`/`-samefile` 的参考文件等
-仍走原文与规范路径检查。未知谓词、缺参、不完整表达式或执行/写入动作不获模式
-豁免；整条 Bash 原文的敏感路径匹配也保留优先级。该区分不改变 deny、ask 或
-只读分类器，不是通用 shell 数据流分析。
+`find`/`grep`/`rg`/`du`/`tree` 参数按角色检查：只有完整识别为只读调用时，
+匹配谓词与字面量参数（`-name`/`-path`、`-g`/`--glob`、`--exclude`、`-I` 等）
+才免于被当作读取目标；支持 find 的括号、否定、与/或、隐式与和多个模式，以及
+grep/rg 的 `-e`/`--regexp` 与 `-f`/`--file` 两种模式来源。搜索根（含 BSD `-f`）、
+模式文件（`-f`/`--file`）、`--ignore-file`、`--exclude-from`、`--files0-from`、
+`--fromfile`、`-newer`/`-samefile` 的参考文件等仍走原文与规范路径检查；附着在
+`--opt=value` 或 `-Xvalue` 里的值按同一角色处理。`echo`/`printf` 的参数只是文本，
+不参与路径检查。未知命令、未知选项、缺参、不完整表达式或执行/写入动作不获豁免，
+退回逐参数检查；`sed`/`awk`/解释器的程序文本继续整体扫描。整条 Bash 原文的敏感
+路径匹配也保留优先级。该区分不改变 deny、ask 或只读分类器，不是通用 shell
+数据流分析。
 
 The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
 state tree, including `config.toml`, `mcp-oauth.json`, and

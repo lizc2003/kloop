@@ -13,6 +13,8 @@ use crate::shell::argv_is_readonly;
 use crate::shell::strip_wrappers;
 use crate::tools::Builtin;
 
+use super::argv_roles;
+
 pub(super) struct Hazard {
     pub(super) tag: &'static str,
 }
@@ -184,114 +186,26 @@ fn bash_reads_sensitive_path(command: &str, analysis: &BashAnalysis, cwd: &Path)
         return false;
     };
     commands.iter().any(|argv| {
-        let patterns = find_pattern_arguments(argv).unwrap_or_default();
-        argv.iter().enumerate().skip(1).any(|(index, arg)| {
-            if patterns.binary_search(&index).is_ok() {
-                return false;
-            }
-            if arg.starts_with('-') && !arg.contains('/') {
-                return false;
-            }
-            let path = expand_shell_path(arg, cwd);
-            PathFacts::gather(&path, cwd).sensitive
-        }) || recursive_search_covers_sensitive_path(argv, cwd)
+        let sensitive = match argv_roles::path_arguments(argv) {
+            // 识别出参数角色：只检查命令真正会打开的值。
+            Some(paths) => paths
+                .into_iter()
+                .any(|arg| path_argument_is_sensitive(arg, cwd)),
+            // 未知命令或语法：退回逐参数检查。
+            None => argv.iter().skip(1).any(|arg| {
+                if arg.starts_with('-') && !arg.contains('/') {
+                    return false;
+                }
+                path_argument_is_sensitive(arg, cwd)
+            }),
+        };
+        sensitive || recursive_search_covers_sensitive_path(argv, cwd)
     })
 }
 
-/// 只给完整识别的只读 find 区分匹配模式与文件路径；模式不参与文件读取。
-/// 未知语法、缺少操作数或执行/写入动作都退回原来的逐参数路径检查。
-fn find_pattern_arguments(argv: &[String]) -> Option<Vec<usize>> {
-    if argv.first()?.rsplit('/').next()? != "find" || !argv_is_readonly(argv) {
-        return None;
-    }
-    let mut index = 1;
-    while let Some(arg) = argv.get(index) {
-        match arg.as_str() {
-            "-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x" => index += 1,
-            "-f" => {
-                // BSD -f 后面是搜索根，即使它恰好叫 -path 也不是谓词。
-                argv.get(index + 1)?;
-                index += 2;
-            }
-            _ => break,
-        }
-    }
-    while let Some(arg) = argv.get(index) {
-        if arg.starts_with('-') || matches!(arg.as_str(), "(" | r"\(" | "!" | r"\!") {
-            break;
-        }
-        index += 1;
-    }
-
-    let mut patterns = Vec::new();
-    let mut depth = 0_usize;
-    let mut needs_operand = true;
-    while let Some(arg) = argv.get(index) {
-        match arg.as_str() {
-            "(" | r"\(" => {
-                depth += 1;
-                needs_operand = true;
-            }
-            ")" | r"\)" => {
-                if needs_operand || depth == 0 {
-                    return None;
-                }
-                depth -= 1;
-            }
-            "!" | r"\!" | "-not" => needs_operand = true,
-            "-a" | "-and" | "-o" | "-or" | "," => {
-                if needs_operand {
-                    return None;
-                }
-                needs_operand = true;
-            }
-            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
-            | "-iregex" | "-lname" | "-ilname" => {
-                index += 1;
-                argv.get(index)?;
-                patterns.push(index);
-                needs_operand = false;
-            }
-            "-type" | "-xtype" | "-size" | "-perm" | "-flags" | "-fstype" | "-user" | "-group"
-            | "-uid" | "-gid" | "-inum" | "-links" | "-amin" | "-atime" | "-cmin" | "-ctime"
-            | "-mmin" | "-mtime" | "-Bmin" | "-Btime" | "-used" | "-maxdepth" | "-mindepth"
-            | "-regextype" | "-newer" | "-anewer" | "-cnewer" | "-mnewer" | "-Bnewer"
-            | "-samefile" | "-xattrname" | "-printf" => {
-                // 比较参考文件、格式串等不获得模式豁免；仍由原路径检查判定。
-                index += 1;
-                argv.get(index)?;
-                needs_operand = false;
-            }
-            "-true"
-            | "-false"
-            | "-empty"
-            | "-nouser"
-            | "-nogroup"
-            | "-readable"
-            | "-writable"
-            | "-executable"
-            | "-acl"
-            | "-sparse"
-            | "-xattr"
-            | "-depth"
-            | "-d"
-            | "-xdev"
-            | "-mount"
-            | "-follow"
-            | "-daystart"
-            | "-noleaf"
-            | "-ignore_readdir_race"
-            | "-noignore_readdir_race"
-            | "-print"
-            | "-print0"
-            | "-ls"
-            | "-prune"
-            | "-quit" => needs_operand = false,
-            _ => return None,
-        }
-        index += 1;
-    }
-    (depth == 0 && !needs_operand).then_some(patterns)
+fn path_argument_is_sensitive(raw: &str, cwd: &Path) -> bool {
+    let path = expand_shell_path(raw, cwd);
+    PathFacts::gather(&path, cwd).sensitive
 }
 
 /// The one exemption to `.kloop` being sensitive: `.kloop/worktrees/<name>` holds

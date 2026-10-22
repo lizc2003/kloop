@@ -59,6 +59,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
+mod argv_roles;
 mod describe;
 mod facts;
 mod policy;
@@ -1574,6 +1575,69 @@ mod tests {
                 "cat -path ./.git -prune -o",
                 "find . -path ./.git -prune -o -print; cat ~/.kloop/config.toml",
                 "find . -path ~/.kloop/config.toml -prune -o -print",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Err("bash: reading this sensitive path is blocked. Do not retry or work around the protection.".to_string()),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn match_pattern_arguments_are_not_sensitive_reads_across_commands() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "find -O2 . -path ./.git -prune -o -print",
+                r"find . -newermt '2024-01-01' -path ./.git -prune -o -print",
+                "grep -rn '.env' src",
+                "grep -e './.git/config' docs",
+                "grep --include='*.rs' -rn '.env*' .",
+                "rg -n '.env' .",
+                "rg -g '!**/.git/*' TODO .",
+                "rg --glob='!**/.git/*' TODO .",
+                "du -sh --exclude=./.git .",
+                "tree -I .git",
+                "echo .env",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Ok(None),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reader_arguments_remain_sensitive_reads() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "grep -f ./.git/config src",
+                "grep --exclude-from=./.git/config -rn x .",
+                "rg --ignore-file=./.git/config -n x .",
+                "rg --pre 'cat ./.git/config' x .",
+                "rg --future-flag ./.git/config",
+                "du -X ./.git/config .",
+                "du --files0-from=./.git/config",
+                "tree --fromfile ./.git/config",
+                "find . -files0-from ./.git/config",
+                "find . -newer ./.git/config -print0",
+                "sudo find . -path ./.git -prune -o -print",
+                "xargs find . -path ./.git -prune -o -print",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
