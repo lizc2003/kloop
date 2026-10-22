@@ -996,10 +996,17 @@ shell、路径和危险特征，`describe.rs` 构造审批记忆载荷与展示�
 危险命令、敏感路径写入、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
 普通调用仍使用已配置的 OS 沙箱；只有调用主动脱沙箱或失败后升级才脱离沙箱。
 Credential-bearing/read-sensitive
-paths (`.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
+paths (`.git`, `.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
 boundary: `read_file` refuses them, grep/glob filter them before reading, and
-Bash checks literal plus canonical paths before sandbox/read-only/bypass. The
-macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
+Bash checks literal plus canonical paths before sandbox/read-only/bypass.
+`find` 参数按角色检查：只有完整识别为只读目录/元数据查询时，`-path`、`-name`、
+`-regex` 等匹配谓词的模式参数才免于被当作读取目标；支持括号、否定、与/或、
+隐式与和多个模式。搜索根（含 BSD `-f`）、`-newer`/`-samefile` 的参考文件等
+仍走原文与规范路径检查。未知谓词、缺参、不完整表达式或执行/写入动作不获模式
+豁免；整条 Bash 原文的敏感路径匹配也保留优先级。该区分不改变 deny、ask 或
+只读分类器，不是通用 shell 数据流分析。
+
+The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
 state tree, including `config.toml`, `mcp-oauth.json`, and
 `projects/v1/<ProjectId>/permissions.json` plus its lock, even through symlinks.
 Private-store directory and leaf checks also reject open permissions, symlinks,

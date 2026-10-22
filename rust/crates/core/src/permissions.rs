@@ -1488,6 +1488,106 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repository_size_and_find_prune_call_passes_sensitive_read_gate() {
+        let command = r#"cd refs/sample && echo "== top dirs"; du -sh packages/* apps/* 2>/dev/null | sort -h | tail -40; echo "== total"; du -sh .; echo "== ts loc"; find . -path ./.git -prune -o -type f \( -name '*.ts' -o -name '*.tsx' \) -print | wc -l"#;
+        for mode in [Mode::Manual, Mode::Bypass] {
+            for sandbox_auto_allow in [false, true] {
+                let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+                let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+                assert_eq!(
+                    p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                        .await,
+                    Ok(None)
+                );
+                assert_eq!(
+                    approver.ask_count(),
+                    usize::from(mode == Mode::Manual && !sandbox_auto_allow)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn find_match_patterns_are_not_sensitive_reads() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "find . -path './.git' -prune -o -type f -print",
+                "/usr/bin/find . src -ipath '*/.git/*' -prune -or -print",
+                r"find . \( -path ./.git -o -name '.env*' \) -prune -o -print",
+                "find . '(' -path './.git/*' -or -iname '.git' ')' -prune -o -print",
+                r"find -P . \! \( -path '*/.git/*' -o -name .git \) -type f -print0",
+                "find . -maxdepth 3 -type f -not -path './.git/*' -print",
+                "find -E -f src tests -iregex '.*/.git/.*' -prune -o -print",
+                "find . -name .git -prune -o -path ./.git -prune -o -print",
+                "find . -wholename './.git/*' -a -iwholename './.git/*' -print",
+                "find . -lname './.git/config' -o -ilname './.git/config' -print",
+                "find . -path ./.git -prune -o -depth -print",
+                "find -d . -path ./.git -prune -o -print",
+                "find . -path ./.git -print",
+                "find . -path ./.git -prune -a -print",
+                "find . -path ./.git -prune -o -path ./.git/config -print",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Ok(None),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn find_match_patterns_never_exempt_sensitive_reads() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "cat ./.git/config",
+                "find ./.git -path ./.git -prune -o -print",
+                "find -f ./.git . -path ./.git -prune -o -print",
+                "find . -path ./.git -prune -o -print; cat ./.git/config",
+                "find . -path ./.git -prune -o -exec cat '{}' ';'",
+                "find . -path ./.git -prune -o -execdir cat '{}' ';'",
+                "find . -path ./.git -prune -o -ok cat '{}' ';'",
+                "find . -path ./.git -prune -o -okdir cat '{}' ';'",
+                "find . -path ./.git -prune -o -fprint result.txt",
+                "find . -path ./.git -prune -o -fprintf result.txt '%p'",
+                "find . -path ./.git -prune -o -fls result.txt",
+                "find . -path ./.git -prune -o -delete",
+                "find . -path ./.git -newer ./.git/config -print",
+                "find . -samefile ./.git/config -path ./.git -print",
+                "find -f -path ./.git -prune -o -print",
+                "find . -newer -path ./.git -prune -o -print",
+                "find . -path ./.git -unknown -print",
+                "find . -path ./.git -prune -o",
+                "find . -path ./.git -prune -o -name",
+                "find . '(' -path ./.git -print",
+                "find . -path ./.git ')' -print",
+                "find . -path ./.git -o -o -print",
+                "cat -path ./.git -prune -o",
+                "find . -path ./.git -prune -o -print; cat ~/.kloop/config.toml",
+                "find . -path ~/.kloop/config.toml -prune -o -print",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Err("bash: reading this sensitive path is blocked. Do not retry or work around the protection.".to_string()),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn sensitive_reads_follow_symlinks_to_the_canonical_target() {
