@@ -4,6 +4,8 @@ mod tui_pty_support;
 
 use std::path::Path;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use anyhow::bail;
@@ -211,6 +213,148 @@ async fn startup_paints_mcp_progress_and_gates_input_until_connected() -> Result
             .any(|text| text.contains("too early")),
         "input submitted during startup leaked into a turn: {:?}",
         requests[0].user_texts
+    );
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// A durable scheduled task that comes due while a resumed session is still
+/// connecting MCP must not start a turn: the wake waits for the gate. Once the
+/// gate opens, the delivery request already carries the server's tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
+    use sha2::Digest as _;
+
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("timer delivered")]).await;
+    let mcp =
+        McpFixture::start_with_tools(Duration::from_millis(800), &[("echo", "echo back")]).await;
+    const SESSION_ID: &str = "20260101-000000-sched";
+    let provider_config = format!(
+        "provider = \"openai-compat\"\n\n\
+         [providers.openai-compat]\n\
+         wire_api = \"chat\"\n\
+         base_url = \"{}\"\n\
+         auth_header = {{ Authorization = \"Bearer synthetic-tui-pty-key\" }}\n\
+         model = \"tui-pty-model\"\n\n\
+         [mcp.servers.slow]\n\
+         url = \"{}\"\n\
+         bearer_token = \"synthetic-mcp-token\"\n",
+        fixture.uri(),
+        mcp.uri(),
+    );
+    // A resumed session needs a transcript and a due durable job before kloop
+    // starts: the scheduler binds while the MCP handshakes are still running.
+    let provider_base = fixture.uri();
+    let prepare = move |home: &Path, workspace: &Path| -> Result<()> {
+        let store = kloop_core::session_store::SessionStore::global(home.join(".kloop"));
+        let dirs = store.ensure(workspace)?;
+        let fingerprint = kloop_provider::Provider::endpoint_fingerprint_for(
+            kloop_protocol::ProviderApiFamily::OpenAiChatCompletions,
+            &provider_base,
+        );
+        let header = serde_json::json!({
+            "type": "session",
+            "id": format!("{SESSION_ID}#1"),
+            "format_version": 1,
+            "ts": 1_700_000_000_000u64,
+            "runtime": {"cwd": workspace.to_string_lossy()},
+        });
+        // A resumable transcript must open with its initial provider route
+        // before any history; this session has no messages, just the preamble.
+        let route = serde_json::json!({
+            "type": "provider_route_initial",
+            "id": format!("{SESSION_ID}#2"),
+            "parent": format!("{SESSION_ID}#1"),
+            "ts": 1_700_000_000_001u64,
+            "route_revision": 1,
+            "route_boundary": 2,
+            "source": "initial",
+            "provider_id": "openai-compat",
+            "api_family": "open_ai_chat_completions",
+            "endpoint_fingerprint": fingerprint,
+            "model": "tui-pty-model",
+            "continuity": "preserved",
+        });
+        std::fs::write(
+            dirs.sessions.join(format!("{SESSION_ID}.jsonl")),
+            format!("{header}\n{route}\n"),
+        )?;
+        let canonical = workspace.canonicalize()?;
+        let digest = sha2::Sha256::digest(canonical.to_string_lossy().as_bytes());
+        let project_key = kloop_core::resource_id::encode_digest(digest.into());
+        let scheduler_dir = home.join(".kloop").join("scheduler").join(&project_key);
+        std::fs::create_dir_all(&scheduler_dir)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+        let job_id = kloop_core::resource_id::fresh("job-")?;
+        let job = serde_json::json!({
+            "version": 1,
+            "project_key": project_key,
+            "jobs": [{
+                "id": job_id,
+                "owner": SESSION_ID,
+                "cron": "* * * * *",
+                "prompt": "timer work",
+                "created_at_ms": now - 120_000,
+                "next_fire_at_ms": now - 5_000,
+                "recurring": true,
+                "durable": true,
+                "kind": "cron",
+                "generation": 1
+            }]
+        });
+        std::fs::write(
+            scheduler_dir.join("scheduled_tasks.json"),
+            serde_json::to_vec_pretty(&job)?,
+        )?;
+        Ok(())
+    };
+    let mut harness = PtyHarness::spawn_with_options(
+        Path::new(env!("CARGO_BIN_EXE_kloop")),
+        &fixture.uri(),
+        30,
+        100,
+        &PtyOptions {
+            args: &["--resume", SESSION_ID],
+            provider_config: Some(&provider_config),
+            prepare: Some(&prepare),
+            ..PtyOptions::default()
+        },
+    )?;
+
+    harness.wait_for("MCP startup line", Duration::from_secs(10), |frame| {
+        frame.contains("MCP connecting 1 server(s)")
+    })?;
+    // The scheduler fires within milliseconds of binding. Give it a window
+    // inside the handshake to (wrongly) start the wake turn.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        fixture.requests().is_empty(),
+        "the scheduled wake ran before MCP settled: {:?}",
+        fixture.requests()
+    );
+
+    harness.wait_for("timer reply", Duration::from_secs(20), |frame| {
+        frame.contains("timer delivered")
+    })?;
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0]
+            .user_texts
+            .iter()
+            .any(|text| text.contains("timer work")),
+        "the scheduled prompt never reached the model: {:?}",
+        requests[0].user_texts
+    );
+    assert!(
+        requests[0]
+            .tool_names
+            .iter()
+            .any(|name| name == "slow__echo"),
+        "the first request lacks the MCP tool: {:?}",
+        requests[0].tool_names
     );
 
     graceful_exit(&mut harness)?;

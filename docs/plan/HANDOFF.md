@@ -1,5 +1,14 @@
 # HANDOFF — 当前状态与会话交接
 
+**启动门补齐自动唤醒（2026-10-21）**：Plan 236 的启动门只拦了键盘；审查发现
+恢复会话的持久定时任务可在 MCP 握手窗口经 autowake 提前发首轮。现在
+`autowake_ready` 把 startup 并入条件，门打开时主动再查一次 inbox（否则等待期间
+已消费 activity 边沿的通知会滞留）。PTY 回归用预置 session+scheduler 真跑
+`--resume`：无修复时窗口内出现 provider 请求且首请求没有 `slow__echo`，修复后
+窗口内 0 请求、放开后首请求带定时 prompt 与 `slow__echo`。外层沙箱之外
+`make check` 全绿（含本机 parity；CLI 156、core 1133、TUI 283、TUI PTY 23）。
+提交号以本条所在提交为准，教训 250。
+
 **TUI 先绘制、MCP 启动期间显示进度（2026-10-21）**：Plan 235 之后最慢那台
 MCP 仍让 TUI 黑屏。Plan 236 把握手挪到 `setup_terminal` 之后：首帧就画 banner
 和 `MCP connecting k/N · name`，连接期间除 Ctrl+C/Ctrl+D 外丢弃输入，第一轮
@@ -2917,3 +2926,18 @@ sources 的 Vec 快照，晚到的源不会自己进来——resource 工具源�
 界面。验收要断言“启动期间提交的输入没有到达 provider”，只看屏幕上出现过启动行
 区分不出是否真的挡住了 turn；PTY 里用户消息会带注入的 reminder，断言应匹配输入
 子串而不是整段相等。边界照旧：慢 server 仍让会话晚可用，只是可见、可退出。
+
+250. **输入门不等于启动门：任何能启动一次 turn 的入口都得过同一道闸。**
+Plan 236 只拦了键盘和 slash 命令，恢复会话里到期的持久定时任务却通过 inbox
+activity 与 `on_agent_events` 触发 autowake，在 MCP 握手窗口直接发
+`WorkerMsg::Wake`，首轮请求里没有 `slow__echo`，只有内置工具——正是“目录还没
+settle”的样子。修法不是再加一个 if，而是把 startup 状态并进 autowake 的
+readiness 谓词（`!running && !startup_pending && !inbox.is_empty()`），让两个
+调用点自动共享；并在门打开的同一处主动再查一次 inbox，否则等待期间到达的通知
+因为 activity 边沿已被消费，会一直滞留到下一次无关活动。回归必须真的恢复一个
+会话、让 durable 任务在窗口内到期：先在没有修复的代码上跑红（窗口内就出现
+provider 请求），再恢复修法跑绿，断言放开后的首请求同时带定时 prompt 与 MCP
+工具名。手工构造 resumed session 也有坑：录音必须以 `#1`/`#2` 的 id/parent 链
+开头，第二行是 `provider_route_initial`（`route_boundary` 必须等于该行 seq），
+scheduler store 的 `kind` 序列化是 `cron`/`loop_wakeup`，job id 必须是
+`job-<resource suffix>`。

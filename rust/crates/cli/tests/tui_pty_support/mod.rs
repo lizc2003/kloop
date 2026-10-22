@@ -41,6 +41,8 @@ pub struct RecordedRequest {
     pub model: String,
     pub user_texts: Vec<String>,
     pub tool_texts: Vec<String>,
+    /// Names as the provider saw them in `tools[]` (namespaced for MCP).
+    pub tool_names: Vec<String>,
 }
 
 #[derive(Default)]
@@ -81,11 +83,25 @@ impl Respond for QueueResponder {
             .filter_map(|message| message.get("content"))
             .map(content_text)
             .collect();
+        let tool_names = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| tool.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+            .collect();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.requests.push(RecordedRequest {
             model,
             user_texts,
             tool_texts,
+            tool_names,
         });
         let Some(response) = state.responses.pop_front() else {
             return ResponseTemplate::new(500).set_body_string("no synthetic response queued");
@@ -202,8 +218,24 @@ pub struct McpFixture {
 
 impl McpFixture {
     pub async fn start(delay: Duration) -> Self {
+        Self::start_with_tools(delay, &[]).await
+    }
+
+    /// Advertise `(name, description)` tools from `tools/list`, so a test can
+    /// prove the model's first request already carries the namespaced MCP tool.
+    pub async fn start_with_tools(delay: Duration, tools: &[(&str, &str)]) -> Self {
         use wiremock::matchers::body_partial_json;
 
+        let advertised: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|(name, description)| {
+                serde_json::json!({
+                    "name": name,
+                    "description": description,
+                    "inputSchema": {"type": "object", "properties": {}}
+                })
+            })
+            .collect();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_partial_json(
@@ -244,7 +276,7 @@ impl McpFixture {
                     .set_body_json(serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": 2,
-                        "result": {"tools": []}
+                        "result": {"tools": advertised}
                     })),
             )
             .mount(&server)
@@ -257,6 +289,10 @@ impl McpFixture {
     }
 }
 
+/// Seeds state outside the workspace before the child starts; receives
+/// `(home, workspace)`.
+pub type SandboxPrepare<'a> = &'a dyn Fn(&Path, &Path) -> Result<()>;
+
 /// What a spawn varies beyond size. [`PtyHarness::spawn`] and
 /// [`PtyHarness::spawn_with_args`] stay the short forms for the common cases.
 #[derive(Default)]
@@ -266,6 +302,10 @@ pub struct PtyOptions<'a> {
     /// Seeded into the workspace before the binary starts, as (path relative to
     /// the workspace, contents) — a tool scenario needs something to act on.
     pub files: &'a [(&'a str, &'a str)],
+    /// Runs after the sandbox directories exist and before the binary starts,
+    /// with `(home, workspace)`, for state outside the workspace (a pre-seeded
+    /// session or scheduler store).
+    pub prepare: Option<SandboxPrepare<'a>>,
 }
 
 #[derive(Clone, Debug)]
@@ -530,6 +570,9 @@ impl PtyHarness {
         // profile the environment used to build.
         let kloop_home = home.join(".kloop");
         std::fs::create_dir_all(&kloop_home).context("create PTY ~/.kloop")?;
+        if let Some(prepare) = options.prepare {
+            prepare(&home, &workspace).context("prepare PTY sandbox")?;
+        }
         let config = kloop_home.join("config.toml");
         let provider_config = options
             .provider_config

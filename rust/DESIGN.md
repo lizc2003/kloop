@@ -1887,7 +1887,11 @@ terminal so a slow server is visible instead of a blank start. Input is ignored
 while that line is present — except the quit chords — so no turn or slash
 command can run against a half-known catalog: the first turn still sees the
 complete snapshot, and `mcp_server_status/list` keeps its startup-snapshot
-contract. Warnings from the deferred connect go to the transcript as notes
+contract. Autowake obeys the same gate, because a scheduler fire or a finished
+sub-agent can otherwise start that first turn without a keypress; when the gate
+opens the loop re-checks the inbox once, so work queued during the wait is
+delivered immediately instead of stranded until unrelated activity. Warnings
+from the deferred connect go to the transcript as notes
 (stderr would fight the viewport), and the tool-merge pass runs once the
 catalogs exist. Plain, headless and server mode still connect before they start,
 because they have nothing to show until the catalog settles.

@@ -1114,12 +1114,14 @@ async fn search_files(cwd: &std::path::Path, target: &menu::CompletionTarget) ->
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
-/// waiting: a running turn drains the inbox at its own round boundary (firing
-/// then would double-deliver), and an empty inbox means there is nothing to wake
-/// for. Kept as a pure function so the delivery invariant is unit-tested rather
-/// than only exercised through the live terminal loop.
-fn autowake_ready(running: bool, inbox: &Inbox) -> bool {
-    !running && !inbox.is_empty()
+/// waiting AND no startup task still owns the keyboard: a running turn drains
+/// the inbox at its own round boundary (firing then would double-deliver), an
+/// empty inbox means there is nothing to wake for, and a pending startup would
+/// run the first turn against a half-known tool catalog. Kept as a pure function
+/// so the delivery invariant is unit-tested rather than only exercised through
+/// the live terminal loop.
+fn autowake_ready(running: bool, startup_pending: bool, inbox: &Inbox) -> bool {
+    !running && !startup_pending && !inbox.is_empty()
 }
 
 fn dispatch_autowake(
@@ -1127,7 +1129,7 @@ fn dispatch_autowake(
     inbox: &Inbox,
     msgs: &mpsc::UnboundedSender<WorkerMsg>,
 ) -> Option<CancellationToken> {
-    if !autowake_ready(app.running, inbox) {
+    if !autowake_ready(app.running, app.startup.is_some(), inbox) {
         return None;
     }
     let cancel = CancellationToken::new();
@@ -1511,9 +1513,16 @@ async fn ui_loop(
             // The startup task publishing its latest line, or releasing the
             // keyboard by dropping the sender when it finishes.
             line = startup_line.changed(), if state.app.startup.is_some() => {
-                match line {
-                    Ok(()) => state.app.startup = startup_line.borrow_and_update().clone(),
-                    Err(_) => state.app.startup = None,
+                state.app.startup = match line {
+                    Ok(()) => startup_line.borrow_and_update().clone(),
+                    // The task finished or was aborted without a final line.
+                    Err(_) => None,
+                };
+                if state.app.startup.is_none() {
+                    // A scheduler fire or a background sub-agent may have filled
+                    // the inbox while the gate held the keyboard; deliver it now
+                    // instead of waiting for the next unrelated activity.
+                    state.autowake();
                 }
                 ControlFlow::Continue(())
             },
@@ -2347,6 +2356,33 @@ mod tests {
         let effective = cells_leaving(&app, viewport);
         let physical = cells_leaving(&app, Rect::new(0, 0, 40, 12));
         assert!(effective > physical);
+    }
+
+    /// A scheduled fire that landed during a slow MCP startup must not start a
+    /// turn before the catalogs settle; releasing the gate must deliver it
+    /// without waiting for further activity.
+    #[tokio::test]
+    async fn scheduled_wake_waits_for_a_pending_startup() {
+        let inbox = Arc::new(Inbox::default());
+        inbox.push(InboxItem::ScheduledPrompt {
+            id: "job-1".into(),
+            origin: kloop_core::inbox::ScheduledOrigin::Cron,
+            scheduled_for_ms: 0,
+            reason: None,
+            prompt: "timer work".into(),
+            missed: false,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new("startup-gated".into());
+        app.startup = Some("MCP connecting 1 server(s)…".into());
+
+        assert!(dispatch_autowake(&mut app, &inbox, &tx).is_none());
+        assert!(rx.try_recv().is_err(), "startup must not dispatch a wake");
+
+        app.startup = None;
+        assert!(dispatch_autowake(&mut app, &inbox, &tx).is_some());
+        assert!(matches!(rx.recv().await, Some(WorkerMsg::Wake { .. })));
+        assert!(app.running);
     }
 
     #[tokio::test]
