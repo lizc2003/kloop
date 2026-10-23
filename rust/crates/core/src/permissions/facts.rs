@@ -399,7 +399,9 @@ pub(crate) fn bash_protection_requirement(
     match bash_reads_sensitive_path(command, &facts, cwd, execution) {
         ReadVerdict::RequiresProtection => Ok(true),
         ReadVerdict::Clear => Ok(false),
-        ReadVerdict::Sensitive | ReadVerdict::Unresolved => Err("bash: this literal-input command requires credential read/write protection. Running it without that protection is blocked; sandbox escalation is unavailable.".into()),
+        ReadVerdict::Sensitive | ReadVerdict::Unresolved => {
+            Err(crate::sandbox::PROTECTION_REQUIRED.into())
+        }
     }
 }
 
