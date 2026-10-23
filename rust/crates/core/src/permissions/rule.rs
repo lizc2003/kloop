@@ -1,5 +1,7 @@
 //! 权限规则语言、解析与两个方向的匹配。
 
+use std::path::Path;
+
 use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::bail;
@@ -63,11 +65,24 @@ impl Rule {
         }
     }
 
-    /// Shell 写入只匹配规范目标；原路径别名不能把目录授权带到其它目录。
+    /// 相对 glob 只看 cwd 内的规范相对目标；`**` 能匹配 `/`，不能拿它直接匹配绝对路径。
     pub(super) fn matches_shell_write(&self, tool: &str, facts: &PathFacts) -> bool {
-        matches!(self, Rule::PathGlob { tool: rule_tool, glob }
-            if rule_tool == tool && (glob.is_match(&facts.normalized)
-                || facts.relative.as_ref().is_some_and(|path| glob.is_match(path))))
+        let Rule::PathGlob {
+            tool: rule_tool,
+            glob,
+        } = self
+        else {
+            return false;
+        };
+        if rule_tool != tool {
+            return false;
+        }
+        let target = if Path::new(glob.glob().glob()).is_absolute() {
+            Some(facts.normalized.as_path())
+        } else {
+            facts.relative.as_deref()
+        };
+        target.is_some_and(|path| glob.is_match(path))
     }
 
     pub(super) fn matches_path(&self, tool: &str, facts: &PathFacts) -> bool {

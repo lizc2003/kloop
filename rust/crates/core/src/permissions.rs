@@ -2440,6 +2440,226 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cwd_root_log_project_rules_stay_within_the_canonical_directory() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver, writer.clone());
+        assert!(
+            ok(
+                &p,
+                "bash",
+                json!({
+                    "command": "make check > check.log",
+                    "disable_sandbox": true
+                })
+            )
+            .await
+        );
+        let directory = std::fs::canonicalize(test_cwd()).unwrap();
+        let stored = writer.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            stored,
+            vec![
+                "bash(make check *)".to_string(),
+                format!("bash_write({}/**)", directory.display())
+            ]
+        );
+        let approver = ScriptedApprover::new(vec![]);
+        let restarted = gate(
+            Mode::Manual,
+            PermissionRules {
+                allow: stored,
+                ..Default::default()
+            },
+            approver.clone(),
+        );
+        for target in ["next.log", "logs/next.log"] {
+            assert!(
+                ok(
+                    &restarted,
+                    "bash",
+                    json!({
+                        "command": format!("make check jobs=2 > {target}"),
+                        "disable_sandbox": true
+                    })
+                )
+                .await
+            );
+        }
+        let outside = directory.parent().unwrap().join("outside.log");
+        assert!(
+            !ok(
+                &restarted,
+                "bash",
+                json!({
+                    "command": format!("make check > {}", outside.display()),
+                    "disable_sandbox": true
+                })
+            )
+            .await
+        );
+        assert_eq!(approver.ask_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_root_log_escalation_rules_stay_within_the_canonical_directory() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver, writer.clone());
+        assert_eq!(
+            p.escalate_sandbox("make check > check.log", None, 0).await,
+            EscalationOutcome::Approved(EscalationApproval::User)
+        );
+        let directory = std::fs::canonicalize(test_cwd()).unwrap();
+        let stored = writer.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            stored,
+            vec![
+                "sandbox_escalate(make check *)".to_string(),
+                format!("sandbox_escalate_write({}/**)", directory.display())
+            ]
+        );
+        let approver = ScriptedApprover::new(vec![]);
+        let restarted = gate(
+            Mode::Manual,
+            PermissionRules {
+                allow: stored,
+                ..Default::default()
+            },
+            approver.clone(),
+        );
+        assert!(restarted.sandbox_escalation_remembered("make check jobs=2 > next.log"));
+        let outside = directory.parent().unwrap().join("outside.log");
+        let command = format!("make check > {}", outside.display());
+        assert!(!restarted.sandbox_escalation_remembered(&command));
+        assert_eq!(
+            restarted.escalate_sandbox(&command, None, 0).await,
+            EscalationOutcome::Declined
+        );
+        assert_eq!(approver.ask_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_root_log_session_keys_include_the_canonical_directory() {
+        let directory = std::fs::canonicalize(test_cwd()).unwrap();
+        let call = CallFacts::gather("bash", &bash("make check > check.log"), &test_cwd(), None);
+        assert_eq!(
+            remember_payload("bash", &call).unwrap().signatures,
+            vec![
+                "bash:make check".to_string(),
+                format!("bash-write:{}", directory.display())
+            ]
+        );
+        assert_eq!(
+            escalation_remember_payload("make check > check.log", &test_cwd())
+                .unwrap()
+                .signatures,
+            vec![
+                "sandbox_escalate:make check".to_string(),
+                format!("sandbox_escalate-write:{}", directory.display())
+            ]
+        );
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&p, "bash", bash("make check > check.log")).await);
+        assert!(ok(&p, "bash", bash("make check jobs=2 > next.log")).await);
+        let outside = directory.parent().unwrap().join("outside.log");
+        let command = format!("make check > {}", outside.display());
+        assert!(!ok(&p, "bash", bash(&command)).await);
+        assert_eq!(approver.ask_count(), 2);
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert_eq!(
+            p.escalate_sandbox("make check > check.log", None, 0).await,
+            EscalationOutcome::Approved(EscalationApproval::User)
+        );
+        assert!(p.sandbox_escalation_remembered("make check jobs=2 > next.log"));
+        assert!(!p.sandbox_escalation_remembered(&command));
+        assert!(
+            !p.fresh_session()
+                .sandbox_escalation_remembered("make check > next.log")
+        );
+        for tool in ["bash", "sandbox_escalate"] {
+            let call = CallFacts::gather(
+                "bash",
+                &bash("make check > /check.log"),
+                Path::new("/"),
+                None,
+            );
+            let remember = if tool == "bash" {
+                remember_payload(tool, &call)
+            } else {
+                escalation_remember_payload("make check > /check.log", Path::new("/"))
+            };
+            assert!(
+                remember.is_none(),
+                "{tool}: filesystem root must not be suggested"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_root_log_legacy_wildcards_only_cover_canonical_cwd_targets() {
+        let directory = std::fs::canonicalize(test_cwd()).unwrap();
+        let outside = directory.parent().unwrap().join("outside.log");
+        let command = format!("make check > {}", outside.display());
+        for pattern in ["*", "**"] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(
+                Mode::Manual,
+                rules(
+                    &[
+                        "bash(make check *)",
+                        &format!("bash_write({pattern})"),
+                        "sandbox_escalate(make check *)",
+                        &format!("sandbox_escalate_write({pattern})"),
+                    ],
+                    &[],
+                    &[],
+                ),
+                approver.clone(),
+            );
+            for target in ["next.log", "logs/next.log"] {
+                let inside = format!("make check > {}", directory.join(target).display());
+                assert!(ok(&p, "bash", bash(&inside)).await, "{pattern}");
+                assert!(p.sandbox_escalation_remembered(&inside), "{pattern}");
+            }
+            assert!(
+                !ok(
+                    &p,
+                    "bash",
+                    json!({
+                        "command": command,
+                        "disable_sandbox": true
+                    })
+                )
+                .await,
+                "{pattern}"
+            );
+            assert!(!p.sandbox_escalation_remembered(&command), "{pattern}");
+            assert_eq!(approver.ask_count(), 1);
+            for tool in ["bash_write", "sandbox_escalate_write"] {
+                let rule = parse_rule(&format!("{tool}({pattern})")).unwrap();
+                let alias = PathFacts::gather_with_resolved(
+                    &directory.join("alias/out.log"),
+                    &directory,
+                    Some(&outside),
+                );
+                assert!(
+                    !rule.matches_shell_write(tool, &alias),
+                    "{pattern}: canonical alias escaped cwd"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn log_wrappers_require_every_command_and_write_scope() {
         let command = bash("make check > /tmp/check.log 2>&1");
         for allow in [
