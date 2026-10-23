@@ -43,8 +43,8 @@ effort      = "max"
 wire_api    = "responses"
 base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
-model       = "deepseek-v4.1-flash"
-models      = ["deepseek-v4-flash-0731", "deepseek-v4.1-flash", "glm-5.3-flash"]
+model       = "deepseek-v4.1-flash-1017"
+models      = ["deepseek-v4-flash-0731", "deepseek-v4.1-flash-1017", "glm-5.3-flash"]
 context_window = 1000000
 effort      = "xhigh"
 
