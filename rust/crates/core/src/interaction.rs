@@ -13,7 +13,7 @@ use serde::Serialize;
 
 pub(crate) const MAX_TOTAL_CHARS: usize = 50_000;
 pub(crate) const MAX_QUESTION_CHARS: usize = 1_000;
-pub(crate) const MAX_HEADER_CHARS: usize = 12;
+pub(crate) const MAX_HEADER_CHARS: usize = 32;
 pub(crate) const MAX_LABEL_CHARS: usize = 100;
 pub(crate) const MAX_DESCRIPTION_CHARS: usize = 2_000;
 pub(crate) const MAX_PREVIEW_CHARS: usize = 10_000;

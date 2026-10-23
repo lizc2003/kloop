@@ -260,7 +260,7 @@ mod tests {
             (
                 "/properties/questions/items/properties/header",
                 "/questions/0/header",
-                12,
+                32,
             ),
             (
                 "/properties/questions/items/properties/options/items/properties/label",
@@ -311,7 +311,7 @@ mod tests {
     async fn second_question_header_enforces_character_limit_through_dispatch() {
         let ctx = ctx_with(QuestionOutcome::Cancelled);
         for unit in ["a", "界"] {
-            for length in [12, 13] {
+            for length in [12, 13, 20, 32, 33] {
                 let mut value = input();
                 let mut second = value["questions"][0].clone();
                 second["header"] = json!(unit.repeat(length));
@@ -324,11 +324,11 @@ mod tests {
                     ),
                 ] {
                     let (out, is_error) = run_tool(name, input, &ctx).await;
-                    assert_eq!(is_error, length > 12, "{out}");
+                    assert_eq!(is_error, length > 32, "{out}");
                     if is_error {
                         assert_eq!(
                             out,
-                            "ask_user_question: questions[1].header exceeds the 12-character limit"
+                            "ask_user_question: questions[1].header exceeds the 32-character limit"
                         );
                     } else {
                         assert!(out.contains("cancelled"), "{out}");

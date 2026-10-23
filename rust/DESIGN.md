@@ -1308,11 +1308,12 @@ changes do not invalidate the prompt-cache prefix.
 `ask_user_question` tool uses a separate `Questioner` contract and can ask one
 to four bounded single- or multi-select questions, with Other text and option
 previews.
-模型工具 schema 与运行时校验共用文本上限：正文 1,000、短标题 `header` 12、
+模型工具 schema 与运行时校验共用文本上限：正文 1,000、短标题 `header` 32、
 选项标签 100、描述 2,000、预览 10,000、`metadata.source` 200 个 Unicode 字符。
 这些字段在 schema 中声明 `minLength: 1` / `maxLength`，说明要求非空白；工具说明
 同时声明合计最多 50,000 字符。`header` 的说明明确它只是短展示标题，完整问题放在
-`question`；超限仍由运行时拒绝，不截断或改写。选项标签唯一、多选禁用预览、
+`question`；输入超限仍由运行时拒绝，不截断或改写。标题显示由 TUI 按终端列宽
+截断，不以显示宽度代替输入字符上限。选项标签唯一、多选禁用预览、
 总量与空白文本等跨字段/领域约束继续由共享 `QuestionRequest::validate` 校验。
 There is no notes step after picking an option (plan 214 dropped it):
 Other text already says "A, but…", and a step that appeared only for options
