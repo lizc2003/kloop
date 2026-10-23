@@ -337,6 +337,7 @@ pub(super) mod seatbelt {
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(&root).unwrap();
         let policy = SandboxPolicy {
+            credential_home: None,
             writable_roots: vec![WritableRoot {
                 root: root.clone(),
                 origins: vec![crate::sandbox::WritableRootOrigin::Workspace],

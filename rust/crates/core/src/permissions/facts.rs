@@ -6,10 +6,11 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::sandbox::ExecutionContext;
 use crate::shell::BashAnalysis;
-use crate::shell::analyze_bash;
 use crate::shell::argv_is_dangerous;
 use crate::shell::strip_wrappers;
+use crate::shell::{BashFacts, CommandFact, Direction, WordValue, analyze_bash_facts};
 use crate::tools::Builtin;
 
 use super::argv_roles;
@@ -33,6 +34,9 @@ pub(crate) struct CallFacts {
     pub(super) path: Option<PathFacts>,
     pub(super) path_key: Option<&'static str>,
     pub(super) sensitive_read: bool,
+    pub(super) risk_commands: Vec<CommandFact>,
+    pub(super) risk_writes: Vec<PathFacts>,
+    unresolved_sensitive_write: bool,
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     pub(crate) removing_worktree: bool,
@@ -74,18 +78,32 @@ pub(super) struct PathFacts {
 }
 
 impl CallFacts {
+    #[cfg(test)]
     pub(super) fn gather(
         name: &str,
         input: &Value,
         cwd: &Path,
         resolved_path: Option<&Path>,
     ) -> Self {
+        Self::gather_with_execution(name, input, cwd, resolved_path, ExecutionContext::default())
+    }
+
+    pub(super) fn gather_with_execution(
+        name: &str,
+        input: &Value,
+        cwd: &Path,
+        resolved_path: Option<&Path>,
+        execution: ExecutionContext<'_>,
+    ) -> Self {
         let shell_command = matches!(name, "bash" | "powershell")
             .then(|| input["command"].as_str())
             .flatten();
+        let bash_facts = (name == "bash")
+            .then(|| shell_command.map(analyze_bash_facts))
+            .flatten();
         let shell = match (name, shell_command) {
-            ("bash", Some(command)) => {
-                let analysis = analyze_bash(command);
+            ("bash", Some(_)) => {
+                let analysis = bash_facts.as_ref().unwrap().analysis.clone();
                 // Git Bash 的 POSIX 路径不能按原生 Windows cwd 规范化；未建模映射前不生成文件授权。
                 let analysis = if cfg!(windows) && !analysis.writes().is_empty() {
                     BashAnalysis::Opaque
@@ -121,10 +139,16 @@ impl CallFacts {
                 && shell_command
                     .zip(shell.as_ref())
                     .is_some_and(|(command, facts)| {
-                        let ShellFacts::Bash(analysis) = facts else {
+                        let ShellFacts::Bash(_) = facts else {
                             return false;
                         };
-                        bash_reads_sensitive_path(command, analysis, cwd)
+                        bash_reads_sensitive_path(
+                            command,
+                            bash_facts.as_ref().unwrap(),
+                            cwd,
+                            execution,
+                        )
+                        .blocked()
                     }));
         let powershell_sensitive =
             name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
@@ -144,6 +168,30 @@ impl CallFacts {
             path,
             path_key,
             sensitive_read,
+            risk_commands: bash_facts
+                .as_ref()
+                .map_or_else(Vec::new, |facts| facts.commands.clone()),
+            unresolved_sensitive_write: bash_facts.as_ref().is_some_and(|facts| facts.redirects.iter().any(|redirect| {
+                redirect.direction == Direction::Write && redirect.context.cwd_unknown
+                    && matches!(&redirect.target, WordValue::Literal(path) if !Path::new(path).is_absolute() && path_sensitivity(Path::new(path)).is_some())
+            })),
+            risk_writes: bash_facts.as_ref().map_or_else(Vec::new, |facts| {
+                facts
+                    .redirects
+                    .iter()
+                    .filter_map(|redirect| {
+                        if redirect.direction != Direction::Write {
+                            return None;
+                        }
+                        let WordValue::Literal(path) = &redirect.target else {
+                            return None;
+                        };
+                        if path == "/dev/null" { return None; }
+                        (!redirect.context.cwd_unknown || Path::new(path).is_absolute())
+                            .then(|| PathFacts::gather(Path::new(path), cwd))
+                    })
+                    .collect()
+            }),
             powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),
@@ -176,10 +224,25 @@ impl CallFacts {
         {
             return Some(Hazard { tag: "destructive" });
         }
-        if self
-            .writes
-            .iter()
-            .any(|path| path.sensitive || path.normalized.starts_with("/dev"))
+        if self.risk_commands.iter().any(|command| {
+            // 未知词用不可执行占位符保留位置；只用于 blocklist，不交给角色表或授权。
+            let argv: Vec<_> = command
+                .words
+                .iter()
+                .map(|word| match &word.value {
+                    WordValue::Literal(value) => value.clone(),
+                    WordValue::Unknown => "\0unknown".into(),
+                })
+                .collect();
+            argv_is_dangerous(&argv) || argv_is_dangerous(&strip_wrappers(&argv))
+        }) {
+            return Some(Hazard { tag: "destructive" });
+        }
+        if self.unresolved_sensitive_write
+            || self
+                .risk_writes
+                .iter()
+                .any(|path| path.sensitive || path.normalized.starts_with("/dev"))
         {
             return Some(Hazard {
                 tag: "sensitive redirect path",
@@ -219,34 +282,125 @@ impl CallFacts {
     }
 }
 
-fn bash_reads_sensitive_path(command: &str, analysis: &BashAnalysis, cwd: &Path) -> bool {
-    if raw_mentions_sensitive_path(command) {
-        return true;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadVerdict {
+    Clear,
+    Sensitive,
+    Unresolved,
+    RequiresProtection,
+}
+
+impl ReadVerdict {
+    fn blocked(self) -> bool {
+        matches!(self, Self::Sensitive | Self::Unresolved)
     }
-    let Some(commands) = analysis.commands() else {
-        return false;
+}
+
+fn argv_reads_sensitive_path(argv: &[String], cwd: &Path) -> bool {
+    let paths = argv_roles::path_arguments(argv);
+    // 已建模命令解析失败时角色不明，按内容访问处理；未建模命令（`ls`、
+    // `stat`）没有角色表可失败，元数据判定直接生效。
+    let metadata = argv_roles::is_metadata_access(argv)
+        && (paths.is_some() || !argv_roles::is_modeled_command(argv));
+    let sensitive = match paths {
+        // 识别出参数角色：只检查命令真正会打开的值。
+        Some(paths) => paths
+            .into_iter()
+            .any(|arg| path_argument_is_sensitive(arg, cwd, metadata)),
+        // 未知命令或语法：退回逐参数检查。
+        None => argv.iter().skip(1).any(|arg| {
+            if arg.starts_with('-') && !arg.contains('/') {
+                return false;
+            }
+            path_argument_is_sensitive(arg, cwd, metadata)
+        }),
     };
-    commands.iter().any(|argv| {
-        let paths = argv_roles::path_arguments(argv);
-        // 已建模命令解析失败时角色不明，按内容访问处理；未建模命令（`ls`、
-        // `stat`）没有角色表可失败，元数据判定直接生效。
-        let metadata = argv_roles::is_metadata_access(argv)
-            && (paths.is_some() || !argv_roles::is_modeled_command(argv));
-        let sensitive = match paths {
-            // 识别出参数角色：只检查命令真正会打开的值。
-            Some(paths) => paths
-                .into_iter()
-                .any(|arg| path_argument_is_sensitive(arg, cwd, metadata)),
-            // 未知命令或语法：退回逐参数检查。
-            None => argv.iter().skip(1).any(|arg| {
-                if arg.starts_with('-') && !arg.contains('/') {
-                    return false;
-                }
-                path_argument_is_sensitive(arg, cwd, metadata)
-            }),
-        };
-        sensitive || recursive_search_covers_sensitive_path(argv, cwd)
-    })
+    sensitive || recursive_search_covers_sensitive_path(argv, cwd)
+}
+
+fn bash_reads_sensitive_path(
+    command: &str,
+    facts: &BashFacts,
+    cwd: &Path,
+    execution: ExecutionContext<'_>,
+) -> ReadVerdict {
+    let raw_sensitive = raw_mentions_sensitive_path(command);
+    let mut masked = command.to_string();
+    let mut requires_protection = false;
+    if raw_sensitive && facts.reliable {
+        for input in &facts.literal_inputs {
+            if !input.eligible {
+                continue;
+            }
+            let body = &command[input.body.clone()];
+            if raw_mentions_sensitive_path(body) && protected_body(body, execution) {
+                // 只替换正文的字节，保留所有正文外命令与同一行的兄弟节点。
+                masked.replace_range(input.body.clone(), &" ".repeat(body.len()));
+                requires_protection = true;
+            }
+        }
+    }
+    if raw_mentions_sensitive_path(&masked) {
+        return ReadVerdict::Unresolved;
+    }
+    if let Some(commands) = facts.analysis.commands()
+        && commands
+            .iter()
+            .any(|argv| argv_reads_sensitive_path(argv, cwd))
+    {
+        return ReadVerdict::Sensitive;
+    }
+    {
+        for command in &facts.commands {
+            if let Some(argv) = command.argv() {
+                if argv_reads_sensitive_path(&argv, cwd) { return ReadVerdict::Sensitive; }
+            } else if command.words.iter().skip(1).any(|word| {
+                matches!(&word.value, WordValue::Literal(value) if path_argument_is_sensitive(value, cwd, false))
+            }) { return ReadVerdict::Sensitive; }
+        }
+        for redirect in &facts.redirects {
+            if redirect.direction == Direction::Read
+                && matches!(&redirect.target, WordValue::Literal(path) if path_argument_is_sensitive(path, cwd, false))
+            {
+                return ReadVerdict::Sensitive;
+            }
+        }
+    }
+    if requires_protection {
+        ReadVerdict::RequiresProtection
+    } else {
+        ReadVerdict::Clear
+    }
+}
+
+fn protected_body(body: &str, execution: ExecutionContext<'_>) -> bool {
+    // 只识别路径样本的词法边界，不解析 Rust/Python；每处 needle 都须落在受保护路径中。
+    body.split(|ch: char| ch.is_whitespace() || "\"'`(){}[];,|<>=&".contains(ch))
+        .filter(|token| raw_mentions_sensitive_path(token))
+        .all(|token| {
+            !token.contains(['\\', '$', '*', '?']) && execution.protected_literal_path(token)
+        })
+}
+
+/// 每个实际启动入口都复核；只有依赖本轮正文例外的调用改变执行契约。
+pub(crate) fn bash_protection_requirement(
+    command: &str,
+    cwd: &Path,
+    execution: ExecutionContext<'_>,
+) -> Result<bool, String> {
+    let facts = analyze_bash_facts(command);
+    if !facts
+        .literal_inputs
+        .iter()
+        .any(|input| input.eligible && raw_mentions_sensitive_path(&command[input.body.clone()]))
+    {
+        return Ok(false);
+    }
+    match bash_reads_sensitive_path(command, &facts, cwd, execution) {
+        ReadVerdict::RequiresProtection => Ok(true),
+        ReadVerdict::Clear => Ok(false),
+        ReadVerdict::Sensitive | ReadVerdict::Unresolved => Err("bash: this literal-input command requires credential read/write protection. Running it without that protection is blocked; sandbox escalation is unavailable.".into()),
+    }
 }
 
 fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
@@ -651,6 +805,47 @@ fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan239_partial_commands_keep_sensitive_reads() {
+        let call = CallFacts::gather(
+            "bash",
+            &serde_json::json!({"command": "echo $VALUE; cat .env"}),
+            Path::new("/workspace"),
+            None,
+        );
+        assert!(call.sensitive_read);
+    }
+
+    #[test]
+    fn plan239_partial_commands_keep_hazards() {
+        let call = CallFacts::gather(
+            "bash",
+            &serde_json::json!({"command": "echo $VALUE; rm -rf build"}),
+            Path::new("/workspace"),
+            None,
+        );
+        assert_eq!(
+            call.hazard("bash").map(|hazard| hazard.tag),
+            Some("destructive")
+        );
+    }
+
+    #[test]
+    fn plan239_literal_probe_passes_sensitive_gate() {
+        let home = std::env::temp_dir().join("kloop-plan239-facts-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let policy = crate::sandbox::SandboxPolicy::workspace(&home, &[], false)
+            .with_credential_roots(&home);
+        let call = CallFacts::gather_with_execution(
+            "bash",
+            &serde_json::json!({"command": "cat > /tmp/probe.rs <<'EOF'\nlet path = \"~/.ssh/id_rsa\";\nEOF\ncargo run"}),
+            Path::new("/workspace"),
+            None,
+            ExecutionContext::sandboxed(Some(&policy)),
+        );
+        assert_eq!(call.sensitive_read, !cfg!(target_os = "macos"));
+    }
 
     /// The string layer is the only screen left for a command too opaque to
     /// parse into argv, so its exemption must not become a traversal hole.

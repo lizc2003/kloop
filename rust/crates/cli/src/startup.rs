@@ -807,6 +807,18 @@ pub(crate) fn build_sandbox(
     offload_dir: &Path,
     warn: impl Fn(&str),
 ) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
+    let home = std::env::home_dir();
+    build_sandbox_for_home(args, cwd, runtime, offload_dir, home.as_deref(), warn)
+}
+
+fn build_sandbox_for_home(
+    args: &CliArgs,
+    cwd: &Path,
+    runtime: &RuntimeSettings,
+    offload_dir: &Path,
+    home: Option<&Path>,
+    warn: impl Fn(&str),
+) -> Result<Option<Arc<kloop_core::sandbox::SandboxPolicy>>> {
     // --mock stays hermetic; the env escape hatch was captured at startup.
     if args.mock {
         return Ok(None);
@@ -832,6 +844,9 @@ pub(crate) fn build_sandbox(
             // output, which it was handed a preview of and a path to. Writes there
             // remain denied.
             .with_allowed_read_path(offload_dir);
+            if let Some(home) = home {
+                policy = policy.with_credential_roots(home);
+            }
             policy.auto_allow = settings.trust_sandboxed;
             policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
@@ -1396,9 +1411,16 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         let args = crate::args::parse_args(&[]).unwrap();
 
         let offload = private_state_root.join("projects/v1/p1_test/offload");
-        let policy = build_sandbox(&args, &private_state_root, &runtime, &offload, |_| {})
-            .unwrap()
-            .unwrap();
+        let policy = build_sandbox_for_home(
+            &args,
+            &private_state_root,
+            &runtime,
+            &offload,
+            Some(&base.join("home")),
+            |_| {},
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(
             policy
@@ -1406,6 +1428,12 @@ http_headers = { Authorization = "SENTINEL-MCP" }
                 .iter()
                 .any(|root| root.root == private_state_root)
         );
+        assert_eq!(policy.credential_home, Some(base.join("home")));
+        for name in [".ssh", ".aws", ".gnupg"] {
+            let root = base.join("home").join(name);
+            assert!(policy.denied_read_paths.contains(&root));
+            assert!(policy.denied_write_paths.contains(&root));
+        }
         assert!(policy.denied_read_paths.contains(&private_state_root));
         assert!(policy.denied_write_paths.contains(&private_state_root));
         // The offload store is the one read-back inside the denied tree: it holds
@@ -1451,9 +1479,16 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         let runtime = RuntimeSettings::load(&config, /*mock_mode=*/ false).unwrap();
         let args = crate::args::parse_args(&[]).unwrap();
         let offload = private_state_root.join("projects/v1/p1_test/offload");
-        let policy = build_sandbox(&args, &private_state_root, &runtime, &offload, |_| {})
-            .unwrap()
-            .unwrap();
+        let policy = build_sandbox_for_home(
+            &args,
+            &private_state_root,
+            &runtime,
+            &offload,
+            Some(&base.join("home")),
+            |_| {},
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(!policy.denied_read_paths.is_empty());
         let uncovered: Vec<&std::path::PathBuf> = policy

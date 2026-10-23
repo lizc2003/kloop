@@ -96,7 +96,11 @@ pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> 
         && *code != Some(0)
         && sandbox::is_likely_sandbox_denied(*code, &tail, sb.network_disabled)
     {
-        tail.push_str(sandbox::DENIAL_HINT);
+        tail.push_str(if sb.requires_protection {
+            sandbox::PROTECTION_REQUIRED
+        } else {
+            sandbox::DENIAL_HINT
+        });
     }
     Ok(format!(
         "{status_line}\noutput file: {}\n--- output ---\n{tail}",
@@ -176,6 +180,7 @@ fn status_text(status: &BgStatus) -> String {
 #[derive(Clone, Copy)]
 struct BgSandbox {
     network_disabled: bool,
+    requires_protection: bool,
 }
 
 type BackgroundShellRegistration = ExecutionRegistration;
@@ -234,6 +239,12 @@ impl BackgroundShells {
         workspace: &EffectiveWorkspace,
     ) -> Result<String> {
         let command = input.command.as_str();
+        let requires_protection = crate::permissions::bash_protection_requirement(
+            command,
+            cwd,
+            sandbox::ExecutionContext::sandboxed(sandbox),
+        )
+        .map_err(anyhow::Error::msg)?;
         let description = input.description.as_deref().unwrap_or("");
         let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
@@ -298,6 +309,7 @@ impl BackgroundShells {
                     killer: Some(killer.clone()),
                     sandbox: sandbox.map(|policy| BgSandbox {
                         network_disabled: !policy.allow_network,
+                        requires_protection,
                     }),
                 },
             );

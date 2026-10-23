@@ -177,10 +177,10 @@ async fn run_gated_bash(
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
     let input = json!({ "command": command });
-    let sandbox_auto = bash::sandbox_auto_allowed("bash", &input, workspace);
+    let sandbox_auto = bash::execution_context("bash", &input, workspace);
     workspace
         .permissions
-        .check_call("bash", &input, ctx.depth, sandbox_auto)
+        .check_call_with_execution("bash", &input, ctx.depth, sandbox_auto)
         .await
         .map_err(|reason| anyhow!("!`{command}`: {reason}"))?;
     bash::bash_tool(&input, ctx, workspace).await

@@ -286,10 +286,10 @@ impl CheckRunner for GatedCheck {
             let ctx = ToolCtx::harness(Arc::clone(&self.cfg), self.cancel.clone());
             let workspace = self.cfg.effective_workspace();
             let input = json!({ "command": command });
-            let sandbox_auto = super::bash::sandbox_auto_allowed("bash", &input, &workspace);
+            let sandbox_auto = super::bash::execution_context("bash", &input, &workspace);
             if let Err(reason) = workspace
                 .permissions
-                .check_call("bash", &input, 0, sandbox_auto)
+                .check_call_with_execution("bash", &input, 0, sandbox_auto)
                 .await
             {
                 return CheckOutcome::Unavailable(format!("blocked: {reason}"));
@@ -360,6 +360,56 @@ mod tests {
             cfg.permissions = Arc::new(permissions);
         }
         GatedCheck::new(Arc::new(cfg))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn plan239_scheduled_check_keeps_literal_input_protection() {
+        let root = std::env::temp_dir().join(crate::resource_id::fresh("plan239-check-").unwrap());
+        std::fs::create_dir_all(root.join("home/.ssh")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("home/.ssh/sentinel"), "SCHEDULED-SECRET").unwrap();
+        let base = crate::tools::testutil::TestConfig::new("plan239-check").build();
+        let mut cfg = (*base).clone();
+        cfg.cwd = root.clone();
+        cfg.permissions = Arc::new(
+            Permissions::new(Mode::Bypass, &Default::default(), root.clone(), None).unwrap(),
+        );
+        cfg.sandbox = Some(Arc::new(
+            crate::sandbox::SandboxPolicy::workspace(&root, &[], false)
+                .with_credential_roots(&root.join("home")),
+        ));
+        let root_path = root.display();
+        let command = format!(
+            r#"cat > {root_path}/probe.sh <<'EOF'
+p='{root_path}/home/.ssh/sentinel'
+if [ "$1" = read ]; then /bin/cat "$p"; fi
+EOF
+echo attempt >> {root_path}/attempts
+/bin/sh {root_path}/probe.sh"#
+        );
+        let runner = GatedCheck::new(Arc::new(cfg.clone()));
+        assert_eq!(runner.run(&command).await, CheckOutcome::Passed);
+        let outcome = runner.run(&format!("{command} read")).await;
+        let CheckOutcome::Failed(output) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(!output.contains("SCHEDULED-SECRET"), "{output}");
+        assert!(
+            output.contains("requires credential read/write protection"),
+            "{output}"
+        );
+        assert!(!output.contains("Re-ran without"), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("attempts")).unwrap(),
+            "attempt\nattempt\n"
+        );
+        cfg.sandbox = None;
+        assert!(matches!(
+            GatedCheck::new(Arc::new(cfg)).run(&command).await,
+            CheckOutcome::Unavailable(_)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

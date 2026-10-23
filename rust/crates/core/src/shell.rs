@@ -1,9 +1,9 @@
 //! shell — bash command analysis on a real parse tree (tree-sitter-bash),
 //! ported from codex's `codex-shell-command` crate (Apache-2.0).
 //!
-//! One analysis feeds three verdicts: concurrency safety (tools.rs), the
-//! read-only/allowlist layers, and the dangerous-command safety check
-//! (permissions.rs). The core rule is a *whitelist walk*: a script is only
+//! 一棵树同时提供严格授权分析与局部风险证据。并发、只读、前缀与路径授权只消费
+//! 完整分析；deny、敏感读取和危险判定还消费保留参数位置的局部事实。
+//! The core rule is a *whitelist walk*: a script is only
 //! [`BashAnalysis::Commands`] when every node in its parse tree is a plain
 //! word-only command joined by `&&`/`||`/`;`/`|`/newline. Anything else —
 //! subshells, command/process substitution, general expansions, variable assignments,
@@ -14,6 +14,10 @@
 //! `>/dev/null`) are the exception: they add nothing the argv does not
 //! already say ([`redirect_is_stream_only`]). 固定文件输出进入 `WithWrites`，
 //! 同时保留 argv 与目标；只有 echo 参数的退出码展开例外地按纯数据分析。
+
+mod facts;
+pub(crate) use facts::analyze as analyze_bash_facts;
+pub(crate) use facts::{BashFacts, CommandFact, Direction, WordValue};
 
 use tree_sitter::Node;
 use tree_sitter::Parser;
@@ -58,21 +62,34 @@ impl BashAnalysis {
 const MAX_UNWRAP_DEPTH: u8 = 2;
 
 pub fn analyze_bash(script: &str) -> BashAnalysis {
-    analyze_at_depth(script, 0)
+    analyze_bash_facts(script).analysis
 }
 
-fn analyze_at_depth(script: &str, depth: u8) -> BashAnalysis {
-    let Some((commands, mut paths)) = parse_word_only_commands(script) else {
-        return BashAnalysis::Opaque;
-    };
-    // Unwrap nested `bash|sh|zsh -c|-lc "<script>"` one level at a time so
-    // the inner commands are classified, not the opaque wrapper words. An
-    // unparseable inner script keeps the wrapper argv as-is: `bash` is in no
-    // safe list and matches no sane allow rule, so it falls through to ask.
+fn strict_analysis(
+    commands: Vec<Vec<String>>,
+    mut paths: Vec<String>,
+    depth: u8,
+    nested: &[(Vec<String>, BashAnalysis)],
+) -> BashAnalysis {
+    // 只用同一轮解析已采集的嵌套结论；未知 shell 选项或正文保持 opaque，
+    // 不能退回 wrapper argv 后反而命中更宽的 allow。
     let mut flattened = Vec::with_capacity(commands.len());
     for argv in commands {
+        if argv
+            .first()
+            .is_some_and(|name| matches!(executable_name(name), "bash" | "sh" | "zsh"))
+            && argv.get(1).is_some_and(|arg| arg.starts_with('-'))
+            && extract_wrapped_script(&argv).is_none()
+        {
+            return BashAnalysis::Opaque;
+        }
         match extract_wrapped_script(&argv) {
-            Some(inner) if depth < MAX_UNWRAP_DEPTH => match analyze_at_depth(inner, depth + 1) {
+            Some(_) if depth < MAX_UNWRAP_DEPTH => match nested
+                .iter()
+                .find(|(outer, _)| outer == &argv)
+                .map(|(_, analysis)| analysis.clone())
+                .unwrap_or(BashAnalysis::Opaque)
+            {
                 BashAnalysis::Commands(inner_cmds) => flattened.extend(inner_cmds),
                 BashAnalysis::WithWrites {
                     commands,
@@ -115,11 +132,6 @@ fn extract_wrapped_script(argv: &[String]) -> Option<&str> {
     } else {
         None
     }
-}
-
-fn parse_word_only_commands(script: &str) -> Option<(Vec<Vec<String>>, Vec<String>)> {
-    let tree = parse_bash(script)?;
-    word_only_commands_sequence(&tree, script)
 }
 
 fn parse_bash(script: &str) -> Option<Tree> {

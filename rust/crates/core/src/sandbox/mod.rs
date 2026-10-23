@@ -28,6 +28,9 @@ const SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base.sbpl");
 const SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network.sbpl");
 const SEATBELT_LOOPBACK_POLICY: &str = include_str!("seatbelt_loopback.sbpl");
 
+/// 正文例外依赖凭据隔离；失败和启动前拒绝都不能建议移除该保护。
+pub const PROTECTION_REQUIRED: &str = "\n[This literal-input command requires credential read/write protection. Running it without that protection is blocked; sandbox escalation is unavailable.]";
+
 /// Appended to a failed sandboxed bash result when the failure looks like a
 /// sandbox denial — this is what teaches the model the escalation move (cc
 /// keeps the equivalent guidance in its system prompt; a hint at failure time
@@ -105,6 +108,8 @@ pub struct WritableRoot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxPolicy {
+    /// 保护声明只提供 home 坐标；每次使用仍核对实际 deny 与 carve-out。
+    pub credential_home: Option<PathBuf>,
     pub writable_roots: Vec<WritableRoot>,
     /// Credential-bearing files that sandboxed model shell commands may never
     /// read. The parent kloop process loads them before spawning a command.
@@ -176,6 +181,7 @@ impl SandboxPolicy {
             push_root_aliases(&mut writable_roots, extra, WritableRootOrigin::Extra);
         }
         SandboxPolicy {
+            credential_home: None,
             writable_roots,
             denied_read_paths: Vec::new(),
             allowed_read_paths: Vec::new(),
@@ -234,6 +240,139 @@ impl SandboxPolicy {
         push_path_aliases(&mut policy.denied_write_paths, path);
         policy
     }
+
+    pub fn with_credential_roots(&self, home: &Path) -> Self {
+        let mut policy = self.clone();
+        policy.credential_home = Some(home.to_path_buf());
+        for name in [".ssh", ".aws", ".gnupg"] {
+            let root = home.join(name);
+            policy = policy
+                .with_denied_read_path(&root)
+                .with_denied_write_path(&root);
+        }
+        policy
+    }
+
+    /// 核验根的两种名字都被读写拒绝，且读取 carve-out 不与禁区相交。
+    pub(crate) fn protects_credential_path(&self, path: &Path) -> bool {
+        let Some(home) = &self.credential_home else {
+            return false;
+        };
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        [".ssh", ".aws", ".gnupg"].into_iter().any(|name| {
+            let root = home.join(name);
+            if !path.starts_with(&root) {
+                return false;
+            }
+            let Some(root_resolved) = resolve_existing(&root) else {
+                return false;
+            };
+            let Some(path_resolved) = resolve_existing(path) else {
+                return false;
+            };
+            if !path_resolved.starts_with(&root_resolved) {
+                return false;
+            }
+            [root, root_resolved].iter().all(|root| {
+                let denied = |paths: &[PathBuf]| paths.iter().any(|deny| root.starts_with(deny));
+                denied(&self.denied_read_paths)
+                    && denied(&self.denied_write_paths)
+                    && !self.allowed_read_paths.iter().any(|allow| {
+                        let Some(resolved) = resolve_existing(allow) else {
+                            return true;
+                        };
+                        [allow, &resolved]
+                            .iter()
+                            .any(|allow| read_ranges_might_overlap(allow, root))
+                    })
+            })
+        })
+    }
+}
+
+fn read_ranges_might_overlap(left: &Path, right: &Path) -> bool {
+    if cfg!(any(target_os = "macos", windows)) {
+        let Some((left, right)) = left.to_str().zip(right.to_str()) else {
+            return true;
+        };
+        // 只用于拒绝 carve-out：大小写不明时多拒绝，不能据此证明 deny 已覆盖另一个名字。
+        let left = PathBuf::from(left.to_ascii_lowercase());
+        let right = PathBuf::from(right.to_ascii_lowercase());
+        left.starts_with(&right) || right.starts_with(&left)
+    } else {
+        left.starts_with(right) || right.starts_with(left)
+    }
+}
+
+/// 不存在的叶子仍须解析最近祖先；权限错误或断链不能当成覆盖成功。
+fn resolve_existing(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut root) => {
+                for part in suffix.iter().rev() {
+                    root.push(part);
+                }
+                return Some(root);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // 断链与缺失叶子不同，不能通过退到父目录吞掉符号链接。
+                if std::fs::symlink_metadata(ancestor).is_ok() {
+                    return None;
+                }
+                suffix.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 实际执行保护与免审批分别表示；旧的 bool 接口只能表达后者。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExecutionContext<'a> {
+    pub(crate) auto_allow: bool,
+    sandbox: Option<&'a SandboxPolicy>,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub(crate) fn sandboxed(policy: Option<&'a SandboxPolicy>) -> Self {
+        Self {
+            auto_allow: policy.is_some_and(|policy| policy.auto_allow),
+            sandbox: if cfg!(target_os = "macos") {
+                policy
+            } else {
+                None
+            },
+        }
+    }
+
+    pub(crate) fn approval_only(auto_allow: bool) -> Self {
+        Self {
+            auto_allow,
+            sandbox: None,
+        }
+    }
+
+    pub(crate) fn protected_literal_path(self, raw: &str) -> bool {
+        let Some(policy) = self.sandbox else {
+            return false;
+        };
+        let Some(home) = &policy.credential_home else {
+            return false;
+        };
+        let path = raw
+            .strip_prefix("~/")
+            .map_or_else(|| PathBuf::from(raw), |rest| home.join(rest));
+        policy.protects_credential_path(&path)
+    }
 }
 
 /// The platform's user cache directory: `~/Library/Caches` on macOS, else
@@ -253,7 +392,7 @@ fn user_cache_dir() -> Option<PathBuf> {
 fn push_path_aliases(paths: &mut Vec<PathBuf>, path: &Path) {
     for candidate in [
         path.to_path_buf(),
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        resolve_existing(path).unwrap_or_else(|| path.to_path_buf()),
     ] {
         if !paths.contains(&candidate) {
             paths.push(candidate);
@@ -342,14 +481,23 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
         rule
     };
     let mut write_denies = Vec::new();
+    let mut rename_denies = Vec::new();
     for (i, path) in policy.denied_write_paths.iter().enumerate() {
         let key = format!("DENIED_WRITE_{i}");
         params.push((key.clone(), path.clone()));
         write_denies.push(format!(
             "(literal (param \"{key}\")) (subpath (param \"{key}\"))"
         ));
+        // rename 父目录不会逐个检查后代；只固定祖先目录条目，普通兄弟文件仍可写。
+        for ancestor in path.ancestors().skip(1) {
+            if !ancestor.as_os_str().is_empty()
+                && !rename_denies.iter().any(|path| path == ancestor)
+            {
+                rename_denies.push(ancestor.to_path_buf());
+            }
+        }
     }
-    let file_write = if write_denies.is_empty() {
+    let mut file_write = if write_denies.is_empty() {
         format!("(allow file-write*\n{}\n)", write_parts.join("\n"))
     } else {
         format!(
@@ -358,6 +506,15 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
             write_denies.join(" ")
         )
     };
+    if !rename_denies.is_empty() {
+        let mut parts = Vec::new();
+        for (i, path) in rename_denies.into_iter().enumerate() {
+            let key = format!("DENIED_RENAME_{i}");
+            params.push((key.clone(), path));
+            parts.push(format!("(literal (param \"{key}\"))"));
+        }
+        file_write.push_str(&format!("\n(deny file-write-unlink {})", parts.join(" ")));
+    }
     // Reads are full-disk except explicit credential files; network is denied
     // by the base policy's (deny default) unless allow rules are appended.
     let mut sections = vec![
@@ -572,6 +729,7 @@ mod tests {
 
     fn policy_with(roots: Vec<WritableRoot>, allow_network: bool) -> SandboxPolicy {
         SandboxPolicy {
+            credential_home: None,
             writable_roots: roots,
             denied_read_paths: Vec::new(),
             allowed_read_paths: Vec::new(),
@@ -625,10 +783,14 @@ mod tests {
 
     #[test]
     fn denied_state_tree_is_parameterized_for_reads_and_writes() {
-        let private_root = Path::new("/home/u/.kloop");
+        let root =
+            std::env::temp_dir().join(crate::resource_id::fresh("plan239-profile-").unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let private_root = root.join(".kloop");
         let policy = policy_with(Vec::new(), false)
-            .with_denied_read_path(private_root)
-            .with_denied_write_path(private_root);
+            .with_denied_read_path(&private_root)
+            .with_denied_write_path(&private_root);
         let (profile, params) = seatbelt_profile(&policy);
         assert!(profile.contains(
             "(allow file-read*)\n(deny file-read* (literal (param \"DENIED_READ_0\")) (subpath (param \"DENIED_READ_0\")))"
@@ -636,16 +798,20 @@ mod tests {
         assert!(profile.contains(
             "(deny file-write* (literal (param \"DENIED_WRITE_0\")) (subpath (param \"DENIED_WRITE_0\")))"
         ));
-        assert_eq!(
-            params,
-            vec![
-                ("DENIED_READ_0".to_string(), PathBuf::from("/home/u/.kloop")),
-                (
-                    "DENIED_WRITE_0".to_string(),
-                    PathBuf::from("/home/u/.kloop")
-                ),
-            ]
+        let mut expected = vec![
+            ("DENIED_READ_0".to_string(), private_root.clone()),
+            ("DENIED_WRITE_0".to_string(), private_root.clone()),
+        ];
+        expected.extend(
+            private_root
+                .ancestors()
+                .skip(1)
+                .enumerate()
+                .map(|(i, path)| (format!("DENIED_RENAME_{i}"), path.to_path_buf())),
         );
+        assert_eq!(params, expected);
+        assert!(profile.contains("(deny file-write-unlink (literal (param \"DENIED_RENAME_0\"))"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

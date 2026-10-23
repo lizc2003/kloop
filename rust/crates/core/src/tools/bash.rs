@@ -166,28 +166,15 @@ fn shell_args(
     args
 }
 
-/// The session sandbox policy for this call: disable_sandbox is the model's
-/// per-call escape hatch (cc's dangerouslyDisableSandbox shape). The call
-/// still went through the permission gate like any other — escaping changes
-/// the execution wrapper, never the asking.
-fn call_sandbox(input: &Value, workspace: &EffectiveWorkspace) -> Option<Arc<SandboxPolicy>> {
-    if input["disable_sandbox"].as_bool().unwrap_or(false) {
-        None
-    } else {
-        workspace.sandbox.clone()
-    }
-}
-
-/// The per-call verdict dispatch feeds the permission gate's sandbox
-/// auto-allow layer: bash, not escaped, and the active policy opts in.
-/// Foreground and background take the same wrapper, so one verdict covers
-/// both.
-pub(super) fn sandbox_auto_allowed(
+pub(super) fn execution_context<'a>(
     name: &str,
     input: &Value,
-    workspace: &EffectiveWorkspace,
-) -> bool {
-    name == "bash" && call_sandbox(input, workspace).is_some_and(|policy| policy.auto_allow)
+    workspace: &'a EffectiveWorkspace,
+) -> sandbox::ExecutionContext<'a> {
+    let policy = (name == "bash" && !input["disable_sandbox"].as_bool().unwrap_or(false))
+        .then_some(workspace.sandbox.as_deref())
+        .flatten();
+    sandbox::ExecutionContext::sandboxed(policy)
 }
 
 pub(super) async fn bash_tool(
@@ -265,6 +252,12 @@ pub(crate) async fn run_foreground_bash(
     // the expensive half — the run that compiles the test binary, binds the
     // port, and only then discovers it may not — and re-running it every time
     // is what made "remember this" feel like it had not been remembered.
+    let requires_protection = crate::permissions::bash_protection_requirement(
+        command,
+        &cwd,
+        sandbox::ExecutionContext::sandboxed(sandbox.as_deref()),
+    )
+    .map_err(anyhow::Error::msg)?;
     let remembered_escalation = sandbox.as_ref().is_some_and(|policy| policy.escalate)
         && workspace.permissions.sandbox_escalation_remembered(command);
     let effective_sandbox = if remembered_escalation {
@@ -272,6 +265,10 @@ pub(crate) async fn run_foreground_bash(
     } else {
         sandbox.as_deref()
     };
+    // 已有通配升级不能覆盖这次调用新引入的保护要求；在第一次执行前拒绝。
+    if requires_protection && remembered_escalation {
+        bail!(sandbox::PROTECTION_REQUIRED);
+    }
     let output = run_foreground(command, &cwd, effective_sandbox, bash, timeout_ms, ctx).await?;
     let mut text = format_output(&output);
     let success = output.status.success();
@@ -289,7 +286,9 @@ pub(crate) async fn run_foreground_bash(
         && let Some(denial) =
             sandbox::classify_sandbox_denial(output.status.code(), &text, !policy.allow_network)
     {
-        if policy.escalate {
+        if requires_protection {
+            text.push_str(sandbox::PROTECTION_REQUIRED);
+        } else if policy.escalate {
             // The code-level escalation loop (codex's retry-on-denial):
             // ask once, and on approval re-run the command unsandboxed —
             // one fewer model round-trip than the disable_sandbox hint.
@@ -341,6 +340,12 @@ async fn run_foreground(
     timeout_ms: u64,
     ctx: &ToolCtx,
 ) -> Result<ForegroundOutput> {
+    crate::permissions::bash_protection_requirement(
+        command,
+        cwd,
+        sandbox::ExecutionContext::sandboxed(sandbox),
+    )
+    .map_err(anyhow::Error::msg)?;
     let spec = shell_spec(
         command,
         cwd,
@@ -1385,6 +1390,7 @@ mod tests {
     /// other test in this file) and the pure profile tests in sandbox.rs.
     #[cfg(target_os = "macos")]
     mod seatbelt {
+        include!("bash/protection_tests.rs");
         use super::*;
         use crate::sandbox::SandboxPolicy;
         use crate::sandbox::WritableRoot;
@@ -1438,6 +1444,7 @@ mod tests {
             )
             .unwrap();
             let policy = SandboxPolicy {
+                credential_home: None,
                 writable_roots: vec![WritableRoot {
                     root,
                     origins: vec![crate::sandbox::WritableRootOrigin::Workspace],

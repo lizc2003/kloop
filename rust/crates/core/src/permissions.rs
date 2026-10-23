@@ -62,6 +62,7 @@ use serde_json::Value;
 mod argv_roles;
 mod describe;
 mod facts;
+pub(crate) use facts::bash_protection_requirement;
 mod policy;
 mod rule;
 #[cfg(test)]
@@ -591,7 +592,29 @@ impl Permissions {
         depth: u8,
         sandbox_auto_allow: bool,
     ) -> Result<Option<PermissionNotice>, String> {
-        self.check_call_with_resolved_path(name, input, None, None, depth, sandbox_auto_allow)
+        self.check_call_with_resolved_path(
+            name,
+            input,
+            None,
+            None,
+            depth,
+            crate::sandbox::ExecutionContext::approval_only(sandbox_auto_allow),
+        )
+        .await
+        .map_err(|refusal| match refusal {
+            Refusal::Denied(reason) => reason,
+            Refusal::Stopped => user_denial(name),
+        })
+    }
+
+    pub(crate) async fn check_call_with_execution(
+        &self,
+        name: &str,
+        input: &Value,
+        depth: u8,
+        execution: crate::sandbox::ExecutionContext<'_>,
+    ) -> Result<Option<PermissionNotice>, String> {
+        self.check_call_with_resolved_path(name, input, None, None, depth, execution)
             .await
             .map_err(|refusal| match refusal {
                 Refusal::Denied(reason) => reason,
@@ -609,12 +632,18 @@ impl Permissions {
         resolved_path: Option<&Path>,
         preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
-        sandbox_auto_allow: bool,
+        execution: crate::sandbox::ExecutionContext<'_>,
     ) -> Result<Option<PermissionNotice>, Refusal> {
         if self.allow_everything {
             return Ok(None);
         }
-        let call = CallFacts::gather(name, input, self.identity.cwd(), resolved_path);
+        let call = CallFacts::gather_with_execution(
+            name,
+            input,
+            self.identity.cwd(),
+            resolved_path,
+            execution,
+        );
         let resolved_input = call
             .path
             .as_ref()
@@ -694,7 +723,7 @@ impl Permissions {
         // 8. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say.
-        if sandbox_auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
+        if execution.auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
             return Ok(None);
         }
 
@@ -1025,6 +1054,7 @@ impl Permissions {
 
 #[cfg(test)]
 mod tests {
+    include!("permissions/plan239_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;
@@ -1337,27 +1367,22 @@ mod tests {
             rules(&[], &["bash(rm *)"], &[]),
             approver.clone(),
         );
-        // 动态目标仍 opaque；固定目标现在可解析，必须重新经过 deny 检查。
+        // 动态目标仍 opaque；局部命令证据足以命中 deny，不必等完整授权分析。
         assert!(!ok(&p, "bash", bash("rm -rf build > \"$LOG\"")).await);
-        assert_eq!(
-            approver.ask_count(),
-            1,
-            "manual 下无法分析的 Bash 必须由用户批准"
-        );
-        // Its stream-only twin is parsed, so the deny rule sees the `rm` itself
-        // and nobody is asked at all — the stricter end of the same story.
+        assert_eq!(approver.ask_count(), 0, "opaque 不得隐藏已知的 deny 前缀");
+        // 固定输出与纯流重定向也命中同一规则。
         assert!(!ok(&p, "bash", bash("rm -rf build > cleanup.log")).await);
         assert!(!ok(&p, "bash", bash("rm -rf build > /dev/null")).await);
         assert_eq!(
             approver.ask_count(),
-            1,
+            0,
             "a parsed `rm` is denied by the rule, without a question"
         );
         // A parseable, non-destructive command still auto-runs with no prompt.
         assert!(ok(&p, "bash", bash("ls -la")).await);
         assert_eq!(
             approver.ask_count(),
-            1,
+            0,
             "manual 下已知只读的 Bash 仍直接放行"
         );
     }
@@ -2835,8 +2860,15 @@ mod tests {
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let write = file("/elsewhere/x.txt");
         assert_eq!(
-            p.check_call_with_resolved_path("write_file", &write, None, None, 0, false)
-                .await,
+            p.check_call_with_resolved_path(
+                "write_file",
+                &write,
+                None,
+                None,
+                0,
+                Default::default()
+            )
+            .await,
             Err(Refusal::Stopped)
         );
         assert_eq!(
@@ -2844,8 +2876,15 @@ mod tests {
             Err(user_denial("write_file"))
         );
         assert_eq!(
-            p.check_call_with_resolved_path("write_file", &write, None, None, 0, false)
-                .await,
+            p.check_call_with_resolved_path(
+                "write_file",
+                &write,
+                None,
+                None,
+                0,
+                Default::default()
+            )
+            .await,
             Err(Refusal::Denied(user_denial("write_file")))
         );
         assert_eq!(approver.ask_count(), 3);

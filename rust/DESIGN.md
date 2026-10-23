@@ -1025,13 +1025,21 @@ grep/rg 的 `-e`/`--regexp` 与 `-f`/`--file` 两种模式来源。搜索根（�
 操作数的短选项若后面仍有字符也退回全查，避免把 `-Ia` 误当成附着模式。
 `echo`/`printf` 的参数只是文本，
 不参与路径检查。未知命令、未知选项、缺参、不完整表达式或执行/写入动作不获豁免，
-退回逐参数检查；`sed`/`awk`/解释器的程序文本继续整体扫描。整条 Bash 原文的敏感
-路径匹配也保留优先级。该区分不改变 deny、ask 或只读分类器，不是通用 shell
-数据流分析。
+退回逐参数检查；`sed`/`awk`/解释器的程序文本继续整体扫描。Bash 原文的敏感
+needle 仍优先，但对边界明确、带引用分隔符的 `cat` heredoc 写固定文件，可只跳过
+正文中已确认由实际 macOS 策略保护的 home 凭据路径。每处命中都要落在当前 home 的
+`.ssh`、`.aws` 或 `.gnupg` 根内，并核对原文与规范路径的读写拒绝、根自身的符号链接
+和读取 carve-out；`..`、相对路径、其它用户路径、保护外 needle 与覆盖不明都保留拒绝。
+不解析 Rust/Python 字符串、不推算生成程序的文件访问；后续代码的边界由相同 OS 策略承担。
+无沙箱和未支持平台保持原文保守扫描，`.kloop`、`.git`、rc 文件与 `.env*` 不属于该例外。
 
 The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
 state tree, including `config.toml`, `mcp-oauth.json`, and
 `projects/v1/<ProjectId>/permissions.json` plus its lock, even through symlinks.
+CLI 同时为当前 home 的 `.ssh`、`.aws`、`.gnupg` 添加递归读写拒绝，保留字面与
+规范名字；不存在的叶子也解析最近存在祖先，不读取凭据内容。配对的拒写阻止移动凭据文件或
+根本身；Seatbelt 还对拒写路径的祖先目录条目添加 literal `file-write-unlink` 拒绝，防止把
+整个父目录改名后再读取。它不把祖先子树变为只读，普通兄弟文件仍可编辑。
 Private-store directory and leaf checks also reject open permissions, symlinks,
 and non-regular entries. Provider/search key env vars are removed from model
 shell children.
@@ -1047,7 +1055,12 @@ layer, while deny rules, sensitive reads, safety checks and explicit ask rules
 keep their say (the ask-rule half is deliberately stricter than cc's
 autoAllowBashIfSandboxed).
 
-**Bash 决策共用真实语法树**（`crates/core/src/shell.rs`，tree-sitter-bash）。
+**Bash 严格授权与局部风险共用真实语法树**（`crates/core/src/shell.rs`、`shell/facts.rs`，
+tree-sitter-bash）。一次解析保留命令的字面/未知参数与位置、重定向方向/fd/目标、
+heredoc 正文范围/引用状态/消费命令、管道/替换/复合结构与 cwd 是否未知，以及不完整证据。
+动态参数不能删除后重新对齐角色。遇到 `cd` 不推算新 cwd，相对输出不生成路径授权；
+已知敏感类别仍参与风险判断。支持的 `-c` 包裹有界递归，未知 wrapper 选项保持 opaque。
+解析错误、缺失节点、超过 1 MiB、20,000 个节点或 128 层语法树、递归超限时不给正文例外或完整授权。
 普通字面命令可由 `&&` / `||` / `;` / `|` / 换行连接，`bash -c "…"` 递归解包。
 固定输出重定向（`>` / `>>` / `>|` / `&>` / `&>>`）进入 `WithWrites`，同时保留
 全部 argv 和每个输出目标，不把写入藏进命令参数或丢掉。复合脚本的目标要求绝对路径；
@@ -1057,7 +1070,15 @@ autoAllowBashIfSandboxed).
 只有 `echo` 参数中的 `$?` / `${?}` 作为纯数据展开，以稳定占位符参与分析，执行仍使用原文。
 命令名、重定向目标和其它命令参数不获此例外。输入重定向、heredoc、动态目标、子 shell、
 命令/进程替换、其它展开、变量赋值与控制流仍 opaque：manual 下不能靠解析或 allow 规则
-放行，只能由沙箱、逐字会话同意或本次审批决定；bypass 直接放行。
+放行，只能由沙箱、逐字会话同意或本次审批决定；bypass 跳过审批，前置硬限制仍生效。
+局部命令、输入和固定输出即使在 opaque 脚本内也继续参与 deny、ask、敏感读取和危险判断。
+部分命令的 deny 前缀只看第一个未知词之前的连续字面词；完整命令才可匹配无通配的精确规则。
+这些证据始终不能进入 allow、只读、并发、项目持久化或前缀记忆。
+正文例外首批只认无文件参数的 `cat`（或 `/bin/cat`、`/usr/bin/cat`），一个默认 stdin
+heredoc 加一个默认 stdout 的 `>` 固定文件输出；支持完整单/双引号、反斜杠分隔符和 `<<-`。
+直接给解释器、管道/替换/未知复合结构、多 heredoc、非标准 fd 或附加重定向均不获例外。
+同一行藏在 heredoc 节点内的可执行兄弟也不获例外。只屏蔽认可的正文范围，执行原文完整保留。
+heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记住工作区会话，不生成项目或升级前缀。
 `2>&1` / `>&2` / `…>/dev/null` 等纯流重定向继续不增加文件效果。
 `WithWrites` 永远不是只读调用，也不能并发批处理；已识别 argv 继续经过 deny、危险命令
 和敏感读取检查，输出路径的敏感类别与 `/dev` 目标在 manual 下强制逐次确认。
@@ -3092,7 +3113,7 @@ explicitly.
 ## OS sandbox (Phase 2, thirteenth slice)
 
 On macOS, bash commands run inside a seatbelt sandbox by default
-(`crates/core/src/sandbox/`, executed via `/usr/bin/sandbox-run_program` with a
+(`crates/core/src/sandbox/`, executed via `/usr/bin/sandbox-exec` with a
 deny-by-default SBPL profile — the shape cc and codex converged on):
 
 - **Writes** are allow-listed: the current workspace-derived root + `/tmp` +
@@ -3111,8 +3132,9 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   are privilege-escalation surfaces — hooks and git config run code, and project
   `.kloop` contains agent instructions/state; the rest of `.git` stays writable
   so `git commit` works sandboxed). The user-private `~/.kloop` state tree is a
-  separate recursive deny-read/deny-write boundary.
-- **Reads** are full-disk; **network** is off unless configured — with one
+  separate recursive deny-read/deny-write boundary. 当前 home 下 `.ssh`、`.aws`、`.gnupg`
+  同样递归拒读与拒写；它们不享受 offload 的读取例外。
+- **Reads** are full-disk apart from explicit credential/state denies; **network** is off unless configured — with one
   deliberate exception: **loopback**. A denied network still admits `bind`,
   `listen` and `connect` on this machine, because that is where the project's
   own test servers listen (Go's `httptest` takes a loopback port for nearly
@@ -3142,7 +3164,8 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   first, then run sandboxed). `--permission-mode bypass` 跳过全部工具权限审批，
   包括复杂脚本、危险命令和带 `disable_sandbox: true` 的主动脱沙箱调用。
   它不关闭已配置的 OS 沙箱；普通调用仍先在沙箱内执行，模型主动脱沙箱和程序失败后
-  自动升级则都免审批。用户选择该模式即接受这些调用的执行代价；deny 与敏感读取
+  自动升级通常也免审批。依赖字面正文例外的调用必须保留凭据隔离，任何模式都不能升级移除它。
+  用户选择该模式即接受这些调用的执行代价；deny 与敏感读取
   硬拦截仍优先，权限模式本身不提供命令内容或文件系统隔离保证。
 
 On platforms without an OS shell sandbox, worktree separation still anchors
@@ -3193,6 +3216,13 @@ only ever waives containment for commands that already got through it. Without
 this a test suite that binds a local
 port re-asked on every run — one measured review spent 20 minutes of its 63 on
 escalation round-trips, against 1 minute for the same review without them.
+
+字面正文例外使用独立的执行上下文，不能用 `trust_sandboxed` 或免审批 bool 代替实际保护。
+关闭自动放行但保留沙箱时仍可通过敏感门，随后按 opaque 规则审批。前景、背景和直接前景执行器
+（包括 scheduler）在启动前重新核对传入的同一份策略。已有升级记忆（含会话通配记忆）若会跳过
+沙箱，须在第一次执行前硬拒绝；沙箱失败也不询问或自动脱沙箱重跑，不提示 `disable_sandbox`。
+主动脱沙箱、无策略、平台不支持或缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。
+未依赖这次正文例外的调用保持现有升级行为。
 
 Otherwise escalation is per call — the next command is sandboxed again —
 and the command already cleared the permission gate (deny rules and safety

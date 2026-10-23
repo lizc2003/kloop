@@ -214,12 +214,26 @@ pub(super) fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) ->
 /// `bash(rm *)` rule, and any single matching segment hits.
 pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
     if rules.iter().any(|r| r.matches_tool(name))
-        || call.writes.iter().any(|path| {
+        || call.risk_writes.iter().any(|path| {
             rules
                 .iter()
                 .any(|rule| rule.matches_path("bash_write", path))
         })
     {
+        return true;
+    }
+    if call.risk_commands.iter().any(|command| {
+        if let Some(argv) = command.argv() {
+            let stripped = strip_wrappers(&argv);
+            return rules.iter().any(|rule| rule.matches_argv(&argv) || rule.matches_argv(&stripped));
+        }
+        let prefix = command.literal_prefix();
+        let stripped = strip_wrappers(&prefix);
+        rules.iter().any(|rule| {
+            matches!(rule, Rule::BashPrefix { tokens, wildcard: true }
+                if argv_has_prefix(tokens, true, &prefix) || argv_has_prefix(tokens, true, &stripped))
+        })
+    }) {
         return true;
     }
     match (&call.shell, &call.path) {
