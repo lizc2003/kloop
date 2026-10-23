@@ -1305,12 +1305,13 @@ fn confirm_panel(req: &ConfirmRequest, cursor: usize, width: usize) -> choice::P
 fn question_panel(question: &PendingQuestion, width: usize) -> choice::Panel {
     let current = question.current();
     let total = question.req.questions.len();
+    // 从末尾裁剪标题时，题号必须留在可见前缀。
     let header = if total > 1 {
         format!(
-            "{} ({}/{})",
-            current.header,
+            "({}/{}) {}",
             question.question_index + 1,
-            total
+            total,
+            current.header
         )
     } else {
         current.header.clone()
@@ -2456,6 +2457,65 @@ mod tests {
                 "Enter select · ↑↓ move · 1-9 pick · Esc cancel",
             ]
         );
+    }
+
+    #[test]
+    fn question_panel_keeps_progress_visible_with_long_titles() {
+        use kloop_core::interaction::Question;
+        use kloop_core::interaction::QuestionOption;
+        use kloop_core::interaction::QuestionRequest;
+
+        for header in ["界".repeat(32), "a".repeat(32)] {
+            let request = QuestionRequest {
+                questions: vec![
+                    Question {
+                        question: "Which way?".into(),
+                        header: header.clone(),
+                        options: vec![
+                            QuestionOption {
+                                label: "A".into(),
+                                description: "first".into(),
+                                preview: None,
+                            },
+                            QuestionOption {
+                                label: "B".into(),
+                                description: "second".into(),
+                                preview: None,
+                            },
+                        ],
+                        multi_select: false,
+                    };
+                    4
+                ],
+                metadata: None,
+            };
+            assert_eq!(request.validate(), Ok(()));
+            let mut app = App::new("s".into());
+            let (reply, _rx) = tokio::sync::oneshot::channel();
+            app.apply(crate::events::AgentEvent::Question {
+                req: request,
+                reply,
+            });
+            for index in 0..4 {
+                let Some(PendingInteraction::Question(question)) = app.interactions.front_mut()
+                else {
+                    panic!("expected an active question");
+                };
+                question.question_index = index;
+                for width in [40, 60, 20, 80] {
+                    let panel = active_panel(&app, width).unwrap();
+                    let layout = choice::panel_lines(&panel, width, 30, 0);
+                    let rendered = line_text(&layout.lines[0]);
+                    let progress = format!("({}/4)", index + 1);
+                    assert!(rendered.contains(&progress), "{width}: {rendered}");
+                    assert!(
+                        rendered.starts_with(&format!("▌ {progress} ")),
+                        "{rendered}"
+                    );
+                    assert!(display_width(&rendered) <= width, "{width}: {rendered}");
+                }
+            }
+        }
     }
 
     /// The rewind picker is the same panel, so its keys are the same keys.

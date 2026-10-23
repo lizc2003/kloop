@@ -54,8 +54,8 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "question": {"type": "string", "minLength": 1, "maxLength": MAX_QUESTION_CHARS, "description": "Non-blank full question text."},
-                            "header": {"type": "string", "minLength": 1, "maxLength": MAX_HEADER_CHARS, "description": format!("Non-blank short display title, at most {MAX_HEADER_CHARS} characters. Put the full question in question.")},
+                            "question": {"type": "string", "minLength": 1, "maxLength": MAX_QUESTION_CHARS, "pattern": ".*\\S.*", "description": "Non-blank full question text."},
+                            "header": {"type": "string", "minLength": 1, "maxLength": MAX_HEADER_CHARS, "pattern": ".*\\S.*", "description": format!("Non-blank short display title, at most {MAX_HEADER_CHARS} characters. Put the full question in question.")},
                             "options": {
                                 "type": "array",
                                 "minItems": 2,
@@ -63,9 +63,9 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "label": {"type": "string", "minLength": 1, "maxLength": MAX_LABEL_CHARS, "description": "Non-blank option label, unique within this question."},
-                                        "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_CHARS, "description": "Non-blank explanation of this option."},
-                                        "preview": {"type": "string", "minLength": 1, "maxLength": MAX_PREVIEW_CHARS, "description": "Optional non-blank preview, only for single-select questions."}
+                                        "label": {"type": "string", "minLength": 1, "maxLength": MAX_LABEL_CHARS, "pattern": ".*\\S.*", "description": "Non-blank option label, unique within this question."},
+                                        "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "Non-blank explanation of this option."},
+                                        "preview": {"type": "string", "minLength": 1, "maxLength": MAX_PREVIEW_CHARS, "pattern": ".*\\S.*", "description": "Optional non-blank preview, only for single-select questions."}
                                     },
                                     "required": ["label", "description"],
                                     "additionalProperties": false
@@ -94,7 +94,7 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                 },
                 "metadata": {
                     "type": "object",
-                    "properties": {"source": {"type": "string", "minLength": 1, "maxLength": MAX_SOURCE_CHARS, "description": "Optional non-blank question source."}},
+                    "properties": {"source": {"type": "string", "minLength": 1, "maxLength": MAX_SOURCE_CHARS, "pattern": ".*\\S.*", "description": "Optional non-blank question source."}},
                     "additionalProperties": false
                 }
             },
@@ -286,6 +286,7 @@ mod tests {
             let schema = definition.schema.pointer(schema_path).unwrap();
             assert_eq!(schema["minLength"], 1, "{schema_path}");
             assert_eq!(schema["maxLength"], max, "{schema_path}");
+            assert_eq!(schema["pattern"], ".*\\S.*", "{schema_path}");
             for unit in ["a", "界"] {
                 for length in [max, max + 1] {
                     let mut value = input();
@@ -303,6 +304,55 @@ mod tests {
                     };
                     assert_eq!(request.validate(), expected, "{input_path}: {unit}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn question_schema_prompts_nonblank_text_and_runtime_rejects_whitespace() {
+        let definition = ask_user_question_def();
+        let validator = jsonschema::validator_for(&definition.schema).unwrap();
+        for input_path in [
+            "/questions/0/question",
+            "/questions/0/header",
+            "/questions/0/options/0/label",
+            "/questions/0/options/0/description",
+            "/questions/0/options/0/preview",
+            "/metadata/source",
+        ] {
+            let field = input_path
+                .trim_start_matches('/')
+                .replace("/0/", "[0].")
+                .replace('/', ".");
+            for text in ["", " ", "\n", "\t\r\n", "答", " \n答\n "] {
+                let mut value = input();
+                value["metadata"] = json!({"source": "test"});
+                *value.pointer_mut(input_path).unwrap() = json!(text);
+                let expected_valid = !text.trim().is_empty();
+                assert_eq!(
+                    validator.is_valid(&value),
+                    expected_valid,
+                    "schema: {input_path} = {text:?}"
+                );
+                let request: QuestionRequest = serde_json::from_value(value).unwrap();
+                let expected = if expected_valid {
+                    Ok(())
+                } else {
+                    Err(format!("{field} must not be empty"))
+                };
+                assert_eq!(request.validate(), expected, "{input_path} = {text:?}");
+            }
+            // schema 正则和 trim 的 Unicode 空白集合不保证一致，最终由运行时裁决。
+            for text in ["\u{0085}", "\u{3000}", " \u{3000}\t"] {
+                let mut value = input();
+                value["metadata"] = json!({"source": "test"});
+                *value.pointer_mut(input_path).unwrap() = json!(text);
+                let request: QuestionRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(
+                    request.validate(),
+                    Err(format!("{field} must not be empty")),
+                    "{input_path} = {text:?}"
+                );
             }
         }
     }
