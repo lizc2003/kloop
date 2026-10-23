@@ -47,16 +47,14 @@ pub(super) fn is_metadata_access(argv: &[String]) -> bool {
     };
     match command {
         "ls" | "stat" => true,
-        // du 只统计目录；这些选项会打开文件。
-        "du" => !argv[1..].iter().any(|arg| {
-            matches!(arg.as_str(), "-X" | "--exclude-from" | "--files0-from")
-                || arg.starts_with("--exclude-from=")
-                || arg.starts_with("--files0-from=")
-                || (arg.starts_with("-X") && arg.len() > 2)
-        }),
-        // tree 只 stat；-o 写文件，--from* / --gitfile / --infofile / --h* 读文件。
+        // du 只统计目录；带 Path 操作数的选项（-X、--exclude-from、
+        // --files0-from，含 -sX 这类组合）会打开文件。
+        "du" => option_opens_file(argv, &DU) == Some(false),
+        // tree 只 stat；-o/-R 写文件，--from* / --gitignore / --gitfile /
+        // --infofile / --h* 读文件。
         "tree" => {
             argv_is_readonly(argv)
+                && option_opens_file(argv, &TREE) == Some(false)
                 && !argv[1..].iter().any(|arg| {
                     matches!(arg.as_str(), "--outfile")
                         || arg.starts_with("--outfile=")
@@ -64,6 +62,7 @@ pub(super) fn is_metadata_access(argv: &[String]) -> bool {
                             arg.as_str(),
                             "--fromfile"
                                 | "--fromtabfile"
+                                | "--gitignore"
                                 | "--gitfile"
                                 | "--infofile"
                                 | "--hintro"
@@ -125,12 +124,35 @@ enum Positionals {
     PatternThenPaths,
 }
 
+struct Walked<'a> {
+    paths: Vec<&'a str>,
+    /// 消费了某个选项的 Path 类操作数（会打开或写入文件）；位置参数不算。
+    opens_file: bool,
+}
+
 fn option_paths<'a>(
     argv: &'a [String],
     spec: &Spec,
     positionals: Positionals,
 ) -> Option<Vec<&'a str>> {
-    let mut paths = Vec::new();
+    walk_options(argv, spec, positionals).map(|walked| walked.paths)
+}
+
+/// 命令是否消费了带 Path 角色的选项操作数。用来区分“只 stat 位置参数”的
+/// 元数据调用和会打开文件的调用（`du -sX file`、`tree -so file`）。
+fn option_opens_file(argv: &[String], spec: &Spec) -> Option<bool> {
+    walk_options(argv, spec, Positionals::AllPaths).map(|walked| walked.opens_file)
+}
+
+fn walk_options<'a>(
+    argv: &'a [String],
+    spec: &Spec,
+    positionals: Positionals,
+) -> Option<Walked<'a>> {
+    let mut walked = Walked {
+        paths: Vec::new(),
+        opens_file: false,
+    };
     let mut pattern_source = false;
     // 第一个位置参数可能是模式，也可能是路径：`-f`/`--file` 可以出现在它后面
     // （getopt 会把选项换到前面），所以推迟到解析结束再决定。
@@ -141,12 +163,12 @@ fn option_paths<'a>(
         let arg = raw.as_str();
         if options_done || !arg.starts_with('-') || arg == "-" {
             match positionals {
-                Positionals::AllPaths => paths.push(arg),
+                Positionals::AllPaths => walked.paths.push(arg),
                 Positionals::PatternThenPaths => {
                     if first_positional.is_none() && !pattern_source {
                         first_positional = Some(arg);
                     } else {
-                        paths.push(arg);
+                        walked.paths.push(arg);
                     }
                 }
             }
@@ -181,12 +203,14 @@ fn option_paths<'a>(
                 }
                 (Operand::Path | Operand::PatternPath, Some(value)) => {
                     pattern_source |= role == Operand::PatternPath;
-                    paths.push(value);
+                    walked.opens_file = true;
+                    walked.paths.push(value);
                     index += 1;
                 }
                 (Operand::Path | Operand::PatternPath, None) => {
                     pattern_source |= role == Operand::PatternPath;
-                    paths.push(argv.get(index + 1)?.as_str());
+                    walked.opens_file = true;
+                    walked.paths.push(argv.get(index + 1)?.as_str());
                     index += 2;
                 }
             }
@@ -221,7 +245,8 @@ fn option_paths<'a>(
             };
             pattern_source |= matches!(role, Operand::Pattern | Operand::PatternPath);
             if matches!(role, Operand::Path | Operand::PatternPath) {
-                paths.push(value);
+                walked.opens_file = true;
+                walked.paths.push(value);
             }
             break;
         }
@@ -231,9 +256,9 @@ fn option_paths<'a>(
         && pattern_source
         && let Some(first) = first_positional
     {
-        paths.push(first);
+        walked.paths.push(first);
     }
-    Some(paths)
+    Some(walked)
 }
 
 fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
@@ -801,8 +826,14 @@ mod tests {
         assert!(metadata(&["find", ".git", "-maxdepth", "1", "-print"]));
         assert!(!metadata(&["du", "--files0-from=.git/config"]));
         assert!(!metadata(&["du", "-X", ".git/config", "."]));
+        assert!(!metadata(&["du", "-sX", ".git/config", "."]));
+        assert!(!metadata(&["du", "-hX", "./.git/config"]));
         assert!(!metadata(&["tree", "--fromfile", ".git/config"]));
+        assert!(!metadata(&["tree", "--gitignore", ".git"]));
+        assert!(!metadata(&["tree", "-R", "-L", "1", ".git"]));
+        assert!(!metadata(&["tree", "-aR", ".git"]));
         assert!(!metadata(&["tree", "-o", "out.txt", "."]));
+        assert!(!metadata(&["tree", "-so", ".git/config", "."]));
         assert!(!metadata(&["find", ".git", "-files0-from", ".git/config"]));
         assert!(!metadata(&["find", ".git", "-exec", "cat", "{}", ";"]));
         assert!(!metadata(&["cat", ".git/config"]));

@@ -312,7 +312,16 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
                 || matches!(a.as_str(), "-z" | "--search-zip")
         }),
 
-        "tree" => !rest.iter().any(|a| a == "-o"),
+        // -o writes the listing; -R re-runs tree with -H and writes
+        // 00Tree.html at each depth boundary. Both may sit inside a short
+        // cluster (`-ao`, `-aR`), so scan the letters, not just the token.
+        "tree" => !rest.iter().any(|a| {
+            a == "--outfile"
+                || a.starts_with("--outfile=")
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.chars().skip(1).any(|c| matches!(c, 'o' | 'R')))
+        }),
 
         "git" => git_is_readonly(argv),
 
@@ -653,7 +662,16 @@ mod tests {
         assert!(!argv_is_readonly(&argv(&["rg", "--pre", "evil", "x"])));
         assert!(!argv_is_readonly(&argv(&["rg", "-z", "x"])));
         assert!(!argv_is_readonly(&argv(&["base64", "-o", "out", "f"])));
+        assert!(argv_is_readonly(&argv(&[
+            "tree",
+            "-I",
+            "node_modules",
+            "."
+        ])));
         assert!(!argv_is_readonly(&argv(&["tree", "-o", "out.txt"])));
+        assert!(!argv_is_readonly(&argv(&["tree", "-R", "-L", "1", "."])));
+        assert!(!argv_is_readonly(&argv(&["tree", "-aR", "."])));
+        assert!(!argv_is_readonly(&argv(&["tree", "-ao", "out.txt"])));
         assert!(!argv_is_readonly(&argv(&["sed", "-i", "s/a/b/", "f"])));
         assert!(!argv_is_readonly(&argv(&["rm", "-rf", "x"])));
         assert!(!argv_is_readonly(&argv(&["make", "build"])));

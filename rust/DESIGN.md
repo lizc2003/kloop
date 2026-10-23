@@ -1000,10 +1000,14 @@ Credential-bearing/read-sensitive
 paths are an even earlier hard boundary: `read_file` refuses them, grep/glob filter
 them before reading, and Bash checks literal plus canonical paths before
 sandbox/read-only/bypass. Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
-内部，元数据访问（`ls`、`stat`、`du`、`tree`、只读 `find` 的 stat/列目录，不含
-`--files0-from` 这类读取选项）不算读取，只有内容访问（`cat`、`grep`、`sed`、
-解释器等；未识别命令默认按内容访问）才硬拦；`.kloop`、`.ssh`、`.gnupg`、
-`.aws`、`.env*` 和 rc 文件是凭据或 agent state，元数据访问也硬拦。
+内部，元数据访问（`ls`、`stat`、`du`、`tree`、只读 `find` 的 stat/列目录）不算
+读取，只有内容访问（`cat`、`grep`、`sed`、解释器等；未识别命令默认按内容访问）
+才硬拦；`.kloop`、`.ssh`、`.gnupg`、`.aws`、`.env*` 和 rc 文件是凭据或 agent
+state，元数据访问也硬拦。元数据判定按命令的真实选项解析：du 的 `-X`/
+`--exclude-from`/`--files0-from` 无论独立、组合（`-sX`）还是附着（`-XFILE`）
+都算打开文件；tree 的 `-o`/`-R` 写文件（`-R` 会在每层生成 `00Tree.html`），
+`--fromfile`/`--fromtabfile`/`--gitignore`/`--gitfile`/`--infofile`/`--hintro`/
+`--houtro` 读文件，find 的 `-files0-from` 读文件，全部按内容访问处理。
 `find`/`grep`/`rg`/`du`/`tree` 参数按角色检查：只有完整识别为只读调用时，
 匹配谓词与字面量参数（`-name`/`-path`、`-g`/`--glob`、`--exclude`、`-I` 等）
 才免于被当作读取目标；支持 find 的括号、否定、与/或、隐式与和多个模式，以及
