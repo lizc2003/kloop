@@ -49,6 +49,15 @@ pub(super) struct OpaqueScript {
     pub(super) no_sandbox: bool,
 }
 
+/// 敏感路径的类别，决定元数据访问是否算读取。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sensitivity {
+    /// 仓库内部（`.git`）：元数据访问不是读取，内容访问仍是硬边界。
+    Vcs,
+    /// 凭据或 agent state：元数据也按读取处理。
+    Secret,
+}
+
 pub(super) struct PathFacts {
     /// Canonical existing ancestor plus any not-yet-created suffix.
     pub(super) normalized: PathBuf,
@@ -60,6 +69,7 @@ pub(super) struct PathFacts {
     pub(super) original_relative: Option<PathBuf>,
     pub(super) inside_cwd: bool,
     pub(super) sensitive: bool,
+    pub(super) sensitivity: Option<Sensitivity>,
 }
 
 impl CallFacts {
@@ -186,26 +196,37 @@ fn bash_reads_sensitive_path(command: &str, analysis: &BashAnalysis, cwd: &Path)
         return false;
     };
     commands.iter().any(|argv| {
-        let sensitive = match argv_roles::path_arguments(argv) {
+        let paths = argv_roles::path_arguments(argv);
+        // 已建模命令解析失败时角色不明，按内容访问处理；未建模命令（`ls`、
+        // `stat`）没有角色表可失败，元数据判定直接生效。
+        let metadata = argv_roles::is_metadata_access(argv)
+            && (paths.is_some() || !argv_roles::is_modeled_command(argv));
+        let sensitive = match paths {
             // 识别出参数角色：只检查命令真正会打开的值。
             Some(paths) => paths
                 .into_iter()
-                .any(|arg| path_argument_is_sensitive(arg, cwd)),
+                .any(|arg| path_argument_is_sensitive(arg, cwd, metadata)),
             // 未知命令或语法：退回逐参数检查。
             None => argv.iter().skip(1).any(|arg| {
                 if arg.starts_with('-') && !arg.contains('/') {
                     return false;
                 }
-                path_argument_is_sensitive(arg, cwd)
+                path_argument_is_sensitive(arg, cwd, metadata)
             }),
         };
         sensitive || recursive_search_covers_sensitive_path(argv, cwd)
     })
 }
 
-fn path_argument_is_sensitive(raw: &str, cwd: &Path) -> bool {
+fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
     let path = expand_shell_path(raw, cwd);
-    PathFacts::gather(&path, cwd).sensitive
+    match PathFacts::gather(&path, cwd).sensitivity {
+        None => false,
+        // 凭据和 agent state 连名字都算敏感，元数据访问也不例外。
+        Some(Sensitivity::Secret) => true,
+        // `.git` 的元数据（stat、列目录）不是内容读取；内容访问仍是硬边界。
+        Some(Sensitivity::Vcs) => !metadata,
+    }
 }
 
 /// The one exemption to `.kloop` being sensitive: `.kloop/worktrees/<name>` holds
@@ -219,7 +240,7 @@ const WORKTREE_SEGMENT: &str = "worktrees";
 /// argv, so it refuses to grant the exemption to anything carrying a `..`: a
 /// spelling like `.kloop/worktrees/../sessions` must not walk out through the
 /// hole. Normalized paths are exempted structurally instead, in
-/// [`path_is_sensitive`].
+/// [`path_sensitivity`].
 fn worktree_mention_is_structural(command: &str) -> bool {
     !command.contains("..")
 }
@@ -429,7 +450,9 @@ impl PathFacts {
             .map(Path::to_path_buf);
         let original_relative = original.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
-        let sensitive = path_is_sensitive(&original) || path_is_sensitive(&normalized);
+        let sensitivity =
+            merge_sensitivity(path_sensitivity(&original), path_sensitivity(&normalized));
+        let sensitive = sensitivity.is_some();
         PathFacts {
             normalized,
             relative,
@@ -437,6 +460,7 @@ impl PathFacts {
             original_relative,
             inside_cwd,
             sensitive,
+            sensitivity,
         }
     }
 }
@@ -515,13 +539,23 @@ fn path_tail_is_spill(normalized: &Path) -> bool {
         .is_some_and(|parent| fs_fold(parent) == "offload")
 }
 
-/// Paths where a write is privilege escalation, not editing: VCS internals
-/// (hooks run code), kloop's own state, key material, shell/git rc files
-/// (cc's `checkPathSafetyForAutoEdit` list, trimmed to this project's
-/// blast radius).
-fn path_is_sensitive(normalized: &Path) -> bool {
-    const SENSITIVE_DIRS: &[&str] = &[".git", ".kloop", ".ssh", ".gnupg", ".aws"];
-    const SENSITIVE_FILES: &[&str] = &[
+fn merge_sensitivity(a: Option<Sensitivity>, b: Option<Sensitivity>) -> Option<Sensitivity> {
+    if a == Some(Sensitivity::Secret) || b == Some(Sensitivity::Secret) {
+        Some(Sensitivity::Secret)
+    } else {
+        a.or(b)
+    }
+}
+
+/// Paths where a write is privilege escalation, not editing (VCS internals,
+/// kloop's own state, key material, shell/git rc files) and their read
+/// classification: `Vcs` allows metadata access, `Secret` does not.
+/// `Secret` wins over `Vcs`: a path that reaches both a repository and a
+/// credential store is a secret path for every access kind.
+fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
+    const VCS_DIR: &str = ".git";
+    const SECRET_DIRS: &[&str] = &[".kloop", ".ssh", ".gnupg", ".aws"];
+    const SECRET_FILES: &[&str] = &[
         ".bashrc",
         ".zshrc",
         ".zshenv",
@@ -537,13 +571,14 @@ fn path_is_sensitive(normalized: &Path) -> bool {
     let traversal = normalized
         .components()
         .any(|comp| matches!(comp, Component::ParentDir));
+    let mut found = None;
     let mut components = normalized.components().peekable();
     while let Some(comp) = components.next() {
         let Component::Normal(name) = comp else {
             continue;
         };
         let Some(name) = name.to_str() else {
-            return true; // non-UTF8 path: refuse to vouch
+            return Some(Sensitivity::Secret); // non-UTF8 path: refuse to vouch
         };
         let folded = fs_fold(name);
         let name = folded.as_ref();
@@ -568,18 +603,18 @@ fn path_is_sensitive(normalized: &Path) -> bool {
         if name == ".kloop" && !traversal && path_tail_is_spill(normalized) {
             continue;
         }
-        if SENSITIVE_DIRS.contains(&name) && !is_last {
-            return true;
+        if name == VCS_DIR {
+            found = Some(Sensitivity::Vcs);
+            continue;
         }
-        if is_last
-            && (SENSITIVE_DIRS.contains(&name)
-                || SENSITIVE_FILES.contains(&name)
-                || name.starts_with(".env"))
-        {
-            return true;
+        if SECRET_DIRS.contains(&name) {
+            return Some(Sensitivity::Secret);
+        }
+        if is_last && (SECRET_FILES.contains(&name) || name.starts_with(".env")) {
+            return Some(Sensitivity::Secret);
         }
     }
-    false
+    found
 }
 
 #[cfg(test)]
@@ -613,7 +648,7 @@ mod tests {
 
     #[test]
     fn sensitive_path_detection_is_component_based() {
-        let s = |p: &str| path_is_sensitive(Path::new(p));
+        let s = |p: &str| path_sensitivity(Path::new(p)).is_some();
         assert!(s("/w/proj/.git/hooks/pre-commit"));
         assert!(s("/w/proj/.git"));
         assert!(s("/w/proj/.kloop/sessions/x.jsonl"));
@@ -640,7 +675,7 @@ mod tests {
 
     #[test]
     fn sensitive_path_folds_case_on_case_insensitive_fs() {
-        let s = |p: &str| path_is_sensitive(Path::new(p));
+        let s = |p: &str| path_sensitivity(Path::new(p)).is_some();
         // A cased alias resolves to the real `.git`/`.ssh`/`.env*` on a
         // case-folding FS, so it must be caught there; on a case-sensitive FS
         // those are genuinely distinct paths and stay non-sensitive.

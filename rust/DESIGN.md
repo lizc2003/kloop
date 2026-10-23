@@ -997,9 +997,13 @@ shell、路径和危险特征，`argv_roles.rs` 持有各命令的参数角色�
 危险命令、敏感路径写入、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
 普通调用仍使用已配置的 OS 沙箱；只有调用主动脱沙箱或失败后升级才脱离沙箱。
 Credential-bearing/read-sensitive
-paths (`.git`, `.kloop`, `.ssh`, `.gnupg`, `.aws`, `.env*`) are an even earlier hard
-boundary: `read_file` refuses them, grep/glob filter them before reading, and
-Bash checks literal plus canonical paths before sandbox/read-only/bypass.
+paths are an even earlier hard boundary: `read_file` refuses them, grep/glob filter
+them before reading, and Bash checks literal plus canonical paths before
+sandbox/read-only/bypass. Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
+内部，元数据访问（`ls`、`stat`、`du`、`tree`、只读 `find` 的 stat/列目录，不含
+`--files0-from` 这类读取选项）不算读取，只有内容访问（`cat`、`grep`、`sed`、
+解释器等；未识别命令默认按内容访问）才硬拦；`.kloop`、`.ssh`、`.gnupg`、
+`.aws`、`.env*` 和 rc 文件是凭据或 agent state，元数据访问也硬拦。
 `find`/`grep`/`rg`/`du`/`tree` 参数按角色检查：只有完整识别为只读调用时，
 匹配谓词与字面量参数（`-name`/`-path`、`-g`/`--glob`、`--exclude`、`-I` 等）
 才免于被当作读取目标；支持 find 的括号、否定、与/或、隐式与和多个模式，以及

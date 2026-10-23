@@ -1551,8 +1551,6 @@ mod tests {
             let p = gate(mode, rules(&[], &[], &[]), approver.clone());
             for command in [
                 "cat ./.git/config",
-                "find ./.git -path ./.git -prune -o -print",
-                "find -f ./.git . -path ./.git -prune -o -print",
                 "find . -path ./.git -prune -o -print; cat ./.git/config",
                 "find . -path ./.git -prune -o -exec cat '{}' ';'",
                 "find . -path ./.git -prune -o -execdir cat '{}' ';'",
@@ -1562,9 +1560,6 @@ mod tests {
                 "find . -path ./.git -prune -o -fprintf result.txt '%p'",
                 "find . -path ./.git -prune -o -fls result.txt",
                 "find . -path ./.git -prune -o -delete",
-                "find . -path ./.git -newer ./.git/config -print",
-                "find . -samefile ./.git/config -path ./.git -print",
-                "find -f -path ./.git -prune -o -print",
                 "find . -newer -path ./.git -prune -o -print",
                 "find . -path ./.git -unknown -print",
                 "find . -path ./.git -prune -o",
@@ -1660,7 +1655,6 @@ mod tests {
                 "tree --fromfile -I .git README.md .env",
                 "tree -Ia -P .git",
                 "tree --fromfile README.md -La 1 -I -P .env",
-                "tree -L2a .git",
                 "tree --fromfile -L2ahU -I .git .env",
                 "tree -L2P .git .",
                 "tree --fromfile -L2aP .git .env",
@@ -1694,9 +1688,75 @@ mod tests {
                 "du --files0-from=./.git/config",
                 "tree --fromfile ./.git/config",
                 "find . -files0-from ./.git/config",
-                "find . -newer ./.git/config -print0",
                 "sudo find . -path ./.git -prune -o -print",
                 "xargs find . -path ./.git -prune -o -print",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Err("bash: reading this sensitive path is blocked. Do not retry or work around the protection.".to_string()),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn repo_metadata_access_is_not_a_sensitive_read() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "ls -l .git/config",
+                "ls -la .git",
+                "stat .git/config",
+                "du -sh .git",
+                "tree -L1 .git",
+                "tree -L2a .git",
+                "find .git",
+                "find .git -maxdepth 1 -print",
+                "find ./.git -path ./.git -prune -o -print",
+                "find -f ./.git . -path ./.git -prune -o -print",
+                "find . -path ./.git -newer ./.git/config -print",
+                "find . -newer ./.git/config -print0",
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    assert_eq!(
+                        p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                            .await,
+                        Ok(None),
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn content_and_secret_metadata_stay_hard_blocked() {
+        let approver = ScriptedApprover::new(vec![]);
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            for command in [
+                "cat .git/config",
+                "head -1 .git/config",
+                "grep -rn branch .git",
+                "du --files0-from=.git/config",
+                "tree --fromfile .git/config",
+                "tree -o .git/config .",
+                "find .git -files0-from .git/config",
+                "find .git -exec cat '{}' ';'",
+                "find .git -delete",
+                "find .git -unknown -print",
+                "tree -Ia -P .git",
+                "ls -l .kloop/config.toml",
+                "ls -l .env",
+                "stat ~/.ssh/id_rsa",
+                "ls -l .git/config; cat .env",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(

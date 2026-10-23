@@ -30,6 +30,63 @@ pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<&str>> {
     }
 }
 
+/// 命令是否在参数角色表里。已建模命令解析失败时不能拿"元数据访问"替它担保：
+/// 角色不明，路径可能被当成模式或读取目标。
+pub(super) fn is_modeled_command(argv: &[String]) -> bool {
+    let Some(command) = argv.first().and_then(|arg| arg.rsplit('/').next()) else {
+        return false;
+    };
+    matches!(command, "find" | "grep" | "rg" | "du" | "tree")
+}
+
+/// 只 stat 或列目录、不打开文件内容的调用。未知命令一律按内容访问处理，
+/// 所以这里只放行明确确认过"没有读取内容选项"的命令。
+pub(super) fn is_metadata_access(argv: &[String]) -> bool {
+    let Some(command) = argv.first().and_then(|arg| arg.rsplit('/').next()) else {
+        return false;
+    };
+    match command {
+        "ls" | "stat" => true,
+        // du 只统计目录；这些选项会打开文件。
+        "du" => !argv[1..].iter().any(|arg| {
+            matches!(arg.as_str(), "-X" | "--exclude-from" | "--files0-from")
+                || arg.starts_with("--exclude-from=")
+                || arg.starts_with("--files0-from=")
+                || (arg.starts_with("-X") && arg.len() > 2)
+        }),
+        // tree 只 stat；-o 写文件，--from* / --gitfile / --infofile / --h* 读文件。
+        "tree" => {
+            argv_is_readonly(argv)
+                && !argv[1..].iter().any(|arg| {
+                    matches!(arg.as_str(), "--outfile")
+                        || arg.starts_with("--outfile=")
+                        || matches!(
+                            arg.as_str(),
+                            "--fromfile"
+                                | "--fromtabfile"
+                                | "--gitfile"
+                                | "--infofile"
+                                | "--hintro"
+                                | "--houtro"
+                        )
+                        || arg.starts_with("--gitfile=")
+                        || arg.starts_with("--infofile=")
+                        || arg.starts_with("--hintro=")
+                        || arg.starts_with("--houtro=")
+                })
+        }
+        // 普通 find 谓词只 stat / 输出名字；-files0-from 会打开文件，
+        // 执行/写入动作由只读分类器排除。
+        "find" => {
+            argv_is_readonly(argv)
+                && !argv[1..]
+                    .iter()
+                    .any(|arg| arg == "-files0-from" || arg.starts_with("-files0-from="))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operand {
     /// 没有操作数。
@@ -205,6 +262,10 @@ fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
         }
         paths.push(arg.as_str());
         index += 1;
+    }
+    // 没有表达式也是合法调用（`find .git` 只列目录），此时只有搜索根是路径。
+    if argv.get(index).is_none() {
+        return Some(paths);
     }
 
     let mut depth = 0_usize;
@@ -722,5 +783,30 @@ mod tests {
         assert_paths(&["sudo", "find", ".", "-path", "./.git"], None);
         assert_paths(&["xargs", "find", ".", "-path", "./.git"], None);
         assert_paths(&["grep", "-z", ".env"], None);
+    }
+
+    #[test]
+    fn metadata_access_requires_a_command_that_only_stats() {
+        let metadata = |words: &[&str]| {
+            let argv = words
+                .iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<_>>();
+            is_metadata_access(&argv)
+        };
+        assert!(metadata(&["ls", "-l", ".git/config"]));
+        assert!(metadata(&["stat", ".git/config"]));
+        assert!(metadata(&["du", "-sh", ".git"]));
+        assert!(metadata(&["tree", "-L1", ".git"]));
+        assert!(metadata(&["find", ".git", "-maxdepth", "1", "-print"]));
+        assert!(!metadata(&["du", "--files0-from=.git/config"]));
+        assert!(!metadata(&["du", "-X", ".git/config", "."]));
+        assert!(!metadata(&["tree", "--fromfile", ".git/config"]));
+        assert!(!metadata(&["tree", "-o", "out.txt", "."]));
+        assert!(!metadata(&["find", ".git", "-files0-from", ".git/config"]));
+        assert!(!metadata(&["find", ".git", "-exec", "cat", "{}", ";"]));
+        assert!(!metadata(&["cat", ".git/config"]));
+        assert!(!metadata(&["grep", "-rn", "x", ".git"]));
+        assert!(!metadata(&["future-tool", ".git/config"]));
     }
 }
