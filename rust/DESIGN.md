@@ -1047,30 +1047,31 @@ layer, while deny rules, sensitive reads, safety checks and explicit ask rules
 keep their say (the ask-rule half is deliberately stricter than cc's
 autoAllowBashIfSandboxed).
 
-**Bash decisions run on a real parse tree** (`crates/core/src/shell.rs`,
-tree-sitter-bash): a script qualifies only when every node is a plain
-word-only command joined by `&&`/`||`/`;`/`|`/newline; `bash -c "…"` is
-unwrapped and analyzed recursively. Subshells, command/process substitution,
-expansions, variable-assignment prefixes, and any redirect that reads or writes
-a file (`> f`, `< f`, heredocs) make the script *opaque*：不能靠解析结果或
-allow 规则自动放行；manual 下由沙箱自动放行、已批准的会话记忆或用户本次审批决定，
-bypass 下直接放行。
-Stream-only redirects are the exception: `2>&1`, `>&2` and `…>/dev/null` move a
-stream around without naming a file, so `go test ./x 2>&1 | tail -3` still
-decomposes into `go test` and `tail` and a `bash(go test *)` rule still covers
-it. The read-only classifier vets options, not just
-names (`find -delete`, `rg --pre`, `git -C`/`--git-dir`/`log --output`,
-`base64 -o`, `sed` beyond `-n Np` all disqualify), and the independent
-dangerous classifier 在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
+**Bash 决策共用真实语法树**（`crates/core/src/shell.rs`，tree-sitter-bash）。
+普通字面命令可由 `&&` / `||` / `;` / `|` / 换行连接，`bash -c "…"` 递归解包。
+固定输出重定向（`>` / `>>` / `>|` / `&>` / `&>>`）进入 `WithWrites`，同时保留
+全部 argv 和每个输出目标，不把写入藏进命令参数或丢掉。复合脚本的目标要求绝对路径；
+单命令可用相对目标，多命令相对目标仍 opaque，避免把运行中变化的 cwd 当成工具初始 cwd。
+文件范围授权目前限 Unix；Windows Git Bash 的 POSIX/原生路径映射未建模，权限层仍把文件输出
+视为 opaque，不用原生 cwd 猜它的目标。
+只有 `echo` 参数中的 `$?` / `${?}` 作为纯数据展开，以稳定占位符参与分析，执行仍使用原文。
+命令名、重定向目标和其它命令参数不获此例外。输入重定向、heredoc、动态目标、子 shell、
+命令/进程替换、其它展开、变量赋值与控制流仍 opaque：manual 下不能靠解析或 allow 规则
+放行，只能由沙箱、逐字会话同意或本次审批决定；bypass 直接放行。
+`2>&1` / `>&2` / `…>/dev/null` 等纯流重定向继续不增加文件效果。
+`WithWrites` 永远不是只读调用，也不能并发批处理；已识别 argv 继续经过 deny、危险命令
+和敏感读取检查，输出路径的敏感类别与 `/dev` 目标在 manual 下强制逐次确认。
+只读分类器同时检查命令选项：`find -delete`、`rg --pre`、`git -C` / `--git-dir` /
+`log --output`、`base64 -o` 与超出 `sed -n Np` 查询形式的调用都不算只读。
+独立的危险分类器在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
 Wrappers (`sudo`, `env`, `timeout`, `nice`,
 `xargs`) are stripped before deny/danger matching so they can't smuggle a
 command past a rule. That classifier is a blocklist, so what it holds is chosen
 by one rule rather than by how alarming a command looks: **the damage is
 irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
 `shred`, and any of them behind `sudo`. `git clean -fdx` and `git reset --hard`
-are deliberately absent: inside a repository those are the recovery path. A
-redirect onto a device (`… > /dev/sda`) needs no entry either — a redirect onto a
-file makes the whole script opaque；manual 下不能靠内容分类获得自动裁决。
+are deliberately absent: inside a repository those are the recovery path.
+设备输出（`… > /dev/sda`）由固定输出路径检查强制确认；动态目标仍 opaque。
 
 **Rules** are split by lifetime. Global `~/.kloop/config.toml` provides only
 process-wide constraints:
@@ -1096,6 +1097,15 @@ rule form at all (see **Asking** below); `write_file(<glob>)` /
 `path`, while `notebook_edit(<glob>)` matches `notebook_path` (both also match
 their cwd-relative form), with `**` globs.
 
+固定 Bash 输出还要求每个目标匹配 `bash_write(<glob>)`，单独的命令前缀或 whole-tool
+`bash` 不覆盖重定向写入。普通审批同时记命令前缀与规范目标的父目录（如
+`bash(make check *)` + `bash_write(/tmp/**)`；本机规范路径可能显示 `/private/tmp`）。
+新写入 allow 只按规范路径或其 cwd 相对形式匹配，原路径别名不能带着日志目录授权越界；
+deny / ask 仍同时匹配原文与规范路径。新写入 glob 保留目录名的前导空白。
+目录含 glob 元字符或位于文件系统根时不自动生成
+持久模式。会话缓存也同时包含命令与目录，换日志名、测试参数仍可复用，换目录或追加未批准
+写入则重新询问；重启后由同一项目规则复核。
+
 **File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
 directories, shell/git rc files, and `.env*` are sensitive：manual 下每次确认，
 allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批。
@@ -1104,7 +1114,7 @@ allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批�
 **Asking**: `y` allows once. `a` allows for this session in the current
 workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
 approving `git commit` never covers `git rebase` — or parent directory for file
-writes). A bash script the word-only parser cannot vouch for (a file redirect, a
+writes). A bash script the parser cannot vouch for (a dynamic/input redirect, a
 substitution, an assignment — `cat > probe.go <<'EOF'` is the usual shape) has
 no prefix to key on and is instead remembered **verbatim**, for this session
 only: that exact command text, and only that one. `p` is not offered for it —
@@ -3164,7 +3174,10 @@ why containment was removed.
 
 Escalation consent is **remember-able** at the same granularity bash approvals
 use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`
-rule. A remembered rule is consulted **before** the sandboxed attempt, not after
+rule. 固定文件输出还必须逐个匹配 `sandbox_escalate_write(<glob>)`，会话缓存也包含
+相同写入范围。升级继续记住每个命令（包括只读段），与普通审批跳过只读段的粒度区别保留；
+普通 `bash_write` 与升级写入规则不能互相替代。
+A remembered rule is consulted **before** the sandboxed attempt, not after
 it fails: the command runs uncontained from the start and the result says so
 (`[Ran without the sandbox: a remembered sandbox_escalate rule …]`). Consulting
 it only at the denial would save the question but still pay for the contained
@@ -4905,8 +4918,9 @@ control / treatment：两臂版本与唯一被测差异。
   dispatch rejecting a tool outside the allowlist, `[agents.<name>]` parsing
   with malformed-field rejection); shell analysis contracts (word-only
   parsing, quote/concatenation
-  unwrapping, opaque-construct rejection, stream-only redirects kept parseable
-  while file redirects still sink the script, `bash -c` unwrap, read-only option
+  unwrapping, opaque-construct rejection, stream-only redirects kept parseable,
+  固定输出显式保留且命令/目录两种授权缺一不可，动态/输入重定向仍 opaque，
+  echo 退出码展开边界，日志规则跨会话复用与沙箱首跑跳过，`bash -c` unwrap, read-only option
   vetting, git option-injection, dangerous-through-wrappers); permission
   pipeline (deny-beats-allow-and-bypass, wrapper-stripped deny, bypass 全部工具免审批、
   manual safety checks, sensitive paths never cached, ask-rules-over-allow,

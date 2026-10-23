@@ -1801,6 +1801,55 @@ mod tests {
             assert!(second.is_dir(), "the uncontained run actually did the work");
         }
 
+        #[tokio::test]
+        async fn remembered_log_writes_skip_the_sandboxed_attempt() {
+            let (ctx, asked) = escalating_ctx(
+                "log-remembered",
+                crate::permissions::Decision::Allow(
+                    crate::permissions::ApprovalScope::WorkspaceSession,
+                ),
+            );
+            let outside = outside_dir("log-remembered");
+            let counter = ctx.cfg.sandbox.as_ref().unwrap().writable_roots[0]
+                .root
+                .join("attempts.log");
+            let _ = std::fs::remove_file(&counter);
+            for (index, name) in ["first.log", "next.log"].into_iter().enumerate() {
+                let command = format!(
+                    "echo attempt >> {}; echo \"EXIT:$?\" >> {}; echo complete > {}",
+                    counter.display(),
+                    counter.display(),
+                    outside.join(name).display()
+                );
+                let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+                assert!(!is_error, "{out}");
+                assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+                assert_eq!(
+                    std::fs::read_to_string(outside.join(name)).unwrap(),
+                    "complete\n"
+                );
+                if index == 0 {
+                    assert!(out.contains("Re-ran without the sandbox"), "{out}");
+                    assert_eq!(
+                        std::fs::read_to_string(&counter).unwrap(),
+                        "attempt\nEXIT:0\nattempt\nEXIT:0\n"
+                    );
+                } else {
+                    assert!(
+                        out.contains("a remembered sandbox_escalate rule already covers this"),
+                        "{out}"
+                    );
+                    assert!(!out.contains("Re-ran without the sandbox"), "{out}");
+                    assert_eq!(
+                        std::fs::read_to_string(&counter).unwrap(),
+                        "attempt\nEXIT:0\nattempt\nEXIT:0\nattempt\nEXIT:0\n"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(outside).unwrap();
+            std::fs::remove_file(counter).unwrap();
+        }
+
         /// Escalation loop, declined: the sandboxed failure is kept and the
         /// result steers the model away from a disable_sandbox retry (not the
         /// hint, which would invite exactly that).

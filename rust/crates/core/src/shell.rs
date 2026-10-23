@@ -6,13 +6,14 @@
 //! (permissions.rs). The core rule is a *whitelist walk*: a script is only
 //! [`BashAnalysis::Commands`] when every node in its parse tree is a plain
 //! word-only command joined by `&&`/`||`/`;`/`|`/newline. Anything else —
-//! subshells, command/process substitution, expansions, variable assignments,
-//! control flow, and any redirect that reads or writes a file — makes the
+//! subshells, command/process substitution, general expansions, variable assignments,
+//! control flow, and input or dynamic output redirects — makes the
 //! whole script [`BashAnalysis::Opaque`]: no classifier can vouch for what it
 //! runs；manual 下不能靠内容分类自动放行，沙箱、bypass 与逐字会话批准另行决定。
 //! Stream-only redirects (`2>&1`,
 //! `>/dev/null`) are the exception: they add nothing the argv does not
-//! already say ([`redirect_is_stream_only`]).
+//! already say ([`redirect_is_stream_only`]). 固定文件输出进入 `WithWrites`，
+//! 同时保留 argv 与目标；只有 echo 参数的退出码展开例外地按纯数据分析。
 
 use tree_sitter::Node;
 use tree_sitter::Parser;
@@ -23,8 +24,34 @@ use tree_sitter_bash::LANGUAGE as BASH;
 pub enum BashAnalysis {
     /// Every command in the script, as plain argv words, in source order.
     Commands(Vec<Vec<String>>),
+    /// 固定输出重定向显式保留；它始终有写入效果，不能按 argv 当作只读。
+    WithWrites {
+        commands: Vec<Vec<String>>,
+        paths: Vec<String>,
+    },
     /// The script contains constructs the word-only parser cannot vouch for.
     Opaque,
+}
+
+impl BashAnalysis {
+    pub fn commands(&self) -> Option<&[Vec<String>]> {
+        match self {
+            Self::Commands(commands) | Self::WithWrites { commands, .. } => Some(commands),
+            Self::Opaque => None,
+        }
+    }
+
+    pub fn writes(&self) -> &[String] {
+        match self {
+            Self::WithWrites { paths, .. } => paths,
+            Self::Commands(_) | Self::Opaque => &[],
+        }
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        matches!(self, Self::Commands(commands)
+            if !commands.is_empty() && commands.iter().all(|argv| argv_is_readonly(argv)))
+    }
 }
 
 /// How deep `bash -c "…"` nesting is unwrapped before giving up.
@@ -35,7 +62,7 @@ pub fn analyze_bash(script: &str) -> BashAnalysis {
 }
 
 fn analyze_at_depth(script: &str, depth: u8) -> BashAnalysis {
-    let Some(commands) = parse_word_only_commands(script) else {
+    let Some((commands, mut paths)) = parse_word_only_commands(script) else {
         return BashAnalysis::Opaque;
     };
     // Unwrap nested `bash|sh|zsh -c|-lc "<script>"` one level at a time so
@@ -47,6 +74,13 @@ fn analyze_at_depth(script: &str, depth: u8) -> BashAnalysis {
         match extract_wrapped_script(&argv) {
             Some(inner) if depth < MAX_UNWRAP_DEPTH => match analyze_at_depth(inner, depth + 1) {
                 BashAnalysis::Commands(inner_cmds) => flattened.extend(inner_cmds),
+                BashAnalysis::WithWrites {
+                    commands,
+                    paths: inner_paths,
+                } => {
+                    flattened.extend(commands);
+                    paths.extend(inner_paths);
+                }
                 BashAnalysis::Opaque => return BashAnalysis::Opaque,
             },
             // A `bash -c` wrapper past the unwrap limit must NOT be kept as a
@@ -56,7 +90,19 @@ fn analyze_at_depth(script: &str, depth: u8) -> BashAnalysis {
             None => flattened.push(argv),
         }
     }
-    BashAnalysis::Commands(flattened)
+    if paths.is_empty() {
+        BashAnalysis::Commands(flattened)
+    } else if flattened.is_empty()
+        || (flattened.len() != 1 && paths.iter().any(|path| !path.starts_with('/')))
+    {
+        // 多命令中 cwd 可能已经变化；不把相对目标错误地锚定到工具初始 cwd。
+        BashAnalysis::Opaque
+    } else {
+        BashAnalysis::WithWrites {
+            commands: flattened,
+            paths,
+        }
+    }
 }
 
 fn extract_wrapped_script(argv: &[String]) -> Option<&str> {
@@ -71,7 +117,7 @@ fn extract_wrapped_script(argv: &[String]) -> Option<&str> {
     }
 }
 
-fn parse_word_only_commands(script: &str) -> Option<Vec<Vec<String>>> {
+fn parse_word_only_commands(script: &str) -> Option<(Vec<Vec<String>>, Vec<String>)> {
     let tree = parse_bash(script)?;
     word_only_commands_sequence(&tree, script)
 }
@@ -87,7 +133,7 @@ fn parse_bash(script: &str) -> Option<Tree> {
 /// The whitelist walk (codex `try_parse_word_only_commands_sequence`): any
 /// named node outside ALLOWED_KINDS, or any operator token outside
 /// `&& || ; |` (plus quotes/whitespace), rejects the whole script.
-fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>>> {
+fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<(Vec<Vec<String>>, Vec<String>)> {
     if tree.root_node().has_error() {
         return None;
     }
@@ -104,9 +150,7 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
         "number",
         "concatenation",
         "comment",
-        // Only the wrapper: each `file_redirect` under it is vetted separately
-        // by `redirect_is_stream_only`, and a heredoc/herestring redirect is
-        // not on this list at all.
+        // 重定向独立解析并保留固定输出目标；heredoc/herestring 不在白名单。
         "redirected_statement",
     ];
     const ALLOWED_PUNCT_TOKENS: &[&str] = &["&&", "||", ";", "|", "\"", "'"];
@@ -115,6 +159,7 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
     let mut cursor = root.walk();
     let mut stack = vec![root];
     let mut command_nodes = Vec::new();
+    let mut redirect_nodes = Vec::new();
     while let Some(node) = stack.pop() {
         let kind = node.kind();
         if node.is_named() {
@@ -122,9 +167,10 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
             // tokens (`>`, `>&`, …) are not punctuation the rest of the walk
             // should learn to accept, and its destination is not an argument.
             if kind == "file_redirect" {
-                if !redirect_is_stream_only(node, src) {
-                    return None;
-                }
+                redirect_nodes.push(node);
+                continue;
+            }
+            if echo_status_expansion(node, src) {
                 continue;
             }
             if !ALLOWED_KINDS.contains(&kind) {
@@ -152,7 +198,12 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
     for node in command_nodes {
         commands.push(plain_command_argv(node, src)?);
     }
-    Some(commands)
+    redirect_nodes.sort_by_key(Node::start_byte);
+    let mut paths = Vec::new();
+    for node in redirect_nodes {
+        paths.extend(output_redirect_paths(node, src)?);
+    }
+    Some((commands, paths))
 }
 
 /// Whether one redirect only moves streams around, leaving the argv a complete
@@ -160,11 +211,8 @@ fn word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>
 /// (`2>&1`, `>&2`) and discarding into `/dev/null` — and both are how a shell
 /// command says "I do not want this output", not how it touches the filesystem.
 ///
-/// Everything else sinks the whole script: `> f` and `>> f` write a file the
-/// argv never names, `< f` feeds one in, and a heredoc carries content no
-/// classifier reads. The shape alone cannot tell them apart — `foo > 1`
-/// parses with the same `destination: (number)` as `2>&1` — so the operator
-/// text is what decides.
+/// 文件输出由 `output_redirect_paths` 显式保留；输入重定向和动态目标仍 opaque。
+/// `foo > 1` 与 `2>&1` 的目标节点同为 number，必须同时看操作符，不能只看树形。
 fn redirect_is_stream_only(node: Node, src: &str) -> bool {
     /// `2>&1`, `>&2`: the destination must be a bare descriptor number.
     const DUP_OPS: &[&str] = &[">&", "<&"];
@@ -209,7 +257,92 @@ fn redirect_is_stream_only(node: Node, src: &str) -> bool {
     pending_op.is_none()
 }
 
+/// 只认固定文件输出；目标独立于 argv 进入权限门，不能静默丢掉。
+fn output_redirect_paths(node: Node, src: &str) -> Option<Vec<String>> {
+    if redirect_is_stream_only(node, src) {
+        return Some(Vec::new());
+    }
+    let mut paths = Vec::new();
+    let mut pending_op = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            if pending_op.replace(child.kind()).is_some() {
+                return None;
+            }
+        } else if child.kind() == "file_descriptor" {
+            if pending_op.is_some() {
+                return None;
+            }
+        } else {
+            let op = pending_op.take()?;
+            let target = fixed_output_target(child, src)?;
+            if matches!(op, ">&" | "<&")
+                && !target.is_empty()
+                && target.chars().all(|ch| ch.is_ascii_digit())
+            {
+                continue;
+            }
+            if !matches!(op, ">" | ">>" | ">|" | "&>" | "&>>")
+                || target.is_empty()
+                || target.contains(['\\', '\n', '\r'])
+            {
+                return None;
+            }
+            if target != "/dev/null" {
+                paths.push(target);
+            }
+        }
+    }
+    pending_op.is_none().then_some(paths)
+}
+
+fn fixed_output_target(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "word" | "number" => {
+            let raw = node.utf8_text(src.as_bytes()).ok()?;
+            (!raw.contains(['*', '?', '[', ']', '{', '}', '~', '$', '`', '\\']))
+                .then(|| raw.to_string())
+        }
+        "string" | "raw_string" => plain_word(node, src, /*status_allowed*/ false),
+        "concatenation" => {
+            let mut target = String::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                target.push_str(&fixed_output_target(child, src)?);
+            }
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
+/// $? 只在 echo 的参数中降为稳定占位符；命令名和重定向目标不参与此例外。
+fn echo_status_expansion(node: Node, src: &str) -> bool {
+    if !matches!(node.kind(), "simple_expansion" | "expansion")
+        || !matches!(node.utf8_text(src.as_bytes()), Ok("$?" | "${?}"))
+    {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "file_redirect" | "command_name" => return false,
+            "command" => {
+                return parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.utf8_text(src.as_bytes()) == Ok("echo"));
+            }
+            _ => ancestor = parent.parent(),
+        }
+    }
+    false
+}
+
 fn plain_command_argv(cmd: Node, src: &str) -> Option<Vec<String>> {
+    let status_allowed = cmd
+        .child_by_field_name("name")
+        .is_some_and(|name| name.utf8_text(src.as_bytes()) == Ok("echo"));
     let mut words = Vec::new();
     let mut cursor = cmd.walk();
     for child in cmd.named_children(&mut cursor) {
@@ -221,51 +354,52 @@ fn plain_command_argv(cmd: Node, src: &str) -> Option<Vec<String>> {
                 }
                 words.push(word.utf8_text(src.as_bytes()).ok()?.to_owned());
             }
-            "word" | "number" => {
-                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
-            }
-            "string" => words.push(double_quoted_content(child, src)?),
-            "raw_string" => words.push(raw_string_content(child, src)?),
-            "concatenation" => {
-                // e.g. -g"*.py": flag glued to a quoted value.
-                let mut joined = String::new();
-                let mut concat_cursor = child.walk();
-                for part in child.named_children(&mut concat_cursor) {
-                    match part.kind() {
-                        "word" | "number" => {
-                            joined.push_str(part.utf8_text(src.as_bytes()).ok()?);
-                        }
-                        "string" => joined.push_str(&double_quoted_content(part, src)?),
-                        "raw_string" => joined.push_str(&raw_string_content(part, src)?),
-                        _ => return None,
-                    }
-                }
-                if joined.is_empty() {
-                    return None;
-                }
-                words.push(joined);
-            }
             "comment" => {}
-            _ => return None,
+            _ => words.push(plain_word(child, src, status_allowed)?),
         }
     }
-    if words.is_empty() {
-        return None;
-    }
-    Some(words)
+    (!words.is_empty()).then_some(words)
 }
 
-/// A double-quoted string is literal only if every named child is plain
-/// content — any expansion/substitution node inside rejects it.
-fn double_quoted_content(node: Node, src: &str) -> Option<String> {
-    let mut cursor = node.walk();
-    for part in node.named_children(&mut cursor) {
-        if part.kind() != "string_content" {
-            return None;
+fn plain_word(node: Node, src: &str, status_allowed: bool) -> Option<String> {
+    match node.kind() {
+        "word" | "number" => {
+            let raw = node.utf8_text(src.as_bytes()).ok()?;
+            Some(raw.to_string())
         }
+        "raw_string" => raw_string_content(node, src),
+        "string" => {
+            // 原始切片保留换行和转义；只替换已经认可的退出码节点。
+            let mut value = String::new();
+            let mut start = node.start_byte() + 1;
+            let mut cursor = node.walk();
+            for part in node.named_children(&mut cursor) {
+                if part.kind() == "string_content" {
+                    continue;
+                }
+                if !status_allowed || !echo_status_expansion(part, src) {
+                    return None;
+                }
+                value.push_str(&src[start..part.start_byte()]);
+                value.push('0');
+                start = part.end_byte();
+            }
+            value.push_str(&src[start..node.end_byte() - 1]);
+            Some(value)
+        }
+        "concatenation" => {
+            let mut value = String::new();
+            let mut cursor = node.walk();
+            for part in node.named_children(&mut cursor) {
+                value.push_str(&plain_word(part, src, status_allowed)?);
+            }
+            (!value.is_empty()).then_some(value)
+        }
+        "simple_expansion" | "expansion" if status_allowed && echo_status_expansion(node, src) => {
+            Some("0".to_string())
+        }
+        _ => None,
     }
-    let raw = node.utf8_text(src.as_bytes()).ok()?;
-    Some(raw.strip_prefix('"')?.strip_suffix('"')?.to_string())
 }
 
 fn raw_string_content(node: Node, src: &str) -> Option<String> {
@@ -449,9 +583,8 @@ fn tree_writes(argv: &[String]) -> bool {
 /// is irreversible and git is not the way back**. That admits `rm -rf`, `dd`
 /// writing to a destination, `mkfs*`, and `shred`; it deliberately leaves out
 /// `git clean -fdx` and `git reset --hard`, which inside a repository are the
-/// recovery path rather than the threat. Device clobbering through a redirect
-/// (`… > /dev/sda`) needs no entry either: a redirect onto a file makes the
-/// whole script [`BashAnalysis::Opaque`]，manual 下不能靠内容分类获得自动裁决。
+/// recovery path rather than the threat. 固定输出设备目标（`… > /dev/sda`）
+/// 由权限门独立检查；未知目标仍使整个脚本 [`BashAnalysis::Opaque`]。
 ///
 /// 这是 manual 下需要强制审批的短名单，不提供 OS containment 保证；bypass 跳过它。
 pub fn argv_is_dangerous(argv: &[String]) -> bool {
@@ -628,7 +761,7 @@ mod tests {
     fn commands(script: &str) -> Option<Vec<Vec<String>>> {
         match analyze_bash(script) {
             BashAnalysis::Commands(c) => Some(c),
-            BashAnalysis::Opaque => None,
+            BashAnalysis::WithWrites { .. } | BashAnalysis::Opaque => None,
         }
     }
 
@@ -670,7 +803,7 @@ mod tests {
             "echo \"hi ${USER}\"",        // expansion inside quotes
             "rg -g\"$(pwd)\" pattern",    // substitution inside concatenation
             "(ls)",                       // subshell
-            "ls > out.txt",               // redirection onto a file
+            "ls > \"$LOG\"",              // dynamic redirection target
             "echo hi & echo bye",         // background chaining
             "sleep 60 >/dev/null 2>&1 &", // background `&` (the redirects are fine)
             "FOO=bar ls",                 // assignment prefix
@@ -713,19 +846,97 @@ mod tests {
     }
 
     #[test]
-    fn a_redirect_that_touches_a_file_still_sinks_the_script() {
+    fn dynamic_and_input_redirects_still_sink_the_script() {
         for script in [
-            "ls >> out.txt",          // append
-            "cat < in.txt",           // a file read the argv never names
-            "foo &> log",             // both streams, real file
-            "foo > 1",                // same parse shape as `2>&1`, a file named 1
-            "go test ./x 2>&1 > out", // one bad redirect among good ones
-            "foo 3>&-",               // operator with no destination
-            "cat <<EOF\nhi\nEOF",     // heredoc
-            "cat <<< hi",             // herestring
+            "cat < in.txt",       // a file read the argv never names
+            "foo 3>&-",           // operator with no destination
+            "cat <<EOF\nhi\nEOF", // heredoc
+            "cat <<< hi",         // herestring
         ] {
             assert_eq!(analyze_bash(script), BashAnalysis::Opaque, "{script}");
         }
+    }
+
+    #[test]
+    fn fixed_output_redirects_keep_every_write_and_stay_mutating() {
+        for (script, paths) in [
+            ("make check > out.log 2>&1", vec!["out.log"]),
+            ("echo result >> out.log", vec!["out.log"]),
+            ("echo result >| out.log", vec!["out.log"]),
+            ("make check &> /tmp/out.log", vec!["/tmp/out.log"]),
+            ("make check &>> /tmp/out.log", vec!["/tmp/out.log"]),
+            (
+                "make check > /tmp/one 2> /tmp/two",
+                vec!["/tmp/one", "/tmp/two"],
+            ),
+            (
+                "make check > '/tmp/log dir'/result.log",
+                vec!["/tmp/log dir/result.log"],
+            ),
+            ("make check > 1", vec!["1"]),
+        ] {
+            let analysis = analyze_bash(script);
+            assert_eq!(analysis.writes(), paths, "{script}");
+            assert!(analysis.commands().is_some(), "{script}");
+            assert!(!analysis.is_readonly(), "{script}");
+        }
+        assert_eq!(
+            analyze_bash(
+                "cd /tmp && make check > /tmp/check.log; echo \"EXIT:$?\" >> /tmp/check.log"
+            ),
+            BashAnalysis::WithWrites {
+                commands: vec![
+                    argv(&["cd", "/tmp"]),
+                    argv(&["make", "check"]),
+                    argv(&["echo", "EXIT:0"])
+                ],
+                paths: vec!["/tmp/check.log".into(), "/tmp/check.log".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn status_expansion_is_only_echo_data() {
+        for script in ["echo $?", "echo ${?}", "echo \"EXIT:$?\"", "echo EXIT:${?}"] {
+            assert!(analyze_bash(script).is_readonly(), "{script}");
+        }
+        for script in [
+            "$?",
+            "make $?",
+            "echo > /tmp/$?",
+            "echo > \"/tmp/${?}\"",
+            "echo ${?:-fallback}",
+            "echo $(touch /tmp/status)",
+            "echo $((1 + $?))",
+        ] {
+            assert_eq!(analyze_bash(script), BashAnalysis::Opaque, "{script}");
+        }
+    }
+
+    #[test]
+    fn output_target_expansions_and_ambiguous_working_directories_stay_opaque() {
+        for script in [
+            "> /tmp/out.log",
+            "make > /tmp/*.log",
+            "make > /tmp/'logs'/*.log",
+            "make > ~/out.log",
+            "make > /tmp/{one,two}",
+            "make > \"$LOG\"",
+            "make > $(pwd)/out.log",
+            "cd sub && make check > out.log",
+            "make > out.log; echo done",
+            "sh -c 'cd sub && make > out.log'",
+            "cd sub && sh -c 'make > out.log'",
+        ] {
+            assert_eq!(analyze_bash(script), BashAnalysis::Opaque, "{script}");
+        }
+        assert_eq!(
+            analyze_bash("sh -c 'make check > /tmp/nested.log'"),
+            BashAnalysis::WithWrites {
+                commands: vec![argv(&["make", "check"])],
+                paths: vec!["/tmp/nested.log".into()],
+            }
+        );
     }
 
     #[test]
@@ -868,9 +1079,13 @@ mod tests {
         assert!(!argv_is_dangerous(&argv(&["git", "clean", "-fdx"])));
         assert!(!argv_is_dangerous(&argv(&["git", "reset", "--hard"])));
 
-        // A redirect onto a device needs no entry: it makes the whole script
-        // opaque，manual 下不能靠内容分类获得自动裁决。
-        assert_eq!(analyze_bash("cat x > /dev/sda"), BashAnalysis::Opaque);
+        assert_eq!(
+            analyze_bash("cat x > /dev/sda"),
+            BashAnalysis::WithWrites {
+                commands: vec![argv(&["cat", "x"])],
+                paths: vec!["/dev/sda".into()],
+            }
+        );
     }
 
     #[test]

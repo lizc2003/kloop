@@ -9,7 +9,6 @@ use serde_json::Value;
 use crate::shell::BashAnalysis;
 use crate::shell::analyze_bash;
 use crate::shell::argv_is_dangerous;
-use crate::shell::argv_is_readonly;
 use crate::shell::strip_wrappers;
 use crate::tools::Builtin;
 
@@ -30,6 +29,7 @@ pub(super) enum ShellFacts {
 /// module's gate.
 pub(crate) struct CallFacts {
     pub(super) shell: Option<ShellFacts>,
+    pub(super) writes: Vec<PathFacts>,
     pub(super) path: Option<PathFacts>,
     pub(super) path_key: Option<&'static str>,
     pub(super) sensitive_read: bool,
@@ -58,6 +58,7 @@ pub(super) enum Sensitivity {
     Secret,
 }
 
+#[derive(Clone)]
 pub(super) struct PathFacts {
     /// Canonical existing ancestor plus any not-yet-created suffix.
     pub(super) normalized: PathBuf,
@@ -83,10 +84,29 @@ impl CallFacts {
             .then(|| input["command"].as_str())
             .flatten();
         let shell = match (name, shell_command) {
-            ("bash", Some(command)) => Some(ShellFacts::Bash(analyze_bash(command))),
+            ("bash", Some(command)) => {
+                let analysis = analyze_bash(command);
+                // Git Bash 的 POSIX 路径不能按原生 Windows cwd 规范化；未建模映射前不生成文件授权。
+                let analysis = if cfg!(windows) && !analysis.writes().is_empty() {
+                    BashAnalysis::Opaque
+                } else {
+                    analysis
+                };
+                Some(ShellFacts::Bash(analysis))
+            }
             ("powershell", Some(_)) => Some(ShellFacts::PowerShellOpaque),
             _ => None,
         };
+        let writes = shell
+            .as_ref()
+            .and_then(|shell| match shell {
+                ShellFacts::Bash(analysis) => Some(analysis.writes()),
+                ShellFacts::PowerShellOpaque => None,
+            })
+            .unwrap_or_default()
+            .iter()
+            .map(|path| PathFacts::gather(Path::new(path), cwd))
+            .collect();
         let path_key = match name {
             "write_file" | "edit_file" | "read_file" => Some("path"),
             "notebook_edit" => Some("notebook_path"),
@@ -120,6 +140,7 @@ impl CallFacts {
         };
         CallFacts {
             shell,
+            writes,
             path,
             path_key,
             sensitive_read,
@@ -146,12 +167,23 @@ impl CallFacts {
                 tag: "sensitive PowerShell path",
             });
         }
-        if let Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))) = &self.shell
-            && cmds
-                .iter()
-                .any(|argv| argv_is_dangerous(argv) || argv_is_dangerous(&strip_wrappers(argv)))
+        if let Some(cmds) = self.shell.as_ref().and_then(|shell| match shell {
+            ShellFacts::Bash(analysis) => analysis.commands(),
+            ShellFacts::PowerShellOpaque => None,
+        }) && cmds
+            .iter()
+            .any(|argv| argv_is_dangerous(argv) || argv_is_dangerous(&strip_wrappers(argv)))
         {
             return Some(Hazard { tag: "destructive" });
+        }
+        if self
+            .writes
+            .iter()
+            .any(|path| path.sensitive || path.normalized.starts_with("/dev"))
+        {
+            return Some(Hazard {
+                tag: "sensitive redirect path",
+            });
         }
         if matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && self.path.as_ref().is_some_and(|p| p.sensitive)
@@ -168,8 +200,7 @@ impl CallFacts {
     /// one decomposition, so `Builtin::concurrency_safe` asks the same question
     /// of its own copy of the analysis.
     pub(crate) fn bash_is_readonly(&self) -> bool {
-        matches!(&self.shell, Some(ShellFacts::Bash(BashAnalysis::Commands(cmds)))
-            if !cmds.is_empty() && cmds.iter().all(|c| argv_is_readonly(c)))
+        matches!(&self.shell, Some(ShellFacts::Bash(analysis)) if analysis.is_readonly())
     }
 
     /// Read-only in the permission sense: nothing on the user's system to sign
@@ -192,7 +223,7 @@ fn bash_reads_sensitive_path(command: &str, analysis: &BashAnalysis, cwd: &Path)
     if raw_mentions_sensitive_path(command) {
         return true;
     }
-    let BashAnalysis::Commands(commands) = analysis else {
+    let Some(commands) = analysis.commands() else {
         return false;
     };
     commands.iter().any(|argv| {

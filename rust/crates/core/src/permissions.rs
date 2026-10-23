@@ -882,10 +882,9 @@ impl Permissions {
             return EscalationOutcome::Approved(EscalationApproval::Bypass);
         }
         // A remembered escalation answers before the ask, exactly as a durable
-        // allow rule does for the ordinary gate. Opaque scripts produce no
-        // payload and so can never be remembered — the same rule the ordinary
-        // gate follows, and stricter here matters more.
-        let remember = escalation_remember_payload(command);
+        // allow rule does for the ordinary gate. 固定输出还需写入范围；opaque
+        // 只能使用本工作区会话的通配升级同意，不产生持久规则。
+        let remember = escalation_remember_payload(command, self.identity.cwd());
         if self.blanket_escalation_granted()
             || remember
                 .as_ref()
@@ -967,7 +966,7 @@ impl Permissions {
         if self.blanket_escalation_granted() {
             return true;
         }
-        escalation_remember_payload(command)
+        escalation_remember_payload(command, self.identity.cwd())
             .is_some_and(|remember| self.escalation_remembered(&remember))
     }
 
@@ -1006,7 +1005,10 @@ impl Permissions {
     /// Whether a durable project rule or this workspace's session cache already
     /// consented to running these commands uncontained.
     fn escalation_remembered(&self, remember: &Remember) -> bool {
-        if self.project.matches_escalation(&remember.argvs) {
+        if self
+            .project
+            .matches_escalation(&remember.argvs, &remember.writes)
+        {
             return true;
         }
         let caches = self.session.cache.lock().unwrap();
@@ -1335,9 +1337,8 @@ mod tests {
             rules(&[], &["bash(rm *)"], &[]),
             approver.clone(),
         );
-        // A file target still means Opaque: it escapes deny + destructive, so
-        // it must reach the user (here denied) rather than silently run.
-        assert!(!ok(&p, "bash", bash("rm -rf build > cleanup.log")).await);
+        // 动态目标仍 opaque；固定目标现在可解析，必须重新经过 deny 检查。
+        assert!(!ok(&p, "bash", bash("rm -rf build > \"$LOG\"")).await);
         assert_eq!(
             approver.ask_count(),
             1,
@@ -1345,6 +1346,7 @@ mod tests {
         );
         // Its stream-only twin is parsed, so the deny rule sees the `rm` itself
         // and nobody is asked at all — the stricter end of the same story.
+        assert!(!ok(&p, "bash", bash("rm -rf build > cleanup.log")).await);
         assert!(!ok(&p, "bash", bash("rm -rf build > /dev/null")).await);
         assert_eq!(
             approver.ask_count(),
@@ -2303,6 +2305,431 @@ mod tests {
             [vec!["bash(go test *)".to_string()]],
             "one prefix rule, not the whole command"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_persist_command_and_write_scopes_across_sessions() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        let input = json!({
+            "command": "cd /tmp && make check > /tmp/kloop-check.log 2>&1; echo \"EXIT:$?\" >> /tmp/kloop-check.log; tail -5 /tmp/kloop-check.log",
+            "disable_sandbox": true
+        });
+        assert!(ok(&p, "bash", input).await);
+        assert!(
+            approver.asked()[0]
+                .approval_scopes
+                .contains(&ApprovalScope::Project)
+        );
+        let stored = writer.calls.lock().unwrap()[0].clone();
+        let directory =
+            PathFacts::gather_with_resolved(Path::new("/tmp/kloop-check.log"), &test_cwd(), None)
+                .normalized
+                .parent()
+                .unwrap()
+                .display()
+                .to_string();
+        assert_eq!(
+            stored,
+            vec![
+                "bash(make check *)".to_string(),
+                format!("bash_write({directory}/**)")
+            ]
+        );
+
+        let next_approver = ScriptedApprover::new(vec![]);
+        let restarted = gate(
+            Mode::Manual,
+            PermissionRules {
+                allow: stored,
+                ..Default::default()
+            },
+            next_approver.clone(),
+        );
+        assert!(ok(&restarted, "bash", json!({
+            "command": "make check extra=1 > /tmp/kloop-next.log 2>&1; echo \"EXIT:${?}\" >> /tmp/kloop-next.log; tail -8 /tmp/kloop-next.log",
+            "disable_sandbox": true
+        })).await);
+        assert_eq!(next_approver.asked(), vec![]);
+        assert!(
+            !ok(
+                &restarted,
+                "bash",
+                bash("make install > /tmp/kloop-next.log")
+            )
+            .await
+        );
+        assert!(
+            !ok(
+                &restarted,
+                "bash",
+                bash("make check > /elsewhere/kloop-next.log")
+            )
+            .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_persist_escalation_with_separate_write_consent() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        let command = "make check > /tmp/kloop-escalate.log 2>&1; echo \"EXIT:$?\" >> /tmp/kloop-escalate.log";
+        assert_eq!(
+            p.escalate_sandbox(command, None, 0).await,
+            EscalationOutcome::Approved(EscalationApproval::User)
+        );
+        let stored = writer.calls.lock().unwrap()[0].clone();
+        assert!(
+            stored
+                .iter()
+                .any(|rule| rule.starts_with("sandbox_escalate_write("))
+        );
+        let next_approver = ScriptedApprover::new(vec![]);
+        let restarted = gate(
+            Mode::Manual,
+            PermissionRules {
+                allow: stored,
+                ..Default::default()
+            },
+            next_approver.clone(),
+        );
+        assert!(restarted.sandbox_escalation_remembered(
+            "make check jobs=2 > /tmp/kloop-escalate-next.log; echo \"EXIT:$?\" >> /tmp/kloop-escalate-next.log"));
+        assert!(
+            !restarted.sandbox_escalation_remembered("make check > /elsewhere/kloop-escalate.log")
+        );
+        assert!(
+            !ok(
+                &restarted,
+                "bash",
+                bash("make check > /tmp/kloop-escalate.log")
+            )
+            .await
+        );
+        assert_eq!(next_approver.ask_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_require_every_command_and_write_scope() {
+        let command = bash("make check > /tmp/check.log 2>&1");
+        for allow in [
+            vec!["bash(make check *)"],
+            vec!["bash_write(/tmp/**)", "bash_write(/private/tmp/**)"],
+            vec!["bash"],
+        ] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(Mode::Manual, rules(&allow, &[], &[]), approver.clone());
+            assert!(!ok(&p, "bash", command.clone()).await, "{allow:?}");
+            assert_eq!(approver.ask_count(), 1);
+        }
+        let allow = [
+            "bash(make check *)",
+            "bash_write(/tmp/**)",
+            "bash_write(/private/tmp/**)",
+        ];
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Manual, rules(&allow, &[], &[]), approver.clone());
+        assert!(ok(&p, "bash", command).await);
+        assert!(
+            !ok(
+                &p,
+                "bash",
+                bash("make check > /tmp/check.log 2> /elsewhere/check.log")
+            )
+            .await
+        );
+        assert!(!p.sandbox_escalation_remembered("make check > /tmp/check.log"));
+        let escalation = gate(
+            Mode::Manual,
+            rules(&["sandbox_escalate(make check *)"], &[], &[]),
+            approver,
+        );
+        assert!(!escalation.sandbox_escalation_remembered("make check > /tmp/check.log"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_session_cache_tracks_commands_and_directories() {
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&p, "bash", bash("make check > /tmp/check.log")).await);
+        assert!(ok(&p, "bash", bash("make check jobs=2 > /tmp/next.log")).await);
+        assert_eq!(approver.ask_count(), 1);
+        assert!(!ok(&p, "bash", bash("make install > /tmp/next.log")).await);
+        assert!(!ok(&p, "bash", bash("make check > /elsewhere/next.log")).await);
+        assert!(
+            !ok(
+                &p.fresh_session(),
+                "bash",
+                bash("make check > /tmp/next.log")
+            )
+            .await
+        );
+
+        let approver =
+            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert_eq!(
+            p.escalate_sandbox("make check > /tmp/check.log", None, 0)
+                .await,
+            EscalationOutcome::Approved(EscalationApproval::User)
+        );
+        assert!(p.sandbox_escalation_remembered("make check jobs=2 > /tmp/next.log"));
+        assert!(!p.sandbox_escalation_remembered("make check > /elsewhere/next.log"));
+        assert!(!p.sandbox_escalation_remembered("make install > /tmp/next.log"));
+        assert!(
+            !p.fresh_session()
+                .sandbox_escalation_remembered("make check > /tmp/next.log")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_respect_hard_gates_and_explicit_asks() {
+        let allow = [
+            "bash(make check *)",
+            "bash_write(/tmp/**)",
+            "bash_write(/private/tmp/**)",
+        ];
+        for deny in [
+            "bash(make check *)",
+            "bash_write(/tmp/**)",
+            "bash_write(/private/tmp/**)",
+        ] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(Mode::Manual, rules(&allow, &[deny], &[]), approver.clone());
+            // deny 同时检查原文与规范目标，分别验证两种路径拼写。
+            let input = if deny.starts_with("bash_write") {
+                bash(&format!(
+                    "make check > {}/check.log",
+                    if deny.contains("/private/") {
+                        "/private/tmp"
+                    } else {
+                        "/tmp"
+                    }
+                ))
+            } else {
+                bash("make check > /tmp/check.log")
+            };
+            assert!(
+                p.check_call("bash", &input, 0, true)
+                    .await
+                    .unwrap_err()
+                    .contains("deny permission rule")
+            );
+            assert_eq!(approver.ask_count(), 0);
+        }
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 2]);
+        let p = gate(
+            Mode::Manual,
+            rules(
+                &allow,
+                &[],
+                &["bash_write(/tmp/**)", "bash_write(/private/tmp/**)"],
+            ),
+            approver.clone(),
+        );
+        for _ in 0..2 {
+            assert!(
+                p.check_call("bash", &bash("make check > /tmp/check.log"), 0, true)
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(approver.ask_count(), 2);
+        assert!(
+            approver
+                .asked()
+                .iter()
+                .all(|req| req.remember_rules.is_none())
+        );
+
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Plan, rules(&allow, &[], &[]), approver.clone());
+        let input = bash("echo done > /tmp/check.log");
+        assert!(
+            p.check_call("bash", &input, 0, true)
+                .await
+                .unwrap_err()
+                .contains("plan mode")
+        );
+        assert!(!crate::tools::Builtin::Bash.concurrency_safe(&input));
+        assert!(crate::tools::Builtin::Bash.concurrency_safe(&bash("echo \"EXIT:$?\"")));
+        assert_eq!(approver.ask_count(), 0);
+
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(
+            Mode::Manual,
+            rules(&["bash", "bash_write(/**)"], &[], &[]),
+            approver.clone(),
+        );
+        assert!(!ok(&p, "bash", bash("rm -rf build > /tmp/check.log")).await);
+        assert!(approver.asked()[0].description.contains("[destructive]"));
+        assert!(!ok(&p, "bash", bash("echo result > /dev/sda")).await);
+        assert!(
+            approver.asked()[1]
+                .description
+                .contains("[sensitive redirect path]")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_match_canonical_write_targets_and_keep_sensitive_reads_blocked() {
+        let root =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-log-scopes-").unwrap());
+        let logs = root.join("logs");
+        let outside = root.join("outside");
+        let sensitive = root.join(".git");
+        for dir in [&logs, &outside, &sensitive] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, logs.join("alias")).unwrap();
+        std::os::unix::fs::symlink(&sensitive, logs.join("vcs")).unwrap();
+        std::os::unix::fs::symlink(&sensitive, root.join("vcs-alias")).unwrap();
+        let logs = std::fs::canonicalize(logs).unwrap();
+        let allow = vec![
+            "bash(make check *)".to_string(),
+            format!("bash_write({}/**)", logs.display()),
+        ];
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(
+            Mode::Manual,
+            PermissionRules {
+                allow: allow.clone(),
+                ..Default::default()
+            },
+            approver.clone(),
+        );
+        assert!(
+            !ok(
+                &p,
+                "bash",
+                bash(&format!("make check > {}/alias/out.log", logs.display()))
+            )
+            .await
+        );
+        assert!(approver.asked()[0].remember_rules.is_some());
+        for _ in 0..2 {
+            assert!(
+                !ok(
+                    &p,
+                    "bash",
+                    bash(&format!("make check > {}/vcs/out.log", logs.display()))
+                )
+                .await
+            );
+        }
+        assert!(
+            approver.asked()[1..]
+                .iter()
+                .all(|req| req.remember_rules.is_none()
+                    && req.description.contains("[sensitive redirect path]"))
+        );
+        let input = bash(&format!(
+            "cat {} > {}/out.log",
+            root.join("vcs-alias/config").display(),
+            logs.display()
+        ));
+        assert!(
+            p.check_call("bash", &input, 0, true)
+                .await
+                .unwrap_err()
+                .contains("sensitive path")
+        );
+        assert_eq!(approver.ask_count(), 3);
+
+        let denied = Permissions::new(
+            Mode::Bypass,
+            &PermissionRules {
+                allow,
+                deny: vec![format!("bash_write({}/**)", logs.display())],
+                ask: vec![],
+            },
+            test_cwd(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            denied
+                .check(
+                    "bash",
+                    &bash(&format!("make check > {}/alias/out.log", logs.display())),
+                    0
+                )
+                .await
+                .unwrap_err()
+                .contains("deny permission rule")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_do_not_turn_literal_directory_names_into_glob_grants() {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        assert!(ok(&p, "bash", bash("make check > '/tmp/log[123]/out.log'")).await);
+        assert_eq!(
+            approver.asked()[0].approval_scopes,
+            vec![ApprovalScope::Once]
+        );
+        assert!(writer.calls.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_wrappers_preserve_leading_spaces_in_directory_rules() {
+        let directory = crate::resource_id::fresh(" logs-").unwrap();
+        let command = format!("make check > '{directory}/first.log'");
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver, writer.clone());
+        assert!(ok(&p, "bash", bash(&command)).await);
+        let stored = writer.calls.lock().unwrap()[0].clone();
+        assert_eq!(
+            stored,
+            vec![
+                "bash(make check *)".to_string(),
+                format!("bash_write({directory}/**)")
+            ]
+        );
+        let restarted = gate(
+            Mode::Manual,
+            PermissionRules {
+                allow: stored,
+                ..Default::default()
+            },
+            ScriptedApprover::new(vec![]),
+        );
+        assert!(
+            ok(
+                &restarted,
+                "bash",
+                bash(&format!("make check > '{directory}/next.log'"))
+            )
+            .await
+        );
+        let escalation = gate(
+            Mode::Manual,
+            rules(
+                &[
+                    "sandbox_escalate(make check *)",
+                    &format!("sandbox_escalate_write({directory}/**)"),
+                ],
+                &[],
+                &[],
+            ),
+            ScriptedApprover::new(vec![]),
+        );
+        assert!(escalation.sandbox_escalation_remembered(&command));
     }
 
     /// An unparseable script is remember-able too, keyed on its own text: the

@@ -527,17 +527,9 @@ impl Builtin {
             // a crash after an injected command ran is not "nothing happened"
             // (plan 204).
             Self::Skill => false,
-            Self::Bash => {
-                input["command"]
-                    .as_str()
-                    .is_some_and(|cmd| match crate::shell::analyze_bash(cmd) {
-                        crate::shell::BashAnalysis::Commands(cmds) => {
-                            !cmds.is_empty()
-                                && cmds.iter().all(|c| crate::shell::argv_is_readonly(c))
-                        }
-                        crate::shell::BashAnalysis::Opaque => false,
-                    })
-            }
+            Self::Bash => input["command"]
+                .as_str()
+                .is_some_and(|cmd| crate::shell::analyze_bash(cmd).is_readonly()),
             Self::AskUserQuestion | Self::CronList | Self::ListAgents => true,
             Self::SendMessage
             | Self::CronCreate

@@ -15,6 +15,7 @@ use super::ProjectPermissionWriter;
 use super::ProjectPolicySnapshot;
 use super::ProjectPolicyStoreError;
 use super::facts::CallFacts;
+use super::facts::PathFacts;
 use super::rule::Rule;
 use super::rule::allow_rules_match;
 use super::rule::parse_rules;
@@ -107,7 +108,7 @@ impl ProjectPermissionPolicy {
     /// Whether durable rules consent to re-running every one of these argvs
     /// outside the sandbox. Strict like `matches_allow`: one uncovered segment
     /// means the whole command still has to be asked about.
-    pub(super) fn matches_escalation(&self, argvs: &[Vec<String>]) -> bool {
+    pub(super) fn matches_escalation(&self, argvs: &[Vec<String>], writes: &[PathFacts]) -> bool {
         if argvs.is_empty() {
             return false;
         }
@@ -116,6 +117,11 @@ impl ProjectPermissionPolicy {
         argvs
             .iter()
             .all(|argv| rules.iter().any(|rule| rule.matches_escalation_argv(argv)))
+            && writes.iter().all(|path| {
+                rules
+                    .iter()
+                    .any(|rule| rule.matches_shell_write("sandbox_escalate_write", path))
+            })
     }
 
     pub(super) fn can_persist(&self) -> bool {

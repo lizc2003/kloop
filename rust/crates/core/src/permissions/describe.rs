@@ -1,8 +1,11 @@
 //! 审批记忆载荷、拒绝说明与前端展示文案。
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use super::facts::CallFacts;
+use super::facts::PathFacts;
 use super::facts::ShellFacts;
 use crate::shell::BashAnalysis;
 use crate::shell::analyze_bash;
@@ -49,11 +52,23 @@ pub(super) const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this 
 /// `sandbox_escalate(...)` rule, because "may run" and "may run uncontained"
 /// are different permissions. `None` = opaque script or a token that would
 /// corrupt a rule string, i.e. not remember-able.
-pub(super) fn escalation_remember_payload(command: &str) -> Option<Remember> {
-    let BashAnalysis::Commands(cmds) = analyze_bash(command) else {
+pub(super) fn escalation_remember_payload(command: &str, cwd: &Path) -> Option<Remember> {
+    let analysis = analyze_bash(command);
+    if cfg!(windows) && !analysis.writes().is_empty() {
         return None;
-    };
-    bash_prefix_memory(&cmds, "sandbox_escalate", ReadOnlySegments::Remember)
+    }
+    let cmds = analysis.commands()?;
+    let writes: Vec<_> = analysis
+        .writes()
+        .iter()
+        .map(|path| PathFacts::gather_with_resolved(Path::new(path), cwd, None))
+        .collect();
+    bash_prefix_memory(
+        cmds,
+        &writes,
+        "sandbox_escalate",
+        ReadOnlySegments::Remember,
+    )
 }
 
 pub(super) fn user_denial(name: &str) -> String {
@@ -85,6 +100,8 @@ pub(super) struct Remember {
     /// itself, where the ordinary gate has already done that upstream. Empty
     /// for the ordinary gate's payloads.
     pub(super) argvs: Vec<Vec<String>>,
+    /// 升级记忆匹配还需复核同一组规范输出目标。
+    pub(super) writes: Vec<PathFacts>,
 }
 
 impl Remember {
@@ -102,6 +119,7 @@ impl Remember {
             rules,
             signatures,
             argvs,
+            writes: Vec::new(),
         }
     }
 }
@@ -127,8 +145,10 @@ enum ReadOnlySegments {
 /// embedded whitespace), so nothing can be written down at all. An empty argv
 /// is rejected for the same reason: the parser never produces one, but a rule
 /// reading `bash( *)` would be worse than no memory.
+/// 固定输出独立追加父目录写入规则；无法安全表示目录范围时整组不生成可复用授权。
 fn bash_prefix_memory(
     cmds: &[Vec<String>],
+    writes: &[PathFacts],
     tool: &str,
     segments: ReadOnlySegments,
 ) -> Option<Remember> {
@@ -159,10 +179,34 @@ fn bash_prefix_memory(
             argvs.push(argv.clone());
         }
     }
+    for path in writes {
+        let parent = path
+            .relative
+            .as_deref()
+            .unwrap_or(&path.normalized)
+            .parent()?;
+        let scope = parent.to_str()?;
+        // 不把目录名中的 glob 语法当通配授权，也不自动建议文件系统根目录授权。
+        if scope == "/" || scope.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r']) {
+            return None;
+        }
+        let pattern = if scope.is_empty() {
+            "**".to_string()
+        } else {
+            format!("{scope}/**")
+        };
+        let rule = format!("{tool}_write({pattern})");
+        if !rules.contains(&rule) {
+            rules.push(rule);
+            signatures.push(format!("{tool}-write:{scope}"));
+        }
+    }
     if rules.is_empty() {
         return None;
     }
-    Some(Remember::echoing_rules(rules, signatures, argvs))
+    let mut remember = Remember::echoing_rules(rules, signatures, argvs);
+    remember.writes = writes.to_vec();
+    Some(remember)
 }
 
 /// cc's "always allow" granularity: bash remembers a two-word command
@@ -178,9 +222,12 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
         return None;
     }
     match (&call.shell, &call.path) {
-        (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => {
-            bash_prefix_memory(cmds, "bash", ReadOnlySegments::Skip)
-        }
+        (
+            Some(ShellFacts::Bash(
+                BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
+            )),
+            _,
+        ) => bash_prefix_memory(cmds, &call.writes, "bash", ReadOnlySegments::Skip),
         // PowerShell stays unremember-able: bash at least gets parsed and only
         // then gives up, while PowerShell has no analysis at all — so "every
         // call asks" is the only safety net it has left.
@@ -205,6 +252,7 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
                 echo: vec![VERBATIM_REMEMBER_RULE.to_string()],
                 signatures: vec![format!("bash-script{escape}:{command}")],
                 argvs: Vec::new(),
+                writes: Vec::new(),
             })
         }
         (None, Some(path)) => {
@@ -375,7 +423,8 @@ mod tests {
 
         // The sandbox denied the whole line, `ls` included, so the escalation
         // remembers both — under its own rule name.
-        let escalation = escalation_remember_payload(command).expect("same command, other door");
+        let escalation = escalation_remember_payload(command, &super::super::testutil::test_cwd())
+            .expect("same command, other door");
         assert_eq!(
             escalation.rules,
             vec![
@@ -399,7 +448,9 @@ mod tests {
         );
         assert!(remember_payload("bash", &read_only).is_none());
         assert_eq!(
-            escalation_remember_payload("ls && pwd").unwrap().rules,
+            escalation_remember_payload("ls && pwd", &super::super::testutil::test_cwd())
+                .unwrap()
+                .rules,
             vec!["sandbox_escalate(ls *)", "sandbox_escalate(pwd *)"]
         );
 
@@ -414,6 +465,8 @@ mod tests {
             Some(ShellFacts::Bash(BashAnalysis::Commands(_)))
         ));
         assert!(remember_payload("bash", &corrupt_call).is_none());
-        assert!(escalation_remember_payload(corrupt).is_none());
+        assert!(
+            escalation_remember_payload(corrupt, &super::super::testutil::test_cwd()).is_none()
+        );
     }
 }

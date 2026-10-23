@@ -63,6 +63,13 @@ impl Rule {
         }
     }
 
+    /// Shell 写入只匹配规范目标；原路径别名不能把目录授权带到其它目录。
+    pub(super) fn matches_shell_write(&self, tool: &str, facts: &PathFacts) -> bool {
+        matches!(self, Rule::PathGlob { tool: rule_tool, glob }
+            if rule_tool == tool && (glob.is_match(&facts.normalized)
+                || facts.relative.as_ref().is_some_and(|path| glob.is_match(path))))
+    }
+
     pub(super) fn matches_path(&self, tool: &str, facts: &PathFacts) -> bool {
         match self {
             Rule::Tool(t) => t == tool,
@@ -133,10 +140,21 @@ pub(super) fn parse_rule(entry: &str) -> Result<Rule> {
                     "rule '{entry}': powershell(...) prefix rules are unsupported; PowerShell v1 only accepts the whole-tool rule 'powershell'"
                 )
             }
-            "write_file" | "edit_file" | "read_file" | "notebook_edit" => {
+            "write_file"
+            | "edit_file"
+            | "read_file"
+            | "notebook_edit"
+            | "bash_write"
+            | "sandbox_escalate_write" => {
                 // Match case-insensitively on case-folding filesystems so a
                 // deny like `write_file(secrets/**)` is not slipped by `Secrets/`.
-                let glob = globset::GlobBuilder::new(inner.trim())
+                // Shell 目录名中的前导空白属于路径，不能裁掉后再写成另一条授权。
+                let pattern = if matches!(tool, "bash_write" | "sandbox_escalate_write") {
+                    inner
+                } else {
+                    inner.trim()
+                };
+                let glob = globset::GlobBuilder::new(pattern)
                     .case_insensitive(FS_FOLDS_CASE)
                     .build()
                     .with_context(|| format!("rule '{entry}': invalid glob"))?
@@ -167,9 +185,20 @@ pub(super) fn parse_rules(entries: &[String]) -> Result<Vec<Rule>> {
 
 pub(super) fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) -> bool {
     match (&call.shell, &call.path) {
-        (Some(ShellFacts::Bash(BashAnalysis::Commands(commands))), _) => commands
-            .iter()
-            .all(|argv| argv_is_readonly(argv) || allow.iter().any(|rule| rule.matches_argv(argv))),
+        (
+            Some(ShellFacts::Bash(
+                BashAnalysis::Commands(commands) | BashAnalysis::WithWrites { commands, .. },
+            )),
+            _,
+        ) => {
+            commands.iter().all(|argv| {
+                argv_is_readonly(argv) || allow.iter().any(|rule| rule.matches_argv(argv))
+            }) && call.writes.iter().all(|path| {
+                allow
+                    .iter()
+                    .any(|rule| rule.matches_shell_write("bash_write", path))
+            })
+        }
         // Nothing vouches for a script the parser could not read, whole-tool
         // `bash` included: that rule was written without anyone having seen
         // this text, and no layer below can vet its content.
@@ -184,11 +213,22 @@ pub(super) fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) ->
 /// after wrapper stripping so `sudo rm` / `env FOO=1 rm` cannot dodge a
 /// `bash(rm *)` rule, and any single matching segment hits.
 pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
-    if rules.iter().any(|r| r.matches_tool(name)) {
+    if rules.iter().any(|r| r.matches_tool(name))
+        || call.writes.iter().any(|path| {
+            rules
+                .iter()
+                .any(|rule| rule.matches_path("bash_write", path))
+        })
+    {
         return true;
     }
     match (&call.shell, &call.path) {
-        (Some(ShellFacts::Bash(BashAnalysis::Commands(cmds))), _) => cmds.iter().any(|argv| {
+        (
+            Some(ShellFacts::Bash(
+                BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
+            )),
+            _,
+        ) => cmds.iter().any(|argv| {
             let stripped = strip_wrappers(argv);
             rules
                 .iter()
