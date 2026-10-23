@@ -363,21 +363,50 @@ fn tree_writes(argv: &[String]) -> bool {
             if name == "outfile" {
                 return true;
             }
-            if attached.is_none()
-                && matches!(
+            let takes_operand = matches!(
+                name,
+                "charset"
+                    | "timefmt"
+                    | "filelimit"
+                    | "sort"
+                    | "gitfile"
+                    | "infofile"
+                    | "hintro"
+                    | "houtro"
+                    | "scheme"
+                    | "authority"
+            );
+            // 未识别的长选项可能带操作数，把后面的 `--` 或 `-o` 吞进去；
+            // 无法担保时按非只读处理。
+            if !takes_operand
+                && !matches!(
                     name,
-                    "charset"
-                        | "timefmt"
-                        | "filelimit"
-                        | "sort"
-                        | "gitfile"
-                        | "infofile"
-                        | "hintro"
-                        | "houtro"
-                        | "scheme"
-                        | "authority"
+                    "gitignore"
+                        | "ignore-case"
+                        | "matchdirs"
+                        | "metafirst"
+                        | "prune"
+                        | "info"
+                        | "noreport"
+                        | "si"
+                        | "du"
+                        | "inodes"
+                        | "device"
+                        | "dirsfirst"
+                        | "filesfirst"
+                        | "nolinks"
+                        | "hyperlink"
+                        | "fromfile"
+                        | "fromtabfile"
+                        | "fflinks"
+                        | "opt-toggle"
+                        | "help"
+                        | "version"
                 )
             {
+                return true;
+            }
+            if takes_operand && attached.is_none() {
                 pending_operands += 1;
             }
             index += 1;
@@ -396,7 +425,13 @@ fn tree_writes(argv: &[String]) -> bool {
                         pending_operands += 1;
                     }
                 }
-                _ => {}
+                // 已知无参开关。其余字母保守按非只读处理：未知短选项也可能
+                // 吞掉后面的 token。
+                'a' | 'c' | 'd' | 'f' | 'g' | 'h' | 'i' | 'l' | 'n' | 'p' | 'q' | 'r' | 's'
+                | 't' | 'u' | 'v' | 'x' | 'A' | 'C' | 'D' | 'F' | 'J' | 'N' | 'Q' | 'S' | 'U'
+                | 'X' => {}
+                '0'..='9' => {}
+                _ => return true,
             }
         }
         index += 1;
@@ -747,6 +782,19 @@ mod tests {
         ])));
         assert!(argv_is_readonly(&argv(&["tree", "-I", "-R", "."])));
         assert!(argv_is_readonly(&argv(&["tree", "--", "-R"])));
+        assert!(argv_is_readonly(&argv(&["tree", "--gitignore", "."])));
+        // Unknown options may take an operand and swallow a `--`, so they
+        // cannot be vouched for.
+        assert!(!argv_is_readonly(&argv(&[
+            "tree",
+            "--compress",
+            "--",
+            "-o",
+            "out.txt",
+            "."
+        ])));
+        assert!(!argv_is_readonly(&argv(&["tree", "--future-flag", "."])));
+        assert!(!argv_is_readonly(&argv(&["tree", "-Z", "."])));
         assert!(!argv_is_readonly(&argv(&["sed", "-i", "s/a/b/", "f"])));
         assert!(!argv_is_readonly(&argv(&["rm", "-rf", "x"])));
         assert!(!argv_is_readonly(&argv(&["make", "build"])));

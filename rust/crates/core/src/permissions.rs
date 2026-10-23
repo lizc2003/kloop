@@ -1753,6 +1753,7 @@ mod tests {
                 "tree --gitignore .git",
                 "tree -R -L 1 -H . .git",
                 "tree -so .git/config .",
+                "tree --compress -- -o .git/config .",
                 "tree -o .git/config .",
                 "find .git -files0-from .git/config",
                 "find .git -exec cat '{}' ';'",
@@ -2829,6 +2830,10 @@ mod tests {
             ),
             ("bash", bash("echo hi > f.txt")),
             ("bash", bash("cargo build")),
+            // Unknown tree options may take an operand and swallow `--`,
+            // exposing `-o` as a write; the read-only classifier must not
+            // vouch for them.
+            ("bash", bash("tree --compress -- -o out.txt .")),
         ] {
             let err = p.check(name, &input, 0).await.unwrap_err();
             assert!(err.contains("plan mode"), "{name}: {err}");
