@@ -11,10 +11,13 @@ use std::pin::Pin;
 use serde::Deserialize;
 use serde::Serialize;
 
-const MAX_TOTAL_CHARS: usize = 50_000;
-const MAX_QUESTION_CHARS: usize = 1_000;
-const MAX_DESCRIPTION_CHARS: usize = 2_000;
-const MAX_PREVIEW_CHARS: usize = 10_000;
+pub(crate) const MAX_TOTAL_CHARS: usize = 50_000;
+pub(crate) const MAX_QUESTION_CHARS: usize = 1_000;
+pub(crate) const MAX_HEADER_CHARS: usize = 12;
+pub(crate) const MAX_LABEL_CHARS: usize = 100;
+pub(crate) const MAX_DESCRIPTION_CHARS: usize = 2_000;
+pub(crate) const MAX_PREVIEW_CHARS: usize = 10_000;
+pub(crate) const MAX_SOURCE_CHARS: usize = 200;
 const MAX_FREE_TEXT_CHARS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +68,7 @@ impl QuestionRequest {
             )?;
             validate_text(
                 &question.header,
-                12,
+                MAX_HEADER_CHARS,
                 &format!("questions[{question_index}].header"),
             )?;
             if !(2..=4).contains(&question.options.len()) {
@@ -77,7 +80,7 @@ impl QuestionRequest {
             for (option_index, option) in question.options.iter().enumerate() {
                 validate_text(
                     &option.label,
-                    100,
+                    MAX_LABEL_CHARS,
                     &format!("questions[{question_index}].options[{option_index}].label"),
                 )?;
                 validate_text(
@@ -113,7 +116,7 @@ impl QuestionRequest {
                 .saturating_add(question.header.chars().count());
         }
         if let Some(source) = self.metadata.as_ref().and_then(|m| m.source.as_ref()) {
-            validate_text(source, 200, "metadata.source")?;
+            validate_text(source, MAX_SOURCE_CHARS, "metadata.source")?;
             total = total.saturating_add(source.chars().count());
         }
         if total > MAX_TOTAL_CHARS {

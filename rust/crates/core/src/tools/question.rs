@@ -7,6 +7,13 @@ use serde_json::Value;
 use serde_json::json;
 
 use super::ToolCtx;
+use crate::interaction::MAX_DESCRIPTION_CHARS;
+use crate::interaction::MAX_HEADER_CHARS;
+use crate::interaction::MAX_LABEL_CHARS;
+use crate::interaction::MAX_PREVIEW_CHARS;
+use crate::interaction::MAX_QUESTION_CHARS;
+use crate::interaction::MAX_SOURCE_CHARS;
+use crate::interaction::MAX_TOTAL_CHARS;
 use crate::interaction::QuestionAnswer;
 use crate::interaction::QuestionMetadata;
 use crate::interaction::QuestionOutcome;
@@ -33,7 +40,9 @@ pub(super) fn normalize_arguments(input: &mut Value) {
 pub(super) fn ask_user_question_def() -> ToolDef {
     ToolDef {
         name: "ask_user_question".into(),
-        description: "Ask the user one to four concrete decision questions only when their answer is genuinely required. Each question has two to four options and always permits an Other free-text answer. Use multi_select for non-exclusive choices and preview only when a visual/code comparison helps. Do not use this for permission approval or to ask whether an implementation plan is ready.".into(),
+        description: format!(
+            "Ask the user one to four concrete decision questions only when their answer is genuinely required. Each question has two to four options and always permits an Other free-text answer. Use multi_select for non-exclusive choices and preview only when a visual/code comparison helps. All question text, headers, option labels/descriptions/previews and metadata.source combined must fit within {MAX_TOTAL_CHARS} characters. Do not use this for permission approval or to ask whether an implementation plan is ready."
+        ),
         schema: json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -45,8 +54,8 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "question": {"type": "string"},
-                            "header": {"type": "string"},
+                            "question": {"type": "string", "minLength": 1, "maxLength": MAX_QUESTION_CHARS, "description": "Non-blank full question text."},
+                            "header": {"type": "string", "minLength": 1, "maxLength": MAX_HEADER_CHARS, "description": format!("Non-blank short display title, at most {MAX_HEADER_CHARS} characters. Put the full question in question.")},
                             "options": {
                                 "type": "array",
                                 "minItems": 2,
@@ -54,9 +63,9 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "label": {"type": "string"},
-                                        "description": {"type": "string"},
-                                        "preview": {"type": "string"}
+                                        "label": {"type": "string", "minLength": 1, "maxLength": MAX_LABEL_CHARS, "description": "Non-blank option label, unique within this question."},
+                                        "description": {"type": "string", "minLength": 1, "maxLength": MAX_DESCRIPTION_CHARS, "description": "Non-blank explanation of this option."},
+                                        "preview": {"type": "string", "minLength": 1, "maxLength": MAX_PREVIEW_CHARS, "description": "Optional non-blank preview, only for single-select questions."}
                                     },
                                     "required": ["label", "description"],
                                     "additionalProperties": false
@@ -85,7 +94,7 @@ pub(super) fn ask_user_question_def() -> ToolDef {
                 },
                 "metadata": {
                     "type": "object",
-                    "properties": {"source": {"type": "string"}},
+                    "properties": {"source": {"type": "string", "minLength": 1, "maxLength": MAX_SOURCE_CHARS, "description": "Optional non-blank question source."}},
                     "additionalProperties": false
                 }
             },
@@ -237,6 +246,96 @@ mod tests {
                 "multi_select": false
             }]
         })
+    }
+
+    #[test]
+    fn question_schema_exposes_runtime_text_limits() {
+        let definition = ask_user_question_def();
+        for (schema_path, input_path, max) in [
+            (
+                "/properties/questions/items/properties/question",
+                "/questions/0/question",
+                1_000,
+            ),
+            (
+                "/properties/questions/items/properties/header",
+                "/questions/0/header",
+                12,
+            ),
+            (
+                "/properties/questions/items/properties/options/items/properties/label",
+                "/questions/0/options/0/label",
+                100,
+            ),
+            (
+                "/properties/questions/items/properties/options/items/properties/description",
+                "/questions/0/options/0/description",
+                2_000,
+            ),
+            (
+                "/properties/questions/items/properties/options/items/properties/preview",
+                "/questions/0/options/0/preview",
+                10_000,
+            ),
+            (
+                "/properties/metadata/properties/source",
+                "/metadata/source",
+                200,
+            ),
+        ] {
+            let schema = definition.schema.pointer(schema_path).unwrap();
+            assert_eq!(schema["minLength"], 1, "{schema_path}");
+            assert_eq!(schema["maxLength"], max, "{schema_path}");
+            for unit in ["a", "界"] {
+                for length in [max, max + 1] {
+                    let mut value = input();
+                    value["metadata"] = json!({"source": "test"});
+                    *value.pointer_mut(input_path).unwrap() = json!(unit.repeat(length));
+                    let request: QuestionRequest = serde_json::from_value(value).unwrap();
+                    let field = input_path
+                        .trim_start_matches('/')
+                        .replace("/0/", "[0].")
+                        .replace('/', ".");
+                    let expected = if length == max {
+                        Ok(())
+                    } else {
+                        Err(format!("{field} exceeds the {max}-character limit"))
+                    };
+                    assert_eq!(request.validate(), expected, "{input_path}: {unit}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn second_question_header_enforces_character_limit_through_dispatch() {
+        let ctx = ctx_with(QuestionOutcome::Cancelled);
+        for unit in ["a", "界"] {
+            for length in [12, 13] {
+                let mut value = input();
+                let mut second = value["questions"][0].clone();
+                second["header"] = json!(unit.repeat(length));
+                value["questions"].as_array_mut().unwrap().push(second);
+                for (name, input) in [
+                    ("ask_user_question", value.clone()),
+                    (
+                        "call_tool",
+                        json!({"tool_name": "ask_user_question", "params": value}),
+                    ),
+                ] {
+                    let (out, is_error) = run_tool(name, input, &ctx).await;
+                    assert_eq!(is_error, length > 12, "{out}");
+                    if is_error {
+                        assert_eq!(
+                            out,
+                            "ask_user_question: questions[1].header exceeds the 12-character limit"
+                        );
+                    } else {
+                        assert!(out.contains("cancelled"), "{out}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
