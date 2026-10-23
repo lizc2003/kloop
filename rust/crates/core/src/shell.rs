@@ -314,14 +314,9 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
 
         // -o writes the listing; -R re-runs tree with -H and writes
         // 00Tree.html at each depth boundary. Both may sit inside a short
-        // cluster (`-ao`, `-aR`), so scan the letters, not just the token.
-        "tree" => !rest.iter().any(|a| {
-            a == "--outfile"
-                || a.starts_with("--outfile=")
-                || (a.starts_with('-')
-                    && !a.starts_with("--")
-                    && a.chars().skip(1).any(|c| matches!(c, 'o' | 'R')))
-        }),
+        // cluster (`-ao`, `-aR`), but operands are skipped: `-I -old*` is a
+        // pattern, not an output file.
+        "tree" => !tree_writes(argv),
 
         "git" => git_is_readonly(argv),
 
@@ -334,6 +329,79 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
 
         _ => false,
     }
+}
+
+/// `tree` writes when `-o` (output file) or `-R` (re-runs with -H and writes
+/// 00Tree.html at each depth boundary) is an option letter. Operand-taking
+/// options consume following argv tokens, so `-I -old*` is a pattern, not an
+/// output file, and `--` ends option parsing.
+fn tree_writes(argv: &[String]) -> bool {
+    let mut pending_operands = 0_usize;
+    let mut options_done = false;
+    let mut index = 1;
+    while let Some(raw) = argv.get(index) {
+        let arg = raw.as_str();
+        if pending_operands > 0 {
+            pending_operands -= 1;
+            index += 1;
+            continue;
+        }
+        if options_done || !arg.starts_with('-') || arg == "-" {
+            index += 1;
+            continue;
+        }
+        if arg == "--" {
+            options_done = true;
+            index += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if name == "outfile" {
+                return true;
+            }
+            if attached.is_none()
+                && matches!(
+                    name,
+                    "charset"
+                        | "timefmt"
+                        | "filelimit"
+                        | "sort"
+                        | "gitfile"
+                        | "infofile"
+                        | "hintro"
+                        | "houtro"
+                        | "scheme"
+                        | "authority"
+                )
+            {
+                pending_operands += 1;
+            }
+            index += 1;
+            continue;
+        }
+        let body = &arg[1..];
+        for (offset, ch) in body.char_indices() {
+            match ch {
+                'o' | 'R' => return true,
+                'I' | 'P' | 'T' | 'H' => pending_operands += 1,
+                'L' => {
+                    // `-L<digits>` carries its operand; bare `-L` takes the
+                    // next token.
+                    let rest = &body[offset + ch.len_utf8()..];
+                    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                        pending_operands += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Dangerous classifier (codex `is_dangerous_to_call_with_exec`),
@@ -672,6 +740,13 @@ mod tests {
         assert!(!argv_is_readonly(&argv(&["tree", "-R", "-L", "1", "."])));
         assert!(!argv_is_readonly(&argv(&["tree", "-aR", "."])));
         assert!(!argv_is_readonly(&argv(&["tree", "-ao", "out.txt"])));
+        // Operands are skipped: `-I -old*` / `-I -R` are patterns, not writes,
+        // and `--` ends option parsing.
+        assert!(argv_is_readonly(&argv(&[
+            "tree", "-I", "-old*", "-P", ".git", "."
+        ])));
+        assert!(argv_is_readonly(&argv(&["tree", "-I", "-R", "."])));
+        assert!(argv_is_readonly(&argv(&["tree", "--", "-R"])));
         assert!(!argv_is_readonly(&argv(&["sed", "-i", "s/a/b/", "f"])));
         assert!(!argv_is_readonly(&argv(&["rm", "-rf", "x"])));
         assert!(!argv_is_readonly(&argv(&["make", "build"])));

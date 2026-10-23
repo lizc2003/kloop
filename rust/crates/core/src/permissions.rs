@@ -1722,6 +1722,8 @@ mod tests {
                 "find -f ./.git . -path ./.git -prune -o -print",
                 "find . -path ./.git -newer ./.git/config -print",
                 "find . -newer ./.git/config -print0",
+                "tree -I --gitignore .git",
+                "tree -I '-old*' -P .git .",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(

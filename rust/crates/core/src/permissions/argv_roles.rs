@@ -21,7 +21,7 @@ pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<&str>> {
         return None;
     }
     match command {
-        "find" => find_paths(argv),
+        "find" => parse_find(argv).map(|found| found.paths),
         "grep" => option_paths(argv, &GREP, Positionals::PatternThenPaths),
         "rg" => option_paths(argv, &RG, Positionals::PatternThenPaths),
         "du" => option_paths(argv, &DU, Positionals::AllPaths),
@@ -51,37 +51,30 @@ pub(super) fn is_metadata_access(argv: &[String]) -> bool {
         // --files0-from，含 -sX 这类组合）会打开文件。
         "du" => option_opens_file(argv, &DU) == Some(false),
         // tree 只 stat；-o/-R 写文件，--from* / --gitignore / --gitfile /
-        // --infofile / --h* 读文件。
-        "tree" => {
-            argv_is_readonly(argv)
-                && option_opens_file(argv, &TREE) == Some(false)
-                && !argv[1..].iter().any(|arg| {
-                    matches!(arg.as_str(), "--outfile")
-                        || arg.starts_with("--outfile=")
-                        || matches!(
-                            arg.as_str(),
-                            "--fromfile"
-                                | "--fromtabfile"
-                                | "--gitignore"
-                                | "--gitfile"
-                                | "--infofile"
-                                | "--hintro"
-                                | "--houtro"
+        // --infofile / --h* 读文件。只看实际作为选项消费的开关，
+        // `-I --gitignore` 里的 `--gitignore` 是模式，不是开关。
+        "tree" => match walk_options(argv, &TREE, Positionals::AllPaths) {
+            Some(walked) => {
+                !walked.opens_file
+                    && !walked.short_flags.contains(&'R')
+                    && !walked.long_flags.iter().any(|name| {
+                        matches!(
+                            *name,
+                            "outfile"
+                                | "fromfile"
+                                | "fromtabfile"
+                                | "gitignore"
+                                | "gitfile"
+                                | "infofile"
+                                | "hintro"
+                                | "houtro"
                         )
-                        || arg.starts_with("--gitfile=")
-                        || arg.starts_with("--infofile=")
-                        || arg.starts_with("--hintro=")
-                        || arg.starts_with("--houtro=")
-                })
-        }
-        // 普通 find 谓词只 stat / 输出名字；-files0-from 会打开文件，
-        // 执行/写入动作由只读分类器排除。
-        "find" => {
-            argv_is_readonly(argv)
-                && !argv[1..]
-                    .iter()
-                    .any(|arg| arg == "-files0-from" || arg.starts_with("-files0-from="))
-        }
+                    })
+            }
+            None => false,
+        },
+        // 普通 find 谓词只 stat / 输出名字；`-files0-from` 会读取根列表文件。
+        "find" => parse_find(argv).is_some_and(|found| !found.opens_file),
         _ => false,
     }
 }
@@ -128,6 +121,10 @@ struct Walked<'a> {
     paths: Vec<&'a str>,
     /// 消费了某个选项的 Path 类操作数（会打开或写入文件）；位置参数不算。
     opens_file: bool,
+    /// 实际作为选项消费的长选项名（`--name=value` 取 `name`）。
+    long_flags: Vec<&'a str>,
+    /// 实际作为无操作数开关消费的短选项字母。
+    short_flags: Vec<char>,
 }
 
 fn option_paths<'a>(
@@ -152,6 +149,8 @@ fn walk_options<'a>(
     let mut walked = Walked {
         paths: Vec::new(),
         opens_file: false,
+        long_flags: Vec::new(),
+        short_flags: Vec::new(),
     };
     let mut pattern_source = false;
     // 第一个位置参数可能是模式，也可能是路径：`-f`/`--file` 可以出现在它后面
@@ -186,6 +185,7 @@ fn walk_options<'a>(
                 None => (long, None),
             };
             let role = (spec.long)(name)?;
+            walked.long_flags.push(name);
             match (role, attached) {
                 (Operand::None | Operand::Optional, _) => index += 1,
                 (Operand::NoPattern, _) => {
@@ -225,8 +225,12 @@ fn walk_options<'a>(
         for (offset, ch) in body.char_indices() {
             let role = (spec.short)(ch)?;
             match role {
-                Operand::None | Operand::Optional => continue,
+                Operand::None | Operand::Optional => {
+                    walked.short_flags.push(ch);
+                    continue;
+                }
                 Operand::NoPattern => {
+                    walked.short_flags.push(ch);
                     pattern_source = true;
                     continue;
                 }
@@ -261,8 +265,17 @@ fn walk_options<'a>(
     Some(walked)
 }
 
-fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
-    let mut paths = Vec::new();
+struct Found<'a> {
+    paths: Vec<&'a str>,
+    /// `-files0-from` 读取文件内容（根列表），不是元数据访问。
+    opens_file: bool,
+}
+
+fn parse_find(argv: &[String]) -> Option<Found<'_>> {
+    let mut found = Found {
+        paths: Vec::new(),
+        opens_file: false,
+    };
     let mut index = 1;
     // GNU 的前置选项与 BSD 的 `-f` 根：它们把“表达式从哪开始”往后推。
     while let Some(arg) = argv.get(index) {
@@ -270,7 +283,7 @@ fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
             "-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x" => index += 1,
             "-f" => {
                 // BSD `-f` 后面是搜索根，即使它恰好叫 `-path` 也不是谓词。
-                paths.push(argv.get(index + 1)?.as_str());
+                found.paths.push(argv.get(index + 1)?.as_str());
                 index += 2;
             }
             "-D" => {
@@ -285,12 +298,12 @@ fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
         if arg.starts_with('-') || matches!(arg.as_str(), "(" | r"\(" | "!" | r"\!") {
             break;
         }
-        paths.push(arg.as_str());
+        found.paths.push(arg.as_str());
         index += 1;
     }
     // 没有表达式也是合法调用（`find .git` 只列目录），此时只有搜索根是路径。
     if argv.get(index).is_none() {
-        return Some(paths);
+        return Some(found);
     }
 
     let mut depth = 0_usize;
@@ -321,15 +334,22 @@ fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
                 argv.get(index)?;
                 needs_operand = false;
             }
-            // 参考文件：会被打开，必须检查。
-            "-anewer" | "-cnewer" | "-mnewer" | "-Bnewer" | "-samefile" | "-files0-from" => {
+            // 参考文件：只 stat，路径仍要检查。
+            "-anewer" | "-cnewer" | "-mnewer" | "-Bnewer" | "-samefile" => {
                 index += 1;
-                paths.push(argv.get(index)?.as_str());
+                found.paths.push(argv.get(index)?.as_str());
                 needs_operand = false;
             }
             _ if arg.starts_with("-newer") => {
                 index += 1;
-                paths.push(argv.get(index)?.as_str());
+                found.paths.push(argv.get(index)?.as_str());
+                needs_operand = false;
+            }
+            // 根列表文件：读取内容，按内容访问处理。
+            "-files0-from" => {
+                index += 1;
+                found.paths.push(argv.get(index)?.as_str());
+                found.opens_file = true;
                 needs_operand = false;
             }
             // 字面量操作数：类型、大小、模式、格式串……都不是路径。
@@ -370,7 +390,7 @@ fn find_paths(argv: &[String]) -> Option<Vec<&str>> {
         }
         index += 1;
     }
-    (depth == 0 && !needs_operand).then_some(paths)
+    (depth == 0 && !needs_operand).then_some(found)
 }
 
 fn is_find_optimization_level(arg: &str) -> bool {
@@ -824,6 +844,9 @@ mod tests {
         assert!(metadata(&["du", "-sh", ".git"]));
         assert!(metadata(&["tree", "-L1", ".git"]));
         assert!(metadata(&["find", ".git", "-maxdepth", "1", "-print"]));
+        assert!(metadata(&["find", ".git", "-name", "--files0-from"]));
+        assert!(metadata(&["tree", "-I", "--gitignore", ".git"]));
+        assert!(metadata(&["tree", "-I", "-old*", "-P", ".git", "."]));
         assert!(!metadata(&["du", "--files0-from=.git/config"]));
         assert!(!metadata(&["du", "-X", ".git/config", "."]));
         assert!(!metadata(&["du", "-sX", ".git/config", "."]));
