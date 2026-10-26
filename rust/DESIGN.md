@@ -1698,7 +1698,10 @@ long turn's gauge moves while it runs, and once more after a slash command, so
 `/compact` and `/clear` move it without any turn at all) — flush right (dropped
 on a narrow row so the left side wins). The branch is omitted outside a
 repository and cut with `…` past 24 columns; it sits before the hints so the
-branch survives a narrow row. The bar therefore reads
+branch survives a narrow row. Leaving a worktree re-reads the original
+checkout's branch (the core event says only "left the worktree"), and the
+completion menu replaces just the hints, so neither the badge nor the branch
+ever disappears. The bar therefore reads
 `[manual]  main · shift+Tab mode · Ctrl+R rewind · Ctrl+C to exit`: the banner
 that first names the branch scrolls into scrollback, the footer does not. 百分比
 分母来自当前路由的配置窗口：成功的

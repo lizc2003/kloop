@@ -40,4 +40,16 @@
 running、off-repo、30 列窄行与长分支；七份 PTY 快照同步提示文案，effort picker 的
 光标列随页脚缩短由 70 变为 57（列表面板不设光标，停在最后写入处）。外层执行沙箱之外
 完整 `make check` 全绿，含本机 parity（CLI 156、core 1192、TUI 288、TUI PTY 25、
-plain PTY 8）。DESIGN 页脚段落已改写，HANDOFF 已同步并记录教训 270。
+plain PTY 8）。DESIGN 页脚段落已改写，HANDOFF 已同步并记录教训 270。首版提交 `0d6f17d`。
+
+## 审查修正（2026-10-26）
+
+- **退出 worktree 后分支消失（P2）**：`exit_worktree_tool` 的 `CwdChanged` 用
+  `branch: None` 表示“离开 worktree”，页脚把它读成“不在仓库”。core 事件形状被
+  worktree parity 报告钉住（`branch: None`），所以在 TUI 的事件边界
+  `resolve_cwd_branch` 对 `branch: None` 的 cwd 变化重读 git 分支，再交给 `App`。
+  新增临时仓库回归：退出事件补回原分支，已带分支的事件原样保留。
+- **补全菜单绕过常显分支（P3）**：`footer_line` 删掉 `popup` 的提前返回，菜单提示改为
+  与 idle/startup/running 同一套徽标、分支、截断逻辑；菜单打开时不追加 todo 提示。
+  新增回归覆盖完整文案与 20 列窄行仍见分支。
+- 分支修正提交号以本节所在提交为准；完整 `make check` 结果见该提交说明。

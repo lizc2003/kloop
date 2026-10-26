@@ -1150,6 +1150,20 @@ fn event_cwd(event: &AgentEvent) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The worktree tool reports `branch: None` when the session leaves it, but the
+/// footer shows the session's branch and must keep showing the original
+/// checkout's. Re-read it at the new cwd here rather than changing the core
+/// event shape, which the worktree parity report pins.
+fn resolve_cwd_branch(event: AgentEvent) -> AgentEvent {
+    match event {
+        AgentEvent::Core(CoreEvent::CwdChanged { cwd, branch: None }) => {
+            let branch = git_branch(std::path::Path::new(&cwd));
+            AgentEvent::Core(CoreEvent::CwdChanged { cwd, branch })
+        }
+        other => other,
+    }
+}
+
 /// What the loop starts with: the seeded [`App`] and the startup task's line
 /// channel (whose sender dropping means the task finished).
 struct UiBoot {
@@ -1369,6 +1383,10 @@ impl UiState {
     /// marker, which ends the loop and is never applied — the caller restores
     /// the terminal.
     fn absorb(&mut self, event: AgentEvent) -> bool {
+        // A cwd change is the one event whose branch may arrive missing (the
+        // worktree tool means "left the worktree"); fill it before any consumer
+        // sees it so the footer never drops the branch.
+        let event = resolve_cwd_branch(event);
         match &event {
             AgentEvent::Quit => return true,
             AgentEvent::Cleared { .. } => {
@@ -1583,6 +1601,64 @@ mod tests {
                 "{code:?} with {modifiers:?}"
             );
         }
+    }
+
+    /// Leaving a worktree emits `branch: None`, but the footer's always-on
+    /// branch must come back as the original checkout's, not disappear until
+    /// the next session switch.
+    #[test]
+    fn leaving_a_worktree_refills_the_original_branch() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "kloop-tui-branch-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-qm", "base"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let expected = git_branch(&root).expect("temp repo has a branch");
+        let event = AgentEvent::Core(CoreEvent::CwdChanged {
+            cwd: root.display().to_string(),
+            branch: None,
+        });
+        match resolve_cwd_branch(event) {
+            AgentEvent::Core(CoreEvent::CwdChanged { branch, .. }) => {
+                assert_eq!(branch.as_deref(), Some(expected.as_str()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // An event that already carries a branch is left alone.
+        let event = AgentEvent::Core(CoreEvent::CwdChanged {
+            cwd: "/repo/.kloop/worktrees/x".into(),
+            branch: Some("kloop-worktree-x".into()),
+        });
+        match resolve_cwd_branch(event) {
+            AgentEvent::Core(CoreEvent::CwdChanged { branch, .. }) => {
+                assert_eq!(branch.as_deref(), Some("kloop-worktree-x"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct StagedSizeBackend {

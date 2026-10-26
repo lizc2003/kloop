@@ -962,14 +962,10 @@ const BRANCH_MAX: usize = 24;
 /// running/idle hint set, and the (per-turn) context gauge change — never per
 /// event — so the bar barely moves. Live activity lives in [`activity_line`].
 pub fn footer_line(app: &App, width: usize) -> Line<'static> {
-    // A choice panel prints its own key hint on its last row; the footer stays
-    // still underneath it rather than saying the same thing in other words.
-    if app.popup.is_some() {
-        return Line::from(Span::styled(
-            "↑↓ choose · Tab/⏎ complete · Esc cancel".to_string(),
-            DIM,
-        ));
-    }
+    // The completion menu owns the keyboard while it is open: its keys replace
+    // the normal hints, but the badge and branch stay so the session context
+    // does not vanish behind a transient popup.
+    let menu_open = app.popup.is_some();
     // The mode badge carries the brand accent (CC's brand-coloured mode line);
     // everything after it stays dim so only the badge draws the eye.
     let badge = format!("[{}]  ", app.mode.label());
@@ -983,7 +979,9 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
         .filter(|branch| !branch.is_empty())
         .map(|branch| format!("{} · ", truncate(branch, BRANCH_MAX)))
         .unwrap_or_default();
-    let mut hints = if let Some(startup) = &app.startup {
+    let mut hints = if menu_open {
+        "↑↓ choose · Tab/⏎ complete · Esc cancel".to_string()
+    } else if let Some(startup) = &app.startup {
         // Startup owns the keyboard: the line says what is still pending and
         // that quitting is the one live action.
         format!("{startup} · Ctrl+C to exit")
@@ -992,7 +990,7 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     } else {
         "shift+Tab mode · Ctrl+R rewind · Ctrl+C to exit".to_string()
     };
-    if app.live_todos().is_some() {
+    if !menu_open && app.live_todos().is_some() {
         hints.push_str(if app.show_todos {
             " · ctrl+t to hide todos"
         } else {
@@ -2944,6 +2942,35 @@ mod tests {
         );
         assert!(!footer.contains(long), "{footer}");
         assert!(footer.contains("Ctrl+R rewind"), "{footer}");
+    }
+
+    /// The completion menu replaces the key hints, not the session context: the
+    /// badge and branch stay in front of the menu keys, through the same
+    /// truncation, and the todo hint does not displace them.
+    #[test]
+    fn footer_keeps_badge_and_branch_while_the_completion_menu_is_open() {
+        let mut app =
+            App::new("sess".into()).with_working_directory("~/repo".into(), Some("main".into()));
+        app.popup = Some(Popup {
+            target: completion_target(menu::PopupKind::Slash, "/"),
+            items: Vec::new(),
+            cursor: 0,
+        });
+
+        let footer = line_text(&footer_line(&app, 80));
+        assert_eq!(
+            footer,
+            "[manual]  main · ↑↓ choose · Tab/⏎ complete · Esc cancel"
+        );
+
+        app.todos = Some(todo_snapshot(vec![todo("Visible", TodoStatus::Pending)]));
+        let footer = line_text(&footer_line(&app, 80));
+        assert!(!footer.contains("ctrl+t"), "{footer}");
+
+        // The branch also wins over the menu keys on a narrow row.
+        let narrow = line_text(&footer_line(&app, 20));
+        assert!(narrow.starts_with("[manual]  main"), "{narrow}");
+        assert!(display_width(&narrow) <= 20, "{narrow}");
     }
 
     /// The footer's right side carries the model + context gauge when Config
