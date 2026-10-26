@@ -9,9 +9,12 @@ TUI 事件边界新增 `resolve_cwd_branch`：只对 `branch: None` 的 cwd 变�
 都随之恢复原检出分支。另一处是补全菜单的 `popup` 提前返回绕过了徽标/分支，现改为
 菜单只替换 hint，复用同一套徽标、分支、24 列截断与右侧让位逻辑，菜单打开时不再追加
 todo 提示。新增两条回归：临时真仓库验证退出事件补回原分支且已有分支不被改写；菜单态
-完整文案与 20 列窄行仍见分支。外层执行沙箱之外完整 `make check` 全绿，含本机 parity
-（CLI 156、core 1192、TUI 290、TUI PTY 25、plain PTY 8）。首版 `0d6f17d`，修正提交号
-以本条所在提交为准，教训 271。
+完整文案与 20 列窄行仍见分支。随后审查指出该 git 回归仍继承宿主配置（全局
+`commit.gpgSign`、外部钩子会让 base 提交失败），测试内的 git 现在 `env_clear()` 只留
+`PATH`、HOME/XDG 指向临时目录、`GIT_CONFIG_NOSYSTEM/GLOBAL/SYSTEM` 全关，并在本地
+关闭签名、把 `core.hooksPath` 指到空目录。外层执行沙箱之外完整 `make check` 全绿，
+含本机 parity（CLI 156、core 1192、TUI 290、TUI PTY 25、plain PTY 8）。首版
+`0d6f17d`，修正提交号以本条所在提交为准，教训 271、272。
 
 **状态栏常显分支、键位提示精简（2026-10-26）**：分支原先只出现在开场会话头里，
 随转录滚进 scrollback 就看不见了。页脚左端现在是
@@ -3327,3 +3330,11 @@ worktree 退出事件用 `branch: None` 表达“已离开 worktree”，页脚�
 在事件边界按新 cwd 重读分支，`None` 不再到达显示层。同一轮还暴露了“常显”的另一个
 盲点：渲染函数的提前返回绕过了共用逻辑，只测 idle 会全绿。新增常显信息时，要把每个
 可能替换/提前返回的表面都列出来各补一条回归。
+
+272. **测试里 spawn 外部工具时，宿主配置也是输入；只给测试对象设局部值不够，必须把全局配置入口关掉。**
+新 git 回归只设了临时仓库的 user.name/email，仍继承宿主的 `commit.gpgSign`、全局
+`core.hooksPath` 等；一台开了签名却没有可用密钥的机器会让 base 提交直接失败，红的是
+与 kloop 无关的配置。测试内的 git 要 `env_clear()` 只留 `PATH`，HOME/XDG 指向临时目录，
+`GIT_CONFIG_NOSYSTEM/GLOBAL/SYSTEM` 全部关掉，再在本地写死签名与钩子路径——局部值只
+覆盖同名项，覆盖不了没写到的全局项。判据：凡是测试自己 spawn 会读用户配置的外部工具，
+先问“宿主哪一项配置能让它失败”，并把入口而不是某一项值关掉。

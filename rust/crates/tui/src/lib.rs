@@ -1619,22 +1619,44 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        for args in [
-            vec!["init", "-q"],
-            vec!["config", "user.email", "t@example.com"],
-            vec!["config", "user.name", "t"],
-            vec!["commit", "--allow-empty", "-qm", "base"],
-        ] {
+
+        // Keep the fixture off the host's Git configuration: no global
+        // signing, no system config, and hooks point at an empty directory.
+        // A host with `commit.gpgSign = true` and no usable key would
+        // otherwise fail the seed commit for reasons unrelated to kloop.
+        let home = root.join(".git-home");
+        let xdg = home.join(".config");
+        let hooks = home.join("hooks");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&hooks).unwrap();
+        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(&root).env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+            let output = command
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_config)
+                .env("GIT_CONFIG_SYSTEM", null_config)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
             assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&root)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
             );
-        }
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgSign", "false"]);
+        git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        git(&["commit", "--allow-empty", "-qm", "base"]);
         let expected = git_branch(&root).expect("temp repo has a branch");
         let event = AgentEvent::Core(CoreEvent::CwdChanged {
             cwd: root.display().to_string(),

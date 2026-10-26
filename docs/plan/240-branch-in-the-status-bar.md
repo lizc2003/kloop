@@ -52,4 +52,9 @@ plain PTY 8）。DESIGN 页脚段落已改写，HANDOFF 已同步并记录教训
 - **补全菜单绕过常显分支（P3）**：`footer_line` 删掉 `popup` 的提前返回，菜单提示改为
   与 idle/startup/running 同一套徽标、分支、截断逻辑；菜单打开时不追加 todo 提示。
   新增回归覆盖完整文案与 20 列窄行仍见分支。
+- **新 Git 回归依赖宿主配置（P2）**：临时仓库原先只设局部 user.name/email，仍继承
+  全局签名与钩子。现在测试内的 `git` 统一 `env_clear()` 只留 `PATH`，HOME/XDG 指向
+  临时目录，`GIT_CONFIG_NOSYSTEM/GLOBAL/SYSTEM` 全部关掉，`LC_ALL=C`，并在仓库本地
+  写 `commit.gpgSign=false`、`core.hooksPath` 指向空目录，避免宿主配置让 base 提交
+  失败。做法与 plan 59 既有 hermetic git 回归一致。
 - 分支修正提交号以本节所在提交为准；完整 `make check` 结果见该提交说明。
