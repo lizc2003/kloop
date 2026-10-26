@@ -50,16 +50,19 @@ context_window = 1000000
 
 See [`config/config-demo.toml`](config/config-demo.toml) for all settings.
 
-可在 `~/.kloop/config.toml` 的顶层指定自定义系统提示词文件（放在任何 `[表名]` 之前）：
+To replace the built-in base system prompt, add a file path at the top level of
+`~/.kloop/config.toml`, before any `[table]`:
 
 ```toml
 system_prompt_file = 'system-prompt.md'
 ```
 
-把提示词正文直接写入 `~/.kloop/system-prompt.md`，使用 UTF-8，无需 TOML 转义。
-相对路径基于配置文件所在目录，也支持绝对路径。文件正文整体替换内置基础提示词；
-环境信息和开场 Git 快照仍由程序追加。省略该配置则使用内置正文；文件读不到、非 UTF-8
-或正文为空白时启动报错。修改后重启 kloop 生效，包括恢复已有会话。
+Write the prompt directly to `~/.kloop/system-prompt.md` as UTF-8 text; no TOML
+escaping is needed. Relative paths resolve from the config directory; absolute
+paths are also supported. kloop appends environment information and the opening
+Git snapshot. Omit this setting to keep the built-in prompt. Startup fails if
+the file cannot be read, is not valid UTF-8, or is empty or whitespace-only.
+Restart kloop after edits; resumed sessions also use the updated file.
 
 ## Community
 
