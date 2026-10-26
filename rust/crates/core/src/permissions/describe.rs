@@ -180,13 +180,18 @@ fn bash_prefix_memory(
         }
     }
     for path in writes {
-        // cwd 根文件的相对 parent 为空；回退规范绝对目录，不能生成无锚点通配规则或缓存键。
-        let parent = path
-            .relative
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .or_else(|| path.normalized.parent())?;
+        // cwd 本身没有可授权的文件父目录；只有根部文件的空 parent 才能锚回 cwd。
+        let parent = match path.relative.as_deref() {
+            Some(relative) => {
+                let parent = relative.parent()?;
+                if parent.as_os_str().is_empty() {
+                    path.normalized.parent()?
+                } else {
+                    parent
+                }
+            }
+            None => path.normalized.parent()?,
+        };
         let scope = parent.to_str()?;
         // 不把目录名中的 glob 语法当通配授权，也不自动建议文件系统根目录授权。
         if scope == "/" || scope.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r']) {

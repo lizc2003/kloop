@@ -2440,6 +2440,92 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cwd_directory_targets_offer_no_reusable_bash_write_grant() {
+        let cwd = std::fs::canonicalize(test_cwd()).unwrap();
+        let outside = cwd.parent().unwrap().join("other/src/main.rs");
+        for target in [".", "./", "logs/..", cwd.to_str().unwrap()] {
+            let command = format!("make check > '{target}'");
+            let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
+            assert!(remember_payload("bash", &call).is_none(), "{target}");
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+            let writer = ScriptedWriter::succeeding();
+            let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+            assert!(
+                ok(
+                    &p,
+                    "bash",
+                    json!({
+                        "command": command,
+                        "disable_sandbox": true
+                    })
+                )
+                .await,
+                "{target}"
+            );
+            assert!(!ok(&p, "bash", bash(&command)).await, "{target}");
+            assert!(
+                !ok(
+                    &p,
+                    "bash",
+                    bash(&format!("make check > '{}'", outside.display()))
+                )
+                .await,
+                "{target}"
+            );
+            let requests = approver.asked();
+            assert_eq!(requests.len(), 3, "{target}");
+            for request in &requests[..2] {
+                assert_eq!(
+                    request.approval_scopes,
+                    vec![ApprovalScope::Once],
+                    "{target}"
+                );
+                assert!(request.remember_rules.is_none(), "{target}");
+            }
+            assert!(writer.calls.lock().unwrap().is_empty(), "{target}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_directory_targets_offer_no_project_escalation_or_directory_memory() {
+        let cwd = std::fs::canonicalize(test_cwd()).unwrap();
+        let outside = cwd.parent().unwrap().join("other/src/main.rs");
+        for target in [".", "./", "logs/..", cwd.to_str().unwrap()] {
+            let command = format!("make check > '{target}'");
+            assert!(
+                escalation_remember_payload(&command, &test_cwd()).is_none(),
+                "{target}"
+            );
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+            let writer = ScriptedWriter::succeeding();
+            let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+            assert_eq!(
+                p.escalate_sandbox(&command, None, 0).await,
+                EscalationOutcome::Approved(EscalationApproval::User),
+                "{target}"
+            );
+            assert!(
+                !approver.asked()[0]
+                    .approval_scopes
+                    .contains(&ApprovalScope::Project),
+                "{target}"
+            );
+            assert!(!p.sandbox_escalation_remembered(&command), "{target}");
+            let sibling = format!("make check > '{}'", outside.display());
+            assert!(!p.sandbox_escalation_remembered(&sibling), "{target}");
+            assert_eq!(
+                p.escalate_sandbox(&sibling, None, 0).await,
+                EscalationOutcome::Declined,
+                "{target}"
+            );
+            assert_eq!(approver.ask_count(), 2, "{target}");
+            assert!(writer.calls.lock().unwrap().is_empty(), "{target}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn cwd_root_log_project_rules_stay_within_the_canonical_directory() {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
         let writer = ScriptedWriter::succeeding();
