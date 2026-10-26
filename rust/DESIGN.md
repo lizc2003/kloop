@@ -1561,7 +1561,10 @@ a blank screen followed by a repaint — and stops querying the cursor after the
 viewport exists. The construction probe is the only `ESC[6n` the TUI sends; every
 later query (a commit's clear, a resize's anchoring) answers from the position
 the last frame set, which is where the cursor actually is because kloop owns the
-terminal. That takes the round trip out of the commit and makes a resize
+terminal. A shrink can leave that cached row below the new bottom; it is clamped
+to the current size first, mirroring the terminal, because ratatui's inline
+resize would otherwise anchor the viewport at an off-screen row. That takes the
+round trip out of the commit and makes a resize
 independent of a CPR reply: a front-end can hand the terminal to another client
 without taking kloop down when that client resizes the pane. If even the
 construction probe gets no reply, the backend falls back to the origin — a
@@ -5097,7 +5100,8 @@ control / treatment：两臂版本与唯一被测差异。
   construction CPR (and can stop answering afterwards), and feeds raw output
   incrementally to a zero-history `vt100` parser. The suite covers
   boot/bracketed-paste/no alternate screen, shrink/grow resize without a second
-  CPR, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
+  CPR, a grow-past-boot-height → commit → shrink that keeps the viewport on
+  screen, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
   restoration, exact UTF-8 input through grapheme edits, and three pure-layout
   scenarios (a markdown reply with a list and a code block, a tool call with its
   result, a result past the preview cap). Captured request projections exclude

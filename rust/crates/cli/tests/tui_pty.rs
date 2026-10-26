@@ -475,6 +475,66 @@ async fn resize_redraws_when_cpr_goes_unanswered_after_boot() -> Result<()> {
     Ok(())
 }
 
+/// A viewport is created at the boot height; growing past it leaves a shorter
+/// viewport at the bottom of the screen, with a cursor row that no longer
+/// exists after shrinking back. The cached position must be clamped to the new
+/// size, or ratatui's inline resize puts the viewport below the screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shrink_after_growing_and_committing_keeps_the_ui_on_screen() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let mut long = (0..40)
+        .map(|index| format!("SHRINK-OVERFLOW-{index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    long.push_str("\n\nSHRINK_OVERFLOW_TAIL");
+    let fixture = ChatFixture::start(vec![sse_text(&long)]).await;
+    let mut harness = spawn(&fixture, 30, 80)?;
+    wait_for_boot(&mut harness)?;
+
+    harness.resize(60, 80)?;
+    harness.wait_for("grow redraw", Duration::from_millis(1500), |frame| {
+        frame.rows == 60 && frame.cols == 80 && frame.contains("[manual]")
+    })?;
+
+    harness.write(b"long turn")?;
+    harness.write(ENTER)?;
+    harness.wait_for("long turn ends", Duration::from_secs(8), |frame| {
+        frame.contains("SHRINK_OVERFLOW_TAIL")
+            && !frame.contains("Working")
+            && frame.contains("Type a message")
+    })?;
+    // The viewport is the boot height (30), so committing this answer moves it
+    // to the bottom of the 60-row screen and leaves the cursor near row 59.
+    let grown = harness.wait_for_quiescent(
+        "grown turn settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.rows == 60 && frame.contains("SHRINK_OVERFLOW_TAIL"),
+    )?;
+    assert_eq!(grown.count("[manual]"), 1);
+
+    harness.resize(30, 80)?;
+    harness.wait_for("shrink redraw", Duration::from_millis(1500), |frame| {
+        frame.rows == 30
+            && frame.cols == 80
+            && frame.contains("[manual]")
+            && frame.contains("Type a message")
+    })?;
+    let shrunk = harness.wait_for_quiescent(
+        "shrunk screen settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.rows == 30 && frame.cols == 80,
+    )?;
+    assert_eq!(harness.pty_size()?, (30, 80));
+    assert!(shrunk.cursor.0 < shrunk.rows && shrunk.cursor.1 < shrunk.cols);
+    assert_eq!(shrunk.count("[manual]"), 1);
+    assert_eq!(shrunk.count("Type a message"), 1);
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_turn_overflow_commits_without_scroll_regions_then_repaints() -> Result<()> {
     let _guard = PTY_TEST_LOCK.lock().await;

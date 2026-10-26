@@ -1,5 +1,19 @@
 # HANDOFF — 当前状态与会话交接
 
+**CPR 缓存行号缩窗越界（2026-10-26，审查 0fba3a9）**：上一提交让 resize 复用
+`last_cursor`，但缓存的是旧屏幕的绝对行号。以 30 行启动、长到 60、提交内容把
+30 行高的 viewport 推到底部后，缓存 y=59、viewport top=30；缩回 30 行时
+`compute_inline_size` 仍拿 59 和 offset=29 算锚点，得到屏外顶部，本机单元回归实际
+以 ratatui buffer panic（`index outside of buffer`）失败，生产里则是 composer/footer
+越界重叠。现在回答缓存前先取当前 `Backend::size()`，把 x/y 夹到新屏幕内并写回缓存；
+终端本身在缩窗时也是把光标夹到新底行，行为一致。新增单元回归
+`a_shrink_after_growing_keeps_the_viewport_on_screen`（grow→insert_before→draw 到
+59→shrink，旧代码先红）和 PTY 回归
+`shrink_after_growing_and_committing_keeps_the_ui_on_screen`（30→60、长回答提交、
+60→30，断言 footer/composer 与光标仍在屏内、进程正常退出）。外层执行沙箱之外完整
+`make check` 全绿，含本机 parity（CLI 156、core 1192、TUI 287、TUI PTY 25、
+plain PTY 8）；提交号以本条所在提交为准，教训 269。
+
 **CPR 静默后 resize 不再让 TUI 退出（2026-10-26）**：手机链路触发 phone-fit
 resize 时，`PinnedBackend::get_cursor_position` 仍会发真实 `ESC[6n`；当前端不再
 回答（手机拿走 floor、桌面回复被静音），crossterm 2 秒超时后 `draw_frame` 的 `?`
@@ -3265,3 +3279,11 @@ CPR；当前端不再回答时，2 秒超时沿 `?` 直接结束 TUI。viewport 
 首个探测失败也不该终止会话——全高 inline viewport 无论答案是什么都锚在 top 0，回退
 `ORIGIN` 即可。回归要同时钉住“resize 不再发 CPR”和“首个 CPR 失败仍能启动”，否则只
 改其中一半，另一个无人应答的路径还会退出。
+
+269. **缓存的是绝对坐标，坐标空间缩小后必须按新尺寸重新投影；“程序自己拥有的位置”也要区分旧屏幕和新屏幕。**
+resize 不再查询 CPR 后，`last_cursor` 仍是上一屏的绝对行号；长高再提交可把它推到
+y=59，缩回 30 行时 ratatui 用旧的 y 和 offset 算锚点，viewport 落到屏外，buffer
+resize 直接 panic。回答缓存前要取当前 `Backend::size()` 夹住 x/y 并写回；这不是
+CPR 的替代品失效，而是“自己拥有的位置”也必须跟着坐标系变化。回归要覆盖
+“超过启动高度 → 提交内容把 viewport 推到底 → 缩回”，只测 shrink/grow 不提交内容
+不会触发。

@@ -35,9 +35,9 @@
 //!   through the PTY harness. [`FrameWriter`] holds mid-frame flushes so clear
 //!   and repaint land in one synchronized write. The viewport's construction
 //!   probe is the only cursor query the TUI sends; every later one — the
-//!   commit's clear included — answers from the last position kloop sent, so a
-//!   resize cannot stall on a reply either, and a failed probe falls back to
-//!   the origin.
+//!   commit's clear included — answers from the last position kloop sent,
+//!   clamped to the current size so a shrink cannot anchor the viewport below
+//!   the screen. A failed probe falls back to the origin.
 //!
 //! [`PinnedBackend`] also pins one physical size across a commit transaction so
 //! autoresize confirmation, insert/drain, and the repaint share one geometry

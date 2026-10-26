@@ -16,16 +16,23 @@
 //!   out entirely when another client owns the terminal. A commit is bracketed
 //!   by [`PinnedBackend::begin_commit`] so it never queries even before the
 //!   first position exists; the construction probe's failure falls back to the
-//!   origin, where a full-height viewport anchors anyway.
+//!   origin, where a full-height viewport anchors anyway. A cached row from a
+//!   taller screen is clamped to the current size before it is returned, so a
+//!   shrink cannot anchor the viewport off-screen.
 //! - **Frame handover (plan 103).** [`PinnedBackend::commit_frame`] releases the
 //!   [`FrameWriter`] so one frame's bytes reach the terminal in a single
 //!   synchronized write, clear and repaint together.
+
+use std::cell::Cell;
 
 use super::FrameWriter;
 
 pub(crate) struct PinnedBackend<B> {
     pub(crate) inner: B,
     pinned_size: Option<ratatui::layout::Size>,
+    /// The physical size last reported by `Backend::size`. Resize anchoring
+    /// clamps a cached cursor row to it without asking the terminal again.
+    last_size: Cell<Option<ratatui::layout::Size>>,
     /// Present for the real terminal, absent for test backends (which flush
     /// straight through their own writer).
     frames: Option<FrameWriter<std::io::Stdout>>,
@@ -42,6 +49,7 @@ impl<B> PinnedBackend<B> {
         Self {
             inner,
             pinned_size: None,
+            last_size: Cell::new(None),
             frames: None,
             last_cursor: None,
             committing: false,
@@ -159,10 +167,27 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
         // two seconds. Resize anchoring and `Terminal::clear` both used to pay
         // that; a resize must not be able to end the session. The commit
         // bracket still covers the case before any position exists (plan 103).
-        if self.committing || self.last_cursor.is_some() {
+        if self.committing {
             return Ok(self
                 .last_cursor
                 .unwrap_or(ratatui::layout::Position::ORIGIN));
+        }
+        if let Some(position) = self.last_cursor {
+            // A cached row can be outside the terminal after a shrink: the
+            // viewport was anchored at the bottom of a taller screen, and the
+            // terminal clamps the real cursor to the new bottom row. Mirror
+            // that here, or ratatui anchors the inline viewport below the new
+            // screen and the buffer resize panics. `autoresize` reports the
+            // new size through `size()` before it calls this.
+            let Some(size) = self.last_size.get() else {
+                return Ok(position);
+            };
+            let position = ratatui::layout::Position {
+                x: position.x.min(size.width.saturating_sub(1)),
+                y: position.y.min(size.height.saturating_sub(1)),
+            };
+            self.last_cursor = Some(position);
+            return Ok(position);
         }
         // The viewport's construction probe. The terminal must first have seen
         // everything already drawn.
@@ -203,7 +228,12 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
     }
 
     fn size(&self) -> std::result::Result<ratatui::layout::Size, Self::Error> {
-        self.pinned_size.map_or_else(|| self.inner.size(), Ok)
+        let size = match self.pinned_size {
+            Some(size) => size,
+            None => self.inner.size()?,
+        };
+        self.last_size.set(Some(size));
+        Ok(size)
     }
 
     fn window_size(&mut self) -> std::result::Result<ratatui::backend::WindowSize, Self::Error> {
@@ -372,5 +402,63 @@ mod tests {
         terminal.clear().unwrap();
         assert_eq!(terminal.backend().inner.probes(), 1);
         assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 10, 4));
+    }
+
+    #[test]
+    fn a_shrink_after_growing_keeps_the_viewport_on_screen() {
+        const WIDTH: u16 = 20;
+        const BOOT_HEIGHT: u16 = 30;
+        const GROWN_HEIGHT: u16 = 60;
+
+        let mut inner = ratatui::backend::TestBackend::new(WIDTH, BOOT_HEIGHT);
+        inner
+            .set_cursor_position(Position::new(0, BOOT_HEIGHT - 1))
+            .unwrap();
+        let mut terminal = Terminal::with_options(
+            PinnedBackend::new(inner),
+            TerminalOptions {
+                viewport: Viewport::Inline(BOOT_HEIGHT),
+            },
+        )
+        .unwrap();
+
+        // Grow above the boot height, then commit a viewport-tall block. The
+        // now-short viewport moves to the bottom of the taller screen, and the
+        // next frame leaves the cursor on row 59.
+        terminal.backend_mut().inner.resize(WIDTH, GROWN_HEIGHT);
+        terminal.autoresize().unwrap();
+        terminal.backend_mut().begin_commit();
+        terminal.insert_before(BOOT_HEIGHT, |_| {}).unwrap();
+        terminal.backend_mut().end_commit();
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position(Position::new(0, GROWN_HEIGHT - 1));
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().last_cursor,
+            Some(Position::new(0, GROWN_HEIGHT - 1))
+        );
+        assert_eq!(
+            terminal.get_frame().area(),
+            Rect::new(0, BOOT_HEIGHT, WIDTH, BOOT_HEIGHT)
+        );
+
+        // Shrinking back to the boot height must clamp the cached row to the
+        // new bottom; otherwise ratatui anchors the viewport at row 30 on a
+        // 30-row screen.
+        terminal.backend_mut().inner.resize(WIDTH, BOOT_HEIGHT);
+        terminal.autoresize().unwrap();
+        assert_eq!(
+            terminal.get_frame().area(),
+            Rect::new(0, 0, WIDTH, BOOT_HEIGHT)
+        );
+        assert!(
+            terminal
+                .backend()
+                .last_cursor
+                .is_some_and(|position| position.y < BOOT_HEIGHT),
+            "the cached cursor must be clamped into the shrunk screen"
+        );
     }
 }
