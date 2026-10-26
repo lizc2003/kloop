@@ -196,7 +196,7 @@ impl SessionState {
         let project = if args.mock {
             context::mock(cwd)
         } else {
-            context::gather(cwd)
+            context::gather(cwd, process.runtime.base_system())
         };
         for warning in &project.warnings {
             eprintln!("\x1b[2m[{warning}]\x1b[0m");
@@ -409,7 +409,7 @@ fn serve_config_factory(
         let project = if args.mock {
             context::mock(&options.cwd)
         } else {
-            context::gather(&options.cwd)
+            context::gather(&options.cwd, runtime.base_system())
         };
         for warning in &project.warnings {
             notify(warning);

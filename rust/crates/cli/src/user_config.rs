@@ -149,6 +149,7 @@ fn validate_root(table: &toml::Table) -> Result<()> {
             key.as_str(),
             "env"
                 | "provider"
+                | "system_prompt_file"
                 | "providers"
                 | "models"
                 | "permissions"
@@ -208,6 +209,7 @@ mod tests {
         let table = parse_root(
             r#"
 provider = "openai"
+system_prompt_file = 'system-prompt.md'
 [permissions]
 allow = ["bash(cargo test *)"]
 [web]
@@ -229,6 +231,10 @@ max_agents = 3
         )
         .unwrap();
         assert_eq!(table["provider"].as_str(), Some("openai"));
+        assert_eq!(
+            table["system_prompt_file"].as_str(),
+            Some("system-prompt.md")
+        );
         assert!(table.contains_key("permissions"));
         assert!(table.contains_key("mcp"));
     }
@@ -312,6 +318,12 @@ max_agents = 3
             .to_string();
         assert!(error.contains("unknown top-level key 'mystery'"));
         assert!(!error.contains("sentinel-secret"));
+        assert_eq!(
+            parse_root("system_prompt = 'sentinel-prompt'")
+                .unwrap_err()
+                .to_string(),
+            "~/.kloop/config.toml has unknown top-level key 'system_prompt'"
+        );
     }
 
     #[cfg(unix)]

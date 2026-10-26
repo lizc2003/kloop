@@ -17,8 +17,7 @@ use kloop_core::context::assemble_instructions;
 use kloop_core::context::assemble_system;
 use kloop_core::context::utc_today;
 
-/// What Config needs from the project, gathered once per process — server
-/// threads share the process cwd, so they share one assembly too.
+/// 按会话 cwd 组装的上下文；服务端线程共用基础正文，各自收集项目与环境。
 #[derive(Clone)]
 pub struct GatheredContext {
     pub system: String,
@@ -27,7 +26,7 @@ pub struct GatheredContext {
     pub warnings: Vec<String>,
 }
 
-pub fn gather(cwd: &Path) -> GatheredContext {
+pub fn gather(cwd: &Path, base_system: &str) -> GatheredContext {
     let global_dir = std::env::home_dir().map(|home| home.join(".kloop"));
     let git_root = find_git_root(cwd);
     let Discovered {
@@ -48,7 +47,7 @@ pub fn gather(cwd: &Path) -> GatheredContext {
         None
     };
     GatheredContext {
-        system: assemble_system(BASE_SYSTEM, &env, git.as_ref()),
+        system: assemble_system(base_system, &env, git.as_ref()),
         instructions: assembled.message,
         warnings,
     }

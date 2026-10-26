@@ -8,11 +8,9 @@ use std::time::UNIX_EPOCH;
 
 use crate::rollout::civil_from_days;
 
-/// Base instructions that lead every assembled system prompt. `assemble_system`
-/// appends the environment block and git snapshot after this; `--mock` uses it
-/// with only a working-directory line, skipping git/file IO to stay hermetic.
-/// Provider-neutral on purpose — kloop routes across model families, so the base
-/// never names one. Tool usage lives in each tool's own description, not here.
+/// 默认基础正文，用户的 `system_prompt_file` 可整体替换。`assemble_system` 在选定正文后
+/// 追加环境块与 Git 快照；`--mock` 始终使用此常量，只附工作目录，不读取文件或 Git。
+/// 身份不绑定 provider；工具用法留在各工具说明中。
 pub const BASE_SYSTEM: &str = r#"You are kloop, a coding agent working in a terminal-based CLI. You inspect and
 modify files, run commands, and coordinate other tools to carry out software-
 engineering tasks. Be precise, safe, and helpful.

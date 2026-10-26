@@ -54,6 +54,7 @@ use crate::user_config::UserConfig;
 /// deliberately absent: sessions add only their workspace-specific anchors.
 pub(crate) struct RuntimeSettings {
     config_path: PathBuf,
+    base_system: String,
     global_permissions: Arc<GlobalPermissionPolicy>,
     project_registry: Arc<ProjectPolicyRegistry>,
     project_store: Option<Arc<ProjectStore>>,
@@ -77,6 +78,7 @@ impl RuntimeSettings {
             let (shell_programs, shell_warnings) = mock_shell_programs()?;
             return Ok(Self {
                 config_path: PathBuf::new(),
+                base_system: kloop_core::context::BASE_SYSTEM.to_string(),
                 global_permissions: Arc::new(GlobalPermissionPolicy::empty()),
                 project_registry: Arc::new(ProjectPolicyRegistry::default()),
                 project_store: None,
@@ -93,6 +95,7 @@ impl RuntimeSettings {
         }
         let table = config.table();
         let config_path = config.path().to_path_buf();
+        let base_system = load_system_prompt(table, &config_path)?;
         let (shell_overrides, login_env_enabled) = load_shell_overrides(table)?;
         let (shell_programs, mut shell_warnings) =
             kloop_core::shell_programs::resolve_shell_programs(shell_overrides)?;
@@ -117,6 +120,7 @@ impl RuntimeSettings {
         )?));
         Ok(Self {
             config_path,
+            base_system,
             global_permissions,
             project_registry: Arc::new(ProjectPolicyRegistry::default()),
             project_store: Some(project_store),
@@ -140,6 +144,10 @@ impl RuntimeSettings {
         self.project_store.as_ref()
     }
 
+    pub(crate) fn base_system(&self) -> &str {
+        &self.base_system
+    }
+
     pub(crate) fn defer_threshold(&self) -> usize {
         self.defer_threshold
     }
@@ -151,6 +159,57 @@ impl RuntimeSettings {
     pub(crate) fn shell_warnings(&self) -> &[String] {
         &self.shell_warnings
     }
+}
+
+fn load_system_prompt(root: &toml::Table, config_path: &Path) -> Result<String> {
+    use std::io::Read as _;
+
+    let Some(value) = root.get("system_prompt_file") else {
+        return Ok(kloop_core::context::BASE_SYSTEM.to_string());
+    };
+    let path = value
+        .as_str()
+        .filter(|path| !path.trim().is_empty())
+        .context("system_prompt_file must be a non-blank path string")?;
+    let path = config_path
+        .parent()
+        .context("config path has no parent for system_prompt_file")?
+        .join(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // 先以非阻塞方式打开再检查同一描述符，避免 FIFO 在类型检查之前挂住启动。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("cannot open system_prompt_file: {}", path.display()))?;
+    if !file
+        .metadata()
+        .with_context(|| format!("cannot inspect system_prompt_file: {}", path.display()))?
+        .is_file()
+    {
+        bail!(
+            "system_prompt_file must be a regular file: {}",
+            path.display()
+        );
+    }
+    let mut prompt = String::new();
+    file.read_to_string(&mut prompt).with_context(|| {
+        format!(
+            "cannot read system_prompt_file as UTF-8 text: {}",
+            path.display()
+        )
+    })?;
+    if prompt.trim().is_empty() {
+        bail!(
+            "system_prompt_file must contain non-blank text: {}",
+            path.display()
+        );
+    }
+    Ok(prompt)
 }
 
 fn load_shell_overrides(root: &toml::Table) -> Result<(ShellOverrides, bool)> {
@@ -1169,13 +1228,47 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
 
     #[test]
     fn mock_runtime_uses_a_frozen_shell_snapshot() {
-        let user = UserConfig::from_parts(PathBuf::new(), toml::Table::new());
+        let user = UserConfig::from_parts(PathBuf::new(), config("system_prompt_file = false"));
         let runtime = RuntimeSettings::load(&user, /*mock_mode=*/ true).unwrap();
+        assert_eq!(runtime.base_system(), kloop_core::context::BASE_SYSTEM);
         assert_eq!(
             runtime.shell_programs().as_ref(),
             &ShellPrograms::test_fixture()
         );
         assert!(runtime.shell_warnings().is_empty());
+    }
+
+    #[test]
+    fn system_prompt_defaults_to_builtin() {
+        assert_eq!(
+            load_system_prompt(&config(""), Path::new("config.toml")).unwrap(),
+            kloop_core::context::BASE_SYSTEM
+        );
+    }
+
+    #[test]
+    fn system_prompt_file_rejects_blank_paths_and_non_strings() {
+        for value in [
+            "''",
+            "'   '",
+            "'　'",
+            "'''\n\t\n'''",
+            "true",
+            "1",
+            "[]",
+            "{}",
+        ] {
+            assert_eq!(
+                load_system_prompt(
+                    &config(&format!("system_prompt_file = {value}")),
+                    Path::new("config.toml")
+                )
+                .unwrap_err()
+                .to_string(),
+                "system_prompt_file must be a non-blank path string",
+                "accepted: {value}"
+            );
+        }
     }
 
     #[tokio::test]

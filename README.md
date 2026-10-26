@@ -50,6 +50,17 @@ context_window = 1000000
 
 See [`config/config-demo.toml`](config/config-demo.toml) for all settings.
 
+可在 `~/.kloop/config.toml` 的顶层指定自定义系统提示词文件（放在任何 `[表名]` 之前）：
+
+```toml
+system_prompt_file = 'system-prompt.md'
+```
+
+把提示词正文直接写入 `~/.kloop/system-prompt.md`，使用 UTF-8，无需 TOML 转义。
+相对路径基于配置文件所在目录，也支持绝对路径。文件正文整体替换内置基础提示词；
+环境信息和开场 Git 快照仍由程序追加。省略该配置则使用内置正文；文件读不到、非 UTF-8
+或正文为空白时启动报错。修改后重启 kloop 生效，包括恢复已有会话。
+
 ## Community
 
 Share ideas and discuss kloop with the [Linux.do](https://linux.do/) community.

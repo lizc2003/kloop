@@ -8,6 +8,11 @@
 
 provider = "k-flash"                                   # which one this session starts on
 
+# 顶层可选项：用独立 UTF-8 文本文件整体替换内置基础提示词；省略时使用内置正文。
+# 相对路径基于 ~/.kloop/，也可写绝对路径。正文原样读取，环境和 Git 快照由程序追加。
+# 文件缺失、不可读或正文为空白会报启动错误；改文件后重启 kloop 生效。
+# system_prompt_file = 'system-prompt.md'
+
 
 # messages → POST {base_url}/v1/messages    ← base_url carries NO /v1 on this rail
 [providers.k-claude]

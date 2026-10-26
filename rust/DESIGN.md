@@ -2220,13 +2220,17 @@ the parent's hook set and session id. `--mock` runs without hooks (hermetic).
 
 At startup kloop assembles what the model knows about where it is:
 
-- **System prompt** = base instructions (a provider-neutral, sectioned policy
-  prompt — identity plus `# System` / `# Doing tasks` / `# Acting with care` /
-  `# Using your tools` / `# Communication style`; tool usage lives in each
-  tool's own description, not here) + an environment block (working directory,
-  platform, today's UTC date, whether cwd is a git repo) + a git snapshot
-  (current branch, `git status --short` capped at 1000 bytes, last 5 commits)
-  labeled as a start-of-session snapshot.
+- **系统提示词** = 基础正文 + 环境块（工作目录、平台、UTC 日期、是否 Git 仓库）+
+  标明仅为开场状态的 Git 快照（分支、至多 1000 字节的 `git status --short`、最近五条
+  提交）。基础正文默认是 provider 中立的分节方针 `BASE_SYSTEM`，工具用法留在各工具
+  说明中。用户可在全局 `~/.kloop/config.toml` 顶层设置
+  `system_prompt_file = 'system-prompt.md'`，用独立 UTF-8 文件整体替换内置基础正文；
+  正文原样保留，不解析 TOML、导入、模板或 shell 内容，环境与 Git 快照仍由程序追加。
+  路径相对于配置文件所在目录解析，也接受绝对路径，不依赖会话 cwd。路径须为非空白
+  字符串；文件缺失、不可读、非普通文件、非 UTF-8 或正文为空白均启动报错，不回退内置。
+  Unix 先以非阻塞方式打开，再检查同一文件描述符的类型，避免 FIFO 挂住启动。
+  只提供文件入口，没有内联 `system_prompt`。进程启动时读取一次；修改后重启才生效，
+  新建与恢复会话都使用本次进程读到的正文，服务端新线程也不重新读文件。
 - **Instruction files**: one name per directory, `AGENTS.md`. Layers, in order:
   `~/.kloop/` (global), then every directory from the git root down to cwd
   (closest to cwd last). Within each project directory the order is the main
@@ -2252,11 +2256,12 @@ At startup kloop assembles what the model knows about where it is:
   to history — so `--resume` picks up fresh edits and compaction can't
   swallow the rules. The overflow prediction accounts for it separately.
 
-Assembly is pure functions in `core/src/context.rs` (testable without a
-filesystem); the IO — file discovery, git commands — lives in
-`cli/src/context.rs`. Sub-agents inherit the same context with the Config;
-server threads share one process-wide assembly. `--mock` stays hermetic:
-no file reads, no git commands, the pre-assembly hardcoded prompt.
+系统正文与项目指令的纯组装位于 `core/src/context.rs`，无需文件系统即可测试；项目
+文件发现和 Git 采集位于 `cli/src/context.rs`。基础正文由 CLI 启动层按全局配置读取，
+普通会话与服务端共用同一份快照；服务端各线程按自己的 cwd 收集项目指令、环境与 Git
+状态。普通子 agent 随 Config 继承正文，自定义 agent 类型的 `system` 仍整体覆盖；
+worktree 继续由既有逻辑改写工作目录。
+`--mock` 保持隔离，不读取配置或提示词文件，也不运行 Git，始终使用内置正文与工作目录行。
 
 ## File tools (Plans 49, 57, and 61)
 
@@ -4631,7 +4636,8 @@ cargo run -- --mock
 # directory must have no group/other access (kloop creates it as 0700), and the
 # file must be mode 0600:
 #
-#   provider = "gw_router"           # the only top-level selector: which one
+#   provider = "gw_router"           # this session's initial provider
+#   system_prompt_file = 'system-prompt.md'   # optional, relative to ~/.kloop/
 #
 #   [providers.gw_router]
 #   wire_api = "responses"             # responses | chat | messages
