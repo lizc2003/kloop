@@ -1483,8 +1483,10 @@ forwarding everything as events over an mpsc channel (approval/question answers
 travel back over oneshots; dropped question replies are Unavailable rather than
 invented answers). Questions and approvals share one FIFO modal owner so
 concurrent interactions never overlap. Keys arrive from a dedicated
-poll thread (`poll(200ms)+read`, not crossterm's `EventStream`) so the input
-reader never parks holding the lock a resize's cursor-position query needs.
+poll thread (`poll(200ms)+read`, not crossterm's `EventStream`), so the reader
+lock is released between polls and shutdown is observed within 200ms; the
+viewport's construction probe is the only cursor query, and it runs before the
+thread starts.
 The UI loop `select!`s those key events against agent events, folds both into
 pure state (`App`, whose `cells` are the uncommitted tail), and renders via
 pure cell→line functions — which is what makes the transcript logic testable
@@ -1552,11 +1554,19 @@ blank until the repaint arrived — and `Terminal::clear` opens by asking the
 terminal where the cursor is (`ESC[6n`), a reply that waits on crossterm's
 reader lock, held for up to one 200ms input poll. Measured through the PTY
 harness, that left the screen black for 205–335ms per commit. So kloop adds no
-clear of its own (`insert_before` already did it), answers cursor queries from
-the last position it sent while a commit is in flight, and buffers every byte of
-a frame into one write wrapped in synchronized output (DEC mode 2026, ignored by
+clear of its own (`insert_before` already did it), buffers every byte of a frame
+into one write wrapped in synchronized output (DEC mode 2026, ignored by
 terminals without it) — clear and repaint are presented as one update instead of
-a blank screen followed by a repaint.
+a blank screen followed by a repaint — and stops querying the cursor after the
+viewport exists. The construction probe is the only `ESC[6n` the TUI sends; every
+later query (a commit's clear, a resize's anchoring) answers from the position
+the last frame set, which is where the cursor actually is because kloop owns the
+terminal. That takes the round trip out of the commit and makes a resize
+independent of a CPR reply: a front-end can hand the terminal to another client
+without taking kloop down when that client resizes the pane. If even the
+construction probe gets no reply, the backend falls back to the origin — a
+full-height viewport computes the same top row from any answer — after
+crossterm's 2s timeout, and the session still starts.
 A resize that arrives during the transaction
 becomes visible only to the next frame, so commit and repaint cannot split across
 two geometries. Key handling receives the final repaint's viewport. Composer wrapping,
@@ -5083,14 +5093,15 @@ control / treatment：两臂版本与唯一被测差异。
   and `[[hooks]]` parsing (round-trip, defaults, malformed rejection).
 - **kloop TUI PTY (Unix only)** — `cargo test -p kloop --test tui_pty --
   --nocapture` launches the real default binary in a sealed `portable-pty`, serves
-  deterministic loopback OpenAI-compatible SSE, answers every split/multiple CPR
-  query, and feeds raw output incrementally to a zero-history `vt100` parser. 13
-  tests cover boot/bracketed-paste/no alternate screen, shrink/grow resize with
-  continued CPR, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
+  deterministic loopback OpenAI-compatible SSE, answers the viewport's
+  construction CPR (and can stop answering afterwards), and feeds raw output
+  incrementally to a zero-history `vt100` parser. The suite covers
+  boot/bracketed-paste/no alternate screen, shrink/grow resize without a second
+  CPR, ordered scroll-region→clear→repaint overflow facts, double-Ctrl+C
   restoration, exact UTF-8 input through grapheme edits, and three pure-layout
   scenarios (a markdown reply with a list and a code block, a tool call with its
   result, a result past the preview cap). Captured request projections exclude
-  headers/Authorization and raw ANSI is bounded fail-closed. 7 of the 13 also
+  headers/Authorization and raw ANSI is bounded fail-closed. Seven tests also
   assert the whole settled screen against a checked-in `insta` baseline (plan
   149), 8 baselines in all, each bound to its own `rows×cols`: `stable_text()`
   emits size, cursor and screen text with the per-run noise normalized away —

@@ -63,9 +63,10 @@ fn coalesce_scrollback_batches(
 /// black for as long as the reply waited on crossterm's reader lock: 205-335ms,
 /// measured (plan 103). The clear ratatui does itself is free of that stall
 /// because this function brackets the whole commit in
-/// [`PinnedBackend::begin_commit`] — hence the [`PinnedBackend`] in the
-/// signature: opening that window is part of committing, not something a caller
-/// can forget.
+/// [`PinnedBackend::begin_commit`] — and, once the viewport's construction probe
+/// has run, `get_cursor_position` answers from the last sent position even
+/// outside that window — hence the [`PinnedBackend`] in the signature: opening
+/// that window is part of committing, not something a caller can forget.
 pub(crate) fn insert_scrollback_blocks<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     blocks: Vec<Vec<Line<'static>>>,

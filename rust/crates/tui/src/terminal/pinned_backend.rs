@@ -9,11 +9,14 @@
 //! - **Size pin.** [`PinnedBackend::pin_current_size`] freezes one physical size
 //!   across a commit transaction so autoresize confirmation, insert/drain, and
 //!   the repaint share one geometry even if a resize arrives mid-transaction.
-//! - **No cursor round trip inside a commit (plan 103).**
-//!   [`PinnedBackend::begin_commit`] answers `get_cursor_position` from the
-//!   position we last sent instead of an `ESC[6n` query, which would block on
-//!   crossterm's reader lock — held for up to one poll interval by the input
-//!   thread — while the viewport is already cleared.
+//! - **No cursor round trip after the viewport's construction probe (plan 103).**
+//!   [`PinnedBackend::get_cursor_position`] answers from the position we last
+//!   sent instead of an `ESC[6n` query, which would block on crossterm's reader
+//!   lock — held for up to one poll interval by the input thread — and can time
+//!   out entirely when another client owns the terminal. A commit is bracketed
+//!   by [`PinnedBackend::begin_commit`] so it never queries even before the
+//!   first position exists; the construction probe's failure falls back to the
+//!   origin, where a full-height viewport anchors anyway.
 //! - **Frame handover (plan 103).** [`PinnedBackend::commit_frame`] releases the
 //!   [`FrameWriter`] so one frame's bytes reach the terminal in a single
 //!   synchronized write, clear and repaint together.
@@ -26,8 +29,10 @@ pub(crate) struct PinnedBackend<B> {
     /// Present for the real terminal, absent for test backends (which flush
     /// straight through their own writer).
     frames: Option<FrameWriter<std::io::Stdout>>,
-    /// The position we last told the terminal to move to; stands in for a
-    /// cursor query while a commit is in flight.
+    /// The position we last told the terminal to move to. After the viewport's
+    /// construction probe it is where the cursor actually is — kloop owns the
+    /// terminal and every frame ends by setting it — so it answers every later
+    /// cursor query.
     last_cursor: Option<ratatui::layout::Position>,
     committing: bool,
 }
@@ -146,21 +151,35 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
     fn get_cursor_position(
         &mut self,
     ) -> std::result::Result<ratatui::layout::Position, Self::Error> {
-        // Inside a commit the honest answer costs an `ESC[6n` round trip whose
-        // reply waits on crossterm's reader lock — held for up to one 200ms
-        // poll by the input thread — and `Terminal::clear` asks for it right
-        // after blanking the viewport. Measured: 205-335ms of black screen per
-        // overflow commit (plan 103). The position we last sent is what the
-        // terminal's cursor is at anyway, and the repaint sets it regardless.
-        if self.committing
-            && let Some(position) = self.last_cursor
-        {
-            return Ok(position);
+        // After the construction probe, the position we last sent is where the
+        // terminal's cursor is: kloop owns the terminal and every frame ends by
+        // setting it. A real query would instead wait on crossterm's reader
+        // lock — held for up to one 200ms poll by the input thread — and, when
+        // another client owns the terminal and nobody answers, time out after
+        // two seconds. Resize anchoring and `Terminal::clear` both used to pay
+        // that; a resize must not be able to end the session. The commit
+        // bracket still covers the case before any position exists (plan 103).
+        if self.committing || self.last_cursor.is_some() {
+            return Ok(self
+                .last_cursor
+                .unwrap_or(ratatui::layout::Position::ORIGIN));
         }
-        // Outside a commit the query is real (viewport init, resize anchoring),
-        // so the terminal must first have seen everything already drawn.
+        // The viewport's construction probe. The terminal must first have seen
+        // everything already drawn.
         self.commit_frame()?;
-        self.inner.get_cursor_position()
+        match self.inner.get_cursor_position() {
+            Ok(position) => {
+                self.last_cursor = Some(position);
+                Ok(position)
+            }
+            // A full-height inline viewport computes the same top row (0) from
+            // any answer, so one unanswered probe must not abort startup. The
+            // cache keeps later resize and clear from querying again.
+            Err(_) => {
+                self.last_cursor = Some(ratatui::layout::Position::ORIGIN);
+                Ok(ratatui::layout::Position::ORIGIN)
+            }
+        }
     }
 
     fn set_cursor_position<P: Into<ratatui::layout::Position>>(
@@ -197,5 +216,161 @@ impl<B: ratatui::backend::Backend> ratatui::backend::Backend for PinnedBackend<B
 
     fn flush(&mut self) -> std::result::Result<(), Self::Error> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::io;
+
+    use ratatui::Terminal;
+    use ratatui::TerminalOptions;
+    use ratatui::Viewport;
+    use ratatui::backend::Backend;
+    use ratatui::backend::ClearType;
+    use ratatui::backend::WindowSize;
+    use ratatui::buffer::Cell as BufferCell;
+    use ratatui::layout::Position;
+    use ratatui::layout::Rect;
+    use ratatui::layout::Size;
+
+    use super::PinnedBackend;
+
+    /// Counts cursor probes and can refuse them, standing in for a terminal
+    /// that stopped answering CPR.
+    struct ProbeBackend {
+        probes: Cell<usize>,
+        cursor: Cell<Position>,
+        size: Cell<Size>,
+        fail: bool,
+    }
+
+    impl ProbeBackend {
+        fn new(size: Size, cursor: Position, fail: bool) -> Self {
+            Self {
+                probes: Cell::new(0),
+                cursor: Cell::new(cursor),
+                size: Cell::new(size),
+                fail,
+            }
+        }
+
+        fn probes(&self) -> usize {
+            self.probes.get()
+        }
+    }
+
+    impl Backend for ProbeBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> std::result::Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a BufferCell)>,
+        {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> std::result::Result<Position, Self::Error> {
+            self.probes.set(self.probes.get() + 1);
+            if self.fail {
+                Err(io::Error::other(
+                    "nobody answered the cursor-position query",
+                ))
+            } else {
+                Ok(self.cursor.get())
+            }
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> std::result::Result<(), Self::Error> {
+            self.cursor.set(position.into());
+            Ok(())
+        }
+
+        fn clear(&mut self) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn clear_region(&mut self, _clear_type: ClearType) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn size(&self) -> std::result::Result<Size, Self::Error> {
+            Ok(self.size.get())
+        }
+
+        fn window_size(&mut self) -> std::result::Result<WindowSize, Self::Error> {
+            Ok(WindowSize {
+                columns_rows: self.size.get(),
+                pixels: Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn inline_terminal(
+        backend: ProbeBackend,
+        height: u16,
+    ) -> Terminal<PinnedBackend<ProbeBackend>> {
+        Terminal::with_options(
+            PinnedBackend::new(backend),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_refused_construction_probe_still_starts_and_anchors_at_the_origin() {
+        let mut terminal = inline_terminal(
+            ProbeBackend::new(Size::new(10, 6), Position::new(2, 5), true),
+            6,
+        );
+        assert_eq!(terminal.backend().inner.probes(), 1);
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 10, 6));
+
+        terminal.backend_mut().inner.size.set(Size::new(10, 4));
+        terminal.resize(Rect::new(0, 0, 10, 4)).unwrap();
+        assert_eq!(terminal.backend().inner.probes(), 1);
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 10, 4));
+    }
+
+    #[test]
+    fn resize_and_clear_reuse_the_last_sent_position() {
+        let mut terminal = inline_terminal(
+            ProbeBackend::new(Size::new(10, 6), Position::new(4, 5), false),
+            6,
+        );
+        assert_eq!(terminal.backend().inner.probes(), 1);
+
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(1, 2))
+            .unwrap();
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            Position::new(1, 2)
+        );
+
+        terminal.backend_mut().inner.size.set(Size::new(10, 4));
+        terminal.resize(Rect::new(0, 0, 10, 4)).unwrap();
+        terminal.clear().unwrap();
+        assert_eq!(terminal.backend().inner.probes(), 1);
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 10, 4));
     }
 }

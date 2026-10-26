@@ -33,8 +33,11 @@
 //!   held for up to one 200ms poll by the input thread. The screen therefore sat
 //!   blank between the clear and the repaint: 205-335ms of black, measured
 //!   through the PTY harness. [`FrameWriter`] holds mid-frame flushes so clear
-//!   and repaint land in one synchronized write, and the commit answers cursor
-//!   queries from the last position it sent.
+//!   and repaint land in one synchronized write. The viewport's construction
+//!   probe is the only cursor query the TUI sends; every later one — the
+//!   commit's clear included — answers from the last position kloop sent, so a
+//!   resize cannot stall on a reply either, and a failed probe falls back to
+//!   the origin.
 //!
 //! [`PinnedBackend`] also pins one physical size across a commit transaction so
 //! autoresize confirmation, insert/drain, and the repaint share one geometry

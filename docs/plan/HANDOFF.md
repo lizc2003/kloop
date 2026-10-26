@@ -1,5 +1,20 @@
 # HANDOFF — 当前状态与会话交接
 
+**CPR 静默后 resize 不再让 TUI 退出（2026-10-26）**：手机链路触发 phone-fit
+resize 时，`PinnedBackend::get_cursor_position` 仍会发真实 `ESC[6n`；当前端不再
+回答（手机拿走 floor、桌面回复被静音），crossterm 2 秒超时后 `draw_frame` 的 `?`
+把错误带出 `ui_loop`，kloop 恢复终端并以标准库的 `Error: The cursor position could
+not be read within a normal duration` 退出。现在主 TUI 里 viewport 构造探测是唯一
+到达终端的 cursor query：之后 resize 锚定与 `Terminal::clear` 都从 `last_cursor`
+（每帧 `set_cursor_position` 维护）回答；构造探测本身失败也回退 `Position::ORIGIN`，
+全高 inline viewport 的 top 恒为 0，所以最多等一次 2 秒而不会启动失败。`begin_commit` /
+`committing` 保留，继续保证 commit 内绝不查询。新增两条 `PinnedBackend` 单元测试
+（首次探测失败仍启动且 resize 不再探测；resize/clear 复用最后发送位置）和一条 PTY
+回归（boot 后只答构造探测，shrink/grow 均在 1.5 秒内重绘、CPR 计数不变、正常退出）；
+原 resize 测试删掉“resize 必发 CPR”的断言。外层执行沙箱之外完整 `make check` 全绿，
+含本机 parity（CLI 156、core 1192、TUI 286、TUI PTY 24、plain PTY 8）。DESIGN 原
+cursor/commit 段落与 PTY 测试清单已改写；提交号以本条所在提交为准，教训 268。
+
 **输出目标就是 cwd 时不再生成父目录授权（2026-10-26，审查 7c9a19a）**：
 `make check > .` 的规范相对路径为空，其 parent 不存在；原回退链错误地取规范 cwd
 的 parent，普通与升级项目规则因此覆盖兄弟项目。现在区分相对目标为空与非空目标的
@@ -3242,3 +3257,11 @@ cwd 内的规范相对目标匹配，旧规则也须受相同边界约束。回�
 `relative` 的 Some/None 边界，再在 Some 分支要求目标必须有 parent；不能把所有
 取不到 parent 的情况塞进 `.or_else()`。审批发生在执行前，shell 稍后报目录错误
 不会撤销已保存的权限。回归须同时核验普通/升级的项目选项、会话记忆与相邻目录目标。
+
+268. **只用于初始几何的阻塞查询不该留在每次 resize 的路径上；程序自己掌握的位置就是答案。**
+`PinnedBackend` 在 commit 内已经用 `last_cursor` 替代 `ESC[6n`，但 resize 仍走真实
+CPR；当前端不再回答时，2 秒超时沿 `?` 直接结束 TUI。viewport 构造后每一帧都通过
+`set_cursor_position` 把光标放到哪里告诉后端，之后的 clear/resize 都可以直接用这个值；
+首个探测失败也不该终止会话——全高 inline viewport 无论答案是什么都锚在 top 0，回退
+`ORIGIN` 即可。回归要同时钉住“resize 不再发 CPR”和“首个 CPR 失败仍能启动”，否则只
+改其中一半，另一个无人应答的路径还会退出。

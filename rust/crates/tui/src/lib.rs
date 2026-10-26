@@ -248,12 +248,12 @@ pub async fn run(
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let current_cfg = || Arc::clone(&current.lock().unwrap());
 
-    // Setup can fail AFTER raw mode is enabled (e.g. the inline viewport's CPR
-    // probe times out on a PTY that never answers, or an intermediate write
-    // fails). A bare `?` here would return without restoring the terminal or
-    // tearing down a `--worktree` tree — leaving the shell in raw mode and
-    // leaking the worktree on disk (there is no Drop-based cleanup). So on
-    // failure run the same teardown the normal exit does, then propagate.
+    // Setup can fail AFTER raw mode is enabled (e.g. an intermediate write
+    // fails; the inline viewport's construction probe falls back to the origin
+    // instead of failing). A bare `?` here would return without restoring the
+    // terminal or tearing down a `--worktree` tree — leaving the shell in raw
+    // mode and leaking the worktree on disk (there is no Drop-based cleanup).
+    // So on failure run the same teardown the normal exit does, then propagate.
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(e) => {
@@ -826,8 +826,9 @@ fn setup_terminal() -> Result<TerminalSession> {
     // scrolls into native scrollback, so the mouse wheel / selection / Cmd+F
     // reach history directly. The viewport is the full terminal height, so
     // `insert_before` pushes finalized cells above it into scrollback. This CPR
-    // (cursor-position query) runs before the input thread starts, so nothing
-    // races it for stdin.
+    // (cursor-position query) is the only one the TUI sends: it runs before the
+    // input thread starts, so nothing races it for stdin, and a timeout falls
+    // back to the origin. Later queries answer from the last position sent.
     let height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
     // Every byte of a frame goes through one `FrameWriter` (plan 103): ratatui-
     // crossterm flushes on each `execute!`, so without it a frame reaches the
@@ -879,11 +880,11 @@ fn restore_terminal(keyboard_enhancement: &mut KeyboardEnhancementGuard) {
 
 /// Read terminal events on a dedicated OS thread and forward them to the async
 /// loop. Uses `poll(timeout)` + `read()` rather than crossterm's `EventStream`
-/// so the internal reader lock is released between polls: that lets a resize's
-/// `get_cursor_position` (CPR) acquire the lock within one poll interval instead
-/// of deadlocking against a reader parked in a lock-holding blocking read (plan
-/// 38 slice 0, the inline integration trap). The 200ms poll bounds that wait
-/// well under crossterm's 2s CPR timeout and stays idle-cheap.
+/// so the internal reader lock is released between polls and the thread observes
+/// `stop` every 200ms. (The lock used to matter for a resize's cursor-position
+/// query; after the viewport's construction probe, `PinnedBackend` answers from
+/// the last position it sent, so a resize no longer queries at all.) Idle
+/// polling stays cheap.
 fn spawn_input_thread(
     tx: mpsc::UnboundedSender<Event>,
     stop: Arc<AtomicBool>,
@@ -1449,10 +1450,9 @@ async fn ui_loop(
     // session's cells start as the tail and scroll into scrollback on overflow.
     app.mode = permissions.mode();
 
-    // Keys arrive from a dedicated poll thread, not crossterm's EventStream, so
-    // its reader never parks holding the lock a resize's CPR needs (see
-    // `spawn_input_thread`). Started after `setup_terminal`, so nothing raced
-    // the viewport's construction CPR.
+    // Keys arrive from a dedicated poll thread (see `spawn_input_thread`).
+    // Started after `setup_terminal`, so nothing raced the viewport's
+    // construction CPR — the only cursor query that reaches the terminal.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     let stop = Arc::new(AtomicBool::new(false));
     let input_thread = spawn_input_thread(input_tx, stop.clone());

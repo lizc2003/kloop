@@ -363,7 +363,7 @@ async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
+async fn resize_keeps_the_current_viewport_in_sync() -> Result<()> {
     let _guard = PTY_TEST_LOCK.lock().await;
     let fixture = ChatFixture::start(vec![sse_text("unused")]).await;
     let mut harness = spawn(&fixture, 30, 100)?;
@@ -377,14 +377,9 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
         |frame| frame.cols == 100 && frame.cursor.1 == 72,
     )?;
 
-    let initial_cpr = harness.snapshot().cpr_count;
     harness.resize(16, 60)?;
     harness.wait_for("shrink redraw", Duration::from_millis(1500), |frame| {
-        frame.rows == 16
-            && frame.cols == 60
-            && frame.cpr_count > initial_cpr
-            && frame.cursor.1 == 14
-            && frame.contains("[manual]")
+        frame.rows == 16 && frame.cols == 60 && frame.cursor.1 == 14 && frame.contains("[manual]")
     })?;
     // PTY 读到局部重绘不代表整屏已经完成，计数、光标与快照必须检查同一个稳定帧。
     let shrunk = harness.wait_for_quiescent(
@@ -398,14 +393,9 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
     assert_eq!(shrunk.count("[manual]"), 1);
     insta::assert_snapshot!("resize_shrunk_16x60", shrunk.stable_text());
 
-    let shrunk_cpr = shrunk.cpr_count;
     harness.resize(24, 100)?;
     harness.wait_for("grow redraw", Duration::from_millis(1500), |frame| {
-        frame.rows == 24
-            && frame.cols == 100
-            && frame.cpr_count > shrunk_cpr
-            && frame.cursor.1 == 72
-            && frame.contains("[manual]")
+        frame.rows == 24 && frame.cols == 100 && frame.cursor.1 == 72 && frame.contains("[manual]")
     })?;
     let grown = harness.wait_for_quiescent(
         "grown screen settles",
@@ -417,6 +407,69 @@ async fn resize_keeps_cpr_and_current_viewport_in_sync() -> Result<()> {
     assert!(grown.cursor.0 < grown.rows && grown.cursor.1 < grown.cols);
     assert_eq!(grown.count("[manual]"), 1);
     insta::assert_snapshot!("resize_grown_24x100", grown.stable_text());
+
+    graceful_exit(&mut harness)?;
+    Ok(())
+}
+
+/// A front-end that stops answering CPR after boot must not take kloop down
+/// on resize: the viewport answers from the last position it sent, so no
+/// second query is sent and the redraw does not wait out crossterm's 2s
+/// timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resize_redraws_when_cpr_goes_unanswered_after_boot() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("unused")]).await;
+    let mut harness = PtyHarness::spawn_with_options(
+        Path::new(env!("CARGO_BIN_EXE_kloop")),
+        &fixture.uri(),
+        30,
+        100,
+        &PtyOptions {
+            answer_only_boot_cpr: true,
+            ..PtyOptions::default()
+        },
+    )?;
+    wait_for_boot(&mut harness)?;
+    let boot_cpr = harness.snapshot().cpr_count;
+    assert!(boot_cpr >= 1, "the viewport's construction probe must run");
+
+    harness.resize(16, 60)?;
+    harness.wait_for(
+        "shrink redraw without a CPR reply",
+        Duration::from_millis(1500),
+        |frame| frame.rows == 16 && frame.cols == 60 && frame.contains("[manual]"),
+    )?;
+    let shrunk = harness.wait_for_quiescent(
+        "shrunk screen settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.rows == 16 && frame.cols == 60,
+    )?;
+    assert_eq!(harness.pty_size()?, (16, 60));
+    assert!(shrunk.cursor.0 < shrunk.rows && shrunk.cursor.1 < shrunk.cols);
+    assert_eq!(shrunk.count("[manual]"), 1);
+
+    harness.resize(24, 100)?;
+    harness.wait_for(
+        "grow redraw without a CPR reply",
+        Duration::from_millis(1500),
+        |frame| frame.rows == 24 && frame.cols == 100 && frame.contains("[manual]"),
+    )?;
+    let grown = harness.wait_for_quiescent(
+        "grown screen settles",
+        Duration::from_secs(3),
+        QUIET,
+        |frame| frame.rows == 24 && frame.cols == 100,
+    )?;
+    assert_eq!(harness.pty_size()?, (24, 100));
+    assert!(grown.cursor.0 < grown.rows && grown.cursor.1 < grown.cols);
+    assert_eq!(grown.count("[manual]"), 1);
+    assert_eq!(
+        harness.snapshot().cpr_count,
+        boot_cpr,
+        "a resize must answer from the last sent position, not send another CPR"
+    );
 
     graceful_exit(&mut harness)?;
     Ok(())

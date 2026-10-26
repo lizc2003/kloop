@@ -389,6 +389,10 @@ pub struct PtyOptions<'a> {
     /// with `(home, workspace)`, for state outside the workspace (a pre-seeded
     /// session or scheduler store).
     pub prepare: Option<SandboxPrepare<'a>>,
+    /// Answer only the viewport's construction cursor query, then leave later
+    /// queries unanswered — a front-end that lost the terminal to another
+    /// client. A resize must not depend on a reply.
+    pub answer_only_boot_cpr: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +402,8 @@ pub struct FrameSnapshot {
     pub cursor: (u16, u16),
     pub text: String,
     pub bracketed_paste: bool,
+    /// Cursor queries seen in the child's output, whether answered or not, so a
+    /// test can assert a resize sent none.
     pub cpr_count: usize,
     pub raw_len: usize,
     /// Literal per-run values to replace before the frame becomes a baseline.
@@ -757,6 +763,7 @@ impl PtyHarness {
         ));
         let reader_terminal = Arc::clone(&terminal);
         let reader_writer = Arc::clone(&writer);
+        let answer_only_boot_cpr = options.answer_only_boot_cpr;
         let reader_handle = thread::Builder::new()
             .name("kloop-tui-pty-reader".into())
             .spawn(move || {
@@ -773,10 +780,13 @@ impl PtyHarness {
                             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
                             state.push_raw(byte);
                             state.parser.process(&[byte]);
-                            let response = state.scanner.feed(byte).then(|| {
+                            let response = if state.scanner.feed(byte) {
                                 state.cpr_count += 1;
-                                cpr_response(state.parser.screen().cursor_position())
-                            });
+                                (!answer_only_boot_cpr || state.cpr_count == 1)
+                                    .then(|| cpr_response(state.parser.screen().cursor_position()))
+                            } else {
+                                None
+                            };
                             changed.notify_all();
                             response
                         };
