@@ -8,9 +8,11 @@
 
 provider = "k-flash"                                   # which one this session starts on
 
-# 顶层可选项：用独立 UTF-8 文本文件整体替换内置基础提示词；省略时使用内置正文。
-# 相对路径基于 ~/.kloop/，也可写绝对路径。正文原样读取，环境和 Git 快照由程序追加。
-# 文件缺失、不可读或正文为空白会报启动错误；改文件后重启 kloop 生效。
+# Optional top-level setting: replace the built-in base prompt with a UTF-8 file.
+# Omit it to keep the built-in prompt. Relative paths start at the config
+# directory (~/.kloop/); absolute paths also work. Contents are read verbatim;
+# kloop appends the environment and opening Git snapshot. Missing, unreadable,
+# non-UTF-8, or blank files fail startup. Restart kloop after editing the file.
 # system_prompt_file = 'system-prompt.md'
 
 
@@ -99,7 +101,7 @@ context_window = 272000                                 # same as sol, 872000 ma
 # needs no key, carries on.
 
 [web]
-search_provider = "tavily"                              # 也可选 "brave" 或 "deepseek"
+search_provider = "tavily"                              # or "brave" or "deepseek"
 # api_key       = "tvly-..."                            # tavily free tier: no card
 
 
