@@ -1690,12 +1690,18 @@ since that is what the key would actually do. Between the two taps the row is
 replaced by the unmissable `press esc again to clear input`, in the same slot
 Ctrl+C's `press Ctrl+C again to exit` uses (and it shows when idle too, where
 there is no activity row otherwise). The
-**footer** carries the mode badge and key hints on the left and the **system
-status** — model name and a context gauge (`model · N% ctx`, refreshed at the end
+**footer** carries the mode badge, the session's git branch, and the key hints
+on the left and the **system status** — model name and a context gauge
+(`model · N% ctx`, refreshed at the end
 of every agent round from the same usage accounting `/cost` reads, so a
 long turn's gauge moves while it runs, and once more after a slash command, so
 `/compact` and `/clear` move it without any turn at all) — flush right (dropped
-on a narrow row so the hints win). 百分比分母来自当前路由的配置窗口：成功的
+on a narrow row so the left side wins). The branch is omitted outside a
+repository and cut with `…` past 24 columns; it sits before the hints so the
+branch survives a narrow row. The bar therefore reads
+`[manual]  main · shift+Tab mode · Ctrl+R rewind · Ctrl+C to exit`: the banner
+that first names the branch scrolls into scrollback, the footer does not. 百分比
+分母来自当前路由的配置窗口：成功的
 provider/model 切换把重算后的窗口与路由一起送到 TUI，不能沿用启动时的值；
 未知窗口显示估算 token 数。运行中的操作同时冻结路由与窗口，结束后才展示新选择，
 旧 revision 的切换事件不能覆盖新窗口。`/clear` 与 rewind 也同步新会话的窗口。

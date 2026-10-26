@@ -2,7 +2,7 @@
 source: crates/cli/tests/tui_pty.rs
 expression: settled.stable_text()
 ---
-[24x80 cursor=23,70]
+[24x80 cursor=23,57]
 
 ── Worked for <elapsed> ────────────────────────────────────────────────────────
 
@@ -26,4 +26,4 @@ Enter select · ↑↓ move · 1-9 pick · Esc cancel
 ────────────────────────────────────────────────────────────────────────────────
 › Type a message…  (Shift+Enter for newline)
 ────────────────────────────────────────────────────────────────────────────────
-[manual]  shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit
+[manual]  shift+Tab mode · Ctrl+R rewind · Ctrl+C to exit

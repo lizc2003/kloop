@@ -600,7 +600,9 @@ pub struct App {
     commands: Vec<menu::CommandInfo>,
     /// Current session working-directory projection, refreshed by CwdChanged.
     pub cwd: String,
-    /// Current worktree branch, or None in the original checkout.
+    /// The session's git branch, or None outside a repository. Seeded at startup
+    /// and refreshed when the session switches cwd (worktree enter/exit) or
+    /// session (`/clear`, rewind); the footer shows it beside the mode badge.
     pub branch: Option<String>,
     /// Compatibility mirror for legacy callers. Route state below is authoritative.
     pub model: String,

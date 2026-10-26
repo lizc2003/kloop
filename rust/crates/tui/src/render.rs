@@ -952,8 +952,13 @@ pub fn activity_line(app: &App, hud: &Hud) -> Option<Line<'static>> {
     Some(Line::from(spans))
 }
 
-/// The stable bottom bar: the permission-mode badge and key hints on the left,
-/// the system status (model + context gauge) flush right. Only the badge, the
+/// Columns a branch may claim in the footer before it is cut with `…`: a
+/// worktree branch can run long, and the key hints must stay on the row.
+const BRANCH_MAX: usize = 24;
+
+/// The stable bottom bar: the permission-mode badge, the current branch when
+/// the session sits in a repository, and key hints on the left, the system
+/// status (model + context gauge) flush right. Only the badge, the branch, the
 /// running/idle hint set, and the (per-turn) context gauge change — never per
 /// event — so the bar barely moves. Live activity lives in [`activity_line`].
 pub fn footer_line(app: &App, width: usize) -> Line<'static> {
@@ -966,8 +971,18 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
         ));
     }
     // The mode badge carries the brand accent (CC's brand-coloured mode line);
-    // the hints stay dim so only the badge draws the eye.
+    // everything after it stays dim so only the badge draws the eye.
     let badge = format!("[{}]  ", app.mode.label());
+    // The branch rides beside the badge, where a narrow row or a long turn
+    // cannot take it away: the banner that names it scrolls into scrollback,
+    // the footer does not. A very long branch is cut here so it does not push
+    // the key hints off the row.
+    let branch = app
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .map(|branch| format!("{} · ", truncate(branch, BRANCH_MAX)))
+        .unwrap_or_default();
     let mut hints = if let Some(startup) = &app.startup {
         // Startup owns the keyboard: the line says what is still pending and
         // that quitting is the one live action.
@@ -975,7 +990,7 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
     } else if app.running {
         format!("{} · Ctrl+C to exit", esc_action(app))
     } else {
-        "shift+Tab to change mode · Ctrl+R to rewind · Ctrl+C to exit".to_string()
+        "shift+Tab mode · Ctrl+R rewind · Ctrl+C to exit".to_string()
     };
     if app.live_todos().is_some() {
         hints.push_str(if app.show_todos {
@@ -985,23 +1000,27 @@ pub fn footer_line(app: &App, width: usize) -> Line<'static> {
         });
     }
     // Right-aligned system status; dropped if the row is too narrow to fit it
-    // after the badge + hints (those matter more).
+    // after the badge + branch + hints (those matter more).
     let right = system_status(app);
-    let lw = display_width(&badge) + display_width(&hints);
+    let prefix_w = display_width(&badge) + display_width(&branch);
+    let lw = prefix_w + display_width(&hints);
     let rw = display_width(&right);
     let badge_span = Span::styled(badge.clone(), Style::new().fg(BRAND));
     if !right.is_empty() && lw + 3 + rw <= width {
         let pad = width - lw - rw;
         Line::from(vec![
             badge_span,
+            Span::styled(branch, DIM),
             Span::styled(hints, DIM),
             Span::styled(" ".repeat(pad), DIM),
             Span::styled(right, DIM),
         ])
     } else if display_width(&badge) < width {
+        // Branch before hints, so a row too narrow for both keeps the branch.
+        let tail = format!("{branch}{hints}");
         Line::from(vec![
             badge_span,
-            Span::styled(truncate(&hints, width - display_width(&badge)), DIM),
+            Span::styled(truncate(&tail, width - display_width(&badge)), DIM),
         ])
     } else {
         Line::from(Span::styled(
@@ -2879,6 +2898,52 @@ mod tests {
             line_text(&activity_line(&app, &hud).unwrap()),
             "press Ctrl+C again to exit"
         );
+    }
+
+    /// The branch sits beside the mode badge in every footer state, so it stays
+    /// on screen after the opening banner scrolls away; off a repo the segment
+    /// is omitted, and a long branch is cut rather than dropping the key hints.
+    #[test]
+    fn footer_keeps_the_branch_beside_the_badge() {
+        let mut app =
+            App::new("sess".into()).with_working_directory("~/repo".into(), Some("main".into()));
+        let footer = line_text(&footer_line(&app, 80));
+        assert_eq!(
+            footer,
+            "[manual]  main · shift+Tab mode · Ctrl+R rewind · Ctrl+C to exit"
+        );
+
+        // Startup and running are still the same session: the branch stays.
+        app.startup = Some("MCP connecting 1/2".into());
+        let startup = line_text(&footer_line(&app, 80));
+        assert!(startup.contains("main · MCP connecting 1/2"), "{startup}");
+        app.startup = None;
+        app.running = true;
+        let running = line_text(&footer_line(&app, 80));
+        assert!(running.contains("main · esc to interrupt"), "{running}");
+        app.running = false;
+
+        // A narrow row keeps the branch and truncates the hints behind it.
+        let narrow = line_text(&footer_line(&app, 30));
+        assert!(narrow.starts_with("[manual]  main · "), "{narrow}");
+        assert!(display_width(&narrow) <= 30, "{narrow}");
+
+        // Off a repository there is no branch segment and no stray separator.
+        let app = App::new("sess".into());
+        let footer = line_text(&footer_line(&app, 80));
+        assert!(footer.starts_with("[manual]  shift+Tab mode"), "{footer}");
+
+        // A very long branch is cut so the key hints survive.
+        let long = "kloop-worktree-a-rather-long-branch-name";
+        let app =
+            App::new("sess".into()).with_working_directory("~/repo".into(), Some(long.into()));
+        let footer = line_text(&footer_line(&app, 80));
+        assert!(
+            footer.starts_with("[manual]  kloop-worktree-a-rather…"),
+            "{footer}"
+        );
+        assert!(!footer.contains(long), "{footer}");
+        assert!(footer.contains("Ctrl+R rewind"), "{footer}");
     }
 
     /// The footer's right side carries the model + context gauge when Config
