@@ -69,9 +69,11 @@ fn is_composer_newline_key(key: &KeyEvent) -> bool {
 /// The composer edit a key performs, or `None` for anything else. Ctrl and Alt
 /// are told apart (`Ctrl+B` moves a grapheme, `Alt+B` a word) so a combined
 /// chord — AltGr reaches Windows as Ctrl+Alt — cannot trip a single-modifier
-/// action, and an unbound Meta chord is `None`, not typed text. Only motions are
-/// bound: no key here deletes more than the grapheme Backspace/Delete already
-/// did, since there is nothing to undo (plan 211).
+/// action, and an unbound Meta chord is `None`, not typed text. Beyond plain
+/// Backspace/Delete only motions are bound: one press of those two removes a
+/// single visible unit (a grapheme, a whole paste atom, or — Backspace at the
+/// draft's start — the newest image), and range deletes stay unbound since
+/// there is nothing to undo (plan 211).
 fn composer_action(key: &KeyEvent) -> Option<ComposerAction> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);

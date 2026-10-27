@@ -1624,10 +1624,14 @@ bound: **Alt+B / Alt+F**, **Alt+←/→** and **Ctrl+←/→**. A **word** here 
 character class, not a dictionary one: letters, digits and `_` are one run,
 punctuation another, the whitespace between them is skipped, and `\n` counts as
 whitespace so motion crosses hard lines. A CJK run is therefore a single word, and
-every step stays on a grapheme boundary. **Nothing here deletes**: with no undo,
-no key removes more than the grapheme Backspace/Delete already did — Ctrl+W, Ctrl+U,
-Ctrl+K, Alt+D, and the Meta Backspace/Delete chords are left unbound, and the kill
-ring is out of scope.
+every step stays on a grapheme boundary. **Nothing here deletes**: with no undo
+(plan 211), one press of Backspace/Delete removes exactly one unit the user can
+see — a grapheme, a whole paste atom, or (Backspace at the very start of the draft
+only) the newest image on the `📎` line, both described below. The last two are
+larger than a grapheme, but each is a single visible item that pasting again
+brings back, so a slip costs one re-paste rather than typed text the user never
+saw go. Range deletes — Ctrl+W, Ctrl+U, Ctrl+K, Alt+D, and the Meta
+Backspace/Delete chords — are left unbound, and the kill ring is out of scope.
 
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
 stable ID. Its `[Pasted #N: M chars · <preview>]` label shows the payload's first
@@ -1657,7 +1661,8 @@ arrays. Images show on a `📎` line and ride the next fresh turn (steering
 preserves them), reusing the `--image` ingestion in `crates/tui/src/clipboard.rs`
 via `arboard`.
 光标在草稿最开头时按 Backspace 会删掉最近粘贴的一张图(`📎` 行画在正文之前,从开头
-再往前删就删到它);Delete 不碰附件,连按两次 Esc 清空草稿时附件随正文一起清掉。
+再往前删就删到它),这是上文「Nothing here deletes」那条删除规则写明的例外之一;Delete
+不碰附件,连按两次 Esc 清空草稿时附件随正文一起清掉。
 
 Copying two lines therefore keeps one logical newline between them even when the
 terminal supplies CRLF or CR bytes.
