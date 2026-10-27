@@ -1656,6 +1656,8 @@ Typed `Attachment { label, block }` records replace the old parallel label/image
 arrays. Images show on a `📎` line and ride the next fresh turn (steering
 preserves them), reusing the `--image` ingestion in `crates/tui/src/clipboard.rs`
 via `arboard`.
+光标在草稿最开头时按 Backspace 会删掉最近粘贴的一张图(`📎` 行画在正文之前,从开头
+再往前删就删到它);Delete 不碰附件,连按两次 Esc 清空草稿时附件随正文一起清掉。
 
 Copying two lines therefore keeps one logical newline between them even when the
 terminal supplies CRLF or CR bytes.

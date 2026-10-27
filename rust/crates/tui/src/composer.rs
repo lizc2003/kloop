@@ -614,6 +614,10 @@ impl Composer {
             self.cursor = self
                 .document
                 .replace(TextRange::new(previous, self.cursor), "");
+        } else {
+            // 附件行画在正文之前:从正文开头再往前删,删到的是最近粘贴的那张图。
+            // 否则附件只有提交和整稿清空两个出口。
+            self.attachments.pop();
         }
         self.goal_column = None;
     }
@@ -1218,6 +1222,36 @@ mod tests {
         assert_eq!(composer.attachments()[0].label, "shot.png");
         assert_eq!(composer.submit().unwrap().images, vec![block]);
         assert!(composer.attachments().is_empty());
+    }
+
+    #[test]
+    fn backspace_at_the_start_detaches_the_newest_image() {
+        fn state(composer: &Composer) -> (&str, Vec<&str>) {
+            let labels = composer
+                .attachments()
+                .iter()
+                .map(|attachment| attachment.label.as_str())
+                .collect();
+            (composer.text(), labels)
+        }
+        let mut composer = Composer::new();
+        composer.attach_image("a.png".into(), image());
+        composer.attach_image("b.png".into(), image());
+        composer.paste("hi");
+        composer.backspace();
+        assert_eq!(state(&composer), ("h", vec!["a.png", "b.png"]));
+        composer.home();
+        composer.backspace();
+        assert_eq!(state(&composer), ("h", vec!["a.png"]));
+        // Delete 只向后删正文,删空了也不碰附件。
+        composer.delete();
+        composer.delete();
+        assert_eq!(state(&composer), ("", vec!["a.png"]));
+        composer.backspace();
+        assert_eq!(state(&composer), ("", vec![]));
+        assert!(composer.is_blank());
+        composer.backspace();
+        assert_eq!(state(&composer), ("", vec![]));
     }
 
     #[test]

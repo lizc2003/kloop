@@ -3115,6 +3115,23 @@ mod tests {
         assert!(!app.show_todos);
     }
 
+    /// 误粘的图片在空输入框里按 Backspace 就能删掉,随后的 Enter 不再把它送出。
+    #[test]
+    fn backspace_on_an_empty_composer_drops_the_pasted_image() {
+        let block = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            },
+        };
+        let mut app = App::new("s".into());
+        app.attach_image("shot.png".into(), block);
+        assert_eq!(app.on_key(80, key(KeyCode::Backspace)), Command::None);
+        assert!(app.composer.attachments().is_empty());
+        assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
+        assert!(app.take_submit_images().is_empty());
+    }
+
     /// Steering with an image attached: only the text steers the running turn;
     /// the image is NOT sent and NOT shown as an `[image: …]` cell, but stays on
     /// the composer so the next fresh turn carries it. Regression — the image
