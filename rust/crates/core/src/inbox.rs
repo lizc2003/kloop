@@ -16,6 +16,8 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_protocol::Injected;
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::LocalAgentMessage;
@@ -88,8 +90,12 @@ pub struct AgentMessageFailure {
 /// item lets each producer frame its own message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InboxItem {
-    /// User steering typed while the turn runs (plan 22).
-    Steer(String),
+    /// User steering typed while the turn runs (plan 22). 正文里的 `[Image #N]`
+    /// 指 `images` 的第 N 张(plan 242)。
+    Steer {
+        text: String,
+        images: Vec<ImageSource>,
+    },
     /// A background sub-agent's terminal summary, reinjected to its parent
     /// (plan 26). `label` is the "agent-*" id; `summary` is the framed body.
     SubAgentResult {
@@ -137,13 +143,21 @@ pub enum InboxItem {
 }
 
 impl InboxItem {
+    /// Text-only steering, as every producer but the TUI composer sends it.
+    pub fn steer(text: impl Into<String>) -> Self {
+        InboxItem::Steer {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
     /// What this item is, recorded on the message it becomes. A replayed
     /// transcript reads this instead of the framing prose below — that prose is
     /// prompt wording, it gets reworded, and matching on it would silently stop
     /// recognising every session written before the rewording.
     pub fn kind(&self) -> Injected {
         match self {
-            InboxItem::Steer(_) => Injected::Steering,
+            InboxItem::Steer { .. } => Injected::Steering,
             InboxItem::SubAgentResult { label, .. } => Injected::SubAgent {
                 label: label.clone(),
             },
@@ -173,7 +187,21 @@ impl InboxItem {
     /// The history message this item becomes: the framed text the model reads,
     /// carrying the identity a reader needs.
     pub fn into_user_message(self) -> Message {
-        Message::injected(self.kind(), self.into_message())
+        let kind = self.kind();
+        match self {
+            // 图片接在框定文本之后，与普通 turn 的用户消息同形。
+            InboxItem::Steer { text, images } if !images.is_empty() => {
+                let images = images
+                    .into_iter()
+                    .map(|source| ContentBlock::Image { source })
+                    .collect();
+                let mut message =
+                    Message::user_with_blocks(format!("{STEERING_PREFIX}\n{text}"), images);
+                message.injected = Some(kind);
+                message
+            }
+            other => Message::injected(kind, other.into_message()),
+        }
     }
 
     /// The user-message text this item becomes when drained into history. Every
@@ -182,7 +210,7 @@ impl InboxItem {
     /// the frame.
     pub fn into_message(self) -> String {
         match self {
-            InboxItem::Steer(text) => format!("{STEERING_PREFIX}\n{text}"),
+            InboxItem::Steer { text, .. } => format!("{STEERING_PREFIX}\n{text}"),
             InboxItem::SubAgentResult { label, summary } => {
                 format!("{SUBAGENT_PREFIX}\n[Agent {label}]\n{summary}")
             }
@@ -367,7 +395,7 @@ impl Inbox {
                 (Some(_), None) => return Err(SteerRefused::NoActiveTurn),
                 (Some(_), Some(active)) => return Err(SteerRefused::TurnMismatch { active }),
             }
-            pending.items.push(InboxItem::Steer(text));
+            pending.items.push(InboxItem::steer(text));
             window
         };
         self.advance_activity();
@@ -463,7 +491,7 @@ mod tests {
         );
         assert!(inbox.is_empty(), "a refused steer enqueues nothing");
         assert_eq!(inbox.push_steer("idle".into(), None), Ok(None));
-        assert_eq!(inbox.drain(), vec![InboxItem::Steer("idle".into())]);
+        assert_eq!(inbox.drain(), vec![InboxItem::steer("idle")]);
 
         inbox.open_steer_window(4);
         assert_eq!(
@@ -474,10 +502,7 @@ mod tests {
         assert_eq!(inbox.push_steer("also".into(), None), Ok(Some(4)));
         assert_eq!(
             inbox.drain(),
-            vec![
-                InboxItem::Steer("amend".into()),
-                InboxItem::Steer("also".into())
-            ]
+            vec![InboxItem::steer("amend"), InboxItem::steer("also")]
         );
     }
 
@@ -489,10 +514,10 @@ mod tests {
     fn the_final_drain_closes_the_window_only_when_it_ends_the_turn() {
         let inbox = Inbox::default();
         inbox.open_steer_window(7);
-        inbox.push(InboxItem::Steer("keep going".into()));
+        inbox.push(InboxItem::steer("keep going"));
         assert_eq!(
             inbox.drain_or_close_steer_window(),
-            vec![InboxItem::Steer("keep going".into())]
+            vec![InboxItem::steer("keep going")]
         );
         assert_eq!(inbox.push_steer("still 7".into(), Some(7)), Ok(Some(7)));
         assert_eq!(inbox.drain().len(), 1);
@@ -528,11 +553,41 @@ mod tests {
         assert!(inbox.is_empty());
     }
 
+    /// 带图的 steer 与普通 turn 的用户消息同形：框定文本在前，图片按编号跟在后面。
+    #[test]
+    fn steering_with_images_keeps_them_after_the_framed_text() {
+        let image = |data: &str| ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: data.into(),
+        };
+        let text = "compare [Image #1] with [Image #2]";
+        let message = InboxItem::Steer {
+            text: text.into(),
+            images: vec![image("one"), image("two")],
+        }
+        .into_user_message();
+        let expected = Message {
+            injected: Some(Injected::Steering),
+            ..Message::user_with_blocks(
+                format!("{STEERING_PREFIX}\n{text}"),
+                vec![
+                    ContentBlock::Image {
+                        source: image("one"),
+                    },
+                    ContentBlock::Image {
+                        source: image("two"),
+                    },
+                ],
+            )
+        };
+        assert_eq!(message, expected);
+    }
+
     /// The producer records what it made, so replay never has to read the
     /// framing prose — which is precisely the part that gets reworded.
     #[test]
     fn every_item_records_its_kind_and_steering_keeps_the_user_words() {
-        let steer = InboxItem::Steer("check logs".into());
+        let steer = InboxItem::steer("check logs");
         assert_eq!(steer.kind(), Injected::Steering);
         let message = steer.into_user_message();
         assert_eq!(message.injected, Some(Injected::Steering));
@@ -589,7 +644,7 @@ mod tests {
     #[test]
     fn every_framing_is_a_single_line() {
         let items = [
-            InboxItem::Steer("s".into()),
+            InboxItem::steer("s"),
             InboxItem::SubAgentResult {
                 label: "agent-1".into(),
                 summary: "s".into(),
@@ -623,7 +678,7 @@ mod tests {
     #[test]
     fn item_kinds_have_distinct_framing() {
         assert_eq!(
-            InboxItem::Steer("check logs".into()).into_message(),
+            InboxItem::steer("check logs").into_message(),
             format!("{STEERING_PREFIX}\ncheck logs")
         );
         assert_eq!(
@@ -703,7 +758,7 @@ mod tests {
     fn push_drain_roundtrips_and_empties() {
         let inbox = Inbox::default();
         assert!(inbox.is_empty());
-        inbox.push(InboxItem::Steer("a".into()));
+        inbox.push(InboxItem::steer("a"));
         inbox.push(InboxItem::SubAgentResult {
             label: "agent-1".into(),
             summary: "b".into(),
@@ -718,7 +773,7 @@ mod tests {
     async fn activity_wakes_on_push() {
         let inbox = Inbox::default();
         let mut activity = inbox.subscribe_activity();
-        inbox.push(InboxItem::Steer("x".into()));
+        inbox.push(InboxItem::steer("x"));
         // Resolves promptly; if signalling were broken this would hang the test.
         activity.changed().await.unwrap();
     }
@@ -726,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn subscriber_observes_only_newer_activity() {
         let inbox = Inbox::default();
-        inbox.push(InboxItem::Steer("old".into()));
+        inbox.push(InboxItem::steer("old"));
         inbox.drain();
 
         let mut activity = inbox.subscribe_activity();

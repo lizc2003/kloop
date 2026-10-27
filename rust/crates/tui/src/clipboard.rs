@@ -9,11 +9,12 @@
 //! block is identical to `--image`'s.
 
 use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 
-/// Read an image off the OS clipboard into an Image block, with a display label.
-/// Returns a human error string when the clipboard is unavailable or holds no
-/// image (the common case — a text clipboard — so the caller notes it, not fails).
-pub fn clipboard_image() -> Result<(String, ContentBlock), String> {
+/// Read an image off the OS clipboard. Returns a human error string when the
+/// clipboard is unavailable or holds no image (the common case — a text
+/// clipboard — so the caller notes it, not fails).
+pub fn clipboard_image() -> Result<ImageSource, String> {
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
 
     // A copied image FILE (e.g. from Finder) is a path list; read its bytes and
@@ -23,13 +24,8 @@ pub fn clipboard_image() -> Result<(String, ContentBlock), String> {
             let Ok(bytes) = std::fs::read(&f) else {
                 continue;
             };
-            if let Ok(block) = kloop_core::image::image_block_from_bytes(&bytes) {
-                let label = f
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("image")
-                    .to_string();
-                return Ok((label, block));
+            if let Ok(source) = image_source_from_bytes(&bytes) {
+                return Ok(source);
             }
         }
     }
@@ -40,8 +36,18 @@ pub fn clipboard_image() -> Result<(String, ContentBlock), String> {
         .map_err(|e| format!("no image on the clipboard: {e}"))?;
     let png = encode_png(img.width, img.height, &img.bytes)
         .ok_or_else(|| "could not encode the clipboard image".to_string())?;
-    let block = kloop_core::image::image_block_from_bytes(&png).map_err(|e| e.to_string())?;
-    Ok((format!("pasted image {}×{}", img.width, img.height), block))
+    image_source_from_bytes(&png)
+}
+
+/// Validate image bytes through core's shared ingestion (the one `--image`
+/// uses) into the source the composer holds.
+pub(crate) fn image_source_from_bytes(bytes: &[u8]) -> Result<ImageSource, String> {
+    match kloop_core::image::image_block_from_bytes(bytes).map_err(|e| e.to_string())? {
+        ContentBlock::Image { source } => Ok(source),
+        other => Err(format!(
+            "image ingestion produced a non-image block: {other:?}"
+        )),
+    }
 }
 
 /// Encode raw RGBA8 pixels into PNG bytes. `None` if the buffer is not exactly

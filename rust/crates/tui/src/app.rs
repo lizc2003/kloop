@@ -40,6 +40,7 @@ use tokio::sync::oneshot;
 use crate::choice::QUESTION_PREFIX;
 use crate::composer::Composer;
 use crate::composer::ComposerAction;
+use crate::composer::Draft;
 use crate::events::AgentEvent;
 use crate::menu;
 
@@ -71,9 +72,9 @@ fn is_composer_newline_key(key: &KeyEvent) -> bool {
 /// chord — AltGr reaches Windows as Ctrl+Alt — cannot trip a single-modifier
 /// action, and an unbound Meta chord is `None`, not typed text. Beyond plain
 /// Backspace/Delete only motions are bound: one press of those two removes a
-/// single visible unit (a grapheme, a whole paste atom, or — Backspace at the
-/// draft's start — the newest image), and range deletes stay unbound since
-/// there is nothing to undo (plan 211).
+/// single visible unit (a grapheme, or a whole atom — a large paste or an
+/// image), and range deletes stay unbound since there is nothing to undo
+/// (plan 211).
 fn composer_action(key: &KeyEvent) -> Option<ComposerAction> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -489,7 +490,8 @@ pub enum Command {
     Slash(String),
     /// Enqueue this text into the running turn's steering queue (plan 22): it
     /// is delivered as a user message at the next round boundary, without
-    /// interrupting the turn. Only produced while a turn is running.
+    /// interrupting the turn, with the images it names (plan 242; taken via
+    /// [`App::take_submit_images`]). Only produced while a turn is running.
     Steer(String),
     /// Cycle the permission mode (shift+Tab): the loop applies it to the shared
     /// gate. App state already updated its own `mode` mirror.
@@ -536,10 +538,13 @@ pub struct App {
     /// The multi-line input widget (plan 38 slice 3): text, cursor, input
     /// history, paste placeholders, and image attachments.
     pub composer: Composer,
-    /// Images attached to the just-submitted turn, taken by the event loop to
-    /// build the user message. Held here rather than on `Command::Submit`
-    /// because `ContentBlock` isn't `Eq` (Command derives it).
-    submit_images: Vec<ContentBlock>,
+    /// Images of the just-submitted turn or steer, in number order, taken by the
+    /// event loop to build the user message. Held here rather than on the
+    /// Command so a Command stays a cheap value to compare.
+    submit_images: Vec<ImageSource>,
+    /// The draft of the fresh turn in flight, for [`App::return_input`] to put
+    /// back with its images where they were.
+    in_flight: Option<Draft>,
     pub running: bool,
     /// A startup task still owns the keyboard; the footer shows this line
     /// instead of the idle hints, and input is ignored except for quitting.
@@ -634,6 +639,7 @@ impl App {
             todo_panel_retired: false,
             composer: Composer::new(),
             submit_images: Vec::new(),
+            in_flight: None,
             running: false,
             startup: None,
             interactions: VecDeque::new(),
@@ -1739,7 +1745,7 @@ impl App {
             // an acknowledgement, so the raw paste does not belong in scrollback.
             let command = self
                 .composer
-                .submit_text()
+                .submit_command()
                 .expect("checked not blank")
                 .trim()
                 .to_string();
@@ -1759,36 +1765,25 @@ impl App {
             if self.held_command().is_some() {
                 return Command::None;
             }
-            // Steering: only the text rides the running turn (absorbed at its
-            // next round boundary). Attached images stay on the composer for the
-            // next FRESH turn — a steer has no image channel, so taking them here
-            // (and showing a `[image: …]` cell) would drop them silently. An
-            // image-only Enter has nothing to steer, so it is a no-op that leaves
-            // the image attached. No new turn starts.
-            return match self.composer.submit_text() {
-                Some(text) => {
-                    self.cells.push(Cell::User(text.trim().to_string()));
-                    Command::Steer(text)
-                }
-                None => Command::None,
-            };
+            // Steering: the text and the images it names ride the running turn
+            // (absorbed at its next round boundary). No new turn starts. The echo
+            // is the text alone, as a resumed steer replays.
+            let sub = self.composer.submit().expect("checked not blank");
+            self.cells.push(Cell::User(sub.text.trim().to_string()));
+            self.submit_images = sub.images;
+            return Command::Steer(sub.text);
         }
-        let labels: Vec<String> = self
-            .composer
-            .attachments()
-            .iter()
-            .map(|attachment| attachment.label.clone())
-            .collect();
         let sub = self.composer.submit().expect("checked not blank");
-        self.submit_images = sub.images;
         let echo = sub.text.trim().to_string();
         if !echo.is_empty() {
             self.cells.push(Cell::User(echo));
         }
-        // Each attached image replays as a placeholder line, like a resumed one.
-        for label in &labels {
-            self.cells.push(Cell::User(format!("[image: {label}]")));
+        // Each image also replays as a placeholder line, like a resumed one.
+        for source in &sub.images {
+            self.cells.push(Cell::User(image_placeholder(source)));
         }
+        self.submit_images = sub.images;
+        self.in_flight = Some(sub.draft);
         self.running = true;
         self.freeze_selected_route();
         Command::Submit(sub.text)
@@ -1796,14 +1791,15 @@ impl App {
 
     /// Take the images attached to the turn just submitted (the event loop builds
     /// the user message with them). Empty for a text-only turn.
-    pub fn take_submit_images(&mut self) -> Vec<ContentBlock> {
+    pub fn take_submit_images(&mut self) -> Vec<ImageSource> {
         std::mem::take(&mut self.submit_images)
     }
 
     /// The turn never happened — interrupted before the model produced a thing,
     /// so it is in neither history nor the session file. Undo the echo and put
     /// the input back in the composer to be fixed and resent.
-    fn return_input(&mut self, text: String, images: Vec<(String, ContentBlock)>) {
+    fn return_input(&mut self, text: String, images: Vec<ImageSource>) {
+        let draft = self.in_flight.take().filter(|draft| draft.text() == text);
         // Esc only reaches a running turn from an empty composer (a draft makes
         // it a two-tap clear), but the user can start typing in the gap between
         // the interrupt and the worker handing this back. Their new draft wins:
@@ -1812,12 +1808,20 @@ impl App {
         if !self.composer.is_blank() {
             return;
         }
-        self.drop_input_echo(&text, images.len());
-        if !text.is_empty() {
-            self.composer.paste(&text);
+        // The draft's images lead the returned ones and each was echoed; any
+        // after them are `--image` blocks that rode this turn and ride the next.
+        let (restored, echoed) = match &draft {
+            Some(draft) => (draft.image_count(), draft.image_count()),
+            None => (0, images.len()),
+        };
+        self.drop_input_echo(&text, echoed);
+        match draft {
+            Some(draft) => self.composer.restore(draft),
+            None if !text.is_empty() => self.composer.paste(&text),
+            None => {}
         }
-        for (label, block) in images {
-            self.composer.attach_image(label, block);
+        for source in images.into_iter().skip(restored) {
+            self.composer.attach_image(source);
         }
     }
 
@@ -1894,9 +1898,11 @@ impl App {
         }
     }
 
-    /// Attach a pasted image (the loop already read + validated it into a block).
-    pub fn attach_image(&mut self, label: String, block: ContentBlock) {
-        self.composer.attach_image(label, block);
+    /// Attach a pasted image at the cursor (the loop already read + validated
+    /// it). The cursor now follows a label, which no completion menu answers.
+    pub fn attach_image(&mut self, source: ImageSource) {
+        self.composer.attach_image(source);
+        self.popup = None;
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Command {
@@ -2253,6 +2259,13 @@ fn injected_label(injected: &Injected) -> String {
     }
 }
 
+/// The transcript line for a user image, live echo and resumed replay alike:
+/// the base64 is not shown, only that an image rode the turn.
+fn image_placeholder(source: &ImageSource) -> String {
+    let ImageSource::Base64 { media_type, .. } = source;
+    format!("[image: {media_type}]")
+}
+
 /// Replay a resumed session's history into transcript cells so `--resume`
 /// shows the conversation instead of a blank screen. Tool calls collapse to
 /// the same status rows the live path produces: paired result's `is_error`
@@ -2311,15 +2324,8 @@ pub fn cells_from_history(messages: &[Message]) -> Vec<Cell> {
                 (Role::User, ContentBlock::Text { text }) => {
                     cells.push(Cell::User(text.clone()));
                 }
-                // A user image replays as a placeholder line: the base64 is not
-                // shown, only that an image rode this turn.
-                (
-                    Role::User,
-                    ContentBlock::Image {
-                        source: ImageSource::Base64 { media_type, .. },
-                    },
-                ) => {
-                    cells.push(Cell::User(format!("[image: {media_type}]")));
+                (Role::User, ContentBlock::Image { source }) => {
+                    cells.push(Cell::User(image_placeholder(source)));
                 }
                 (Role::Assistant, ContentBlock::Text { text }) => {
                     cells.push(Cell::Assistant(text.clone()));
@@ -3117,63 +3123,79 @@ mod tests {
         assert!(!app.show_todos);
     }
 
-    /// 误粘的图片在空输入框里按 Backspace 就能删掉,随后的 Enter 不再把它送出。
+    fn png(data: &str) -> ImageSource {
+        ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: data.into(),
+        }
+    }
+
+    /// 误粘的图片紧挨着光标，按 Backspace 就整块删掉，随后的 Enter 不再把它送出。
     #[test]
-    fn backspace_on_an_empty_composer_drops_the_pasted_image() {
-        let block = ContentBlock::Image {
-            source: ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "aGk=".into(),
-            },
-        };
+    fn backspace_after_a_pasted_image_removes_it() {
         let mut app = App::new("s".into());
-        app.attach_image("shot.png".into(), block);
+        app.attach_image(png("one"));
+        assert_eq!(app.composer.text(), "[Image #1]");
         assert_eq!(app.on_key(80, key(KeyCode::Backspace)), Command::None);
-        assert!(app.composer.attachments().is_empty());
+        assert!(app.composer.is_blank());
         assert_eq!(app.on_key(80, key(KeyCode::Enter)), Command::None);
         assert!(app.take_submit_images().is_empty());
     }
 
-    /// Steering with an image attached: only the text steers the running turn;
-    /// the image is NOT sent and NOT shown as an `[image: …]` cell, but stays on
-    /// the composer so the next fresh turn carries it. Regression — the image
-    /// used to be stranded in submit_images (never delivered) while a misleading
-    /// placeholder cell claimed it rode the turn.
+    /// A fresh turn sends the text with its `[Image #N]` placeholders and the
+    /// images in number order; the echo is the text plus one line per image,
+    /// exactly what a resumed session replays.
     #[test]
-    fn steering_keeps_the_image_for_the_next_fresh_turn() {
-        let block = ContentBlock::Image {
-            source: ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "aGk=".into(),
-            },
-        };
+    fn a_fresh_turn_sends_its_images_in_number_order() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "compare ");
+        app.attach_image(png("one"));
+        type_str(&mut app, " with ");
+        app.attach_image(png("two"));
+        let text = "compare [Image #1] with [Image #2]";
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit(text.into())
+        );
+        assert_eq!(app.take_submit_images(), vec![png("one"), png("two")]);
+        assert_eq!(
+            app.cells,
+            vec![
+                Cell::User(text.into()),
+                Cell::User("[image: image/png]".into()),
+                Cell::User("[image: image/png]".into()),
+            ]
+        );
+    }
+
+    /// Steering carries the images its text names into the running turn, an
+    /// image-only steer included; the echo is the text, as a resumed steer
+    /// replays.
+    #[test]
+    fn steering_carries_its_images_into_the_running_turn() {
         let mut app = App::new("s".into());
         app.running = true;
-        app.attach_image("shot.png".into(), block.clone());
-        type_str(&mut app, "keep going");
+        app.attach_image(png("one"));
+        type_str(&mut app, " look");
         assert_eq!(
             app.on_key(80, key(KeyCode::Enter)),
-            Command::Steer("keep going".into())
+            Command::Steer("[Image #1] look".into())
         );
-        // No [image:] cell, and the steer carries no image.
-        assert_eq!(app.cells, vec![Cell::User("keep going".into())]);
-        assert!(app.take_submit_images().is_empty(), "steer sends no image");
-        assert_eq!(
-            app.composer.attachments()[0].label,
-            "shot.png",
-            "image kept for a fresh turn"
-        );
+        assert_eq!(app.take_submit_images(), vec![png("one")]);
+        assert!(app.composer.is_blank());
 
-        // The turn ends; a fresh Enter now delivers the still-attached image.
-        app.running = false;
+        app.attach_image(png("two"));
         assert_eq!(
             app.on_key(80, key(KeyCode::Enter)),
-            Command::Submit(String::new())
+            Command::Steer("[Image #1]".into())
         );
+        assert_eq!(app.take_submit_images(), vec![png("two")]);
         assert_eq!(
-            app.take_submit_images(),
-            vec![block],
-            "the fresh turn carries the image"
+            app.cells,
+            vec![
+                Cell::User("[Image #1] look".into()),
+                Cell::User("[Image #1]".into()),
+            ]
         );
     }
 
@@ -4085,18 +4107,10 @@ mod tests {
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
 
         // An attached image is a draft too, so it is what the two taps drop.
-        app.attach_image(
-            "shot.png".into(),
-            ContentBlock::Image {
-                source: ImageSource::Base64 {
-                    media_type: "image/png".into(),
-                    data: "aGk=".into(),
-                },
-            },
-        );
+        app.attach_image(png("one"));
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::None);
-        assert!(app.composer.attachments().is_empty());
+        assert!(app.composer.is_blank());
         assert_eq!(app.on_key(80, key(KeyCode::Esc)), Command::Interrupt);
     }
 
@@ -4842,7 +4856,8 @@ mod tests {
     /// A replayed transcript shows the conversation, not the plumbing: an inbox
     /// reinjection collapses to one note naming which one it was (the sub-agent
     /// summary it carries runs past twenty thousand characters and was never
-    /// addressed to the reader), steering gives back the user's own words, and a
+    /// addressed to the reader), steering gives back the user's own words (its
+    /// images named by their placeholders in them), and a
     /// run of untimed thinking blocks folds into the single `∗ Thought` row that
     /// says everything each of them would.
     #[test]
@@ -4852,8 +4867,11 @@ mod tests {
             summary: "P1: the silent path skips validation".into(),
         }
         .into_user_message();
-        let steered =
-            kloop_core::inbox::InboxItem::Steer("also check the poller".into()).into_user_message();
+        let steered = kloop_core::inbox::InboxItem::Steer {
+            text: "also check [Image #1]".into(),
+            images: vec![png("one")],
+        }
+        .into_user_message();
         let messages = vec![
             Message::user_text("review these commits"),
             Message::assistant(vec![
@@ -4881,7 +4899,7 @@ mod tests {
                     seconds: None,
                 },
                 Cell::Note("sub-agent result · agent-1".into()),
-                Cell::User("also check the poller".into()),
+                Cell::User("also check [Image #1]".into()),
                 Cell::Assistant("done".into()),
                 Cell::Note("resumed session — 5 message(s)".into()),
             ]
@@ -5224,6 +5242,35 @@ mod tests {
 
         assert!(app.cells.is_empty(), "the turn left no transcript behind");
         assert_eq!(app.composer.text(), "teh quick brown fox");
+    }
+
+    /// A returned turn puts its draft back with the images where they were,
+    /// and drops the image echo lines with the text. An `--image` block that
+    /// rode the turn comes back after them and is attached at the end.
+    #[test]
+    fn a_returned_input_restores_its_images_in_place() {
+        let mut app = App::new("s".into());
+        type_str(&mut app, "a");
+        app.attach_image(png("one"));
+        type_str(&mut app, "b");
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit("a[Image #1]b".into())
+        );
+
+        app.apply(AgentEvent::InputReturned {
+            text: "a[Image #1]b".into(),
+            images: vec![png("one"), png("cli")],
+        });
+
+        assert!(app.cells.is_empty(), "the turn left no transcript behind");
+        assert_eq!(app.composer.text(), "a[Image #1]b[Image #2]");
+        app.apply(AgentEvent::Core(Event::TurnEnded(EndReason::Aborted)));
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit("a[Image #1]b[Image #2]".into())
+        );
+        assert_eq!(app.take_submit_images(), vec![png("one"), png("cli")]);
     }
 
     /// The gap between the interrupt and the worker handing the input back is

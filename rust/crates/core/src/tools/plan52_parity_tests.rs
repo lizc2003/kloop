@@ -677,9 +677,7 @@ async fn native_surface_report() -> Value {
     assert!(strict_write_error, "{strict_write}");
     let strict_write_events = projected_todo_events(&todo_ui.take_events(), "todo_write");
 
-    ctx.cfg
-        .inbox
-        .push(InboxItem::Steer("WAIT-PENDING-52".into()));
+    ctx.cfg.inbox.push(InboxItem::steer("WAIT-PENDING-52"));
     let (wait_output, wait_error) = run_tool("wait_for_activity", json!({}), &ctx).await;
     assert!(!wait_error, "{wait_output}");
     let pending_after_wait = ctx.cfg.inbox.drain();

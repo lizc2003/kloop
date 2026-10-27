@@ -539,7 +539,7 @@ fn drain_inbox_offloads_only_large_machine_results() {
         run_id: "run-1".into(),
         summary: large_program.clone(),
     });
-    inbox.push(InboxItem::Steer(large_user.clone()));
+    inbox.push(InboxItem::steer(large_user.clone()));
     let mut history = History::new(dir.clone());
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
 
@@ -4499,8 +4499,7 @@ async fn steering_delivered_at_next_boundary_not_mid_request() {
                 }
             ) && !self.fired.swap(true, Ordering::SeqCst)
             {
-                self.inbox
-                    .push(InboxItem::Steer("also check the logs".into()));
+                self.inbox.push(InboxItem::steer("also check the logs"));
             }
         }
     }
@@ -4521,7 +4520,7 @@ async fn steering_delivered_at_next_boundary_not_mid_request() {
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.rounds, 2);
-    let steer = crate::inbox::InboxItem::Steer("also check the logs".into()).into_user_message();
+    let steer = crate::inbox::InboxItem::steer("also check the logs").into_user_message();
     // [user go, assistant tool_use, user tool_results, user steer, assistant done]
     assert_eq!(
         history.messages()[3],
@@ -4719,7 +4718,7 @@ async fn late_steering_keeps_the_turn_going() {
                 }
             ) && !self.fired.swap(true, Ordering::SeqCst)
             {
-                self.inbox.push(InboxItem::Steer("wait, also do Y".into()));
+                self.inbox.push(InboxItem::steer("wait, also do Y"));
             }
         }
     }
@@ -4744,7 +4743,7 @@ async fn late_steering_keeps_the_turn_going() {
         outcome.rounds, 2,
         "the late steer prevented ending at round 1"
     );
-    let steer = crate::inbox::InboxItem::Steer("wait, also do Y".into()).into_user_message();
+    let steer = crate::inbox::InboxItem::steer("wait, also do Y").into_user_message();
     assert!(history.messages().contains(&steer));
     assert!(cfg.inbox.is_empty(), "the queue was drained");
 }
@@ -4830,7 +4829,7 @@ async fn subagent_does_not_drain_parent_steering() {
                 && !agent.is_empty()
                 && !self.fired.swap(true, Ordering::SeqCst)
             {
-                self.inbox.push(InboxItem::Steer("parent steer".into()));
+                self.inbox.push(InboxItem::steer("parent steer"));
             }
         }
     }
@@ -5179,7 +5178,7 @@ mod a_turn_that_never_happened {
             .await
             .expect("sampling did not start")
             .expect("sampling gate dropped");
-        inbox.push(InboxItem::Steer("actually, the other thing".into()));
+        inbox.push(InboxItem::steer("actually, the other thing"));
         cancel.cancel();
         let (outcome, returned, history) = tokio::time::timeout(Duration::from_secs(2), handle)
             .await

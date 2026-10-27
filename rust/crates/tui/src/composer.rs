@@ -3,9 +3,13 @@
 //! The document uses UTF-8 byte ranges, while editing moves only across extended
 //! grapheme boundaries. Rendering and vertical navigation consume one canonical
 //! visual-row layout. Large pastes are range-addressed atoms: their visible label
-//! is only a projection, and submission expands the exact atom once.
+//! is only a projection, and submission expands the exact atom once. Images are
+//! atoms too (plan 242): `[Image #N]` stays in the submitted text, and the image
+//! itself rides after it as the N-th one.
 
-use kloop_protocol::ContentBlock;
+use std::sync::Arc;
+
+use kloop_protocol::ImageSource;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -35,22 +39,52 @@ const PASTE_LINES: usize = 5;
 const PASTE_PREVIEW_COLS: usize = 24;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+/// Atoms (images and large pastes) stand apart from typed text.
+const ATOM: Style = Style::new().fg(Color::Cyan);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PasteId(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PasteAtom {
-    id: PasteId,
+struct Atom {
     range: TextRange,
     label: String,
-    content: String,
+    payload: AtomPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AtomPayload {
+    Paste {
+        id: PasteId,
+        content: String,
+    },
+    /// 编号按粘贴先后连续为 1..n,是文档不变量：删掉或切掉一张后其余就地重编。
+    /// 图片数据用 `Arc` 共享，草稿进历史、翻历史都不复制 base64。
+    Image {
+        number: usize,
+        source: Arc<ImageSource>,
+    },
+}
+
+impl Atom {
+    /// What an edit cutting into the atom leaves behind. An image has no text
+    /// form, so cutting its label drops the image with it.
+    fn materialized(&self) -> &str {
+        match &self.payload {
+            AtomPayload::Paste { content, .. } => content,
+            AtomPayload::Image { .. } => "",
+        }
+    }
+}
+
+fn image_label(number: usize) -> String {
+    format!("[Image #{number}]")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ComposerDocument {
     display: String,
-    atoms: Vec<PasteAtom>,
+    atoms: Vec<Atom>,
 }
 
 impl ComposerDocument {
@@ -63,11 +97,35 @@ impl ComposerDocument {
         let mut copied = 0;
         for atom in &self.atoms {
             expanded.push_str(&self.display[copied..atom.range.start().get()]);
-            expanded.push_str(&atom.content);
+            match &atom.payload {
+                AtomPayload::Paste { content, .. } => expanded.push_str(content),
+                AtomPayload::Image { .. } => expanded.push_str(&atom.label),
+            }
             copied = atom.range.end().get();
         }
         expanded.push_str(&self.display[copied..]);
         expanded
+    }
+
+    /// The images in number order: the N-th is the one `[Image #N]` names.
+    fn images(&self) -> Vec<Arc<ImageSource>> {
+        let mut images: Vec<(usize, Arc<ImageSource>)> = self
+            .atoms
+            .iter()
+            .filter_map(|atom| match &atom.payload {
+                AtomPayload::Image { number, source } => Some((*number, Arc::clone(source))),
+                AtomPayload::Paste { .. } => None,
+            })
+            .collect();
+        images.sort_by_key(|(number, _)| *number);
+        images.into_iter().map(|(_, source)| source).collect()
+    }
+
+    fn image_count(&self) -> usize {
+        self.atoms
+            .iter()
+            .filter(|atom| matches!(atom.payload, AtomPayload::Image { .. }))
+            .count()
     }
 
     /// The display split into word-scan cells: one per grapheme, but a paste
@@ -103,13 +161,7 @@ impl ComposerDocument {
             .position(|atom| atom.range.start() == offset)
     }
 
-    fn insert_atom(
-        &mut self,
-        at: ByteOffset,
-        id: PasteId,
-        label: String,
-        content: String,
-    ) -> ByteOffset {
+    fn insert_atom(&mut self, at: ByteOffset, label: String, payload: AtomPayload) -> ByteOffset {
         self.assert_boundary(at);
         debug_assert!(
             self.atoms
@@ -120,17 +172,34 @@ impl ComposerDocument {
         let mut projected = self.display.clone();
         projected.insert_str(at.get(), &label);
         let end = ByteOffset::new(at.get() + label.len());
-        if !is_grapheme_boundary(&projected, at) || !is_grapheme_boundary(&projected, end) {
-            return self.replace(TextRange::empty(at), &content);
+        let fits_start = is_grapheme_boundary(&projected, at);
+        let fits_end = is_grapheme_boundary(&projected, end);
+        if !fits_start || !fits_end {
+            match payload {
+                AtomPayload::Paste { content, .. } => {
+                    return self.replace(TextRange::empty(at), &content);
+                }
+                // 图片没有文字形态可退：在缺边界的一侧补一个空格，标签就落在
+                // 字素边界上(前面是 Prepend 字符，或后面紧跟组合符时)。
+                AtomPayload::Image { .. } => {
+                    let mut at = at;
+                    if !fits_start {
+                        at = self.replace_raw(TextRange::empty(at), " ");
+                    }
+                    if !fits_end {
+                        self.replace_raw(TextRange::empty(at), " ");
+                    }
+                    return self.insert_atom(at, label, payload);
+                }
+            }
         }
 
         let cursor = self.replace(TextRange::empty(at), &label);
         debug_assert_eq!(cursor, end);
-        self.atoms.push(PasteAtom {
-            id,
+        self.atoms.push(Atom {
             range: TextRange::new(at, end),
             label,
-            content,
+            payload,
         });
         self.atoms.sort_by_key(|atom| atom.range.start());
         self.assert_invariants();
@@ -156,6 +225,7 @@ impl ComposerDocument {
         }) {
             cursor = self.materialize_atom(index, cursor);
         }
+        let cursor = self.renumber_images(cursor);
         self.assert_invariants();
         cursor
     }
@@ -163,7 +233,52 @@ impl ComposerDocument {
     fn delete_atom(&mut self, index: usize) -> ByteOffset {
         let atom = self.atoms.remove(index);
         let cursor = self.replace_raw(atom.range, "");
+        let cursor = self.renumber_images(cursor);
         self.assert_invariants();
+        cursor
+    }
+
+    /// Close the gaps a removed image left: the rest keep their order and become
+    /// 1..n again, each label rewritten in place. `cursor` is never inside a
+    /// label, so it only moves when a label before it changes length.
+    fn renumber_images(&mut self, mut cursor: ByteOffset) -> ByteOffset {
+        let mut order: Vec<(usize, usize)> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .filter_map(|(index, atom)| match atom.payload {
+                AtomPayload::Image { number, .. } => Some((number, index)),
+                AtomPayload::Paste { .. } => None,
+            })
+            .collect();
+        order.sort_unstable();
+        for (rank, (number, index)) in order.into_iter().enumerate() {
+            let wanted = rank + 1;
+            if number == wanted {
+                continue;
+            }
+            let label = image_label(wanted);
+            let old = self.atoms[index].range;
+            self.display
+                .replace_range(old.start().get()..old.end().get(), &label);
+            for atom in &mut self.atoms {
+                if atom.range.start() >= old.end() {
+                    atom.range = shift_range(atom.range, old.len(), label.len());
+                }
+            }
+            if cursor >= old.end() {
+                cursor = shift_offset(cursor, old.len(), label.len());
+            }
+            let atom = &mut self.atoms[index];
+            atom.range = TextRange::new(
+                old.start(),
+                ByteOffset::new(old.start().get() + label.len()),
+            );
+            atom.label = label;
+            if let AtomPayload::Image { number, .. } = &mut atom.payload {
+                *number = wanted;
+            }
+        }
         cursor
     }
 
@@ -178,10 +293,10 @@ impl ComposerDocument {
         {
             let atom = self.atoms.remove(index);
             let old = atom.range;
-            let materialized_end = ByteOffset::new(old.start().get() + atom.content.len());
+            let materialized_end = ByteOffset::new(old.start().get() + atom.materialized().len());
             let start = map_start(range.start(), old, materialized_end);
             let end = map_end(range.end(), old, materialized_end);
-            self.replace_raw(old, &atom.content);
+            self.replace_raw(old, atom.materialized());
             range = TextRange::new(start, end);
         }
         range
@@ -190,9 +305,9 @@ impl ComposerDocument {
     fn materialize_atom(&mut self, index: usize, cursor: ByteOffset) -> ByteOffset {
         let atom = self.atoms.remove(index);
         let old = atom.range;
-        let materialized_end = ByteOffset::new(old.start().get() + atom.content.len());
+        let materialized_end = ByteOffset::new(old.start().get() + atom.materialized().len());
         let cursor = map_end(cursor, old, materialized_end);
-        self.replace_raw(old, &atom.content);
+        self.replace_raw(old, atom.materialized());
         if is_grapheme_boundary(&self.display, cursor) {
             cursor
         } else {
@@ -243,6 +358,16 @@ impl ComposerDocument {
             );
             previous_end = atom.range.end();
         }
+        let mut numbers: Vec<usize> = self
+            .atoms
+            .iter()
+            .filter_map(|atom| match atom.payload {
+                AtomPayload::Image { number, .. } => Some(number),
+                AtomPayload::Paste { .. } => None,
+            })
+            .collect();
+        numbers.sort_unstable();
+        debug_assert!(numbers.iter().copied().eq(1..=numbers.len()));
     }
 }
 
@@ -373,10 +498,20 @@ struct HistoryEntry {
     document: ComposerDocument,
 }
 
+/// The draft exactly as it was submitted, images in place: what goes back into
+/// the composer when the turn is interrupted before the model produced anything.
 #[derive(Clone, Debug)]
-pub struct Attachment {
-    pub label: String,
-    block: ContentBlock,
+pub struct Draft(ComposerDocument);
+
+impl Draft {
+    /// The text that was sent for this draft.
+    pub fn text(&self) -> String {
+        self.0.expand()
+    }
+
+    pub fn image_count(&self) -> usize {
+        self.0.image_count()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,7 +618,9 @@ pub struct View {
 
 pub struct Submission {
     pub text: String,
-    pub images: Vec<ContentBlock>,
+    /// In number order: the N-th is the image `[Image #N]` in `text` names.
+    pub images: Vec<ImageSource>,
+    pub draft: Draft,
 }
 
 /// One composer edit reachable from a key. `app.rs` owns which key maps to which
@@ -511,7 +648,6 @@ pub struct Composer {
     history: Vec<HistoryEntry>,
     hist: Option<usize>,
     draft: ComposerDocument,
-    attachments: Vec<Attachment>,
     goal_column: Option<usize>,
     next_paste_id: u64,
 }
@@ -524,7 +660,6 @@ impl Composer {
             history: Vec::new(),
             hist: None,
             draft: ComposerDocument::default(),
-            attachments: Vec::new(),
             goal_column: None,
             next_paste_id: 1,
         }
@@ -535,15 +670,11 @@ impl Composer {
     }
 
     pub fn is_blank(&self) -> bool {
-        self.text().trim().is_empty() && self.attachments.is_empty()
+        self.text().trim().is_empty()
     }
 
     pub fn cursor(&self) -> ByteOffset {
         self.cursor
-    }
-
-    pub fn attachments(&self) -> &[Attachment] {
-        &self.attachments
     }
 
     pub fn insert_char(&mut self, character: char) {
@@ -571,9 +702,14 @@ impl Composer {
                 .checked_add(1)
                 .expect("paste id high-water exhausted");
             let label = paste_label(id, text, character_count);
-            self.cursor = self
-                .document
-                .insert_atom(self.cursor, id, label, text.to_string());
+            self.cursor = self.document.insert_atom(
+                self.cursor,
+                label,
+                AtomPayload::Paste {
+                    id,
+                    content: text.to_string(),
+                },
+            );
         } else {
             self.cursor = self.document.replace(TextRange::empty(self.cursor), text);
         }
@@ -601,8 +737,21 @@ impl Composer {
         true
     }
 
-    pub fn attach_image(&mut self, label: String, block: ContentBlock) {
-        self.attachments.push(Attachment { label, block });
+    /// Insert `[Image #N]` at the cursor, N being one past the images already in
+    /// the draft.
+    pub fn attach_image(&mut self, source: ImageSource) {
+        self.attach_shared_image(Arc::new(source));
+    }
+
+    fn attach_shared_image(&mut self, source: Arc<ImageSource>) {
+        self.begin_edit();
+        let number = self.document.image_count() + 1;
+        self.cursor = self.document.insert_atom(
+            self.cursor,
+            image_label(number),
+            AtomPayload::Image { number, source },
+        );
+        self.goal_column = None;
     }
 
     pub fn backspace(&mut self) {
@@ -614,10 +763,6 @@ impl Composer {
             self.cursor = self
                 .document
                 .replace(TextRange::new(previous, self.cursor), "");
-        } else {
-            // 附件行画在正文之前:从正文开头再往前删,删到的是最近粘贴的那张图。
-            // 否则附件只有提交和整稿清空两个出口。
-            self.attachments.pop();
         }
         self.goal_column = None;
     }
@@ -829,19 +974,49 @@ impl Composer {
         if self.is_blank() {
             return None;
         }
-        let text = self.take_text();
-        let images = std::mem::take(&mut self.attachments)
+        let draft = Draft(self.document.clone());
+        let images = self
+            .document
+            .images()
             .into_iter()
-            .map(|attachment| attachment.block)
+            .map(|source| ImageSource::clone(&source))
             .collect();
-        Some(Submission { text, images })
+        let text = self.take_text();
+        Some(Submission {
+            text,
+            images,
+            draft,
+        })
     }
 
-    pub fn submit_text(&mut self) -> Option<String> {
-        if self.text().trim().is_empty() {
+    /// A slash command's line. Commands take text only, so the images are left
+    /// out of it and stay behind as the next draft.
+    pub fn submit_command(&mut self) -> Option<String> {
+        if self.is_blank() {
             return None;
         }
-        Some(self.take_text())
+        let images = self.document.images();
+        let mut command = self.document.clone();
+        while let Some(index) = command
+            .atoms
+            .iter()
+            .position(|atom| matches!(atom.payload, AtomPayload::Image { .. }))
+        {
+            command.delete_atom(index);
+        }
+        self.take_text();
+        for source in images {
+            self.attach_shared_image(source);
+        }
+        Some(command.expand())
+    }
+
+    /// Put a submitted draft back, cursor at its end.
+    pub fn restore(&mut self, draft: Draft) {
+        self.document = draft.0;
+        self.cursor = ByteOffset::new(self.text().len());
+        self.hist = None;
+        self.goal_column = None;
     }
 
     fn take_text(&mut self) -> String {
@@ -862,7 +1037,6 @@ impl Composer {
     pub fn clear(&mut self) {
         self.document = ComposerDocument::default();
         self.cursor = ByteOffset::ZERO;
-        self.attachments.clear();
         self.hist = None;
         self.draft = ComposerDocument::default();
         self.goal_column = None;
@@ -885,6 +1059,31 @@ impl Composer {
         }
 
         self.view_with_prefix(width, PROMPT, Style::new().fg(Color::Cyan))
+    }
+
+    /// One visual row's text, atom pieces styled: a label wrapped across rows is
+    /// styled on each row it reaches.
+    fn row_spans(&self, source: TextRange) -> Vec<Span<'static>> {
+        let text = self.text();
+        let end = source.end().get();
+        let mut at = source.start().get();
+        let mut spans = Vec::new();
+        for atom in &self.document.atoms {
+            let start = atom.range.start().get().max(at);
+            let stop = atom.range.end().get().min(end);
+            if start >= stop {
+                continue;
+            }
+            if at < start {
+                spans.push(Span::raw(text[at..start].to_string()));
+            }
+            spans.push(Span::styled(text[start..stop].to_string(), ATOM));
+            at = stop;
+        }
+        if at < end || spans.is_empty() {
+            spans.push(Span::raw(text[at..end].to_string()));
+        }
+        spans
     }
 
     pub(crate) fn view_with_prefix(&self, width: usize, prefix: &str, style: Style) -> View {
@@ -911,12 +1110,9 @@ impl Composer {
                 } else {
                     (continuation.as_str(), Style::default())
                 };
-                Line::from(vec![
-                    Span::styled(gutter.to_string(), style),
-                    Span::raw(
-                        self.text()[row.source.start().get()..row.source.end().get()].to_string(),
-                    ),
-                ])
+                let mut spans = vec![Span::styled(gutter.to_string(), style)];
+                spans.extend(self.row_spans(row.source));
+                Line::from(spans)
             })
             .collect();
         let cursor_col = (layout.cursor_column + gutter_width).min(width - 1);
@@ -981,13 +1177,22 @@ mod tests {
         }
     }
 
-    fn image() -> ContentBlock {
-        ContentBlock::Image {
-            source: kloop_protocol::ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "aGk=".into(),
-            },
+    fn image(data: &str) -> ImageSource {
+        ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: data.into(),
         }
+    }
+
+    /// What a submit hands over: the text, and the images by their data.
+    fn submitted(composer: &mut Composer) -> (String, Vec<String>) {
+        let submission = composer.submit().expect("not blank");
+        let images = submission
+            .images
+            .into_iter()
+            .map(|ImageSource::Base64 { data, .. }| data)
+            .collect();
+        (submission.text, images)
     }
 
     #[test]
@@ -1185,9 +1390,11 @@ mod tests {
         let mut document = ComposerDocument::default();
         let cursor = document.insert_atom(
             ByteOffset::ZERO,
-            PasteId(1),
             "[Pasted #1: 600 chars]".into(),
-            big.clone(),
+            AtomPayload::Paste {
+                id: PasteId(1),
+                content: big.clone(),
+            },
         );
         let cut = TextRange::new(ByteOffset::ZERO, cursor);
         let cursor = document.replace(cut, "replacement");
@@ -1210,48 +1417,183 @@ mod tests {
     }
 
     #[test]
-    fn image_attachment_rides_submit_and_survives_steer() {
-        let block = image();
-        let mut composer = Composer::new();
-        composer.attach_image("shot.png".into(), block.clone());
-        assert_eq!(composer.attachments()[0].label, "shot.png");
-        assert!(!composer.is_blank());
-        assert!(composer.submit_text().is_none());
-        composer.paste("keep going");
-        assert_eq!(composer.submit_text().as_deref(), Some("keep going"));
-        assert_eq!(composer.attachments()[0].label, "shot.png");
-        assert_eq!(composer.submit().unwrap().images, vec![block]);
-        assert!(composer.attachments().is_empty());
+    fn an_image_lands_at_the_cursor_and_submits_in_number_order() {
+        let mut composer = typed("ab");
+        composer.left();
+        composer.attach_image(image("one"));
+        composer.end();
+        composer.attach_image(image("two"));
+        composer.home();
+        composer.attach_image(image("three"));
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("[Image #3]a[Image #1]b[Image #2]", "[Image #3]".len())
+        );
+        // 编号是粘贴先后，不是位置先后：第 N 张就是 `[Image #N]`。
+        let mut copy = Composer::new();
+        copy.document = composer.document.clone();
+        assert_eq!(
+            submitted(&mut copy),
+            (
+                "[Image #3]a[Image #1]b[Image #2]".into(),
+                vec!["one".into(), "two".into(), "three".into()]
+            )
+        );
+        // 相邻 Backspace 整块删掉一张;删的是最大号，其余不动。
+        composer.backspace();
+        assert_eq!(
+            submitted(&mut composer),
+            (
+                "a[Image #1]b[Image #2]".into(),
+                vec!["one".into(), "two".into()]
+            )
+        );
     }
 
     #[test]
-    fn backspace_at_the_start_detaches_the_newest_image() {
-        fn state(composer: &Composer) -> (&str, Vec<&str>) {
-            let labels = composer
-                .attachments()
-                .iter()
-                .map(|attachment| attachment.label.as_str())
-                .collect();
-            (composer.text(), labels)
-        }
+    fn removing_an_image_renumbers_the_rest_in_place() {
         let mut composer = Composer::new();
-        composer.attach_image("a.png".into(), image());
-        composer.attach_image("b.png".into(), image());
-        composer.paste("hi");
-        composer.backspace();
-        assert_eq!(state(&composer), ("h", vec!["a.png", "b.png"]));
+        composer.attach_image(image("i1"));
         composer.home();
+        for index in 2..=10 {
+            composer.attach_image(image(&format!("i{index}")));
+        }
+        composer.end();
+        // `[Image #1]` 在最后;删掉它，前面 `[Image #10]` 变短一位，光标跟着左移。
         composer.backspace();
-        assert_eq!(state(&composer), ("h", vec!["a.png"]));
-        // Delete 只向后删正文,删空了也不碰附件。
+        let labels: String = (1..=9).map(image_label).collect();
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            (labels.as_str(), labels.len())
+        );
+        let data = (2..=10).map(|index| format!("i{index}")).collect();
+        assert_eq!(submitted(&mut composer), (labels, data));
+    }
+
+    #[test]
+    fn delete_and_word_motion_treat_an_image_as_one_unit() {
+        let mut composer = typed("go ");
+        composer.attach_image(image("one"));
+        composer.insert_text(" x");
+        composer.word_left();
+        composer.word_left();
+        assert_eq!(composer.cursor().get(), "go ".len());
         composer.delete();
-        composer.delete();
-        assert_eq!(state(&composer), ("", vec!["a.png"]));
-        composer.backspace();
-        assert_eq!(state(&composer), ("", vec![]));
-        assert!(composer.is_blank());
-        composer.backspace();
-        assert_eq!(state(&composer), ("", vec![]));
+        assert_eq!(
+            (composer.text(), composer.document.image_count()),
+            ("go  x", 0)
+        );
+    }
+
+    #[test]
+    fn an_edit_cutting_an_image_label_drops_that_image() {
+        let mut document = ComposerDocument::default();
+        for (number, data) in [(1, "a"), (2, "b")] {
+            let at = ByteOffset::new(document.text().len());
+            document.insert_atom(
+                at,
+                image_label(number),
+                AtomPayload::Image {
+                    number,
+                    source: Arc::new(image(data)),
+                },
+            );
+        }
+        let cursor = document.replace(TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)), "x");
+        assert_eq!(
+            (document.text(), cursor.get(), document.images()),
+            ("x[Image #1]", 1, vec![Arc::new(image("b"))])
+        );
+    }
+
+    #[test]
+    fn an_image_label_never_breaks_a_grapheme() {
+        // 换行后紧跟组合符：换行之后是字素边界，但标签的 `]` 会和组合符粘成一个字素。
+        let mut composer = typed("\n\u{301}");
+        composer.left();
+        composer.attach_image(image("one"));
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("\n[Image #1] \u{301}", "\n[Image #1]".len())
+        );
+        assert_eq!(composer.document.image_count(), 1);
+    }
+
+    #[test]
+    fn history_recall_brings_the_images_back() {
+        let mut composer = Composer::new();
+        composer.attach_image(image("one"));
+        composer.insert_text(" look");
+        submitted(&mut composer);
+        composer.up(WIDTH);
+        assert_eq!(
+            submitted(&mut composer),
+            ("[Image #1] look".into(), vec!["one".into()])
+        );
+    }
+
+    #[test]
+    fn a_slash_command_leaves_its_images_as_the_next_draft() {
+        let mut composer = typed("/review ");
+        composer.attach_image(image("one"));
+        composer.attach_image(image("two"));
+        composer.insert_text(" now");
+        assert_eq!(composer.submit_command().as_deref(), Some("/review  now"));
+        assert_eq!(
+            submitted(&mut composer),
+            (
+                "[Image #1][Image #2]".into(),
+                vec!["one".into(), "two".into()]
+            )
+        );
+    }
+
+    #[test]
+    fn a_restored_draft_puts_images_back_where_they_were() {
+        let mut composer = typed("a");
+        composer.attach_image(image("one"));
+        composer.insert_char('b');
+        let draft = composer.submit().expect("not blank").draft;
+        assert_eq!(
+            (draft.text(), draft.image_count()),
+            ("a[Image #1]b".into(), 1)
+        );
+        composer.restore(draft);
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("a[Image #1]b", "a[Image #1]b".len())
+        );
+        assert_eq!(
+            submitted(&mut composer),
+            ("a[Image #1]b".into(), vec!["one".into()])
+        );
+    }
+
+    #[test]
+    fn atoms_are_styled_on_every_row_they_reach() {
+        let mut composer = typed("a");
+        composer.attach_image(image("one"));
+        composer.insert_char('b');
+        let prompt = Span::styled(PROMPT.to_string(), Style::new().fg(Color::Cyan));
+        assert_eq!(
+            composer.view(WIDTH).rows,
+            vec![Line::from(vec![
+                prompt.clone(),
+                Span::raw("a"),
+                Span::styled("[Image #1]", ATOM),
+                Span::raw("b"),
+            ])]
+        );
+
+        let mut wrapped = Composer::new();
+        wrapped.attach_image(image("one"));
+        assert_eq!(
+            wrapped.view(GUTTER_W + 6).rows,
+            vec![
+                Line::from(vec![prompt, Span::styled("[Image", ATOM)]),
+                Line::from(vec![Span::raw("  "), Span::styled(" #1]", ATOM)]),
+            ]
+        );
     }
 
     #[test]

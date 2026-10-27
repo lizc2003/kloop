@@ -67,7 +67,7 @@ pub enum AgentEvent {
     /// echoed and the composer gets the input back to be edited and resent.
     InputReturned {
         text: String,
-        images: Vec<(String, kloop_protocol::ContentBlock)>,
+        images: Vec<kloop_protocol::ImageSource>,
     },
     /// A rewind completed: the worker is on a new session that holds this
     /// forked branch, so the loop rebuilds the transcript from `messages`.

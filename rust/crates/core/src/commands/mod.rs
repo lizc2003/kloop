@@ -812,7 +812,7 @@ mod tests {
         let mut history = History::new(cfg.offload_dir.clone());
         history.record(Message::user_text("some earlier work"));
         cfg.inbox
-            .push(crate::inbox::InboxItem::Steer("queued steer".into()));
+            .push(crate::inbox::InboxItem::steer("queued steer"));
 
         let result = run(
             "/clear",

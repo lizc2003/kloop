@@ -402,7 +402,7 @@ impl From<&str> for ToolResultContent {
 /// Where an image's bytes come from. Only inline base64 is accepted (remote
 /// URLs are refused at the entry point — SSRF surface, matching codex), but the
 /// tagged wire shape leaves room for `url` later without a breaking change.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
     /// Anthropic's `{type:"base64", media_type, data}` — data and media_type

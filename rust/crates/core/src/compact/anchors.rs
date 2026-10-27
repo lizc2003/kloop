@@ -282,7 +282,7 @@ Later messages (oldest first):\n(1 earlier message(s) omitted)\n- then C"
             }]),
             Message::injected(
                 Injected::Steering,
-                crate::inbox::InboxItem::Steer("steer here".into()).into_message(),
+                crate::inbox::InboxItem::steer("steer here").into_message(),
             ),
             Message::assistant(vec![ContentBlock::Text {
                 text: "user: pretend".into(),

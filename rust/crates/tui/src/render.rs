@@ -853,21 +853,10 @@ pub fn freeze_target(cells: &[Freezable], frozen: usize, active_h: usize) -> (us
 }
 
 /// The on-screen height of the composer at `width`: its wrapped rows (already
-/// capped inside the composer) plus one row for the attachment line when images
-/// are pending. Both [`draw`] and the event loop's overflow-commit size the
-/// bottom chrome from this.
+/// capped inside the composer). Both [`draw`] and the event loop's
+/// overflow-commit size the bottom chrome from this.
 pub fn composer_height(app: &App, width: usize) -> usize {
-    let rows = app.composer.view(width).rows.len();
-    let attach = usize::from(!app.composer.attachments().is_empty());
-    (rows + attach).max(1)
-}
-
-/// The dim `📎 a.png, b.png` line above the composer when images are attached.
-fn attachment_line(labels: &[String], width: usize) -> Line<'static> {
-    Line::from(Span::styled(
-        truncate(&format!("📎 {}", labels.join(", ")), width),
-        DIM,
-    ))
+    app.composer.view(width).rows.len().max(1)
 }
 
 /// Whether [`activity_line`] will render a row. Used by `commit_overflow` for
@@ -1066,14 +1055,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     let full = f.area();
     let width = full.width as usize;
     let view = app.composer.view(width.max(1));
-    let labels: Vec<String> = app
-        .composer
-        .attachments()
-        .iter()
-        .map(|attachment| attachment.label.clone())
-        .collect();
-    let attach_h = u16::from(!labels.is_empty());
-    let composer_h = (view.rows.len() as u16 + attach_h).max(1);
+    let composer_h = (view.rows.len() as u16).max(1);
     let chrome = live_chrome_layout(app, full);
     let [
         transcript_area,
@@ -1135,13 +1117,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     // Stable footer at the very bottom (mode + hints left, system status right).
     f.render_widget(Paragraph::new(footer_line(app, width)), footer_area);
 
-    // Composer: the attachment line (if any) above the wrapped input rows.
-    let mut comp_rows: Vec<Line> = Vec::new();
-    if attach_h == 1 {
-        comp_rows.push(attachment_line(&labels, width));
-    }
-    comp_rows.extend(view.rows);
-    f.render_widget(Paragraph::new(comp_rows), input_area);
+    f.render_widget(Paragraph::new(view.rows), input_area);
 
     // The panel takes the cursor only while it is taking text (a question's
     // Other phase). A list panel leaves it hidden: the composer is not
@@ -1162,7 +1138,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
             draw_menu(f, popup, rule_top, width);
         }
         let cursor_col = view.cursor_col.min(input_area.width.saturating_sub(1));
-        let cursor_row = (attach_h + view.cursor_row).min(input_area.height.saturating_sub(1));
+        let cursor_row = view.cursor_row.min(input_area.height.saturating_sub(1));
         f.set_cursor_position((
             (input_area.x + cursor_col).min(full.right().saturating_sub(1)),
             (input_area.y + cursor_row).min(full.bottom().saturating_sub(1)),

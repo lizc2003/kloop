@@ -67,6 +67,7 @@ use kloop_core::rewind::RewindOutcome;
 use kloop_core::rollout::fork_points;
 
 use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
 pub use session_picker::SessionEntry;
 pub use session_picker::pick_session;
@@ -121,8 +122,9 @@ impl StartupReporter {
 
 struct Turn {
     text: String,
-    /// Images the composer attached to this turn (plan 38 slice 3); merged with
-    /// any `--image` blocks that still ride the first turn.
+    /// The composer's images in number order (plan 242), so `[Image #N]` in
+    /// `text` is the N-th; any `--image` blocks still riding the first turn
+    /// are appended after them.
     images: Vec<ContentBlock>,
     cancel: CancellationToken,
 }
@@ -470,10 +472,11 @@ async fn agent_worker(
                     route: cfg.provider_route.public_route(),
                     context_window: cfg.context_window,
                 });
-                // `--image` blocks ride the first turn; the composer's attached
-                // images ride the turn they were sent with. Merge both.
-                let mut images = std::mem::take(&mut pending_images);
-                images.extend(turn.images);
+                // The composer's images ride the turn they were sent with and
+                // lead, so `[Image #N]` in the text is the N-th image; `--image`
+                // blocks ride the first turn after them.
+                let mut images = turn.images;
+                images.append(&mut pending_images);
                 let msg = if images.is_empty() {
                     Message::user_text(turn.text)
                 } else {
@@ -1057,22 +1060,16 @@ where
     unreachable!("bounded geometry retry loop always returns")
 }
 
-/// Take a returned user message apart into what the composer holds: the text as
-/// it was typed, and its attachments. The label an attachment was submitted
-/// under is not in the message, so it comes back as the media type — the same
-/// placeholder a resumed session shows for an image.
-fn split_user_input(input: Message) -> (String, Vec<(String, ContentBlock)>) {
+/// Take a returned user message apart: the text as it was sent (its
+/// `[Image #N]` placeholders included), and the images in message order — the
+/// composer's in number order, then any `--image` blocks.
+fn split_user_input(input: Message) -> (String, Vec<ImageSource>) {
     let mut text = String::new();
     let mut images = Vec::new();
     for block in input.content {
-        match &block {
-            ContentBlock::Text { text: part } => text.push_str(part),
-            ContentBlock::Image {
-                source: kloop_protocol::ImageSource::Base64 { media_type, .. },
-            } => {
-                let label = media_type.clone();
-                images.push((label, block));
-            }
+        match block {
+            ContentBlock::Text { text: part } => text.push_str(&part),
+            ContentBlock::Image { source } => images.push(source),
             _ => {}
         }
     }
@@ -1082,9 +1079,8 @@ fn split_user_input(input: Message) -> (String, Vec<(String, ContentBlock)>) {
 /// Recognize a pasted/dragged image-file path and load it into an Image block
 /// (plan 38 slice 3). Terminals paste a dropped file as its (often quoted) path;
 /// a single-line path with an image extension that reads and validates becomes
-/// an attachment, otherwise the paste is plain text. Returns the display label
-/// (file name) and the block.
-fn load_image_paste(s: &str) -> Option<(String, ContentBlock)> {
+/// an attachment, otherwise the paste is plain text.
+fn load_image_paste(s: &str) -> Option<ImageSource> {
     let path = s.trim().trim_matches(['\'', '"']).trim();
     if path.is_empty() || path.contains('\n') {
         return None;
@@ -1095,13 +1091,7 @@ fn load_image_paste(s: &str) -> Option<(String, ContentBlock)> {
         return None;
     }
     let bytes = std::fs::read(p).ok()?;
-    let block = kloop_core::image::image_block_from_bytes(&bytes).ok()?;
-    let label = p
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
-        .to_string();
-    Some((label, block))
+    clipboard::image_source_from_bytes(&bytes).ok()
 }
 
 async fn search_files(cwd: &std::path::Path, target: &menu::CompletionTarget) -> Vec<String> {
@@ -1255,7 +1245,7 @@ impl UiState {
             }
             Some(Event::Paste(s)) => {
                 match load_image_paste(&s) {
-                    Some((label, block)) => self.app.attach_image(label, block),
+                    Some(source) => self.app.attach_image(source),
                     None => {
                         if let Command::SearchFiles(target) = self.app.paste_text(&s) {
                             let paths = search_files(&self.cwd, &target).await;
@@ -1278,9 +1268,13 @@ impl UiState {
             Command::Submit(text) => {
                 let cancel = CancellationToken::new();
                 self.current_cancel = Some(cancel.clone());
-                // Attachments live on the App (ContentBlock isn't Eq, so they
-                // can't ride the Command); take them here.
-                let images = self.app.take_submit_images();
+                // The images live on the App, not on the Command; take them here.
+                let images = self
+                    .app
+                    .take_submit_images()
+                    .into_iter()
+                    .map(|source| ContentBlock::Image { source })
+                    .collect();
                 let _ = self.msgs.send(WorkerMsg::Turn(Turn {
                     text,
                     images,
@@ -1298,7 +1292,8 @@ impl UiState {
                 // Enqueue for the running turn; the agent loop drains it at the
                 // next round boundary. The user's raw text already showed as a
                 // User cell.
-                self.inbox.push(InboxItem::Steer(text));
+                let images = self.app.take_submit_images();
+                self.inbox.push(InboxItem::Steer { text, images });
             }
             Command::SetMode(mode) => {
                 // shift+Tab: apply the new mode to the shared gate; subsequent
@@ -1329,7 +1324,7 @@ impl UiState {
                 // Read the OS clipboard here (a side effect); attach an image,
                 // or note why there was none.
                 match clipboard::clipboard_image() {
-                    Ok((label, block)) => self.app.attach_image(label, block),
+                    Ok(source) => self.app.attach_image(source),
                     Err(e) => self.app.apply(AgentEvent::Core(CoreEvent::Note(e))),
                 }
             }

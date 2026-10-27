@@ -1626,11 +1626,10 @@ punctuation another, the whitespace between them is skipped, and `\n` counts as
 whitespace so motion crosses hard lines. A CJK run is therefore a single word, and
 every step stays on a grapheme boundary. **Nothing here deletes**: with no undo
 (plan 211), one press of Backspace/Delete removes exactly one unit the user can
-see — a grapheme, a whole paste atom, or (Backspace at the very start of the draft
-only) the newest image on the `📎` line, both described below. The last two are
-larger than a grapheme, but each is a single visible item that pasting again
-brings back, so a slip costs one re-paste rather than typed text the user never
-saw go. Range deletes — Ctrl+W, Ctrl+U, Ctrl+K, Alt+D, and the Meta
+see — a grapheme, or a whole atom (a large paste or an image, both described
+below). An atom is larger than a grapheme, but it is a single visible item that
+pasting again brings back, so a slip costs one re-paste rather than typed text
+the user never saw go. Range deletes — Ctrl+W, Ctrl+U, Ctrl+K, Alt+D, and the Meta
 Backspace/Delete chords — are left unbound, and the kill ring is out of scope.
 
 A large text paste becomes an indivisible, range-addressed **paste atom** with a
@@ -1656,13 +1655,24 @@ accept — materializes its payload before editing.
 **Ctrl+V / Alt+V** pastes an image straight off the OS clipboard (a screenshot,
 browser copy, or Finder-copied file); a pasted or dragged single-line
 **image-file path** attaches too, while ordinary bracketed paste remains text.
-Typed `Attachment { label, block }` records replace the old parallel label/image
-arrays. Images show on a `📎` line and ride the next fresh turn (steering
-preserves them), reusing the `--image` ingestion in `crates/tui/src/clipboard.rs`
-via `arboard`.
-光标在草稿最开头时按 Backspace 会删掉最近粘贴的一张图(`📎` 行画在正文之前,从开头
-再往前删就删到它),这是上文「Nothing here deletes」那条删除规则写明的例外之一;Delete
-不碰附件,连按两次 Esc 清空草稿时附件随正文一起清掉。
+Both reuse the `--image` ingestion in `crates/tui/src/clipboard.rs` via `arboard`.
+
+**图片也是原子(plan 242,照 codex)**:粘贴时在光标处插入 `[Image #N]`,与文字
+随意混排;光标进不去、按词移动一步跨过、相邻 Backspace/Delete 整块删掉，与粘贴
+占位同一套规则。编号按粘贴先后连续为 1..n,是文档不变量：删掉一张后其余保持
+先后、就地改写成连续编号(`[Image #10]` 变 `[Image #9]` 时其后内容与光标随之前移)。
+图片没有文字形态，所以切到标签的编辑(补全替换)直接删掉那张图，而不是像粘贴占位
+那样展开;标签放不到字素边界上时(前面是 Prepend 字符，或紧跟组合符)在缺边界的
+一侧补一个空格。原子在输入框里以青色显示。
+提交时正文在前、`[Image #N]` 原样留在正文里，图片按编号跟在后面，第 N 张就是
+`[Image #N]`;`--image` 的图排在它们之后。**不在每张图前另加标签文本块**:OpenAI
+chat 与 Responses 适配器把一条用户消息的文本块拼成一段、图片统一放到最后，单独
+的标签会被粘到正文末尾——编号顺序是三条 provider 路径都能原样保住的唯一对应。
+steer 同样带上正文里的图片(见 Steering 一节)。图片数据以 `Arc` 共享，草稿进历史、
+↑ 翻回时图片随之恢复;slash 命令只收文字，命令行里的图片留在输入框作为下一条草稿;
+turn 在模型产出任何东西前被打断时，提交时的草稿原样放回(图片在原位),此后的
+`--image` 图接在末尾。转录回显与 resume 回放一致：正文一行，每张图另起一行
+`[image: {media_type}]`。连按两次 Esc 清空草稿时图片随正文一起清掉。
 
 Copying two lines therefore keeps one logical newline between them even when the
 terminal supplies CRLF or CR bytes.
@@ -3507,9 +3517,11 @@ out.
 
 Each **sub-agent gets its own fresh queue** (the `run_agent` tool resets it on the
 cloned Config), so a running sub-agent never drains the parent's steering. TUI enqueues on Enter-while-running (the raw text shows as
-a User cell); server mode enqueues via `turn/steer {thread_id, input}` (while a
+a User cell) together with the images its `[Image #N]` placeholders name —
+`InboxItem::Steer { text, images }` becomes the framed text followed by the
+images, the same shape as an ordinary turn's user message (plan 242); server mode enqueues via `turn/steer {thread_id, input}` (while a
 turn runs it folds in at the next round boundary; while idle the thread worker's
-inbox-activity branch allocates a delivery turn).
+inbox-activity branch allocates a delivery turn); `turn/steer` stays text-only.
 
 **The steer window (plan 198).** A steer that arrives just as a turn is ending
 has a gap to fall into: after the turn's last drain (the end guard above) and
@@ -5060,7 +5072,7 @@ control / treatment：两臂版本与唯一被测差异。
   ZWJ/skin-tone/flag/CJK input, one hard+soft visual-row layout for navigation,
   windowing, cursor projection and height, display-column goal preservation, exact
   completion ranges, stable paste-atom expansion/history/draft/steer behavior, and
-  typed attachments. Pure rendering additionally covers grapheme-safe
+  image atoms (placement, renumbering, history, restore). Pure rendering additionally covers grapheme-safe
   wrap/truncate, per-cell-kind lines, tool-row collapse, diff colors, live-chrome
   reservation, exact/narrow cursor bounds, and popup windowing through Ratatui
   `TestBackend`. TestBackend proves deterministic layout/composition and synthetic
