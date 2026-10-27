@@ -7,7 +7,8 @@ Ctrl+V/Alt+V 与拖入的图片路径不再挂在输入框上方的 `📎` 行�
 那张图，标签放不到字素边界时补空格;原子以青色显示。提交时正文在前、占位原样保留，
 图片按编号跟在后面(`--image` 排在其后)——不加逐图标签块，因为 OpenAI chat 与
 Responses 适配器会把文本块拼成一段、图片放到最后。steer 带图(`InboxItem::Steer
-{ text, images }`,服务端 `turn/steer` 仍只收文字);↑ 翻历史恢复图片;slash 命令的
+{ text, images }`;服务端 `turn/steer` 随后也接上：与 `turn/start` 同一 `input` 形状，
+图片块跟在框定文本之后，非文本非图片的块拒收);↑ 翻历史恢复图片;slash 命令的
 图片留作下一条草稿;中断退回时草稿连同图片原位恢复。`db78ac8` 的“开头 Backspace
 删最近一张”随之取消。新增 composer 单测 9 条、app 单测 4 条、core 单测 1 条。
 外层执行沙箱之外 `make check` 的 fmt、clippy、workspace 全量测试全绿;parity 先因本机

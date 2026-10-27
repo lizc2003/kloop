@@ -18,7 +18,7 @@
   粘到正文末尾。`--image` 的图排在输入框图片之后，不打乱编号。
 - **steer 带图(用户 2026-10-27 同意)**:运行中按 Enter,正文和其中的图片一起进入
   当前 turn。`InboxItem::Steer` 改为带 `text` 与 `images`,注入消息为框定文本在前、
-  图片在后。服务端 `turn/steer` 仍只收文字。
+  图片在后。服务端 `turn/steer` 当时仍只收文字(随后单独一次提交接上，见完成记录)。
 - **历史**:↑ 翻历史时图片随草稿一起恢复(文档原样存进历史，图片数据用 `Arc` 共享)。
 - **slash 命令**:命令只收文字;命令行里的图片不进命令，留在输入框作为下一条草稿，
   与改动前附件留在输入框的行为一致。
@@ -65,3 +65,7 @@
   放宽本机校验器的 kloop 位置检查(只查格式与文件存在，不进仓库)后 `make parity`
   全绿。真实终端里的 Ctrl+V 粘贴与真实 provider 本次未实测。
 - DESIGN 改写删除规则、图片段落与 Steering 一节;HANDOFF 记进展与教训 276。
+- 后续：服务端 `turn/steer` 原本就用 `turn/start` 的 `parse_input` 解析，却把图片块
+  静默丢掉、投影只记文字。现把图片经 `push_steer` 送进 `InboxItem::Steer`,投影记完整
+  `input`,非文本非图片的块以 `INVALID_PARAMS` 拒收;集成测试改为带图 steer 并断言
+  rollout 里那条 steering 消息的完整形状，另加拒收测试。

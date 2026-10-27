@@ -4773,7 +4773,11 @@ async fn the_turn_that_admits_a_steer_answers_it_and_then_closes_its_window() {
                 }
             ) && admitted.is_none()
             {
-                *admitted = Some(self.inbox.push_steer("wait, also do Y".into(), Some(1)));
+                *admitted = Some(self.inbox.push_steer(
+                    "wait, also do Y".into(),
+                    Vec::new(),
+                    Some(1),
+                ));
             }
         }
     }
@@ -4798,7 +4802,7 @@ async fn the_turn_that_admits_a_steer_answers_it_and_then_closes_its_window() {
     assert_eq!(outcome.final_text, "addressed the steer");
     assert_eq!(outcome.rounds, 2);
     assert_eq!(
-        cfg.inbox.push_steer("too late".into(), Some(1)),
+        cfg.inbox.push_steer("too late".into(), Vec::new(), Some(1)),
         Err(SteerRefused::NoActiveTurn)
     );
 }

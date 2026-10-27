@@ -3287,8 +3287,8 @@ async fn missing_question_capability_fails_closed_without_reverse_request() {
 /// `turn/steer` pushed while a turn is hung at an approval gate is delivered
 /// into that same turn: the worker drains the inbox at the next round boundary,
 /// after the tool executes. Proves the server wires steering into a *running*
-/// turn (not just queued for the next one), and that steer echoes the running
-/// turn's id.
+/// turn (not just queued for the next one), that steer echoes the running
+/// turn's id, and that an image part rides after the framed text.
 #[tokio::test]
 async fn steer_folds_into_a_running_turn() {
     let dirs = test_dirs("steer");
@@ -3319,10 +3319,17 @@ async fn steer_folds_into_a_running_turn() {
 
     // Steer while the turn is parked at the gate; the server pushes it to the
     // thread's inbox and acks with the running turn's id.
+    let image = kloop_protocol::ImageSource::Base64 {
+        media_type: "image/png".into(),
+        data: "aGk=".into(),
+    };
     let steer_id = client
         .request(
             "turn/steer",
-            json!({"thread_id": thread_id, "input": "also check the logs"}),
+            json!({"thread_id": thread_id, "input": [
+                {"type": "text", "text": "also check the logs"},
+                {"type": "image", "source": image},
+            ]}),
         )
         .await;
     let log = client.recv_until(|m| m["id"] == steer_id).await;
@@ -3342,17 +3349,49 @@ async fn steer_folds_into_a_running_turn() {
     let messages =
         kloop_core::rollout::load_session(&dirs.sessions.join(format!("{thread_id}.jsonl")))
             .unwrap();
-    let steered = messages.iter().any(|m| {
-        m.content.iter().any(|b| {
-            matches!(b, ContentBlock::Text { text }
-                if text.contains(kloop_core::inbox::STEERING_PREFIX)
-                    && text.contains("also check the logs"))
-        })
-    });
-    assert!(
+    let steered: Vec<_> = messages
+        .iter()
+        .filter(|m| m.injected == Some(kloop_protocol::Injected::Steering))
+        .map(|m| m.content.clone())
+        .collect();
+    assert_eq!(
         steered,
-        "the steer must be delivered as a framed user message in the turn: {messages:?}"
+        vec![vec![
+            ContentBlock::Text {
+                text: format!(
+                    "{}\nalso check the logs",
+                    kloop_core::inbox::STEERING_PREFIX
+                ),
+            },
+            ContentBlock::Image { source: image },
+        ]],
+        "the steer must be delivered as one framed user message in the turn"
     );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A steer has an image channel and nothing else: a part that is neither text
+/// nor an image is refused rather than silently dropped.
+#[tokio::test]
+async fn steer_refuses_a_part_that_is_not_text_or_an_image() {
+    let dirs = test_dirs("steer-bad-part");
+    let mut client = start_server(
+        factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    client.initialize().await;
+    let id = client
+        .request(
+            "turn/steer",
+            json!({"thread_id": "ghost", "input": [
+                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}},
+            ]}),
+        )
+        .await;
+    let err = client.recv().await;
+    assert_eq!(err["id"], id);
+    assert_eq!(err["error"]["code"], -32602);
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

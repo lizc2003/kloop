@@ -1806,7 +1806,9 @@ not migrated. A `thread_id` the client supplies must be ASCII letters, digits,
 (`YYYYMMDD-HHMMSS[-N]`) always are, and the constraint is what lets a thread id
 be used unescaped as a filename, an HTTP header value, and a log field.
 `input` is a string or an array of content parts
-(`{type:"text",text}` / `{type:"image",source:{…}}`).
+(`{type:"text",text}` / `{type:"image",source:{…}}`). `turn/steer` takes the
+same shape: its image parts follow the framed steering text, and a part that is
+neither text nor an image is refused (`INVALID_PARAMS`) rather than dropped.
 
 **Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcp_server_status/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 
@@ -3521,7 +3523,8 @@ a User cell) together with the images its `[Image #N]` placeholders name —
 `InboxItem::Steer { text, images }` becomes the framed text followed by the
 images, the same shape as an ordinary turn's user message (plan 242); server mode enqueues via `turn/steer {thread_id, input}` (while a
 turn runs it folds in at the next round boundary; while idle the thread worker's
-inbox-activity branch allocates a delivery turn); `turn/steer` stays text-only.
+inbox-activity branch allocates a delivery turn), carrying image parts the
+same way.
 
 **The steer window (plan 198).** A steer that arrives just as a turn is ending
 has a gap to fall into: after the turn's last drain (the end guard above) and

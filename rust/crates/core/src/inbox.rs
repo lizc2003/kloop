@@ -376,7 +376,8 @@ impl Inbox {
         self.advance_activity();
     }
 
-    /// Enqueue steering text, admitted against the steer window. With
+    /// Enqueue steering text and the images it carries, admitted against the
+    /// steer window. With
     /// `expected`, the steer is enqueued only if that turn's window is open;
     /// without it, it is always enqueued. Either way the answer is the turn the
     /// steer will reach, or `None` when it will instead start (or wait for) a
@@ -384,6 +385,7 @@ impl Inbox {
     pub fn push_steer(
         &self,
         text: String,
+        images: Vec<ImageSource>,
         expected: Option<u64>,
     ) -> Result<Option<u64>, SteerRefused> {
         let window = {
@@ -395,7 +397,7 @@ impl Inbox {
                 (Some(_), None) => return Err(SteerRefused::NoActiveTurn),
                 (Some(_), Some(active)) => return Err(SteerRefused::TurnMismatch { active }),
             }
-            pending.items.push(InboxItem::steer(text));
+            pending.items.push(InboxItem::Steer { text, images });
             window
         };
         self.advance_activity();
@@ -486,20 +488,26 @@ mod tests {
         // Idle: a conditional steer is refused, an unconditional one is taken
         // and reported as reaching no particular turn.
         assert_eq!(
-            inbox.push_steer("late".into(), Some(3)),
+            inbox.push_steer("late".into(), Vec::new(), Some(3)),
             Err(SteerRefused::NoActiveTurn)
         );
         assert!(inbox.is_empty(), "a refused steer enqueues nothing");
-        assert_eq!(inbox.push_steer("idle".into(), None), Ok(None));
+        assert_eq!(inbox.push_steer("idle".into(), Vec::new(), None), Ok(None));
         assert_eq!(inbox.drain(), vec![InboxItem::steer("idle")]);
 
         inbox.open_steer_window(4);
         assert_eq!(
-            inbox.push_steer("stale".into(), Some(3)),
+            inbox.push_steer("stale".into(), Vec::new(), Some(3)),
             Err(SteerRefused::TurnMismatch { active: 4 })
         );
-        assert_eq!(inbox.push_steer("amend".into(), Some(4)), Ok(Some(4)));
-        assert_eq!(inbox.push_steer("also".into(), None), Ok(Some(4)));
+        assert_eq!(
+            inbox.push_steer("amend".into(), Vec::new(), Some(4)),
+            Ok(Some(4))
+        );
+        assert_eq!(
+            inbox.push_steer("also".into(), Vec::new(), None),
+            Ok(Some(4))
+        );
         assert_eq!(
             inbox.drain(),
             vec![InboxItem::steer("amend"), InboxItem::steer("also")]
@@ -519,15 +527,21 @@ mod tests {
             inbox.drain_or_close_steer_window(),
             vec![InboxItem::steer("keep going")]
         );
-        assert_eq!(inbox.push_steer("still 7".into(), Some(7)), Ok(Some(7)));
+        assert_eq!(
+            inbox.push_steer("still 7".into(), Vec::new(), Some(7)),
+            Ok(Some(7))
+        );
         assert_eq!(inbox.drain().len(), 1);
 
         assert_eq!(inbox.drain_or_close_steer_window(), Vec::new());
         assert_eq!(
-            inbox.push_steer("too late".into(), Some(7)),
+            inbox.push_steer("too late".into(), Vec::new(), Some(7)),
             Err(SteerRefused::NoActiveTurn)
         );
-        assert_eq!(inbox.push_steer("next turn".into(), None), Ok(None));
+        assert_eq!(
+            inbox.push_steer("next turn".into(), Vec::new(), None),
+            Ok(None)
+        );
     }
 
     /// An over-release used to wrap the counter, and a wrapped counter leaves

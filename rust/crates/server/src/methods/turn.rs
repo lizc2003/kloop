@@ -3,6 +3,7 @@
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use kloop_protocol::ContentBlock;
 use serde_json::Value;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -63,11 +64,12 @@ impl Server {
         Ok(json!({"turn": {"id": turn_id}}))
     }
 
-    /// Enqueue steering text typed while a turn runs (or between turns). Unlike
-    /// `turn/start` this never starts a turn itself and never checks the
-    /// running flag: a steer admitted into a running turn's window folds in at
-    /// its next round boundary, and one pushed while idle wakes the worker's
-    /// inbox branch, which starts a delivery turn for it.
+    /// Enqueue steering typed while a turn runs (or between turns): its text,
+    /// and any image parts, which follow the framed text as in a turn's user
+    /// message. Unlike `turn/start` this never starts a turn itself and never
+    /// checks the running flag: a steer admitted into a running turn's window
+    /// folds in at its next round boundary, and one pushed while idle wakes the
+    /// worker's inbox branch, which starts a delivery turn for it.
     ///
     /// `expected_turn_id` makes the steer conditional: it is enqueued only while
     /// that turn is still taking steers, and otherwise refused with nothing
@@ -87,19 +89,29 @@ impl Server {
                 ))
             })?),
         };
-        let (text, _images) = parse_input(params).map_err(SteerError::Request)?;
+        let (text, blocks) = parse_input(params).map_err(SteerError::Request)?;
+        // steer 只有图片通道：别的块拒收，不静默丢掉。
+        let images = blocks
+            .into_iter()
+            .map(|block| match block {
+                ContentBlock::Image { source } => Ok(source),
+                _ => Err(SteerError::Request((
+                    wire::INVALID_PARAMS,
+                    "turn/steer input takes only text and image parts".into(),
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             SteerError::Request((
                 wire::SERVER_ERROR,
                 format!("no active thread '{thread_id}'"),
             ))
         })?;
-        let input = Value::String(text.clone());
         let turn_id = handle
             .inbox
-            .push_steer(text, expected)
+            .push_steer(text, images, expected)
             .map_err(SteerError::Refused)?;
-        handle.projection.record_input(turn_id, &input);
+        handle.projection.record_input(turn_id, &params["input"]);
         Ok(json!({"turn_id": turn_id}))
     }
 
