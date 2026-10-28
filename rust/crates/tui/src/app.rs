@@ -1737,7 +1737,10 @@ impl App {
         // it is echoed like one: `/compact` can work for a minute, and without
         // the echo pressing Enter leaves the screen exactly as it was. While a
         // turn runs, a '/'-line is steering.
-        if !self.running && !display.is_empty() && kloop_core::commands::is_command(&display) {
+        if !self.running
+            && !display.is_empty()
+            && (kloop_core::commands::is_command(&display) || self.held_command().is_some())
+        {
             // The command line goes out EXPANDED — `/name <pasted block>` has to
             // reach the skill / summarizer as its content, not as a
             // `[Pasted #1: n chars]` label. Detection and the echo stay on the
@@ -3275,6 +3278,18 @@ mod tests {
         assert_eq!(
             app.on_key(80, key(KeyCode::Enter)),
             Command::Submit("/usr/bin 这个路径不对".into())
+        );
+
+        // A loaded skill name that contains `/` outranks the path rule: the
+        // catalog is what `commands::run` can actually resolve.
+        let mut app = app_with_commands().with_commands(vec![menu::CommandInfo {
+            name: "team/review".into(),
+            description: "review a team diff".into(),
+        }]);
+        type_str(&mut app, "/team/review this diff");
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Slash("/team/review this diff".into())
         );
 
         // Idle, a one-word name is a real command (routing does not consult the

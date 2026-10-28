@@ -298,7 +298,7 @@ async fn run_turn_or_command(
             .await
             .reason;
     }
-    if turn.images.is_empty() && commands::is_command(&turn.text) {
+    if turn.images.is_empty() && commands::is_command_or_skill(&turn.text, &cfg.skills) {
         let result = commands::run_with_provider_state(
             &turn.text,
             history,

@@ -335,7 +335,7 @@ async fn plain_main(
         // Slash commands run inline: the REPL owns History directly, so no
         // routing is needed (unlike the TUI). Ctrl+C cancels a slow one (e.g.
         // /compact), waits for it to settle, then exits the plain REPL.
-        if kloop_core::commands::is_command(&line) {
+        if kloop_core::commands::is_command_or_skill(&line, &cfg.skills) {
             let cancel = CancellationToken::new();
             let (result, exit_requested) = run_plain_operation(
                 kloop_core::commands::run_with_provider_state(

@@ -3738,7 +3738,10 @@ An unknown `/name` lists the available commands (the same discoverable shape
 as an unknown `agent_type`). A slash command is diagnosed by
 `commands::is_command` as `/` plus one word that contains no `/`, so a pasted
 absolute path (`/usr/bin is wrong`, `/tmp/report.md, review this`) is an
-ordinary message at every front-end, not a command named after the path.
+ordinary message at every front-end, not a command named after the path. A
+loaded skill whose frontmatter name contains `/` (`name: team/review`) is the
+exception: `is_command_or_skill` (and the TUI's catalog) checks the exact name
+first, because `commands::run` resolves that same word.
 Commands run **only when idle** — they read or rewrite History, which a running
 turn is otherwise using. So while a turn runs,
 a `/`-line whose first word names a **known** command or skill is *parked*: the

@@ -5,8 +5,9 @@
 （`/private/tmp/…/review.md, 审查这个报告`）会被当成命令名，回一条
 `unknown command '…'`。现在命令名限定为第一个空白分隔词且不含 `/`：
 路径形态的输入在任何前端都按普通消息/steer 走，单词形未知命令仍由
-`commands::run` 列出可用命令。流式 steer 的 `held_command` 继续只认目录里的
-已知命令，两处判定不再互相矛盾。core 单测改名并补路径断言，TUI 空闲提交
+`commands::run` 列出可用命令。已加载技能名可以带 `/`(frontmatter
+`name: team/review`)，三个入口改用 `is_command_or_skill` 按精确名优先匹配，
+TUI 直接复用 slash 目录；路径规则不会再把这类技能挡在命令层之外。core 单测改名并补路径断言，TUI 空闲提交
 回归改为断言 `Command::Submit`；DESIGN 对应段落同步。外层执行沙箱之外
 `make check` 全绿（含本机 parity）。提交号以本条所在提交为准。
 

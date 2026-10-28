@@ -184,25 +184,38 @@ pub const BUILTINS: &[Builtin] = &[
     },
 ];
 
+/// The command name on a slash line: the leading `/` stripped and cut at the
+/// first whitespace. `None` when the line has no `/` or no name after it.
+fn slash_name(line: &str) -> Option<&str> {
+    line.strip_prefix('/')?
+        .split(char::is_whitespace)
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
 /// Whether an input line is a slash-command invocation: a leading `/` followed
 /// by a command name — the first word, which must not contain `/`. Everything
 /// else is a normal message to the model, so a pasted absolute path such as
 /// `/Users/me/report.md, review this` is not read as a command named after the
 /// path. A one-word unknown name still reaches [`run`], which answers with the
-/// available commands.
+/// available commands. Use [`is_command_or_skill`] on any path that has the
+/// loaded skills: their names may contain `/`.
 pub fn is_command(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix('/') else {
-        return false;
-    };
-    match rest.split(char::is_whitespace).next() {
-        Some(name) => !name.is_empty() && !name.contains('/'),
-        None => false,
-    }
+    slash_name(line).is_some_and(|name| !name.contains('/'))
 }
 
-/// Parse and run a slash-command line. Assumes [`is_command`] already held; an
-/// unrecognized name is handled (not an error) so the reply can list what
-/// exists — the same discoverable shape as an unknown agent_type.
+/// [`is_command`], plus a loaded skill matched by exact name. A skill's
+/// frontmatter name may contain `/` (`name: team/review`), and [`run`] resolves
+/// exactly that first word, so routing has to accept it — the path rule alone
+/// would call the line a message and the skill could never be invoked.
+pub fn is_command_or_skill(line: &str, skills: &[crate::skills::Skill]) -> bool {
+    is_command(line) || slash_name(line).is_some_and(|name| skills.iter().any(|s| s.name == name))
+}
+
+/// Parse and run a slash-command line. Assumes [`is_command`] or
+/// [`is_command_or_skill`] already held; an unrecognized name is handled (not an
+/// error) so the reply can list what exists — the same discoverable shape as an
+/// unknown agent_type.
 ///
 /// `ui` is the live event seam. Most commands never touch it: they return text
 /// and the front-end shows it. `/compact` does — a [`SlashResult`] only exists
@@ -339,6 +352,19 @@ mod tests {
         assert!(!is_command("/ spaced"));
         assert!(!is_command("hello"));
         assert!(!is_command("  /help")); // leading space: a normal message
+    }
+
+    #[test]
+    fn a_loaded_skill_name_with_a_slash_is_still_a_command() {
+        let skills = vec![crate::skills::Skill {
+            name: "team/review".into(),
+            ..Default::default()
+        }];
+        // The path rule alone would send it to the model.
+        assert!(!is_command("/team/review this diff"));
+        assert!(is_command_or_skill("/team/review this diff", &skills));
+        assert!(!is_command_or_skill("/team/other", &skills));
+        assert!(!is_command_or_skill("/usr/bin is wrong", &skills));
     }
 
     #[tokio::test]
