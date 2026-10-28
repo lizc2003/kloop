@@ -3735,13 +3735,16 @@ Anthropic prompt cache (the request prefix changes), so the next turn re-pays
 cache creation.
 
 An unknown `/name` lists the available commands (the same discoverable shape
-as an unknown `agent_type`). Commands run **only when idle** — they read or
-rewrite History, which a running turn is otherwise using. So while a turn runs,
+as an unknown `agent_type`). A slash command is diagnosed by
+`commands::is_command` as `/` plus one word that contains no `/`, so a pasted
+absolute path (`/usr/bin is wrong`, `/tmp/report.md, review this`) is an
+ordinary message at every front-end, not a command named after the path.
+Commands run **only when idle** — they read or rewrite History, which a running
+turn is otherwise using. So while a turn runs,
 a `/`-line whose first word names a **known** command or skill is *parked*: the
 draft stays in the composer, Enter is a no-op that leaves it there, and a hint
-row above the composer says it runs when the turn ends. This is deliberately
-not `commands::is_command` (slash followed by non-space), which would swallow
-real steering like `/usr/bin is wrong`; the catalog decides. The plain REPL runs them inline (it owns
+row above the composer says it runs when the turn ends. The catalog decides
+that question — a known name parks, anything else is steering. The plain REPL runs them inline (it owns
 History); the TUI routes them to its worker (which owns History) so a slow
 `/compact` shows as busy and Ctrl+C interrupts it like a turn. Only cc has
 this feature among the three references (claw has built-in slash but no user

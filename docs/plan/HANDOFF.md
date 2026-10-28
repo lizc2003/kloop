@@ -1,5 +1,15 @@
 # HANDOFF — 当前状态与会话交接
 
+**斜杠命令不再吞掉路径开头的消息（2026-10-28，审查后小修）**：
+`commands::is_command` 原先只要求 `/` 后接非空白，于是粘贴一份绝对路径
+（`/private/tmp/…/review.md, 审查这个报告`）会被当成命令名，回一条
+`unknown command '…'`。现在命令名限定为第一个空白分隔词且不含 `/`：
+路径形态的输入在任何前端都按普通消息/steer 走，单词形未知命令仍由
+`commands::run` 列出可用命令。流式 steer 的 `held_command` 继续只认目录里的
+已知命令，两处判定不再互相矛盾。core 单测改名并补路径断言，TUI 空闲提交
+回归改为断言 `Command::Submit`；DESIGN 对应段落同步。外层执行沙箱之外
+`make check` 全绿（含本机 parity）。提交号以本条所在提交为准。
+
 **全仓审查立项：plan 243–270（2026-10-28，待实现）**：
 用户要求全面扫一遍错漏、重复与可优化处。按领域分 12 路只读审查(工具派发、文件/搜索、shell/进程、
 权限/沙箱、agent 主循环、子 agent/编排、配置/持久化、provider、TUI、CLI、server/mcp/web、跨 crate

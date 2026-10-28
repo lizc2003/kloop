@@ -3267,7 +3267,17 @@ mod tests {
             Command::Steer("/usr/bin 这个路径不对".into())
         );
 
-        // Idle, the same line is a real command (routing does not consult the
+        // A path-shaped line is a message at any time: the command name is one
+        // word without `/`, so `/usr/bin is wrong` never reaches the command
+        // layer even when idle.
+        let mut app = app_with_commands();
+        type_str(&mut app, "/usr/bin 这个路径不对");
+        assert_eq!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit("/usr/bin 这个路径不对".into())
+        );
+
+        // Idle, a one-word name is a real command (routing does not consult the
         // catalog — an unknown name is answered by `commands::run`).
         let mut app = App::new("s".into());
         type_str(&mut app, "/compact");

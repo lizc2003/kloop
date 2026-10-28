@@ -185,9 +185,19 @@ pub const BUILTINS: &[Builtin] = &[
 ];
 
 /// Whether an input line is a slash-command invocation: a leading `/` followed
-/// by a non-space character. Everything else is a normal message to the model.
+/// by a command name — the first word, which must not contain `/`. Everything
+/// else is a normal message to the model, so a pasted absolute path such as
+/// `/Users/me/report.md, review this` is not read as a command named after the
+/// path. A one-word unknown name still reaches [`run`], which answers with the
+/// available commands.
 pub fn is_command(line: &str) -> bool {
-    matches!(line.strip_prefix('/'), Some(rest) if rest.starts_with(|c: char| !c.is_whitespace()))
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    match rest.split(char::is_whitespace).next() {
+        Some(name) => !name.is_empty() && !name.contains('/'),
+        None => false,
+    }
 }
 
 /// Parse and run a slash-command line. Assumes [`is_command`] already held; an
@@ -320,10 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn is_command_detects_slash_lines_only() {
+    fn is_command_detects_command_words_only() {
         assert!(is_command("/help"));
         assert!(is_command("/help me"));
-        assert!(is_command("/usr/bin")); // a command line (unknown name)
+        assert!(!is_command("/usr/bin")); // a path, not a command name
+        assert!(!is_command("/private/tmp/report.md, review this"));
         assert!(!is_command("/")); // bare slash: not a command
         assert!(!is_command("/ spaced"));
         assert!(!is_command("hello"));
