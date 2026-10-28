@@ -3146,7 +3146,7 @@ mod tests {
     /// images in placeholder order; the echo is the text plus one line per
     /// image, exactly what a resumed session replays.
     #[test]
-    fn a_fresh_turn_sends_its_images_in_number_order() {
+    fn a_fresh_turn_sends_its_images_in_placeholder_order() {
         let mut app = App::new("s".into());
         type_str(&mut app, "compare ");
         app.attach_image(png("one"));
@@ -3184,18 +3184,18 @@ mod tests {
         assert_eq!(app.take_submit_images(), vec![png("one")]);
         assert!(app.composer.is_blank());
 
-        // 编号在会话里持续累加：下一条输入里的新图是 #2。
+        // 下一条输入从 #1 重新编号。
         app.attach_image(png("two"));
         assert_eq!(
             app.on_key(80, key(KeyCode::Enter)),
-            Command::Steer("[Image #2]".into())
+            Command::Steer("[Image #1]".into())
         );
         assert_eq!(app.take_submit_images(), vec![png("two")]);
         assert_eq!(
             app.cells,
             vec![
                 Cell::User("[Image #1] look".into()),
-                Cell::User("[Image #2]".into()),
+                Cell::User("[Image #1]".into()),
             ]
         );
     }

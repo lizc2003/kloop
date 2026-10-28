@@ -58,9 +58,9 @@ enum AtomPayload {
         id: PasteId,
         content: String,
     },
-    /// 编号在整个会话里按粘贴先后递增、从不复用(与粘贴占位同理):删掉一张，
-    /// 其余编号不变，用户才认得出删的是哪张。图片数据用 `Arc` 共享，草稿进
-    /// 历史、翻历史都不复制 base64。
+    /// 编号在一次输入里按粘贴先后递增，不复用也不重编：删掉一张，其余编号
+    /// 不变，用户才认得出删的是哪张。图片数据用 `Arc` 共享，草稿进历史、翻
+    /// 历史都不复制 base64。
     Image {
         number: usize,
         source: Arc<ImageSource>,
@@ -86,6 +86,10 @@ fn image_label(number: usize) -> String {
 struct ComposerDocument {
     display: String,
     atoms: Vec<Atom>,
+    /// The highest image number this input has handed out. It lives on the
+    /// draft, so a new input starts again at #1 while history recall and a
+    /// restored draft carry on from their own numbers.
+    image_high_water: usize,
 }
 
 impl ComposerDocument {
@@ -196,6 +200,9 @@ impl ComposerDocument {
 
         let cursor = self.replace(TextRange::empty(at), &label);
         debug_assert_eq!(cursor, end);
+        if let AtomPayload::Image { number, .. } = &payload {
+            self.image_high_water = self.image_high_water.max(*number);
+        }
         self.atoms.push(Atom {
             range: TextRange::new(at, end),
             label,
@@ -360,6 +367,11 @@ impl ComposerDocument {
             .collect();
         numbers.sort_unstable();
         debug_assert!(numbers.windows(2).all(|pair| pair[0] < pair[1]));
+        debug_assert!(
+            numbers
+                .last()
+                .is_none_or(|&last| last <= self.image_high_water)
+        );
     }
 }
 
@@ -642,7 +654,6 @@ pub struct Composer {
     draft: ComposerDocument,
     goal_column: Option<usize>,
     next_paste_id: u64,
-    next_image_number: usize,
 }
 
 impl Composer {
@@ -655,7 +666,6 @@ impl Composer {
             draft: ComposerDocument::default(),
             goal_column: None,
             next_paste_id: 1,
-            next_image_number: 1,
         }
     }
 
@@ -731,14 +741,10 @@ impl Composer {
         true
     }
 
-    /// Insert `[Image #N]` at the cursor, N one past every number this session
-    /// has handed out — survives submit and clear, so a deleted image's number
-    /// never comes back.
+    /// Insert `[Image #N]` at the cursor, N one past every number this input has
+    /// handed out, so a deleted image's number never comes back within it.
     pub fn attach_image(&mut self, source: ImageSource) {
-        let number = self.next_image_number;
-        self.next_image_number = number
-            .checked_add(1)
-            .expect("image number high-water exhausted");
+        let number = self.document.image_high_water + 1;
         self.insert_image(number, Arc::new(source));
     }
 
@@ -994,6 +1000,7 @@ impl Composer {
             return None;
         }
         let images = self.document.images();
+        let high_water = self.document.image_high_water;
         let mut command = self.document.clone();
         while let Some(index) = command
             .atoms
@@ -1006,6 +1013,8 @@ impl Composer {
         for (number, source) in images {
             self.insert_image(number, source);
         }
+        // 留下的图仍是这次输入：已删掉的号也不能在它上面复用。
+        self.document.image_high_water = high_water;
         Some(command.expand())
     }
 
@@ -1449,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn image_numbers_stay_put_and_never_come_back() {
+    fn image_numbers_stay_put_within_an_input() {
         let mut composer = Composer::new();
         for data in ["i1", "i2", "i3"] {
             composer.attach_image(image(data));
@@ -1469,11 +1478,17 @@ mod tests {
                 vec!["i1".into(), "i4".into()]
             )
         );
-        // 提交与清空都不重置：清空等于删掉了图，它们的号同样不再出现。
+        // 提交或清空之后是新的一次输入，从 #1 重新开始。
         composer.attach_image(image("i5"));
+        assert_eq!(composer.text(), "[Image #1]");
         composer.clear();
         composer.attach_image(image("i6"));
-        assert_eq!(composer.text(), "[Image #6]");
+        assert_eq!(composer.text(), "[Image #1]");
+        // 翻回历史里的那次输入，接着它自己的编号往上加。
+        composer.clear();
+        composer.up(WIDTH);
+        composer.attach_image(image("i7"));
+        assert_eq!(composer.text(), "[Image #1][Image #4][Image #5]");
     }
 
     #[test]
@@ -1581,13 +1596,17 @@ mod tests {
         let mut composer = typed("/review ");
         composer.attach_image(image("one"));
         composer.attach_image(image("two"));
+        composer.attach_image(image("gone"));
+        composer.backspace();
         composer.insert_text(" now");
         assert_eq!(composer.submit_command().as_deref(), Some("/review  now"));
+        // 留下的图还属于这次输入：删掉的 #3 不复用。
+        composer.attach_image(image("three"));
         assert_eq!(
             submitted(&mut composer),
             (
-                "[Image #1][Image #2]".into(),
-                vec!["one".into(), "two".into()]
+                "[Image #1][Image #2][Image #4]".into(),
+                vec!["one".into(), "two".into(), "three".into()]
             )
         );
     }

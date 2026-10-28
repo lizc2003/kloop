@@ -567,7 +567,7 @@ mod tests {
         assert!(inbox.is_empty());
     }
 
-    /// 带图的 steer 与普通 turn 的用户消息同形：框定文本在前，图片按编号跟在后面。
+    /// 带图的 steer 与普通 turn 的用户消息同形：框定文本在前，图片按占位先后跟在后面。
     #[test]
     fn steering_with_images_keeps_them_after_the_framed_text() {
         let image = |data: &str| ImageSource::Base64 {
