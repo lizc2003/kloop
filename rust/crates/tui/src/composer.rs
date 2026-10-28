@@ -1013,8 +1013,11 @@ impl Composer {
         for (number, source) in images {
             self.insert_image(number, source);
         }
-        // 留下的图仍是这次输入：已删掉的号也不能在它上面复用。
-        self.document.image_high_water = high_water;
+        // 留下了图，它们仍是这次输入：已删掉的号也不能在上面复用。一张没留
+        // 就是新输入，从 #1 起。
+        if self.document.image_count() > 0 {
+            self.document.image_high_water = high_water;
+        }
         Some(command.expand())
     }
 
@@ -1609,6 +1612,17 @@ mod tests {
                 vec!["one".into(), "two".into(), "three".into()]
             )
         );
+    }
+
+    #[test]
+    fn a_slash_command_that_leaves_no_image_starts_the_next_input_at_one() {
+        let mut composer = Composer::new();
+        composer.attach_image(image("gone"));
+        composer.backspace();
+        composer.insert_text("/help");
+        assert_eq!(composer.submit_command().as_deref(), Some("/help"));
+        composer.attach_image(image("one"));
+        assert_eq!(composer.text(), "[Image #1]");
     }
 
     #[test]
