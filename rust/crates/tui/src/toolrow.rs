@@ -55,7 +55,11 @@ pub fn tool_cell_lines(
     if name == "edit_file" {
         lines.extend(edit_diff_lines(input, width));
     } else if let Some(out) = output {
-        lines.extend(preview_lines(out, status == ToolStatus::Failed, width));
+        if name == "ask_user_question" && status != ToolStatus::Failed {
+            lines.extend(ask_result_lines(input, out, width));
+        } else {
+            lines.extend(preview_lines(out, status == ToolStatus::Failed, width));
+        }
     }
     lines
 }
@@ -208,17 +212,21 @@ fn tool_label(name: &str, input: &str) -> (String, String) {
             };
             ("Schedule wakeup".into(), detail)
         }
-        // The first question is the one the user is about to read; the rest of
-        // the panel is not a transcript row's job.
+        // The panel's short title, not the question text: that runs to 1000
+        // characters and truncates mid-sentence on a row, while the header is
+        // written to identify the question in one line.
         "ask_user_question" => {
-            let first = v
-                .get("questions")
-                .and_then(Value::as_array)
-                .and_then(|questions| questions.first())
-                .and_then(|question| question.get("question"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            ("Ask".into(), first.to_string())
+            let questions = v.get("questions").and_then(Value::as_array);
+            let detail = match questions.map(Vec::as_slice) {
+                Some([one]) => one
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                Some(many) if !many.is_empty() => format!("{} questions", many.len()),
+                _ => String::new(),
+            };
+            ("Ask".into(), detail)
         }
         "enter_plan_mode" => ("Enter plan mode".into(), String::new()),
         // The plan itself is the result preview under the row, not the detail.
@@ -318,6 +326,90 @@ fn diff_line(gutter: &str, sign: &str, text: &str, color: Color, width: usize) -
             Style::new().fg(color),
         ),
     ])
+}
+
+/// The result text core writes for a cancelled question, matched so the row can
+/// say that in one line instead of previewing the model-facing instructions.
+const CANCELLED_RESULT: &str = "The user cancelled the questions without answering.";
+
+/// One answered question as the row shows it: the question's own short header
+/// and the labels (plus any typed-in text) the user chose.
+struct AskAnswer {
+    header: String,
+    answer: String,
+}
+
+/// What came of the question, from the result core wrote: the answers, a
+/// one-line cancel, or — when the result is neither — the plain output preview.
+fn ask_result_lines(input: &str, out: &str, width: usize) -> Vec<Line<'static>> {
+    if let Some(answers) = ask_answers(input, out) {
+        let named = answers.len() > 1;
+        return answers
+            .iter()
+            .enumerate()
+            .map(|(index, answer)| {
+                let gutter = if index == 0 { GUTTER } else { GUTTER_CONT };
+                let label = if named {
+                    Some(answer.header.as_str())
+                } else {
+                    None
+                };
+                answer_line(gutter, label, &answer.answer, width)
+            })
+            .collect();
+    }
+    if out.trim_start().starts_with(CANCELLED_RESULT) {
+        return vec![answer_line(GUTTER, None, "cancelled — no answer", width)];
+    }
+    preview_lines(out, false, width)
+}
+
+/// Pair every question in the call's input with the answer core wrote into the
+/// result. The answer is the JSON string that follows `"<question>"=`, so the
+/// match rests on the question text the call already carries rather than on the
+/// sentence around it. `None` when the result is not an answered form (an error,
+/// or a bounded result that lost its tail) and the row should fall back.
+fn ask_answers(input: &str, out: &str) -> Option<Vec<AskAnswer>> {
+    let v: Value = serde_json::from_str(input).ok()?;
+    let questions = v.get("questions")?.as_array()?;
+    if questions.is_empty() {
+        return None;
+    }
+    let mut read = 0;
+    let mut answers = Vec::with_capacity(questions.len());
+    for question in questions {
+        let text = question.get("question")?.as_str()?;
+        let needle = format!("{}=", serde_json::to_string(text).ok()?);
+        let at = read + out.get(read..)?.find(&needle)? + needle.len();
+        let mut values = serde_json::Deserializer::from_str(out.get(at..)?).into_iter::<String>();
+        let answer = values.next()?.ok()?;
+        read = at + values.byte_offset();
+        let header = question
+            .get("header")
+            .and_then(Value::as_str)
+            .filter(|header| !header.trim().is_empty())
+            .unwrap_or(text)
+            .to_string();
+        answers.push(AskAnswer { header, answer });
+    }
+    Some(answers)
+}
+
+/// One answer row. Multiple questions name the question first, dim, and the
+/// choice after it in the row's own weight, so the eye lands on what was chosen
+/// rather than on the boilerplate the result sentence used to start with.
+fn answer_line(gutter: &str, label: Option<&str>, answer: &str, width: usize) -> Line<'static> {
+    let content_w = width.saturating_sub(display_width(GUTTER)).max(1);
+    let mut spans = vec![Span::styled(gutter.to_string(), DIM)];
+    let mut budget = content_w;
+    if let Some(label) = label {
+        // Half the row at most: a long header must leave room for the answer.
+        let label = truncate(&format!("{} → ", clean(label)), (content_w / 2).max(1));
+        budget = content_w.saturating_sub(display_width(&label)).max(1);
+        spans.push(Span::styled(label, DIM));
+    }
+    spans.push(Span::raw(truncate(&clean(answer), budget)));
+    Line::from(spans)
 }
 
 /// The result preview under a tool row: the first few lines, each truncated to
@@ -808,7 +900,7 @@ mod tests {
             (
                 "ask_user_question",
                 r#"{"questions":[{"question":"Which rail?","header":"Rail","options":[]}]}"#,
-                "✓ Ask Which rail?",
+                "✓ Ask Rail",
             ),
             ("enter_plan_mode", "{}", "✓ Enter plan mode"),
             (
@@ -865,6 +957,102 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
+    }
+
+    /// The result sentence is written for the model, and it quotes the full
+    /// question text before the choice — on a row that made the answer, the one
+    /// thing worth reading, the first thing truncated away. The row now names
+    /// the question by its own short header and shows what was picked.
+    #[test]
+    fn answered_question_shows_the_choice_under_its_header() {
+        let input = r#"{"questions":[{"question":"Which layout?","header":"Layout","options":[{"label":"Rows","description":"stack"},{"label":"Columns","description":"split"}],"multi_select":false}]}"#;
+        let out = "Your questions have been answered: \"Which layout?\"=\"Columns\". You can now continue with these answers in mind.";
+        let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 80);
+        assert_eq!(texts(&lines), vec!["✓ Ask Layout", "  └ Columns"]);
+    }
+
+    /// Several questions get a row each: the header on every line, the choice
+    /// in the row's own weight. A chosen preview follows the answer in the
+    /// result and must not leak into the next line.
+    #[test]
+    fn every_answered_question_gets_a_line_and_ignores_the_selected_preview() {
+        let input = r#"{"questions":[
+            {"question":"Which layout?","header":"Layout","options":[{"label":"Rows","description":"stack"},{"label":"Columns","description":"split"}]},
+            {"question":"Which colors?","header":"Colors","options":[{"label":"Red","description":"warm"},{"label":"Blue","description":"cool"}]}
+        ]}"#;
+        let out = "The user answered: \"Which layout?\"=\"Columns\" selected preview:\nCOL, \"Which colors?\"=\"Red, my own words\". Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.";
+        let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 80);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "✓ Ask 2 questions",
+                "  └ Layout → Columns",
+                "    Colors → Red, my own words",
+            ]
+        );
+        // The choice is not dimmed like a tool's output preview.
+        assert!(lines[1].spans.last().unwrap().style.add_modifier.is_empty());
+    }
+
+    /// The question text is quoted into the result as JSON, so a question that
+    /// itself contains quotes and newlines is still paired with its answer.
+    #[test]
+    fn a_question_with_quotes_and_newlines_still_pairs_with_its_answer() {
+        let input =
+            r#"{"questions":[{"question":"Use \"v2\"\nnow?","header":"Version","options":[]}]}"#;
+        let out = "Your questions have been answered: \"Use \\\"v2\\\"\\nnow?\"=\"Yes\". You can now continue with these answers in mind.";
+        let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 80);
+        assert_eq!(texts(&lines), vec!["✓ Ask Version", "  └ Yes"]);
+    }
+
+    #[test]
+    fn a_cancelled_question_says_so_in_one_line() {
+        let input =
+            r#"{"questions":[{"question":"Which layout?","header":"Layout","options":[]}]}"#;
+        let out = "The user cancelled the questions without answering. Do not assume a choice; continue only if a safe default follows from existing requirements, otherwise explain what remains blocked.";
+        let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 80);
+        assert_eq!(
+            texts(&lines),
+            vec!["✓ Ask Layout", "  └ cancelled — no answer"]
+        );
+    }
+
+    /// A failed call — no questioner in this frontend, a validation error — is
+    /// not an answer; it keeps the ordinary (red) output preview.
+    #[test]
+    fn a_failed_question_keeps_the_error_preview() {
+        let input =
+            r#"{"questions":[{"question":"Which layout?","header":"Layout","options":[]}]}"#;
+        let out = "ask_user_question: no interactive user is available in this frontend";
+        let lines = tool_cell_lines(
+            "ask_user_question",
+            input,
+            ToolStatus::Failed,
+            Some(out),
+            80,
+        );
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "✗ Ask Layout",
+                "  └ ask_user_question: no interactive user is available in this frontend"
+            ]
+        );
+        assert_eq!(lines[1].spans[1].style.fg, Some(Color::Red));
+    }
+
+    /// A long header gives way to the answer instead of pushing it off the row.
+    #[test]
+    fn a_long_question_header_leaves_room_for_the_answer() {
+        let input = r#"{"questions":[
+            {"question":"Which rail?","header":"A header that runs the whole width","options":[]},
+            {"question":"Which colors?","header":"Colors","options":[]}
+        ]}"#;
+        let out = "Your questions have been answered: \"Which rail?\"=\"Left\", \"Which colors?\"=\"Red\". You can now continue with these answers in mind.";
+        let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 40);
+        assert!(display_width(&text(&lines[1])) <= 40);
+        assert!(text(&lines[1]).contains("…"), "{}", text(&lines[1]));
+        assert!(text(&lines[1]).ends_with("Left"), "{}", text(&lines[1]));
     }
 
     /// The fallback arm — raw name plus compacted JSON — is right for an MCP

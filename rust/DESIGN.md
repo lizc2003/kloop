@@ -1353,8 +1353,20 @@ sides together. A call whose arguments are still streaming has no command yet,
 so it gets no command row. Every built-in has a
 row of its own; the raw-name-plus-JSON fallback is for source tools, and a guard
 test over the catalog keeps it that way. `edit_file` shows a one-line `- old` /
-`+ new` diff from its input instead. Permission prompts, model questions, and the
-provider and rewind pickers all render through one **inline choice panel** (plan 104,
+`+ new` diff from its input instead. `ask_user_question` is the one row that
+does not preview its result: that result is written for the model
+(`Your questions have been answered: "<the full question>"="…"`), so its first
+line is boilerplate and the choice sits behind a question text long enough to be
+truncated away. The row instead names the question by the panel's own short
+header (`Ask Layout`, or `Ask 2 questions`) and puts one line per question
+under it — the header, dim, then the chosen labels (and any typed-in text) in
+the row's own weight; a cancelled question is one `cancelled — no answer` line.
+Answers are paired with questions by matching each input question's JSON-quoted
+text to the `=` after it in the result, so the row does not depend on the
+wording around them; a result that does not pair (an error, a bounded one that
+lost its tail) falls back to the plain preview. Permission prompts, model
+questions, and the provider and rewind pickers all render through one **inline
+choice panel** (plan 104,
 `crates/tui/src/choice.rs`) that sits directly on the composer's top rule —
 not a popup centered over the viewport, so the conversation that led to the
 prompt stays on screen instead of being cleared out from under it. A panel is a
