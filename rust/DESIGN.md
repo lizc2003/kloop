@@ -1361,12 +1361,15 @@ truncated away. The row instead names the question by the panel's own short
 header (`Ask Layout`, or `Ask 2 questions`) and puts one line per question
 under it — the header, dim, then the chosen labels (and any typed-in text) in
 the row's own weight; a cancelled question is one `cancelled — no answer` line.
-Answers are paired with questions by matching each input question's JSON-quoted
-text to the `=` after it in the result — skipping the selected preview first,
-by the option's own text from the input, because that preview is free text and
-may quote a later question verbatim. So the row does not depend on the wording
-around the answers; a result that does not pair (an error, a bounded one that
-lost its tail) falls back to the plain preview. Permission prompts, model
+Answers are paired with questions by walking the result's exact entry
+boundaries — `"<question>"=` after the intro sentence, then the `, ` that joins
+the entries — rather than searching ahead for each question, because the one
+free text an entry carries (the selected preview) can quote a later question
+verbatim. That preview is skipped only by the text of the option the answer
+names; an answer can join labels with `, ` and labels may nest, so when the
+picked option cannot be pinned down, or its preview is not the whole of what
+follows (the UI keeps only the result's first 4000 characters), the row falls
+back to the plain preview rather than guess. Permission prompts, model
 questions, and the provider and rewind pickers all render through one **inline
 choice panel** (plan 104,
 `crates/tui/src/choice.rs`) that sits directly on the composer's top rule —

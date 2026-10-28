@@ -334,6 +334,8 @@ const CANCELLED_RESULT: &str = "The user cancelled the questions without answeri
 
 /// What core puts between an answer and the preview the user saw for it.
 const SELECTED_PREVIEW: &str = " selected preview:\n";
+/// What core joins the entries with.
+const ENTRY_SEPARATOR: &str = ", ";
 
 /// One answered question as the row shows it: the question's own short header
 /// and the labels (plus any typed-in text) the user chose.
@@ -368,10 +370,13 @@ fn ask_result_lines(input: &str, out: &str, width: usize) -> Vec<Line<'static>> 
 }
 
 /// Pair every question in the call's input with the answer core wrote into the
-/// result. The answer is the JSON string that follows `"<question>"=`, so the
-/// match rests on the question text the call already carries rather than on the
-/// sentence around it. `None` when the result is not an answered form (an error,
-/// or a bounded result that lost its tail) and the row should fall back.
+/// result. Each entry is `"<question>"="<answer>"`, and each later one starts at
+/// the `, ` that joins them, so the bytes are required exactly rather than
+/// searched for: the one free text an entry can carry (its selected preview) can
+/// quote a later question and would otherwise pass itself off as that entry.
+/// `None` when a boundary cannot be confirmed — a result that is not an answered
+/// form, one whose tail was cut off, or a preview that is not the whole of what
+/// the result continues with — and the row shows no answers rather than a guess.
 fn ask_answers(input: &str, out: &str) -> Option<Vec<AskAnswer>> {
     let v: Value = serde_json::from_str(input).ok()?;
     let questions = v.get("questions")?.as_array()?;
@@ -382,27 +387,31 @@ fn ask_answers(input: &str, out: &str) -> Option<Vec<AskAnswer>> {
     let mut answers = Vec::with_capacity(questions.len());
     for (position, question) in questions.iter().enumerate() {
         let text = question.get("question")?.as_str()?;
-        let needle = format!("{}=", serde_json::to_string(text).ok()?);
-        let at = read + out.get(read..)?.find(&needle)? + needle.len();
-        let mut values = serde_json::Deserializer::from_str(out.get(at..)?).into_iter::<String>();
+        let entry = format!("{}=", serde_json::to_string(text).ok()?);
+        // The first entry follows the result's intro sentence; every later one
+        // follows the separator.
+        if position == 0 {
+            read += out.get(read..)?.find(&entry)?;
+        } else {
+            out.get(read..)?.strip_prefix(ENTRY_SEPARATOR)?;
+            read += ENTRY_SEPARATOR.len();
+        }
+        out.get(read..)?.strip_prefix(&entry)?;
+        read += entry.len();
+        let mut values = serde_json::Deserializer::from_str(out.get(read..)?).into_iter::<String>();
         let answer = values.next()?.ok()?;
-        read = at + values.byte_offset();
-        // A selected preview is free text copied out of the option, so it can
-        // quote a later question verbatim — including its `"<question>"=`.
-        // Skip it by the text the input already carries before searching for
-        // the next answer, or that search would read the preview's copy.
+        read += values.byte_offset();
+        // The preview is free text copied out of the option, so it can quote a
+        // later question — including its `"<question>"=`. Only the option the
+        // answer names says where it ends; anything else means the boundary is
+        // unknown (a cut-off result, or two options that answer naming cannot
+        // tell apart), and guessing there is how the row shows a wrong answer.
         if position + 1 < questions.len()
             && let Some(body) = out.get(read..)?.strip_prefix(SELECTED_PREVIEW)
         {
-            let preview = question
-                .get("options")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|option| option.get("preview").and_then(Value::as_str))
-                .filter(|preview| body.starts_with(preview))
-                .max_by_key(|preview| preview.len())?;
-            read += SELECTED_PREVIEW.len() + preview.len();
+            let preview = selected_preview(question, &answer)?;
+            let rest = body.strip_prefix(preview)?;
+            read += SELECTED_PREVIEW.len() + (body.len() - rest.len());
         }
         let header = question
             .get("header")
@@ -413,6 +422,33 @@ fn ask_answers(input: &str, out: &str) -> Option<Vec<AskAnswer>> {
         answers.push(AskAnswer { header, answer });
     }
     Some(answers)
+}
+
+/// The preview core echoed for this answer: the one belonging to the option the
+/// user picked. Core writes the first selected option's preview, and an answer
+/// names that option by its label, so the label the answer starts with is what
+/// identifies it. Answers join several labels with `, ` and labels may nest
+/// (`A` and `A, B` are both valid, distinct labels), so if more than one option
+/// could be the named one the preview cannot be pinned down and the row falls
+/// back instead.
+fn selected_preview<'a>(question: &'a Value, answer: &str) -> Option<&'a str> {
+    let options = question.get("options")?.as_array()?;
+    let mut named = options.iter().filter(|option| {
+        option
+            .get("label")
+            .and_then(Value::as_str)
+            .is_some_and(|label| {
+                answer == label
+                    || answer
+                        .strip_prefix(label)
+                        .is_some_and(|rest| rest.starts_with(", "))
+            })
+    });
+    let option = named.next()?;
+    if named.next().is_some() {
+        return None;
+    }
+    option.get("preview").and_then(Value::as_str)
 }
 
 /// One answer row. Multiple questions name the question first, dim, and the
@@ -1050,6 +1086,108 @@ mod tests {
                 "  └ Layout → Rows",
                 "    Colors → Blue",
             ]
+        );
+    }
+
+    /// Two options whose previews share a prefix, the longer one picked and cut
+    /// off by the 4000-character bound the UI event and the replay both apply:
+    /// the longer preview no longer matches, and taking the shorter one — the
+    /// other option's — walks into the preview body and pairs its quoted
+    /// `"Which colors?"="Red"` as the second answer. With no way to confirm the
+    /// picked option's preview covers what follows, the row shows no answers.
+    #[test]
+    fn a_truncated_preview_sharing_a_prefix_does_not_answer_the_next_question() {
+        let fake = r#"COL {"Which colors?"="Red"}"#;
+        let long = format!("{fake}{}", "x".repeat(4_000));
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "Which layout?", "header": "Layout", "options": [
+                    {"label": "Short", "description": "stack", "preview": "COL"},
+                    {"label": "Long", "description": "split", "preview": long}
+                ]},
+                {"question": "Which colors?", "header": "Colors", "options": [
+                    {"label": "Red", "description": "warm"},
+                    {"label": "Blue", "description": "cool"}
+                ]}
+            ]
+        })
+        .to_string();
+        let out: String = format!(
+            "Your questions have been answered: \"Which layout?\"=\"Long\" selected preview:\n\
+             {long}, \"Which colors?\"=\"Blue\". You can now continue with these answers in mind."
+        )
+        .chars()
+        .take(4_000)
+        .collect();
+        let lines = tool_cell_lines("ask_user_question", &input, ToolStatus::Ok, Some(&out), 80);
+        assert!(text(&lines[1]).starts_with("  └ Your questions have been answered:"));
+        assert!(
+            !texts(&lines).iter().any(|line| line.contains("→")),
+            "{:?}",
+            texts(&lines)
+        );
+    }
+
+    /// The same two options with the picked preview intact: the answer's own
+    /// label says which preview core wrote, so the shorter one is never
+    /// considered and the second answer stays Blue.
+    #[test]
+    fn the_answers_own_label_selects_the_preview_to_skip() {
+        let long = r#"COL and note {"Which colors?"="Red"}"#;
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "Which layout?", "header": "Layout", "options": [
+                    {"label": "Short", "description": "stack", "preview": "COL"},
+                    {"label": "Long", "description": "split", "preview": long}
+                ]},
+                {"question": "Which colors?", "header": "Colors", "options": [
+                    {"label": "Red", "description": "warm"},
+                    {"label": "Blue", "description": "cool"}
+                ]}
+            ]
+        })
+        .to_string();
+        let out = format!(
+            "Your questions have been answered: \"Which layout?\"=\"Long\" selected preview:\n\
+             {long}, \"Which colors?\"=\"Blue\". You can now continue with these answers in mind."
+        );
+        let lines = tool_cell_lines("ask_user_question", &input, ToolStatus::Ok, Some(&out), 80);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "✓ Ask 2 questions",
+                "  └ Layout → Long",
+                "    Colors → Blue",
+            ]
+        );
+    }
+
+    /// Labels may nest — `A` and `A, B` are two valid, distinct labels — and an
+    /// answer joins several with `, `, so `A, B` names either. When the pick
+    /// cannot be pinned down the preview's end is unknown, and the row falls
+    /// back rather than risk pairing text from inside it.
+    #[test]
+    fn an_answer_that_names_two_options_falls_back() {
+        let input = serde_json::json!({
+            "questions": [
+                {"question": "Which rail?", "header": "Rail", "options": [
+                    {"label": "A", "description": "first", "preview": "P"},
+                    {"label": "A, B", "description": "second", "preview": "Q"}
+                ]},
+                {"question": "Which colors?", "header": "Colors", "options": [
+                    {"label": "Red", "description": "warm"},
+                    {"label": "Blue", "description": "cool"}
+                ]}
+            ]
+        })
+        .to_string();
+        let out = "Your questions have been answered: \"Which rail?\"=\"A, B\" selected preview:\nQ, \"Which colors?\"=\"Blue\". You can now continue with these answers in mind.";
+        let lines = tool_cell_lines("ask_user_question", &input, ToolStatus::Ok, Some(out), 80);
+        assert!(text(&lines[1]).starts_with("  └ Your questions have been answered:"));
+        assert!(
+            !texts(&lines).iter().any(|line| line.contains("→")),
+            "{:?}",
+            texts(&lines)
         );
     }
 
