@@ -4,8 +4,8 @@
 //! grapheme boundaries. Rendering and vertical navigation consume one canonical
 //! visual-row layout. Large pastes are range-addressed atoms: their visible label
 //! is only a projection, and submission expands the exact atom once. Images are
-//! atoms too (plan 242): `[Image #N]` stays in the submitted text, and the image
-//! itself rides after it as the N-th one.
+//! atoms too (plan 242): `[Image #N]` stays in the submitted text, and the
+//! images ride after it in the order their placeholders appear.
 
 use std::sync::Arc;
 
@@ -58,8 +58,9 @@ enum AtomPayload {
         id: PasteId,
         content: String,
     },
-    /// 编号按粘贴先后连续为 1..n,是文档不变量：删掉或切掉一张后其余就地重编。
-    /// 图片数据用 `Arc` 共享，草稿进历史、翻历史都不复制 base64。
+    /// 编号在整个会话里按粘贴先后递增、从不复用(与粘贴占位同理):删掉一张，
+    /// 其余编号不变，用户才认得出删的是哪张。图片数据用 `Arc` 共享，草稿进
+    /// 历史、翻历史都不复制 base64。
     Image {
         number: usize,
         source: Arc<ImageSource>,
@@ -107,18 +108,17 @@ impl ComposerDocument {
         expanded
     }
 
-    /// The images in number order: the N-th is the one `[Image #N]` names.
-    fn images(&self) -> Vec<Arc<ImageSource>> {
-        let mut images: Vec<(usize, Arc<ImageSource>)> = self
-            .atoms
+    /// The images in the order their placeholders appear, each with its
+    /// number: sent in this order, the k-th image is the k-th `[Image #N]` a
+    /// reader meets in the text.
+    fn images(&self) -> Vec<(usize, Arc<ImageSource>)> {
+        self.atoms
             .iter()
             .filter_map(|atom| match &atom.payload {
                 AtomPayload::Image { number, source } => Some((*number, Arc::clone(source))),
                 AtomPayload::Paste { .. } => None,
             })
-            .collect();
-        images.sort_by_key(|(number, _)| *number);
-        images.into_iter().map(|(_, source)| source).collect()
+            .collect()
     }
 
     fn image_count(&self) -> usize {
@@ -235,7 +235,6 @@ impl ComposerDocument {
                 AtomPayload::Image { .. } => self.separate_image(index, cursor),
             };
         }
-        let cursor = self.renumber_images(cursor);
         self.assert_invariants();
         cursor
     }
@@ -271,52 +270,7 @@ impl ComposerDocument {
     fn delete_atom(&mut self, index: usize) -> ByteOffset {
         let atom = self.atoms.remove(index);
         let cursor = self.replace_raw(atom.range, "");
-        let cursor = self.renumber_images(cursor);
         self.assert_invariants();
-        cursor
-    }
-
-    /// Close the gaps a removed image left: the rest keep their order and become
-    /// 1..n again, each label rewritten in place. `cursor` is never inside a
-    /// label, so it only moves when a label before it changes length.
-    fn renumber_images(&mut self, mut cursor: ByteOffset) -> ByteOffset {
-        let mut order: Vec<(usize, usize)> = self
-            .atoms
-            .iter()
-            .enumerate()
-            .filter_map(|(index, atom)| match atom.payload {
-                AtomPayload::Image { number, .. } => Some((number, index)),
-                AtomPayload::Paste { .. } => None,
-            })
-            .collect();
-        order.sort_unstable();
-        for (rank, (number, index)) in order.into_iter().enumerate() {
-            let wanted = rank + 1;
-            if number == wanted {
-                continue;
-            }
-            let label = image_label(wanted);
-            let old = self.atoms[index].range;
-            self.display
-                .replace_range(old.start().get()..old.end().get(), &label);
-            for atom in &mut self.atoms {
-                if atom.range.start() >= old.end() {
-                    atom.range = shift_range(atom.range, old.len(), label.len());
-                }
-            }
-            if cursor >= old.end() {
-                cursor = shift_offset(cursor, old.len(), label.len());
-            }
-            let atom = &mut self.atoms[index];
-            atom.range = TextRange::new(
-                old.start(),
-                ByteOffset::new(old.start().get() + label.len()),
-            );
-            atom.label = label;
-            if let AtomPayload::Image { number, .. } = &mut atom.payload {
-                *number = wanted;
-            }
-        }
         cursor
     }
 
@@ -405,7 +359,7 @@ impl ComposerDocument {
             })
             .collect();
         numbers.sort_unstable();
-        debug_assert!(numbers.iter().copied().eq(1..=numbers.len()));
+        debug_assert!(numbers.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }
 
@@ -656,7 +610,7 @@ pub struct View {
 
 pub struct Submission {
     pub text: String,
-    /// In number order: the N-th is the image `[Image #N]` in `text` names.
+    /// In placeholder order: the k-th is the k-th `[Image #N]` in `text`.
     pub images: Vec<ImageSource>,
     pub draft: Draft,
 }
@@ -688,6 +642,7 @@ pub struct Composer {
     draft: ComposerDocument,
     goal_column: Option<usize>,
     next_paste_id: u64,
+    next_image_number: usize,
 }
 
 impl Composer {
@@ -700,6 +655,7 @@ impl Composer {
             draft: ComposerDocument::default(),
             goal_column: None,
             next_paste_id: 1,
+            next_image_number: 1,
         }
     }
 
@@ -775,15 +731,19 @@ impl Composer {
         true
     }
 
-    /// Insert `[Image #N]` at the cursor, N being one past the images already in
-    /// the draft.
+    /// Insert `[Image #N]` at the cursor, N one past every number this session
+    /// has handed out — survives submit and clear, so a deleted image's number
+    /// never comes back.
     pub fn attach_image(&mut self, source: ImageSource) {
-        self.attach_shared_image(Arc::new(source));
+        let number = self.next_image_number;
+        self.next_image_number = number
+            .checked_add(1)
+            .expect("image number high-water exhausted");
+        self.insert_image(number, Arc::new(source));
     }
 
-    fn attach_shared_image(&mut self, source: Arc<ImageSource>) {
+    fn insert_image(&mut self, number: usize, source: Arc<ImageSource>) {
         self.begin_edit();
-        let number = self.document.image_count() + 1;
         self.cursor = self.document.insert_atom(
             self.cursor,
             image_label(number),
@@ -1017,7 +977,7 @@ impl Composer {
             .document
             .images()
             .into_iter()
-            .map(|source| ImageSource::clone(&source))
+            .map(|(_, source)| ImageSource::clone(&source))
             .collect();
         let text = self.take_text();
         Some(Submission {
@@ -1043,8 +1003,8 @@ impl Composer {
             command.delete_atom(index);
         }
         self.take_text();
-        for source in images {
-            self.attach_shared_image(source);
+        for (number, source) in images {
+            self.insert_image(number, source);
         }
         Some(command.expand())
     }
@@ -1455,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn an_image_lands_at_the_cursor_and_submits_in_number_order() {
+    fn an_image_lands_at_the_cursor_and_submits_in_placeholder_order() {
         let mut composer = typed("ab");
         composer.left();
         composer.attach_image(image("one"));
@@ -1467,17 +1427,17 @@ mod tests {
             (composer.text(), composer.cursor().get()),
             ("[Image #3]a[Image #1]b[Image #2]", "[Image #3]".len())
         );
-        // 编号是粘贴先后，不是位置先后：第 N 张就是 `[Image #N]`。
+        // 编号是粘贴先后;发送则按占位在正文里的先后。
         let mut copy = Composer::new();
         copy.document = composer.document.clone();
         assert_eq!(
             submitted(&mut copy),
             (
                 "[Image #3]a[Image #1]b[Image #2]".into(),
-                vec!["one".into(), "two".into(), "three".into()]
+                vec!["three".into(), "one".into(), "two".into()]
             )
         );
-        // 相邻 Backspace 整块删掉一张;删的是最大号，其余不动。
+        // 相邻 Backspace 整块删掉一张，其余编号不动。
         composer.backspace();
         assert_eq!(
             submitted(&mut composer),
@@ -1489,23 +1449,31 @@ mod tests {
     }
 
     #[test]
-    fn removing_an_image_renumbers_the_rest_in_place() {
+    fn image_numbers_stay_put_and_never_come_back() {
         let mut composer = Composer::new();
-        composer.attach_image(image("i1"));
-        composer.home();
-        for index in 2..=10 {
-            composer.attach_image(image(&format!("i{index}")));
+        for data in ["i1", "i2", "i3"] {
+            composer.attach_image(image(data));
         }
-        composer.end();
-        // `[Image #1]` 在最后;删掉它，前面 `[Image #10]` 变短一位，光标跟着左移。
+        // 删掉中间的 #2:其余编号不动，删的是哪张一眼可见。
+        composer.left();
         composer.backspace();
-        let labels: String = (1..=9).map(image_label).collect();
+        assert_eq!(composer.text(), "[Image #1][Image #3]");
+        // 删掉最大号 #3 后再粘，也不复用 #3。
+        composer.end();
+        composer.backspace();
+        composer.attach_image(image("i4"));
         assert_eq!(
-            (composer.text(), composer.cursor().get()),
-            (labels.as_str(), labels.len())
+            submitted(&mut composer),
+            (
+                "[Image #1][Image #4]".into(),
+                vec!["i1".into(), "i4".into()]
+            )
         );
-        let data = (2..=10).map(|index| format!("i{index}")).collect();
-        assert_eq!(submitted(&mut composer), (labels, data));
+        // 提交与清空都不重置：清空等于删掉了图，它们的号同样不再出现。
+        composer.attach_image(image("i5"));
+        composer.clear();
+        composer.attach_image(image("i6"));
+        assert_eq!(composer.text(), "[Image #6]");
     }
 
     #[test]
@@ -1540,7 +1508,7 @@ mod tests {
         let cursor = document.replace(TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)), "x");
         assert_eq!(
             (document.text(), cursor.get(), document.images()),
-            ("x[Image #1]", 1, vec![Arc::new(image("b"))])
+            ("x[Image #2]", 1, vec![(2, Arc::new(image("b")))])
         );
     }
 

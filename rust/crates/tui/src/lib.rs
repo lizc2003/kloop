@@ -122,9 +122,9 @@ impl StartupReporter {
 
 struct Turn {
     text: String,
-    /// The composer's images in number order (plan 242), so `[Image #N]` in
-    /// `text` is the N-th; any `--image` blocks still riding the first turn
-    /// are appended after them.
+    /// The composer's images in placeholder order (plan 242), so the k-th is
+    /// the k-th `[Image #N]` in `text`; any `--image` blocks still riding the
+    /// first turn are appended after them.
     images: Vec<ContentBlock>,
     cancel: CancellationToken,
 }
@@ -473,8 +473,8 @@ async fn agent_worker(
                     context_window: cfg.context_window,
                 });
                 // The composer's images ride the turn they were sent with and
-                // lead, so `[Image #N]` in the text is the N-th image; `--image`
-                // blocks ride the first turn after them.
+                // lead, in the order their `[Image #N]`s appear in the text;
+                // `--image` blocks ride the first turn after them.
                 let mut images = turn.images;
                 images.append(&mut pending_images);
                 let msg = if images.is_empty() {
@@ -1062,7 +1062,7 @@ where
 
 /// Take a returned user message apart: the text as it was sent (its
 /// `[Image #N]` placeholders included), and the images in message order — the
-/// composer's in number order, then any `--image` blocks.
+/// composer's in placeholder order, then any `--image` blocks.
 fn split_user_input(input: Message) -> (String, Vec<ImageSource>) {
     let mut text = String::new();
     let mut images = Vec::new();

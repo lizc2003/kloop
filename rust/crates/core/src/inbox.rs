@@ -90,8 +90,8 @@ pub struct AgentMessageFailure {
 /// item lets each producer frame its own message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InboxItem {
-    /// User steering typed while the turn runs (plan 22). 正文里的 `[Image #N]`
-    /// 指 `images` 的第 N 张(plan 242)。
+    /// User steering typed while the turn runs (plan 22). `images` 按占位在正文
+    /// 里出现的先后排列，第 k 张对应正文里第 k 个 `[Image #N]`(plan 242)。
     Steer {
         text: String,
         images: Vec<ImageSource>,

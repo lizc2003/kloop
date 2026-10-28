@@ -538,7 +538,7 @@ pub struct App {
     /// The multi-line input widget (plan 38 slice 3): text, cursor, input
     /// history, paste placeholders, and image attachments.
     pub composer: Composer,
-    /// Images of the just-submitted turn or steer, in number order, taken by the
+    /// Images of the just-submitted turn or steer, in placeholder order, taken by the
     /// event loop to build the user message. Held here rather than on the
     /// Command so a Command stays a cheap value to compare.
     submit_images: Vec<ImageSource>,
@@ -3143,8 +3143,8 @@ mod tests {
     }
 
     /// A fresh turn sends the text with its `[Image #N]` placeholders and the
-    /// images in number order; the echo is the text plus one line per image,
-    /// exactly what a resumed session replays.
+    /// images in placeholder order; the echo is the text plus one line per
+    /// image, exactly what a resumed session replays.
     #[test]
     fn a_fresh_turn_sends_its_images_in_number_order() {
         let mut app = App::new("s".into());
@@ -3184,17 +3184,18 @@ mod tests {
         assert_eq!(app.take_submit_images(), vec![png("one")]);
         assert!(app.composer.is_blank());
 
+        // 编号在会话里持续累加：下一条输入里的新图是 #2。
         app.attach_image(png("two"));
         assert_eq!(
             app.on_key(80, key(KeyCode::Enter)),
-            Command::Steer("[Image #1]".into())
+            Command::Steer("[Image #2]".into())
         );
         assert_eq!(app.take_submit_images(), vec![png("two")]);
         assert_eq!(
             app.cells,
             vec![
                 Cell::User("[Image #1] look".into()),
-                Cell::User("[Image #1]".into()),
+                Cell::User("[Image #2]".into()),
             ]
         );
     }
