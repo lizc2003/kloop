@@ -332,6 +332,9 @@ fn diff_line(gutter: &str, sign: &str, text: &str, color: Color, width: usize) -
 /// say that in one line instead of previewing the model-facing instructions.
 const CANCELLED_RESULT: &str = "The user cancelled the questions without answering.";
 
+/// What core puts between an answer and the preview the user saw for it.
+const SELECTED_PREVIEW: &str = " selected preview:\n";
+
 /// One answered question as the row shows it: the question's own short header
 /// and the labels (plus any typed-in text) the user chose.
 struct AskAnswer {
@@ -377,13 +380,30 @@ fn ask_answers(input: &str, out: &str) -> Option<Vec<AskAnswer>> {
     }
     let mut read = 0;
     let mut answers = Vec::with_capacity(questions.len());
-    for question in questions {
+    for (position, question) in questions.iter().enumerate() {
         let text = question.get("question")?.as_str()?;
         let needle = format!("{}=", serde_json::to_string(text).ok()?);
         let at = read + out.get(read..)?.find(&needle)? + needle.len();
         let mut values = serde_json::Deserializer::from_str(out.get(at..)?).into_iter::<String>();
         let answer = values.next()?.ok()?;
         read = at + values.byte_offset();
+        // A selected preview is free text copied out of the option, so it can
+        // quote a later question verbatim — including its `"<question>"=`.
+        // Skip it by the text the input already carries before searching for
+        // the next answer, or that search would read the preview's copy.
+        if position + 1 < questions.len()
+            && let Some(body) = out.get(read..)?.strip_prefix(SELECTED_PREVIEW)
+        {
+            let preview = question
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|option| option.get("preview").and_then(Value::as_str))
+                .filter(|preview| body.starts_with(preview))
+                .max_by_key(|preview| preview.len())?;
+            read += SELECTED_PREVIEW.len() + preview.len();
+        }
         let header = question
             .get("header")
             .and_then(Value::as_str)
@@ -977,7 +997,7 @@ mod tests {
     #[test]
     fn every_answered_question_gets_a_line_and_ignores_the_selected_preview() {
         let input = r#"{"questions":[
-            {"question":"Which layout?","header":"Layout","options":[{"label":"Rows","description":"stack"},{"label":"Columns","description":"split"}]},
+            {"question":"Which layout?","header":"Layout","options":[{"label":"Rows","description":"stack"},{"label":"Columns","description":"split","preview":"COL"}]},
             {"question":"Which colors?","header":"Colors","options":[{"label":"Red","description":"warm"},{"label":"Blue","description":"cool"}]}
         ]}"#;
         let out = "The user answered: \"Which layout?\"=\"Columns\" selected preview:\nCOL, \"Which colors?\"=\"Red, my own words\". Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.";
@@ -1003,6 +1023,34 @@ mod tests {
         let out = "Your questions have been answered: \"Use \\\"v2\\\"\\nnow?\"=\"Yes\". You can now continue with these answers in mind.";
         let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 80);
         assert_eq!(texts(&lines), vec!["✓ Ask Version", "  └ Yes"]);
+    }
+
+    /// A selected preview is free text copied from the option, so it can quote
+    /// the next question — the pairing must skip it by its known text instead
+    /// of finding the next `"<question>"=` inside it and showing that instead
+    /// of what the user picked.
+    #[test]
+    fn a_preview_quoting_the_next_question_does_not_become_its_answer() {
+        let input = r#"{"questions":[
+            {"question":"Which layout?","header":"Layout","options":[
+                {"label":"Rows","description":"stack","preview":"see \"Which colors?\"=\"Red\" above"},
+                {"label":"Columns","description":"split"}
+            ]},
+            {"question":"Which colors?","header":"Colors","options":[
+                {"label":"Red","description":"warm"},
+                {"label":"Blue","description":"cool"}
+            ]}
+        ]}"#;
+        let out = "Your questions have been answered: \"Which layout?\"=\"Rows\" selected preview:\nsee \"Which colors?\"=\"Red\" above, \"Which colors?\"=\"Blue\". You can now continue with these answers in mind.";
+        let lines = tool_cell_lines("ask_user_question", input, ToolStatus::Ok, Some(out), 80);
+        assert_eq!(
+            texts(&lines),
+            vec![
+                "✓ Ask 2 questions",
+                "  └ Layout → Rows",
+                "    Colors → Blue",
+            ]
+        );
     }
 
     #[test]

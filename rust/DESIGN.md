@@ -1362,8 +1362,10 @@ header (`Ask Layout`, or `Ask 2 questions`) and puts one line per question
 under it — the header, dim, then the chosen labels (and any typed-in text) in
 the row's own weight; a cancelled question is one `cancelled — no answer` line.
 Answers are paired with questions by matching each input question's JSON-quoted
-text to the `=` after it in the result, so the row does not depend on the
-wording around them; a result that does not pair (an error, a bounded one that
+text to the `=` after it in the result — skipping the selected preview first,
+by the option's own text from the input, because that preview is free text and
+may quote a later question verbatim. So the row does not depend on the wording
+around the answers; a result that does not pair (an error, a bounded one that
 lost its tail) falls back to the plain preview. Permission prompts, model
 questions, and the provider and rewind pickers all render through one **inline
 choice panel** (plan 104,
