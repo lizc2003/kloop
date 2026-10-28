@@ -47,7 +47,10 @@ impl Server {
             .turn_tx
             .send(ThreadWorkerMsg::Turn(Turn {
                 text,
-                images,
+                images: images
+                    .into_iter()
+                    .map(|source| ContentBlock::Image { source })
+                    .collect(),
                 id: turn_id,
                 cancel,
                 delivery_only: false,
@@ -89,18 +92,7 @@ impl Server {
                 ))
             })?),
         };
-        let (text, blocks) = parse_input(params).map_err(SteerError::Request)?;
-        // steer 只有图片通道：别的块拒收，不静默丢掉。
-        let images = blocks
-            .into_iter()
-            .map(|block| match block {
-                ContentBlock::Image { source } => Ok(source),
-                _ => Err(SteerError::Request((
-                    wire::INVALID_PARAMS,
-                    "turn/steer input takes only text and image parts".into(),
-                ))),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (text, images) = parse_input(params).map_err(SteerError::Request)?;
         let handle = self.threads.get(thread_id).ok_or_else(|| {
             SteerError::Request((
                 wire::SERVER_ERROR,

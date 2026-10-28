@@ -1661,9 +1661,10 @@ Both reuse the `--image` ingestion in `crates/tui/src/clipboard.rs` via `arboard
 随意混排;光标进不去、按词移动一步跨过、相邻 Backspace/Delete 整块删掉，与粘贴
 占位同一套规则。编号按粘贴先后连续为 1..n,是文档不变量：删掉一张后其余保持
 先后、就地改写成连续编号(`[Image #10]` 变 `[Image #9]` 时其后内容与光标随之前移)。
-图片没有文字形态，所以切到标签的编辑(补全替换)直接删掉那张图，而不是像粘贴占位
-那样展开;标签放不到字素边界上时(前面是 Prepend 字符，或紧跟组合符)在缺边界的
-一侧补一个空格。原子在输入框里以青色显示。
+图片没有文字形态，所以切进标签的范围编辑(补全替换)直接删掉那张图，而不是像粘贴
+占位那样展开;插入图片、或打字/删除让相邻字素粘到标签上(组合符跟在后面、Prepend
+字符在前面)时，则在粘连的一侧补一个空格隔开，图片不丢——一次按键不会删掉一张图。
+原子在输入框里以青色显示。
 提交时正文在前、`[Image #N]` 原样留在正文里，图片按编号跟在后面，第 N 张就是
 `[Image #N]`;`--image` 的图排在它们之后。**不在每张图前另加标签文本块**:OpenAI
 chat 与 Responses 适配器把一条用户消息的文本块拼成一段、图片统一放到最后，单独
@@ -1806,9 +1807,11 @@ not migrated. A `thread_id` the client supplies must be ASCII letters, digits,
 (`YYYYMMDD-HHMMSS[-N]`) always are, and the constraint is what lets a thread id
 be used unescaped as a filename, an HTTP header value, and a log field.
 `input` is a string or an array of content parts
-(`{type:"text",text}` / `{type:"image",source:{…}}`). `turn/steer` takes the
-same shape: its image parts follow the framed steering text, and a part that is
-neither text nor an image is refused (`INVALID_PARAMS`) rather than dropped.
+(`{type:"text",text}` / `{type:"image",source:{…}}`), the same for `turn/start`
+and `turn/steer`; image parts follow the text (for a steer, the framed steering
+text). A part that is neither text nor an image is refused (`INVALID_PARAMS`) by
+both, in the one shared parser, rather than reaching a provider that rejects or
+drops it.
 
 **Read-only discovery:** `provider/catalog/read {}` returns configured provider IDs, API families, ordered model allowlists, and bounded availability codes; `config/read {cwd? | thread_id?}` returns an explicit non-sensitive allowlist including the active route; `skills/list {cwd? | thread_id?, force_reload?}` returns skill metadata without bodies, allowed-tool rules, or user commands; and `mcp_server_status/list {}` returns the immutable startup discovery snapshot. Read methods reject unknown parameters, accept at most one scope selector, and canonicalize cwd before invoking their reader.
 

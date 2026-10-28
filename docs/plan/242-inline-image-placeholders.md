@@ -69,3 +69,8 @@
   静默丢掉、投影只记文字。现把图片经 `push_steer` 送进 `InboxItem::Steer`,投影记完整
   `input`,非文本非图片的块以 `INVALID_PARAMS` 拒收;集成测试改为带图 steer 并断言
   rollout 里那条 steering 消息的完整形状，另加拒收测试。
+- 评审后续：(a) 打字或删除让组合符/Prepend 字符粘到图片标签上时，`replace` 原先把
+  图片当作被切开而连标签删掉;现与插入时一样在粘连一侧补空格，且在光标对齐之前
+  完成，新增单测覆盖三种粘连。(b)“只收 text 与 image”从 `turn_steer` 收进共用的
+  `parse_input`,`turn/start` 同样以 `INVALID_PARAMS` 拒收 thinking/tool_use 等块;
+  拒收集成测试改为覆盖两条方法。教训 277。

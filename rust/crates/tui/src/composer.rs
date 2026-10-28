@@ -210,6 +210,12 @@ impl ComposerDocument {
         self.assert_range(range);
         let range = self.materialize_intersections(range);
         let mut cursor = self.replace_raw(range, replacement);
+        // 先隔开图片再对齐光标：否则光标会被对齐进与标签粘成一体的字素里。
+        while let Some(index) = self.atoms.iter().position(|atom| {
+            matches!(atom.payload, AtomPayload::Image { .. }) && self.breaks_boundary(atom)
+        }) {
+            cursor = self.separate_image(index, cursor);
+        }
         if !is_grapheme_boundary(&self.display, cursor) {
             let snapped = snap_grapheme_boundary(&self.display, cursor);
             cursor = if snapped < cursor {
@@ -219,14 +225,46 @@ impl ComposerDocument {
             };
         }
 
-        while let Some(index) = self.atoms.iter().position(|atom| {
-            !is_grapheme_boundary(&self.display, atom.range.start())
-                || !is_grapheme_boundary(&self.display, atom.range.end())
-        }) {
-            cursor = self.materialize_atom(index, cursor);
+        while let Some(index) = self
+            .atoms
+            .iter()
+            .position(|atom| self.breaks_boundary(atom))
+        {
+            cursor = match self.atoms[index].payload {
+                AtomPayload::Paste { .. } => self.materialize_atom(index, cursor),
+                AtomPayload::Image { .. } => self.separate_image(index, cursor),
+            };
         }
         let cursor = self.renumber_images(cursor);
         self.assert_invariants();
+        cursor
+    }
+
+    fn breaks_boundary(&self, atom: &Atom) -> bool {
+        !is_grapheme_boundary(&self.display, atom.range.start())
+            || !is_grapheme_boundary(&self.display, atom.range.end())
+    }
+
+    /// An edit glued a neighbour onto an image label (a combining mark after
+    /// it, a Prepend character before it). An image has no text to expand
+    /// into, so a space goes on the glued side instead and the image stays.
+    /// The cursor ends on a boundary: after the space when it was past the
+    /// gap, and never between a Prepend character and its space.
+    fn separate_image(&mut self, index: usize, mut cursor: ByteOffset) -> ByteOffset {
+        let end = self.atoms[index].range.end();
+        if !is_grapheme_boundary(&self.display, end) {
+            self.replace_raw(TextRange::empty(end), " ");
+            if cursor > end {
+                cursor = ByteOffset::new(cursor.get() + 1);
+            }
+        }
+        let start = self.atoms[index].range.start();
+        if !is_grapheme_boundary(&self.display, start) {
+            self.replace_raw(TextRange::empty(start), " ");
+            if cursor >= start {
+                cursor = ByteOffset::new(cursor.get() + 1);
+            }
+        }
         cursor
     }
 
@@ -1517,6 +1555,44 @@ mod tests {
             ("\n[Image #1] \u{301}", "\n[Image #1]".len())
         );
         assert_eq!(composer.document.image_count(), 1);
+    }
+
+    #[test]
+    fn typing_that_glues_onto_an_image_label_keeps_the_image() {
+        // 标签后打组合符：`]` 会和它粘成一个字素，补空格隔开，图片不丢。
+        let mut composer = Composer::new();
+        composer.attach_image(image("one"));
+        composer.insert_char('\u{301}');
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("[Image #1] \u{301}", "[Image #1] \u{301}".len())
+        );
+
+        // 标签前打 Prepend 字符：它会和 `[` 粘连;光标落在空格之后、标签之前。
+        let mut composer = Composer::new();
+        composer.attach_image(image("one"));
+        composer.home();
+        composer.insert_char('\u{600}');
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("\u{600} [Image #1]", "\u{600} ".len())
+        );
+
+        // 删掉中间的换行同样会让组合符粘上来;光标留在标签末尾。
+        let mut composer = Composer::new();
+        composer.attach_image(image("one"));
+        composer.insert_text("\n\u{301}");
+        composer.left();
+        composer.left();
+        composer.delete();
+        assert_eq!(
+            (composer.text(), composer.cursor().get()),
+            ("[Image #1] \u{301}", "[Image #1]".len())
+        );
+        assert_eq!(
+            submitted(&mut composer),
+            ("[Image #1] \u{301}".into(), vec!["one".into()])
+        );
     }
 
     #[test]

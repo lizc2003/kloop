@@ -14,6 +14,7 @@ use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 
 use crate::ThreadStartOptions;
 use crate::wire;
@@ -289,11 +290,13 @@ pub(super) fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, (i6
 }
 
 /// Parse a `turn/start` (or `turn/steer`) `input` into its user text and any
-/// trailing content blocks (images). The structured form is an array of
-/// content parts — `{type:"text",text}` and `{type:"image",source:{…}}`, the
-/// canonical block shapes — and text parts join with newlines. A bare string is
-/// accepted too as a single text part, for a client that only sends text.
-pub(super) fn parse_input(params: &Value) -> Result<(String, Vec<ContentBlock>), (i64, String)> {
+/// images, which trail it. The structured form is an array of content parts —
+/// `{type:"text",text}` and `{type:"image",source:{…}}`, the canonical block
+/// shapes — and text parts join with newlines. Any other block is refused: a
+/// user message has no place for one, and a provider would reject or drop it.
+/// A bare string is accepted too as a single text part, for a client that only
+/// sends text.
+pub(super) fn parse_input(params: &Value) -> Result<(String, Vec<ImageSource>), (i64, String)> {
     let input = &params["input"];
     if let Some(s) = input.as_str() {
         return Ok((s.to_string(), Vec::new()));
@@ -311,8 +314,13 @@ pub(super) fn parse_input(params: &Value) -> Result<(String, Vec<ContentBlock>),
             .map_err(|e| (wire::INVALID_PARAMS, format!("bad input part: {e}")))?;
         match block {
             ContentBlock::Text { text } => text_parts.push(text),
-            // Non-text blocks (images) ride along as trailing content.
-            other => images.push(other),
+            ContentBlock::Image { source } => images.push(source),
+            _ => {
+                return Err((
+                    wire::INVALID_PARAMS,
+                    "input takes only text and image parts".into(),
+                ));
+            }
         }
     }
     Ok((text_parts.join("\n"), images))

@@ -3370,27 +3370,35 @@ async fn steer_folds_into_a_running_turn() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
-/// A steer has an image channel and nothing else: a part that is neither text
-/// nor an image is refused rather than silently dropped.
+/// `turn/start` and `turn/steer` share one input rule: text and image parts
+/// only. Any other block is refused as invalid params on both, rather than
+/// reaching a provider that rejects it (a user-turn `thinking` block) or
+/// silently drops it.
 #[tokio::test]
-async fn steer_refuses_a_part_that_is_not_text_or_an_image() {
-    let dirs = test_dirs("steer-bad-part");
+async fn input_parts_other_than_text_or_image_are_refused() {
+    let dirs = test_dirs("input-bad-part");
     let mut client = start_server(
         factory(vec![vec![text("ok")]], dirs.offload.clone(), false),
         &dirs,
     );
     client.initialize().await;
-    let id = client
-        .request(
-            "turn/steer",
-            json!({"thread_id": "ghost", "input": [
-                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}},
-            ]}),
-        )
-        .await;
-    let err = client.recv().await;
-    assert_eq!(err["id"], id);
-    assert_eq!(err["error"]["code"], -32602);
+    let parts = [
+        json!({"type": "thinking", "thinking": "hm"}),
+        json!({"type": "tool_use", "id": "t1", "name": "read_file", "input": {}}),
+    ];
+    for method in ["turn/start", "turn/steer"] {
+        for part in &parts {
+            let id = client
+                .request(method, json!({"thread_id": "ghost", "input": [part]}))
+                .await;
+            let err = client.recv().await;
+            assert_eq!(
+                (&err["id"], &err["error"]["code"]),
+                (&json!(id), &json!(-32602)),
+                "{method} {part}"
+            );
+        }
+    }
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
