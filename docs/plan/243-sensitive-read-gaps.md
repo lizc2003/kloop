@@ -112,4 +112,4 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 验证：四条新 gate 回归在旧代码上先红、修后转绿；`explicit_file_roots_do_not_fall_back_to_cwd`、
 `text_arguments_stay_text_when_dynamic` 与 sensitive 的 `.??`/`.e[ab]*` 断言覆盖 P2。
 外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2096 通过、本机 parity）。
-提交号见 `git log --grep 'plan243 review'`。
+提交 `f980eac`。
