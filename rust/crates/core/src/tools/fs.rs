@@ -2236,9 +2236,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("kloop-read-approval-swap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::create_dir_all(root.join(".kloop")).unwrap();
         let safe = root.join("safe.txt");
-        let secret = root.join(".ssh/config.toml");
+        let secret = root.join(".kloop/config.toml");
         let alias = root.join("alias.txt");
         std::fs::write(&safe, "safe bytes").unwrap();
         std::fs::write(&secret, "SENTINEL-SECRET").unwrap();
@@ -2293,7 +2293,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let safe_parent = root.join("safe");
         let moved_parent = root.join("safe-before-swap");
-        let secret_parent = root.join(".ssh");
+        let secret_parent = root.join(".kloop");
         std::fs::create_dir_all(&safe_parent).unwrap();
         std::fs::create_dir_all(&secret_parent).unwrap();
         let requested = safe_parent.join("config.toml");

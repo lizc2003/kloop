@@ -1,4 +1,5 @@
-// plan 271：`.kloop` 的读取只认私有状态根；项目里的 `.kloop/` 可读，写入仍确认。
+// plan 271：`.kloop` 按它下面第一层的条目判。worktrees、rules、skills、commands
+// 可读；其余是凭据或 agent state；写入照旧确认。
 
 fn plan271_repo(label: &str) -> PathBuf {
     let root = std::env::temp_dir()
@@ -11,7 +12,7 @@ fn plan271_repo(label: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn plan271_project_kloop_dirs_are_readable() {
+async fn plan271_readable_kloop_entries_pass_in_any_spelling() {
     let root = plan271_repo("read");
     let shown = root.display();
     for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
@@ -26,8 +27,10 @@ async fn plan271_project_kloop_dirs_are_readable() {
             "grep -rn EndpointGeminiNative .".to_string(),
             "cat .kloop/rules/style.md".into(),
             format!("cat {shown}/.kloop/rules/style.md"),
-            format!("rg style {shown}/.kloop"),
-            format!("ls {shown}/.k*"),
+            format!("cd {shown} && cat ./.kloop/rules/style.md"),
+            format!("rg style {shown}/.kloop/rules"),
+            format!("ls {shown}/.kloop"),
+            format!("cat {shown}/.k*/rules/style.md"),
         ] {
             assert_eq!(
                 p.check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
@@ -43,6 +46,55 @@ async fn plan271_project_kloop_dirs_are_readable() {
             "{mode:?}"
         );
         assert!(!p.read_path_blocked(&root.join(".kloop/rules/style.md")));
+        assert_eq!(approver.ask_count(), 0, "{mode:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 判定只看名字，换落点的拼写（glob、花括号、`..`、Git Bash 的 `/c/` 根、firmlink、
+/// `cd`、命令自带的 `-C`、经文本传给 `xargs`）都改不了结论。
+#[tokio::test]
+async fn plan271_kloop_state_stays_blocked_in_any_spelling() {
+    let root = plan271_repo("state");
+    std::fs::write(root.join(".kloop/config.toml"), "api_key = 'x'").unwrap();
+    let shown = root.display();
+    let home = std::env::home_dir().expect("home");
+    let above_home = home.parent().expect("home has a parent").display().to_string();
+    for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = Permissions::new(mode, &rules(&[], &[], &[]), root.clone(), Some(approver.clone()))
+            .unwrap();
+        for command in [
+            "cat ~/{sub,}/.kloop/config.toml".to_string(),
+            "cat /Users/*/.kloop/config.toml".into(),
+            "cat /c/Users/u/.kloop/config.toml".into(),
+            "cat /System/Volumes/Data/Users/u/.kloop/config.toml".into(),
+            format!("cat {shown}/link/../.kloop/config.toml"),
+            "cat ${HOME}/.kloop/mcp-oauth.json".into(),
+            "cd ~ && cat .kloop/config.toml".into(),
+            "tar -C ~ -cf - .kloop".into(),
+            "echo /home/*/.kloop/config.toml | xargs cat".into(),
+            format!("cat {shown}/.kloop/projects/v1/p/sessions/x.jsonl"),
+            format!("rg KEY {shown}/.kloop"),
+            "grep -rn api_key .".into(),
+            format!("grep -rn api_key {above_home}"),
+        ] {
+            let error = p
+                .check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
+                .await
+                .expect_err(&command);
+            assert!(
+                error.contains("sensitive path"),
+                "{mode:?}: {command}: {error}"
+            );
+        }
+        assert!(
+            p.check("read_file", &json!({"path": ".kloop/config.toml"}), 0)
+                .await
+                .is_err(),
+            "{mode:?}"
+        );
+        assert!(p.read_path_blocked(&root.join(".kloop/config.toml")));
         assert_eq!(approver.ask_count(), 0, "{mode:?}");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -76,33 +128,4 @@ async fn plan271_project_kloop_writes_still_ask() {
         vec![Some("[sensitive path]"), Some("[sensitive redirect path]")]
     );
     let _ = std::fs::remove_dir_all(&root);
-}
-
-/// 私有状态根仍是硬边界：任何拼写落到 `~/.kloop` 都拒，包括递归搜索的根把它
-/// 包在里面。
-#[tokio::test]
-async fn plan271_private_state_root_stays_hard_blocked() {
-    let home = std::env::home_dir().expect("home");
-    let parent = home.parent().expect("home has a parent").display().to_string();
-    let home = home.display();
-    for mode in [Mode::Manual, Mode::Plan, Mode::Bypass] {
-        let approver = ScriptedApprover::new(vec![]);
-        let p = gate(mode, rules(&[], &[], &[]), approver.clone());
-        for command in [
-            format!("cat {home}/.kloop/config.toml"),
-            "cat ${HOME}/.kloop/sessions/x.jsonl".to_string(),
-            format!("grep -rn api_key {parent}"),
-            format!("ls {home}/.KLOOP/sessions"),
-        ] {
-            let blocked = p
-                .check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
-                .await
-                .is_err();
-            // 大小写别名只在折叠大小写的文件系统上指向同一个目录。
-            let expected = sensitive::FS_FOLDS_CASE || !command.contains(".KLOOP");
-            assert_eq!(blocked, expected, "{mode:?}: {command}");
-        }
-        assert!(p.read_path_blocked(Path::new(&format!("{home}/.kloop/config.toml"))));
-        assert_eq!(approver.ask_count(), 0, "{mode:?}");
-    }
 }

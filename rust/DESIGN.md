@@ -575,8 +575,8 @@ Consequences worth knowing:
   into a real project's bucket. It is the only mode that keeps session state
   in a `.kloop` directory below the working directory; everything else under a
   project's `.kloop` is a managed worktree (`worktrees/`) or input kloop never
-  creates (`rules/`, `skills/`, `commands/`), which is why only the private
-  `~/.kloop` is read-sensitive.
+  creates (`rules/`, `skills/`, `commands/`) — the four entries the read gate
+  leaves open under any `.kloop`.
 
 `crates/core/src/rollout.rs` 保留追加写入器及公开门面；`rollout/line.rs` 定义
 JSONL 行、快照与错误的序列化表示；`rollout/validate.rs` 负责完整行读取、格式版本、
@@ -1004,23 +1004,25 @@ them before reading, and Bash checks literal plus canonical paths before
 sandbox/read-only/bypass. 名字只有一份（`permissions/sensitive.rs`）：凭据目录
 （`.ssh`、`.gnupg`、`.aws`）、kloop 目录名 `.kloop`、rc 文件与 `.env*` 的判定同时供路径检查、
 Bash 原文扫描、递归搜索、glob 拼写与沙箱凭据根使用。
-`.kloop` 按访问方向分口径（plan 271）。私有状态根 `~/.kloop`（进程 home 下，与 CLI 的
-`private_state_root` 同源）存 provider 凭据、OAuth 存储与所有项目的转录，读取硬拦；
-项目里的 `.kloop/` 只放 kloop 建的 worktree 与用户提交的 `rules/`、`skills/`、
-`commands/`，读取不拦——否则用过一次 worktree 的仓库在根上 `grep -rn` 永远被拒，
-agent 也读不了项目自己的 skill。写入仍按名字确认：写进项目 `.kloop/rules` 一类会引导
-以后的会话。读取要能确定落点才按位置判：绝对路径和 cwd 已知时的相对路径按原拼写与
-规范路径比较（符号链接别名也落回状态根）；`cd` 之后的相对拼写、含未知片段的词与
-PowerShell 原文落点未知，`.kloop` 退回按名字算；glob 分量能拼出 `.kloop` 时看它的
-父目录是不是 home。原文扫描只认状态根的拼写（`~/.kloop`、`$HOME/.kloop`、
-`${HOME}/.kloop` 与它的绝对路径）。嵌在解释器代码里、拼法绕开这些的状态根访问
-（`os.environ['HOME'] + '/.kloop'`）由 macOS 沙箱按绝对路径拒读兜底；无沙箱时是已知
-缺口，与 `Path.home() / '.kloop'` 这类原本就扫不到的拼法同级。
+`.kloop` 按它下面第一层的条目判，不看它在哪（plan 271）。读取放行 `worktrees/`
+（kloop 建的 checkout）与 `rules/`、`skills/`、`commands/`（kloop 当作用户输入读取）；
+其余条目——`config.toml` 及备份、`mcp-oauth.json`、`projects/`（转录、权限）、
+`scheduler/`，以及以后新加的状态文件——一律按凭据硬拦。列可读条目而不是受保护条目，
+是为了让新增的状态文件默认受保护。`.kloop` 目录本身只拦内容访问（`ls` 放行，`tar`、
+`cp -r`、`rg … .kloop` 会把受保护条目一起带走）；`.kloop/` 下第一层写成 glob
+（`.kloop/*`）拿不准命中什么，按受保护处理；可读条目里嵌套的 `.kloop` 按它自己的条目
+再判，`..` 取消豁免。写入只豁免 `worktrees/`：写进 `rules/` 一类会引导以后的会话。
+曾试过按位置判（只认私有状态根 `~/.kloop`），审查发现落点能被拼写改写——glob 与花括号
+（`~/{sub,}/.kloop`、`/Users/*/.kloop`）、经符号链接的 `..`、macOS firmlink
+（`/System/Volumes/Data/Users/…`）、Windows Git Bash 的 `/c/…` 根、`cd` 与命令自带的
+`-C`（`tar -C ~ -cf - .kloop`）、经文本传给 `xargs`——证明“不是状态根”的规则补不完；
+名字不随这些拼写变化。原文扫描照旧按名字认 `~/.kloop` 与 `/.kloop/`，只逐 token 中和
+`/.kloop/<可读条目>`（同一 token 里的 `..` 取消中和），PowerShell 同一口径。
 Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
 内部，元数据访问（`ls`、`stat`、`du`、`tree`、只读 `find` 的 stat/列目录）不算
 读取，只有内容访问（`cat`、`grep`、`sed`、解释器等；未识别命令默认按内容访问）
-才硬拦；`~/.kloop`、`.ssh`、`.gnupg`、`.aws`、`.env*` 和 rc 文件是凭据或 agent
-state，元数据访问也硬拦。元数据判定按命令的真实选项解析：du 的 `-X`/
+才硬拦；`.kloop` 目录本身同属这一类；`.kloop` 下的受保护条目、`.ssh`、`.gnupg`、`.aws`、
+`.env*` 和 rc 文件是凭据或 agent state，元数据访问也硬拦。元数据判定按命令的真实选项解析：du 的 `-X`/
 `--exclude-from`/`--files0-from` 无论独立、组合（`-sX`）还是附着（`-XFILE`）
 都算打开文件；tree 的 `-o`/`-R` 写文件（`-R` 会在每层生成 `00Tree.html`），
 `--fromfile`/`--fromtabfile`/`--gitignore`/`--gitfile`/`--infofile`/`--hintro`/
@@ -1048,17 +1050,18 @@ needle 仍优先，但对边界明确、带引用分隔符的 `cat` heredoc 写�
 `.ssh`、`.aws` 或 `.gnupg` 根内，并核对原文与规范路径的读写拒绝、根自身的符号链接
 和读取 carve-out；`..`、相对路径、其它用户路径、保护外 needle 与覆盖不明都保留拒绝。
 不解析 Rust/Python 字符串、不推算生成程序的文件访问；后续代码的边界由相同 OS 策略承担。
-无沙箱和未支持平台保持原文保守扫描，`~/.kloop`、`.git`、rc 文件与 `.env*` 不属于该例外。
+无沙箱和未支持平台保持原文保守扫描，`.kloop`、`.git`、rc 文件与 `.env*` 不属于该例外。
 递归搜索（`grep -r`/`rg --hidden` 一类）按命令自己的选项簇判定是否真的递归：grep 的
 `-rn`/`-Rl`/`-d recurse`/`--directories=recurse` 与 rg 的 `-uu`/`-.`/`--unrestricted`/
 `--hidden` 都算；夹了未收录选项、选项簇解析失败时，仍按同一组拼写复核（`rg --no-config
 -.` 不会因为多一个选项丢掉递归证据）。搜索根只取位置参数：`-f patterns.txt` 是模式来源
 而不是根（`rg -uu -f patterns.txt` 仍然搜 cwd）；没有路径参数才在 cwd 下递归，明确给了
-普通文件就只读那个文件，不能拿 cwd 顶替。根自身或祖先落在敏感目录下（`.kloop` 只认
-私有状态根）、根把私有状态根包在里面、或根的直接子项里出现凭据名字（含 `.env*`）就
-硬拦。`.git` 与项目里的 `.kloop/` 都不在这份递归名单里：否则任何仓库内的 `grep -r`
-（或用过 worktree 的仓库根上的 `grep -rn`）都要被拦，而 `.git` 的内容访问由路径参数
-判定覆盖。根按会话 cwd 解析，`cd` 之后的相对根不重新定位——这是已知缺口。
+普通文件就只读那个文件，不能拿 cwd 顶替。根自身或祖先落在敏感目录下、根把私有状态根
+`~/.kloop` 包在里面（子项只看一层，`grep -r … /Users` 靠这一条），或根的直接子项里出现
+凭据名字（含 `.env*`）就硬拦。直接子项是 `.kloop` 时看它实际的条目：只有可读条目
+（用过 worktree 的仓库根上的 `grep -rn`）放行，有别的条目、列不出来都拦。`.git` 不在这份
+递归名单里：否则任何仓库内的 `grep -r` 都要被拦，而 `.git` 的内容访问由路径参数判定
+覆盖。根按会话 cwd 解析，`cd` 之后的相对根不重新定位——这是 plan 243 之前就有的缺口。
 未展开的 glob 拼写不访问文件系统：以 `.` 开头且含 `*`/`?`/`[`/`{` 的分量，与名单里的
 名字（含 `.env*` 这一族）**真的存在交集**才按敏感处理——`.en?`、`.gi?`、`.s*`、`.e*`
 拦，长度不够的 `.??`、字符类排除 `n` 的 `.e[ab]*`、拼不出名字的 `.c*`，以及 shell 的
@@ -1202,8 +1205,8 @@ deny / ask 仍同时匹配原文与规范路径。
 
 **File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
 directories, shell/git rc files, and `.env*` are sensitive：manual 下每次确认，
-allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批。写入侧的 `.kloop` 不分位置
-（项目 `.kloop/rules` 一类会引导以后的会话），与读取侧只认私有状态根不同。
+allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批。`.kloop` 下只有 `worktrees/`
+免确认；读取放行的 `rules/`、`skills/`、`commands/` 写进去会引导以后的会话，照旧确认。
 目录外写入不享有 contained-writes 自动放行，仍可由 bypass 或对应批准放行。
 
 **Asking**: `y` allows once. `a` allows for this session in the current
@@ -2672,8 +2675,8 @@ is already read-only-whitelisted).
 Both read tools honor the read gate's blocklist uniformly (cc's
 `getFileReadIgnorePatterns`; `Permissions::read_path_blocked`, plan 31): a file
 covered by a `read_file` deny rule (`read_file(**/*.pem)`, or the whole-tool
-`read_file` form) or on the sensitive-path list (`.env*`, `.ssh`, `.git`, the
-private `~/.kloop`, …) is dropped from grep/glob output — before its contents are read —
+`read_file` form) or on the sensitive-path list (`.env*`, `.ssh`, `.git`, state
+entries under `.kloop`, …) is dropped from grep/glob output — before its contents are read —
 so a deny meant for reads is not slipped by grep, and secrets do not leak
 through a search. Grep also skips files with multiple hard links because the
 pathname cannot classify another name for the same inode. The dropped count is reported (`[N path(s) hidden by
