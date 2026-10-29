@@ -103,14 +103,86 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
         .map_or(true, |glob| glob.compile_matcher().is_match(name))
 }
 
-/// 模式能否匹配以 `prefix` 开头的一族名字（`.env*` 这类前缀规则用）。取第一个
-/// 元字符之前的字面前缀：`.en?` → `.en`、`.env.p*` → `.env.p`。
+/// 模式与“以 `prefix` 开头的一族名字”是否有交集。只看字面前缀不够：`.??`
+/// 长度不足、`.e[ab]*` 的字符类排除了 `n`，都拼不出 `.env`；`.e*`、`.en?`、
+/// `.env.p*` 才有交集。
 fn could_match_prefix(pattern: &str, prefix: &str) -> bool {
-    let literal: String = pattern
-        .chars()
-        .take_while(|ch| !matches!(ch, '*' | '?' | '[' | '{'))
-        .collect();
-    prefix.starts_with(&literal) || literal.starts_with(prefix)
+    let Some(tokens) = glob_tokens(pattern) else {
+        // 花括号交替、反斜杠转义这些没建模的语法：按可能命中处理。
+        return true;
+    };
+    let prefix: Vec<char> = prefix.chars().collect();
+    // reachable[i][j]：前 i 个模式记号能否吃掉前缀的前 j 个字符。`*` 留在原
+    // 记号上继续吃，其余记号各吃一个。
+    let mut reachable = vec![vec![false; prefix.len() + 1]; tokens.len() + 1];
+    reachable[0][0] = true;
+    for index in 0..tokens.len() {
+        for consumed in 0..=prefix.len() {
+            if !reachable[index][consumed] {
+                continue;
+            }
+            match &tokens[index] {
+                GlobToken::Star => {
+                    reachable[index + 1][consumed] = true;
+                    if consumed < prefix.len() {
+                        reachable[index][consumed + 1] = true;
+                    }
+                }
+                GlobToken::Any if consumed < prefix.len() => {
+                    reachable[index + 1][consumed + 1] = true;
+                }
+                GlobToken::Literal(ch) if consumed < prefix.len() && prefix[consumed] == *ch => {
+                    reachable[index + 1][consumed + 1] = true;
+                }
+                GlobToken::Class(class)
+                    if consumed < prefix.len()
+                        && glob_matches(class, &prefix[consumed].to_string()) =>
+                {
+                    reachable[index + 1][consumed + 1] = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    // 前缀吃完后，剩下的模式总能匹配某个后缀，交集即成立。
+    (0..=tokens.len()).any(|index| reachable[index][prefix.len()])
+}
+
+enum GlobToken {
+    Literal(char),
+    Any,
+    Star,
+    /// 原样的字符类（含 `[`/`]`），交给 globset 判单个字符。
+    Class(String),
+}
+
+fn glob_tokens(pattern: &str) -> Option<Vec<GlobToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => tokens.push(GlobToken::Star),
+            '?' => tokens.push(GlobToken::Any),
+            '[' => {
+                let mut class = String::from("[");
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    class.push(ch);
+                    if ch == ']' && class.len() > 2 {
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                tokens.push(GlobToken::Class(class));
+            }
+            '{' | '}' | '\\' => return None,
+            other => tokens.push(GlobToken::Literal(other)),
+        }
+    }
+    Some(tokens)
 }
 
 #[cfg(test)]
@@ -156,6 +228,13 @@ mod tests {
             glob_component_sensitivity(".env", /*last*/ true),
             None,
             "literal names are handled by the path check"
+        );
+        // 与 `.env*` 的交集要真的存在：长度不够或字符类排除 `n` 都不算。
+        assert_eq!(glob_component_sensitivity(".??", /*last*/ true), None);
+        assert_eq!(glob_component_sensitivity(".e[ab]*", /*last*/ true), None);
+        assert_eq!(
+            glob_component_sensitivity(".e*", /*last*/ true),
+            Some(Sensitivity::Secret)
         );
     }
 

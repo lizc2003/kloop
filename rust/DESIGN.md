@@ -1036,16 +1036,21 @@ needle 仍优先，但对边界明确、带引用分隔符的 `cat` heredoc 写�
 无沙箱和未支持平台保持原文保守扫描，`.kloop`、`.git`、rc 文件与 `.env*` 不属于该例外。
 递归搜索（`grep -r`/`rg --hidden` 一类）按命令自己的选项簇判定是否真的递归：grep 的
 `-rn`/`-Rl`/`-d recurse`/`--directories=recurse` 与 rg 的 `-uu`/`-.`/`--unrestricted`/
-`--hidden` 都算；搜索根取参数角色表认定的路径（缺省为 cwd）。根自身或祖先落在敏感目录
+`--hidden` 都算；夹了未收录选项、选项簇解析失败时，仍按同一组拼写复核（`rg --no-config
+-.` 不会因为多一个选项丢掉递归证据）。搜索根取参数角色表认定的路径：没有路径参数才在
+cwd 下递归；明确给了普通文件就只读那个文件，不能拿 cwd 顶替。根自身或祖先落在敏感目录
 下、根的直接子项里出现凭据/状态名字（含 `.env*`）就硬拦。`.git` 不在这份递归名单里：
 否则任何仓库内的 `grep -r` 都要被拦，而 `.git` 的内容访问由路径参数判定覆盖。
-未展开的 glob 拼写不访问文件系统：以 `.` 开头且含 `*`/`?`/`[`/`{` 的分量只要能拼出
-名单里的名字（`.en?`、`.gi?`、`.s*`）就按敏感处理，拼不出的（`.c*`，以及 shell 的
-glob 本就不匹配点开头名字的 `*.env`）照旧放行。固定输出目标里的 `~/…`、`$HOME/…`、
-`${HOME}/…` 按 shell 的展开规则展开后再参与敏感、设备与 deny 判断（`>> ~/.bashrc`
-因此能命中 `bash_write(**/.bashrc)`）；其余动态目标（`"$DIR/x"`、glob）定不下落点，
-至少按最后一段名字过一遍名单。`/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty`
-是纯流设备，不当作敏感目标。
+未展开的 glob 拼写不访问文件系统：以 `.` 开头且含 `*`/`?`/`[`/`{` 的分量，与名单里的
+名字（含 `.env*` 这一族）**真的存在交集**才按敏感处理——`.en?`、`.gi?`、`.s*`、`.e*`
+拦，长度不够的 `.??`、字符类排除 `n` 的 `.e[ab]*`、拼不出名字的 `.c*`，以及 shell 的
+glob 本就不匹配点开头名字的 `*.env` 照旧放行；交集按模式自动机吃前缀判定，不再只看
+字面前缀。读取侧与写入侧共用这套复核：`cat < .en?` 和 `cat .en?` 一样被拦；`echo`/
+`printf` 的参数即使含动态词（`echo "$PWD/.env"`）仍是文本。固定输出目标里的 `~/…`、
+`$HOME/…`、`${HOME}/…` 按 shell 的展开与引号删除规则还原落点（`~/".bashrc"` 就是
+`~/.bashrc`），再参与敏感、设备与 deny 判断（因此能命中 `bash_write(**/.bashrc)`）；
+其余动态目标（`"$DIR/x"`、glob）定不下落点，至少按最后一段名字过一遍名单。
+`/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty` 是纯流设备，不当作敏感目标。
 
 The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
 state tree, including `config.toml`, `mcp-oauth.json`, and

@@ -41,18 +41,15 @@ pub(super) fn is_modeled_command(argv: &[String]) -> bool {
 
 /// grep/rg 是否在搜索根下递归。共用同一套选项簇解析：`-rn`、`-d recurse`、
 /// `--directories=recurse`、`-.`、`-uu`、`--unrestricted` 都按各自语法判定，
-/// 不再只认原样的 `-r`。选项簇解析失败时退回旧的字面形状。
+/// 不再只认原样的 `-r`。选项簇解析失败（夹了未收录的选项）时仍按同一组拼写
+/// 复核：`rg --no-config -.` 这类调用不该因为多一个选项就丢掉递归证据。
 pub(super) fn search_is_recursive(argv: &[String]) -> bool {
     let Some(command) = argv.first().and_then(|raw| raw.rsplit('/').next()) else {
         return false;
     };
     match command {
         "grep" => walk_options(argv, &GREP, Positionals::PatternThenPaths).map_or_else(
-            || {
-                argv[1..]
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "-r" | "-R" | "--recursive"))
-            },
+            || grep_recursion_fallback(argv),
             |walked| {
                 walked
                     .short_flags
@@ -76,14 +73,7 @@ pub(super) fn search_is_recursive(argv: &[String]) -> bool {
         // `--unrestricted` 才会读隐藏的点文件。`-u` 一次就够：它让被 gitignore
         // 的 `.env` 重新可见。
         "rg" => walk_options(argv, &RG, Positionals::PatternThenPaths).map_or_else(
-            || {
-                argv[1..].iter().any(|arg| {
-                    arg == "--hidden"
-                        || (arg.starts_with('-')
-                            && !arg.starts_with("--")
-                            && arg.chars().skip(1).any(|ch| ch == 'u'))
-                })
-            },
+            || rg_recursion_fallback(argv),
             |walked| {
                 walked
                     .short_flags
@@ -97,6 +87,44 @@ pub(super) fn search_is_recursive(argv: &[String]) -> bool {
         ),
         _ => false,
     }
+}
+
+/// 选项簇解析失败时的 grep 递归证据。只认无歧义的拼写：簇里的 `r`/`R`、
+/// 递归长选项，以及 `-d`/`--directories` 的 `recurse` 值。
+fn grep_recursion_fallback(argv: &[String]) -> bool {
+    let recurse_value = |value: &str| value == "recurse";
+    argv[1..].iter().any(|arg| match arg.strip_prefix("--") {
+        Some(long) => match long.split_once('=') {
+            Some((name, value)) => {
+                matches!(name, "recursive" | "dereference-recursive")
+                    || (name == "directories" && recurse_value(value))
+            }
+            None => matches!(long, "recursive" | "dereference-recursive"),
+        },
+        None => {
+            arg.len() > 1
+                && arg.starts_with('-')
+                && arg[1..].chars().any(|ch| matches!(ch, 'r' | 'R'))
+        }
+    }) || argv
+        .windows(2)
+        .any(|pair| matches!(pair[0].as_str(), "-d" | "--directories") && recurse_value(&pair[1]))
+}
+
+/// 选项簇解析失败时的 rg 递归证据：`--hidden`、`--unrestricted`，以及簇里的
+/// `u`/`.`（`-uu`、`-.`）。
+fn rg_recursion_fallback(argv: &[String]) -> bool {
+    argv[1..].iter().any(|arg| match arg.strip_prefix("--") {
+        Some(long) => matches!(
+            long.split_once('=').map_or(long, |(name, _)| name),
+            "hidden" | "unrestricted"
+        ),
+        None => {
+            arg.len() > 1
+                && arg.starts_with('-')
+                && arg[1..].chars().any(|ch| matches!(ch, 'u' | '.'))
+        }
+    })
 }
 
 /// 只 stat 或列目录、不打开文件内容的调用。未知命令一律按内容访问处理，

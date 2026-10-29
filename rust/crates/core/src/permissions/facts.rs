@@ -337,19 +337,30 @@ fn bash_reads_sensitive_path(
                 if argv_reads_sensitive_path(&argv, cwd) {
                     return ReadVerdict::Sensitive;
                 }
-            } else if command.words.iter().skip(1).any(|word| match &word.value {
-                WordValue::Literal(value) => path_argument_is_sensitive(value, cwd, false),
-                // glob、`~`、`$HOME` 这类展开拼写落进 Unknown，原文仍可复核
-                // （`cat .en?`、`cat ~/.s*/id_rsa`）。
-                WordValue::Unknown => path_argument_is_sensitive(&word.raw, cwd, false),
-            }) {
+            } else if !arguments_are_text(command)
+                && command.words.iter().skip(1).any(|word| match &word.value {
+                    WordValue::Literal(value) => path_argument_is_sensitive(value, cwd, false),
+                    // glob、`~`、`$HOME` 这类展开拼写落进 Unknown，原文仍可复核
+                    // （`cat .en?`、`cat ~/.s*/id_rsa`）。
+                    WordValue::Unknown => path_argument_is_sensitive(&word.raw, cwd, false),
+                })
+            {
                 return ReadVerdict::Sensitive;
             }
         }
         for redirect in &facts.redirects {
-            if redirect.direction == Direction::Read
-                && matches!(&redirect.target, WordValue::Literal(path) if path_argument_is_sensitive(path, cwd, false))
-            {
+            if redirect.direction != Direction::Read {
+                continue;
+            }
+            let sensitive = match &redirect.target {
+                WordValue::Literal(path) => path_argument_is_sensitive(path, cwd, false),
+                // 输入重定向同样可能是 glob 拼写：`cat < .en?`。
+                WordValue::Unknown => redirect
+                    .raw_target
+                    .as_deref()
+                    .is_some_and(|raw| path_argument_is_sensitive(unquote(raw), cwd, false)),
+            };
+            if sensitive {
                 return ReadVerdict::Sensitive;
             }
         }
@@ -359,6 +370,16 @@ fn bash_reads_sensitive_path(
     } else {
         ReadVerdict::Clear
     }
+}
+
+/// `echo`/`printf` 的参数只是文本。参数角色表在 argv 完整时才给出这条豁免；
+/// 参数里出现动态词（`echo "$PWD/.env"`）走不了角色表，这里补上同一句。
+fn arguments_are_text(command: &CommandFact) -> bool {
+    matches!(
+        command.words.first().map(|word| &word.value),
+        Some(WordValue::Literal(name))
+            if matches!(name.rsplit('/').next(), Some("echo" | "printf"))
+    )
 }
 
 fn protected_body(body: &str, execution: ExecutionContext<'_>) -> bool {
@@ -603,8 +624,25 @@ fn expand_home_spelling(raw: &str) -> Option<PathBuf> {
         text.strip_prefix("$HOME/")
             .or_else(|| text.strip_prefix("${HOME}/"))?
     };
+    // shell 在拼接时会去掉引号与反斜杠转义：`~/".bashrc"` 落到 `~/.bashrc`。
+    let rest = shell_unquote(rest)?;
     (!rest.is_empty() && !rest.contains(['\\', '$', '`', '*', '?', '[', ']', '{', '}']))
         .then(|| home.join(rest))
+}
+
+/// 去掉 shell 的引号删除与反斜杠转义。这里不做展开：`$`、反引号、glob 都在
+/// 调用方被拒，剩下的只是把拼写还原成落点。
+fn shell_unquote(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' => {}
+            '\\' => out.push(chars.next()?),
+            _ => out.push(ch),
+        }
+    }
+    Some(out)
 }
 
 fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
@@ -626,25 +664,36 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
     if !argv_roles::search_is_recursive(argv) {
         return false;
     }
-    let roots: Vec<PathBuf> = match argv_roles::path_arguments(argv) {
-        Some(paths) => paths
+    let roots: Option<Vec<PathBuf>> = argv_roles::path_arguments(argv).map(|paths| {
+        paths
             .iter()
             .map(|path| expand_shell_path(path, cwd))
-            .collect(),
-        // 未识别的语法退回逐参数；命令的操作数在这里已被过滤掉。
-        None => argv[1..]
+            .collect()
+    });
+    match roots {
+        // 角色表说没有路径参数：grep/rg 在 cwd 下递归。
+        Some(paths) if paths.is_empty() => recursive_root_is_sensitive(cwd),
+        // 明确给了路径：只读这些根。给了普通文件就不是目录遍历，不能拿 cwd 顶替。
+        Some(paths) => paths
             .iter()
-            .filter(|arg| !arg.starts_with('-'))
-            .map(|arg| expand_shell_path(arg, cwd))
-            .collect(),
-    };
-    let roots: Vec<PathBuf> = roots.into_iter().filter(|path| path.is_dir()).collect();
-    let roots = if roots.is_empty() {
-        vec![cwd.to_path_buf()]
-    } else {
-        roots
-    };
-    roots.iter().any(|root| recursive_root_is_sensitive(root))
+            .filter(|path| path.is_dir())
+            .any(|root| recursive_root_is_sensitive(root)),
+        // 选项簇解析失败时角色不明：能认出目录参数的按根检查，认不出时按可能读
+        // cwd 处理（保守方向）。
+        None => {
+            let roots: Vec<PathBuf> = argv[1..]
+                .iter()
+                .filter(|arg| !arg.starts_with('-'))
+                .map(|arg| expand_shell_path(arg, cwd))
+                .filter(|path| path.is_dir())
+                .collect();
+            if roots.is_empty() {
+                recursive_root_is_sensitive(cwd)
+            } else {
+                roots.iter().any(|root| recursive_root_is_sensitive(root))
+            }
+        }
+    }
 }
 
 fn recursive_root_is_sensitive(root: &Path) -> bool {
@@ -1051,6 +1100,42 @@ mod tests {
         assert!(path_argument_is_sensitive("~/.s*/id_rsa", cwd, false));
         assert!(!path_argument_is_sensitive(".c*", cwd, false));
         assert!(!path_argument_is_sensitive("*.env", cwd, false));
+        // 长度与字符类都要与 `.env*` 真正有交集，不能只看字面前缀。
+        assert!(!path_argument_is_sensitive(".??", cwd, false));
+        assert!(!path_argument_is_sensitive(".e[ab]*", cwd, false));
+    }
+
+    /// 指定了普通文件就只读那个文件；不能因为“根里没有目录”退回 cwd。
+    #[test]
+    fn explicit_file_roots_do_not_fall_back_to_cwd() {
+        let root = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan243-file-root-").expect("fresh id"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), "KEY=x").unwrap();
+        std::fs::write(root.join("notes.txt"), "KEY").unwrap();
+        let file = ["grep", "-rn", "KEY", "notes.txt"].map(str::to_string);
+        assert!(
+            !recursive_search_covers_sensitive_path(&file, &root),
+            "`grep -rn KEY notes.txt` never reads the cwd's .env"
+        );
+        let no_root = ["grep", "-rn", "KEY"].map(str::to_string);
+        assert!(
+            recursive_search_covers_sensitive_path(&no_root, &root),
+            "no explicit path searches cwd"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 动态纯文本参数不是读取：echo/printf 的参数角色豁免对 Unknown 词同样成立。
+    #[test]
+    fn text_arguments_stay_text_when_dynamic() {
+        let call = CallFacts::gather(
+            "bash",
+            &serde_json::json!({ "command": "echo \"$PWD/.env\"" }),
+            Path::new("/workspace"),
+            None,
+        );
+        assert!(!call.sensitive_read);
     }
 
     /// `~/`、`$HOME/` 的展开只在 shell 真的会展开时发生。

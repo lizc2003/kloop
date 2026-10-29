@@ -87,3 +87,29 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
   敏感读取);递归根只查直接子项与根/祖先，不做整树遍历;`.git` 不在递归名单里。
 - 验证：`make check` 全绿(fmt、clippy、workspace 2090 通过、本机 parity)。Linux 与
   Windows 未实测。
+
+## 审查后补（2026-10-29，同日六处）
+
+首版有四条入口仍可绕过、三条新误拦，逐条修掉并补回归：
+
+1. **P1 解析失败丢递归证据**：`rg --no-config -. KEY .` 的 `--no-config` 不在角色表，
+   `walk_options` 返回 `None`，旧回退只认 `--hidden` 与簇里的 `u`。回退改为按同一组
+   拼写复核：grep 的簇 `r`/`R`、`--recursive`/`--dereference-recursive`、
+   `-d|--directories recurse`；rg 的簇 `u`/`.`、`--hidden`/`--unrestricted`。
+2. **P1 读重定向的 Unknown 目标**：`cat < .en?` 的目标是 Unknown，读取侧只认 `Literal`。
+   读写两侧现在共用同一套复核（`raw_target` 去掉引号后过 `path_argument_is_sensitive`）。
+3. **P1 home 后缀的引号**：`echo x > ~/".bashrc"` 实际写 `~/.bashrc`，原实现把引号当
+   文件名。`expand_home_spelling` 现在按 shell 的引号删除与反斜杠转义还原后缀。
+4. **P2 显式文件根**：`grep -rn KEY notes.txt` 的根过滤成空后退回 cwd，含 `.env` 的 cwd
+   会误拦。只有“没有路径参数”才在 cwd 下递归；**解析失败**时角色不明，仍按可能读
+   cwd 保守处理。
+5. **P2 动态纯文本参数**：`echo "$PWD/.env"` 的参数走到 Unknown 分支，绕过了
+   echo/printf 的参数角色豁免；豁免补到 argv 不完整的路径。
+6. **P2 glob 交集**：`.??`（长度不足）与 `.e[ab]*`（字符类排除 `n`）没有与 `.env*` 的
+   交集却被拦。`could_match_prefix` 改为在模式自动机上吃前缀，前缀吃完才认定有交集；
+   花括号/转义等未建模语法仍按可能命中处理。
+
+验证：四条新 gate 回归在旧代码上先红、修后转绿；`explicit_file_roots_do_not_fall_back_to_cwd`、
+`text_arguments_stay_text_when_dynamic` 与 sensitive 的 `.??`/`.e[ab]*` 断言覆盖 P2。
+外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2096 通过、本机 parity）。
+提交号见 `git log --grep 'plan243 review'`。

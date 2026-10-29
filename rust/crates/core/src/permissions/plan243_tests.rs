@@ -165,3 +165,86 @@ async fn plan243_stream_devices_are_not_sensitive_targets() {
         Some("sensitive redirect path")
     );
 }
+
+#[tokio::test]
+async fn plan243_unparsed_search_options_keep_recursion_evidence() {
+    let root = plan243_root("unparsed");
+    std::fs::write(root.join(".env"), "API_KEY=x").unwrap();
+    for command in [
+        format!("rg --no-config -. KEY {}", root.display()),
+        format!("rg --no-config -uu KEY {}", root.display()),
+        format!("grep --no-config -rn KEY {}", root.display()),
+        format!("grep --no-config -d recurse KEY {}", root.display()),
+    ] {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        let error = p
+            .check_call("bash", &bash(&command), 0, true)
+            .await
+            .expect_err(&command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan243_glob_read_redirects_are_screened() {
+    let root = plan243_root("read-redirect");
+    let root = root.display().to_string();
+    for command in [
+        format!("cat < {root}/.en?"),
+        format!("cat 0< {root}/.gi?/config"),
+    ] {
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+        let error = p
+            .check_call("bash", &bash(&command), 0, true)
+            .await
+            .expect_err(&command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan243_quoted_home_suffix_is_decoded() {
+    for command in [
+        "echo x > ~/\".bashrc\"",
+        "echo x >> ~/.bas\"hrc\"",
+    ] {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(command), 0, false)
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        assert_eq!(approver.ask_count(), 1, "{command}");
+        assert_eq!(
+            approver.asked()[0].notice.as_deref(),
+            Some("sensitive redirect path"),
+            "{command}"
+        );
+
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(**/.bashrc)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call("bash", &bash(command), 0, true)
+            .await
+            .expect_err(command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn plan243_text_arguments_are_not_sensitive_reads() {
+    let p = gate(
+        Mode::Bypass,
+        rules(&[], &[], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    p.check_call("bash", &bash("echo \"$PWD/.env\""), 0, true)
+        .await
+        .unwrap();
+}
