@@ -177,7 +177,7 @@ async fn run_gated_bash(
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
     let input = json!({ "command": command });
-    let sandbox_auto = bash::execution_context("bash", &input, workspace);
+    let sandbox_auto = bash::execution_context("bash", &input, workspace, &ctx.cfg.shell_login_env);
     workspace
         .permissions
         .check_call_with_execution("bash", &input, ctx.depth, sandbox_auto)

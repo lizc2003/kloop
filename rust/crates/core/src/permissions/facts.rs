@@ -10,7 +10,9 @@ use crate::sandbox::ExecutionContext;
 use crate::shell::BashAnalysis;
 use crate::shell::argv_is_dangerous;
 use crate::shell::strip_wrappers;
-use crate::shell::{BashFacts, CommandFact, Direction, WordValue, analyze_bash_facts};
+use crate::shell::{
+    BashFacts, CommandFact, Direction, WordEvaluation, WordValue, analyze_bash_facts,
+};
 use crate::tools::Builtin;
 
 use super::argv_roles;
@@ -39,8 +41,7 @@ pub(crate) struct CallFacts {
     pub(super) path_key: Option<&'static str>,
     pub(super) sensitive_read: bool,
     pub(super) risk_commands: Vec<CommandFact>,
-    pub(super) risk_writes: Vec<PathFacts>,
-    unresolved_sensitive_write: bool,
+    pub(super) risk_writes: Vec<WriteTarget>,
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     pub(crate) removing_worktree: bool,
@@ -55,6 +56,28 @@ pub(crate) struct CallFacts {
 pub(super) struct OpaqueScript {
     pub(super) command: String,
     pub(super) no_sandbox: bool,
+}
+
+/// 未知效果不能从规则输入中消失；只有 Resolved 可按确切路径排除 deny/ask。
+pub(super) enum WriteTarget {
+    Resolved(PathFacts),
+    Partial { sensitive: bool },
+    Unknown,
+}
+
+impl WriteTarget {
+    fn sensitive(&self) -> bool {
+        match self {
+            Self::Resolved(path) => {
+                path.sensitive
+                    || (path.normalized.starts_with("/dev")
+                        && !is_stream_device(&path.original)
+                        && !is_stream_device(&path.normalized))
+            }
+            Self::Partial { sensitive } => *sensitive,
+            Self::Unknown => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -157,9 +180,9 @@ impl CallFacts {
             }
             _ => None,
         };
-        let (risk_writes, unresolved_sensitive_write) = bash_facts
+        let risk_writes = bash_facts
             .as_ref()
-            .map_or_else(|| (Vec::new(), false), |facts| write_targets(facts, cwd));
+            .map_or_else(Vec::new, |facts| write_targets(facts, cwd, execution));
         CallFacts {
             shell,
             writes,
@@ -169,7 +192,6 @@ impl CallFacts {
             risk_commands: bash_facts
                 .as_ref()
                 .map_or_else(Vec::new, |facts| facts.commands.clone()),
-            unresolved_sensitive_write,
             risk_writes,
             powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
@@ -217,14 +239,7 @@ impl CallFacts {
         }) {
             return Some(Hazard { tag: "destructive" });
         }
-        if self.unresolved_sensitive_write
-            || self.risk_writes.iter().any(|path| {
-                path.sensitive
-                    || (path.normalized.starts_with("/dev")
-                        && !is_stream_device(&path.original)
-                        && !is_stream_device(&path.normalized))
-            })
-        {
+        if self.risk_writes.iter().any(WriteTarget::sensitive) {
             return Some(Hazard {
                 tag: "sensitive redirect path",
             });
@@ -324,28 +339,32 @@ fn bash_reads_sensitive_path(
     if raw_mentions_sensitive_path(&masked) {
         return ReadVerdict::Unresolved;
     }
-    if let Some(commands) = facts.analysis.commands()
-        && commands
-            .iter()
-            .any(|argv| argv_reads_sensitive_path(argv, cwd))
     {
-        return ReadVerdict::Sensitive;
-    }
-    {
+        let home = execution.shell_home();
         for command in &facts.commands {
-            if let Some(argv) = command.argv() {
+            let home = home.as_deref().filter(|_| !command.context.home_unknown);
+            let words: Vec<_> = command
+                .words
+                .iter()
+                .map(|word| word.syntax.evaluate(home))
+                .collect();
+            // 不删除未知参数：角色表只有在每个位置都有完整拼写时才能使用。
+            let argv: Option<Vec<_>> = words
+                .iter()
+                .map(|word| match word {
+                    WordEvaluation::Resolved(text) => Some(text.clone()),
+                    WordEvaluation::Partial(_) | WordEvaluation::Unknown => None,
+                })
+                .collect();
+            if let Some(argv) = argv {
                 if argv_reads_sensitive_path(&argv, cwd) {
                     return ReadVerdict::Sensitive;
                 }
             } else if !arguments_are_text(command)
-                && command.words.iter().skip(1).any(|word| match &word.value {
-                    WordValue::Literal(value) => path_argument_is_sensitive(value, cwd, false),
-                    // glob、`~`、`$HOME` 这类展开拼写落进 Unknown，原文仍可复核
-                    // （`cat .en?`、`cat ~/.s*/id_rsa`）。
-                    WordValue::Unknown => {
-                        path_argument_is_sensitive(&decoded_spelling(&word.raw), cwd, false)
-                    }
-                })
+                && words
+                    .iter()
+                    .skip(1)
+                    .any(|word| evaluation_is_sensitive(word, cwd, false))
             {
                 return ReadVerdict::Sensitive;
             }
@@ -354,14 +373,8 @@ fn bash_reads_sensitive_path(
             if redirect.direction != Direction::Read {
                 continue;
             }
-            let sensitive = match &redirect.target {
-                WordValue::Literal(path) => path_argument_is_sensitive(path, cwd, false),
-                // 输入重定向同样可能是 glob 拼写：`cat < .en?`。
-                WordValue::Unknown => redirect.raw_target.as_deref().is_some_and(|raw| {
-                    path_argument_is_sensitive(&decoded_spelling(raw), cwd, false)
-                }),
-            };
-            if sensitive {
+            let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
+            if evaluation_is_sensitive(&redirect.syntax.evaluate(home), cwd, false) {
                 return ReadVerdict::Sensitive;
             }
         }
@@ -416,7 +429,7 @@ pub(crate) fn bash_protection_requirement(
 }
 
 fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
-    let path = expand_shell_path(raw, cwd);
+    let path = lexical_normalize(cwd, Path::new(raw));
     let sensitivity = merge_sensitivity(
         PathFacts::gather(&path, cwd).sensitivity,
         glob_spelling_sensitivity(&path, metadata),
@@ -427,6 +440,28 @@ fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
         Some(Sensitivity::Secret) => true,
         // `.git` 的元数据（stat、列目录）不是内容读取；内容访问仍是硬边界。
         Some(Sensitivity::Vcs) => !metadata,
+    }
+}
+
+fn evaluation_is_sensitive(word: &WordEvaluation, cwd: &Path, metadata: bool) -> bool {
+    match word {
+        WordEvaluation::Resolved(path) => path_argument_is_sensitive(path, cwd, metadata),
+        WordEvaluation::Partial(spelling) if !spelling.contains('\0') => {
+            path_argument_is_sensitive(spelling, cwd, metadata)
+        }
+        WordEvaluation::Partial(spelling) => {
+            // 未知片段不能假装成文件系统落点，但已知的敏感分量仍然成立。
+            let path = Path::new(spelling);
+            match merge_sensitivity(
+                path_sensitivity(path),
+                glob_spelling_sensitivity(path, metadata),
+            ) {
+                Some(Sensitivity::Secret) => true,
+                Some(Sensitivity::Vcs) => !metadata,
+                None => false,
+            }
+        }
+        WordEvaluation::Unknown => false,
     }
 }
 
@@ -598,104 +633,6 @@ fn powershell_mentions_sensitive_path(command: &str) -> bool {
         })
 }
 
-/// shell 会展开的路径拼写：`~`、`~/…`、`$HOME/…`、`${HOME}/…`，引号按 shell 的
-/// 规则参与拼接。展开结果与 cwd 无关；夹着别的展开或 glob 的拼写返回 `None`，不猜。
-fn expand_home_spelling(raw: &str) -> Option<PathBuf> {
-    let raw = raw.trim();
-    let (suffix, quote) = split_home_prefix(raw)?;
-    let home = std::env::home_dir()?;
-    // 后缀独立解码：`$HOME/'.bashrc'` 的单引号只让后缀成为字面量。
-    let suffix = shell_unquote(suffix, quote)?;
-    let suffix = suffix.trim_start_matches('/');
-    (!suffix.contains(['\\', '$', '`', '*', '?', '[', ']', '{', '}'])).then(|| home.join(suffix))
-}
-
-/// 从拼写开头消费 `~/`、`$HOME/`、`${HOME}/`，返回（剩余拼写, 剩余部分所处的
-/// 引用状态）。`~` 只在未引用、且紧接 `/` 或结尾时展开；`$HOME` 在双引号里仍
-/// 展开、单引号里不展开。整条包在双引号里时，剩余部分继续留在双引号状态。
-fn split_home_prefix(raw: &str) -> Option<(&str, Option<char>)> {
-    if raw == "~" {
-        return Some(("", None));
-    }
-    if let Some(suffix) = raw.strip_prefix("~/") {
-        return Some((suffix, None));
-    }
-    if raw == "$HOME" || raw == "${HOME}" {
-        return Some(("", None));
-    }
-    if let Some(suffix) = raw
-        .strip_prefix("$HOME/")
-        .or_else(|| raw.strip_prefix("${HOME}/"))
-    {
-        return Some((suffix, None));
-    }
-    // 整条目标包在双引号里：`"$HOME/O'Brien.txt"`。`"~/…"` 里的 `~` 不展开。
-    let inner = raw.strip_prefix('"')?;
-    let suffix = inner
-        .strip_prefix("$HOME")
-        .or_else(|| inner.strip_prefix("${HOME}"))?;
-    Some((suffix, Some('"')))
-}
-
-/// 按 shell 的引用状态去掉引号与反斜杠转义。`quote` 是拼写开头所处的引用：
-/// 单引号内的字符全是字面量；双引号内只有 `"`、`\\`、`$`、反引号能被反斜杠转义。
-/// `O'Brien.txt` 在双引号里是普通文件名。未闭合的引用返回 `None`——那不是一条
-/// 能落地的路径。
-fn shell_unquote(raw: &str, quote: Option<char>) -> Option<String> {
-    let mut out = String::new();
-    let mut chars = raw.chars();
-    let mut quote = quote;
-    while let Some(ch) = chars.next() {
-        match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                } else {
-                    out.push(ch);
-                }
-            }
-            Some('"') => {
-                if ch == '"' {
-                    quote = None;
-                } else if ch == '\\' {
-                    let escaped = chars.next()?;
-                    if !matches!(escaped, '"' | '\\' | '$' | '`') {
-                        out.push('\\');
-                    }
-                    out.push(escaped);
-                } else {
-                    out.push(ch);
-                }
-            }
-            Some(_) => return None,
-            None => match ch {
-                '"' | '\'' => quote = Some(ch),
-                '\\' => out.push(chars.next()?),
-                _ => out.push(ch),
-            },
-        }
-    }
-    quote.is_none().then_some(out)
-}
-
-/// 动态拼写的名字复核用：能按 shell 规则还原就还原，还原不了退回原文。
-fn decoded_spelling(raw: &str) -> String {
-    let raw = raw.trim();
-    shell_unquote(raw, None).unwrap_or_else(|| unquote(raw).to_string())
-}
-
-fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
-    if raw == "~" {
-        return std::env::home_dir().unwrap_or_else(|| cwd.to_path_buf());
-    }
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = std::env::home_dir()
-    {
-        return home.join(rest);
-    }
-    lexical_normalize(cwd, Path::new(raw))
-}
-
 /// 递归搜索会读出根下所有文件的内容：命令是否真的递归、以及根里有没有凭据名，
 /// 两件事都要问清楚。递归开关走命令自己的选项簇解析（`-rn`、`-d recurse`、
 /// `-uu`、`-.`），根下名单与敏感判定共用 [`sensitive`]。
@@ -706,7 +643,7 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
     let roots: Option<Vec<PathBuf>> = argv_roles::search_roots(argv).map(|paths| {
         paths
             .iter()
-            .map(|path| expand_shell_path(path, cwd))
+            .map(|path| lexical_normalize(cwd, Path::new(path)))
             .collect()
     });
     match roots {
@@ -723,7 +660,7 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
             let roots: Vec<PathBuf> = argv[1..]
                 .iter()
                 .filter(|arg| !arg.starts_with('-'))
-                .map(|arg| expand_shell_path(arg, cwd))
+                .map(|arg| lexical_normalize(cwd, Path::new(arg)))
                 .filter(|path| path.is_dir())
                 .collect();
             if roots.is_empty() {
@@ -755,52 +692,46 @@ fn recursive_root_is_sensitive(root: &Path) -> bool {
     })
 }
 
-/// 固定输出目标的落点。动态目标不能只留一个 “Unknown”：`~/`、`$HOME/` 是
-/// shell 会展开的绝对路径，其余拼写至少还能按最后一段名字过一遍敏感名单。
-fn write_targets(facts: &BashFacts, cwd: &Path) -> (Vec<PathFacts>, bool) {
-    let mut writes = Vec::new();
-    let mut unresolved_sensitive = false;
-    for redirect in &facts.redirects {
-        if redirect.direction != Direction::Write {
-            continue;
-        }
-        match &redirect.target {
-            // `/dev/null` 只是丢掉输出，没有写效果。
-            WordValue::Literal(path) if path == "/dev/null" => {}
-            WordValue::Literal(path) => {
-                if !redirect.context.cwd_unknown || Path::new(path).is_absolute() {
-                    writes.push(PathFacts::gather(Path::new(path), cwd));
-                } else if path_sensitivity(Path::new(path)).is_some() {
-                    // cwd 会变：落点定不下来，但名字本身敏感。
-                    unresolved_sensitive = true;
+/// argv 与重定向共用求值器；不确定的写效果必须保留给 deny/ask。
+fn write_targets(
+    facts: &BashFacts,
+    cwd: &Path,
+    execution: ExecutionContext<'_>,
+) -> Vec<WriteTarget> {
+    let home = execution.shell_home();
+    let mut writes: Vec<_> = facts
+        .redirects
+        .iter()
+        .filter(|redirect| redirect.direction == Direction::Write)
+        .filter_map(|redirect| {
+            let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
+            let target = redirect.syntax.evaluate(home);
+            match target {
+                // `/dev/null` 只是丢掉输出，没有写效果。
+                WordEvaluation::Resolved(path) if path == "/dev/null" => None,
+                WordEvaluation::Resolved(path)
+                    if !redirect.context.cwd_unknown || Path::new(&path).is_absolute() =>
+                {
+                    Some(WriteTarget::Resolved(PathFacts::gather(
+                        Path::new(&path),
+                        cwd,
+                    )))
                 }
+                WordEvaluation::Resolved(path) => Some(WriteTarget::Partial {
+                    sensitive: evaluation_is_sensitive(&WordEvaluation::Partial(path), cwd, false),
+                }),
+                WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
+                    sensitive: evaluation_is_sensitive(&target, cwd, false),
+                }),
+                WordEvaluation::Unknown => Some(WriteTarget::Unknown),
             }
-            WordValue::Unknown => {
-                let raw = redirect.raw_target.as_deref().unwrap_or_default().trim();
-                match expand_home_spelling(raw) {
-                    // 与 cwd 无关的绝对目标：进 risk_writes，deny 规则也按它匹配。
-                    Some(path) => writes.push(PathFacts::gather(&path, cwd)),
-                    // 其余动态目标（`"$DIR/x"`、glob）只知道拼写：名字敏感就标记。
-                    None if path_argument_is_sensitive(&decoded_spelling(raw), cwd, false) => {
-                        unresolved_sensitive = true;
-                    }
-                    None => {}
-                }
-            }
-        }
-    }
-    (writes, unresolved_sensitive)
-}
-
-fn unquote(raw: &str) -> &str {
-    let raw = raw.trim();
-    raw.strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .or_else(|| {
-            raw.strip_prefix('\'')
-                .and_then(|rest| rest.strip_suffix('\''))
         })
-        .unwrap_or(raw)
+        .collect();
+    if !facts.reliable {
+        // 达到解析界限时不能用空效果列表证明“不写文件”。
+        writes.push(WriteTarget::Unknown);
+    }
+    writes
 }
 
 /// 纯流设备：写进去没有持久副作用，不按敏感目标处理。
@@ -1187,44 +1118,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 引号删除要保留引用状态：双引号里的单引号是文件名的一部分。
-    #[test]
-    fn home_spelling_keeps_quoted_apostrophes() {
-        let Some(home) = std::env::home_dir() else {
-            return;
-        };
-        assert_eq!(
-            expand_home_spelling("\"$HOME/O'Brien.txt\""),
-            Some(home.join("O'Brien.txt"))
-        );
-        assert_eq!(
-            expand_home_spelling("~/.bas\"hrc\""),
-            Some(home.join(".bashrc"))
-        );
-        // 未闭合的引用不是一条能落地的路径。
-        assert_eq!(expand_home_spelling("~/O'Brien.txt"), None);
-    }
-
-    /// `$HOME` 的引用状态与后缀无关：后缀的单引号只让后缀成为字面量。
-    #[test]
-    fn home_prefix_quoting_is_independent_of_the_suffix() {
-        let Some(home) = std::env::home_dir() else {
-            return;
-        };
-        assert_eq!(
-            expand_home_spelling("$HOME/'.bashrc'"),
-            Some(home.join(".bashrc"))
-        );
-        assert_eq!(
-            expand_home_spelling("$HOME/\"O'Brien.txt\""),
-            Some(home.join("O'Brien.txt"))
-        );
-        assert_eq!(
-            expand_home_spelling("\"$HOME\"/.bashrc"),
-            Some(home.join(".bashrc"))
-        );
-    }
-
     /// 动态词按 shell 规则还原后再查名字：`cat "$PWD/.env"` 仍是读取。
     #[test]
     fn dynamic_words_are_checked_after_unquoting() {
@@ -1247,37 +1140,6 @@ mod tests {
             None,
         );
         assert!(!call.sensitive_read);
-    }
-
-    /// `~/`、`$HOME/` 的展开只在 shell 真的会展开时发生。
-    #[test]
-    fn home_spellings_expand_only_when_the_shell_would() {
-        let Some(home) = std::env::home_dir() else {
-            return;
-        };
-        assert_eq!(expand_home_spelling("~"), Some(home.clone()));
-        assert_eq!(
-            expand_home_spelling("~/.bashrc"),
-            Some(home.join(".bashrc"))
-        );
-        assert_eq!(
-            expand_home_spelling("$HOME/.gitconfig"),
-            Some(home.join(".gitconfig"))
-        );
-        assert_eq!(
-            expand_home_spelling("${HOME}/.ssh/id_rsa"),
-            Some(home.join(".ssh/id_rsa"))
-        );
-        assert_eq!(
-            expand_home_spelling("\"$HOME/.bashrc\""),
-            Some(home.join(".bashrc"))
-        );
-        // 双引号里的 `~` 与单引号里的任何拼写都不展开。
-        assert_eq!(expand_home_spelling("\"~/.bashrc\""), None);
-        assert_eq!(expand_home_spelling("'$HOME/.bashrc'"), None);
-        // 夹着别的展开或 glob 时不下结论。
-        assert_eq!(expand_home_spelling("~/$NAME/.bashrc"), None);
-        assert_eq!(expand_home_spelling("$OTHER/.bashrc"), None);
     }
 
     /// 静态拼不出落点的写目标，至少按名字过一遍敏感名单。

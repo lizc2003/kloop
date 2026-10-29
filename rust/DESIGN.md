@@ -1049,14 +1049,26 @@ glob 本就不匹配点开头名字的 `*.env` 照旧放行；交集按模式自
 字面前缀。字符类按 glob 语义解析（否定类 `[!]]` 的第一个 `]` 是成员），花括号/转义这类
 未建模语法仍保留字面前缀的排除判断（`.c{ache,onfig}` 放行）。引用不会让模式变成字面量：
 还原后的拼写仍按 glob 判定（`cat ".en?"` 也拦），宁可多拦一次也不放过拼写上的交集。
-读取侧与写入侧共用这套复核：`cat < .en?` 和 `cat .en?` 一样被拦；`echo`/`printf` 的参数
-即使含动态词（`echo "$PWD/.env"`）仍是文本。固定输出目标里的 `~/…`、`$HOME/…`、
-`${HOME}/…` 按 shell 的展开与引用状态还原落点：前缀与后缀的引用各自独立（`$HOME` 没被
-引用就展开，后缀的引号只让后缀成为字面量，`$HOME/'.bashrc'` 是 `~/.bashrc`）；单引号内
-不展开、双引号里的 `'` 是文件名的一部分（`~/".bashrc"` 是 `~/.bashrc`，
-`"$HOME/O'Brien.txt"` 是 `O'Brien.txt`）。这些落点再参与敏感、设备与 deny 判断（因此
-能命中 `bash_write(**/.bashrc)`）；其余动态目标（`"$DIR/x"`、glob）定不下落点，至少按
-最后一段名字过一遍名单。
+读取侧与写入侧共用词求值：`cat < .en?` 和 `cat .en?` 一样被拦；`echo`/`printf` 的参数
+即使含动态词（`echo "$PWD/.env"`）仍是文本。`shell/word.rs` 从语法树保留有序词片段：
+字面文本、home、完整变量名、模式与未知展开，各自带未引用/单引号/双引号状态。
+权限层只消费统一求值的 `Resolved` / `Partial` / `Unknown`，不再解析源文本或猜前缀。
+`~` 只在词首未引用时展开；`$HOME`/`${HOME}` 按变量节点展开，与前后空引用或后缀引用无关
+（`""$HOME/.bashrc`、`$HOME/'.bashrc'` 同为 home 内 rc 文件）。拼接按字符串语义：
+`"$HOME.bashrc"` 是 home 名字后接 `.bashrc` 的兄弟文件；`$HOMEBREW_PREFIX` 是另一变量。
+双引号里的 `'` 保留在文件名中；单引号、转义后的 `$` 和被引用的 `~` 不展开。
+求值不执行 shell、不展开目录、不模拟参数运算或命令替换，也不猜 `~user` 的账户目录。
+只有回放到实际工具 shell 的 `HOME` 参与 home 展开；登录环境无法回放、缺少 `HOME` 或
+使用未知分词规则时保留未知，不猜 kloop 主进程的 home。脚本含变量赋值、函数、算术或
+未建模的环境修改时同样不推算；嵌套 `-c` 继承不确定性，登录 wrapper 的启动文件也不可
+当成已知环境。未引用变量可能分词/glob 时同样保留为 `Partial`。未知片段带不可成为真实
+文件名的占位，不用它查询规范落点；已知敏感分量仍参与风险判断。
+
+写效果始终保留为已知路径、部分已知或未知；cwd 会变化的相对目标也保留，不能因解析失败
+从 deny/ask 输入中消失。解析错误或达到界限时保留未知写效果。已知目标按字面与规范路径匹配；部分已知/未知目标无法证明与显式
+`bash_write` deny/ask 不相交，保守命中这些规则（deny 在 bypass 下仍生效）。因此配置了此类
+规则时，动态写入可能受更宽的限制；没有显式规则时，不单凭未知目标新增敏感确认。
+局部求值结果只用于风险收紧，不能授予文件范围 allow、只读、并发或前缀记忆。
 `/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty` 是纯流设备，不当作敏感目标。
 
 The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
@@ -1081,9 +1093,10 @@ layer, while deny rules, sensitive reads, safety checks and explicit ask rules
 keep their say (the ask-rule half is deliberately stricter than cc's
 autoAllowBashIfSandboxed).
 
-**Bash 严格授权与局部风险共用真实语法树**（`crates/core/src/shell.rs`、`shell/facts.rs`，
-tree-sitter-bash）。一次解析保留命令的字面/未知参数与位置、重定向方向/fd/目标、
+**Bash 严格授权与局部风险共用真实语法树**（`crates/core/src/shell.rs`、`shell/facts.rs`、`shell/word.rs`，
+tree-sitter-bash）。一次解析保留命令的严格字面/未知参数、词结构与位置、重定向方向/fd/词目标、
 heredoc 正文范围/引用状态/消费命令、管道/替换/复合结构与 cwd 是否未知，以及不完整证据。
+反斜杠换行导致的相邻 AST 词按连续源范围合并，严格授权保持 opaque。
 动态参数不能删除后重新对齐角色。遇到 `cd` 不推算新 cwd，相对输出不生成路径授权；
 已知敏感类别仍参与风险判断。支持的 `-c` 包裹有界递归，未知 wrapper 选项保持 opaque。
 解析错误、缺失节点、超过 1 MiB、20,000 个节点或 128 层语法树、递归超限时不给正文例外或完整授权。
@@ -5348,6 +5361,8 @@ crates/core/        kloop-core — the agent, network-free
                     TypeScript API generation; engine is the codemode crate
   src/shell.rs      tree-sitter-bash word-only analysis, read-only and
                     dangerous classifiers, wrapper stripping
+  src/shell/facts.rs 局部命令/重定向/正文事实与不确定上下文
+  src/shell/word.rs 有引用状态的词片段与受限统一求值
   src/project.rs   machine-local ProjectId/WorkspaceId resolution
   src/permissions.rs 公开门面、完整权限管线、审批/升级与模式切换
   src/permissions/rule.rs 规则语言、解析与 allow/deny/ask 两个方向的匹配

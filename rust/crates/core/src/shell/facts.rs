@@ -18,9 +18,7 @@ pub(crate) enum WordValue {
 pub(crate) struct WordFact {
     pub value: WordValue,
     pub range: Range<usize>,
-    /// 源文本。`value` 只保留可静态确定的字面量；glob、`~`、`$HOME` 这类
-    /// 展开拼写落进 `Unknown` 后仍要能复核，不能只剩一个“未知”标记。
-    pub raw: String,
+    pub syntax: ShellWord,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -29,6 +27,8 @@ pub(crate) struct Context {
     pub substitution: bool,
     pub compound: bool,
     pub cwd_unknown: bool,
+    /// 有环境赋值或未建模的 shell 状态变更时，不拿启动环境推算展开。
+    pub home_unknown: bool,
     /// 嵌套 -c 的范围属于它自己的源字符串，不能拿来裁外层原文。
     pub script_depth: u8,
 }
@@ -76,9 +76,7 @@ pub(crate) enum Direction {
 pub(crate) struct RedirectFact {
     pub direction: Direction,
     pub fd: Option<String>,
-    pub target: WordValue,
-    /// 目标节点的源文本；动态目标（`~`、`$HOME`、glob）靠它复核落点。
-    pub raw_target: Option<String>,
+    pub syntax: ShellWord,
     pub range: Range<usize>,
     pub context: Context,
 }
@@ -145,15 +143,30 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
     nodes.sort_by_key(Node::start_byte);
     let cwd_unknown = nodes.iter().any(|node| {
         node.kind() == "command"
-            && node.child_by_field_name("name").is_some_and(|name| {
-                matches!(name.utf8_text(src.as_bytes()), Ok("cd" | "pushd" | "popd"))
-            })
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| name.utf8_text(src.as_bytes()).is_ok_and(changes_directory))
+    });
+    let home_unknown = nodes.iter().any(|node| {
+        matches!(
+            node.kind(),
+            "variable_assignment"
+                | "function_definition"
+                | "arithmetic_expansion"
+                | "arithmetic_command"
+        ) || (node.kind() == "expansion" && node.named_child_count() > 1)
+            || (node.kind() == "command"
+                && node.child_by_field_name("name").is_some_and(|name| {
+                    name.utf8_text(src.as_bytes())
+                        .is_ok_and(changes_environment)
+                }))
     });
     facts.reliable = true;
     let strict = word_only_commands_sequence(&tree, src);
     let mut nested_analyses = Vec::new();
+    let mut joined_words = false;
     for node in nodes {
-        let context = context(node, depth, cwd_unknown);
+        let context = context(node, depth, cwd_unknown, home_unknown);
         match node.kind() {
             "command" => {
                 let mut words = Vec::new();
@@ -170,14 +183,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     } else {
                         child
                     };
-                    words.push(WordFact {
-                        value: literal(word, src),
-                        range: child.byte_range(),
-                        raw: word
-                            .utf8_text(src.as_bytes())
-                            .unwrap_or_default()
-                            .to_string(),
-                    });
+                    joined_words |= push_word(&mut words, word, child.byte_range(), src);
                 }
                 let command = CommandFact {
                     words,
@@ -198,7 +204,22 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     }
                     if let Some(inner) = extract_wrapped_script(&stripped) {
                         if depth < MAX_UNWRAP_DEPTH {
-                            let nested = analyze_depth(inner, depth + 1);
+                            let mut nested = analyze_depth(inner, depth + 1);
+                            let startup_unknown = stripped.get(1).is_some_and(|flag| flag == "-lc")
+                                || stripped
+                                    .first()
+                                    .is_some_and(|shell| executable_name(shell) == "zsh");
+                            if home_unknown || cwd_unknown || startup_unknown {
+                                for command in &mut nested.commands {
+                                    command.context.home_unknown |= home_unknown || startup_unknown;
+                                    command.context.cwd_unknown |= cwd_unknown || startup_unknown;
+                                }
+                                for redirect in &mut nested.redirects {
+                                    redirect.context.home_unknown |=
+                                        home_unknown || startup_unknown;
+                                    redirect.context.cwd_unknown |= cwd_unknown || startup_unknown;
+                                }
+                            }
                             nested_analyses.push((argv.clone(), nested.analysis.clone()));
                             facts.reliable &= nested.reliable;
                             facts.commands.extend(nested.commands);
@@ -235,22 +256,19 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     .and_then(|fd| fd.utf8_text(src.as_bytes()).ok())
                     .map(str::to_string);
                 let mut cursor = node.walk();
-                let mut targets: Vec<_> = node
-                    .children_by_field_name("destination", &mut cursor)
-                    .map(|target| {
-                        let raw = target.utf8_text(src.as_bytes()).ok().map(str::to_string);
-                        (literal(target, src), raw)
-                    })
-                    .collect();
-                if targets.is_empty() {
-                    targets.push((WordValue::Unknown, None));
+                let mut targets = Vec::new();
+                for target in node.children_by_field_name("destination", &mut cursor) {
+                    joined_words |= push_word(&mut targets, target, target.byte_range(), src);
                 }
-                for (target, raw_target) in targets {
+                let mut targets: Vec<_> = targets.into_iter().map(|word| word.syntax).collect();
+                if targets.is_empty() {
+                    targets.push(ShellWord::unknown());
+                }
+                for syntax in targets {
                     facts.redirects.push(RedirectFact {
                         direction,
                         fd: fd.clone(),
-                        target,
-                        raw_target,
+                        syntax,
                         range: node.byte_range(),
                         context: context.clone(),
                     });
@@ -281,7 +299,47 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
             _ => {}
         }
     }
+    // 命令名也可能由引用或换行续接构成；最终按保留位置的字面事实复核状态变更。
+    let names: Vec<_> = facts
+        .commands
+        .iter()
+        .filter(|command| command.context.script_depth == depth)
+        .filter_map(|command| command.words.first())
+        .map(|word| word.syntax.evaluate(None))
+        .collect();
+    let state_unknown = names
+        .iter()
+        .any(|word| !matches!(word, WordEvaluation::Resolved(_)))
+        || facts
+            .commands
+            .iter()
+            .any(|command| command.context.compound);
+    let cwd_unknown = cwd_unknown
+        || state_unknown
+        || names
+            .iter()
+            .any(|word| matches!(word, WordEvaluation::Resolved(name) if changes_directory(name)));
+    let home_unknown = home_unknown
+        || state_unknown
+        || names.iter().any(
+            |word| matches!(word, WordEvaluation::Resolved(name) if changes_environment(name)),
+        )
+        || facts.commands.iter().any(|command| {
+            let prefix = command.literal_prefix();
+            prefix.first().is_some_and(|name| name == "printf")
+                && prefix.get(1).is_some_and(|flag| flag.starts_with("-v"))
+        });
+    for command in &mut facts.commands {
+        command.context.cwd_unknown |= cwd_unknown;
+        command.context.home_unknown |= home_unknown;
+    }
+    for redirect in &mut facts.redirects {
+        redirect.context.cwd_unknown |= cwd_unknown;
+        redirect.context.home_unknown |= home_unknown;
+    }
+    // 严格白名单没有建模跨节点续接；局部事实可以合并，但不能因此扩大授权。
     if facts.reliable
+        && !joined_words
         && let Some((commands, paths)) = strict
     {
         facts.analysis = strict_analysis(commands, paths, depth, &nested_analyses);
@@ -289,10 +347,81 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
     facts
 }
 
-fn context(node: Node, depth: u8, cwd_unknown: bool) -> Context {
+fn changes_directory(name: &str) -> bool {
+    matches!(
+        name,
+        "cd" | "pushd"
+            | "popd"
+            | "eval"
+            | "source"
+            | "."
+            | "builtin"
+            | "command"
+            | "trap"
+            | "set"
+            | "shopt"
+            | "alias"
+            | "unalias"
+            | "enable"
+            | "fc"
+    )
+}
+
+fn changes_environment(name: &str) -> bool {
+    matches!(
+        name,
+        "eval"
+            | "source"
+            | "."
+            | "builtin"
+            | "command"
+            | "read"
+            | "readarray"
+            | "mapfile"
+            | "unset"
+            | "export"
+            | "declare"
+            | "typeset"
+            | "local"
+            | "let"
+            | "getopts"
+            | "trap"
+            | "set"
+            | "shopt"
+            | "alias"
+            | "unalias"
+            | "enable"
+            | "fc"
+    )
+}
+
+fn push_word(words: &mut Vec<WordFact>, node: Node, range: Range<usize>, src: &str) -> bool {
+    let syntax = ShellWord::from_node(node, src);
+    if let Some(previous) = words.last_mut() {
+        let gap = &src[previous.range.end..range.start];
+        if !gap.is_empty() && gap.replace("\\\n", "").is_empty() {
+            previous.syntax.append(syntax);
+            previous.range.end = range.end;
+            previous.value = match previous.syntax.evaluate(None) {
+                WordEvaluation::Resolved(text) => WordValue::Literal(text),
+                WordEvaluation::Partial(_) | WordEvaluation::Unknown => WordValue::Unknown,
+            };
+            return true;
+        }
+    }
+    words.push(WordFact {
+        value: literal(node, src),
+        range,
+        syntax,
+    });
+    false
+}
+
+fn context(node: Node, depth: u8, cwd_unknown: bool, home_unknown: bool) -> Context {
     let mut context = Context {
         script_depth: depth,
         cwd_unknown,
+        home_unknown,
         ..Context::default()
     };
     let mut parent = node.parent();
@@ -449,7 +578,46 @@ fn heredoc(node: Node, src: &str, context: Context) -> LiteralInput {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use super::super::word::{PartKind, Quoting, WordPart};
     use super::*;
+
+    fn text(value: &str) -> ShellWord {
+        ShellWord {
+            parts: vec![WordPart {
+                kind: PartKind::Text(value.into()),
+                quoting: Quoting::Bare,
+            }],
+        }
+    }
+
+    #[test]
+    fn continued_words_keep_one_argument_and_one_redirect_target() {
+        let home = Path::new("/tmp/home");
+        for src in [
+            "cat ~/.bas\\\nhrc",
+            "cat < ~/.bas\\\nhrc",
+            "echo x > ~/.bas\\\nhrc",
+        ] {
+            let facts = analyze(src);
+            let word = if facts.redirects.is_empty() {
+                assert_eq!(facts.commands[0].words.len(), 2, "{src}: {facts:#?}");
+                &facts.commands[0].words[1].syntax
+            } else {
+                assert_eq!(facts.redirects.len(), 1, "{src}: {facts:#?}");
+                &facts.redirects[0].syntax
+            };
+            assert_eq!(
+                word.evaluate(Some(home)),
+                WordEvaluation::Resolved("/tmp/home/.bashrc".into()),
+                "{src}: {facts:#?}"
+            );
+            assert_eq!(facts.analysis, BashAnalysis::Opaque, "{src}");
+        }
+        let facts = analyze("c\\\nd /tmp; echo x > notes.txt");
+        assert!(facts.redirects[0].context.cwd_unknown, "{facts:#?}");
+    }
 
     #[test]
     fn plan239_unknown_words_keep_positions_and_ranges() {
@@ -462,22 +630,27 @@ mod tests {
                     WordFact {
                         value: WordValue::Literal("rg".into()),
                         range: 0..2,
-                        raw: "rg".into()
+                        syntax: text("rg")
                     },
                     WordFact {
                         value: WordValue::Unknown,
                         range: 3..13,
-                        raw: "\"$PATTERN\"".into()
+                        syntax: ShellWord {
+                            parts: vec![WordPart {
+                                kind: PartKind::Variable("PATTERN".into()),
+                                quoting: Quoting::Double
+                            },]
+                        }
                     },
                     WordFact {
                         value: WordValue::Literal("--file".into()),
                         range: 14..20,
-                        raw: "--file".into()
+                        syntax: text("--file")
                     },
                     WordFact {
                         value: WordValue::Literal(".env".into()),
                         range: 21..25,
-                        raw: ".env".into()
+                        syntax: text(".env")
                     },
                 ],
                 range: 0..25,
@@ -527,8 +700,7 @@ mod tests {
                         &RedirectFact {
                             direction: Direction::Write,
                             fd: None,
-                            target: WordValue::Literal("/tmp/probe".into()),
-                            raw_target: Some("/tmp/probe".into()),
+                            syntax: text("/tmp/probe"),
                             range: output_start..output_start + "> /tmp/probe".len(),
                             context: Context::default(),
                         }

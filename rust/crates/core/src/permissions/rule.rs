@@ -11,6 +11,7 @@ use super::facts::CallFacts;
 use super::facts::FS_FOLDS_CASE;
 use super::facts::PathFacts;
 use super::facts::ShellFacts;
+use super::facts::WriteTarget;
 use crate::shell::BashAnalysis;
 use crate::shell::argv_is_readonly;
 use crate::shell::strip_wrappers;
@@ -229,10 +230,13 @@ pub(super) fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) ->
 /// `bash(rm *)` rule, and any single matching segment hits.
 pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
     if rules.iter().any(|r| r.matches_tool(name))
-        || call.risk_writes.iter().any(|path| {
-            rules
-                .iter()
-                .any(|rule| rule.matches_path("bash_write", path))
+        || call.risk_writes.iter().any(|target| {
+            rules.iter().any(|rule| match target {
+                WriteTarget::Resolved(path) => rule.matches_path("bash_write", path),
+                // 未知目标无法证明与显式规则不相交；allow 不消费这类事实。
+                WriteTarget::Partial { .. } | WriteTarget::Unknown => matches!(rule,
+                    Rule::Tool(tool) | Rule::PathGlob { tool, .. } if tool == "bash_write"),
+            })
         })
     {
         return true;

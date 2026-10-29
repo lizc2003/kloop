@@ -242,7 +242,8 @@ impl BackgroundShells {
         let requires_protection = crate::permissions::bash_protection_requirement(
             command,
             cwd,
-            sandbox::ExecutionContext::sandboxed(sandbox),
+            sandbox::ExecutionContext::sandboxed(sandbox)
+                .with_shell_home(super::replayed_home(&ctx.cfg.shell_login_env)),
         )
         .map_err(anyhow::Error::msg)?;
         let description = input.description.as_deref().unwrap_or("");

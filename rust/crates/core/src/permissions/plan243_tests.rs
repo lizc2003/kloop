@@ -1,9 +1,8 @@
 // plan 243：敏感路径判定的补漏回归（递归搜索拼写、glob 拼写、`~`/`$HOME` 写目标）。
 
 fn plan243_root(label: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(
-        crate::resource_id::fresh(&format!("kloop-plan243-{label}-")).expect("fresh id"),
-    );
+    let root = std::env::temp_dir()
+        .join(crate::resource_id::fresh(&format!("kloop-plan243-{label}-")).expect("fresh id"));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     root
@@ -81,10 +80,7 @@ async fn plan243_glob_spellings_cannot_reach_sensitive_names() {
     // 拼不出敏感名字的 glob 不打扰：`.c*` 命不中名单里的任何一项。
     let approver = ScriptedApprover::new(vec![]);
     let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-    for command in [
-        format!("cat {root}/.c*"),
-        format!("ls {root}/*.txt"),
-    ] {
+    for command in [format!("cat {root}/.c*"), format!("ls {root}/*.txt")] {
         p.check_call("bash", &bash(&command), 0, true)
             .await
             .unwrap_or_else(|error| panic!("{command}: {error}"));
@@ -196,7 +192,11 @@ async fn plan243_glob_read_redirects_are_screened() {
         format!("cat < {root}/.en?"),
         format!("cat 0< {root}/.gi?/config"),
     ] {
-        let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &[], &[]),
+            ScriptedApprover::new(vec![]),
+        );
         let error = p
             .check_call("bash", &bash(&command), 0, true)
             .await
@@ -208,10 +208,7 @@ async fn plan243_glob_read_redirects_are_screened() {
 
 #[tokio::test]
 async fn plan243_quoted_home_suffix_is_decoded() {
-    for command in [
-        "echo x > ~/\".bashrc\"",
-        "echo x >> ~/.bas\"hrc\"",
-    ] {
+    for command in ["echo x > ~/\".bashrc\"", "echo x >> ~/.bas\"hrc\""] {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         p.check_call("bash", &bash(command), 0, false)
@@ -327,5 +324,170 @@ async fn plan243_home_prefix_quoting_is_independent_of_the_suffix() {
         .check_call("bash", &bash("echo x >> $HOME/'.bashrc'"), 0, true)
         .await
         .expect_err("quoted suffix");
+    assert!(error.contains("deny permission rule"), "{error}");
+}
+
+#[tokio::test]
+async fn plan243_equivalent_words_have_the_same_write_policy() {
+    for target in [
+        "~/.bas\\\nhrc",
+        "~/.bashrc",
+        "~/'.bashrc'",
+        "$HOME/.bashrc",
+        "${HOME}/.bashrc",
+        "\"$HOME/.bashrc\"",
+        "\"\"$HOME/.bashrc",
+        "''${HOME}/.bashrc",
+        "$HOME/'.bashrc'",
+        "\"$HOME\"/'.bashrc'",
+        "\"\"\"$HOME\"/.bas\"hrc\"",
+    ] {
+        let command = format!("echo x >> {target}");
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(&command), 0, true)
+            .await
+            .unwrap();
+        assert_eq!(approver.ask_count(), 1, "{target}");
+        assert_eq!(
+            approver.asked()[0].notice.as_deref(),
+            Some("sensitive redirect path"),
+            "{target}"
+        );
+
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(**/.bashrc)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call("bash", &bash(&command), 0, true)
+            .await
+            .expect_err(target);
+        assert!(error.contains("deny permission rule"), "{target}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn plan243_home_concatenation_keeps_the_real_path() {
+    let home = std::env::home_dir().unwrap();
+    for target in ["\"$HOME.bashrc\"", "${HOME}.bashrc", "\"\"${HOME}.bashrc"] {
+        let command = format!("echo x > {target}");
+        // 这是 home 的兄弟文件，不能误认成 home 内的 rc 文件。
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(**/.bashrc)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        p.check_call("bash", &bash(&command), 0, true)
+            .await
+            .unwrap();
+
+        let deny = format!("bash_write({}.bashrc)", home.display());
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &[&deny], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call("bash", &bash(&command), 0, true)
+            .await
+            .expect_err(target);
+        assert!(error.contains("deny permission rule"), "{target}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn plan243_unknown_writes_keep_explicit_rules_effective() {
+    for command in [
+        "printf x > \"$TARGET\"",
+        "printf x > \"$DIR/notes.txt\"",
+        "printf x > *.txt",
+        "cd /tmp; printf x > notes.txt",
+        "HOME=/tmp; printf x > \"$HOME/notes.txt\"",
+        "HOME=/tmp; bash -c 'printf x > \"$HOME/notes.txt\"'",
+        "printf -v HOME /tmp; echo x > \"$HOME/notes.txt\"",
+        "bash -lc 'printf x > \"$HOME/notes.txt\"'",
+        "$CMD 'HOME=/tmp'; echo x > \"$HOME/notes.txt\"",
+        "for HOME in /tmp; do echo x > \"$HOME/notes.txt\"; done",
+    ] {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(**/locked.txt)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call("bash", &bash(command), 0, true)
+            .await
+            .expect_err(command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(
+            Mode::Manual,
+            rules(&[], &[], &["bash_write(**/locked.txt)"]),
+            approver.clone(),
+        );
+        p.check_call("bash", &bash(command), 0, true).await.unwrap();
+        assert_eq!(approver.ask_count(), 1, "{command}");
+
+        // 没有显式规则、也没有敏感证据时，保留现有沙箱免审批。
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(command), 0, true).await.unwrap();
+        assert_eq!(approver.ask_count(), 0, "{command}");
+    }
+
+    // 求值结果只能收紧风险判断，不能变成文件范围 allow 的证据。
+    let approver = ScriptedApprover::new(vec![Decision::Deny]);
+    let p = gate(
+        Mode::Manual,
+        rules(&["bash_write(**)"], &[], &[]),
+        approver.clone(),
+    );
+    assert!(
+        p.check_call("bash", &bash("printf x > \"$TARGET\""), 0, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(approver.ask_count(), 1);
+}
+
+#[tokio::test]
+async fn plan243_word_evaluation_is_shared_by_read_arguments_and_redirects() {
+    for target in [
+        "~/.bas\\\nhrc",
+        "\"\"$HOME/.bashrc",
+        "${HOME}/'.bashrc'",
+        "\"$DIR/.bashrc\"",
+        "\".en?\"",
+    ] {
+        for command in [format!("cat {target}"), format!("cat < {target}")] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            let error = p
+                .check_call("bash", &bash(&command), 0, true)
+                .await
+                .expect_err(&command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan243_parse_limits_do_not_erase_unknown_write_effects() {
+    let command = format!("#{}\nprintf x > /tmp/locked.txt", " ".repeat(1_048_576));
+    let p = gate(
+        Mode::Bypass,
+        rules(&[], &["bash_write(**/locked.txt)"], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    let error = p
+        .check_call("bash", &bash(&command), 0, true)
+        .await
+        .expect_err("unknown effects");
     assert!(error.contains("deny permission rule"), "{error}");
 }

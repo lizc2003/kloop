@@ -16,8 +16,10 @@
 //! 同时保留 argv 与目标；只有 echo 参数的退出码展开例外地按纯数据分析。
 
 mod facts;
+mod word;
 pub(crate) use facts::analyze as analyze_bash_facts;
 pub(crate) use facts::{BashFacts, CommandFact, Direction, WordValue};
+pub(crate) use word::{ShellWord, WordEvaluation};
 
 use tree_sitter::Node;
 use tree_sitter::Parser;

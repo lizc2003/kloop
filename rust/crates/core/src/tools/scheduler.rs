@@ -286,7 +286,12 @@ impl CheckRunner for GatedCheck {
             let ctx = ToolCtx::harness(Arc::clone(&self.cfg), self.cancel.clone());
             let workspace = self.cfg.effective_workspace();
             let input = json!({ "command": command });
-            let sandbox_auto = super::bash::execution_context("bash", &input, &workspace);
+            let sandbox_auto = super::bash::execution_context(
+                "bash",
+                &input,
+                &workspace,
+                &self.cfg.shell_login_env,
+            );
             if let Err(reason) = workspace
                 .permissions
                 .check_call_with_execution("bash", &input, 0, sandbox_auto)

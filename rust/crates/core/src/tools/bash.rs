@@ -170,11 +170,22 @@ pub(super) fn execution_context<'a>(
     name: &str,
     input: &Value,
     workspace: &'a EffectiveWorkspace,
+    login_env: &'a ShellLoginEnv,
 ) -> sandbox::ExecutionContext<'a> {
     let policy = (name == "bash" && !input["disable_sandbox"].as_bool().unwrap_or(false))
         .then_some(workspace.sandbox.as_deref())
         .flatten();
     sandbox::ExecutionContext::sandboxed(policy)
+        .with_shell_home((name == "bash").then(|| replayed_home(login_env)).flatten())
+}
+
+pub(super) fn replayed_home(login_env: &ShellLoginEnv) -> Option<&str> {
+    // 回放失败会退回登录 shell，其启动文件可以改变环境，不能拿父进程的 HOME 猜。
+    login_env.replay_path_for_use().ok().flatten()?;
+    if login_env.get("IFS").is_some_and(|ifs| ifs != " \t\n") {
+        return None;
+    }
+    login_env.get("HOME")
 }
 
 pub(super) async fn bash_tool(
@@ -255,7 +266,8 @@ pub(crate) async fn run_foreground_bash(
     let requires_protection = crate::permissions::bash_protection_requirement(
         command,
         &cwd,
-        sandbox::ExecutionContext::sandboxed(sandbox.as_deref()),
+        sandbox::ExecutionContext::sandboxed(sandbox.as_deref())
+            .with_shell_home(replayed_home(&ctx.cfg.shell_login_env)),
     )
     .map_err(anyhow::Error::msg)?;
     let remembered_escalation = sandbox.as_ref().is_some_and(|policy| policy.escalate)
@@ -343,7 +355,8 @@ async fn run_foreground(
     crate::permissions::bash_protection_requirement(
         command,
         cwd,
-        sandbox::ExecutionContext::sandboxed(sandbox),
+        sandbox::ExecutionContext::sandboxed(sandbox)
+            .with_shell_home(replayed_home(&ctx.cfg.shell_login_env)),
     )
     .map_err(anyhow::Error::msg)?;
     let spec = shell_spec(
@@ -953,6 +966,60 @@ mod tests {
         .await;
         assert!(!is_error, "{out}");
         assert!(out.contains("from-login"), "{out}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_rules_use_the_home_replayed_to_the_actual_shell() {
+        use crate::permissions::{Mode, PermissionRules, Permissions};
+
+        let root = std::env::temp_dir().join(crate::resource_id::fresh("kloop-word-env-").unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let home = root.to_str().unwrap();
+        let ctx = test_ctx_with_cfg(
+            0,
+            TestConfig::new("word-env")
+                .login_env(ShellLoginEnv::test_fixture(&[("HOME", home)]))
+                .build(),
+        );
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.cwd = root.clone();
+        cfg.permissions = Arc::new(
+            Permissions::new(
+                Mode::Bypass,
+                &PermissionRules {
+                    allow: Vec::new(),
+                    deny: vec![format!("bash_write({home}/locked.txt)")],
+                    ask: Vec::new(),
+                },
+                root.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let ctx = crate::tools::ToolCtx {
+            cfg: Arc::new(cfg),
+            ..ctx
+        };
+        let (out, is_error) =
+            run_tool("bash", bash_input("printf x > \"$HOME/locked.txt\""), &ctx).await;
+        assert!(is_error && out.contains("deny permission rule"), "{out}");
+        assert!(!root.join("locked.txt").exists());
+
+        let (out, is_error) =
+            run_tool("bash", bash_input("printf x > \"$HOME/other.txt\""), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert_eq!(std::fs::read(root.join("other.txt")).unwrap(), b"x");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_login_home_stays_unknown() {
+        assert_eq!(super::replayed_home(&ShellLoginEnv::none()), None);
+        let login = ShellLoginEnv::test_fixture(&[("PATH", "/bin")]);
+        assert_eq!(super::replayed_home(&login), None);
+        let login = ShellLoginEnv::test_fixture(&[("HOME", "/tmp/home"), ("IFS", "/")]);
+        assert_eq!(super::replayed_home(&login), None);
     }
 
     #[tokio::test]

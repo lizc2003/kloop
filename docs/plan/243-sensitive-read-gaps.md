@@ -150,3 +150,32 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 上红（`$HOME/'.bashrc'` 无 notice）、修后转绿且 deny 命中；单测补
 `home_prefix_quoting_is_independent_of_the_suffix` 与 `dynamic_words_are_checked_after_unquoting`。
 外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2104 通过、本机 parity）。提交 `60b49d7`。
+
+
+## 结构修复 ✅（2026-10-29）
+
+前三轮仍在权限层重解析原文，`""$HOME/.bashrc` 又丢落点，`"$HOME.bashrc"` 被误拼成
+home 内文件，变量名也没有真正的边界。这轮改掉事实模型，替代前面几轮字符串帮助项。
+
+- `shell/word.rs` 从 AST 建立有序词片段，各自保留引用、变量和模式信息；提供唯一的
+  `Resolved` / `Partial` / `Unknown` 求值，不执行 shell、不读取展开变量或目录。
+  home 按节点展开、按字符串拼接；变量名严格取 AST 完整名字。
+- `WordFact` 与 `RedirectFact` 保存词结构，删除 `raw` / `raw_target` 及权限层的
+  去引号、home 前缀匹配函数；读参数、读重定向与写重定向共同消费求值结果。
+- 所有写效果都进入风险事实。已知目标按真实路径匹配；部分已知/未知目标保守命中显式
+  `bash_write` deny/ask，不能通过未知词或变化的 cwd 让规则失效。没有显式规则时，
+  不单凭未知目标新增敏感确认；局部求值不能产生 allow 或只读授权。
+- HOME 来自实际工具 shell 的登录环境回放，无法回放或存在未知分词规则时不猜父进程
+  环境；工具派发、内联命令、scheduler 与启动前保护复核均携带同一上下文。
+- 有赋值/函数/算术/未建模的环境修改时，home 展开保持未知；有分词/glob 可能时不冒充
+  单一路径；未建模的 `~user` 也不猜账户目录。嵌套 `-c` 继承外层 home/cwd 不确定性。
+- 解析失败或达到界限时保留未知写效果，不用空列表冒充无写入。
+- 回归用真实 Bash 的参数字节核对词求值，并覆盖等价引用、非等价的字符串拼接、完整
+  变量名、未知效果的 deny/ask/bypass、allow 边界及读参数/重定向的一致性；另有实际工具
+  shell 采用不同 HOME 的派发回归，确认 deny 挡住目标而普通兄弟文件仍能写入。
+- Bash 对照另抓到反斜杠换行被 AST 拆成相邻词；事实层合并连续片段（保留引用），
+  严格授权仍 opaque，不能按错误的参数边界放行。
+
+验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2110 项通过，
+另有两次子进程回归通过，本机 parity）。真实 Bash 参数对照与实际工具派发回归通过。
+Linux 与 Windows 未实测。提交：本节所在提交（`fix(plan243): preserve shell words and unknown write effects`）。

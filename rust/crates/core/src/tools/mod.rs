@@ -1270,7 +1270,8 @@ impl PreparedCall {
             .mutation
             .as_ref()
             .and_then(fs::PreparedMutation::preview_context);
-        let sandbox_auto_allow = bash::execution_context(name, input, workspace);
+        let sandbox_auto_allow =
+            bash::execution_context(name, input, workspace, &ctx.cfg.shell_login_env);
         let permission = unless_stopped(
             &ctx.stop,
             workspace.permissions.check_call_with_resolved_path(

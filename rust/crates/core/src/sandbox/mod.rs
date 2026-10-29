@@ -338,11 +338,20 @@ fn resolve_existing(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 实际执行保护与免审批分别表示；旧的 bool 接口只能表达后者。
+/// 实际执行保护、回放环境与免审批分别表示；旧的 bool 接口只能声明免审批。
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ExecutionContext<'a> {
     pub(crate) auto_allow: bool,
     sandbox: Option<&'a SandboxPolicy>,
+    home: ShellHome<'a>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ShellHome<'a> {
+    /// 兼容只声明免审批的公共入口；实际工具派发显式传入回放环境。
+    #[default]
+    Process,
+    Replayed(Option<&'a str>),
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -354,6 +363,7 @@ impl<'a> ExecutionContext<'a> {
             } else {
                 None
             },
+            home: ShellHome::Process,
         }
     }
 
@@ -361,6 +371,19 @@ impl<'a> ExecutionContext<'a> {
         Self {
             auto_allow,
             sandbox: None,
+            home: ShellHome::Process,
+        }
+    }
+
+    pub(crate) fn with_shell_home(mut self, home: Option<&'a str>) -> Self {
+        self.home = ShellHome::Replayed(home);
+        self
+    }
+
+    pub(crate) fn shell_home(self) -> Option<PathBuf> {
+        match self.home {
+            ShellHome::Process => std::env::var_os("HOME").map(PathBuf::from),
+            ShellHome::Replayed(home) => home.map(PathBuf::from),
         }
     }
 
