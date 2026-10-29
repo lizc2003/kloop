@@ -14,6 +14,10 @@ use crate::shell::{BashFacts, CommandFact, Direction, WordValue, analyze_bash_fa
 use crate::tools::Builtin;
 
 use super::argv_roles;
+use super::sensitive;
+pub(super) use super::sensitive::FS_FOLDS_CASE;
+pub(super) use super::sensitive::Sensitivity;
+use super::sensitive::fs_fold;
 
 pub(super) struct Hazard {
     pub(super) tag: &'static str,
@@ -51,15 +55,6 @@ pub(crate) struct CallFacts {
 pub(super) struct OpaqueScript {
     pub(super) command: String,
     pub(super) no_sandbox: bool,
-}
-
-/// 敏感路径的类别，决定元数据访问是否算读取。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Sensitivity {
-    /// 仓库内部（`.git`）：元数据访问不是读取，内容访问仍是硬边界。
-    Vcs,
-    /// 凭据或 agent state：元数据也按读取处理。
-    Secret,
 }
 
 #[derive(Clone)]
@@ -162,6 +157,9 @@ impl CallFacts {
             }
             _ => None,
         };
+        let (risk_writes, unresolved_sensitive_write) = bash_facts
+            .as_ref()
+            .map_or_else(|| (Vec::new(), false), |facts| write_targets(facts, cwd));
         CallFacts {
             shell,
             writes,
@@ -171,27 +169,8 @@ impl CallFacts {
             risk_commands: bash_facts
                 .as_ref()
                 .map_or_else(Vec::new, |facts| facts.commands.clone()),
-            unresolved_sensitive_write: bash_facts.as_ref().is_some_and(|facts| facts.redirects.iter().any(|redirect| {
-                redirect.direction == Direction::Write && redirect.context.cwd_unknown
-                    && matches!(&redirect.target, WordValue::Literal(path) if !Path::new(path).is_absolute() && path_sensitivity(Path::new(path)).is_some())
-            })),
-            risk_writes: bash_facts.as_ref().map_or_else(Vec::new, |facts| {
-                facts
-                    .redirects
-                    .iter()
-                    .filter_map(|redirect| {
-                        if redirect.direction != Direction::Write {
-                            return None;
-                        }
-                        let WordValue::Literal(path) = &redirect.target else {
-                            return None;
-                        };
-                        if path == "/dev/null" { return None; }
-                        (!redirect.context.cwd_unknown || Path::new(path).is_absolute())
-                            .then(|| PathFacts::gather(Path::new(path), cwd))
-                    })
-                    .collect()
-            }),
+            unresolved_sensitive_write,
+            risk_writes,
             powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),
@@ -239,10 +218,12 @@ impl CallFacts {
             return Some(Hazard { tag: "destructive" });
         }
         if self.unresolved_sensitive_write
-            || self
-                .risk_writes
-                .iter()
-                .any(|path| path.sensitive || path.normalized.starts_with("/dev"))
+            || self.risk_writes.iter().any(|path| {
+                path.sensitive
+                    || (path.normalized.starts_with("/dev")
+                        && !is_stream_device(&path.original)
+                        && !is_stream_device(&path.normalized))
+            })
         {
             return Some(Hazard {
                 tag: "sensitive redirect path",
@@ -353,10 +334,17 @@ fn bash_reads_sensitive_path(
     {
         for command in &facts.commands {
             if let Some(argv) = command.argv() {
-                if argv_reads_sensitive_path(&argv, cwd) { return ReadVerdict::Sensitive; }
-            } else if command.words.iter().skip(1).any(|word| {
-                matches!(&word.value, WordValue::Literal(value) if path_argument_is_sensitive(value, cwd, false))
-            }) { return ReadVerdict::Sensitive; }
+                if argv_reads_sensitive_path(&argv, cwd) {
+                    return ReadVerdict::Sensitive;
+                }
+            } else if command.words.iter().skip(1).any(|word| match &word.value {
+                WordValue::Literal(value) => path_argument_is_sensitive(value, cwd, false),
+                // glob、`~`、`$HOME` 这类展开拼写落进 Unknown，原文仍可复核
+                // （`cat .en?`、`cat ~/.s*/id_rsa`）。
+                WordValue::Unknown => path_argument_is_sensitive(&word.raw, cwd, false),
+            }) {
+                return ReadVerdict::Sensitive;
+            }
         }
         for redirect in &facts.redirects {
             if redirect.direction == Direction::Read
@@ -407,13 +395,39 @@ pub(crate) fn bash_protection_requirement(
 
 fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
     let path = expand_shell_path(raw, cwd);
-    match PathFacts::gather(&path, cwd).sensitivity {
+    let sensitivity = merge_sensitivity(
+        PathFacts::gather(&path, cwd).sensitivity,
+        glob_spelling_sensitivity(&path, metadata),
+    );
+    match sensitivity {
         None => false,
         // 凭据和 agent state 连名字都算敏感，元数据访问也不例外。
         Some(Sensitivity::Secret) => true,
         // `.git` 的元数据（stat、列目录）不是内容读取；内容访问仍是硬边界。
         Some(Sensitivity::Vcs) => !metadata,
     }
+}
+
+/// 未展开的 glob 分量能否拼出敏感名字。判定不读文件系统：只看拼写，所以与
+/// bash 何时展开无关，也不会因为目录里恰好没有该文件而放行。
+fn glob_spelling_sensitivity(path: &Path, metadata: bool) -> Option<Sensitivity> {
+    let components: Vec<_> = path.components().collect();
+    let mut found = None;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let last = index + 1 == components.len();
+        match sensitive::glob_component_sensitivity(name, last) {
+            Some(Sensitivity::Secret) => return Some(Sensitivity::Secret),
+            Some(Sensitivity::Vcs) => found = Some(Sensitivity::Vcs),
+            None => {}
+        }
+    }
+    found.filter(|_| !metadata)
 }
 
 /// The one exemption to `.kloop` being sensitive: `.kloop/worktrees/<name>` holds
@@ -509,12 +523,13 @@ fn raw_mentions_sensitive_path(command: &str) -> bool {
     mentions_sensitive_needle(command)
 }
 
+/// 文本层只认目录拼写：`~/name` 与 `/name/`。文件名（`.env*`、rc 文件）走路径
+/// 与 argv 判定；把它们塞进子串扫描会让 `echo "add .env to .gitignore"` 这类
+/// 纯文本也变成敏感读取。
 fn mentions_sensitive_needle(command: &str) -> bool {
-    [
-        "~/.kloop", "/.kloop/", "~/.ssh", "/.ssh/", "~/.gnupg", "/.gnupg/", "~/.aws", "/.aws/",
-    ]
-    .iter()
-    .any(|needle| command.contains(needle))
+    sensitive::SECRET_DIRS
+        .iter()
+        .any(|dir| command.contains(&format!("~/{dir}")) || command.contains(&format!("/{dir}/")))
 }
 
 fn powershell_mentions_sensitive_path(command: &str) -> bool {
@@ -527,8 +542,10 @@ fn powershell_mentions_sensitive_path(command: &str) -> bool {
         normalized
     };
     let normalized = normalized.as_str();
-    [".kloop", ".ssh", ".gnupg", ".aws", ".env"]
-        .into_iter()
+    sensitive::SECRET_DIRS
+        .iter()
+        .copied()
+        .chain([sensitive::ENV_PREFIX])
         .any(|needle| {
             normalized.match_indices(needle).any(|(index, _)| {
                 let before = normalized[..index].chars().next_back();
@@ -554,9 +571,40 @@ fn powershell_mentions_sensitive_path(command: &str) -> bool {
                             )
                     })
                 };
-                boundary(before) && (needle == ".env" || boundary(after))
+                boundary(before) && (needle == sensitive::ENV_PREFIX || boundary(after))
             })
         })
+}
+
+/// shell 会展开的路径拼写：`~`、`~/…`、`$HOME/…`、`${HOME}/…`，以及包着一层的
+/// 双引号（`$HOME` 在双引号里仍展开，`~` 不展开）。展开结果与 cwd 无关；拼写
+/// 里还夹着别的展开或 glob 时返回 `None`，不猜。
+fn expand_home_spelling(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    let (text, tilde_expands) = if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        (inner, /*tilde_expands*/ false)
+    } else if raw.starts_with('\'') {
+        return None;
+    } else {
+        (raw, /*tilde_expands*/ true)
+    };
+    let home = std::env::home_dir()?;
+    if text == "$HOME" || text == "${HOME}" || (tilde_expands && text == "~") {
+        return Some(home);
+    }
+    let rest = if tilde_expands {
+        text.strip_prefix("~/")
+            .or_else(|| text.strip_prefix("$HOME/"))
+            .or_else(|| text.strip_prefix("${HOME}/"))?
+    } else {
+        text.strip_prefix("$HOME/")
+            .or_else(|| text.strip_prefix("${HOME}/"))?
+    };
+    (!rest.is_empty() && !rest.contains(['\\', '$', '`', '*', '?', '[', ']', '{', '}']))
+        .then(|| home.join(rest))
 }
 
 fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
@@ -571,48 +619,108 @@ fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
     lexical_normalize(cwd, Path::new(raw))
 }
 
+/// 递归搜索会读出根下所有文件的内容：命令是否真的递归、以及根里有没有凭据名，
+/// 两件事都要问清楚。递归开关走命令自己的选项簇解析（`-rn`、`-d recurse`、
+/// `-uu`、`-.`），根下名单与敏感判定共用 [`sensitive`]。
 fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
-    let Some(command) = argv.first().and_then(|raw| raw.rsplit('/').next()) else {
-        return false;
-    };
-    let recursive = match command {
-        // ripgrep is recursive, but only exposes hidden credential directories
-        // when --hidden / -u is requested.
-        "rg" => argv[1..].iter().any(|arg| {
-            arg == "--hidden"
-                || (arg.starts_with('-')
-                    && !arg.starts_with("--")
-                    && arg.chars().skip(1).any(|ch| ch == 'u'))
-        }),
-        "grep" => argv[1..]
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "-r" | "-R" | "--recursive")),
-        _ => false,
-    };
-    if !recursive {
+    if !argv_roles::search_is_recursive(argv) {
         return false;
     }
-    let roots: Vec<PathBuf> = argv[1..]
-        .iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .map(|arg| expand_shell_path(arg, cwd))
-        .filter(|path| path.is_dir())
-        .collect();
+    let roots: Vec<PathBuf> = match argv_roles::path_arguments(argv) {
+        Some(paths) => paths
+            .iter()
+            .map(|path| expand_shell_path(path, cwd))
+            .collect(),
+        // 未识别的语法退回逐参数；命令的操作数在这里已被过滤掉。
+        None => argv[1..]
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .map(|arg| expand_shell_path(arg, cwd))
+            .collect(),
+    };
+    let roots: Vec<PathBuf> = roots.into_iter().filter(|path| path.is_dir()).collect();
     let roots = if roots.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
         roots
     };
-    roots.iter().any(|root| {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        let local_sensitive = [".kloop", ".ssh", ".gnupg", ".aws"]
-            .iter()
-            .any(|name| root.join(name).exists());
-        let global_config_is_below = std::env::home_dir()
-            .map(|home| home.join(".kloop/config.toml").starts_with(&root))
-            .unwrap_or(false);
-        local_sensitive || global_config_is_below
+    roots.iter().any(|root| recursive_root_is_sensitive(root))
+}
+
+fn recursive_root_is_sensitive(root: &Path) -> bool {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if path_sensitivity(&root).is_some() {
+        return true;
+    }
+    if std::env::home_dir().is_some_and(|home| home.join(".kloop/config.toml").starts_with(&root)) {
+        return true;
+    }
+    // `.git` 不在名单里：仓库内 `grep -r` 是日常操作，而 `.git` 的内容访问
+    // 已由路径参数判定兜底。
+    std::fs::read_dir(&root).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(sensitive::name_is_secret)
+        })
     })
+}
+
+/// 固定输出目标的落点。动态目标不能只留一个 “Unknown”：`~/`、`$HOME/` 是
+/// shell 会展开的绝对路径，其余拼写至少还能按最后一段名字过一遍敏感名单。
+fn write_targets(facts: &BashFacts, cwd: &Path) -> (Vec<PathFacts>, bool) {
+    let mut writes = Vec::new();
+    let mut unresolved_sensitive = false;
+    for redirect in &facts.redirects {
+        if redirect.direction != Direction::Write {
+            continue;
+        }
+        match &redirect.target {
+            // `/dev/null` 只是丢掉输出，没有写效果。
+            WordValue::Literal(path) if path == "/dev/null" => {}
+            WordValue::Literal(path) => {
+                if !redirect.context.cwd_unknown || Path::new(path).is_absolute() {
+                    writes.push(PathFacts::gather(Path::new(path), cwd));
+                } else if path_sensitivity(Path::new(path)).is_some() {
+                    // cwd 会变：落点定不下来，但名字本身敏感。
+                    unresolved_sensitive = true;
+                }
+            }
+            WordValue::Unknown => {
+                let raw = redirect.raw_target.as_deref().unwrap_or_default().trim();
+                match expand_home_spelling(raw) {
+                    // 与 cwd 无关的绝对目标：进 risk_writes，deny 规则也按它匹配。
+                    Some(path) => writes.push(PathFacts::gather(&path, cwd)),
+                    // 其余动态目标（`"$DIR/x"`、glob）只知道拼写：名字敏感就标记。
+                    None if path_argument_is_sensitive(unquote(raw), cwd, false) => {
+                        unresolved_sensitive = true;
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    (writes, unresolved_sensitive)
+}
+
+fn unquote(raw: &str) -> &str {
+    let raw = raw.trim();
+    raw.strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            raw.strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .unwrap_or(raw)
+}
+
+/// 纯流设备：写进去没有持久副作用，不按敏感目标处理。
+fn is_stream_device(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty")
+    )
 }
 
 impl PathFacts {
@@ -696,20 +804,6 @@ fn lexical_normalize(cwd: &Path, path: &Path) -> PathBuf {
     out
 }
 
-/// Case-folding filesystems (macOS/Windows default): `.GIT` and `.git` are
-/// the same inode, so a cased alias would slip a write past a case-sensitive
-/// sensitive-path or deny check and land on the real `.git/hooks`. Fold case
-/// there; compare verbatim where distinct names are distinct files.
-pub(super) const FS_FOLDS_CASE: bool = cfg!(any(target_os = "macos", target_os = "windows"));
-
-fn fs_fold(name: &str) -> std::borrow::Cow<'_, str> {
-    if FS_FOLDS_CASE {
-        std::borrow::Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        std::borrow::Cow::Borrowed(name)
-    }
-}
-
 /// Whether a normalized path ends in `offload/<spill file>` — the structural
 /// form of [`is_spill_file_name`], for callers that already have components.
 fn path_tail_is_spill(normalized: &Path) -> bool {
@@ -740,18 +834,6 @@ fn merge_sensitivity(a: Option<Sensitivity>, b: Option<Sensitivity>) -> Option<S
 /// `Secret` wins over `Vcs`: a path that reaches both a repository and a
 /// credential store is a secret path for every access kind.
 fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
-    const VCS_DIR: &str = ".git";
-    const SECRET_DIRS: &[&str] = &[".kloop", ".ssh", ".gnupg", ".aws"];
-    const SECRET_FILES: &[&str] = &[
-        ".bashrc",
-        ".zshrc",
-        ".zshenv",
-        ".zprofile",
-        ".bash_profile",
-        ".profile",
-        ".gitconfig",
-        ".envrc",
-    ];
     // Callers normalize first, but the exemption below must not depend on that:
     // `.kloop/worktrees/../sessions` is only a worktree path if you stop reading
     // at the second segment. A `..` anywhere forfeits the exemption entirely.
@@ -790,14 +872,14 @@ fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
         if name == ".kloop" && !traversal && path_tail_is_spill(normalized) {
             continue;
         }
-        if name == VCS_DIR {
+        if name == sensitive::VCS_DIR {
             found = Some(Sensitivity::Vcs);
             continue;
         }
-        if SECRET_DIRS.contains(&name) {
+        if sensitive::dir_name_is_secret(name) {
             return Some(Sensitivity::Secret);
         }
-        if is_last && (SECRET_FILES.contains(&name) || name.starts_with(".env")) {
+        if is_last && sensitive::file_name_is_secret(name) {
             return Some(Sensitivity::Secret);
         }
     }
@@ -899,6 +981,127 @@ mod tests {
         );
         assert!(!s("/w/proj/git/readme.md"), "git dir ≠ .git dir");
         assert!(!s("/w/proj/environment.rs"), ".env prefix is filename-only");
+    }
+
+    /// 名单只有一份：同一组名字在文本扫描、路径判定、递归搜索与沙箱凭据根里
+    /// 给出相同答案。递归搜索漏掉 `.env*` 就是名单分家的结果。
+    #[test]
+    fn sensitive_names_agree_across_every_caller() {
+        for name in sensitive::SECRET_DIRS {
+            assert!(
+                path_sensitivity(&Path::new("/w/proj").join(name).join("x")).is_some(),
+                "{name}"
+            );
+            assert!(mentions_sensitive_needle(&format!("~/{name}")), "{name}");
+            assert!(
+                powershell_mentions_sensitive_path(&format!(r"C:\Users\u\{name}")),
+                "{name}"
+            );
+            let root = std::env::temp_dir()
+                .join(crate::resource_id::fresh("kloop-plan243-names-").expect("fresh id"));
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            let argv = [
+                "grep".to_string(),
+                "-rn".into(),
+                "KEY".into(),
+                root.display().to_string(),
+            ];
+            assert!(
+                recursive_search_covers_sensitive_path(&argv, &root),
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        for name in sensitive::HOME_CREDENTIAL_DIRS {
+            assert!(sensitive::dir_name_is_secret(name), "{name}");
+        }
+        for name in sensitive::SECRET_FILES
+            .iter()
+            .copied()
+            .chain([sensitive::ENV_PREFIX])
+        {
+            assert!(
+                path_sensitivity(&Path::new("/w/proj").join(name)).is_some(),
+                "{name}"
+            );
+        }
+        let root = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan243-env-").expect("fresh id"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), "KEY=x").unwrap();
+        let argv = [
+            "grep".to_string(),
+            "-rn".into(),
+            "KEY".into(),
+            root.display().to_string(),
+        ];
+        assert!(
+            recursive_search_covers_sensitive_path(&argv, &root),
+            "recursive search must see .env* like the path check does"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// glob 拼写不访问文件系统：能拼出敏感名字才拦，拼不出就照旧放行。
+    #[test]
+    fn glob_spellings_are_screened_without_touching_the_filesystem() {
+        let cwd = Path::new("/w/proj");
+        assert!(path_argument_is_sensitive(".en?", cwd, false));
+        assert!(path_argument_is_sensitive("./.gi?/config", cwd, false));
+        assert!(path_argument_is_sensitive("~/.s*/id_rsa", cwd, false));
+        assert!(!path_argument_is_sensitive(".c*", cwd, false));
+        assert!(!path_argument_is_sensitive("*.env", cwd, false));
+    }
+
+    /// `~/`、`$HOME/` 的展开只在 shell 真的会展开时发生。
+    #[test]
+    fn home_spellings_expand_only_when_the_shell_would() {
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        assert_eq!(expand_home_spelling("~"), Some(home.clone()));
+        assert_eq!(
+            expand_home_spelling("~/.bashrc"),
+            Some(home.join(".bashrc"))
+        );
+        assert_eq!(
+            expand_home_spelling("$HOME/.gitconfig"),
+            Some(home.join(".gitconfig"))
+        );
+        assert_eq!(
+            expand_home_spelling("${HOME}/.ssh/id_rsa"),
+            Some(home.join(".ssh/id_rsa"))
+        );
+        assert_eq!(
+            expand_home_spelling("\"$HOME/.bashrc\""),
+            Some(home.join(".bashrc"))
+        );
+        // 双引号里的 `~` 与单引号里的任何拼写都不展开。
+        assert_eq!(expand_home_spelling("\"~/.bashrc\""), None);
+        assert_eq!(expand_home_spelling("'$HOME/.bashrc'"), None);
+        // 夹着别的展开或 glob 时不下结论。
+        assert_eq!(expand_home_spelling("~/$NAME/.bashrc"), None);
+        assert_eq!(expand_home_spelling("$OTHER/.bashrc"), None);
+    }
+
+    /// 静态拼不出落点的写目标，至少按名字过一遍敏感名单。
+    #[test]
+    fn dynamic_write_targets_are_screened_by_name() {
+        let hazard = |command: &str| {
+            CallFacts::gather(
+                "bash",
+                &serde_json::json!({ "command": command }),
+                Path::new("/workspace"),
+                None,
+            )
+            .hazard("bash")
+            .map(|hazard| hazard.tag)
+        };
+        assert_eq!(
+            hazard("echo x > \"$DIR/.bashrc\""),
+            Some("sensitive redirect path")
+        );
+        assert_eq!(hazard("echo x > \"$DIR/out.json\""), None);
     }
 
     #[test]

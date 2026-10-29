@@ -65,6 +65,7 @@ mod facts;
 pub(crate) use facts::bash_protection_requirement;
 mod policy;
 mod rule;
+pub(crate) mod sensitive;
 #[cfg(test)]
 mod testutil;
 
@@ -1055,6 +1056,7 @@ impl Permissions {
 #[cfg(test)]
 mod tests {
     include!("permissions/plan239_tests.rs");
+    include!("permissions/plan243_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;

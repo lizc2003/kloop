@@ -18,6 +18,9 @@ pub(crate) enum WordValue {
 pub(crate) struct WordFact {
     pub value: WordValue,
     pub range: Range<usize>,
+    /// 源文本。`value` 只保留可静态确定的字面量；glob、`~`、`$HOME` 这类
+    /// 展开拼写落进 `Unknown` 后仍要能复核，不能只剩一个“未知”标记。
+    pub raw: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,6 +77,8 @@ pub(crate) struct RedirectFact {
     pub direction: Direction,
     pub fd: Option<String>,
     pub target: WordValue,
+    /// 目标节点的源文本；动态目标（`~`、`$HOME`、glob）靠它复核落点。
+    pub raw_target: Option<String>,
     pub range: Range<usize>,
     pub context: Context,
 }
@@ -168,6 +173,10 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     words.push(WordFact {
                         value: literal(word, src),
                         range: child.byte_range(),
+                        raw: word
+                            .utf8_text(src.as_bytes())
+                            .unwrap_or_default()
+                            .to_string(),
                     });
                 }
                 let command = CommandFact {
@@ -228,16 +237,20 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                 let mut cursor = node.walk();
                 let mut targets: Vec<_> = node
                     .children_by_field_name("destination", &mut cursor)
-                    .map(|target| literal(target, src))
+                    .map(|target| {
+                        let raw = target.utf8_text(src.as_bytes()).ok().map(str::to_string);
+                        (literal(target, src), raw)
+                    })
                     .collect();
                 if targets.is_empty() {
-                    targets.push(WordValue::Unknown);
+                    targets.push((WordValue::Unknown, None));
                 }
-                for target in targets {
+                for (target, raw_target) in targets {
                     facts.redirects.push(RedirectFact {
                         direction,
                         fd: fd.clone(),
                         target,
+                        raw_target,
                         range: node.byte_range(),
                         context: context.clone(),
                     });
@@ -448,19 +461,23 @@ mod tests {
                 words: vec![
                     WordFact {
                         value: WordValue::Literal("rg".into()),
-                        range: 0..2
+                        range: 0..2,
+                        raw: "rg".into()
                     },
                     WordFact {
                         value: WordValue::Unknown,
-                        range: 3..13
+                        range: 3..13,
+                        raw: "\"$PATTERN\"".into()
                     },
                     WordFact {
                         value: WordValue::Literal("--file".into()),
-                        range: 14..20
+                        range: 14..20,
+                        raw: "--file".into()
                     },
                     WordFact {
                         value: WordValue::Literal(".env".into()),
-                        range: 21..25
+                        range: 21..25,
+                        raw: ".env".into()
                     },
                 ],
                 range: 0..25,
@@ -511,6 +528,7 @@ mod tests {
                             direction: Direction::Write,
                             fd: None,
                             target: WordValue::Literal("/tmp/probe".into()),
+                            raw_target: Some("/tmp/probe".into()),
                             range: output_start..output_start + "> /tmp/probe".len(),
                             context: Context::default(),
                         }

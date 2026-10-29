@@ -244,7 +244,7 @@ impl SandboxPolicy {
     pub fn with_credential_roots(&self, home: &Path) -> Self {
         let mut policy = self.clone();
         policy.credential_home = Some(home.to_path_buf());
-        for name in [".ssh", ".aws", ".gnupg"] {
+        for name in crate::permissions::sensitive::HOME_CREDENTIAL_DIRS {
             let root = home.join(name);
             policy = policy
                 .with_denied_read_path(&root)
@@ -265,34 +265,37 @@ impl SandboxPolicy {
         {
             return false;
         }
-        [".ssh", ".aws", ".gnupg"].into_iter().any(|name| {
-            let root = home.join(name);
-            if !path.starts_with(&root) {
-                return false;
-            }
-            let Some(root_resolved) = resolve_existing(&root) else {
-                return false;
-            };
-            let Some(path_resolved) = resolve_existing(path) else {
-                return false;
-            };
-            if !path_resolved.starts_with(&root_resolved) {
-                return false;
-            }
-            [root, root_resolved].iter().all(|root| {
-                let denied = |paths: &[PathBuf]| paths.iter().any(|deny| root.starts_with(deny));
-                denied(&self.denied_read_paths)
-                    && denied(&self.denied_write_paths)
-                    && !self.allowed_read_paths.iter().any(|allow| {
-                        let Some(resolved) = resolve_existing(allow) else {
-                            return true;
-                        };
-                        [allow, &resolved]
-                            .iter()
-                            .any(|allow| read_ranges_might_overlap(allow, root))
-                    })
+        crate::permissions::sensitive::HOME_CREDENTIAL_DIRS
+            .iter()
+            .any(|name| {
+                let root = home.join(name);
+                if !path.starts_with(&root) {
+                    return false;
+                }
+                let Some(root_resolved) = resolve_existing(&root) else {
+                    return false;
+                };
+                let Some(path_resolved) = resolve_existing(path) else {
+                    return false;
+                };
+                if !path_resolved.starts_with(&root_resolved) {
+                    return false;
+                }
+                [root, root_resolved].iter().all(|root| {
+                    let denied =
+                        |paths: &[PathBuf]| paths.iter().any(|deny| root.starts_with(deny));
+                    denied(&self.denied_read_paths)
+                        && denied(&self.denied_write_paths)
+                        && !self.allowed_read_paths.iter().any(|allow| {
+                            let Some(resolved) = resolve_existing(allow) else {
+                                return true;
+                            };
+                            [allow, &resolved]
+                                .iter()
+                                .any(|allow| read_ranges_might_overlap(allow, root))
+                        })
+                })
             })
-        })
     }
 }
 

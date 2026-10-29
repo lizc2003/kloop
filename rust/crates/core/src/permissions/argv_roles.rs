@@ -39,6 +39,66 @@ pub(super) fn is_modeled_command(argv: &[String]) -> bool {
     matches!(command, "find" | "grep" | "rg" | "du" | "tree")
 }
 
+/// grep/rg 是否在搜索根下递归。共用同一套选项簇解析：`-rn`、`-d recurse`、
+/// `--directories=recurse`、`-.`、`-uu`、`--unrestricted` 都按各自语法判定，
+/// 不再只认原样的 `-r`。选项簇解析失败时退回旧的字面形状。
+pub(super) fn search_is_recursive(argv: &[String]) -> bool {
+    let Some(command) = argv.first().and_then(|raw| raw.rsplit('/').next()) else {
+        return false;
+    };
+    match command {
+        "grep" => walk_options(argv, &GREP, Positionals::PatternThenPaths).map_or_else(
+            || {
+                argv[1..]
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-r" | "-R" | "--recursive"))
+            },
+            |walked| {
+                walked
+                    .short_flags
+                    .iter()
+                    .any(|flag| matches!(flag, 'r' | 'R'))
+                    || walked
+                        .short_values
+                        .iter()
+                        .any(|(flag, value)| *flag == 'd' && *value == "recurse")
+                    || walked
+                        .long_flags
+                        .iter()
+                        .any(|name| matches!(*name, "recursive" | "dereference-recursive"))
+                    || walked
+                        .long_values
+                        .iter()
+                        .any(|(name, value)| *name == "directories" && *value == "recurse")
+            },
+        ),
+        // ripgrep 默认递归，但只有 `--hidden` / `-u`（含 `-uu`）/ `-.` /
+        // `--unrestricted` 才会读隐藏的点文件。`-u` 一次就够：它让被 gitignore
+        // 的 `.env` 重新可见。
+        "rg" => walk_options(argv, &RG, Positionals::PatternThenPaths).map_or_else(
+            || {
+                argv[1..].iter().any(|arg| {
+                    arg == "--hidden"
+                        || (arg.starts_with('-')
+                            && !arg.starts_with("--")
+                            && arg.chars().skip(1).any(|ch| ch == 'u'))
+                })
+            },
+            |walked| {
+                walked
+                    .short_flags
+                    .iter()
+                    .any(|flag| matches!(flag, 'u' | '.'))
+                    || walked
+                        .long_flags
+                        .iter()
+                        .any(|name| matches!(*name, "hidden" | "unrestricted"))
+            },
+        ),
+        _ => false,
+    }
+}
+
 /// 只 stat 或列目录、不打开文件内容的调用。未知命令一律按内容访问处理，
 /// 所以这里只放行明确确认过"没有读取内容选项"的命令。
 pub(super) fn is_metadata_access(argv: &[String]) -> bool {
@@ -125,6 +185,11 @@ struct Walked<'a> {
     long_flags: Vec<&'a str>,
     /// 实际作为无操作数开关消费的短选项字母。
     short_flags: Vec<char>,
+    /// 短选项及其操作数（`-d recurse`、`--directories=recurse` 这类语义住在
+    /// 值里的开关靠它判定）。
+    short_values: Vec<(char, &'a str)>,
+    /// 长选项及其操作数。
+    long_values: Vec<(&'a str, &'a str)>,
 }
 
 fn option_paths<'a>(
@@ -151,6 +216,8 @@ fn walk_options<'a>(
         opens_file: false,
         long_flags: Vec::new(),
         short_flags: Vec::new(),
+        short_values: Vec::new(),
+        long_values: Vec::new(),
     };
     let mut pattern_source = false;
     // 第一个位置参数可能是模式，也可能是路径：`-f`/`--file` 可以出现在它后面
@@ -192,25 +259,30 @@ fn walk_options<'a>(
                     pattern_source = true;
                     index += 1;
                 }
-                (Operand::Literal | Operand::Pattern, Some(_)) => {
+                (Operand::Literal | Operand::Pattern, Some(value)) => {
                     pattern_source |= role == Operand::Pattern;
+                    walked.long_values.push((name, value));
                     index += 1;
                 }
                 (Operand::Literal | Operand::Pattern, None) => {
-                    argv.get(index + 1)?;
+                    let value = argv.get(index + 1)?.as_str();
                     pattern_source |= role == Operand::Pattern;
+                    walked.long_values.push((name, value));
                     index += 2;
                 }
                 (Operand::Path | Operand::PatternPath, Some(value)) => {
                     pattern_source |= role == Operand::PatternPath;
                     walked.opens_file = true;
                     walked.paths.push(value);
+                    walked.long_values.push((name, value));
                     index += 1;
                 }
                 (Operand::Path | Operand::PatternPath, None) => {
+                    let value = argv.get(index + 1)?.as_str();
                     pattern_source |= role == Operand::PatternPath;
                     walked.opens_file = true;
-                    walked.paths.push(argv.get(index + 1)?.as_str());
+                    walked.paths.push(value);
+                    walked.long_values.push((name, value));
                     index += 2;
                 }
             }
@@ -248,6 +320,7 @@ fn walk_options<'a>(
                 }
             };
             pattern_source |= matches!(role, Operand::Pattern | Operand::PatternPath);
+            walked.short_values.push((ch, value));
             if matches!(role, Operand::Path | Operand::PatternPath) {
                 walked.opens_file = true;
                 walked.paths.push(value);
@@ -480,7 +553,9 @@ fn rg_short(ch: char) -> Option<Operand> {
             Some(Operand::Literal)
         }
         'F' | 'H' | 'I' | 'L' | 'N' | 'P' | 'S' | 'U' | 'V' | 'a' | 'b' | 'c' | 'h' | 'i' | 'l'
-        | 'n' | 'o' | 'p' | 'q' | 's' | 'u' | 'v' | 'w' | 'x' | 'z' | '0' => Some(Operand::None),
+        | 'n' | 'o' | 'p' | 'q' | 's' | 'u' | 'v' | 'w' | 'x' | 'z' | '0' | '.' => {
+            Some(Operand::None)
+        }
         _ => None,
     }
 }
@@ -579,6 +654,7 @@ fn rg_long(name: &str) -> Option<Operand> {
         | "debug"
         | "trace"
         | "no-color"
+        | "unrestricted"
         | "help"
         | "version"
         | "generate"

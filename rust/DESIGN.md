@@ -999,7 +999,9 @@ shell、路径和危险特征，`argv_roles.rs` 持有各命令的参数角色�
 Credential-bearing/read-sensitive
 paths are an even earlier hard boundary: `read_file` refuses them, grep/glob filter
 them before reading, and Bash checks literal plus canonical paths before
-sandbox/read-only/bypass. Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
+sandbox/read-only/bypass. 名字只有一份（`permissions/sensitive.rs`）：凭据/agent state
+目录（`.kloop`、`.ssh`、`.gnupg`、`.aws`）、rc 文件与 `.env*` 的判定同时供路径检查、
+Bash 原文扫描、递归搜索、glob 拼写与沙箱凭据根使用。Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
 内部，元数据访问（`ls`、`stat`、`du`、`tree`、只读 `find` 的 stat/列目录）不算
 读取，只有内容访问（`cat`、`grep`、`sed`、解释器等；未识别命令默认按内容访问）
 才硬拦；`.kloop`、`.ssh`、`.gnupg`、`.aws`、`.env*` 和 rc 文件是凭据或 agent
@@ -1032,11 +1034,23 @@ needle 仍优先，但对边界明确、带引用分隔符的 `cat` heredoc 写�
 和读取 carve-out；`..`、相对路径、其它用户路径、保护外 needle 与覆盖不明都保留拒绝。
 不解析 Rust/Python 字符串、不推算生成程序的文件访问；后续代码的边界由相同 OS 策略承担。
 无沙箱和未支持平台保持原文保守扫描，`.kloop`、`.git`、rc 文件与 `.env*` 不属于该例外。
+递归搜索（`grep -r`/`rg --hidden` 一类）按命令自己的选项簇判定是否真的递归：grep 的
+`-rn`/`-Rl`/`-d recurse`/`--directories=recurse` 与 rg 的 `-uu`/`-.`/`--unrestricted`/
+`--hidden` 都算；搜索根取参数角色表认定的路径（缺省为 cwd）。根自身或祖先落在敏感目录
+下、根的直接子项里出现凭据/状态名字（含 `.env*`）就硬拦。`.git` 不在这份递归名单里：
+否则任何仓库内的 `grep -r` 都要被拦，而 `.git` 的内容访问由路径参数判定覆盖。
+未展开的 glob 拼写不访问文件系统：以 `.` 开头且含 `*`/`?`/`[`/`{` 的分量只要能拼出
+名单里的名字（`.en?`、`.gi?`、`.s*`）就按敏感处理，拼不出的（`.c*`，以及 shell 的
+glob 本就不匹配点开头名字的 `*.env`）照旧放行。固定输出目标里的 `~/…`、`$HOME/…`、
+`${HOME}/…` 按 shell 的展开规则展开后再参与敏感、设备与 deny 判断（`>> ~/.bashrc`
+因此能命中 `bash_write(**/.bashrc)`）；其余动态目标（`"$DIR/x"`、glob）定不下落点，
+至少按最后一段名字过一遍名单。`/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty`
+是纯流设备，不当作敏感目标。
 
 The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`
 state tree, including `config.toml`, `mcp-oauth.json`, and
 `projects/v1/<ProjectId>/permissions.json` plus its lock, even through symlinks.
-CLI 同时为当前 home 的 `.ssh`、`.aws`、`.gnupg` 添加递归读写拒绝，保留字面与
+CLI 同时为当前 home 的 `.ssh`、`.aws`、`.gnupg` 添加递归读写拒绝（名单与权限判定同源），保留字面与
 规范名字；不存在的叶子也解析最近存在祖先，不读取凭据内容。配对的拒写阻止移动凭据文件或
 根本身；Seatbelt 还对拒写路径的祖先目录条目添加 literal `file-write-unlink` 拒绝，防止把
 整个父目录改名后再读取。它不把祖先子树变为只读，普通兄弟文件仍可编辑。
@@ -1081,7 +1095,8 @@ heredoc 加一个默认 stdout 的 `>` 固定文件输出；支持完整单/双�
 heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记住工作区会话，不生成项目或升级前缀。
 `2>&1` / `>&2` / `…>/dev/null` 等纯流重定向继续不增加文件效果。
 `WithWrites` 永远不是只读调用，也不能并发批处理；已识别 argv 继续经过 deny、危险命令
-和敏感读取检查，输出路径的敏感类别与 `/dev` 目标在 manual 下强制逐次确认。
+和敏感读取检查，输出路径的敏感类别与非流 `/dev` 目标在 manual 下强制逐次确认
+（`/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty` 是纯流设备，不在此列）。
 只读分类器同时检查命令选项：`find -delete`、`rg --pre`、`git -C` / `--git-dir` /
 `log --output`、`base64 -o` 与超出 `sed -n Np` 查询形式的调用都不算只读。
 独立的危险分类器在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
@@ -5326,6 +5341,7 @@ crates/core/        kloop-core — the agent, network-free
   src/permissions/rule.rs 规则语言、解析与 allow/deny/ask 两个方向的匹配
   src/permissions/policy.rs 全局约束、项目策略、工作区会话状态与 epoch 发布
   src/permissions/facts.rs shell/路径事实、敏感读取、危险特征与路径豁免
+  src/permissions/sensitive.rs 敏感名字的唯一名单（目录/rc/.env*）与 glob 拼写查询
   src/permissions/describe.rs 审批记忆载荷、拒绝说明与展示文案
   src/permissions/testutil.rs 策略与管线测试共用的项目存储夹具
   src/diff.rs       write/edit change previews for the approval prompt
