@@ -244,7 +244,7 @@ impl SandboxPolicy {
     pub fn with_credential_roots(&self, home: &Path) -> Self {
         let mut policy = self.clone();
         policy.credential_home = Some(home.to_path_buf());
-        for name in crate::permissions::sensitive::HOME_CREDENTIAL_DIRS {
+        for name in crate::permissions::sensitive::SECRET_DIRS {
             let root = home.join(name);
             policy = policy
                 .with_denied_read_path(&root)
@@ -265,7 +265,7 @@ impl SandboxPolicy {
         {
             return false;
         }
-        crate::permissions::sensitive::HOME_CREDENTIAL_DIRS
+        crate::permissions::sensitive::SECRET_DIRS
             .iter()
             .any(|name| {
                 let root = home.join(name);

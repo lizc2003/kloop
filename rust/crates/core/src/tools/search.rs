@@ -1389,12 +1389,12 @@ mod tests {
             "grep-open-binding",
             &[
                 ("search/safe.txt", "needle-safe\n"),
-                (".kloop/config.toml", "needle-secret\n"),
+                (".ssh/config.toml", "needle-secret\n"),
             ],
         );
         let search_root = t.root.join("search");
         let safe = search_root.join("safe.txt");
-        let secret = t.root.join(".kloop/config.toml");
+        let secret = t.root.join(".ssh/config.toml");
         let args = GrepArgs::parse(
             &json!({
                 "pattern": "needle",

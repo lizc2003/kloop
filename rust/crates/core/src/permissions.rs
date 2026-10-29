@@ -86,6 +86,7 @@ use describe::tool_title;
 use describe::user_denial;
 pub(crate) use describe::user_stop;
 pub(crate) use facts::CallFacts;
+use facts::KloopScope;
 use facts::PathFacts;
 use facts::ShellFacts;
 pub use policy::GlobalPermissionPolicy;
@@ -882,7 +883,7 @@ impl Permissions {
             return false;
         }
         let facts = PathFacts::gather_with_resolved(path, self.identity.cwd(), resolved_path);
-        facts.sensitive
+        facts.sensitivity(KloopScope::PrivateRoot).is_some()
             || self
                 .global
                 .deny
@@ -1057,6 +1058,7 @@ impl Permissions {
 mod tests {
     include!("permissions/plan239_tests.rs");
     include!("permissions/plan243_tests.rs");
+    include!("permissions/plan271_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;
@@ -1442,7 +1444,9 @@ mod tests {
     async fn spilled_output_is_readable_but_the_exemption_does_not_widen() {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 16]);
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
-        let store = "/home/u/.kloop/projects/v1/p1_abc";
+        let home = std::env::home_dir().expect("home");
+        let home = home.display();
+        let store = format!("{home}/.kloop/projects/v1/p1_abc");
 
         for command in [
             format!("wc -c {store}/offload/off-11111111111.txt"),
@@ -1465,7 +1469,7 @@ mod tests {
 
         for command in [
             // The credential and the transcripts are what the deny is for.
-            "cat /home/u/.kloop/config.toml".to_string(),
+            format!("cat {home}/.kloop/config.toml"),
             format!("cat {store}/sessions/20260101-000000.jsonl"),
             // Not a spill file, merely sitting next to one.
             format!("cat {store}/offload/notes.txt"),
@@ -1474,7 +1478,7 @@ mod tests {
             format!("cat {store}/offload/../../../config.toml"),
             format!("cat {store}/offload/off-11111111111.txt/../../config.toml"),
             // Masking one token must not unmask another in the same command.
-            format!("cat {store}/offload/off-11111111111.txt /home/u/.kloop/config.toml"),
+            format!("cat {store}/offload/off-11111111111.txt {home}/.kloop/config.toml"),
             format!("cat {store}/offload/off-11111111111.txt; cat ~/.kloop/config.toml"),
         ] {
             assert!(
@@ -1496,16 +1500,22 @@ mod tests {
     async fn sensitive_reads_are_hard_blocked_before_sandbox_and_bypass() {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 8]);
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
-        assert!(!ok(&p, "read_file", json!({"path": ".kloop/config.toml"})).await);
+        let home = std::env::home_dir().expect("home");
+        let state = home.join(".kloop");
+        assert!(!ok(&p, "read_file", json!({"path": state.join("config.toml")})).await);
+        let state = state.display();
         for command in [
-            "cat ~/.kloop/config.toml",
-            "base64 /work/proj/.kloop/config.toml",
-            "head -n 2 sub/.kloop/config.toml",
-            "rg token ~/.kloop",
-            "python3 -c 'print(open(\"/work/proj/.kloop/config.toml\").read())'",
+            "cat ~/.kloop/config.toml".to_string(),
+            format!("base64 {state}/config.toml"),
+            "cat $HOME/.kloop/config.toml".into(),
+            // `cd` 之后相对拼写的落点未知，`.kloop` 退回按名字算。
+            "cd ~ && head -n 2 .kloop/config.toml".into(),
+            "rg token ~/.kloop".into(),
+            "ls ~/.k*".into(),
+            format!("python3 -c 'print(open(\"{state}/config.toml\").read())'"),
         ] {
             assert!(
-                p.check_call("bash", &bash(command), 0, /*sandbox_auto_allow*/ true)
+                p.check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
                     .await
                     .is_err(),
                 "sensitive command escaped: {command}"
@@ -1789,7 +1799,7 @@ mod tests {
                 "find .git -delete",
                 "find .git -unknown -print",
                 "tree -Ia -P .git",
-                "ls -l .kloop/config.toml",
+                "ls -l ~/.kloop/config.toml",
                 "ls -l .env",
                 "stat ~/.ssh/id_rsa",
                 "ls -l .git/config; cat .env",
@@ -1813,9 +1823,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("kloop-sensitive-read-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let secret_dir = root.join(".kloop");
+        let secret_dir = root.join(".ssh");
         std::fs::create_dir_all(&secret_dir).unwrap();
-        let secret = secret_dir.join("config.toml");
+        let secret = secret_dir.join("id_rsa");
         std::fs::write(&secret, "SENTINEL").unwrap();
         let alias = root.join("innocent.toml");
         std::os::unix::fs::symlink(&secret, &alias).unwrap();

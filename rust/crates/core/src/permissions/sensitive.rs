@@ -6,8 +6,14 @@
 /// 仓库内部：元数据访问不算读取，内容访问仍是硬边界。
 pub(super) const VCS_DIR: &str = ".git";
 
-/// 凭据与 agent state 目录：元数据访问也按读取处理。
-pub(super) const SECRET_DIRS: &[&str] = &[".kloop", ".ssh", ".gnupg", ".aws"];
+/// 凭据目录：任何位置都算，元数据访问也按读取处理。沙箱在 home 下按绝对路径
+/// 拒读写同一份名单。
+pub(crate) const SECRET_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws"];
+
+/// kloop 的目录名，判定随访问而变。私有状态根 `~/.kloop` 存 provider 凭据与所有
+/// 项目的转录；项目里的 `.kloop/`（worktrees、rules、skills、commands）不是秘密，
+/// 但写进去会引导以后的会话。所以写入按名字确认，读取只认私有状态根。
+pub(super) const KLOOP_DIR: &str = ".kloop";
 
 /// shell / git 的启动文件：进程一启动就会执行里面的内容。
 pub(super) const SECRET_FILES: &[&str] = &[
@@ -23,10 +29,6 @@ pub(super) const SECRET_FILES: &[&str] = &[
 
 /// `.env` 及其派生文件（`.env.local`、`.env.production`）按文件名前缀匹配。
 pub(super) const ENV_PREFIX: &str = ".env";
-
-/// home 下的凭据目录。`.kloop` 是 kloop 自己的 state，按配置的绝对路径而不是
-/// home 下的名字定位，所以沙箱的凭据根不包含它。
-pub(crate) const HOME_CREDENTIAL_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws"];
 
 /// 敏感路径的类别，决定元数据访问是否算读取。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +53,7 @@ pub(super) fn fs_fold(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// 目录名是否属于凭据/agent state。
+/// 目录名是否属于凭据。`.kloop` 不在其中，见 [`KLOOP_DIR`]。
 pub(super) fn dir_name_is_secret(name: &str) -> bool {
     let folded = fs_fold(name);
     SECRET_DIRS.contains(&folded.as_ref())
@@ -91,6 +93,13 @@ pub(super) fn glob_component_sensitivity(pattern: &str, last: bool) -> Option<Se
         return Some(Sensitivity::Secret);
     }
     vcs.then_some(Sensitivity::Vcs)
+}
+
+/// 未引用的 glob 分量能否拼出 [`KLOOP_DIR`]；落点是否是私有状态根由调用方判定。
+pub(super) fn glob_component_may_be_kloop(pattern: &str) -> bool {
+    pattern.starts_with('.')
+        && pattern.contains(['*', '?', '[', '{'])
+        && glob_matches(fs_fold(pattern).as_ref(), KLOOP_DIR)
 }
 
 /// 用规则表同一套 globset 语义做单分量匹配；解析不了的模式按“可能命中”处理，
@@ -282,5 +291,16 @@ mod tests {
         assert!(file_name_is_secret(".env.production"));
         assert!(!file_name_is_secret("environment.rs"));
         assert!(!dir_name_is_secret(".git"));
+        // `.kloop` 的落点由调用方判定，不进按名字匹配的凭据名单。
+        assert!(!name_is_secret(KLOOP_DIR));
+    }
+
+    #[test]
+    fn kloop_glob_spellings_are_recognized() {
+        assert!(glob_component_may_be_kloop(".k*"));
+        assert!(glob_component_may_be_kloop(".kl??p"));
+        assert!(!glob_component_may_be_kloop(".kloop"));
+        assert!(!glob_component_may_be_kloop(".c*"));
+        assert!(!glob_component_may_be_kloop("*kloop"));
     }
 }

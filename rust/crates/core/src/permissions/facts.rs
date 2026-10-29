@@ -69,7 +69,7 @@ impl WriteTarget {
     fn sensitive(&self) -> bool {
         match self {
             Self::Resolved(path) => {
-                path.sensitive
+                path.sensitivity(KloopScope::Anywhere).is_some()
                     || (path.normalized.starts_with("/dev")
                         && !is_stream_device(&path.original)
                         && !is_stream_device(&path.normalized))
@@ -91,8 +91,6 @@ pub(super) struct PathFacts {
     pub(super) original: PathBuf,
     pub(super) original_relative: Option<PathBuf>,
     pub(super) inside_cwd: bool,
-    pub(super) sensitive: bool,
-    pub(super) sensitivity: Option<Sensitivity>,
 }
 
 impl CallFacts {
@@ -152,7 +150,9 @@ impl CallFacts {
             .and_then(|key| input[key].as_str())
             .map(|raw| PathFacts::gather_with_resolved(Path::new(raw), cwd, resolved_path));
         let sensitive_read = (name == "read_file"
-            && path.as_ref().is_some_and(|path| path.sensitive))
+            && path
+                .as_ref()
+                .is_some_and(|path| path.sensitivity(KloopScope::PrivateRoot).is_some()))
             || (name == "bash"
                 && shell_command
                     .zip(shell.as_ref())
@@ -245,7 +245,10 @@ impl CallFacts {
             });
         }
         if matches!(name, "write_file" | "edit_file" | "notebook_edit")
-            && self.path.as_ref().is_some_and(|p| p.sensitive)
+            && self
+                .path
+                .as_ref()
+                .is_some_and(|p| p.sensitivity(KloopScope::Anywhere).is_some())
         {
             return Some(Hazard {
                 tag: "sensitive path",
@@ -292,7 +295,37 @@ impl ReadVerdict {
     }
 }
 
-fn argv_reads_sensitive_path(argv: &[String], cwd: &Path) -> bool {
+/// `.kloop` 在哪里算敏感（见 [`sensitive::KLOOP_DIR`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KloopScope {
+    /// 写入，以及落点未知的读取：任何位置的 `.kloop` 都算。
+    Anywhere,
+    /// 落点已知的读取：只有私有状态根 `~/.kloop` 算。
+    PrivateRoot,
+}
+
+/// 一条路径拼写的访问方向，决定它的 `.kloop` 口径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access {
+    Write,
+    /// `cwd_unknown`：前面有 `cd` 一类命令，相对拼写不能按会话 cwd 定位。
+    Read {
+        cwd_unknown: bool,
+    },
+}
+
+impl Access {
+    fn kloop_scope(self, spelling: &str) -> KloopScope {
+        match self {
+            Self::Read { cwd_unknown } if !cwd_unknown || Path::new(spelling).is_absolute() => {
+                KloopScope::PrivateRoot
+            }
+            Self::Read { .. } | Self::Write => KloopScope::Anywhere,
+        }
+    }
+}
+
+fn argv_reads_sensitive_path(argv: &[String], cwd: &Path, access: Access) -> bool {
     let paths = argv_roles::path_arguments(argv);
     // 已建模命令解析失败时角色不明，按内容访问处理；未建模命令（`ls`、
     // `stat`）没有角色表可失败，元数据判定直接生效。
@@ -302,13 +335,13 @@ fn argv_reads_sensitive_path(argv: &[String], cwd: &Path) -> bool {
         // 识别出参数角色：只检查命令真正会打开的值。
         Some(paths) => paths
             .into_iter()
-            .any(|arg| path_argument_is_sensitive(arg, cwd, metadata)),
+            .any(|arg| path_argument_is_sensitive(arg, cwd, metadata, access)),
         // 未知命令或语法：退回逐参数检查。
         None => argv.iter().skip(1).any(|arg| {
             if arg.starts_with('-') && !arg.contains('/') {
                 return false;
             }
-            path_argument_is_sensitive(arg, cwd, metadata)
+            path_argument_is_sensitive(arg, cwd, metadata, access)
         }),
     };
     sensitive || recursive_search_covers_sensitive_path(argv, cwd)
@@ -343,6 +376,9 @@ fn bash_reads_sensitive_path(
         let home = execution.shell_home();
         for command in &facts.commands {
             let home = home.as_deref().filter(|_| !command.context.home_unknown);
+            let access = Access::Read {
+                cwd_unknown: command.context.cwd_unknown,
+            };
             let words: Vec<_> = command
                 .words
                 .iter()
@@ -357,14 +393,14 @@ fn bash_reads_sensitive_path(
                 })
                 .collect();
             if let Some(argv) = argv {
-                if argv_reads_sensitive_path(&argv, cwd) {
+                if argv_reads_sensitive_path(&argv, cwd, access) {
                     return ReadVerdict::Sensitive;
                 }
             } else if !arguments_are_text(command)
                 && words
                     .iter()
                     .skip(1)
-                    .any(|word| evaluation_is_sensitive(word, cwd, false))
+                    .any(|word| evaluation_is_sensitive(word, cwd, false, access))
             {
                 return ReadVerdict::Sensitive;
             }
@@ -374,7 +410,10 @@ fn bash_reads_sensitive_path(
                 continue;
             }
             let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
-            if evaluation_is_sensitive(&redirect.syntax.evaluate(home), cwd, false) {
+            let access = Access::Read {
+                cwd_unknown: redirect.context.cwd_unknown,
+            };
+            if evaluation_is_sensitive(&redirect.syntax.evaluate(home), cwd, false, access) {
                 return ReadVerdict::Sensitive;
             }
         }
@@ -428,11 +467,12 @@ pub(crate) fn bash_protection_requirement(
     }
 }
 
-fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
+fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool, access: Access) -> bool {
     let path = lexical_normalize(cwd, Path::new(raw));
+    let scope = access.kloop_scope(raw);
     let sensitivity = merge_sensitivity(
-        PathFacts::gather(&path, cwd).sensitivity,
-        glob_spelling_sensitivity(&path, metadata),
+        PathFacts::gather(&path, cwd).sensitivity(scope),
+        glob_spelling_sensitivity(&path, metadata, scope),
     );
     match sensitivity {
         None => false,
@@ -443,18 +483,24 @@ fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool) -> bool {
     }
 }
 
-fn evaluation_is_sensitive(word: &WordEvaluation, cwd: &Path, metadata: bool) -> bool {
+fn evaluation_is_sensitive(
+    word: &WordEvaluation,
+    cwd: &Path,
+    metadata: bool,
+    access: Access,
+) -> bool {
     match word {
-        WordEvaluation::Resolved(path) => path_argument_is_sensitive(path, cwd, metadata),
+        WordEvaluation::Resolved(path) => path_argument_is_sensitive(path, cwd, metadata, access),
         WordEvaluation::Partial(spelling) if !spelling.contains('\0') => {
-            path_argument_is_sensitive(spelling, cwd, metadata)
+            path_argument_is_sensitive(spelling, cwd, metadata, access)
         }
         WordEvaluation::Partial(spelling) => {
-            // 未知片段不能假装成文件系统落点，但已知的敏感分量仍然成立。
+            // 未知片段不能假装成文件系统落点，但已知的敏感分量仍然成立；
+            // 落点未知，`.kloop` 也只能按名字算。
             let path = Path::new(spelling);
             match merge_sensitivity(
-                path_sensitivity(path),
-                glob_spelling_sensitivity(path, metadata),
+                path_sensitivity(path, KloopScope::Anywhere),
+                glob_spelling_sensitivity(path, metadata, KloopScope::Anywhere),
             ) {
                 Some(Sensitivity::Secret) => true,
                 Some(Sensitivity::Vcs) => !metadata,
@@ -467,7 +513,11 @@ fn evaluation_is_sensitive(word: &WordEvaluation, cwd: &Path, metadata: bool) ->
 
 /// 未展开的 glob 分量能否拼出敏感名字。判定不读文件系统：只看拼写，所以与
 /// bash 何时展开无关，也不会因为目录里恰好没有该文件而放行。
-fn glob_spelling_sensitivity(path: &Path, metadata: bool) -> Option<Sensitivity> {
+fn glob_spelling_sensitivity(
+    path: &Path,
+    metadata: bool,
+    scope: KloopScope,
+) -> Option<Sensitivity> {
     let components: Vec<_> = path.components().collect();
     let mut found = None;
     for (index, component) in components.iter().enumerate() {
@@ -477,6 +527,20 @@ fn glob_spelling_sensitivity(path: &Path, metadata: bool) -> Option<Sensitivity>
         let Some(name) = name.to_str() else {
             continue;
         };
+        if sensitive::glob_component_may_be_kloop(name)
+            && match scope {
+                KloopScope::Anywhere => true,
+                KloopScope::PrivateRoot => {
+                    let parent: PathBuf = components[..index].iter().collect();
+                    let canonical = canonicalize_nearest_existing(&parent);
+                    std::iter::once(parent)
+                        .chain(canonical)
+                        .any(|parent| is_private_state_root(&parent.join(sensitive::KLOOP_DIR)))
+                }
+            }
+        {
+            return Some(Sensitivity::Secret);
+        }
         let last = index + 1 == components.len();
         match sensitive::glob_component_sensitivity(name, last) {
             Some(Sensitivity::Secret) => return Some(Sensitivity::Secret),
@@ -580,13 +644,25 @@ fn raw_mentions_sensitive_path(command: &str) -> bool {
     mentions_sensitive_needle(command)
 }
 
-/// 文本层只认目录拼写：`~/name` 与 `/name/`。文件名（`.env*`、rc 文件）走路径
-/// 与 argv 判定；把它们塞进子串扫描会让 `echo "add .env to .gitignore"` 这类
-/// 纯文本也变成敏感读取。
+/// 文本层只认目录拼写：凭据目录认 `~/name` 与 `/name/`；`.kloop` 只认私有状态根
+/// 的拼写（`~`、`$HOME`、`${HOME}` 前缀与它的绝对路径），项目里的
+/// `/repo/.kloop/rules` 不算。文件名（`.env*`、rc 文件）走路径与 argv 判定；把它们
+/// 塞进子串扫描会让 `echo "add .env to .gitignore"` 这类纯文本也变成敏感读取。
+/// 调用方传入已按文件系统折叠大小写的原文。
 fn mentions_sensitive_needle(command: &str) -> bool {
+    let kloop = sensitive::KLOOP_DIR;
     sensitive::SECRET_DIRS
         .iter()
         .any(|dir| command.contains(&format!("~/{dir}")) || command.contains(&format!("/{dir}/")))
+        || ["~", "$HOME", "${HOME}"]
+            .into_iter()
+            .map(|home| format!("{home}/{kloop}"))
+            .chain(
+                private_state_roots()
+                    .iter()
+                    .map(|root| root.to_string_lossy().into_owned()),
+            )
+            .any(|needle| command.contains(fs_fold(&needle).as_ref()))
 }
 
 fn powershell_mentions_sensitive_path(command: &str) -> bool {
@@ -599,10 +675,11 @@ fn powershell_mentions_sensitive_path(command: &str) -> bool {
         normalized
     };
     let normalized = normalized.as_str();
+    // PowerShell 没有解析层能给出落点，`.kloop` 只能按名字算。
     sensitive::SECRET_DIRS
         .iter()
         .copied()
-        .chain([sensitive::ENV_PREFIX])
+        .chain([sensitive::KLOOP_DIR, sensitive::ENV_PREFIX])
         .any(|needle| {
             normalized.match_indices(needle).any(|(index, _)| {
                 let before = normalized[..index].chars().next_back();
@@ -674,14 +751,18 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
 
 fn recursive_root_is_sensitive(root: &Path) -> bool {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if path_sensitivity(&root).is_some() {
+    if path_sensitivity(&root, KloopScope::PrivateRoot).is_some() {
         return true;
     }
-    if std::env::home_dir().is_some_and(|home| home.join(".kloop/config.toml").starts_with(&root)) {
+    if private_state_roots()
+        .iter()
+        .any(|state| starts_with_folded(state, &root))
+    {
         return true;
     }
     // `.git` 不在名单里：仓库内 `grep -r` 是日常操作，而 `.git` 的内容访问
-    // 已由路径参数判定兜底。
+    // 已由路径参数判定兜底。项目里的 `.kloop/` 也不在：私有状态根由上一条按
+    // 位置判定。
     std::fs::read_dir(&root).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
             entry
@@ -718,10 +799,15 @@ fn write_targets(
                     )))
                 }
                 WordEvaluation::Resolved(path) => Some(WriteTarget::Partial {
-                    sensitive: evaluation_is_sensitive(&WordEvaluation::Partial(path), cwd, false),
+                    sensitive: evaluation_is_sensitive(
+                        &WordEvaluation::Partial(path),
+                        cwd,
+                        false,
+                        Access::Write,
+                    ),
                 }),
                 WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
-                    sensitive: evaluation_is_sensitive(&target, cwd, false),
+                    sensitive: evaluation_is_sensitive(&target, cwd, false, Access::Write),
                 }),
                 WordEvaluation::Unknown => Some(WriteTarget::Unknown),
             }
@@ -764,18 +850,22 @@ impl PathFacts {
             .map(Path::to_path_buf);
         let original_relative = original.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
-        let sensitivity =
-            merge_sensitivity(path_sensitivity(&original), path_sensitivity(&normalized));
-        let sensitive = sensitivity.is_some();
         PathFacts {
             normalized,
             relative,
             original,
             original_relative,
             inside_cwd,
-            sensitive,
-            sensitivity,
         }
+    }
+
+    /// 原拼写与规范目标任一落在名单里即算；`scope` 决定 `.kloop` 的口径：
+    /// 写入安全用 [`KloopScope::Anywhere`]，读取用 [`KloopScope::PrivateRoot`]。
+    pub(super) fn sensitivity(&self, scope: KloopScope) -> Option<Sensitivity> {
+        merge_sensitivity(
+            path_sensitivity(&self.original, scope),
+            path_sensitivity(&self.normalized, scope),
+        )
     }
 }
 
@@ -851,8 +941,9 @@ fn merge_sensitivity(a: Option<Sensitivity>, b: Option<Sensitivity>) -> Option<S
 /// kloop's own state, key material, shell/git rc files) and their read
 /// classification: `Vcs` allows metadata access, `Secret` does not.
 /// `Secret` wins over `Vcs`: a path that reaches both a repository and a
-/// credential store is a secret path for every access kind.
-fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
+/// credential store is a secret path for every access kind. `scope` decides
+/// which `.kloop` directories count.
+fn path_sensitivity(normalized: &Path, scope: KloopScope) -> Option<Sensitivity> {
     // Callers normalize first, but the exemption below must not depend on that:
     // `.kloop/worktrees/../sessions` is only a worktree path if you stop reading
     // at the second segment. A `..` anywhere forfeits the exemption entirely.
@@ -860,8 +951,10 @@ fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
         .components()
         .any(|comp| matches!(comp, Component::ParentDir));
     let mut found = None;
+    let mut prefix = PathBuf::new();
     let mut components = normalized.components().peekable();
     while let Some(comp) = components.next() {
+        prefix.push(comp);
         let Component::Normal(name) = comp else {
             continue;
         };
@@ -871,24 +964,26 @@ fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
         let folded = fs_fold(name);
         let name = folded.as_ref();
         let is_last = components.peek().is_none();
-        // `.kloop/worktrees/...` is a checkout, not kloop's state. Skipping the
-        // `.kloop` segment (rather than returning false) keeps the scan running
-        // over the rest, so a nested `.kloop` inside the worktree still trips.
-        if name == ".kloop"
-            && !traversal
-            && components.peek().is_some_and(|next| {
+        if name == sensitive::KLOOP_DIR {
+            // `.kloop/worktrees/...` is a checkout, not kloop's state. Skipping
+            // the `.kloop` segment (rather than returning false) keeps the scan
+            // running over the rest, so a nested `.kloop` inside the worktree
+            // still trips.
+            let worktree = components.peek().is_some_and(|next| {
                 matches!(next, Component::Normal(next)
                     if fs_fold(&next.to_string_lossy()) == WORKTREE_SEGMENT)
-            })
-        {
-            continue;
-        }
-        // The spill exemption reads the *tail* rather than the next segment,
-        // because the store partitions by project between the two
-        // (`.kloop/projects/v1/<id>/offload/off-0001.txt`). Skipping `.kloop`
-        // rather than returning keeps the scan running, so a `.ssh` or a nested
-        // `.kloop` elsewhere in the path still trips.
-        if name == ".kloop" && !traversal && path_tail_is_spill(normalized) {
+            });
+            // The spill exemption reads the *tail* rather than the next segment,
+            // because the store partitions by project between the two
+            // (`.kloop/projects/v1/<id>/offload/off-0001.txt`).
+            let exempt = !traversal && (worktree || path_tail_is_spill(normalized));
+            let counted = match scope {
+                KloopScope::Anywhere => true,
+                KloopScope::PrivateRoot => is_private_state_root(&prefix),
+            };
+            if counted && !exempt {
+                return Some(Sensitivity::Secret);
+            }
             continue;
         }
         if name == sensitive::VCS_DIR {
@@ -903,6 +998,34 @@ fn path_sensitivity(normalized: &Path) -> Option<Sensitivity> {
         }
     }
     found
+}
+
+/// 私有状态根 `~/.kloop` 的字面与规范两种拼写。与 CLI 的 `private_state_root`
+/// 同源（进程的 home），不是工具 shell 的 `HOME`。
+fn private_state_roots() -> Vec<PathBuf> {
+    let Some(home) = std::env::home_dir() else {
+        return Vec::new();
+    };
+    let root = home.join(sensitive::KLOOP_DIR);
+    let canonical = canonicalize_nearest_existing(&root).filter(|canonical| *canonical != root);
+    std::iter::once(root).chain(canonical).collect()
+}
+
+fn is_private_state_root(path: &Path) -> bool {
+    private_state_roots().iter().any(|root| {
+        path.components().count() == root.components().count() && starts_with_folded(path, root)
+    })
+}
+
+/// 按文件系统的大小写口径逐分量比较前缀。
+fn starts_with_folded(path: &Path, base: &Path) -> bool {
+    let mut path = path.components();
+    base.components().all(|base| {
+        path.next().is_some_and(|part| {
+            fs_fold(&part.as_os_str().to_string_lossy())
+                == fs_fold(&base.as_os_str().to_string_lossy())
+        })
+    })
 }
 
 #[cfg(test)]
@@ -954,19 +1077,23 @@ mod tests {
     /// parse into argv, so its exemption must not become a traversal hole.
     #[test]
     fn raw_command_exemption_covers_worktrees_but_never_a_traversal() {
-        assert!(!raw_mentions_sensitive_path(
-            "cat /w/proj/.kloop/worktrees/wt/src/main.rs"
-        ));
-        assert!(raw_mentions_sensitive_path(
-            "cat /w/proj/.kloop/sessions/x.jsonl"
-        ));
-        assert!(raw_mentions_sensitive_path(
-            "cat /w/proj/.kloop/worktrees/../sessions/x.jsonl"
-        ));
+        // A repository rooted at home keeps its worktrees inside the private
+        // state root, so the exemption still matters at the text layer.
+        let home = std::env::home_dir().expect("home");
+        let home = home.display();
+        assert!(!raw_mentions_sensitive_path(&format!(
+            "cat {home}/.kloop/worktrees/wt/src/main.rs"
+        )));
+        assert!(raw_mentions_sensitive_path(&format!(
+            "cat {home}/.kloop/sessions/x.jsonl"
+        )));
+        assert!(raw_mentions_sensitive_path(&format!(
+            "cat {home}/.kloop/worktrees/../sessions/x.jsonl"
+        )));
         // The rest of an exempted command is still screened.
-        assert!(raw_mentions_sensitive_path(
-            "cp /w/proj/.kloop/worktrees/wt/a ~/.ssh/authorized_keys"
-        ));
+        assert!(raw_mentions_sensitive_path(&format!(
+            "cp {home}/.kloop/worktrees/wt/a ~/.ssh/authorized_keys"
+        )));
         assert!(powershell_mentions_sensitive_path(
             "Get-Content /w/proj/.kloop/sessions/x.jsonl"
         ));
@@ -977,7 +1104,7 @@ mod tests {
 
     #[test]
     fn sensitive_path_detection_is_component_based() {
-        let s = |p: &str| path_sensitivity(Path::new(p)).is_some();
+        let s = |p: &str| path_sensitivity(Path::new(p), KloopScope::Anywhere).is_some();
         assert!(s("/w/proj/.git/hooks/pre-commit"));
         assert!(s("/w/proj/.git"));
         assert!(s("/w/proj/.kloop/sessions/x.jsonl"));
@@ -1002,15 +1129,128 @@ mod tests {
         assert!(!s("/w/proj/environment.rs"), ".env prefix is filename-only");
     }
 
+    /// 读取只认私有状态根，写入按名字；两种口径共用 worktree 与溢出文件豁免。
+    #[test]
+    fn kloop_reads_count_only_the_private_state_root() {
+        let home = std::env::home_dir().expect("home");
+        let state = home.join(".kloop");
+        let read = |path: &Path| path_sensitivity(path, KloopScope::PrivateRoot);
+        let write = |path: &Path| path_sensitivity(path, KloopScope::Anywhere);
+
+        let project = Path::new("/w/proj/.kloop/rules/style.md");
+        assert_eq!(read(project), None);
+        assert_eq!(write(project), Some(Sensitivity::Secret));
+        assert_eq!(read(&state), Some(Sensitivity::Secret));
+        assert_eq!(read(&state.join("config.toml")), Some(Sensitivity::Secret));
+        assert_eq!(
+            read(&home.join(".KLOOP/config.toml")),
+            FS_FOLDS_CASE.then_some(Sensitivity::Secret)
+        );
+        // 项目 `.kloop` 下还有凭据名时照旧按凭据算。
+        assert_eq!(
+            read(Path::new("/w/proj/.kloop/rules/.env")),
+            Some(Sensitivity::Secret)
+        );
+        assert_eq!(read(&state.join("worktrees/wt/src/main.rs")), None);
+        assert_eq!(
+            read(&state.join("worktrees/../sessions/x.jsonl")),
+            Some(Sensitivity::Secret)
+        );
+
+        let glob =
+            |raw: &str| glob_spelling_sensitivity(Path::new(raw), false, KloopScope::PrivateRoot);
+        assert_eq!(
+            glob(&format!("{}/.k*/config.toml", home.display())),
+            Some(Sensitivity::Secret)
+        );
+        assert_eq!(glob("/w/proj/.k*/rules"), None);
+        assert_eq!(
+            glob_spelling_sensitivity(Path::new("/w/proj/.k*/rules"), false, KloopScope::Anywhere),
+            Some(Sensitivity::Secret)
+        );
+    }
+
+    /// 别名经规范化后落回私有状态根，仍按状态根判定。
+    #[cfg(unix)]
+    #[test]
+    fn kloop_reads_follow_aliases_into_the_private_state_root() {
+        let home = std::env::home_dir().expect("home");
+        let root = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan271-alias-").expect("fresh id"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&home, root.join("h")).unwrap();
+        let facts = PathFacts::gather(&root.join("h/.kloop/config.toml"), &root);
+        assert_eq!(
+            facts.sensitivity(KloopScope::PrivateRoot),
+            Some(Sensitivity::Secret)
+        );
+        assert_eq!(
+            glob_spelling_sensitivity(
+                &root.join("h/.k*/config.toml"),
+                false,
+                KloopScope::PrivateRoot
+            ),
+            Some(Sensitivity::Secret)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 原文扫描只认私有状态根的拼写；项目 `.kloop` 交给能定位的 argv 层。
+    #[test]
+    fn raw_scan_names_only_the_private_state_root() {
+        let home = std::env::home_dir().expect("home");
+        let home = home.display();
+        for command in [
+            "cat ~/.kloop/config.toml".to_string(),
+            "cat $HOME/.kloop/config.toml".into(),
+            "cat ${HOME}/.kloop/config.toml".into(),
+            format!("python3 -c 'open(\"{home}/.kloop/config.toml\")'"),
+        ] {
+            assert!(raw_mentions_sensitive_path(&command), "{command}");
+        }
+        for command in [
+            "cat /w/proj/.kloop/rules/style.md",
+            "cat ./.kloop/skills/x/SKILL.md",
+            "grep -rn x /w/proj/.kloop",
+        ] {
+            assert!(!raw_mentions_sensitive_path(command), "{command}");
+        }
+    }
+
+    /// 递归根里有项目 `.kloop/` 不算；根把私有状态根包在里面才算。
+    #[test]
+    fn recursive_roots_judge_kloop_by_location() {
+        let root = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan271-recursive-").expect("fresh id"));
+        std::fs::create_dir_all(root.join(".kloop/worktrees")).unwrap();
+        let project = ["grep", "-rn", "KEY", "."].map(str::to_string);
+        assert!(!recursive_search_covers_sensitive_path(&project, &root));
+        let home = std::env::home_dir().expect("home");
+        let above_home = [
+            "grep".to_string(),
+            "-rn".into(),
+            "KEY".into(),
+            home.parent()
+                .expect("home has a parent")
+                .display()
+                .to_string(),
+        ];
+        assert!(recursive_search_covers_sensitive_path(&above_home, &root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 名单只有一份：同一组名字在文本扫描、路径判定、递归搜索与沙箱凭据根里
     /// 给出相同答案。递归搜索漏掉 `.env*` 就是名单分家的结果。
     #[test]
     fn sensitive_names_agree_across_every_caller() {
+        let scopes = [KloopScope::Anywhere, KloopScope::PrivateRoot];
         for name in sensitive::SECRET_DIRS {
-            assert!(
-                path_sensitivity(&Path::new("/w/proj").join(name).join("x")).is_some(),
-                "{name}"
-            );
+            for scope in scopes {
+                assert!(
+                    path_sensitivity(&Path::new("/w/proj").join(name).join("x"), scope).is_some(),
+                    "{name}"
+                );
+            }
             assert!(mentions_sensitive_needle(&format!("~/{name}")), "{name}");
             assert!(
                 powershell_mentions_sensitive_path(&format!(r"C:\Users\u\{name}")),
@@ -1031,18 +1271,17 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&root);
         }
-        for name in sensitive::HOME_CREDENTIAL_DIRS {
-            assert!(sensitive::dir_name_is_secret(name), "{name}");
-        }
         for name in sensitive::SECRET_FILES
             .iter()
             .copied()
             .chain([sensitive::ENV_PREFIX])
         {
-            assert!(
-                path_sensitivity(&Path::new("/w/proj").join(name)).is_some(),
-                "{name}"
-            );
+            for scope in scopes {
+                assert!(
+                    path_sensitivity(&Path::new("/w/proj").join(name), scope).is_some(),
+                    "{name}"
+                );
+            }
         }
         let root = std::env::temp_dir()
             .join(crate::resource_id::fresh("kloop-plan243-env-").expect("fresh id"));
@@ -1065,14 +1304,17 @@ mod tests {
     #[test]
     fn glob_spellings_are_screened_without_touching_the_filesystem() {
         let cwd = Path::new("/w/proj");
-        assert!(path_argument_is_sensitive(".en?", cwd, false));
-        assert!(path_argument_is_sensitive("./.gi?/config", cwd, false));
-        assert!(path_argument_is_sensitive("~/.s*/id_rsa", cwd, false));
-        assert!(!path_argument_is_sensitive(".c*", cwd, false));
-        assert!(!path_argument_is_sensitive("*.env", cwd, false));
+        let read = |raw: &str| {
+            path_argument_is_sensitive(raw, cwd, false, Access::Read { cwd_unknown: false })
+        };
+        assert!(read(".en?"));
+        assert!(read("./.gi?/config"));
+        assert!(read("~/.s*/id_rsa"));
+        assert!(!read(".c*"));
+        assert!(!read("*.env"));
         // 长度与字符类都要与 `.env*` 真正有交集，不能只看字面前缀。
-        assert!(!path_argument_is_sensitive(".??", cwd, false));
-        assert!(!path_argument_is_sensitive(".e[ab]*", cwd, false));
+        assert!(!read(".??"));
+        assert!(!read(".e[ab]*"));
     }
 
     /// 指定了普通文件就只读那个文件；不能因为“根里没有目录”退回 cwd。
@@ -1164,7 +1406,7 @@ mod tests {
 
     #[test]
     fn sensitive_path_folds_case_on_case_insensitive_fs() {
-        let s = |p: &str| path_sensitivity(Path::new(p)).is_some();
+        let s = |p: &str| path_sensitivity(Path::new(p), KloopScope::Anywhere).is_some();
         // A cased alias resolves to the real `.git`/`.ssh`/`.env*` on a
         // case-folding FS, so it must be caught there; on a case-sensitive FS
         // those are genuinely distinct paths and stay non-sensitive.
