@@ -131,4 +131,4 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 
 验证：三条 gate 回归先在 `f980eac` 上红、修后转绿；单测补 `pattern_files_are_not_search_roots`、
 `home_spelling_keeps_quoted_apostrophes` 与否定类/花括号的 glob 断言。外层执行沙箱之外
-`make check` 全绿（fmt、clippy、workspace 2101 通过、本机 parity）。
+`make check` 全绿（fmt、clippy、workspace 2101 通过、本机 parity）。提交 `8820fb3`。
