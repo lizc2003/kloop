@@ -84,7 +84,7 @@
 （`cd ~ && grep -rn token .` 查的是会话 cwd 而不是 home），属于 plan 243 之前就有的定位缺口；
 本次只在 `.kloop` 上对“cwd 未知的相对拼写”退回按名字，没有改递归根的定位。
 
-## 审查后改：按第一层条目判（同日）
+## 审查后改：按第一层条目判（同日，提交 `855a9b8`）
 
 审查指出首版在读取侧留下同类绕过：位置判要求拼写能词法解析成 `<home>/.kloop`，原文
 扫描又撤掉了 `/.kloop/` 这条按名字的退路，两边都认不出的拼写就能读出凭据（Linux、
@@ -130,8 +130,8 @@ needle；`Access { Read, Write }` 只决定 `.kloop` 条目的口径，由 `kloo
   全部硬拒，同样先红；写入询问照旧。✅
 - facts 单测：第一层条目的读写口径、目录本身、glob、嵌套与 `..`、大小写；原文扫描只中和
   可读条目；递归根看 `.kloop` 实际条目。sensitive 单测：可读名单。✅
-- 外层执行沙箱之外 `make check`；DESIGN 改写 `.kloop` 一段、递归搜索、文件写入、grep/glob
-  过滤与 `--mock` 存储。✅
+- 外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2123 项通过、本机 parity）；
+  DESIGN 改写 `.kloop` 一段、递归搜索、文件写入、grep/glob 过滤与 `--mock` 存储。✅
 
 已知未改：递归根在 `cd` 之后仍按会话 cwd 解析（plan 243 之前就有）。按第一层条目判后，
 `cd ~ && grep -rn token .` 在会话 cwd 只有可读 `.kloop` 时会放行——与会话 cwd 没有 `.kloop`
