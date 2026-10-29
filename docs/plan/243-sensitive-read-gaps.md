@@ -75,7 +75,7 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 - 外层执行沙箱之外 `make check`;DESIGN 改写敏感路径一节(先读那段现在还成不成立);
   HANDOFF 记进展与教训。 ✅
 
-## 完成记录（2026-10-29）
+## 完成记录（2026-10-29，提交 `a624892`）
 
 - 新增 `permissions/sensitive.rs`(名单、大小写折叠、glob 拼写查询)与
   `permissions/plan243_tests.rs`(四条 gate 回归，先在旧代码上确认全红)。
