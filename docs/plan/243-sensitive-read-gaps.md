@@ -178,4 +178,24 @@ home 内文件，变量名也没有真正的边界。这轮改掉事实模型，
 
 验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2110 项通过，
 另有两次子进程回归通过，本机 parity）。真实 Bash 参数对照与实际工具派发回归通过。
-Linux 与 Windows 未实测。提交：本节所在提交（`fix(plan243): preserve shell words and unknown write effects`）。
+Linux 与 Windows 未实测。提交：`a676ec4`。
+
+## 结构修复审查后补 ✅：包装器的环境效果（2026-10-29）
+
+- 用户复现 `env HOME=/w/proj bash -c 'printf x > "$HOME/locked.txt"'` 可绕过窄路径
+  `bash_write(/w/proj/locked.txt)` deny。赋值是普通参数，AST 不会报告为
+  `variable_assignment`；旧剥离器丢掉赋值时也丢掉了其环境效果。
+- 包装器分析改为统一返回 argv、环境/cwd 不确定性与完整性，原 deny/危险前缀接口复用
+  该结果。内层脚本继承包装器带来的不确定性，不在 `changes_environment` 另抄列表。
+- 同处处理 `env -u`/`--unset`、`-i`/`--ignore-environment` 与 sudo 环境重置、选项操作数，
+  `timeout` 等链条累积效果。未知选项/动态参数保留未知写效果；近似剥离仅用于风险前缀，
+  不能生成静态路径事实。改变根目录的 `sudo -R` 也保留为未建模，不能仅标记 cwd 未知。
+  环境效果只传内层，不污染外层重定向或后续命令。
+- 窄路径 deny/ask 回归在修前先红，修后转绿；覆盖赋值、移除/清空环境、sudo、timeout、
+  动态/未知选项与父环境隔离。另补包装器结构断言，并扩展真实工具派发回归，验证
+  `/usr/bin/env` 修改 HOME 后的目标仍被 deny 阻断。
+
+验证：修前原始绕过回归先红；修后包装器定向测试 16 项通过。最终代码在外层执行沙箱
+之外 `make check` 全绿（fmt、clippy、workspace 2112 项通过，另有两次子进程回归通过，
+本机 parity）。Linux 与 Windows 未实测。
+提交：本节所在提交（`fix(plan243): retain wrapper environment effects in shell facts`）。

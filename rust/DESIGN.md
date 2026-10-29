@@ -1125,9 +1125,14 @@ heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记�
 只读分类器同时检查命令选项：`find -delete`、`rg --pre`、`git -C` / `--git-dir` /
 `log --output`、`base64 -o` 与超出 `sed -n Np` 查询形式的调用都不算只读。
 独立的危险分类器在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
-Wrappers (`sudo`, `env`, `timeout`, `nice`,
-`xargs`) are stripped before deny/danger matching so they can't smuggle a
-command past a rule. That classifier is a blocklist, so what it holds is chosen
+包装器（`sudo`、`env`、`timeout`、`nice`、`xargs` 等）的统一分析同时返回剥离后的
+argv、环境/cwd 不确定性与分析是否完整。deny/危险前缀保留近似剥离；嵌套脚本的路径求值
+只消费完整分析。`env` 的赋值、`-u`/`--unset`、`-i`/`--ignore-environment` 以及 sudo 的
+环境重置都会使内层 home 未知；带操作数的选项按包装器语法消费，嵌套链累积这些效果。
+未知选项或动态包装器参数保留未知写效果，不能因剥离停在操作数上就假装没有写入。
+这些环境修改只作用于被启动的命令，外层重定向与后续兄弟命令仍使用父环境。
+规则匹配和上下文采集共用这份包装器知识，权限层不另列一份环境修改名单。
+The danger classifier is a blocklist, so what it holds is chosen
 by one rule rather than by how alarming a command looks: **the damage is
 irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
 `shred`, and any of them behind `sudo`. `git clean -fdx` and `git reset --hard`

@@ -491,3 +491,85 @@ async fn plan243_parse_limits_do_not_erase_unknown_write_effects() {
         .expect_err("unknown effects");
     assert!(error.contains("deny permission rule"), "{error}");
 }
+
+#[tokio::test]
+async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective() {
+    use crate::sandbox::ExecutionContext;
+
+    let inner = "bash -c 'printf x > \"$HOME/locked.txt\"'";
+    for command in [
+        "env HOME=/w/proj",
+        "env -- HOME=/w/proj",
+        "env -i HOME=/w/proj",
+        "env --ignore-environment HOME=/w/proj",
+        "env -u HOME HOME=/w/proj",
+        "env -uHOME HOME=/w/proj",
+        "env --unset=HOME HOME=/w/proj",
+        "sudo env HOME=/w/proj",
+        "sudo -E env HOME=/w/proj",
+        "sudo -u root env HOME=/w/proj",
+        "timeout 5 env HOME=/w/proj",
+        "timeout -s TERM 5 env HOME=/w/proj",
+        "nice -n -10 env HOME=/w/proj",
+        "env HOME=\"$DIR\"",
+        "env --unsupported value",
+        "timeout --unsupported value 5 env HOME=/w/proj",
+    ]
+    .into_iter()
+    .map(|wrapper| format!("{wrapper} {inner}"))
+    .chain(["sudo -R /w/proj bash -c 'printf x > /locked.txt'".into()])
+    {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(/w/proj/locked.txt)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call_with_execution(
+                "bash",
+                &bash(&command),
+                0,
+                ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
+            )
+            .await
+            .expect_err(&command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(
+            Mode::Manual,
+            rules(&[], &[], &["bash_write(/w/proj/locked.txt)"]),
+            approver.clone(),
+        );
+        p.check_call_with_execution(
+            "bash",
+            &bash(&command),
+            0,
+            ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(approver.ask_count(), 1, "{command}");
+    }
+
+    // env 只改子进程：外层重定向与后续兄弟命令仍使用原 HOME。
+    for command in [
+        format!("env {inner}"),
+        "env HOME=/w/proj printf x > \"$HOME/locked.txt\"".into(),
+        "env HOME=/w/proj true; printf x > \"$HOME/locked.txt\"".into(),
+    ] {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(/w/proj/locked.txt)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        p.check_call_with_execution(
+            "bash",
+            &bash(&command),
+            0,
+            ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{command}: {error}"));
+    }
+}

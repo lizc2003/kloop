@@ -976,6 +976,8 @@ mod tests {
         let root = std::env::temp_dir().join(crate::resource_id::fresh("kloop-word-env-").unwrap());
         std::fs::create_dir_all(&root).unwrap();
         let home = root.to_str().unwrap();
+        let wrapped_home = root.join("wrapped");
+        std::fs::create_dir_all(&wrapped_home).unwrap();
         let ctx = test_ctx_with_cfg(
             0,
             TestConfig::new("word-env")
@@ -989,7 +991,10 @@ mod tests {
                 Mode::Bypass,
                 &PermissionRules {
                     allow: Vec::new(),
-                    deny: vec![format!("bash_write({home}/locked.txt)")],
+                    deny: vec![
+                        format!("bash_write({home}/locked.txt)"),
+                        format!("bash_write({}/locked.txt)", wrapped_home.display()),
+                    ],
                     ask: Vec::new(),
                 },
                 root.clone(),
@@ -1005,6 +1010,19 @@ mod tests {
             run_tool("bash", bash_input("printf x > \"$HOME/locked.txt\""), &ctx).await;
         assert!(is_error && out.contains("deny permission rule"), "{out}");
         assert!(!root.join("locked.txt").exists());
+
+        for options in ["", "-u HOME "] {
+            let command = format!(
+                "/usr/bin/env {options}HOME={} /bin/bash -c 'printf x > \"$HOME/locked.txt\"'",
+                wrapped_home.display()
+            );
+            let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+            assert!(
+                is_error && out.contains("deny permission rule"),
+                "{command}: {out}"
+            );
+            assert!(!wrapped_home.join("locked.txt").exists());
+        }
 
         let (out, is_error) =
             run_tool("bash", bash_input("printf x > \"$HOME/other.txt\""), &ctx).await;

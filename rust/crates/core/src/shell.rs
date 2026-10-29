@@ -628,41 +628,242 @@ pub fn argv_is_dangerous(argv: &[String]) -> bool {
     }
 }
 
-/// Strip wrapper prefixes (`sudo`, `env FOO=x`, `timeout 5`, `nice -n 10`,
-/// `nohup`, `time`, `xargs`) so DENY rules match the wrapped command.
-/// Only used for deny matching and the danger check — allow/read-only
-/// verdicts never strip, erring conservative.
-pub fn strip_wrappers(argv: &[String]) -> Vec<String> {
-    let mut rest: &[String] = argv;
-    loop {
-        let Some(first) = rest.first() else {
-            return rest.to_vec();
-        };
-        match executable_name(first) {
-            "sudo" | "env" | "nohup" | "nice" | "time" | "timeout" | "xargs" => {
-                rest = &rest[1..];
-                // Drop the wrapper's own leading options / assignments /
-                // durations, e.g. `env FOO=1`, `timeout 5s`, `nice -n 10`.
-                while let Some(tok) = rest.first() {
-                    let is_assignment = tok.split_once('=').is_some_and(|(name, _)| {
-                        !name.is_empty()
-                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    });
-                    let is_duration = !tok.is_empty()
-                        && tok.chars().all(|c| {
-                            c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd')
-                        })
-                        && tok.chars().any(|c| c.is_ascii_digit());
-                    if tok.starts_with('-') || is_assignment || is_duration {
-                        rest = &rest[1..];
-                    } else {
-                        break;
-                    }
-                }
+/// 包装器剥离与执行上下文共用一份分析；未知选项不能被猜成无操作数开关。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WrapperAnalysis<'a> {
+    pub argv: &'a [String],
+    pub complete: bool,
+    pub environment_unknown: bool,
+    pub cwd_unknown: bool,
+}
+
+pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
+    let mut analysis = WrapperAnalysis {
+        argv,
+        complete: true,
+        environment_unknown: false,
+        cwd_unknown: false,
+    };
+    let mut rest = argv;
+    while let Some(first) = rest.first() {
+        let wrapper = executable_name(first);
+        let next = match wrapper {
+            "env" => env_command(&rest[1..], &mut analysis),
+            "sudo" => sudo_command(&rest[1..], &mut analysis),
+            "nohup" | "nice" | "time" | "timeout" | "xargs" => {
+                transparent_wrapper_command(wrapper, &rest[1..])
             }
-            _ => return rest.to_vec(),
+            _ => break,
+        };
+        rest = match next {
+            Some(next) => next,
+            None => {
+                analysis.complete = false;
+                // 保留原有 deny/危险前缀的近似剥离；事实层不能把它当成完整命令。
+                risk_wrapper_command(&rest[1..], &mut analysis)
+            }
+        };
+    }
+    analysis.argv = rest;
+    analysis
+}
+
+fn transparent_wrapper_command<'a>(wrapper: &str, mut rest: &'a [String]) -> Option<&'a [String]> {
+    while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
+        let token = token.as_str();
+        if token == "--" {
+            rest = &rest[1..];
+            break;
+        }
+        let takes_value = match wrapper {
+            "nice" => matches!(token, "-n" | "--adjustment"),
+            "timeout" => matches!(token, "-s" | "--signal" | "-k" | "--kill-after"),
+            _ => false,
+        };
+        let attached = match wrapper {
+            "nice" => {
+                token.starts_with("--adjustment=")
+                    || (token.starts_with("-n") && token.len() > 2)
+                    || token[1..].chars().all(|ch| ch.is_ascii_digit())
+            }
+            "timeout" => {
+                token.starts_with("--signal=")
+                    || token.starts_with("--kill-after=")
+                    || (token.len() > 2 && (token.starts_with("-s") || token.starts_with("-k")))
+            }
+            _ => false,
+        };
+        let no_value = match wrapper {
+            "time" => token == "-p",
+            "timeout" => matches!(
+                token,
+                "--foreground" | "--preserve-status" | "-v" | "--verbose"
+            ),
+            _ => false,
+        };
+        if takes_value {
+            rest = rest.get(1..)?;
+            rest.first()?;
+        } else if !attached && !no_value {
+            return None;
+        }
+        rest = &rest[1..];
+    }
+    if wrapper == "timeout" {
+        let duration = rest.first()?;
+        if !duration
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd'))
+            || !duration.chars().any(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+        rest = &rest[1..];
+    }
+    Some(rest)
+}
+
+fn risk_wrapper_command<'a>(
+    mut rest: &'a [String],
+    analysis: &mut WrapperAnalysis<'_>,
+) -> &'a [String] {
+    while let Some(tok) = rest.first() {
+        let is_duration = !tok.is_empty()
+            && tok
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd'))
+            && tok.chars().any(|c| c.is_ascii_digit());
+        if tok.starts_with('-') || environment_assignment(tok) || is_duration {
+            analysis.environment_unknown |= environment_assignment(tok);
+            rest = &rest[1..];
+        } else {
+            break;
         }
     }
+    rest
+}
+
+fn environment_assignment(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(name, _)| !name.is_empty())
+}
+
+fn env_command<'a>(
+    mut rest: &'a [String],
+    analysis: &mut WrapperAnalysis<'_>,
+) -> Option<&'a [String]> {
+    while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
+        let token = token.as_str();
+        match token {
+            "--" => {
+                rest = &rest[1..];
+                break;
+            }
+            "-" | "-i" | "--ignore-environment" => analysis.environment_unknown = true,
+            "-u" | "--unset" | "-C" | "--chdir" => {
+                analysis.environment_unknown = true;
+                analysis.cwd_unknown |= matches!(token, "-C" | "--chdir");
+                rest = rest.get(1..)?;
+                rest.first()?;
+            }
+            _ if token.starts_with("--unset=") || (token.starts_with("-u") && token.len() > 2) => {
+                analysis.environment_unknown = true;
+            }
+            _ if token.starts_with("--chdir=") || (token.starts_with("-C") && token.len() > 2) => {
+                analysis.environment_unknown = true;
+                analysis.cwd_unknown = true;
+            }
+            _ => return None,
+        }
+        rest = &rest[1..];
+    }
+    while rest
+        .first()
+        .is_some_and(|token| environment_assignment(token))
+    {
+        analysis.environment_unknown = true;
+        rest = &rest[1..];
+    }
+    Some(rest)
+}
+
+fn sudo_command<'a>(
+    mut rest: &'a [String],
+    analysis: &mut WrapperAnalysis<'_>,
+) -> Option<&'a [String]> {
+    // sudo 的环境重置由系统策略决定，连不带 -E/-H 的形式也不能沿用父 HOME。
+    analysis.environment_unknown = true;
+    const VALUE_OPTIONS: &[&str] = &[
+        "-u",
+        "--user",
+        "-g",
+        "--group",
+        "-h",
+        "--host",
+        "-p",
+        "--prompt",
+        "-C",
+        "--close-from",
+        "-T",
+        "--command-timeout",
+        "-D",
+        "--chdir",
+        "-r",
+        "--role",
+        "-t",
+        "--type",
+    ];
+    while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
+        let token = token.as_str();
+        let option = token.split_once('=').map_or(token, |(name, _)| name);
+        if token == "--" {
+            rest = &rest[1..];
+            break;
+        }
+        if VALUE_OPTIONS.contains(&option) {
+            analysis.cwd_unknown |= matches!(option, "-D" | "--chdir");
+            if !token.contains('=') {
+                rest = rest.get(1..)?;
+                rest.first()?;
+            }
+        } else if let Some(option) = VALUE_OPTIONS
+            .iter()
+            .find(|option| option.len() == 2 && token.starts_with(**option) && token.len() > 2)
+        {
+            analysis.cwd_unknown |= *option == "-D";
+        } else if matches!(token, "-i" | "--login" | "-s" | "--shell") {
+            analysis.cwd_unknown = true;
+        } else if !matches!(
+            option,
+            "--preserve-env"
+                | "--set-home"
+                | "--non-interactive"
+                | "--stdin"
+                | "--background"
+                | "--reset-timestamp"
+                | "--remove-timestamp"
+        ) && !(token.starts_with('-')
+            && !token.starts_with("--")
+            && token.len() > 1
+            && token[1..].chars().all(|ch| "nEHkKSb".contains(ch)))
+        {
+            return None;
+        }
+        rest = &rest[1..];
+    }
+    while rest
+        .first()
+        .is_some_and(|token| environment_assignment(token))
+    {
+        rest = &rest[1..];
+    }
+    Some(rest)
+}
+
+/// 仅供 deny/危险判断；allow 与只读判定不消费剥离后的命令。
+pub fn strip_wrappers(argv: &[String]) -> Vec<String> {
+    analyze_wrappers(argv).argv.to_vec()
 }
 
 /// Find the git subcommand while skipping global options, and refuse the
@@ -1107,6 +1308,11 @@ mod tests {
         let cases: &[(&[&str], &[&str])] = &[
             (&["sudo", "rm", "-rf", "x"], &["rm", "-rf", "x"]),
             (&["env", "FOO=1", "BAR=2", "rm", "x"], &["rm", "x"]),
+            (&["env", "-u", "HOME", "rm", "x"], &["rm", "x"]),
+            (
+                &["sudo", "-u", "root", "env", "-i", "rm", "x"],
+                &["rm", "x"],
+            ),
             (&["timeout", "5s", "make", "clean"], &["make", "clean"]),
             (&["nice", "-n", "10", "git", "push"], &["git", "push"]),
             (&["xargs", "rm"], &["rm"]),
@@ -1114,6 +1320,63 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(strip_wrappers(&argv(input)), argv(expected), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn wrapper_analysis_keeps_environment_effects() {
+        let prefixes: &[&[&str]] = &[
+            &["env", "HOME=/tmp"],
+            &["env", "-u", "HOME"],
+            &["env", "-uHOME"],
+            &["env", "--unset=HOME"],
+            &["env", "-i"],
+            &["sudo"],
+            &["sudo", "-E"],
+            &["sudo", "--preserve-env=HOME"],
+            &["sudo", "-u", "root", "env", "HOME=/tmp"],
+            &["timeout", "5", "/usr/bin/env", "HOME=/tmp"],
+        ];
+        for prefix in prefixes {
+            let mut input = argv(prefix);
+            input.extend(argv(&["bash", "-c", "printf x"]));
+            assert_eq!(
+                analyze_wrappers(&input),
+                WrapperAnalysis {
+                    argv: &input[prefix.len()..],
+                    complete: true,
+                    environment_unknown: true,
+                    cwd_unknown: false,
+                },
+                "{prefix:?}"
+            );
+        }
+        let input = argv(&["env", "bash", "-c", "printf x"]);
+        assert_eq!(
+            analyze_wrappers(&input),
+            WrapperAnalysis {
+                argv: &input[1..],
+                complete: true,
+                environment_unknown: false,
+                cwd_unknown: false,
+            }
+        );
+        let input = argv(&["env", "-C", "/tmp", "bash", "-c", "printf x"]);
+        assert_eq!(
+            analyze_wrappers(&input),
+            WrapperAnalysis {
+                argv: &input[3..],
+                complete: true,
+                environment_unknown: true,
+                cwd_unknown: true,
+            }
+        );
+        for input in [
+            argv(&["env", "-u"]),
+            argv(&["sudo", "-u"]),
+            argv(&["env", "-S", "bash -c x"]),
+        ] {
+            assert!(!analyze_wrappers(&input).complete, "{input:?}");
         }
     }
 }
