@@ -1047,13 +1047,16 @@ needle 仍优先，但对边界明确、带引用分隔符的 `cat` heredoc 写�
 拦，长度不够的 `.??`、字符类排除 `n` 的 `.e[ab]*`、拼不出名字的 `.c*`，以及 shell 的
 glob 本就不匹配点开头名字的 `*.env` 照旧放行；交集按模式自动机吃前缀判定，不再只看
 字面前缀。字符类按 glob 语义解析（否定类 `[!]]` 的第一个 `]` 是成员），花括号/转义这类
-未建模语法仍保留字面前缀的排除判断（`.c{ache,onfig}` 放行）。读取侧与写入侧共用这套
-复核：`cat < .en?` 和 `cat .en?` 一样被拦；`echo`/`printf` 的参数即使含动态词
-（`echo "$PWD/.env"`）仍是文本。固定输出目标里的 `~/…`、`$HOME/…`、`${HOME}/…` 按 shell
-的展开与引用状态还原落点（单引号内不展开、双引号里的 `'` 是文件名的一部分：
-`~/".bashrc"` 是 `~/.bashrc`，`"$HOME/O'Brien.txt"` 是 `O'Brien.txt`），再参与敏感、
-设备与 deny 判断（因此能命中 `bash_write(**/.bashrc)`）；其余动态目标（`"$DIR/x"`、
-glob）定不下落点，至少按最后一段名字过一遍名单。
+未建模语法仍保留字面前缀的排除判断（`.c{ache,onfig}` 放行）。引用不会让模式变成字面量：
+还原后的拼写仍按 glob 判定（`cat ".en?"` 也拦），宁可多拦一次也不放过拼写上的交集。
+读取侧与写入侧共用这套复核：`cat < .en?` 和 `cat .en?` 一样被拦；`echo`/`printf` 的参数
+即使含动态词（`echo "$PWD/.env"`）仍是文本。固定输出目标里的 `~/…`、`$HOME/…`、
+`${HOME}/…` 按 shell 的展开与引用状态还原落点：前缀与后缀的引用各自独立（`$HOME` 没被
+引用就展开，后缀的引号只让后缀成为字面量，`$HOME/'.bashrc'` 是 `~/.bashrc`）；单引号内
+不展开、双引号里的 `'` 是文件名的一部分（`~/".bashrc"` 是 `~/.bashrc`，
+`"$HOME/O'Brien.txt"` 是 `O'Brien.txt`）。这些落点再参与敏感、设备与 deny 判断（因此
+能命中 `bash_write(**/.bashrc)`）；其余动态目标（`"$DIR/x"`、glob）定不下落点，至少按
+最后一段名字过一遍名单。
 `/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty` 是纯流设备，不当作敏感目标。
 
 The macOS sandbox denies model-shell reads and writes across the private `~/.kloop`

@@ -300,3 +300,32 @@ async fn plan243_apostrophe_inside_double_quotes_stays_in_the_name() {
         .expect_err(command);
     assert!(error.contains("deny permission rule"), "{command}: {error}");
 }
+
+#[tokio::test]
+async fn plan243_home_prefix_quoting_is_independent_of_the_suffix() {
+    // `$HOME` 没有引用，后缀的单引号只对后缀生效：落点仍是 `~/.bashrc`。
+    for command in ["echo x >> $HOME/'.bashrc'", "echo x >> $HOME/\".zshrc\""] {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(command), 0, false)
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        assert_eq!(approver.ask_count(), 1, "{command}");
+        assert_eq!(
+            approver.asked()[0].notice.as_deref(),
+            Some("sensitive redirect path"),
+            "{command}"
+        );
+    }
+
+    let p = gate(
+        Mode::Bypass,
+        rules(&[], &["bash_write(**/.bashrc)"], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    let error = p
+        .check_call("bash", &bash("echo x >> $HOME/'.bashrc'"), 0, true)
+        .await
+        .expect_err("quoted suffix");
+    assert!(error.contains("deny permission rule"), "{error}");
+}

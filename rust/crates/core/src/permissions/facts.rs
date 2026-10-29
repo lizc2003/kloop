@@ -342,7 +342,9 @@ fn bash_reads_sensitive_path(
                     WordValue::Literal(value) => path_argument_is_sensitive(value, cwd, false),
                     // glob、`~`、`$HOME` 这类展开拼写落进 Unknown，原文仍可复核
                     // （`cat .en?`、`cat ~/.s*/id_rsa`）。
-                    WordValue::Unknown => path_argument_is_sensitive(&word.raw, cwd, false),
+                    WordValue::Unknown => {
+                        path_argument_is_sensitive(&decoded_spelling(&word.raw), cwd, false)
+                    }
                 })
             {
                 return ReadVerdict::Sensitive;
@@ -355,10 +357,9 @@ fn bash_reads_sensitive_path(
             let sensitive = match &redirect.target {
                 WordValue::Literal(path) => path_argument_is_sensitive(path, cwd, false),
                 // 输入重定向同样可能是 glob 拼写：`cat < .en?`。
-                WordValue::Unknown => redirect
-                    .raw_target
-                    .as_deref()
-                    .is_some_and(|raw| path_argument_is_sensitive(unquote(raw), cwd, false)),
+                WordValue::Unknown => redirect.raw_target.as_deref().is_some_and(|raw| {
+                    path_argument_is_sensitive(&decoded_spelling(raw), cwd, false)
+                }),
             };
             if sensitive {
                 return ReadVerdict::Sensitive;
@@ -598,43 +599,52 @@ fn powershell_mentions_sensitive_path(command: &str) -> bool {
 }
 
 /// shell 会展开的路径拼写：`~`、`~/…`、`$HOME/…`、`${HOME}/…`，引号按 shell 的
-/// 规则参与拼接。展开结果与 cwd 无关；单引号里的内容、夹着别的展开或 glob 的
-/// 拼写返回 `None`，不猜。
+/// 规则参与拼接。展开结果与 cwd 无关；夹着别的展开或 glob 的拼写返回 `None`，不猜。
 fn expand_home_spelling(raw: &str) -> Option<PathBuf> {
     let raw = raw.trim();
-    // 整条包在单引号里时既不展开 `~` 也不展开 `$HOME`。
-    if raw.is_empty() || raw.starts_with('\'') {
-        return None;
-    }
-    let tilde_expands = raw.starts_with('~');
-    let (text, saw_single_quote) = shell_unquote(raw)?;
+    let (suffix, quote) = split_home_prefix(raw)?;
     let home = std::env::home_dir()?;
-    if tilde_expands && text == "~" {
-        return Some(home);
-    }
-    if !saw_single_quote && (text == "$HOME" || text == "${HOME}") {
-        return Some(home);
-    }
-    let rest = if tilde_expands && let Some(rest) = text.strip_prefix("~/") {
-        rest
-    } else if !saw_single_quote {
-        text.strip_prefix("$HOME/")
-            .or_else(|| text.strip_prefix("${HOME}/"))?
-    } else {
-        return None;
-    };
-    (!rest.is_empty() && !rest.contains(['\\', '$', '`', '*', '?', '[', ']', '{', '}']))
-        .then(|| home.join(rest))
+    // 后缀独立解码：`$HOME/'.bashrc'` 的单引号只让后缀成为字面量。
+    let suffix = shell_unquote(suffix, quote)?;
+    let suffix = suffix.trim_start_matches('/');
+    (!suffix.contains(['\\', '$', '`', '*', '?', '[', ']', '{', '}'])).then(|| home.join(suffix))
 }
 
-/// 按 shell 的引用状态去掉引号与反斜杠转义，返回（字面量, 是否出现过单引号段）。
-/// 单引号内的字符全是字面量；双引号内只有 `"`、`\`、`$`、反引号能被反斜杠转义。
-/// `O'Brien.txt` 在双引号里是普通文件名，未闭合的引用返回 `None`。
-fn shell_unquote(raw: &str) -> Option<(String, bool)> {
+/// 从拼写开头消费 `~/`、`$HOME/`、`${HOME}/`，返回（剩余拼写, 剩余部分所处的
+/// 引用状态）。`~` 只在未引用、且紧接 `/` 或结尾时展开；`$HOME` 在双引号里仍
+/// 展开、单引号里不展开。整条包在双引号里时，剩余部分继续留在双引号状态。
+fn split_home_prefix(raw: &str) -> Option<(&str, Option<char>)> {
+    if raw == "~" {
+        return Some(("", None));
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        return Some((suffix, None));
+    }
+    if raw == "$HOME" || raw == "${HOME}" {
+        return Some(("", None));
+    }
+    if let Some(suffix) = raw
+        .strip_prefix("$HOME/")
+        .or_else(|| raw.strip_prefix("${HOME}/"))
+    {
+        return Some((suffix, None));
+    }
+    // 整条目标包在双引号里：`"$HOME/O'Brien.txt"`。`"~/…"` 里的 `~` 不展开。
+    let inner = raw.strip_prefix('"')?;
+    let suffix = inner
+        .strip_prefix("$HOME")
+        .or_else(|| inner.strip_prefix("${HOME}"))?;
+    Some((suffix, Some('"')))
+}
+
+/// 按 shell 的引用状态去掉引号与反斜杠转义。`quote` 是拼写开头所处的引用：
+/// 单引号内的字符全是字面量；双引号内只有 `"`、`\\`、`$`、反引号能被反斜杠转义。
+/// `O'Brien.txt` 在双引号里是普通文件名。未闭合的引用返回 `None`——那不是一条
+/// 能落地的路径。
+fn shell_unquote(raw: &str, quote: Option<char>) -> Option<String> {
     let mut out = String::new();
     let mut chars = raw.chars();
-    let mut quote: Option<char> = None;
-    let mut saw_single_quote = false;
+    let mut quote = quote;
     while let Some(ch) = chars.next() {
         match quote {
             Some('\'') => {
@@ -659,17 +669,19 @@ fn shell_unquote(raw: &str) -> Option<(String, bool)> {
             }
             Some(_) => return None,
             None => match ch {
-                '\'' => {
-                    saw_single_quote = true;
-                    quote = Some(ch);
-                }
-                '"' => quote = Some(ch),
+                '"' | '\'' => quote = Some(ch),
                 '\\' => out.push(chars.next()?),
                 _ => out.push(ch),
             },
         }
     }
-    quote.is_none().then_some((out, saw_single_quote))
+    quote.is_none().then_some(out)
+}
+
+/// 动态拼写的名字复核用：能按 shell 规则还原就还原，还原不了退回原文。
+fn decoded_spelling(raw: &str) -> String {
+    let raw = raw.trim();
+    shell_unquote(raw, None).unwrap_or_else(|| unquote(raw).to_string())
 }
 
 fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
@@ -769,7 +781,7 @@ fn write_targets(facts: &BashFacts, cwd: &Path) -> (Vec<PathFacts>, bool) {
                     // 与 cwd 无关的绝对目标：进 risk_writes，deny 规则也按它匹配。
                     Some(path) => writes.push(PathFacts::gather(&path, cwd)),
                     // 其余动态目标（`"$DIR/x"`、glob）只知道拼写：名字敏感就标记。
-                    None if path_argument_is_sensitive(unquote(raw), cwd, false) => {
+                    None if path_argument_is_sensitive(&decoded_spelling(raw), cwd, false) => {
                         unresolved_sensitive = true;
                     }
                     None => {}
@@ -1191,6 +1203,38 @@ mod tests {
         );
         // 未闭合的引用不是一条能落地的路径。
         assert_eq!(expand_home_spelling("~/O'Brien.txt"), None);
+    }
+
+    /// `$HOME` 的引用状态与后缀无关：后缀的单引号只让后缀成为字面量。
+    #[test]
+    fn home_prefix_quoting_is_independent_of_the_suffix() {
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        assert_eq!(
+            expand_home_spelling("$HOME/'.bashrc'"),
+            Some(home.join(".bashrc"))
+        );
+        assert_eq!(
+            expand_home_spelling("$HOME/\"O'Brien.txt\""),
+            Some(home.join("O'Brien.txt"))
+        );
+        assert_eq!(
+            expand_home_spelling("\"$HOME\"/.bashrc"),
+            Some(home.join(".bashrc"))
+        );
+    }
+
+    /// 动态词按 shell 规则还原后再查名字：`cat "$PWD/.env"` 仍是读取。
+    #[test]
+    fn dynamic_words_are_checked_after_unquoting() {
+        let call = CallFacts::gather(
+            "bash",
+            &serde_json::json!({ "command": "cat \"$PWD/.env\"" }),
+            Path::new("/workspace"),
+            None,
+        );
+        assert!(call.sensitive_read);
     }
 
     /// 动态纯文本参数不是读取：echo/printf 的参数角色豁免对 Unknown 词同样成立。

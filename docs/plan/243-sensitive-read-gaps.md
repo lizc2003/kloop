@@ -132,3 +132,21 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 验证：三条 gate 回归先在 `f980eac` 上红、修后转绿；单测补 `pattern_files_are_not_search_roots`、
 `home_spelling_keeps_quoted_apostrophes` 与否定类/花括号的 glob 断言。外层执行沙箱之外
 `make check` 全绿（fmt、clippy、workspace 2101 通过、本机 parity）。提交 `8820fb3`。
+
+## 审查后补（第三轮，同日）
+
+- **P1 前缀与后缀的引用状态被绑在一起**：`$HOME/'.bashrc'` 的 `$HOME` 未引用、后缀在
+  单引号里，实际写入 `~/.bashrc`；`saw_single_quote` 是整条拼写的标记，一见真就放弃
+  展开，敏感 hazard 与 `bash_write(**/.bashrc)` 双双漏掉。
+- 修法：新增 `split_home_prefix`，按引用状态从开头消费 `~/`、`$HOME/`、`${HOME}/`
+  （`~` 只在未引用时展开；`$HOME` 在双引号里仍展开；`"~/…"` 不展开），返回剩余拼写与
+  它开头的引用状态；后缀用 `shell_unquote(suffix, quote)` 独立解码，再去掉前导 `/`
+  拼到 home 上。
+- 顺带把动态词的名字复核改用 `decoded_spelling`（能按 shell 规则还原就还原）：此前
+  `cat "$PWD/.env"` 的原文带着引号，最后一段是 `.env"`，同样漏判。引用不能让 glob
+  变成字面量（`cat ".en?"` 仍拦），这条保守方向写进 DESIGN。
+
+验证：gate 回归 `plan243_home_prefix_quoting_is_independent_of_the_suffix` 先在 `8820fb3`
+上红（`$HOME/'.bashrc'` 无 notice）、修后转绿且 deny 命中；单测补
+`home_prefix_quoting_is_independent_of_the_suffix` 与 `dynamic_words_are_checked_after_unquoting`。
+外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2104 通过、本机 parity）。
