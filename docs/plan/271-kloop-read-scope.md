@@ -74,9 +74,9 @@
 - 外层执行沙箱之外 `make check`；DESIGN 改写敏感路径一节、递归搜索、文件写入、grep/glob
   过滤与 `--mock` 存储的说法。✅
 
-## 完成记录（2026-10-29）
+## 完成记录（2026-10-29，提交 `f02a6b4`）
 
-见本文件所在提交。验证：新 gate 回归在 `db9cb60` 的临时 worktree 上先红（可读性用例失败，
+验证：新 gate 回归在 `db9cb60` 的临时 worktree 上先红（可读性用例失败，
 两条保护性用例照过）；外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2124 项
 通过、本机 parity）。Linux 与 Windows 未实测。已知未改：递归根与相对读参数在 `cd` 之后仍按会话 cwd 解析
 （`cd ~ && grep -rn token .` 查的是会话 cwd 而不是 home），属于 plan 243 之前就有的定位缺口；
