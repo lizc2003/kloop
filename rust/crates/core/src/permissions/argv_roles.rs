@@ -30,6 +30,19 @@ pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<&str>> {
     }
 }
 
+/// grep/rg 实际遍历的搜索根：位置参数才是根，`-f patterns.txt` 这类选项读取
+/// 的文件不算。返回 `None` 表示语法未识别。
+pub(super) fn search_roots(argv: &[String]) -> Option<Vec<&str>> {
+    let command = argv.first()?.rsplit('/').next()?;
+    match command {
+        "grep" => walk_options(argv, &GREP, Positionals::PatternThenPaths)
+            .map(|walked| walked.positional_paths),
+        "rg" => walk_options(argv, &RG, Positionals::PatternThenPaths)
+            .map(|walked| walked.positional_paths),
+        _ => None,
+    }
+}
+
 /// 命令是否在参数角色表里。已建模命令解析失败时不能拿"元数据访问"替它担保：
 /// 角色不明，路径可能被当成模式或读取目标。
 pub(super) fn is_modeled_command(argv: &[String]) -> bool {
@@ -207,6 +220,9 @@ enum Positionals {
 
 struct Walked<'a> {
     paths: Vec<&'a str>,
+    /// 位置参数里会被遍历/打开的路径。与 `paths` 的区别是它不含选项读取的
+    /// 文件（`-f patterns.txt` 是模式来源，不是搜索根）。
+    positional_paths: Vec<&'a str>,
     /// 消费了某个选项的 Path 类操作数（会打开或写入文件）；位置参数不算。
     opens_file: bool,
     /// 实际作为选项消费的长选项名（`--name=value` 取 `name`）。
@@ -241,6 +257,7 @@ fn walk_options<'a>(
 ) -> Option<Walked<'a>> {
     let mut walked = Walked {
         paths: Vec::new(),
+        positional_paths: Vec::new(),
         opens_file: false,
         long_flags: Vec::new(),
         short_flags: Vec::new(),
@@ -257,12 +274,16 @@ fn walk_options<'a>(
         let arg = raw.as_str();
         if options_done || !arg.starts_with('-') || arg == "-" {
             match positionals {
-                Positionals::AllPaths => walked.paths.push(arg),
+                Positionals::AllPaths => {
+                    walked.paths.push(arg);
+                    walked.positional_paths.push(arg);
+                }
                 Positionals::PatternThenPaths => {
                     if first_positional.is_none() && !pattern_source {
                         first_positional = Some(arg);
                     } else {
                         walked.paths.push(arg);
+                        walked.positional_paths.push(arg);
                     }
                 }
             }
@@ -362,6 +383,7 @@ fn walk_options<'a>(
         && let Some(first) = first_positional
     {
         walked.paths.push(first);
+        walked.positional_paths.push(first);
     }
     Some(walked)
 }

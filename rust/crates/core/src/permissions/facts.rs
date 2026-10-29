@@ -597,52 +597,79 @@ fn powershell_mentions_sensitive_path(command: &str) -> bool {
         })
 }
 
-/// shell 会展开的路径拼写：`~`、`~/…`、`$HOME/…`、`${HOME}/…`，以及包着一层的
-/// 双引号（`$HOME` 在双引号里仍展开，`~` 不展开）。展开结果与 cwd 无关；拼写
-/// 里还夹着别的展开或 glob 时返回 `None`，不猜。
+/// shell 会展开的路径拼写：`~`、`~/…`、`$HOME/…`、`${HOME}/…`，引号按 shell 的
+/// 规则参与拼接。展开结果与 cwd 无关；单引号里的内容、夹着别的展开或 glob 的
+/// 拼写返回 `None`，不猜。
 fn expand_home_spelling(raw: &str) -> Option<PathBuf> {
     let raw = raw.trim();
-    let (text, tilde_expands) = if let Some(inner) = raw
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    {
-        (inner, /*tilde_expands*/ false)
-    } else if raw.starts_with('\'') {
+    // 整条包在单引号里时既不展开 `~` 也不展开 `$HOME`。
+    if raw.is_empty() || raw.starts_with('\'') {
         return None;
-    } else {
-        (raw, /*tilde_expands*/ true)
-    };
+    }
+    let tilde_expands = raw.starts_with('~');
+    let (text, saw_single_quote) = shell_unquote(raw)?;
     let home = std::env::home_dir()?;
-    if text == "$HOME" || text == "${HOME}" || (tilde_expands && text == "~") {
+    if tilde_expands && text == "~" {
         return Some(home);
     }
-    let rest = if tilde_expands {
-        text.strip_prefix("~/")
-            .or_else(|| text.strip_prefix("$HOME/"))
-            .or_else(|| text.strip_prefix("${HOME}/"))?
-    } else {
+    if !saw_single_quote && (text == "$HOME" || text == "${HOME}") {
+        return Some(home);
+    }
+    let rest = if tilde_expands && let Some(rest) = text.strip_prefix("~/") {
+        rest
+    } else if !saw_single_quote {
         text.strip_prefix("$HOME/")
             .or_else(|| text.strip_prefix("${HOME}/"))?
+    } else {
+        return None;
     };
-    // shell 在拼接时会去掉引号与反斜杠转义：`~/".bashrc"` 落到 `~/.bashrc`。
-    let rest = shell_unquote(rest)?;
     (!rest.is_empty() && !rest.contains(['\\', '$', '`', '*', '?', '[', ']', '{', '}']))
         .then(|| home.join(rest))
 }
 
-/// 去掉 shell 的引号删除与反斜杠转义。这里不做展开：`$`、反引号、glob 都在
-/// 调用方被拒，剩下的只是把拼写还原成落点。
-fn shell_unquote(raw: &str) -> Option<String> {
+/// 按 shell 的引用状态去掉引号与反斜杠转义，返回（字面量, 是否出现过单引号段）。
+/// 单引号内的字符全是字面量；双引号内只有 `"`、`\`、`$`、反引号能被反斜杠转义。
+/// `O'Brien.txt` 在双引号里是普通文件名，未闭合的引用返回 `None`。
+fn shell_unquote(raw: &str) -> Option<(String, bool)> {
     let mut out = String::new();
     let mut chars = raw.chars();
+    let mut quote: Option<char> = None;
+    let mut saw_single_quote = false;
     while let Some(ch) = chars.next() {
-        match ch {
-            '"' | '\'' => {}
-            '\\' => out.push(chars.next()?),
-            _ => out.push(ch),
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    out.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' {
+                    let escaped = chars.next()?;
+                    if !matches!(escaped, '"' | '\\' | '$' | '`') {
+                        out.push('\\');
+                    }
+                    out.push(escaped);
+                } else {
+                    out.push(ch);
+                }
+            }
+            Some(_) => return None,
+            None => match ch {
+                '\'' => {
+                    saw_single_quote = true;
+                    quote = Some(ch);
+                }
+                '"' => quote = Some(ch),
+                '\\' => out.push(chars.next()?),
+                _ => out.push(ch),
+            },
         }
     }
-    Some(out)
+    quote.is_none().then_some((out, saw_single_quote))
 }
 
 fn expand_shell_path(raw: &str, cwd: &Path) -> PathBuf {
@@ -664,7 +691,7 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
     if !argv_roles::search_is_recursive(argv) {
         return false;
     }
-    let roots: Option<Vec<PathBuf>> = argv_roles::path_arguments(argv).map(|paths| {
+    let roots: Option<Vec<PathBuf>> = argv_roles::search_roots(argv).map(|paths| {
         paths
             .iter()
             .map(|path| expand_shell_path(path, cwd))
@@ -1124,6 +1151,46 @@ mod tests {
             "no explicit path searches cwd"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 选项读取的文件（`-f patterns.txt`）不是搜索根：没有位置参数时仍搜 cwd。
+    #[test]
+    fn pattern_files_are_not_search_roots() {
+        let root = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan243-pattern-file-").expect("fresh id"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".env"), "KEY=x").unwrap();
+        std::fs::write(root.join("patterns.txt"), "KEY").unwrap();
+        std::fs::write(root.join("notes.txt"), "KEY").unwrap();
+        let pattern_only = ["rg", "-uu", "-f", "patterns.txt"].map(str::to_string);
+        assert!(
+            recursive_search_covers_sensitive_path(&pattern_only, &root),
+            "`rg -uu -f patterns.txt` still searches the cwd"
+        );
+        let explicit_file = ["rg", "-uu", "-f", "patterns.txt", "notes.txt"].map(str::to_string);
+        assert!(
+            !recursive_search_covers_sensitive_path(&explicit_file, &root),
+            "an explicit file root reads only that file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 引号删除要保留引用状态：双引号里的单引号是文件名的一部分。
+    #[test]
+    fn home_spelling_keeps_quoted_apostrophes() {
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        assert_eq!(
+            expand_home_spelling("\"$HOME/O'Brien.txt\""),
+            Some(home.join("O'Brien.txt"))
+        );
+        assert_eq!(
+            expand_home_spelling("~/.bas\"hrc\""),
+            Some(home.join(".bashrc"))
+        );
+        // 未闭合的引用不是一条能落地的路径。
+        assert_eq!(expand_home_spelling("~/O'Brien.txt"), None);
     }
 
     /// 动态纯文本参数不是读取：echo/printf 的参数角色豁免对 Unknown 词同样成立。

@@ -248,3 +248,55 @@ async fn plan243_text_arguments_are_not_sensitive_reads() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn plan243_negated_class_is_not_cut_short() {
+    let root = plan243_root("negated");
+    let root = root.display().to_string();
+    // `[!]]` 是“排除 ]”：第一个 ] 是成员，`.e[!]]v` 能拼出 `.env`。
+    let command = format!("cat {root}/.e[!]]v");
+    let p = gate(
+        Mode::Bypass,
+        rules(&[], &[], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    let error = p
+        .check_call("bash", &bash(&command), 0, true)
+        .await
+        .expect_err(&command);
+    assert!(error.contains("sensitive path"), "{command}: {error}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan243_unmodeled_braces_keep_the_prefix_exclusion() {
+    let root = plan243_root("braces");
+    let root = root.display().to_string();
+    // 花括号只能展开成 .cache/.config，拼不出任何敏感名。
+    let command = format!("ls -d {root}/.c{{ache,onfig}}");
+    let p = gate(
+        Mode::Manual,
+        rules(&[], &[], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    p.check_call("bash", &bash(&command), 0, true)
+        .await
+        .unwrap_or_else(|error| panic!("{command}: {error}"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan243_apostrophe_inside_double_quotes_stays_in_the_name() {
+    // 双引号里的单引号是文件名的一部分：deny 必须按真实名字匹配。
+    let p = gate(
+        Mode::Bypass,
+        rules(&[], &["bash_write(**/O'Brien.txt)"], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    let command = "echo x > \"$HOME/O'Brien.txt\"";
+    let error = p
+        .check_call("bash", &bash(command), 0, true)
+        .await
+        .expect_err(command);
+    assert!(error.contains("deny permission rule"), "{command}: {error}");
+}

@@ -113,3 +113,22 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 `text_arguments_stay_text_when_dynamic` 与 sensitive 的 `.??`/`.e[ab]*` 断言覆盖 P2。
 外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2096 通过、本机 parity）。
 提交 `f980eac`。
+
+## 审查后补（第二轮，同日）
+
+1. **P1 模式文件被当成搜索根**：`rg -uu -f patterns.txt` 的 `-f` 操作数会进
+   `path_arguments`（它确实会被打开），但它不是搜索根；位置参数才是。`Walked` 新增
+   `positional_paths`，`argv_roles::search_roots` 只返回位置参数，递归根改用它。
+   `rg -uu -f patterns.txt` 于是回到“没有路径参数 → 搜 cwd”。
+2. **P1 否定字符类被提前截断**：`[!]]` 是“排除 `]`”，否定符后的第一个 `]` 是成员。
+   tokenizer 改为记住是否已收成员，只有成员后的 `]` 才结束字符类；`.e[!]]v` 重新拦。
+3. **P1 引号删除改变真实路径**：整条目标包在双引号里时，里面的 `'` 是文件名的一部分
+   （`"$HOME/O'Brien.txt"`）。`shell_unquote` 改为带引用状态的解码，返回是否出现过
+   单引号段；`~`/`$HOME` 是否展开另按原文首字符与单引号段判定。
+4. **P2 未建模语法丢前缀证据**：花括号交替不建模，但字面前缀仍能排除
+   （`.c{ache,onfig}` 拼不出敏感名）。回退改为 `literal_prefix_may_match`，
+   `.env{a,b}` 这类仍有交集的保守拦。
+
+验证：三条 gate 回归先在 `f980eac` 上红、修后转绿；单测补 `pattern_files_are_not_search_roots`、
+`home_spelling_keeps_quoted_apostrophes` 与否定类/花括号的 glob 断言。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace 2101 通过、本机 parity）。

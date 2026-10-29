@@ -105,11 +105,12 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 
 /// 模式与“以 `prefix` 开头的一族名字”是否有交集。只看字面前缀不够：`.??`
 /// 长度不足、`.e[ab]*` 的字符类排除了 `n`，都拼不出 `.env`；`.e*`、`.en?`、
-/// `.env.p*` 才有交集。
+/// `.env.p*` 才有交集。交集按模式自动机吃前缀判定。
 fn could_match_prefix(pattern: &str, prefix: &str) -> bool {
     let Some(tokens) = glob_tokens(pattern) else {
-        // 花括号交替、反斜杠转义这些没建模的语法：按可能命中处理。
-        return true;
+        // 花括号交替、反斜杠转义这些没建模：保留字面前缀的排除判断（`.c{…}`
+        // 拼不出敏感名就放行），前缀本身还可能有交集时按可能命中处理。
+        return literal_prefix_may_match(pattern, prefix);
     };
     let prefix: Vec<char> = prefix.chars().collect();
     // reachable[i][j]：前 i 个模式记号能否吃掉前缀的前 j 个字符。`*` 留在原
@@ -148,6 +149,15 @@ fn could_match_prefix(pattern: &str, prefix: &str) -> bool {
     (0..=tokens.len()).any(|index| reachable[index][prefix.len()])
 }
 
+/// 未建模语法的保守回退：第一个元字符之前的字面前缀与 `prefix` 是否可能相交。
+fn literal_prefix_may_match(pattern: &str, prefix: &str) -> bool {
+    let literal: String = pattern
+        .chars()
+        .take_while(|ch| !matches!(ch, '*' | '?' | '[' | '{' | '\\'))
+        .collect();
+    prefix.starts_with(&literal) || literal.starts_with(prefix)
+}
+
 enum GlobToken {
     Literal(char),
     Any,
@@ -158,20 +168,27 @@ enum GlobToken {
 
 fn glob_tokens(pattern: &str) -> Option<Vec<GlobToken>> {
     let mut tokens = Vec::new();
-    let mut chars = pattern.chars();
+    let mut chars = pattern.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             '*' => tokens.push(GlobToken::Star),
             '?' => tokens.push(GlobToken::Any),
             '[' => {
                 let mut class = String::from("[");
+                // 可选否定符之后，第一个 `]` 仍是字符类的成员（`[!]]` 是
+                // “排除 ]”），只有已经收过成员的那个 `]` 才结束字符类。
+                if let Some(negation) = chars.next_if(|ch| matches!(ch, '!' | '^')) {
+                    class.push(negation);
+                }
+                let mut member = false;
                 let mut closed = false;
                 for ch in chars.by_ref() {
                     class.push(ch);
-                    if ch == ']' && class.len() > 2 {
+                    if ch == ']' && member {
                         closed = true;
                         break;
                     }
+                    member = true;
                 }
                 if !closed {
                     return None;
@@ -234,6 +251,20 @@ mod tests {
         assert_eq!(glob_component_sensitivity(".e[ab]*", /*last*/ true), None);
         assert_eq!(
             glob_component_sensitivity(".e*", /*last*/ true),
+            Some(Sensitivity::Secret)
+        );
+        // 否定字符类里第一个 `]` 是成员，`[!]]` 不能把类提前截断。
+        assert_eq!(
+            glob_component_sensitivity(".e[!]]v", /*last*/ true),
+            Some(Sensitivity::Secret)
+        );
+        // 未建模的花括号仍保留字面前缀排除：`.c{ache,onfig}` 拼不出敏感名。
+        assert_eq!(
+            glob_component_sensitivity(".c{ache,onfig}", /*last*/ true),
+            None
+        );
+        assert_eq!(
+            glob_component_sensitivity(".env{a,b}", /*last*/ true),
             Some(Sensitivity::Secret)
         );
     }
