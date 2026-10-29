@@ -149,4 +149,4 @@ DESIGN「Bash 的判定按访问方式 × 路径类别」一节(约 1000–1040 
 验证：gate 回归 `plan243_home_prefix_quoting_is_independent_of_the_suffix` 先在 `8820fb3`
 上红（`$HOME/'.bashrc'` 无 notice）、修后转绿且 deny 命中；单测补
 `home_prefix_quoting_is_independent_of_the_suffix` 与 `dynamic_words_are_checked_after_unquoting`。
-外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2104 通过、本机 parity）。
+外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2104 通过、本机 parity）。提交 `60b49d7`。
