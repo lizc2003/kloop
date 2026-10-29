@@ -190,63 +190,68 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     range: node.byte_range(),
                     context,
                 };
-                if command.argv().is_none() {
+                let argv = command.argv();
+                let dynamic_argv = argv.is_none();
+                let argv = argv.unwrap_or_else(|| {
                     facts.unknown.push("dynamic argument".into());
-                }
-                if let Some(argv) = command.argv() {
-                    let wrappers = analyze_wrappers(&argv);
-                    if !wrappers.complete {
-                        facts.reliable = false;
-                        facts.unknown.push("unsupported wrapper".into());
-                        facts.commands.push(command);
-                        continue;
-                    }
-                    let stripped = wrappers.argv;
-                    if stripped
-                        .first()
-                        .is_some_and(|name| matches!(executable_name(name), "sh" | "bash" | "zsh"))
-                        && extract_wrapped_script(stripped).is_none()
-                    {
-                        facts.unknown.push("unsupported shell wrapper".into());
-                    }
-                    if let Some(inner) = extract_wrapped_script(stripped) {
-                        if depth < MAX_UNWRAP_DEPTH {
-                            let mut nested = analyze_depth(inner, depth + 1);
-                            let startup_unknown = stripped.get(1).is_some_and(|flag| flag == "-lc")
-                                || stripped
-                                    .first()
-                                    .is_some_and(|shell| executable_name(shell) == "zsh");
-                            let nested_home_unknown =
-                                home_unknown || startup_unknown || wrappers.environment_unknown;
-                            let nested_cwd_unknown =
-                                cwd_unknown || startup_unknown || wrappers.cwd_unknown;
-                            if nested_home_unknown || nested_cwd_unknown {
-                                for command in &mut nested.commands {
-                                    command.context.home_unknown |= nested_home_unknown;
-                                    command.context.cwd_unknown |= nested_cwd_unknown;
-                                }
-                                for redirect in &mut nested.redirects {
-                                    redirect.context.home_unknown |= nested_home_unknown;
-                                    redirect.context.cwd_unknown |= nested_cwd_unknown;
-                                }
-                            }
-                            nested_analyses.push((argv.clone(), nested.analysis.clone()));
-                            facts.reliable &= nested.reliable;
-                            facts.commands.extend(nested.commands);
-                            facts.redirects.extend(nested.redirects);
-                            facts.unknown.extend(nested.unknown);
-                            // 嵌套文本经过引号解码；本轮不从它生成外层正文豁免。
+                    command.literal_prefix()
+                });
+                let wrappers = analyze_wrappers(&argv);
+                // 剥离成功后仍有命令名，普通动态参数不等于未知执行体。
+                if !wrappers.complete || (dynamic_argv && wrappers.argv.is_empty()) {
+                    facts.reliable = false;
+                    facts.unknown.push(
+                        if dynamic_argv {
+                            "dynamic wrapper argument"
                         } else {
-                            facts.reliable = false;
-                            facts.unknown.push("wrapper limit".into());
+                            "unsupported wrapper"
                         }
-                    }
-                } else {
-                    let prefix = command.literal_prefix();
-                    let wrappers = analyze_wrappers(&prefix);
-                    if !wrappers.complete || wrappers.argv.len() < prefix.len() {
+                        .into(),
+                    );
+                    facts.commands.push(command);
+                    continue;
+                }
+                let stripped = wrappers.argv;
+                // 风险事实可分析已知脚本及其后的位置参数；严格授权仍要求完整 argv。
+                let inner = stripped.get(..3).and_then(extract_wrapped_script);
+                if stripped
+                    .first()
+                    .is_some_and(|name| matches!(executable_name(name), "sh" | "bash" | "zsh"))
+                    && inner.is_none()
+                {
+                    facts.reliable &= !dynamic_argv;
+                    facts.unknown.push("unsupported shell wrapper".into());
+                }
+                if let Some(inner) = inner {
+                    if depth < MAX_UNWRAP_DEPTH {
+                        let mut nested = analyze_depth(inner, depth + 1);
+                        let startup_unknown = stripped.get(1).is_some_and(|flag| flag == "-lc")
+                            || stripped
+                                .first()
+                                .is_some_and(|shell| executable_name(shell) == "zsh");
+                        let nested_home_unknown =
+                            home_unknown || startup_unknown || wrappers.environment_unknown;
+                        let nested_cwd_unknown =
+                            cwd_unknown || startup_unknown || wrappers.cwd_unknown;
+                        if nested_home_unknown || nested_cwd_unknown {
+                            for command in &mut nested.commands {
+                                command.context.home_unknown |= nested_home_unknown;
+                                command.context.cwd_unknown |= nested_cwd_unknown;
+                            }
+                            for redirect in &mut nested.redirects {
+                                redirect.context.home_unknown |= nested_home_unknown;
+                                redirect.context.cwd_unknown |= nested_cwd_unknown;
+                            }
+                        }
+                        nested_analyses.push((argv.clone(), nested.analysis.clone()));
+                        facts.reliable &= nested.reliable;
+                        facts.commands.extend(nested.commands);
+                        facts.redirects.extend(nested.redirects);
+                        facts.unknown.extend(nested.unknown);
+                        // 嵌套文本经过引号解码；本轮不从它生成外层正文豁免。
+                    } else {
                         facts.reliable = false;
-                        facts.unknown.push("dynamic wrapper argument".into());
+                        facts.unknown.push("wrapper limit".into());
                     }
                 }
                 facts.commands.push(command);

@@ -198,4 +198,20 @@ Linux 与 Windows 未实测。提交：`a676ec4`。
 验证：修前原始绕过回归先红；修后包装器定向测试 16 项通过。最终代码在外层执行沙箱
 之外 `make check` 全绿（fmt、clippy、workspace 2112 项通过，另有两次子进程回归通过，
 本机 parity）。Linux 与 Windows 未实测。
-提交：本节所在提交（`fix(plan243): retain wrapper environment effects in shell facts`）。
+提交：`3f5b72a`。
+
+## 包装器误拒修复 ✅：区分动态参数与动态执行体（2026-10-29）
+
+- 用户复核发现，字面前缀剥离后长度变短只说明包装器已剥掉，不能证明命令位置未知。
+  原判据把 `sudo cat $F`、`env FOO=1 grep -n $P file` 等调用标为整段不可靠，既凭空
+  增加未知写效果、误命中窄路径 deny/ask，也让兄弟节点中受保护的 heredoc 正文失去例外。
+- 判据改为分析不完整或剥离后没有命令名。完整 argv 与字面前缀共用后续分析；普通
+  动态参数不影响事实可靠性，动态命令/包装器操作数/脚本文本仍保守。字面 `-c` 脚本文本
+  后带动态位置参数时，也不能漏掉内层读取与重定向。所有动态调用继续保持严格授权 opaque。
+- 新增 gate 正反回归：窄 deny/ask 不误拦普通动态参数，未知执行体与实际写入仍生效；
+  已受策略保护的 heredoc 正文保留例外，正文外实际敏感读取与不完整分析仍被拒绝。
+
+验证：两条新增回归在修前分别复现窄写规则与敏感正文误拒，修后转绿。最终代码在外层
+执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2114 项通过，另有两次子进程
+回归通过，本机 parity）。Linux 与 Windows 未实测。
+提交：本节所在提交（`fix(plan243): preserve known commands with dynamic wrapper arguments`）。

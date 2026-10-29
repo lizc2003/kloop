@@ -573,3 +573,130 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
         .unwrap_or_else(|error| panic!("{command}: {error}"));
     }
 }
+
+#[tokio::test]
+async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
+    for command in [
+        "cat $F",
+        "sudo cat $F",
+        "env FOO=1 grep -n $P file",
+        "nice -n 10 cat $F",
+        "timeout 5 sudo cat $F",
+        "env bash -c 'cat file' \"$ARG\"",
+        "env bash -c 'cat file' name \"$ARG\"",
+    ] {
+        for ruleset in [
+            rules(&[], &["bash_write(/etc/**)"], &[]),
+            rules(&[], &[], &["bash_write(/etc/**)"]),
+        ] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(Mode::Manual, ruleset, approver.clone());
+            p.check_call("bash", &bash(command), 0, true)
+                .await
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        }
+    }
+
+    for command in [
+        "$CMD file",
+        "env $CMD file",
+        "env FOO=1 $CMD file",
+        "env -u $V cat file",
+        "sudo -u $USER cat file",
+        "timeout $SECONDS cat file",
+        "bash -c \"$SCRIPT\"",
+        "env bash -c \"$SCRIPT\"",
+        "env bash -c 'printf x > /etc/locked.txt' name \"$ARG\"",
+        "sudo cat $F > /etc/locked.txt",
+    ] {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(/etc/**)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call("bash", &bash(command), 0, true)
+            .await
+            .expect_err(command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(
+            Mode::Manual,
+            rules(&[], &[], &["bash_write(/etc/**)"]),
+            approver.clone(),
+        );
+        p.check_call("bash", &bash(command), 0, true).await.unwrap();
+        assert_eq!(approver.ask_count(), 1, "{command}");
+    }
+    for command in [
+        "env bash -c 'cat .env' \"$ARG\"",
+        "env bash -c 'cat < .env' name \"$ARG\"",
+    ] {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &[], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call("bash", &bash(command), 0, true)
+            .await
+            .expect_err(command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
+    use crate::sandbox::{ExecutionContext, SandboxPolicy};
+
+    let home = plan243_root("wrapper-literal");
+    let policy =
+        SandboxPolicy::workspace(&home, &[], /*allow_network*/ false).with_credential_roots(&home);
+    for prefix in [
+        "cat $F",
+        "sudo cat $F",
+        "env FOO=1 grep -n $P file",
+        "nice -n 10 cat $F",
+    ] {
+        let command = format!("{prefix}\ncat > /tmp/probe <<'EOF'\n~/.ssh/id_rsa\nEOF");
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &[], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        p.check_call_with_execution(
+            "bash",
+            &bash(&command),
+            0,
+            ExecutionContext::sandboxed(Some(&policy)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{command}: {error}"));
+    }
+    for prefix in [
+        "env $CMD file",
+        "sudo -u $USER cat file",
+        "cat ~/.ssh/id_rsa",
+    ] {
+        let command = format!("{prefix}\ncat > /tmp/probe <<'EOF'\n~/.ssh/id_rsa\nEOF");
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &[], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call_with_execution(
+                "bash",
+                &bash(&command),
+                0,
+                ExecutionContext::sandboxed(Some(&policy)),
+            )
+            .await
+            .expect_err(&command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
