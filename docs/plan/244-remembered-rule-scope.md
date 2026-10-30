@@ -115,4 +115,4 @@ whole-tool `bash` 都不算）；第 12 层会话缓存改查升级签名（opaq
 `mkdir -p`（第二词是选项，已不再稳定）换成 `git init`，继续验证真正的两词前缀。
 外层执行沙箱之外 `make check` 全绿：fmt、clippy、workspace 全量测试（core 1249 项等）、
 本机 parity 语料 baseline verified。DESIGN 的 Asking、规则匹配段、包装器段与升级段同步改写。
-Linux 与 Windows 未实测。实现提交：`<待补>`。
+Linux 与 Windows 未实测。实现提交：`b0b38fc`。

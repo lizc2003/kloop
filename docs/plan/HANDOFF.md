@@ -13,7 +13,7 @@
 每个起点各试一次，`xargs -I {} rm -rf {}` 现在会被 `bash(rm *)` 与 `[destructive]` 看到。
 升级的 Project 持久化失败也发 notice。新增 10 条 plan244 回归与 shell 单测；旧的 seatbelt
 升级记忆测试因 `mkdir -p` 的第二词是选项而改用 `git init`。外层执行沙箱之外 `make check`
-全绿（core 1249 项等、本机 parity baseline verified）。教训 288。
+全绿（core 1249 项等、本机 parity baseline verified）。实现提交 `b0b38fc`。教训 288。
 
 **Plan 271 ✅：项目 `.kloop` 可读，`~/.kloop` 照旧硬拦（2026-10-30）**：kloop 会话在一个
 用过 worktree 的仓库根上跑 `cd <repo> && grep -rn X --include='*.go' .` 被硬拒——根下有 kloop
