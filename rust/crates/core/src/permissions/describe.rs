@@ -10,6 +10,7 @@ use super::facts::ShellFacts;
 use crate::shell::BashAnalysis;
 use crate::shell::analyze_bash;
 use crate::shell::argv_is_readonly;
+use crate::shell::argv_prefix_is_unstable;
 use crate::tools::Builtin;
 
 /// What the sandbox actually refused, for the approval prompt. "The sandbox
@@ -68,6 +69,8 @@ pub(super) fn escalation_remember_payload(command: &str, cwd: &Path) -> Option<R
         &writes,
         "sandbox_escalate",
         ReadOnlySegments::Remember,
+        Some(command.trim()),
+        /*no_sandbox*/ false,
     )
 }
 
@@ -145,12 +148,16 @@ enum ReadOnlySegments {
 /// embedded whitespace), so nothing can be written down at all. An empty argv
 /// is rejected for the same reason: the parser never produces one, but a rule
 /// reading `bash( *)` would be worse than no memory.
-/// 固定输出独立追加父目录写入规则；无法安全表示目录范围时整组不生成可复用授权。
+/// 两词前缀只描述命令本身时才落成规则；wrapper、第二词是选项或赋值时改记逐字会话
+/// 记忆（`verbatim` 是整条命令的原文）。固定输出独立追加父目录写入规则；无法安全
+/// 表示目录范围时整组不生成可复用授权。
 fn bash_prefix_memory(
     cmds: &[Vec<String>],
     writes: &[PathFacts],
     tool: &str,
     segments: ReadOnlySegments,
+    verbatim: Option<&str>,
+    no_sandbox: bool,
 ) -> Option<Remember> {
     let mut rules = Vec::new();
     let mut signatures = Vec::new();
@@ -158,6 +165,11 @@ fn bash_prefix_memory(
     for argv in cmds {
         if segments == ReadOnlySegments::Skip && argv_is_readonly(argv) {
             continue;
+        }
+        if argv_prefix_is_unstable(argv) {
+            return verbatim
+                .filter(|command| !command.is_empty())
+                .map(|command| verbatim_remember(tool, command, no_sandbox));
         }
         let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
         if prefix.is_empty()
@@ -180,23 +192,7 @@ fn bash_prefix_memory(
         }
     }
     for path in writes {
-        // cwd 本身没有可授权的文件父目录；只有根部文件的空 parent 才能锚回 cwd。
-        let parent = match path.relative.as_deref() {
-            Some(relative) => {
-                let parent = relative.parent()?;
-                if parent.as_os_str().is_empty() {
-                    path.normalized.parent()?
-                } else {
-                    parent
-                }
-            }
-            None => path.normalized.parent()?,
-        };
-        let scope = parent.to_str()?;
-        // 不把目录名中的 glob 语法当通配授权，也不自动建议文件系统根目录授权。
-        if scope == "/" || scope.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r']) {
-            return None;
-        }
+        let scope = path_memory_scope(path)?;
         let pattern = format!("{scope}/**");
         let rule = format!("{tool}_write({pattern})");
         if !rules.contains(&rule) {
@@ -210,6 +206,44 @@ fn bash_prefix_memory(
     let mut remember = Remember::echoing_rules(rules, signatures, argvs);
     remember.writes = writes.to_vec();
     Some(remember)
+}
+
+/// 逐字会话记忆：只认这条命令的原文，不落成规则、不提供 Project。脱沙箱是另一种
+/// 同意，因此普通门的键里带上它；升级门本身就是在记脱沙箱，不再重复。
+fn verbatim_remember(tool: &str, command: &str, no_sandbox: bool) -> Remember {
+    let escape = if tool == "bash" && no_sandbox {
+        "!no-sandbox"
+    } else {
+        ""
+    };
+    Remember {
+        rules: Vec::new(),
+        echo: vec![VERBATIM_REMEMBER_RULE.to_string()],
+        signatures: vec![format!("{tool}-script{escape}:{command}")],
+        argvs: Vec::new(),
+        writes: Vec::new(),
+    }
+}
+
+/// 文件工具的记忆粒度是父目录。与 Bash 写入记忆同一套边界：cwd 本身没有可授权的
+/// 父目录，根部文件锚回规范 cwd；目录含 glob 元字符或位于文件系统根时不生成模式。
+fn path_memory_scope(path: &PathFacts) -> Option<String> {
+    let parent = match path.relative.as_deref() {
+        Some(relative) => {
+            let parent = relative.parent()?;
+            if parent.as_os_str().is_empty() {
+                path.normalized.parent()?
+            } else {
+                parent
+            }
+        }
+        None => path.normalized.parent()?,
+    };
+    let scope = parent.to_str()?;
+    if scope == "/" || scope.contains(['*', '?', '[', ']', '{', '}', '\\', '\n', '\r']) {
+        return None;
+    }
+    Some(scope.to_string())
 }
 
 /// cc's "always allow" granularity: bash remembers a two-word command
@@ -230,7 +264,14 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
                 BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
             )),
             _,
-        ) => bash_prefix_memory(cmds, &call.writes, "bash", ReadOnlySegments::Skip),
+        ) => bash_prefix_memory(
+            cmds,
+            &call.writes,
+            "bash",
+            ReadOnlySegments::Skip,
+            call.command.as_deref(),
+            call.no_sandbox,
+        ),
         // PowerShell stays unremember-able: bash at least gets parsed and only
         // then gives up, while PowerShell has no analysis at all — so "every
         // call asks" is the only safety net it has left.
@@ -245,32 +286,15 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
         // user's disk, 0 hits between them).
         (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => {
             let script = call.opaque_script.as_ref()?;
-            // Escaping the sandbox is part of what the yes was given for, so it
-            // is spelled into the session key: a contained run's approval must
-            // never cover an uncontained one.
-            let escape = if script.no_sandbox { "!no-sandbox" } else { "" };
-            let command = &script.command;
-            Some(Remember {
-                rules: Vec::new(),
-                echo: vec![VERBATIM_REMEMBER_RULE.to_string()],
-                signatures: vec![format!("bash-script{escape}:{command}")],
-                argvs: Vec::new(),
-                writes: Vec::new(),
-            })
+            Some(verbatim_remember(
+                "bash",
+                &script.command,
+                script.no_sandbox,
+            ))
         }
         (None, Some(path)) => {
-            let scope = path
-                .relative
-                .as_deref()
-                .unwrap_or(&path.normalized)
-                .parent()
-                .map(|d| d.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let pattern = if scope.is_empty() {
-                "*".to_string()
-            } else {
-                format!("{scope}/**")
-            };
+            let scope = path_memory_scope(path)?;
+            let pattern = format!("{scope}/**");
             Some(Remember::echoing_rules(
                 vec![format!("{name}({pattern})")],
                 vec![format!("{name}:{scope}")],
@@ -411,10 +435,10 @@ mod tests {
     /// ends of the same command.
     #[test]
     fn the_two_bash_memories_differ_only_in_vocabulary_and_read_only_segments() {
-        let command = "ls -la && git commit -m x";
+        let command = "pwd && git commit -m x";
         let call = CallFacts::gather("bash", &json!({"command": command}), Path::new("/"), None);
 
-        // The ordinary gate never had to ask about `ls`, so it remembers only
+        // The ordinary gate never had to ask about `pwd`, so it remembers only
         // the segment that would have been asked about.
         let ordinary = remember_payload("bash", &call).expect("a parsed command is remember-able");
         assert_eq!(ordinary.rules, vec!["bash(git commit *)"]);
@@ -424,20 +448,17 @@ mod tests {
             "a payload that skipped a segment must not stand in for the whole command"
         );
 
-        // The sandbox denied the whole line, `ls` included, so the escalation
+        // The sandbox denied the whole line, `pwd` included, so the escalation
         // remembers both — under its own rule name.
         let escalation = escalation_remember_payload(command, &super::super::testutil::test_cwd())
             .expect("same command, other door");
         assert_eq!(
             escalation.rules,
-            vec![
-                "sandbox_escalate(ls -la *)",
-                "sandbox_escalate(git commit *)"
-            ]
+            vec!["sandbox_escalate(pwd *)", "sandbox_escalate(git commit *)"]
         );
         assert_eq!(
             escalation.signatures,
-            vec!["sandbox_escalate:ls -la", "sandbox_escalate:git commit"]
+            vec!["sandbox_escalate:pwd", "sandbox_escalate:git commit"]
         );
         assert_eq!(escalation.argvs.len(), 2);
 

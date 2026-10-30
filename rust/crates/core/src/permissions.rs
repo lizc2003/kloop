@@ -69,6 +69,7 @@ pub(crate) mod sensitive;
 #[cfg(test)]
 mod testutil;
 
+use crate::shell::BashAnalysis;
 use describe::BLANKET_ESCALATION_RULE;
 use describe::BLANKET_ESCALATION_SIGNATURE;
 use describe::Remember;
@@ -197,6 +198,35 @@ pub enum EscalationOutcome {
     /// model-driven denial hint.
     NotAttempted,
 }
+
+/// The escalation verdict plus the one thing only a frontend can show: a
+/// project grant that ran once because the durable write failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Escalation {
+    pub outcome: EscalationOutcome,
+    pub notice: Option<PermissionNotice>,
+}
+
+impl Escalation {
+    fn new(outcome: EscalationOutcome) -> Self {
+        Self {
+            outcome,
+            notice: None,
+        }
+    }
+
+    fn with_notice(outcome: EscalationOutcome, message: &str) -> Self {
+        Self {
+            outcome,
+            notice: Some(PermissionNotice {
+                message: message.to_string(),
+            }),
+        }
+    }
+}
+
+const PROJECT_RULE_NOT_SAVED: &str =
+    "project approval applied to this call only; the durable project rule was not saved";
 
 /// The asking seam, separate from `Ui` so the streaming-output trait stays
 /// synchronous. The type-erased future shape mirrors `execute_tool`: it
@@ -724,8 +754,13 @@ impl Permissions {
 
         // 8. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
-        // consulted. Sits under deny/safety/ask: those keep their say.
-        if execution.auto_allow && matches!(call.shell, Some(ShellFacts::Bash(_))) {
+        // consulted. Sits under deny/safety/ask: those keep their say. A call
+        // that opted out of the sandbox is not contained no matter what the
+        // dispatcher says, so it never takes this layer.
+        if execution.auto_allow
+            && !call.no_sandbox
+            && matches!(call.shell, Some(ShellFacts::Bash(_)))
+        {
             return Ok(None);
         }
 
@@ -753,9 +788,29 @@ impl Permissions {
             return Ok(None);
         }
 
-        // 12. Session cache.
-        let remember = remember_payload(name, &call);
-        if let Some(remember) = &remember {
+        // 12. Session cache. A `disable_sandbox` call asks about a different
+        // permission — running uncontained — so neither a contained run's
+        // `bash(...)` rules nor its session key may answer it; only escalation
+        // consent can. An opaque script keeps its own verbatim key, which is
+        // already spelled per containment ([`remember_payload`]).
+        let opaque_bash = matches!(call.shell, Some(ShellFacts::Bash(BashAnalysis::Opaque)));
+        let escalation_memory = call.no_sandbox && !opaque_bash;
+        let remember = if escalation_memory {
+            call.command
+                .as_deref()
+                .and_then(|command| escalation_remember_payload(command, self.identity.cwd()))
+        } else {
+            remember_payload(name, &call)
+        };
+        if escalation_memory {
+            if self.blanket_escalation_granted()
+                || remember
+                    .as_ref()
+                    .is_some_and(|remember| self.escalation_remembered(remember))
+            {
+                return Ok(None);
+            }
+        } else if let Some(remember) = &remember {
             let caches = self.session.cache.lock().unwrap();
             if caches
                 .get(self.identity.workspace_id())
@@ -785,8 +840,18 @@ impl Permissions {
 
     /// Allow is the strict direction: every bash argv must be read-only or
     /// rule-matched (un-stripped — wrappers must be spelled out), and opaque
-    /// bash never matches.
+    /// bash never matches. A call carrying `disable_sandbox` is a different
+    /// permission: only a `sandbox_escalate(...)` rule may vouch for it, never
+    /// `bash(...)` or the whole-tool `bash` rule.
     fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
+        if call.no_sandbox {
+            return match call.shell.as_ref() {
+                Some(ShellFacts::Bash(
+                    BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
+                )) => self.project.matches_escalation(cmds, &call.writes),
+                _ => false,
+            };
+        }
         self.project.matches_allow(name, call)
     }
 
@@ -808,7 +873,12 @@ impl Permissions {
         let mut approval_scopes = vec![ApprovalScope::Once];
         if let Some(remember) = &remember {
             approval_scopes.push(ApprovalScope::WorkspaceSession);
-            if remember.persistable() && self.project.can_persist() {
+            // A rule the store could not read back is not a durable grant; do
+            // not offer the scope at all. The call still runs once.
+            if remember.persistable()
+                && self.project.can_persist()
+                && ProjectAllowRules::parse(&remember.rules).is_ok()
+            {
                 approval_scopes.push(ApprovalScope::Project);
             }
         }
@@ -845,12 +915,15 @@ impl Permissions {
                 let Some(remember) = remember else {
                     return Err(denied());
                 };
-                let additions = ProjectAllowRules::parse(&remember.rules).map_err(|_| denied())?;
+                let Ok(additions) = ProjectAllowRules::parse(&remember.rules) else {
+                    return Ok(Some(PermissionNotice {
+                        message: PROJECT_RULE_NOT_SAVED.into(),
+                    }));
+                };
                 match self.project.persist(additions).await {
                     Ok(_) => Ok(None),
                     Err(_) => Ok(Some(PermissionNotice {
-                        message: "project approval applied to this call only; the durable project rule was not saved"
-                            .into(),
+                        message: PROJECT_RULE_NOT_SAVED.into(),
                     })),
                 }
             }
@@ -902,15 +975,15 @@ impl Permissions {
         command: &str,
         denial: Option<&crate::sandbox::SandboxDenial>,
         depth: u8,
-    ) -> EscalationOutcome {
+    ) -> Escalation {
         // Tests / `--mock`: nobody is watching (and the sandbox is off in
         // `--mock` anyway). Don't silently escalate.
         if self.allow_everything {
-            return EscalationOutcome::NotAttempted;
+            return Escalation::new(EscalationOutcome::NotAttempted);
         }
         // Bypass 的程序升级与模型主动 disable_sandbox 都免审批。
         if self.mode() == Mode::Bypass {
-            return EscalationOutcome::Approved(EscalationApproval::Bypass);
+            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Bypass));
         }
         // A remembered escalation answers before the ask, exactly as a durable
         // allow rule does for the ordinary gate. 固定输出还需写入范围；opaque
@@ -921,15 +994,15 @@ impl Permissions {
                 .as_ref()
                 .is_some_and(|remember| self.escalation_remembered(remember))
         {
-            return EscalationOutcome::Approved(EscalationApproval::Remembered);
+            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Remembered));
         }
         let Some(approver) = &self.session.approver else {
-            return EscalationOutcome::NotAttempted;
+            return Escalation::new(EscalationOutcome::NotAttempted);
         };
         // The session scope is offered either way; only the durable one needs a
-        // rule it can be written down as.
+        // rule it can be written down as. A verbatim memory has no rule.
         let mut approval_scopes = vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession];
-        if remember.is_some() && self.project.can_persist() {
+        if remember.as_ref().is_some_and(Remember::persistable) && self.project.can_persist() {
             approval_scopes.push(ApprovalScope::Project);
         }
         let req = ConfirmRequest {
@@ -951,34 +1024,46 @@ impl Permissions {
         };
         let scope = match approver.confirm(req).await {
             Decision::Allow(scope) => scope,
-            Decision::Deny => return EscalationOutcome::Declined,
-            Decision::Stop => return EscalationOutcome::Stopped,
+            Decision::Deny => return Escalation::new(EscalationOutcome::Declined),
+            Decision::Stop => return Escalation::new(EscalationOutcome::Stopped),
         };
         if !approval_scopes.contains(&scope) {
-            return EscalationOutcome::Declined;
+            return Escalation::new(EscalationOutcome::Declined);
         }
         match scope {
-            ApprovalScope::Once => EscalationOutcome::Approved(EscalationApproval::User),
+            ApprovalScope::Once => {
+                Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
+            }
             ApprovalScope::WorkspaceSession => {
                 let signatures = remember.map_or_else(
                     || vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
                     |remember| remember.signatures,
                 );
                 self.remember_in_session(signatures);
-                EscalationOutcome::Approved(EscalationApproval::User)
+                Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
             }
             ApprovalScope::Project => {
                 let Some(remember) = remember else {
-                    return EscalationOutcome::Declined;
+                    return Escalation::new(EscalationOutcome::Declined);
                 };
                 let Ok(additions) = ProjectAllowRules::parse(&remember.rules) else {
-                    return EscalationOutcome::Declined;
+                    // The call still runs — the user said yes — but the rule
+                    // they asked to keep could not be spelled.
+                    return Escalation::with_notice(
+                        EscalationOutcome::Approved(EscalationApproval::User),
+                        PROJECT_RULE_NOT_SAVED,
+                    );
                 };
                 // A failed durable write still approves this call — the user
                 // said yes. It just will not be remembered, same as the
-                // ordinary gate's project scope.
-                let _ = self.project.persist(additions).await;
-                EscalationOutcome::Approved(EscalationApproval::User)
+                // ordinary gate's project scope, and says so the same way.
+                match self.project.persist(additions).await {
+                    Ok(_) => Escalation::new(EscalationOutcome::Approved(EscalationApproval::User)),
+                    Err(_) => Escalation::with_notice(
+                        EscalationOutcome::Approved(EscalationApproval::User),
+                        PROJECT_RULE_NOT_SAVED,
+                    ),
+                }
             }
         }
     }
@@ -1058,6 +1143,7 @@ impl Permissions {
 mod tests {
     include!("permissions/plan239_tests.rs");
     include!("permissions/plan243_tests.rs");
+    include!("permissions/plan244_tests.rs");
     include!("permissions/plan271_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
@@ -2343,8 +2429,7 @@ mod tests {
         let writer = ScriptedWriter::succeeding();
         let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
         let input = json!({
-            "command": "cd /tmp && make check > /tmp/kloop-check.log 2>&1; echo \"EXIT:$?\" >> /tmp/kloop-check.log; tail -5 /tmp/kloop-check.log",
-            "disable_sandbox": true
+            "command": "cd /tmp && make check > /tmp/kloop-check.log 2>&1; echo \"EXIT:$?\" >> /tmp/kloop-check.log; tail -5 /tmp/kloop-check.log"
         });
         assert!(ok(&p, "bash", input).await);
         assert!(
@@ -2378,8 +2463,7 @@ mod tests {
             next_approver.clone(),
         );
         assert!(ok(&restarted, "bash", json!({
-            "command": "make check extra=1 > /tmp/kloop-next.log 2>&1; echo \"EXIT:${?}\" >> /tmp/kloop-next.log; tail -8 /tmp/kloop-next.log",
-            "disable_sandbox": true
+            "command": "make check extra=1 > /tmp/kloop-next.log 2>&1; echo \"EXIT:${?}\" >> /tmp/kloop-next.log; tail -8 /tmp/kloop-next.log"
         })).await);
         assert_eq!(next_approver.asked(), vec![]);
         assert!(
@@ -2408,7 +2492,7 @@ mod tests {
         let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
         let command = "make check > /tmp/kloop-escalate.log 2>&1; echo \"EXIT:$?\" >> /tmp/kloop-escalate.log";
         assert_eq!(
-            p.escalate_sandbox(command, None, 0).await,
+            p.escalate_sandbox(command, None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         let stored = writer.calls.lock().unwrap()[0].clone();
@@ -2505,7 +2589,7 @@ mod tests {
             let writer = ScriptedWriter::succeeding();
             let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
             assert_eq!(
-                p.escalate_sandbox(&command, None, 0).await,
+                p.escalate_sandbox(&command, None, 0).await.outcome,
                 EscalationOutcome::Approved(EscalationApproval::User),
                 "{target}"
             );
@@ -2519,7 +2603,7 @@ mod tests {
             let sibling = format!("make check > '{}'", outside.display());
             assert!(!p.sandbox_escalation_remembered(&sibling), "{target}");
             assert_eq!(
-                p.escalate_sandbox(&sibling, None, 0).await,
+                p.escalate_sandbox(&sibling, None, 0).await.outcome,
                 EscalationOutcome::Declined,
                 "{target}"
             );
@@ -2539,8 +2623,7 @@ mod tests {
                 &p,
                 "bash",
                 json!({
-                    "command": "make check > check.log",
-                    "disable_sandbox": true
+                    "command": "make check > check.log"
                 })
             )
             .await
@@ -2568,10 +2651,7 @@ mod tests {
                 ok(
                     &restarted,
                     "bash",
-                    json!({
-                        "command": format!("make check jobs=2 > {target}"),
-                        "disable_sandbox": true
-                    })
+                    json!({"command": format!("make check jobs=2 > {target}")})
                 )
                 .await
             );
@@ -2581,10 +2661,7 @@ mod tests {
             !ok(
                 &restarted,
                 "bash",
-                json!({
-                    "command": format!("make check > {}", outside.display()),
-                    "disable_sandbox": true
-                })
+                json!({"command": format!("make check > {}", outside.display())})
             )
             .await
         );
@@ -2598,7 +2675,9 @@ mod tests {
         let writer = ScriptedWriter::succeeding();
         let p = gate_with_writer(Mode::Manual, approver, writer.clone());
         assert_eq!(
-            p.escalate_sandbox("make check > check.log", None, 0).await,
+            p.escalate_sandbox("make check > check.log", None, 0)
+                .await
+                .outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         let directory = std::fs::canonicalize(test_cwd()).unwrap();
@@ -2624,7 +2703,7 @@ mod tests {
         let command = format!("make check > {}", outside.display());
         assert!(!restarted.sandbox_escalation_remembered(&command));
         assert_eq!(
-            restarted.escalate_sandbox(&command, None, 0).await,
+            restarted.escalate_sandbox(&command, None, 0).await.outcome,
             EscalationOutcome::Declined
         );
         assert_eq!(approver.ask_count(), 1);
@@ -2664,7 +2743,9 @@ mod tests {
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
-            p.escalate_sandbox("make check > check.log", None, 0).await,
+            p.escalate_sandbox("make check > check.log", None, 0)
+                .await
+                .outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert!(p.sandbox_escalation_remembered("make check jobs=2 > next.log"));
@@ -2812,7 +2893,8 @@ mod tests {
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
             p.escalate_sandbox("make check > /tmp/check.log", None, 0)
-                .await,
+                .await
+                .outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert!(p.sandbox_escalation_remembered("make check jobs=2 > /tmp/next.log"));
@@ -3363,15 +3445,15 @@ mod tests {
         ]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
-            p.escalate_sandbox("npm install", None, 0).await,
+            p.escalate_sandbox("npm install", None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert_eq!(
-            p.escalate_sandbox("git push", None, 0).await,
+            p.escalate_sandbox("git push", None, 0).await.outcome,
             EscalationOutcome::Declined
         );
         assert_eq!(
-            p.escalate_sandbox("git push", None, 0).await,
+            p.escalate_sandbox("git push", None, 0).await.outcome,
             EscalationOutcome::Stopped
         );
         assert_eq!(approver.ask_count(), 3);
@@ -3385,7 +3467,7 @@ mod tests {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
-            p.escalate_sandbox("curl x", None, 0).await,
+            p.escalate_sandbox("curl x", None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::Bypass)
         );
         assert_eq!(approver.ask_count(), 0, "bypass does not prompt");
@@ -3394,7 +3476,8 @@ mod tests {
         assert_eq!(
             Permissions::allow_all()
                 .escalate_sandbox("rm x", None, 0)
-                .await,
+                .await
+                .outcome,
             EscalationOutcome::NotAttempted
         );
 
@@ -3407,12 +3490,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            p.escalate_sandbox("touch x", None, 0).await,
+            p.escalate_sandbox("touch x", None, 0).await.outcome,
             EscalationOutcome::NotAttempted
         );
         p.set_mode(Mode::Bypass);
         assert_eq!(
-            p.escalate_sandbox("touch x", None, 0).await,
+            p.escalate_sandbox("touch x", None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::Bypass)
         );
     }
@@ -3428,7 +3511,9 @@ mod tests {
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
 
         assert_eq!(
-            p.escalate_sandbox("go test ./pkg -run X", None, 0).await,
+            p.escalate_sandbox("go test ./pkg -run X", None, 0)
+                .await
+                .outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert_eq!(approver.ask_count(), 1);
@@ -3445,7 +3530,7 @@ mod tests {
 
         // Same two-word prefix, different arguments: covered, no second ask.
         assert_eq!(
-            p.escalate_sandbox("go test ./other", None, 0).await,
+            p.escalate_sandbox("go test ./other", None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::Remembered)
         );
         assert_eq!(approver.ask_count(), 1, "remembered, so not asked again");
@@ -3453,7 +3538,7 @@ mod tests {
         // A different command is still asked about (the scripted approver is
         // exhausted, so a prompt would deny — which is what proves it asked).
         assert_eq!(
-            p.escalate_sandbox("cargo build", None, 0).await,
+            p.escalate_sandbox("cargo build", None, 0).await.outcome,
             EscalationOutcome::Declined
         );
         assert_eq!(approver.ask_count(), 2);
@@ -3467,7 +3552,7 @@ mod tests {
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert_eq!(
-            p.escalate_sandbox("go test ./pkg", None, 0).await,
+            p.escalate_sandbox("go test ./pkg", None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert!(p.sandbox_escalation_remembered("go test ./other"));
@@ -3484,7 +3569,10 @@ mod tests {
         // script exhausted, gets a no).
         fresh.set_mode(Mode::Manual);
         assert_eq!(
-            fresh.escalate_sandbox("go test ./pkg", None, 0).await,
+            fresh
+                .escalate_sandbox("go test ./pkg", None, 0)
+                .await
+                .outcome,
             EscalationOutcome::Declined
         );
         assert_eq!(approver.ask_count(), 2);
@@ -3503,7 +3591,7 @@ mod tests {
         let opaque = "tmp=$(mktemp -d) && git archive HEAD | tar -x -C \"$tmp\"";
 
         assert_eq!(
-            p.escalate_sandbox(opaque, None, 0).await,
+            p.escalate_sandbox(opaque, None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
         assert_eq!(
@@ -3519,11 +3607,13 @@ mod tests {
 
         // Blanket consent covers another opaque script and a parseable one.
         assert_eq!(
-            p.escalate_sandbox("x=$(date) && echo $x", None, 0).await,
+            p.escalate_sandbox("x=$(date) && echo $x", None, 0)
+                .await
+                .outcome,
             EscalationOutcome::Approved(EscalationApproval::Remembered)
         );
         assert_eq!(
-            p.escalate_sandbox("go test ./pkg", None, 0).await,
+            p.escalate_sandbox("go test ./pkg", None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::Remembered)
         );
         assert_eq!(approver.ask_count(), 1, "asked once for the whole session");

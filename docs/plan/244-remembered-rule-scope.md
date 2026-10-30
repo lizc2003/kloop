@@ -1,8 +1,8 @@
 # Plan 244 — "总是允许"的作用域收窄：两词前缀、wrapper、文件工具规则
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。
+> 状态：✅ 已完成(2026-10-30)。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目
+> 开工第一步先读代码确认，不成立就在本文件划掉并写明原因。
 
 ## 问题
 
@@ -50,6 +50,7 @@ DESIGN「Asking」一节(约 1143 行)说 `a` 记两词前缀，"批准 `git com
   解释器带 `-c`/`-e`/`-m`、或第二个词以 `-` 开头或含 `=` 时，(a) 只提供 Once 与逐字
   会话记忆;(b) 剥掉 wrapper 再取两词(但 allow 侧不剥，记下的规则以后匹配不上，
   等于白记)。推荐 (a)。
+  用户 2026-10-30：「不知道哪个更好，按合理简洁的方式做」→ 按推荐的 (a)。
 
 ## 做法
 
@@ -73,3 +74,45 @@ DESIGN「Asking」一节(约 1143 行)说 `a` 记两词前缀，"批准 `git com
   有 notice。
 - DESIGN 改写 Asking 一节与"文件规则按词法路径匹配"那句;外层执行沙箱之外 `make check`;
   HANDOFF 记进展与教训。
+
+## 完成记录（2026-10-30）
+
+**复核**：第 1、2、3、5 条成立。第 4 条部分成立——`timeout -s KILL 60 …` 与
+`env -u CI …` 在旧代码里已能正确剥到命令，真正漏的是 `xargs -I {} …` 这类带操作数的
+短选项，以及未知选项时 `risk_wrapper_command` 停在操作数上；修法仍按原计划。
+
+**第 1 条（a）**：`shell::argv_prefix_is_unstable` 判首词是否 wrapper
+（`env`/`sudo`/`nohup`/`nice`/`time`/`timeout`/`xargs`/`command`/`builtin`/`exec`），
+或第二词是否以 `-` 开头/含 `=`。`bash_prefix_memory` 遇到这样的段改走
+`verbatim_remember`：键是整条命令原文，普通门的键带 `!no-sandbox`，升级门的键是
+`sandbox_escalate-script:…`；`rules` 为空，所以不提供 `p`、也不落进通配升级
+（plan 245 第 2 条的约束在这一点上先满足了）。稳定的两词前缀仍照旧落规则。
+
+**第 2 条**：`CallFacts` 新增 `no_sandbox` 与可解析命令原文。第 8 层沙箱自动放行
+不覆盖 `disable_sandbox`；第 11 层 allow 只认 `sandbox_escalate(...)`（普通 `bash(...)`、
+whole-tool `bash` 都不算）；第 12 层会话缓存改查升级签名（opaque 脚本保留原有的
+`bash-script!no-sandbox` 逐字键）；第 13 层提问也改用 `escalation_remember_payload`，
+于是选 `p` 写下的是 `sandbox_escalate(...)` 而不是 `bash(...)`。
+
+**第 3 条**：allow 方向新增 `matches_allow_path`：绝对 glob 只对规范绝对目标，相对 glob
+只对 cwd 内规范相对目标；deny/ask 继续用 `matches_path` 兼顾原文与规范路径。文件工具
+的 `remember_payload` 复用抽出的 `path_memory_scope`：根部文件锚回规范 cwd，cwd 本身、
+文件系统根和含 glob 元字符的目录不再生成模式；`Project` 只在规则能重新解析时出现，
+解析失败按普通持久化失败处理（放行一次 + notice），不再变成“用户拒绝”。
+
+**第 4 条**：`strip_wrappers` 为 `nice`/`timeout`/`time`/`xargs` 建了带操作数/无操作数/
+粘连三种选项表（`xargs --replace` 与 `--eof` 的空参数形式按无操作数算）；未知选项留给
+`risk_wrapper_views`，对剩余 argv 的每个起点各试一次。opaque 脚本的 deny 改从
+`CommandFact::risk_argv()`（未知词保留占位）取整条位置，而不是在第一个未知词处截断；
+这套视图只给 deny/危险判定，allow 与只读不消费。
+
+**第 5 条**：`escalate_sandbox` 改返回 `Escalation { outcome, notice }`；Project 规则
+写入失败（或规则重新解析失败）时仍放行这一次，并带与普通权限门相同的
+`PermissionNotice`，`bash` 工具把它发成 `Event::Note`。
+
+**验证**：新增 `permissions/plan244_tests.rs`（10 项）覆盖上述形状；`shell.rs` 补了
+选项操作数、未知选项多起点与两词前缀稳定性单测；原有 seatbelt 升级记忆测试把
+`mkdir -p`（第二词是选项，已不再稳定）换成 `git init`，继续验证真正的两词前缀。
+外层执行沙箱之外 `make check` 全绿：fmt、clippy、workspace 全量测试（core 1249 项等）、
+本机 parity 语料 baseline verified。DESIGN 的 Asking、规则匹配段、包装器段与升级段同步改写。
+Linux 与 Windows 未实测。实现提交：`<待补>`。

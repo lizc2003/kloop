@@ -61,6 +61,18 @@ impl CommandFact {
             })
             .collect()
     }
+
+    /// 未知词保留成不可执行占位符，后面的已知词仍在原位置。只供 deny 与危险判定
+    /// 这类 blocklist 使用，不能进入 allow、只读或记忆。
+    pub(crate) fn risk_argv(&self) -> Vec<String> {
+        self.words
+            .iter()
+            .map(|word| match &word.value {
+                WordValue::Literal(value) => value.clone(),
+                WordValue::Unknown => "\0unknown".into(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

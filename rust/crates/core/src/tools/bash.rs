@@ -26,6 +26,7 @@ use super::ToolCtx;
 use crate::agent::Ui;
 use crate::config::EffectiveWorkspace;
 use crate::event::Event;
+use crate::permissions::Escalation;
 use crate::permissions::EscalationOutcome;
 use crate::process_tree;
 use crate::process_tree::ProcessExit;
@@ -309,10 +310,16 @@ pub(crate) async fn run_foreground_bash(
                 .escalate_sandbox(command, Some(&denial), ctx.depth);
             // A prompt withdrawn by another call's stop leaves the sandboxed
             // failure standing, exactly as a decline would; the turn is ending.
-            let outcome = super::unless_stopped(&ctx.stop, asking)
+            let escalation = super::unless_stopped(&ctx.stop, asking)
                 .await
-                .unwrap_or(EscalationOutcome::Declined);
-            match outcome {
+                .unwrap_or(Escalation {
+                    outcome: EscalationOutcome::Declined,
+                    notice: None,
+                });
+            if let Some(notice) = &escalation.notice {
+                ctx.ui.emit(&Event::Note(notice.message.clone()));
+            }
+            match escalation.outcome {
                 EscalationOutcome::Approved(approval) => {
                     let raw = run_foreground(command, &cwd, None, bash, timeout_ms, ctx).await?;
                     // What the sandbox refused is the only record of why this
@@ -1846,7 +1853,7 @@ mod tests {
                     crate::permissions::ApprovalScope::WorkspaceSession,
                 ),
             );
-            // `mkdir -p` so the remembered two-word prefix is the subcommand,
+            // `git init` so the remembered two-word prefix is the subcommand,
             // not the path — the second call must be a *different* argument
             // covered by the same rule, which is the point of the prefix.
             let dir = outside_dir("esc-remembered");
@@ -1854,12 +1861,14 @@ mod tests {
             let second = dir.join("two");
             let _ = std::fs::remove_dir_all(&first);
             let _ = std::fs::remove_dir_all(&second);
+            std::fs::create_dir_all(&first).unwrap();
+            std::fs::create_dir_all(&second).unwrap();
 
             // First call: denied inside the sandbox, asked once, approved with
             // the workspace scope.
             let (out, is_error) = run_tool(
                 "bash",
-                bash_input(&format!("mkdir -p {}", first.display())),
+                bash_input(&format!("git init {}", first.display())),
                 &ctx,
             )
             .await;
@@ -1872,7 +1881,7 @@ mod tests {
             // than that a denial was escalated.
             let (out, is_error) = run_tool(
                 "bash",
-                bash_input(&format!("mkdir -p {}", second.display())),
+                bash_input(&format!("git init {}", second.display())),
                 &ctx,
             )
             .await;
@@ -1890,7 +1899,10 @@ mod tests {
                 !out.contains("Operation not permitted"),
                 "no denial output from a skipped attempt: {out}"
             );
-            assert!(second.is_dir(), "the uncontained run actually did the work");
+            assert!(
+                second.join(".git").is_dir(),
+                "the uncontained run actually did the work"
+            );
         }
 
         #[tokio::test]

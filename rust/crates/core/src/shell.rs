@@ -668,6 +668,117 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
     analysis
 }
 
+/// Options that consume the token after them. A wrapper's operand is not the
+/// wrapped command, so stripping has to walk past it: `xargs -I {} rm -rf {}`
+/// must leave `rm -rf {}`, not `{} rm -rf {}`.
+fn wrapper_option_takes_value(wrapper: &str, token: &str) -> bool {
+    match wrapper {
+        "nice" => matches!(token, "-n" | "--adjustment"),
+        "timeout" => matches!(token, "-s" | "--signal" | "-k" | "--kill-after"),
+        "time" => matches!(token, "-o" | "--output" | "-f" | "--format"),
+        // xargs' long optional-argument forms (`--replace`, `--eof`,
+        // `--max-lines`) only take an operand when it is attached with `=`.
+        "xargs" => matches!(
+            token,
+            "-I" | "--max-args"
+                | "-n"
+                | "--max-procs"
+                | "-P"
+                | "--max-chars"
+                | "-s"
+                | "--delimiter"
+                | "-d"
+                | "--arg-file"
+                | "-a"
+                | "-E"
+        ),
+        _ => false,
+    }
+}
+
+fn wrapper_option_is_attached(wrapper: &str, token: &str) -> bool {
+    match wrapper {
+        "nice" => {
+            token.starts_with("--adjustment=")
+                || (token.starts_with("-n") && token.len() > 2)
+                || token[1..].chars().all(|ch| ch.is_ascii_digit())
+        }
+        "timeout" => {
+            token.starts_with("--signal=")
+                || token.starts_with("--kill-after=")
+                || (token.len() > 2 && (token.starts_with("-s") || token.starts_with("-k")))
+        }
+        "time" => {
+            token.starts_with("--output=")
+                || token.starts_with("--format=")
+                || (token.len() > 2 && (token.starts_with("-o") || token.starts_with("-f")))
+        }
+        "xargs" => {
+            token.starts_with("--replace=")
+                || token.starts_with("--eof=")
+                || token.starts_with("--max-lines=")
+                || token.starts_with("--max-args=")
+                || token.starts_with("--max-procs=")
+                || token.starts_with("--max-chars=")
+                || token.starts_with("--delimiter=")
+                || token.starts_with("--arg-file=")
+                || token.starts_with("--process-slot-var=")
+                || (token.len() > 2
+                    && token.starts_with('-')
+                    && !token.starts_with("--")
+                    && matches!(
+                        token.as_bytes()[1],
+                        b'I' | b'L' | b'n' | b'P' | b's' | b'd' | b'E' | b'a' | b'i'
+                    ))
+        }
+        _ => false,
+    }
+}
+
+fn wrapper_option_takes_no_value(wrapper: &str, token: &str) -> bool {
+    match wrapper {
+        "time" => matches!(
+            token,
+            "-p" | "--portability"
+                | "-a"
+                | "--append"
+                | "-v"
+                | "--verbose"
+                | "-q"
+                | "--quiet"
+                | "--help"
+                | "--version"
+        ),
+        "timeout" => matches!(
+            token,
+            "--foreground" | "--preserve-status" | "-v" | "--verbose"
+        ),
+        "xargs" => matches!(
+            token,
+            "-0" | "--null"
+                | "-r"
+                | "--no-run-if-empty"
+                | "-t"
+                | "--verbose"
+                | "-p"
+                | "--interactive"
+                | "-x"
+                | "--exit"
+                | "-o"
+                | "--open-tty"
+                | "--show-limits"
+                | "--replace"
+                | "--eof"
+                | "--max-lines"
+                | "-i"
+                | "--help"
+                | "--version"
+        ),
+        "nohup" => matches!(token, "--help" | "--version"),
+        _ => false,
+    }
+}
+
 fn transparent_wrapper_command<'a>(wrapper: &str, mut rest: &'a [String]) -> Option<&'a [String]> {
     while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
         let token = token.as_str();
@@ -675,36 +786,12 @@ fn transparent_wrapper_command<'a>(wrapper: &str, mut rest: &'a [String]) -> Opt
             rest = &rest[1..];
             break;
         }
-        let takes_value = match wrapper {
-            "nice" => matches!(token, "-n" | "--adjustment"),
-            "timeout" => matches!(token, "-s" | "--signal" | "-k" | "--kill-after"),
-            _ => false,
-        };
-        let attached = match wrapper {
-            "nice" => {
-                token.starts_with("--adjustment=")
-                    || (token.starts_with("-n") && token.len() > 2)
-                    || token[1..].chars().all(|ch| ch.is_ascii_digit())
-            }
-            "timeout" => {
-                token.starts_with("--signal=")
-                    || token.starts_with("--kill-after=")
-                    || (token.len() > 2 && (token.starts_with("-s") || token.starts_with("-k")))
-            }
-            _ => false,
-        };
-        let no_value = match wrapper {
-            "time" => token == "-p",
-            "timeout" => matches!(
-                token,
-                "--foreground" | "--preserve-status" | "-v" | "--verbose"
-            ),
-            _ => false,
-        };
-        if takes_value {
+        if wrapper_option_takes_value(wrapper, token) {
             rest = rest.get(1..)?;
             rest.first()?;
-        } else if !attached && !no_value {
+        } else if !wrapper_option_is_attached(wrapper, token)
+            && !wrapper_option_takes_no_value(wrapper, token)
+        {
             return None;
         }
         rest = &rest[1..];
@@ -864,6 +951,35 @@ fn sudo_command<'a>(
 /// 仅供 deny/危险判断；allow 与只读判定不消费剥离后的命令。
 pub fn strip_wrappers(argv: &[String]) -> Vec<String> {
     analyze_wrappers(argv).argv.to_vec()
+}
+
+/// deny 与危险判定的剥离视图。完整分析只给一条；遇到不认识的选项时，
+/// 不知道哪个才是被包命令，就把剩余 argv 的每个起点都试一次——宁多勿少。
+pub(crate) fn risk_wrapper_views(argv: &[String]) -> Vec<Vec<String>> {
+    let analysis = analyze_wrappers(argv);
+    let mut views = Vec::with_capacity(analysis.argv.len());
+    if !analysis.complete {
+        for start in 1..analysis.argv.len() {
+            views.push(analysis.argv[start..].to_vec());
+        }
+    }
+    views.push(analysis.argv.to_vec());
+    views
+}
+
+/// 两词前缀只在两个词都描述命令本身时才稳：首词是包装器时前缀描述的是包装器，
+/// 第二词是选项或赋值时前缀描述的是这一次调用的参数。
+pub(crate) fn argv_prefix_is_unstable(argv: &[String]) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "env", "sudo", "nohup", "nice", "time", "timeout", "xargs", "command", "builtin", "exec",
+    ];
+    let Some(first) = argv.first() else {
+        return true;
+    };
+    WRAPPERS.contains(&executable_name(first))
+        || argv
+            .get(1)
+            .is_some_and(|second| second.starts_with('-') || second.contains('='))
 }
 
 /// Find the git subcommand while skipping global options, and refuse the
@@ -1316,10 +1432,66 @@ mod tests {
             (&["timeout", "5s", "make", "clean"], &["make", "clean"]),
             (&["nice", "-n", "10", "git", "push"], &["git", "push"]),
             (&["xargs", "rm"], &["rm"]),
+            // Wrapper options take an operand; the operand is not the command.
+            (
+                &["xargs", "-I", "{}", "rm", "-rf", "{}"],
+                &["rm", "-rf", "{}"],
+            ),
+            (
+                &["xargs", "--replace", "-I", "{}", "rm", "{}"],
+                &["rm", "{}"],
+            ),
+            (
+                &["timeout", "-s", "KILL", "60", "rm", "-rf", "build"],
+                &["rm", "-rf", "build"],
+            ),
+            (
+                &["time", "-o", "t.log", "cargo", "build"],
+                &["cargo", "build"],
+            ),
+            (&["env", "-u", "CI", "git", "push"], &["git", "push"]),
             (&["cargo", "build"], &["cargo", "build"]),
         ];
         for (input, expected) in cases {
             assert_eq!(strip_wrappers(&argv(input)), argv(expected), "{input:?}");
+        }
+        // An unknown option leaves the analysis incomplete; deny/danger still
+        // see every possible command start, so an operand cannot hide it.
+        for input in [
+            &["xargs", "-z", "{}", "rm", "-rf", "build"][..],
+            &["xargs", "-I"][..],
+        ] {
+            assert!(!analyze_wrappers(&argv(input)).complete, "{input:?}");
+        }
+        let views = risk_wrapper_views(&argv(&["xargs", "-z", "{}", "rm", "-rf", "build"]));
+        assert!(
+            views
+                .iter()
+                .any(|view| view.as_slice() == argv(&["rm", "-rf", "build"]).as_slice()),
+            "{views:?}"
+        );
+    }
+
+    #[test]
+    fn two_word_prefixes_are_only_stable_for_plain_commands() {
+        for stable in [
+            &["git", "commit", "-m", "x"][..],
+            &["cargo", "test", "--workspace"][..],
+            &["make", "check"][..],
+            &["make"][..],
+        ] {
+            assert!(!argv_prefix_is_unstable(&argv(stable)), "{stable:?}");
+        }
+        for unstable in [
+            &["timeout", "600", "cargo", "test"][..],
+            &["env", "RUST_LOG=1", "cargo", "run"][..],
+            &["time", "cargo", "build"][..],
+            &["git", "-C", "../lib", "status"][..],
+            &["python3", "-c", "print(1)"][..],
+            &["./scripts/run", "--fast"][..],
+            &["make", "VAR=1", "check"][..],
+        ] {
+            assert!(argv_prefix_is_unstable(&argv(unstable)), "{unstable:?}");
         }
     }
 

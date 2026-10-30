@@ -10,7 +10,7 @@ use crate::sandbox::ExecutionContext;
 use crate::shell::BashAnalysis;
 use crate::shell::argv_is_dangerous;
 use crate::shell::argv_is_readonly;
-use crate::shell::strip_wrappers;
+use crate::shell::risk_wrapper_views;
 use crate::shell::{
     BashFacts, CommandFact, Context, Direction, WordEvaluation, WordValue, analyze_bash_facts,
 };
@@ -43,6 +43,10 @@ pub(crate) struct CallFacts {
     pub(super) sensitive_read: bool,
     pub(super) risk_commands: Vec<CommandFact>,
     pub(super) risk_writes: Vec<WriteTarget>,
+    /// 可解析 Bash 的原文，供逐字会话记忆与升级授权使用；其它工具为空。
+    pub(super) command: Option<String>,
+    /// `disable_sandbox`：脱沙箱运行是另一种权限，普通 `bash(...)` 授权不能覆盖。
+    pub(super) no_sandbox: bool,
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     pub(crate) removing_worktree: bool,
@@ -184,6 +188,7 @@ impl CallFacts {
         let risk_writes = bash_facts
             .as_ref()
             .map_or_else(Vec::new, |facts| write_targets(facts, cwd, execution));
+        let no_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
         CallFacts {
             shell,
             writes,
@@ -194,6 +199,11 @@ impl CallFacts {
                 .as_ref()
                 .map_or_else(Vec::new, |facts| facts.commands.clone()),
             risk_writes,
+            command: (name == "bash")
+                .then_some(shell_command)
+                .flatten()
+                .map(str::to_string),
+            no_sandbox,
             powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),
@@ -220,23 +230,20 @@ impl CallFacts {
         if let Some(cmds) = self.shell.as_ref().and_then(|shell| match shell {
             ShellFacts::Bash(analysis) => analysis.commands(),
             ShellFacts::PowerShellOpaque => None,
-        }) && cmds
-            .iter()
-            .any(|argv| argv_is_dangerous(argv) || argv_is_dangerous(&strip_wrappers(argv)))
-        {
+        }) && cmds.iter().any(|argv| {
+            argv_is_dangerous(argv)
+                || risk_wrapper_views(argv)
+                    .iter()
+                    .any(|view| argv_is_dangerous(view))
+        }) {
             return Some(Hazard { tag: "destructive" });
         }
         if self.risk_commands.iter().any(|command| {
-            // 未知词用不可执行占位符保留位置；只用于 blocklist，不交给角色表或授权。
-            let argv: Vec<_> = command
-                .words
-                .iter()
-                .map(|word| match &word.value {
-                    WordValue::Literal(value) => value.clone(),
-                    WordValue::Unknown => "\0unknown".into(),
-                })
-                .collect();
-            argv_is_dangerous(&argv) || argv_is_dangerous(&strip_wrappers(&argv))
+            let argv = command.risk_argv();
+            argv_is_dangerous(&argv)
+                || risk_wrapper_views(&argv)
+                    .iter()
+                    .any(|view| argv_is_dangerous(view))
         }) {
             return Some(Hazard { tag: "destructive" });
         }

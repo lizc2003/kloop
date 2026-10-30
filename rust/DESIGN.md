@@ -1115,7 +1115,8 @@ The sandbox auto-allow layer is the sandbox/approval coupling — see OS sandbox
 below: a bash call the OS sandbox will contain skips everything beneath this
 layer, while deny rules, sensitive reads, safety checks and explicit ask rules
 keep their say (the ask-rule half is deliberately stricter than cc's
-autoAllowBashIfSandboxed).
+autoAllowBashIfSandboxed). A call carrying `disable_sandbox` is not contained,
+so it never takes this layer.
 
 **Bash 严格授权与局部风险共用真实语法树**（`crates/core/src/shell.rs`、`shell/facts.rs`、`shell/word.rs`，
 tree-sitter-bash）。一次解析保留命令的严格字面/未知参数、词结构与位置、重定向方向/fd/词目标、
@@ -1150,8 +1151,10 @@ heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记�
 `log --output`、`base64 -o` 与超出 `sed -n Np` 查询形式的调用都不算只读。
 独立的危险分类器在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
 包装器（`sudo`、`env`、`timeout`、`nice`、`xargs` 等）的统一分析同时返回剥离后的
-argv、环境/cwd 不确定性与分析是否完整。deny/危险前缀保留近似剥离；嵌套脚本的路径求值
-只消费完整分析。`env` 的赋值、`-u`/`--unset`、`-i`/`--ignore-environment` 以及 sudo 的
+argv、环境/cwd 不确定性与分析是否完整。每个包装器的带操作数选项按自己的语法消费
+（`xargs -I {}`、`timeout -s KILL`、`time -o FILE`）；deny/危险前缀保留近似剥离，
+遇到不认识的选项时对剩余 argv 的每个起点各试一次，allow 与只读判定不消费这套近似。
+嵌套脚本的路径求值只消费完整分析。`env` 的赋值、`-u`/`--unset`、`-i`/`--ignore-environment` 以及 sudo 的
 环境重置都会使内层 home 未知；带操作数的选项按包装器语法消费，嵌套链累积这些效果。
 未知选项、缺失/动态的包装器操作数、动态命令名保留未知写效果，不能因剥离停在操作数上
 就假装没有写入。字面前缀已包含被包命令名时，普通动态参数不会降低整段事实的可靠性，
@@ -1187,9 +1190,12 @@ leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied
 per segment — in a chain every segment must be read-only or allowed, while a
 single denied segment poisons the whole chain; an *unparseable* script has no
 rule form at all (see **Asking** below); `write_file(<glob>)` /
-`edit_file(<glob>)` / `read_file(<glob>)` match the lexically-normalized
-`path`, while `notebook_edit(<glob>)` matches `notebook_path` (both also match
-their cwd-relative form), with `**` globs.
+`edit_file(<glob>)` / `read_file(<glob>)` decide **allow** on the canonical
+target only — an absolute glob against the canonical absolute path, a relative
+glob against the canonical cwd-relative path, so a relative glob never reaches
+outside the cwd — and `notebook_edit(<glob>)` likewise on `notebook_path`;
+deny/ask still match the original spelling as well, so an alias cannot dodge a
+rule. `**` globs are supported.
 
 固定 Bash 输出还要求每个目标匹配 `bash_write(<glob>)`，单独的命令前缀或 whole-tool
 `bash` 不覆盖重定向写入。普通审批同时记命令前缀与规范目标的父目录（如
@@ -1215,26 +1221,37 @@ allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批�
 目录外写入不享有 contained-writes 自动放行，仍可由 bypass 或对应批准放行。
 
 **Asking**: `y` allows once. `a` allows for this session in the current
-workspace; its cache is partitioned by `WorkspaceId` (two-word bash prefix —
-approving `git commit` never covers `git rebase` — or parent directory for file
-writes). A bash script the parser cannot vouch for (a dynamic/input redirect, a
-substitution, an assignment — `cat > probe.go <<'EOF'` is the usual shape) has
-no prefix to key on and is instead remembered **verbatim**, for this session
-only: that exact command text, and only that one. `p` is not offered for it —
-the key is the whole command, so a stored copy could only ever match a
-byte-identical re-run, and a real command carries this run's own test filter and
-package list (measured on one project: 38 such rules on disk, 0 hits between
-them). The prompt echoes `only this exact command text` rather than reprinting
-the command already on screen. Which run was consented to is part of the key: a
-call carrying `disable_sandbox` is a separate entry, so a contained grant never
-covers the escape; and a whole-tool `bash` allow vouches for no opaque script at
-all, since it was written without anyone having read this one. Bash 的原文或规范路径
+workspace; its cache is partitioned by `WorkspaceId`. Bash remembers a two-word
+command prefix — approving `git commit` never covers `git rebase` — but only
+when both words describe the command itself: a wrapper as the first word
+(`timeout`/`env`/`nice`/`xargs`/`sudo`/…) or an option or assignment as the
+second word makes the prefix describe one call's parameters, so those commands
+are remembered **verbatim** instead (`timeout 600 cargo test` never covers
+`timeout 600 git push`), for this session only and with `p` not offered. File
+writes remember the canonical parent directory; a file at the cwd root anchors
+to the canonical cwd, and a parent that is `/` or contains glob metacharacters
+yields no memory at all. A bash script the parser cannot vouch for (a
+dynamic/input redirect, a substitution, an assignment — `cat > probe.go <<'EOF'`
+is the usual shape) has no prefix to key on and is instead remembered
+**verbatim**, for this session only: that exact command text, and only that one.
+`p` is not offered for it — the key is the whole command, so a stored copy could
+only ever match a byte-identical re-run, and a real command carries this run's
+own test filter and package list (measured on one project: 38 such rules on
+disk, 0 hits between them). The prompt echoes `only this exact command text`
+rather than reprinting the command already on screen. Which run was consented to
+is part of the key: a call carrying `disable_sandbox` is a separate consent, so
+a contained grant never covers the escape — for a parseable command that escape
+needs a `sandbox_escalate(...)` rule or a remembered escalation, and neither
+`bash(...)` nor the whole-tool `bash` rule covers it; and a whole-tool `bash`
+allow vouches for no opaque script at all, since it was written without anyone
+having read this one. Bash 的原文或规范路径
 命中敏感读取时直接硬拦截，bypass 与会话批准都不能覆盖。Opaque *PowerShell* 不进入会话记忆：
 manual 下每次询问或匹配 whole-tool allow；bypass 下直接放行。`p`
 allows for the current `ProjectId` across sessions and linked
 worktrees, persisting the suggested rule (for example `bash(cargo build *)`) to
-`~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails, only
-the current call runs and the UI says the grant was not saved. A
+`~/.kloop/projects/v1/<ProjectId>/permissions.json`. If persistence fails — or a
+suggested rule cannot be parsed, in which case `p` is not offered — only the
+current call runs and the UI says the grant was not saved. A
 shared child in the same workspace sees its parent's cache; an isolated
 worktree starts with an empty WorkspaceId partition, while the base partition
 survives the transition. Sub-agents share the session mode/approver and project
@@ -3353,6 +3370,8 @@ disables network), there are two escalation paths:
   approver): the result is annotated with guidance and the model retries
   that one call with `disable_sandbox: true`。重试仍先过权限门；bypass 直接放行，
   不弹审批。其他模式沿用权限判定，实际需要弹出审批时才显示 `[no sandbox]` 标记。
+  可解析命令的这次重试只认 `sandbox_escalate(...)` 或升级会话记忆，普通
+  `bash(...)` 与 whole-tool `bash` 都不能替它放行。
 
 The escalation ask says **what** was refused — `file write`, `network`, or
 `unclassified`, plus the failure line that proves it. A blocked socket and a
@@ -3363,9 +3382,11 @@ why containment was removed.
 
 Escalation consent is **remember-able** at the same granularity bash approvals
 use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`
-rule. 固定文件输出还必须逐个匹配 `sandbox_escalate_write(<glob>)`，会话缓存也包含
-相同写入范围。升级继续记住每个命令（包括只读段），与普通审批跳过只读段的粒度区别保留；
-普通 `bash_write` 与升级写入规则不能互相替代。
+rule. 可解析但两词前缀不描述命令本身的调用（`timeout 600 cargo test`、
+`git -C ../lib status`）改记逐字会话记忆，不提供 `p`。固定文件输出还必须逐个匹配
+`sandbox_escalate_write(<glob>)`，会话缓存也包含相同写入范围。升级继续记住每个命令
+（包括只读段），与普通审批跳过只读段的粒度区别保留；普通 `bash_write` 与升级写入规则
+不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
 A remembered rule is consulted **before** the sandboxed attempt, not after
 it fails: the command runs uncontained from the start and the result says so
 (`[Ran without the sandbox: a remembered sandbox_escalate rule …]`). Consulting

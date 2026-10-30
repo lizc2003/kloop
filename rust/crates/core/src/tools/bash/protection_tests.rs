@@ -254,7 +254,7 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
             .cfg
             .permissions
             .escalate_sandbox("value=$DYNAMIC", None, 0)
-            .await,
+            .await.outcome,
         EscalationOutcome::Approved(_)
     ));
     assert!(

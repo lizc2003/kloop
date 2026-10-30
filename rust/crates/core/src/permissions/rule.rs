@@ -14,7 +14,7 @@ use super::facts::ShellFacts;
 use super::facts::WriteTarget;
 use crate::shell::BashAnalysis;
 use crate::shell::argv_is_readonly;
-use crate::shell::strip_wrappers;
+use crate::shell::risk_wrapper_views;
 
 #[derive(Clone, Debug)]
 pub(super) enum Rule {
@@ -37,6 +37,19 @@ pub(super) enum Rule {
         tokens: Vec<String>,
         wildcard: bool,
     },
+}
+
+/// Allow 方向的路径判定只有一条：绝对 glob 对规范绝对目标，相对 glob 只对 cwd 内的
+/// 规范相对目标。`**` 能跨 `/`，所以相对 glob 不能顺手拿去匹配绝对路径。
+fn glob_allows_path(glob: &GlobMatcher, facts: &PathFacts) -> bool {
+    if Path::new(glob.glob().glob()).is_absolute() {
+        glob.is_match(&facts.normalized)
+    } else {
+        facts
+            .relative
+            .as_deref()
+            .is_some_and(|path| glob.is_match(path))
+    }
 }
 
 impl Rule {
@@ -75,17 +88,23 @@ impl Rule {
         else {
             return false;
         };
-        if rule_tool != tool {
-            return false;
-        }
-        let target = if Path::new(glob.glob().glob()).is_absolute() {
-            Some(facts.normalized.as_path())
-        } else {
-            facts.relative.as_deref()
-        };
-        target.is_some_and(|path| glob.is_match(path))
+        rule_tool == tool && glob_allows_path(glob, facts)
     }
 
+    /// allow 方向与 `bash_write` 同一条口径：只认规范目标。原文别名可能与符号
+    /// 链接父目录的落点不同，不能凭它把外面的写入带进这条授权。
+    pub(super) fn matches_allow_path(&self, tool: &str, facts: &PathFacts) -> bool {
+        match self {
+            Rule::Tool(t) => t == tool,
+            Rule::PathGlob {
+                tool: rule_tool,
+                glob,
+            } => rule_tool == tool && glob_allows_path(glob, facts),
+            Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+        }
+    }
+
+    /// deny/ask 方向反过来兼顾别名：原文或规范目标任一命中都算。
     pub(super) fn matches_path(&self, tool: &str, facts: &PathFacts) -> bool {
         match self {
             Rule::Tool(t) => t == tool,
@@ -220,7 +239,7 @@ pub(super) fn allow_rules_match(allow: &[Rule], name: &str, call: &CallFacts) ->
         // this text, and no layer below can vet its content.
         (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => false,
         (Some(ShellFacts::PowerShellOpaque), _) => allow.iter().any(|rule| rule.matches_tool(name)),
-        (None, Some(path)) => allow.iter().any(|rule| rule.matches_path(name, path)),
+        (None, Some(path)) => allow.iter().any(|rule| rule.matches_allow_path(name, path)),
         (None, None) => allow.iter().any(|rule| rule.matches_tool(name)),
     }
 }
@@ -243,14 +262,25 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
     }
     if call.risk_commands.iter().any(|command| {
         if let Some(argv) = command.argv() {
-            let stripped = strip_wrappers(&argv);
-            return rules.iter().any(|rule| rule.matches_argv(&argv) || rule.matches_argv(&stripped));
+            return rules.iter().any(|rule| {
+                rule.matches_argv(&argv)
+                    || risk_wrapper_views(&argv)
+                        .iter()
+                        .any(|view| rule.matches_argv(view))
+            });
         }
+        let argv = command.risk_argv();
         let prefix = command.literal_prefix();
-        let stripped = strip_wrappers(&prefix);
         rules.iter().any(|rule| {
-            matches!(rule, Rule::BashPrefix { tokens, wildcard: true }
-                if argv_has_prefix(tokens, true, &prefix) || argv_has_prefix(tokens, true, &stripped))
+            rule.matches_argv(&argv)
+                || risk_wrapper_views(&argv)
+                    .iter()
+                    .any(|view| rule.matches_argv(view))
+                || matches!(rule, Rule::BashPrefix { tokens, wildcard: true }
+                    if argv_has_prefix(tokens, true, &prefix)
+                        || risk_wrapper_views(&prefix)
+                            .iter()
+                            .any(|view| argv_has_prefix(tokens, true, view)))
         })
     }) {
         return true;
@@ -262,10 +292,12 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
             )),
             _,
         ) => cmds.iter().any(|argv| {
-            let stripped = strip_wrappers(argv);
-            rules
-                .iter()
-                .any(|r| r.matches_argv(&stripped) || r.matches_argv(argv))
+            rules.iter().any(|r| {
+                r.matches_argv(argv)
+                    || risk_wrapper_views(argv)
+                        .iter()
+                        .any(|view| r.matches_argv(view))
+            })
         }),
         // Opaque scripts cannot be inspected, so content-level Bash/PowerShell
         // rules never decide here. Whole-tool rules were handled above.
