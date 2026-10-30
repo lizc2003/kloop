@@ -646,6 +646,7 @@ pub(crate) struct WrapperAnalysis<'a> {
     pub arguments_unknown: bool,
     pub writes_unknown: bool,
     pub replacements: Vec<ArgumentReplacement<'a>>,
+    pub wrapper_commands: Vec<&'a [String]>,
 }
 
 impl WrapperAnalysis<'_> {
@@ -674,6 +675,7 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
         arguments_unknown: false,
         writes_unknown: false,
         replacements: Vec::new(),
+        wrapper_commands: Vec::new(),
     };
     let mut rest = argv;
     while let Some(first) = rest.first() {
@@ -681,11 +683,21 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
         let next = match wrapper {
             "env" => env_command(&rest[1..], &mut analysis),
             "sudo" => sudo_command(&rest[1..], &mut analysis),
+            // 查询模式不执行后面的名字，不能把它当成被包命令。
+            "command"
+                if rest
+                    .get(1)
+                    .is_some_and(|flag| matches!(flag.as_str(), "-v" | "-V")) =>
+            {
+                break;
+            }
+            "command" => command_command(&rest[1..]),
             "nohup" | "nice" | "time" | "timeout" | "xargs" => {
                 transparent_wrapper_command(wrapper, &rest[1..], &mut analysis)
             }
             _ => break,
         };
+        analysis.wrapper_commands.push(rest);
         rest = match next {
             Some(next) => next,
             None => {
@@ -697,6 +709,17 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
     }
     analysis.argv = rest;
     analysis
+}
+
+fn command_command(mut rest: &[String]) -> Option<&[String]> {
+    while let Some(option) = rest.first().filter(|word| word.starts_with('-')) {
+        match option.as_str() {
+            "-p" => rest = &rest[1..],
+            "--" => return Some(&rest[1..]),
+            _ => return None,
+        }
+    }
+    Some(rest)
 }
 
 /// Options that consume the token after them. A wrapper's operand is not the
@@ -1031,12 +1054,17 @@ pub fn strip_wrappers(argv: &[String]) -> Vec<String> {
     analyze_wrappers(argv).argv.to_vec()
 }
 
-/// deny 与危险判定的剥离视图。语法完整且参数不改写时只给一条；未知选项或参数
-/// 替换时把剩余 argv 的每个起点都试一次。这里只增加风险证据，不生成授权。
+/// deny 与危险判定保留每个已定位的包装器及其命令；只有定位失败时才尝试剩余起点。
+/// 参数替换的未知身份由词事实承载，不能把已定位命令的数据参数猜成另一个命令。
 pub(crate) fn risk_wrapper_views(argv: &[String]) -> Vec<Vec<String>> {
     let analysis = analyze_wrappers(argv);
-    let mut views = Vec::with_capacity(analysis.argv.len());
-    if !analysis.complete || analysis.arguments_unknown {
+    // 每个已定位的包装器本身也可能被显式 deny，继续剥离不能抹掉这份证据。
+    let mut views: Vec<_> = analysis
+        .wrapper_commands
+        .iter()
+        .map(|argv| argv.to_vec())
+        .collect();
+    if !analysis.complete {
         for start in 1..analysis.argv.len() {
             views.push(analysis.argv[start..].to_vec());
         }
@@ -1563,6 +1591,7 @@ mod tests {
                             argv: &input[start..],
                         })
                         .collect(),
+                    wrapper_commands: vec![input.as_slice()],
                 }
             );
         }
@@ -1616,19 +1645,19 @@ mod tests {
 
     #[test]
     fn wrapper_analysis_keeps_environment_effects() {
-        let prefixes: &[&[&str]] = &[
-            &["env", "HOME=/tmp"],
-            &["env", "-u", "HOME"],
-            &["env", "-uHOME"],
-            &["env", "--unset=HOME"],
-            &["env", "-i"],
-            &["sudo"],
-            &["sudo", "-E"],
-            &["sudo", "--preserve-env=HOME"],
-            &["sudo", "-u", "root", "env", "HOME=/tmp"],
-            &["timeout", "5", "/usr/bin/env", "HOME=/tmp"],
+        let prefixes: &[(&[&str], &[usize])] = &[
+            (&["env", "HOME=/tmp"], &[0]),
+            (&["env", "-u", "HOME"], &[0]),
+            (&["env", "-uHOME"], &[0]),
+            (&["env", "--unset=HOME"], &[0]),
+            (&["env", "-i"], &[0]),
+            (&["sudo"], &[0]),
+            (&["sudo", "-E"], &[0]),
+            (&["sudo", "--preserve-env=HOME"], &[0]),
+            (&["sudo", "-u", "root", "env", "HOME=/tmp"], &[0, 3]),
+            (&["timeout", "5", "/usr/bin/env", "HOME=/tmp"], &[0, 2]),
         ];
-        for prefix in prefixes {
+        for (prefix, wrapper_starts) in prefixes {
             let mut input = argv(prefix);
             input.extend(argv(&["bash", "-c", "printf x"]));
             assert_eq!(
@@ -1641,6 +1670,10 @@ mod tests {
                     arguments_unknown: false,
                     writes_unknown: false,
                     replacements: Vec::new(),
+                    wrapper_commands: wrapper_starts
+                        .iter()
+                        .map(|&start| &input[start..])
+                        .collect(),
                 },
                 "{prefix:?}"
             );
@@ -1656,6 +1689,7 @@ mod tests {
                 arguments_unknown: false,
                 writes_unknown: false,
                 replacements: Vec::new(),
+                wrapper_commands: vec![input.as_slice()],
             }
         );
         let input = argv(&["env", "-C", "/tmp", "bash", "-c", "printf x"]);
@@ -1669,6 +1703,7 @@ mod tests {
                 arguments_unknown: false,
                 writes_unknown: false,
                 replacements: Vec::new(),
+                wrapper_commands: vec![input.as_slice()],
             }
         );
         for input in [

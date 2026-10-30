@@ -544,3 +544,87 @@ fn plan244_rewritten_xargs_keeps_unknown_execution_dangerous() {
         assert_eq!(call.hazard("bash").map(|hazard| hazard.tag), Some("destructive"), "{command}");
     }
 }
+
+#[tokio::test]
+async fn plan244_dynamic_wrapper_controls_keep_execution_unknown() {
+    for tail in [
+        "xargs $OPTS bash -c 'marker'",
+        "xargs $OPTS -I marker bash -c 'marker'",
+        "env $OPTS xargs -I marker bash -c 'marker'",
+        "env -u $NAME xargs -I marker bash -c 'marker'",
+        "command $OPTS xargs -I marker bash -c 'marker'",
+        "xargs -I marker bash -c VALUE=\"$SCRIPT\"",
+        "env \"$NAME=$VALUE\" xargs -I marker bash -c 'marker'",
+    ] {
+        let command = format!("printf 'rm -rf build\\n' | {tail}");
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(mode, rules(&[], &["bash(rm *)"], &[]), approver.clone());
+            let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+            assert!(error.contains("deny permission rule"), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan244_replacement_roles_preserve_nonreading_arguments() {
+    for tail in [
+        "touch marker", "mkdir marker", "chmod 644 marker",
+        "touch -r marker notes.txt", "mkdir -m marker notes", "chmod --reference=marker notes.txt",
+        "git commit -m marker", "git commit --message=marker", "git commit -mmarker",
+        "command echo marker", "command -p echo marker",
+        "rg -e marker notes.txt", "rg --glob marker PATTERN notes.txt",
+    ] {
+        let command = format!("printf 'notes.txt\\n' | xargs -I marker {tail}");
+        let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
+        assert_eq!(call.hazard("bash").map(|hazard| hazard.tag), None, "{command}");
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(mode, rules(&[], &["bash(rm *)"], &[]), approver.clone());
+            p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        }
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(&command), 0, false).await.expect(&command);
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1, "{command}");
+        assert!(!asked[0].description.contains("[destructive]"), "{command}");
+    }
+    for command in [
+        "xargs -I command echo literal", "xargs -I marker echo command",
+        "env HOME=\"$DIR\" touch notes.txt",
+    ] {
+        let p = gate(Mode::Bypass, rules(&[], &["bash(command *)"], &[]), ScriptedApprover::new(vec![]));
+        p.check_call("bash", &bash(command), 0, true).await.expect(command);
+    }
+}
+
+#[tokio::test]
+async fn plan244_replacement_roles_keep_reads_and_command_rules() {
+    for tail in [
+        "cat marker", "git commit -F marker", "git commit --file=marker",
+        "rg -f marker notes.txt", "rg marker notes.txt", "command marker",
+        "command cat marker",
+    ] {
+        let command = format!("xargs -I marker {tail}");
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+        let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+    }
+    for (command, deny) in [
+        ("xargs -I marker command echo marker", "bash(echo secret)"),
+        ("xargs -I marker command echo marker", "bash(command *)"),
+        ("xargs -I marker env command echo marker", "bash(command *)"),
+    ] {
+        let p = gate(Mode::Bypass, rules(&[], &[deny], &[]), ScriptedApprover::new(vec![]));
+        let error = p.check_call("bash", &bash(command), 0, true).await.unwrap_err();
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+    }
+}

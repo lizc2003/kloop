@@ -55,6 +55,39 @@ impl ShellWord {
         }
     }
 
+    /// xargs 直接改写 exec 参数，不再经过 shell 展开；已知前后缀仍可区分选项与值。
+    pub fn replaced(argument: &str, marker: &str) -> Self {
+        if marker.is_empty() {
+            return Self::unknown();
+        }
+        let mut word = Self::default();
+        for (index, text) in argument.split(marker).enumerate() {
+            if index > 0 {
+                word.push(PartKind::Unknown, Quoting::Single);
+            }
+            word.push(PartKind::Text(text.into()), Quoting::Single);
+        }
+        word
+    }
+
+    /// 带引号的变量值不会把 env 赋值拆成新选项或命令；数组及未知展开不获此例外。
+    pub fn fixed_assignment(&self) -> Option<String> {
+        let WordEvaluation::Partial(value) = self.evaluate(None) else {
+            return None;
+        };
+        (value
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.is_empty() && !name.contains('\0'))
+            && self.parts.iter().all(|part| match &part.kind {
+                PartKind::Text(_) => true,
+                PartKind::Variable(name) => {
+                    part.quoting == Quoting::Double && !matches!(name.as_str(), "@" | "*")
+                }
+                PartKind::Home | PartKind::Pattern(_) | PartKind::Unknown => false,
+            }))
+        .then_some(value)
+    }
+
     pub fn evaluate(&self, home: Option<&Path>) -> WordEvaluation {
         let mut text = String::new();
         let mut partial = false;

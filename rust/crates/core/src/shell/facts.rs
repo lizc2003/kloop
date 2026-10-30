@@ -75,15 +75,35 @@ impl CommandFact {
     }
 
     fn wrapper_prefix(&self) -> Vec<String> {
-        self.words
-            .iter()
-            .map_while(|word| match word.syntax.evaluate(None) {
-                WordEvaluation::Resolved(value) => Some(value),
+        let mut argv = Vec::new();
+        for word in &self.words {
+            match word.syntax.evaluate(None) {
+                WordEvaluation::Resolved(value) => argv.push(value),
                 // 单独的 {} 不发生 brace expansion；它也是 xargs 的默认替换串。
-                WordEvaluation::Partial(value) if value == "{}" => Some(value),
-                WordEvaluation::Partial(_) | WordEvaluation::Unknown => None,
-            })
-            .collect()
+                WordEvaluation::Partial(value) if value == "{}" => argv.push(value),
+                WordEvaluation::Partial(_) => {
+                    let Some(value) = word.syntax.fixed_assignment() else {
+                        break;
+                    };
+                    argv.push(value);
+                    let wrappers = analyze_wrappers(&argv);
+                    // 只越过 env 控制区中的固定赋值，不能把 -c 正文或其它参数猜成字面词。
+                    let fixed_assignment = wrappers.complete
+                        && wrappers.argv.is_empty()
+                        && !wrappers.arguments_unknown
+                        && wrappers
+                            .wrapper_commands
+                            .last()
+                            .is_some_and(|wrapper| executable_name(&wrapper[0]) == "env");
+                    if !fixed_assignment {
+                        argv.pop();
+                        break;
+                    }
+                }
+                WordEvaluation::Unknown => break,
+            }
+        }
+        argv
     }
 
     /// 未知词保留成不可执行占位符，后面的已知词仍在原位置。只供 deny 与危险判定
@@ -247,7 +267,9 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                         }
                         .into(),
                     );
-                    if wrappers.arguments_unknown {
+                    if wrappers.arguments_unknown
+                        || (dynamic_argv && !wrappers.wrapper_commands.is_empty())
+                    {
                         facts.commands.push(command.rewritten_execution());
                     }
                     facts.commands.push(command);
@@ -278,7 +300,11 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     for (word, argument) in child.words.iter_mut().zip(stripped) {
                         if wrappers.rewrites_argument(argument) {
                             word.value = WordValue::Unknown;
-                            word.syntax = ShellWord::unknown();
+                            word.syntax = match wrappers.replacements.as_slice() {
+                                [replacement] => ShellWord::replaced(argument, replacement.marker),
+                                // 多层替换可能跨越未知片段与已知文本的边界。
+                                _ => ShellWord::unknown(),
+                            };
                         } else {
                             word.value = WordValue::Literal(argument.clone());
                         }

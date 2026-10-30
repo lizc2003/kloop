@@ -7,6 +7,50 @@
 
 use crate::shell::argv_is_readonly;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ReplacementEffects {
+    pub reads: bool,
+    pub dangerous: bool,
+}
+
+impl ReplacementEffects {
+    const UNKNOWN: Self = Self {
+        reads: true,
+        dangerous: true,
+    };
+}
+
+/// 只消费改写后的 exec 参数。NUL 是词事实的未知片段，不是可能传给进程的字节。
+pub(super) fn replacement_effects(argv: &[String]) -> ReplacementEffects {
+    if !argv.iter().any(|word| word.contains('\0')) {
+        return ReplacementEffects::default();
+    }
+    let Some(name) = argv.first().filter(|word| !word.contains('\0')) else {
+        return ReplacementEffects::UNKNOWN;
+    };
+    let paths = match name.rsplit('/').next().unwrap_or(name) {
+        // 参数可改变文本或文件元数据，不会打开目标的正文，也不属于危险短名单。
+        "echo" | "printf" | "touch" | "mkdir" | "chmod" => return ReplacementEffects::default(),
+        "rm" => {
+            return ReplacementEffects {
+                reads: false,
+                dangerous: true,
+            };
+        }
+        "git" if argv.get(1).is_some_and(|word| word == "commit") => {
+            option_paths(&argv[1..], &GIT_COMMIT, Positionals::AllPaths)
+        }
+        _ => path_arguments(argv),
+    };
+    match paths {
+        Some(paths) => ReplacementEffects {
+            reads: paths.iter().any(|path| path.contains('\0')),
+            dangerous: false,
+        },
+        None => ReplacementEffects::UNKNOWN,
+    }
+}
+
 /// `argv` 里会被命令当作文件打开或遍历的值，可能是整 token，也可能是
 /// `--opt=value` / `-Xvalue` 中 `=` 或短选项之后的那一段。
 ///
@@ -272,6 +316,11 @@ fn walk_options<'a>(
     let mut index = 1;
     while let Some(raw) = argv.get(index) {
         let arg = raw.as_str();
+        // 未知首字节可能生成新选项。只有已被已知选项消费的值或 -- 后的路径才能
+        // 按固定角色处理；它们不会经过此处分支。
+        if !options_done && arg.starts_with('\0') {
+            return None;
+        }
         if options_done || !arg.starts_with('-') || arg == "-" {
             match positionals {
                 Positionals::AllPaths => {
@@ -418,6 +467,9 @@ fn parse_find(argv: &[String]) -> Option<Found<'_>> {
         }
     }
     while let Some(arg) = argv.get(index) {
+        if arg.starts_with('\0') {
+            return None;
+        }
         if arg.starts_with('-') || matches!(arg.as_str(), "(" | r"\(" | "!" | r"\!") {
             break;
         }
@@ -520,6 +572,32 @@ fn is_find_optimization_level(arg: &str) -> bool {
     arg.strip_prefix("-O")
         .is_some_and(|level| !level.is_empty() && level.chars().all(|c| c.is_ascii_digit()))
 }
+
+const GIT_COMMIT: Spec = Spec {
+    short: |flag| match flag {
+        'm' => Some(Operand::Literal),
+        'F' => Some(Operand::Path),
+        'a' | 'q' | 'v' | 's' => Some(Operand::None),
+        _ => None,
+    },
+    long: |flag| match flag {
+        "message" | "author" | "date" | "cleanup" => Some(Operand::Literal),
+        "file" | "pathspec-from-file" => Some(Operand::Path),
+        "all"
+        | "quiet"
+        | "verbose"
+        | "signoff"
+        | "amend"
+        | "no-edit"
+        | "allow-empty"
+        | "allow-empty-message"
+        | "no-verify"
+        | "pathspec-file-nul" => Some(Operand::None),
+        _ => None,
+    },
+    short_operands: ShortOperands::AttachedOrNext,
+    digits_are_context: false,
+};
 
 const GREP: Spec = Spec {
     short: grep_short,

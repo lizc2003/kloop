@@ -627,8 +627,18 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
             rules(&[], &[], &["bash_write(/etc/**)"]),
             approver.clone(),
         );
-        p.check_call("bash", &bash(command), 0, true).await.unwrap();
-        assert_eq!(approver.ask_count(), 1, "{command}");
+        let result = p.check_call("bash", &bash(command), 0, true).await;
+        if matches!(command,
+            "env $CMD file" | "env FOO=1 $CMD file" | "env -u $V cat file"
+            | "sudo -u $USER cat file" | "timeout $SECONDS cat file") {
+            // 包装器控制无法定位时，未知读取在写入审批之前硬拒绝。
+            let error = result.expect_err(command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(approver.ask_count(), 1, "{command}");
+        }
     }
     for command in [
         "env bash -c 'cat .env' \"$ARG\"",
