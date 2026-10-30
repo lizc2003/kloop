@@ -111,6 +111,8 @@ pub(crate) struct BashFacts {
     pub literal_inputs: Vec<LiteralInput>,
     pub unknown: Vec<String>,
     pub reliable: bool,
+    /// 语法仍是完整的字面命令，但包装器带未知效果：升级只可逐字记忆，不能退到通配。
+    pub verbatim_escalation: bool,
 }
 
 pub(crate) fn analyze(script: &str) -> BashFacts {
@@ -125,6 +127,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
         literal_inputs: Vec::new(),
         unknown: Vec::new(),
         reliable: false,
+        verbatim_escalation: false,
     };
     if src.len() > MAX_SCRIPT_BYTES {
         facts.unknown.push("script limit".into());
@@ -177,6 +180,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
     let strict = word_only_commands_sequence(&tree, src);
     let mut nested_analyses = Vec::new();
     let mut joined_words = false;
+    let mut wrapper_effects_unknown = false;
     for node in nodes {
         let context = context(node, depth, cwd_unknown, home_unknown);
         match node.kind() {
@@ -223,6 +227,9 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     facts.commands.push(command);
                     continue;
                 }
+                let unknown_effects = wrappers.arguments_unknown || wrappers.writes_unknown;
+                wrapper_effects_unknown |= unknown_effects;
+                facts.reliable &= !unknown_effects;
                 let stripped = wrappers.argv;
                 // 风险事实可分析已知脚本及其后的位置参数；严格授权仍要求完整 argv。
                 let inner = stripped.get(..3).and_then(extract_wrapped_script);
@@ -241,10 +248,14 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                             || stripped
                                 .first()
                                 .is_some_and(|shell| executable_name(shell) == "zsh");
-                        let nested_home_unknown =
-                            home_unknown || startup_unknown || wrappers.environment_unknown;
-                        let nested_cwd_unknown =
-                            cwd_unknown || startup_unknown || wrappers.cwd_unknown;
+                        let nested_home_unknown = home_unknown
+                            || startup_unknown
+                            || wrappers.environment_unknown
+                            || wrappers.arguments_unknown;
+                        let nested_cwd_unknown = cwd_unknown
+                            || startup_unknown
+                            || wrappers.cwd_unknown
+                            || wrappers.arguments_unknown;
                         if nested_home_unknown || nested_cwd_unknown {
                             for command in &mut nested.commands {
                                 command.context.home_unknown |= nested_home_unknown;
@@ -256,6 +267,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                             }
                         }
                         nested_analyses.push((argv.clone(), nested.analysis.clone()));
+                        wrapper_effects_unknown |= nested.verbatim_escalation;
                         facts.reliable &= nested.reliable;
                         facts.commands.extend(nested.commands);
                         facts.redirects.extend(nested.redirects);
@@ -372,6 +384,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
         redirect.context.home_unknown |= home_unknown;
     }
     // 严格白名单没有建模跨节点续接；局部事实可以合并，但不能因此扩大授权。
+    facts.verbatim_escalation = wrapper_effects_unknown && !joined_words && strict.is_some();
     if facts.reliable
         && !joined_words
         && let Some((commands, paths)) = strict

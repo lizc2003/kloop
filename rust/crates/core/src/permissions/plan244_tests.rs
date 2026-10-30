@@ -346,3 +346,98 @@ async fn plan244_exact_escalation_rule_still_matches_verbatim_shapes() {
     assert!(!p.sandbox_escalation_remembered("timeout 600 cargo build"));
     assert_eq!(approver.ask_count(), 0);
 }
+
+fn plan244_effectful_wrappers() -> [&'static str; 4] {
+    [
+        "printf x | xargs -I marker",
+        "printf x | xargs --replace=marker",
+        "/usr/bin/time -o timing.log",
+        "/usr/bin/time --output=timing.log",
+    ]
+}
+
+#[tokio::test]
+async fn plan244_effectful_wrappers_keep_nested_deny_and_danger() {
+    for wrapper in plan244_effectful_wrappers() {
+        let command = format!("{wrapper} bash -c 'rm -rf build'");
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Bypass, rules(&[], &["bash(rm *)"], &[]), approver.clone());
+        let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(&command), 0, true).await.unwrap();
+        let asked = approver.asked();
+        assert_eq!(asked.len(), 1, "{command}");
+        assert!(asked[0].description.contains("[destructive]"), "{command}");
+
+        let command = format!("{wrapper} bash -c 'git push'");
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &["bash(git push *)"]), approver.clone());
+        p.check_call("bash", &bash(&command), 0, true).await.unwrap();
+        assert_eq!(approver.ask_count(), 1, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn plan244_effectful_wrappers_keep_nested_sensitive_reads() {
+    for wrapper in plan244_effectful_wrappers() {
+        let command = format!("{wrapper} bash -c 'cat \"$HOME/.bashrc\"'");
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), approver.clone());
+        let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn plan244_effectful_wrappers_never_remember_blanket_escalation() {
+    let commands = plan244_effectful_wrappers()
+        .into_iter()
+        .map(|wrapper| format!("{wrapper} cargo test"))
+        .chain(["bash -c '/usr/bin/time -o timing.log cargo test'".into()]);
+    for command in commands {
+        let different = command.replace("cargo test", "cargo build");
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let writer = ScriptedWriter::succeeding();
+        let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+        assert_eq!(p.escalate_sandbox(&command, None, 0).await.outcome,
+            EscalationOutcome::Approved(EscalationApproval::User));
+        let asked = approver.asked();
+        assert_eq!(asked[0].approval_scopes, vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession]);
+        assert_eq!(asked[0].remember_rules, Some(vec!["only this exact command text".into()]));
+        assert!(p.sandbox_escalation_remembered(&command), "{command}");
+        assert!(!p.sandbox_escalation_remembered(&different), "{command}");
+        assert!(!p.sandbox_escalation_remembered("make install"), "{command}");
+        assert!(ok(&p, "bash", json!({"command": command, "disable_sandbox": true})).await);
+        assert_eq!(approver.ask_count(), 1, "{command}");
+        assert!(!ok(&p, "bash", json!({"command": different, "disable_sandbox": true})).await);
+        assert_eq!(approver.ask_count(), 2, "{command}");
+        assert!(writer.calls.lock().unwrap().is_empty());
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        assert!(ok(&p, "bash", json!({"command": command, "disable_sandbox": true})).await);
+        assert!(p.sandbox_escalation_remembered(&command), "{command}");
+        assert!(!p.sandbox_escalation_remembered(&different), "{command}");
+        assert!(!p.sandbox_escalation_remembered("make install"), "{command}");
+        assert_eq!(approver.ask_count(), 1, "{command}");
+    }
+}
+
+#[tokio::test]
+async fn plan244_effectful_wrappers_keep_containment_consents_separate() {
+    for wrapper in plan244_effectful_wrappers() {
+        let command = format!("{wrapper} cargo test");
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let p = gate(Mode::Manual, rules(&["bash"], &[], &[]), approver.clone());
+        assert!(ok(&p, "bash", bash(&command)).await);
+        assert_eq!(approver.ask_count(), 1, "{command}: whole-tool allow cannot cover unknown effects");
+        assert!(!p.sandbox_escalation_remembered(&command), "{command}");
+        assert!(!ok(&p, "bash", json!({"command": command, "disable_sandbox": true})).await);
+        assert_eq!(approver.ask_count(), 2, "{command}");
+    }
+}

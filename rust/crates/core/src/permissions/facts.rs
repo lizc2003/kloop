@@ -47,6 +47,7 @@ pub(crate) struct CallFacts {
     pub(super) command: Option<String>,
     /// `disable_sandbox`：脱沙箱运行是另一种权限，普通 `bash(...)` 授权不能覆盖。
     pub(super) no_sandbox: bool,
+    pub(super) verbatim_escalation: bool,
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     pub(crate) removing_worktree: bool,
@@ -204,6 +205,9 @@ impl CallFacts {
                 .flatten()
                 .map(str::to_string),
             no_sandbox,
+            verbatim_escalation: bash_facts
+                .as_ref()
+                .is_some_and(|facts| facts.verbatim_escalation),
             powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),

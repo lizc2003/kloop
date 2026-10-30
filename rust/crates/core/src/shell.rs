@@ -632,9 +632,12 @@ pub fn argv_is_dangerous(argv: &[String]) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WrapperAnalysis<'a> {
     pub argv: &'a [String],
+    /// 选项语法完整，被包命令的位置已知；不代表参数或写效果没有变化。
     pub complete: bool,
     pub environment_unknown: bool,
     pub cwd_unknown: bool,
+    pub arguments_unknown: bool,
+    pub writes_unknown: bool,
 }
 
 pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
@@ -643,6 +646,8 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
         complete: true,
         environment_unknown: false,
         cwd_unknown: false,
+        arguments_unknown: false,
+        writes_unknown: false,
     };
     let mut rest = argv;
     while let Some(first) = rest.first() {
@@ -680,7 +685,7 @@ fn wrapper_option_takes_value(wrapper: &str, token: &str) -> bool {
         // `--max-lines`) only take an operand when it is attached with `=`.
         "xargs" => matches!(
             token,
-            "--max-args"
+            "-I" | "--max-args"
                 | "-n"
                 | "--max-procs"
                 | "-P"
@@ -714,7 +719,8 @@ fn wrapper_option_is_attached(wrapper: &str, token: &str) -> bool {
                 || (token.len() > 2 && (token.starts_with("-o") || token.starts_with("-f")))
         }
         "xargs" => {
-            token.starts_with("--eof=")
+            token.starts_with("--replace=")
+                || token.starts_with("--eof=")
                 || token.starts_with("--max-lines=")
                 || token.starts_with("--max-args=")
                 || token.starts_with("--max-procs=")
@@ -727,7 +733,7 @@ fn wrapper_option_is_attached(wrapper: &str, token: &str) -> bool {
                     && !token.starts_with("--")
                     && matches!(
                         token.as_bytes()[1],
-                        b'L' | b'n' | b'P' | b's' | b'd' | b'E' | b'a'
+                        b'I' | b'L' | b'n' | b'P' | b's' | b'd' | b'E' | b'a' | b'i'
                     ))
         }
         _ => false,
@@ -766,8 +772,10 @@ fn wrapper_option_takes_no_value(wrapper: &str, token: &str) -> bool {
                 | "-o"
                 | "--open-tty"
                 | "--show-limits"
+                | "--replace"
                 | "--eof"
                 | "--max-lines"
+                | "-i"
                 | "--help"
                 | "--version"
         ),
@@ -800,10 +808,8 @@ fn transparent_wrapper_command<'a>(
             break;
         }
         if wrapper == "xargs" && xargs_replaces_arguments(token) {
-            // The replacement string is substituted into every later argument,
-            // including text handed to a nested shell. Those words are no
-            // longer the command's literals; keep the analysis incomplete.
-            return None;
+            // 替换会改变内层脚本；仍定位并采集其风险，但不能拿字面词生成授权。
+            analysis.arguments_unknown = true;
         }
         if wrapper == "xargs" && token.starts_with("--process-slot-var=") {
             // GNU xargs sets this variable per child, overriding whatever the
@@ -811,9 +817,8 @@ fn transparent_wrapper_command<'a>(
             analysis.environment_unknown = true;
         }
         if wrapper == "time" && time_writes_a_report(token) {
-            // `time -o FILE` writes the timing report itself; stripping the
-            // wrapper would drop that write from the facts.
-            return None;
+            // 报告由包装器自身写入，不在内层脚本的重定向里。
+            analysis.writes_unknown = true;
         }
         if wrapper_option_takes_value(wrapper, token) {
             rest = rest.get(1..)?;
@@ -982,12 +987,12 @@ pub fn strip_wrappers(argv: &[String]) -> Vec<String> {
     analyze_wrappers(argv).argv.to_vec()
 }
 
-/// deny 与危险判定的剥离视图。完整分析只给一条；遇到不认识的选项时，
-/// 不知道哪个才是被包命令，就把剩余 argv 的每个起点都试一次——宁多勿少。
+/// deny 与危险判定的剥离视图。语法完整且参数不改写时只给一条；未知选项或参数
+/// 替换时把剩余 argv 的每个起点都试一次。这里只增加风险证据，不生成授权。
 pub(crate) fn risk_wrapper_views(argv: &[String]) -> Vec<Vec<String>> {
     let analysis = analyze_wrappers(argv);
     let mut views = Vec::with_capacity(analysis.argv.len());
-    if !analysis.complete {
+    if !analysis.complete || analysis.arguments_unknown {
         for start in 1..analysis.argv.len() {
             views.push(analysis.argv[start..].to_vec());
         }
@@ -1471,18 +1476,44 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(strip_wrappers(&argv(input)), argv(expected), "{input:?}");
         }
-        // Replacement and report-writing options change what the remaining
-        // words mean or write on their own: the analysis stays incomplete so
-        // the facts keep the unknown effects, while deny/danger still try every
-        // possible command start.
         for input in [
             &["xargs", "-z", "{}", "rm", "-rf", "build"][..],
             &["xargs", "-I"][..],
-            &["xargs", "-I", "{}", "rm", "-rf", "{}"][..],
-            &["xargs", "--replace", "-I", "{}", "rm", "{}"][..],
-            &["time", "-o", "t.log", "cargo", "build"][..],
         ] {
             assert!(!analyze_wrappers(&argv(input)).complete, "{input:?}");
+        }
+        for (input, skipped, arguments_unknown, writes_unknown) in [
+            (
+                &["xargs", "-I", "{}", "rm", "-rf", "{}"][..],
+                3,
+                true,
+                false,
+            ),
+            (
+                &["xargs", "--replace", "-I", "{}", "rm", "{}"][..],
+                4,
+                true,
+                false,
+            ),
+            (
+                &["time", "-o", "t.log", "cargo", "build"][..],
+                3,
+                false,
+                true,
+            ),
+        ] {
+            let input = argv(input);
+            assert_eq!(
+                analyze_wrappers(&input),
+                WrapperAnalysis {
+                    argv: &input[skipped..],
+                    complete: true,
+                    environment_unknown: false,
+                    cwd_unknown: false,
+                    arguments_unknown,
+                    writes_unknown,
+                }
+            );
         }
         for (input, expected) in [
             (
@@ -1556,6 +1587,8 @@ mod tests {
                     complete: true,
                     environment_unknown: true,
                     cwd_unknown: false,
+                    arguments_unknown: false,
+                    writes_unknown: false,
                 },
                 "{prefix:?}"
             );
@@ -1568,6 +1601,8 @@ mod tests {
                 complete: true,
                 environment_unknown: false,
                 cwd_unknown: false,
+                arguments_unknown: false,
+                writes_unknown: false,
             }
         );
         let input = argv(&["env", "-C", "/tmp", "bash", "-c", "printf x"]);
@@ -1578,6 +1613,8 @@ mod tests {
                 complete: true,
                 environment_unknown: true,
                 cwd_unknown: true,
+                arguments_unknown: false,
+                writes_unknown: false,
             }
         );
         for input in [

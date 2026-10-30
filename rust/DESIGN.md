@@ -1151,12 +1151,14 @@ heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记�
 `log --output`、`base64 -o` 与超出 `sed -n Np` 查询形式的调用都不算只读。
 独立的危险分类器在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
 包装器（`sudo`、`env`、`timeout`、`nice`、`xargs` 等）的统一分析同时返回剥离后的
-argv、环境/cwd 不确定性与分析是否完整。每个包装器的带操作数选项按自己的语法消费
-（`xargs -n`、`timeout -s KILL`）；会改写参数或自带写入的选项让分析保持不完整，
-事实层保留未知效果（`xargs -I` 的替换串会进入后面每个参数，`time -o` 自己写报告文件），
-`xargs --process-slot-var=` 则向内层传播环境不确定性。deny/危险前缀保留近似剥离，
-遇到不认识的选项时对剩余 argv 的每个起点各试一次，allow 与只读判定不消费这套近似。
-嵌套脚本的路径求值只消费完整分析。`env` 的赋值、`-u`/`--unset`、`-i`/`--ignore-environment` 以及 sudo 的
+argv、环境/cwd 不确定性、参数改写、包装器自带未知写入与选项语法是否完整。完整只表示
+能定位被包命令，不保证没有未知效果。每个包装器的带操作数选项按自己的语法消费
+（`xargs -I marker`、`timeout -s KILL`、`time -o FILE`）；`xargs -I` 改写参数、
+`time -o` 自己写报告文件，都保留未知写效果，但仍采集内层字面 `-c` 脚本的命令和重定向，
+让 deny、ask、敏感读取和危险判定继续生效。参数可能被替换时，内层 home/cwd 也按未知处理；
+`xargs --process-slot-var=` 则向内层传播环境不确定性。未知效果不能生成 allow、只读、
+并发或前缀授权。deny/危险前缀在未知选项或参数改写时对剩余 argv 的每个起点各试一次，
+allow 与只读判定不消费这套近似。`env` 的赋值、`-u`/`--unset`、`-i`/`--ignore-environment` 以及 sudo 的
 环境重置都会使内层 home 未知；带操作数的选项按包装器语法消费，嵌套链累积这些效果。
 未知选项、缺失/动态的包装器操作数、动态命令名保留未知写效果，不能因剥离停在操作数上
 就假装没有写入。字面前缀已包含被包命令名时，普通动态参数不会降低整段事实的可靠性，
@@ -3385,7 +3387,10 @@ why containment was removed.
 Escalation consent is **remember-able** at the same granularity bash approvals
 use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`
 rule. 可解析但两词前缀不描述命令本身的调用（`timeout 600 cargo test`、
-`git -C ../lib status`）改记逐字会话记忆，不提供 `p`。固定文件输出还必须逐个匹配
+`git -C ../lib status`）改记逐字会话记忆，不提供 `p`。字面命令形状完整、但因为
+`xargs -I` 或 `time -o` 的未知效果成为 opaque 的调用（含嵌套形式）同样只记整条原文，
+不退成通配升级，不参与持久前缀规则匹配；主动 `disable_sandbox` 与失败后的升级共用
+这份逐字升级键，普通沙箱内批准仍是另一种同意。固定文件输出还必须逐个匹配
 `sandbox_escalate_write(<glob>)`，会话缓存也包含相同写入范围。升级继续记住每个命令
 （包括只读段），与普通审批跳过只读段的粒度区别保留；普通 `bash_write` 与升级写入规则
 不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
@@ -3396,7 +3401,7 @@ it only at the denial would save the question but still pay for the contained
 run — which is the expensive half, the one that compiles the test binary and
 binds the port before finding out it may not. It is deliberately not a `bash(...)` rule: *may run* and *may run
 uncontained* are different permissions, so neither form matches the other's
-check. An opaque script (an assignment, a substitution) cannot be keyed on at
+check. Other opaque scripts (an assignment, a substitution) cannot be keyed on at
 all here, so its `a` is blanket — *every* sandbox escalation for the rest of this
 workspace session, said in as many words on the prompt, session-only and never
 persisted. That is wider than the ordinary gate's verbatim memory on purpose:

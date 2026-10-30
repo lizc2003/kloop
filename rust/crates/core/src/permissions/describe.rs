@@ -8,7 +8,7 @@ use super::facts::CallFacts;
 use super::facts::PathFacts;
 use super::facts::ShellFacts;
 use crate::shell::BashAnalysis;
-use crate::shell::analyze_bash;
+use crate::shell::analyze_bash_facts;
 use crate::shell::argv_is_readonly;
 use crate::shell::argv_prefix_is_unstable;
 use crate::tools::Builtin;
@@ -51,10 +51,20 @@ pub(super) const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this 
 /// Escalation consent is remembered at the same granularity the ordinary gate
 /// uses for bash — a two-word command prefix per segment — but under its own
 /// `sandbox_escalate(...)` rule, because "may run" and "may run uncontained"
-/// are different permissions. `None` = opaque script or a token that would
-/// corrupt a rule string, i.e. not remember-able.
+/// are different permissions. 已定位但带未知效果的包装器只记原文，不让未知效果
+/// 进入持久规则匹配；其它 opaque 脚本或无法表示的前缀返回 `None`。
 pub(super) fn escalation_remember_payload(command: &str, cwd: &Path) -> Option<Remember> {
-    let analysis = analyze_bash(command);
+    let facts = analyze_bash_facts(command);
+    if facts.verbatim_escalation {
+        return Some(verbatim_remember(
+            "sandbox_escalate",
+            command.trim(),
+            /*no_sandbox*/ false,
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    let analysis = facts.analysis;
     if cfg!(windows) && !analysis.writes().is_empty() {
         return None;
     }

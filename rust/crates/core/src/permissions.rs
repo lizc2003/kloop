@@ -791,10 +791,10 @@ impl Permissions {
         // 12. Session cache. A `disable_sandbox` call asks about a different
         // permission — running uncontained — so neither a contained run's
         // `bash(...)` rules nor its session key may answer it; only escalation
-        // consent can. An opaque script keeps its own verbatim key, which is
-        // already spelled per containment ([`remember_payload`]).
+        // consent can. 已定位但带未知效果的包装器复用升级的逐字键；其它 opaque
+        // 脚本仍用按 containment 分开的普通逐字键（[`remember_payload`]）。
         let opaque_bash = matches!(call.shell, Some(ShellFacts::Bash(BashAnalysis::Opaque)));
-        let escalation_memory = call.no_sandbox && !opaque_bash;
+        let escalation_memory = call.no_sandbox && (!opaque_bash || call.verbatim_escalation);
         let remember = if escalation_memory {
             call.command
                 .as_deref()
@@ -986,8 +986,8 @@ impl Permissions {
             return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Bypass));
         }
         // A remembered escalation answers before the ask, exactly as a durable
-        // allow rule does for the ordinary gate. 固定输出还需写入范围；opaque
-        // 只能使用本工作区会话的通配升级同意，不产生持久规则。
+        // allow rule does for the ordinary gate. 固定输出还需写入范围；已定位但
+        // 带未知效果的包装器只记原文，其余 opaque 仍用本工作区会话的通配同意。
         let remember = escalation_remember_payload(command, self.identity.cwd());
         if self.blanket_escalation_granted()
             || remember
@@ -1014,8 +1014,7 @@ impl Permissions {
                 &describe_denial(denial),
             )),
             approval_scopes: approval_scopes.clone(),
-            // Shown under the remembering choices. An opaque script has no rule
-            // to echo, and leaving it blank would read as "just this command".
+            // 无法逐字记忆的 opaque 脚本必须明示通配范围，留白会被读成“只记这条”。
             remember_rules: Some(remember.as_ref().map_or_else(
                 || vec![BLANKET_ESCALATION_RULE.to_string()],
                 |remember| remember.echo.clone(),
