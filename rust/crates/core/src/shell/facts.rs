@@ -29,6 +29,8 @@ pub(crate) struct Context {
     pub cwd_unknown: bool,
     /// 有环境赋值或未建模的 shell 状态变更时，不拿启动环境推算展开。
     pub home_unknown: bool,
+    /// xargs 在执行前改写了词；未知位置的命令、参数不能按字面风险排除。
+    pub argument_rewrite: bool,
     /// 嵌套 -c 的范围属于它自己的源字符串，不能拿来裁外层原文。
     pub script_depth: u8,
 }
@@ -41,6 +43,16 @@ pub(crate) struct CommandFact {
 }
 
 impl CommandFact {
+    fn rewritten_execution(&self) -> Self {
+        let mut command = self.clone();
+        command.words.truncate(1);
+        command.words[0].value = WordValue::Unknown;
+        command.words[0].syntax = ShellWord::unknown();
+        command.context.argument_rewrite = true;
+        command.context.script_depth += 1;
+        command
+    }
+
     pub fn argv(&self) -> Option<Vec<String>> {
         self.words
             .iter()
@@ -58,6 +70,18 @@ impl CommandFact {
             .map_while(|word| match &word.value {
                 WordValue::Literal(value) => Some(value.clone()),
                 WordValue::Unknown => None,
+            })
+            .collect()
+    }
+
+    fn wrapper_prefix(&self) -> Vec<String> {
+        self.words
+            .iter()
+            .map_while(|word| match word.syntax.evaluate(None) {
+                WordEvaluation::Resolved(value) => Some(value),
+                // 单独的 {} 不发生 brace expansion；它也是 xargs 的默认替换串。
+                WordEvaluation::Partial(value) if value == "{}" => Some(value),
+                WordEvaluation::Partial(_) | WordEvaluation::Unknown => None,
             })
             .collect()
     }
@@ -206,12 +230,11 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                     range: node.byte_range(),
                     context,
                 };
-                let argv = command.argv();
-                let dynamic_argv = argv.is_none();
-                let argv = argv.unwrap_or_else(|| {
+                let argv = command.wrapper_prefix();
+                let dynamic_argv = argv.len() != command.words.len();
+                if dynamic_argv {
                     facts.unknown.push("dynamic argument".into());
-                    command.literal_prefix()
-                });
+                }
                 let wrappers = analyze_wrappers(&argv);
                 // 剥离成功后仍有命令名，普通动态参数不等于未知执行体。
                 if !wrappers.complete || (dynamic_argv && wrappers.argv.is_empty()) {
@@ -224,6 +247,9 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                         }
                         .into(),
                     );
+                    if wrappers.arguments_unknown {
+                        facts.commands.push(command.rewritten_execution());
+                    }
                     facts.commands.push(command);
                     continue;
                 }
@@ -231,13 +257,39 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                 wrapper_effects_unknown |= unknown_effects;
                 facts.reliable &= !unknown_effects;
                 let stripped = wrappers.argv;
+                let rewritten_words = wrappers.arguments_unknown
+                    && stripped.iter().any(|word| wrappers.rewrites_argument(word));
+                let shell = stripped
+                    .first()
+                    .is_some_and(|name| matches!(executable_name(name), "sh" | "bash" | "zsh"));
+                if wrappers.rewrites_wrapper()
+                    || (wrappers.arguments_unknown && dynamic_argv)
+                    || (shell && rewritten_words)
+                {
+                    // 替换能改变包装器选项或给 -c 注入语法，整个执行体均未知。
+                    // 不能继续把替换前的脚本解析成“实际会执行”的字面命令。
+                    facts.commands.push(command.rewritten_execution());
+                    facts.commands.push(command);
+                    continue;
+                }
+                if rewritten_words {
+                    let mut child = command.clone();
+                    child.words.drain(..argv.len() - stripped.len());
+                    for (word, argument) in child.words.iter_mut().zip(stripped) {
+                        if wrappers.rewrites_argument(argument) {
+                            word.value = WordValue::Unknown;
+                            word.syntax = ShellWord::unknown();
+                        } else {
+                            word.value = WordValue::Literal(argument.clone());
+                        }
+                    }
+                    child.context.argument_rewrite = true;
+                    child.context.script_depth += 1;
+                    facts.commands.push(child);
+                }
                 // 风险事实可分析已知脚本及其后的位置参数；严格授权仍要求完整 argv。
                 let inner = stripped.get(..3).and_then(extract_wrapped_script);
-                if stripped
-                    .first()
-                    .is_some_and(|name| matches!(executable_name(name), "sh" | "bash" | "zsh"))
-                    && inner.is_none()
-                {
+                if shell && inner.is_none() {
                     facts.reliable &= !dynamic_argv;
                     facts.unknown.push("unsupported shell wrapper".into());
                 }

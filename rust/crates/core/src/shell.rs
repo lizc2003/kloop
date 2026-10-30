@@ -628,6 +628,13 @@ pub fn argv_is_dangerous(argv: &[String]) -> bool {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ArgumentReplacement<'a> {
+    pub marker: &'a str,
+    /// 替换只作用于这条 xargs 后面的参数，不能污染它自己的选项操作数。
+    pub argv: &'a [String],
+}
+
 /// 包装器剥离与执行上下文共用一份分析；未知选项不能被猜成无操作数开关。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WrapperAnalysis<'a> {
@@ -638,6 +645,24 @@ pub(crate) struct WrapperAnalysis<'a> {
     pub cwd_unknown: bool,
     pub arguments_unknown: bool,
     pub writes_unknown: bool,
+    pub replacements: Vec<ArgumentReplacement<'a>>,
+}
+
+impl WrapperAnalysis<'_> {
+    pub fn rewrites_argument(&self, argument: &str) -> bool {
+        self.replacements
+            .iter()
+            .any(|replacement| argument.contains(replacement.marker))
+    }
+
+    pub fn rewrites_wrapper(&self) -> bool {
+        self.replacements.iter().any(|replacement| {
+            let consumed = replacement.argv.len() - self.argv.len();
+            replacement.argv[..consumed]
+                .iter()
+                .any(|argument| argument.contains(replacement.marker))
+        })
+    }
 }
 
 pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
@@ -648,6 +673,7 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
         cwd_unknown: false,
         arguments_unknown: false,
         writes_unknown: false,
+        replacements: Vec::new(),
     };
     let mut rest = argv;
     while let Some(first) = rest.first() {
@@ -799,8 +825,9 @@ fn time_writes_a_report(token: &str) -> bool {
 fn transparent_wrapper_command<'a>(
     wrapper: &str,
     mut rest: &'a [String],
-    analysis: &mut WrapperAnalysis<'_>,
+    analysis: &mut WrapperAnalysis<'a>,
 ) -> Option<&'a [String]> {
+    let replacement_start = analysis.replacements.len();
     while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
         let token = token.as_str();
         if token == "--" {
@@ -808,8 +835,22 @@ fn transparent_wrapper_command<'a>(
             break;
         }
         if wrapper == "xargs" && xargs_replaces_arguments(token) {
-            // 替换会改变内层脚本；仍定位并采集其风险，但不能拿字面词生成授权。
             analysis.arguments_unknown = true;
+            let (marker, argv) = match token {
+                "-I" => (rest.get(1)?.as_str(), &rest[2..]),
+                "-i" | "--replace" => ("{}", &rest[1..]),
+                _ => (
+                    token
+                        .strip_prefix("--replace=")
+                        .or_else(|| token.strip_prefix("-I"))
+                        .or_else(|| token.strip_prefix("-i"))?,
+                    &rest[1..],
+                ),
+            };
+            analysis.replacements.truncate(replacement_start);
+            analysis
+                .replacements
+                .push(ArgumentReplacement { marker, argv });
         }
         if wrapper == "xargs" && token.starts_with("--process-slot-var=") {
             // GNU xargs sets this variable per child, overriding whatever the
@@ -840,6 +881,9 @@ fn transparent_wrapper_command<'a>(
             return None;
         }
         rest = &rest[1..];
+    }
+    if let Some(replacement) = analysis.replacements.get_mut(replacement_start) {
+        replacement.argv = rest;
     }
     Some(rest)
 }
@@ -1482,23 +1526,23 @@ mod tests {
         ] {
             assert!(!analyze_wrappers(&argv(input)).complete, "{input:?}");
         }
-        for (input, skipped, arguments_unknown, writes_unknown) in [
+        for (input, skipped, replacement_starts, writes_unknown) in [
             (
                 &["xargs", "-I", "{}", "rm", "-rf", "{}"][..],
                 3,
-                true,
+                &[3][..],
                 false,
             ),
             (
                 &["xargs", "--replace", "-I", "{}", "rm", "{}"][..],
                 4,
-                true,
+                &[4][..],
                 false,
             ),
             (
                 &["time", "-o", "t.log", "cargo", "build"][..],
                 3,
-                false,
+                &[][..],
                 true,
             ),
         ] {
@@ -1510,8 +1554,15 @@ mod tests {
                     complete: true,
                     environment_unknown: false,
                     cwd_unknown: false,
-                    arguments_unknown,
+                    arguments_unknown: !replacement_starts.is_empty(),
                     writes_unknown,
+                    replacements: replacement_starts
+                        .iter()
+                        .map(|&start| ArgumentReplacement {
+                            marker: "{}",
+                            argv: &input[start..],
+                        })
+                        .collect(),
                 }
             );
         }
@@ -1589,6 +1640,7 @@ mod tests {
                     cwd_unknown: false,
                     arguments_unknown: false,
                     writes_unknown: false,
+                    replacements: Vec::new(),
                 },
                 "{prefix:?}"
             );
@@ -1603,6 +1655,7 @@ mod tests {
                 cwd_unknown: false,
                 arguments_unknown: false,
                 writes_unknown: false,
+                replacements: Vec::new(),
             }
         );
         let input = argv(&["env", "-C", "/tmp", "bash", "-c", "printf x"]);
@@ -1615,6 +1668,7 @@ mod tests {
                 cwd_unknown: true,
                 arguments_unknown: false,
                 writes_unknown: false,
+                replacements: Vec::new(),
             }
         );
         for input in [

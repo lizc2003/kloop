@@ -441,3 +441,106 @@ async fn plan244_effectful_wrappers_keep_containment_consents_separate() {
         assert_eq!(approver.ask_count(), 2, "{command}");
     }
 }
+
+fn plan244_rewriting_xargs() -> [(&'static str, &'static str); 6] {
+    [
+        ("xargs -I marker", "marker"),
+        ("xargs -Imarker", "marker"),
+        ("xargs --replace=marker", "marker"),
+        ("xargs -imarker", "marker"),
+        ("xargs --replace", "{}"),
+        ("xargs -i", "{}"),
+    ]
+}
+
+#[tokio::test]
+async fn plan244_rewritten_xargs_cannot_bypass_command_deny() {
+    for (wrapper, marker) in plan244_rewriting_xargs() {
+        for script in [marker.to_string(), format!("echo {marker}"), format!("r{marker}")] {
+            let command = format!("printf 'rm -rf build\\n' | {wrapper} bash -c '{script}'");
+            for mode in [Mode::Manual, Mode::Bypass] {
+                let approver = ScriptedApprover::new(vec![]);
+                let p = gate(mode, rules(&[], &["bash(rm *)"], &[]), approver.clone());
+                let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+                assert!(error.contains("deny permission rule"), "{command}: {error}");
+                assert_eq!(approver.ask_count(), 0, "{command}");
+            }
+        }
+    }
+    for command in [
+        "xargs -I marker marker -rf build",
+        "xargs -I marker env -u marker bash -c 'printf x'",
+        "xargs -I marker xargs -I marker bash -c 'other'",
+        "xargs -I marker bash marker 'rm -rf build'",
+        "xargs -I marker -J other bash -c 'marker'",
+        "xargs -I \"mar\\\\ker\" bash -c 'mar\\ker'",
+        "xargs -I marker bash -c marker*",
+        "bash -c 'xargs -I marker bash -c marker'",
+    ] {
+        let p = gate(Mode::Bypass, rules(&[], &["bash(rm *)"], &[]), ScriptedApprover::new(vec![]));
+        let error = p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+    }
+    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+    let p = gate(Mode::Manual, rules(&[], &[], &["bash(echo secret)"]), approver.clone());
+    p.check_call("bash", &bash("xargs -I marker echo marker"), 0, true).await.unwrap();
+    assert_eq!(approver.ask_count(), 1);
+    for (command, deny) in [
+        ("xargs -I marker rm marker build", "bash(rm -rf *)"),
+        ("xargs -I marker echo marker", "bash(echo secret)"),
+    ] {
+        let p = gate(Mode::Bypass, rules(&[], &[deny], &[]), ScriptedApprover::new(vec![]));
+        let error = p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn plan244_rewritten_xargs_read_targets_fail_closed() {
+    for (wrapper, marker) in plan244_rewriting_xargs() {
+        for tail in [
+            format!("cat {marker}"),
+            format!("bash -c 'cat {marker}'"),
+            format!("bash -c 'cat < {marker}'"),
+        ] {
+            let command = format!("printf '.bashrc\\n' | {wrapper} {tail}");
+            for mode in [Mode::Manual, Mode::Bypass] {
+                let approver = ScriptedApprover::new(vec![]);
+                let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+                let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+                assert!(error.contains("sensitive path"), "{command}: {error}");
+                assert_eq!(approver.ask_count(), 0, "{command}");
+            }
+        }
+        let command = format!("{wrapper} bash -c 'printf x > {marker}'");
+        let p = gate(Mode::Bypass, rules(&[], &["bash_write(locked.txt)"], &[]), ScriptedApprover::new(vec![]));
+        let error = p.check_call("bash", &bash(&command), 0, true).await.unwrap_err();
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+
+        // 直接交给 echo 的替换参数只是数据；没有进入 shell 正文或命令名。
+        let command = format!("{wrapper} echo {marker}");
+        let p = gate(Mode::Manual, rules(&[], &["bash(rm *)"], &[]), ScriptedApprover::new(vec![]));
+        p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
+    }
+    for command in [
+        "xargs --replace -I marker echo {}",
+        "xargs -I first -I marker echo first",
+        "xargs -I marker e\\cho marker",
+    ] {
+        let p = gate(Mode::Manual, rules(&[], &["bash(rm *)"], &[]), ScriptedApprover::new(vec![]));
+        p.check_call("bash", &bash(command), 0, true).await.expect(command);
+    }
+}
+
+#[test]
+fn plan244_rewritten_xargs_keeps_unknown_execution_dangerous() {
+    for command in [
+        "xargs -I marker bash -c 'marker'",
+        "xargs -I marker bash -c 'printf x > marker'",
+        "xargs -I marker marker -rf build",
+        "xargs -I marker rm marker",
+    ] {
+        let call = CallFacts::gather("bash", &bash(command), &test_cwd(), None);
+        assert_eq!(call.hazard("bash").map(|hazard| hazard.tag), Some("destructive"), "{command}");
+    }
+}

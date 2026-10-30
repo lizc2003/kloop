@@ -13,6 +13,7 @@ use super::facts::PathFacts;
 use super::facts::ShellFacts;
 use super::facts::WriteTarget;
 use crate::shell::BashAnalysis;
+use crate::shell::WordValue;
 use crate::shell::argv_is_readonly;
 use crate::shell::risk_wrapper_views;
 
@@ -261,6 +262,25 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
         return true;
     }
     if call.risk_commands.iter().any(|command| {
+        if command.context.argument_rewrite {
+            // 被替换的命令名可能展开成任意执行体；已知命令的未知参数则保留位置。
+            return rules.iter().any(|rule| match rule {
+                Rule::BashPrefix { tokens, wildcard } => {
+                    matches!(
+                        command.words.first().map(|word| &word.value),
+                        Some(WordValue::Unknown)
+                    ) || ((*wildcard && command.words.len() >= tokens.len()
+                        || !*wildcard && command.words.len() == tokens.len())
+                        && command.words.iter().zip(tokens).all(|(word, token)| {
+                            match &word.value {
+                                WordValue::Literal(value) => value == token,
+                                WordValue::Unknown => true,
+                            }
+                        }))
+                }
+                Rule::Tool(_) | Rule::PathGlob { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+            });
+        }
         if let Some(argv) = command.argv() {
             return rules.iter().any(|rule| {
                 rule.matches_argv(&argv)

@@ -243,6 +243,9 @@ impl CallFacts {
             return Some(Hazard { tag: "destructive" });
         }
         if self.risk_commands.iter().any(|command| {
+            if command.context.argument_rewrite && !arguments_are_text(command) {
+                return true;
+            }
             let argv = command.risk_argv();
             argv_is_dangerous(&argv)
                 || risk_wrapper_views(&argv)
@@ -483,6 +486,15 @@ fn bash_reads_sensitive_path(
     }
     {
         for command in &facts.commands {
+            if command.context.argument_rewrite
+                && !arguments_are_text(command)
+                && !matches!(command.words.first().map(|word| &word.value),
+                    Some(WordValue::Literal(name)) if name.rsplit('/').next() == Some("rm"))
+            {
+                // 替换可能生成敏感读取或新的读取选项，不能按替换前的拼写排除。
+                // rm 只删除目录项；参数未知仍触发危险判定，不因此变成内容读取。
+                return ReadVerdict::Unresolved;
+            }
             let home = home.as_deref().filter(|_| !command.context.home_unknown);
             let words: Vec<_> = command
                 .words

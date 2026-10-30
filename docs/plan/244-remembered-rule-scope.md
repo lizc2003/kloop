@@ -153,3 +153,21 @@ Linux 与 Windows 未实测。实现提交：`b0b38fc`。
 均失败。原有写效果与精确升级规则回归保留，shell 单测同步拆开的事实契约。
 外层执行沙箱之外 `make check` 全绿：fmt、clippy、workspace 全量测试（core 1257 项，
 含这次新增的 4 条回归）、本机 parity 语料 baseline verified。
+
+## 第三轮审查后修（2026-10-30）
+
+用户给出 `printf 'rm -rf build\n' | xargs -I marker bash -c 'marker'`：第二轮只保留
+原脚本的字面风险，没有跟踪替换串，执行时的命令却可完全不同。`bash(rm *)` deny 在
+manual 沙箱自动放行和 bypass 下都漏拦，`cat marker` 的读取目标也被误当字面路径。
+
+包装器现在保留替换串和它实际作用的 argv，同一 xargs 后写的替换选项覆盖前者。被替换
+的直接参数标为未知并保留位置；替换进入中间包装器或 shell 参数时，整段执行体记为未知，
+不再合并替换前的字面脚本命令与重定向。未知命令保守命中内容级 deny/ask，已知命令的
+未知参数按可能匹配处理；未知读取目标在沙箱自动放行和 bypass 前硬拒绝，危险判定保守。
+写效果继续保持未知，普通授权和逐字升级的边界不变。
+
+新增 3 条回归，在修复前均失败。覆盖六种替换选项、整段脚本/部分脚本/命令名/参数、
+中间包装器及未知选项、嵌套 shell、未知读取和重定向目标，也覆盖 shell 转义、动态参数、
+替换选项覆盖与显式 ask；同时保留直接 echo 数据参数的放行对照，以及原有 rm 危险确认
+和升级记忆回归。外层执行沙箱之外 `make check` 全绿：fmt、clippy、workspace 全量测试
+（core 1260 项，含 21 项 plan244 回归）、本机 parity 语料 baseline verified。
