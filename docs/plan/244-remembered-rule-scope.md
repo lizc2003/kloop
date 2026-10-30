@@ -134,4 +134,4 @@ Linux 与 Windows 未实测。实现提交：`b0b38fc`。
    现在逐字记忆只清空 `rules`，保留 argv 与写入事实供已有规则匹配；新记忆的粒度不变。
 
 新增 4 条回归（xargs 替换、process-slot-var、time -o、精确升级规则）。外层执行沙箱
-之外 `make check` 全绿。审查修复提交：`<待补>`。
+之外 `make check` 全绿。审查修复提交：`3760912`。

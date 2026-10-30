@@ -15,7 +15,7 @@
 升级记忆测试因 `mkdir -p` 的第二词是选项而改用 `git init`。外层执行沙箱之外 `make check`
 全绿（core 1249 项等、本机 parity baseline verified）。审查后修了 `xargs -I` 替换、
 `--process-slot-var` 环境、`time -o` 报告写入与逐字记忆吃掉精确升级规则四处，
-实现提交 `b0b38fc`，审查修复提交 `<待补>`。教训 288。
+实现提交 `b0b38fc`，审查修复提交 `3760912`。教训 288。
 
 **Plan 271 ✅：项目 `.kloop` 可读，`~/.kloop` 照旧硬拦（2026-10-30）**：kloop 会话在一个
 用过 worktree 的仓库根上跑 `cd <repo> && grep -rn X --include='*.go' .` 被硬拒——根下有 kloop
