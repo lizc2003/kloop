@@ -167,9 +167,22 @@ fn bash_prefix_memory(
             continue;
         }
         if argv_prefix_is_unstable(argv) {
-            return verbatim
-                .filter(|command| !command.is_empty())
-                .map(|command| verbatim_remember(tool, command, no_sandbox));
+            let command = verbatim.filter(|command| !command.is_empty())?;
+            // The exact text keys the *new* memory, but the argv and write
+            // facts still have to answer rules that already exist: a durable
+            // `sandbox_escalate(timeout 600 cargo test)` must cover this run.
+            let argvs = if segments == ReadOnlySegments::Remember {
+                cmds.to_vec()
+            } else {
+                Vec::new()
+            };
+            return Some(verbatim_remember(
+                tool,
+                command,
+                no_sandbox,
+                argvs,
+                writes.to_vec(),
+            ));
         }
         let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
         if prefix.is_empty()
@@ -209,8 +222,15 @@ fn bash_prefix_memory(
 }
 
 /// 逐字会话记忆：只认这条命令的原文，不落成规则、不提供 Project。脱沙箱是另一种
-/// 同意，因此普通门的键里带上它；升级门本身就是在记脱沙箱，不再重复。
-fn verbatim_remember(tool: &str, command: &str, no_sandbox: bool) -> Remember {
+/// 同意，因此普通门的键里带上它；升级门本身就是在记脱沙箱，不再重复。`argvs` /
+/// `writes` 不参与新规则，只让已有的精确升级规则还能认领这条命令。
+fn verbatim_remember(
+    tool: &str,
+    command: &str,
+    no_sandbox: bool,
+    argvs: Vec<Vec<String>>,
+    writes: Vec<PathFacts>,
+) -> Remember {
     let escape = if tool == "bash" && no_sandbox {
         "!no-sandbox"
     } else {
@@ -220,8 +240,8 @@ fn verbatim_remember(tool: &str, command: &str, no_sandbox: bool) -> Remember {
         rules: Vec::new(),
         echo: vec![VERBATIM_REMEMBER_RULE.to_string()],
         signatures: vec![format!("{tool}-script{escape}:{command}")],
-        argvs: Vec::new(),
-        writes: Vec::new(),
+        argvs,
+        writes,
     }
 }
 
@@ -290,6 +310,8 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
                 "bash",
                 &script.command,
                 script.no_sandbox,
+                Vec::new(),
+                Vec::new(),
             ))
         }
         (None, Some(path)) => {

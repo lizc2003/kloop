@@ -285,3 +285,64 @@ async fn plan244_escalation_persistence_failure_is_reported() {
             .contains("not saved")
     );
 }
+
+/// xargs 的替换串会写进后面每个参数（包括嵌套 shell 的脚本文本），实际目标
+/// 不再由字面 argv 决定；写入事实必须保持未知，不能让 `bash_write` 规则旁路。
+#[tokio::test]
+async fn plan244_xargs_replacement_keeps_the_written_target_unknown() {
+    let approver = ScriptedApprover::new(vec![]);
+    let p = gate(
+        Mode::Manual,
+        rules(&[], &["bash_write(locked.txt)"], &[]),
+        approver.clone(),
+    );
+    let command = "printf 'locked\\n' | xargs -I marker bash -c 'printf x > marker.txt'";
+    let error = p.check("bash", &bash(command), 0).await.unwrap_err();
+    assert!(error.contains("deny permission rule"), "{error}");
+    assert_eq!(approver.ask_count(), 0);
+}
+
+/// `--process-slot-var` 会改写子进程环境；内层 `$HOME` 不能再按父 HOME 求值。
+#[tokio::test]
+async fn plan244_process_slot_var_makes_the_child_home_unknown() {
+    let approver = ScriptedApprover::new(vec![]);
+    let p = gate(
+        Mode::Manual,
+        rules(&[], &["bash_write(**)"], &[]),
+        approver.clone(),
+    );
+    let command = "xargs --process-slot-var=HOME bash -c 'printf x > \"$HOME\"'";
+    let error = p.check("bash", &bash(command), 0).await.unwrap_err();
+    assert!(error.contains("deny permission rule"), "{error}");
+    assert_eq!(approver.ask_count(), 0);
+}
+
+/// `time -o` 由包装器自己写报告文件；剥离后没有命令承载这份写入，事实层必须
+/// 保留未知写效果。
+#[tokio::test]
+async fn plan244_time_output_report_stays_a_write() {
+    let approver = ScriptedApprover::new(vec![]);
+    let p = gate(
+        Mode::Manual,
+        rules(&[], &["bash_write(locked.log)"], &[]),
+        approver.clone(),
+    );
+    let error = p.check("bash", &bash("time -o locked.log true"), 0).await.unwrap_err();
+    assert!(error.contains("deny permission rule"), "{error}");
+    assert_eq!(approver.ask_count(), 0);
+}
+
+/// 逐字记忆只限制“新规则”的粒度，已有精确升级规则仍须认领同一条命令，
+/// 不能因为它先进沙箱而重新询问。
+#[tokio::test]
+async fn plan244_exact_escalation_rule_still_matches_verbatim_shapes() {
+    let approver = ScriptedApprover::new(vec![]);
+    let p = gate(
+        Mode::Manual,
+        rules(&["sandbox_escalate(timeout 600 cargo test)"], &[], &[]),
+        approver.clone(),
+    );
+    assert!(p.sandbox_escalation_remembered("timeout 600 cargo test"));
+    assert!(!p.sandbox_escalation_remembered("timeout 600 cargo build"));
+    assert_eq!(approver.ask_count(), 0);
+}

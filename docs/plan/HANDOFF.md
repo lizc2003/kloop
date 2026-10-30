@@ -11,9 +11,11 @@
 检查，再也生成不出 `[slug]` 目录或 `write_file(*)`，规则解析失败不再变成“用户拒绝”。
 `strip_wrappers` 补齐 nice/timeout/time/xargs 的操作数选项，未知选项由 deny/危险判定在
 每个起点各试一次，`xargs -I {} rm -rf {}` 现在会被 `bash(rm *)` 与 `[destructive]` 看到。
-升级的 Project 持久化失败也发 notice。新增 10 条 plan244 回归与 shell 单测；旧的 seatbelt
+升级的 Project 持久化失败也发 notice。新增 14 条 plan244 回归与 shell 单测；旧的 seatbelt
 升级记忆测试因 `mkdir -p` 的第二词是选项而改用 `git init`。外层执行沙箱之外 `make check`
-全绿（core 1249 项等、本机 parity baseline verified）。实现提交 `b0b38fc`。教训 288。
+全绿（core 1249 项等、本机 parity baseline verified）。审查后修了 `xargs -I` 替换、
+`--process-slot-var` 环境、`time -o` 报告写入与逐字记忆吃掉精确升级规则四处，
+实现提交 `b0b38fc`，审查修复提交 `<待补>`。教训 288。
 
 **Plan 271 ✅：项目 `.kloop` 可读，`~/.kloop` 照旧硬拦（2026-10-30）**：kloop 会话在一个
 用过 worktree 的仓库根上跑 `cd <repo> && grep -rn X --include='*.go' .` 被硬拒——根下有 kloop

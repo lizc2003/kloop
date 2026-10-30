@@ -110,9 +110,28 @@ whole-tool `bash` 都不算）；第 12 层会话缓存改查升级签名（opaq
 写入失败（或规则重新解析失败）时仍放行这一次，并带与普通权限门相同的
 `PermissionNotice`，`bash` 工具把它发成 `Event::Note`。
 
-**验证**：新增 `permissions/plan244_tests.rs`（10 项）覆盖上述形状；`shell.rs` 补了
+**验证**：新增 `permissions/plan244_tests.rs`（14 项）覆盖上述形状；`shell.rs` 补了
 选项操作数、未知选项多起点与两词前缀稳定性单测；原有 seatbelt 升级记忆测试把
 `mkdir -p`（第二词是选项，已不再稳定）换成 `git init`，继续验证真正的两词前缀。
 外层执行沙箱之外 `make check` 全绿：fmt、clippy、workspace 全量测试（core 1249 项等）、
 本机 parity 语料 baseline verified。DESIGN 的 Asking、规则匹配段、包装器段与升级段同步改写。
 Linux 与 Windows 未实测。实现提交：`b0b38fc`。
+
+## 审查后修（2026-10-30）
+
+审查实现提交 `b0b38fc` 抓出四处，全部复核成立：
+
+1. **`xargs -I` 的替换效果丢失**：替换串会进入后面每个参数（包括交给嵌套 shell 的
+   脚本文本），剥离后按字面分析会把 `marker.txt` 当真实目标，而实际写的是输入行。
+   现在 `-I`/`-i`/`--replace[=]` 让包装器分析保持不完整，事实层保留未知写效果；
+   deny/危险判定仍用多起点视图，`xargs -I {} rm -rf {}` 照样命中。
+2. **`xargs --process-slot-var=` 改写子进程环境**：它会让 `$HOME` 等变量变成数值字符串，
+   内层路径不能再按父 HOME 求值。现在置 `environment_unknown`，随嵌套 `-c` 传播。
+3. **`time -o` 的报告文件写入消失**：`-o`/`--output` 由包装器自己写文件，剥离后没有
+   命令承载；现在让分析保持不完整，保留未知写效果，`bash_write` 规则继续生效。
+4. **逐字记忆清空 `argvs`，已有精确升级规则失效**：`matches_escalation` 对空 argv 恒
+   false，配置了 `sandbox_escalate(timeout 600 cargo test)` 的调用仍先进沙箱再问。
+   现在逐字记忆只清空 `rules`，保留 argv 与写入事实供已有规则匹配；新记忆的粒度不变。
+
+新增 4 条回归（xargs 替换、process-slot-var、time -o、精确升级规则）。外层执行沙箱
+之外 `make check` 全绿。审查修复提交：`<待补>`。

@@ -651,7 +651,7 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
             "env" => env_command(&rest[1..], &mut analysis),
             "sudo" => sudo_command(&rest[1..], &mut analysis),
             "nohup" | "nice" | "time" | "timeout" | "xargs" => {
-                transparent_wrapper_command(wrapper, &rest[1..])
+                transparent_wrapper_command(wrapper, &rest[1..], &mut analysis)
             }
             _ => break,
         };
@@ -680,7 +680,7 @@ fn wrapper_option_takes_value(wrapper: &str, token: &str) -> bool {
         // `--max-lines`) only take an operand when it is attached with `=`.
         "xargs" => matches!(
             token,
-            "-I" | "--max-args"
+            "--max-args"
                 | "-n"
                 | "--max-procs"
                 | "-P"
@@ -714,8 +714,7 @@ fn wrapper_option_is_attached(wrapper: &str, token: &str) -> bool {
                 || (token.len() > 2 && (token.starts_with("-o") || token.starts_with("-f")))
         }
         "xargs" => {
-            token.starts_with("--replace=")
-                || token.starts_with("--eof=")
+            token.starts_with("--eof=")
                 || token.starts_with("--max-lines=")
                 || token.starts_with("--max-args=")
                 || token.starts_with("--max-procs=")
@@ -728,7 +727,7 @@ fn wrapper_option_is_attached(wrapper: &str, token: &str) -> bool {
                     && !token.starts_with("--")
                     && matches!(
                         token.as_bytes()[1],
-                        b'I' | b'L' | b'n' | b'P' | b's' | b'd' | b'E' | b'a' | b'i'
+                        b'L' | b'n' | b'P' | b's' | b'd' | b'E' | b'a'
                     ))
         }
         _ => false,
@@ -767,10 +766,8 @@ fn wrapper_option_takes_no_value(wrapper: &str, token: &str) -> bool {
                 | "-o"
                 | "--open-tty"
                 | "--show-limits"
-                | "--replace"
                 | "--eof"
                 | "--max-lines"
-                | "-i"
                 | "--help"
                 | "--version"
         ),
@@ -779,12 +776,44 @@ fn wrapper_option_takes_no_value(wrapper: &str, token: &str) -> bool {
     }
 }
 
-fn transparent_wrapper_command<'a>(wrapper: &str, mut rest: &'a [String]) -> Option<&'a [String]> {
+fn xargs_replaces_arguments(token: &str) -> bool {
+    matches!(token, "-I" | "-i" | "--replace")
+        || token.starts_with("--replace=")
+        || (token.len() > 2 && (token.starts_with("-I") || token.starts_with("-i")))
+}
+
+fn time_writes_a_report(token: &str) -> bool {
+    matches!(token, "-o" | "--output")
+        || token.starts_with("--output=")
+        || (token.len() > 2 && token.starts_with("-o"))
+}
+
+fn transparent_wrapper_command<'a>(
+    wrapper: &str,
+    mut rest: &'a [String],
+    analysis: &mut WrapperAnalysis<'_>,
+) -> Option<&'a [String]> {
     while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
         let token = token.as_str();
         if token == "--" {
             rest = &rest[1..];
             break;
+        }
+        if wrapper == "xargs" && xargs_replaces_arguments(token) {
+            // The replacement string is substituted into every later argument,
+            // including text handed to a nested shell. Those words are no
+            // longer the command's literals; keep the analysis incomplete.
+            return None;
+        }
+        if wrapper == "xargs" && token.starts_with("--process-slot-var=") {
+            // GNU xargs sets this variable per child, overriding whatever the
+            // parent had (including HOME).
+            analysis.environment_unknown = true;
+        }
+        if wrapper == "time" && time_writes_a_report(token) {
+            // `time -o FILE` writes the timing report itself; stripping the
+            // wrapper would drop that write from the facts.
+            return None;
         }
         if wrapper_option_takes_value(wrapper, token) {
             rest = rest.get(1..)?;
@@ -1432,22 +1461,9 @@ mod tests {
             (&["timeout", "5s", "make", "clean"], &["make", "clean"]),
             (&["nice", "-n", "10", "git", "push"], &["git", "push"]),
             (&["xargs", "rm"], &["rm"]),
-            // Wrapper options take an operand; the operand is not the command.
-            (
-                &["xargs", "-I", "{}", "rm", "-rf", "{}"],
-                &["rm", "-rf", "{}"],
-            ),
-            (
-                &["xargs", "--replace", "-I", "{}", "rm", "{}"],
-                &["rm", "{}"],
-            ),
             (
                 &["timeout", "-s", "KILL", "60", "rm", "-rf", "build"],
                 &["rm", "-rf", "build"],
-            ),
-            (
-                &["time", "-o", "t.log", "cargo", "build"],
-                &["cargo", "build"],
             ),
             (&["env", "-u", "CI", "git", "push"], &["git", "push"]),
             (&["cargo", "build"], &["cargo", "build"]),
@@ -1455,20 +1471,41 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(strip_wrappers(&argv(input)), argv(expected), "{input:?}");
         }
-        // An unknown option leaves the analysis incomplete; deny/danger still
-        // see every possible command start, so an operand cannot hide it.
+        // Replacement and report-writing options change what the remaining
+        // words mean or write on their own: the analysis stays incomplete so
+        // the facts keep the unknown effects, while deny/danger still try every
+        // possible command start.
         for input in [
             &["xargs", "-z", "{}", "rm", "-rf", "build"][..],
             &["xargs", "-I"][..],
+            &["xargs", "-I", "{}", "rm", "-rf", "{}"][..],
+            &["xargs", "--replace", "-I", "{}", "rm", "{}"][..],
+            &["time", "-o", "t.log", "cargo", "build"][..],
         ] {
             assert!(!analyze_wrappers(&argv(input)).complete, "{input:?}");
         }
-        let views = risk_wrapper_views(&argv(&["xargs", "-z", "{}", "rm", "-rf", "build"]));
+        for (input, expected) in [
+            (
+                &["xargs", "-I", "{}", "rm", "-rf", "{}"][..],
+                &["rm", "-rf", "{}"][..],
+            ),
+            (
+                &["time", "-o", "t.log", "cargo", "build"][..],
+                &["cargo", "build"][..],
+            ),
+        ] {
+            let views = risk_wrapper_views(&argv(input));
+            assert!(
+                views
+                    .iter()
+                    .any(|view| view.as_slice() == argv(expected).as_slice()),
+                "{input:?}: {views:?}"
+            );
+        }
         assert!(
-            views
-                .iter()
-                .any(|view| view.as_slice() == argv(&["rm", "-rf", "build"]).as_slice()),
-            "{views:?}"
+            analyze_wrappers(&argv(&["xargs", "--process-slot-var=HOME", "printenv"]))
+                .environment_unknown,
+            "the child environment no longer comes from the parent"
         );
     }
 

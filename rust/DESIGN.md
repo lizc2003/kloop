@@ -1152,7 +1152,9 @@ heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记�
 独立的危险分类器在 manual 下强制确认，即使命中了 allow 规则；bypass 跳过这层。
 包装器（`sudo`、`env`、`timeout`、`nice`、`xargs` 等）的统一分析同时返回剥离后的
 argv、环境/cwd 不确定性与分析是否完整。每个包装器的带操作数选项按自己的语法消费
-（`xargs -I {}`、`timeout -s KILL`、`time -o FILE`）；deny/危险前缀保留近似剥离，
+（`xargs -n`、`timeout -s KILL`）；会改写参数或自带写入的选项让分析保持不完整，
+事实层保留未知效果（`xargs -I` 的替换串会进入后面每个参数，`time -o` 自己写报告文件），
+`xargs --process-slot-var=` 则向内层传播环境不确定性。deny/危险前缀保留近似剥离，
 遇到不认识的选项时对剩余 argv 的每个起点各试一次，allow 与只读判定不消费这套近似。
 嵌套脚本的路径求值只消费完整分析。`env` 的赋值、`-u`/`--unset`、`-i`/`--ignore-environment` 以及 sudo 的
 环境重置都会使内层 home 未知；带操作数的选项按包装器语法消费，嵌套链累积这些效果。
