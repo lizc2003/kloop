@@ -64,7 +64,9 @@ the five architectural bets below; it is now ten crates, and every bet held.
    exemption — as it does for `.kloop/worktrees/`, the other structural
    exemption this one is modelled on. The string layer masks **per token**, so
    exempting one path never unmasks a `.kloop` mention sitting beside it in the
-   same command.
+   same command. 随机 ID 保留原始大小写，先按 Base58 校验，再中和豁免 token、折叠
+   敏感目录名；文件名前缀、扩展名与 `offload` 目录名按文件系统口径比较。路径判定、
+   Bash 与 PowerShell 扫描共用这一顺序，不能先把合法的 `L` 变成 Base58 排除的 `l`。
 
    Whatever reads a spilled result must stay strictly under `OFFLOAD_CAP_CHARS`,
    or the reply spills again and hands back a byte-identical preview under a

@@ -1532,9 +1532,9 @@ mod tests {
         let store = "/home/u/.kloop/projects/v1/p1_abc";
 
         for command in [
-            format!("wc -c {store}/offload/off-11111111111.txt"),
-            format!("python3 -c 'print(1)' < {store}/offload/off-11111111112.txt"),
-            format!("cat {store}/offload/bg-11111111113.out"),
+            format!("wc -c {store}/offload/off-aL23456789Z.txt"),
+            format!("python3 -c 'print(1)' < {store}/offload/off-aL23456789Z.txt"),
+            format!("tail -45 {store}/offload/bg-aL23456789Z.out"),
         ] {
             assert!(
                 ok(&p, "bash", json!({"command": command})).await,
@@ -1545,10 +1545,11 @@ mod tests {
             ok(
                 &p,
                 "read_file",
-                json!({"path": format!("{store}/offload/off-11111111111.txt")})
+                json!({"path": format!("{store}/offload/off-aL23456789Z.txt")})
             )
             .await
         );
+        assert!(!p.read_path_blocked(Path::new(&format!("{store}/offload/bg-aL23456789Z.out"))));
 
         for command in [
             // The credential and the transcripts are what the deny is for.
@@ -1556,13 +1557,15 @@ mod tests {
             format!("cat {store}/sessions/20260101-000000.jsonl"),
             // Not a spill file, merely sitting next to one.
             format!("cat {store}/offload/notes.txt"),
-            format!("cat {store}/offload/off-11111111111.txt.bak"),
+            format!("cat {store}/offload/off-aL23456789Z.txt.bak"),
+            format!("cat {store}/offload/bg-al23456789Z.out"),
+            format!("cat {store}/offload/bg-aL234567890.out"),
             // Traversal forfeits the exemption, as it does for worktrees.
             format!("cat {store}/offload/../../../config.toml"),
-            format!("cat {store}/offload/off-11111111111.txt/../../config.toml"),
+            format!("cat {store}/offload/off-aL23456789Z.txt/../../config.toml"),
             // Masking one token must not unmask another in the same command.
-            format!("cat {store}/offload/off-11111111111.txt /home/u/.kloop/config.toml"),
-            format!("cat {store}/offload/off-11111111111.txt; cat ~/.kloop/config.toml"),
+            format!("cat {store}/offload/off-aL23456789Z.txt /home/u/.kloop/config.toml"),
+            format!("cat {store}/offload/off-aL23456789Z.txt; cat ~/.kloop/config.toml"),
         ] {
             assert!(
                 !ok(&p, "bash", json!({"command": command})).await,

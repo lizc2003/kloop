@@ -691,15 +691,17 @@ const WORKTREE_SEGMENT: &str = "worktrees";
 /// credential is in `config.toml` and every project's transcript in `sessions/`,
 /// and both stay sensitive.
 fn is_spill_file_name(name: &str) -> bool {
-    let random = |rest: &str, ext: &str| {
-        rest.strip_suffix(ext)
-            .is_some_and(crate::resource_id::is_suffix)
+    let Some((prefix, rest)) = name.split_once('-') else {
+        return false;
     };
-    name.strip_prefix("off-")
-        .is_some_and(|rest| random(rest, ".txt"))
-        || name
-            .strip_prefix("bg-")
-            .is_some_and(|rest| random(rest, ".out"))
+    let Some((id, extension)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    // 路径结构可以折叠大小写，Base58 身份不能：`L` 合法，`l` 不合法。
+    matches!(
+        (fs_fold(prefix).as_ref(), fs_fold(extension).as_ref()),
+        ("off", "txt") | ("bg", "out")
+    ) && crate::resource_id::is_suffix(id)
 }
 
 /// Whether one shell token is exactly such a spill path. Token-wise rather than
@@ -713,7 +715,7 @@ fn is_spill_path_token(token: &str) -> bool {
     let Some((parent, name)) = token.rsplit_once('/') else {
         return false;
     };
-    parent.ends_with("/offload") && is_spill_file_name(name)
+    fs_fold(parent).ends_with("/offload") && is_spill_file_name(name)
 }
 
 /// Neutralize the structurally exempt `.kloop` mentions token by token, leaving
@@ -731,7 +733,10 @@ fn mask_exempt_kloop_tokens(command: &str) -> String {
     ];
     const MENTION: &str = "/.kloop/";
     let mask = |token: &str| {
-        if is_spill_path_token(token) {
+        let spill = is_spill_path_token(token);
+        let folded = fs_fold(token);
+        let token = folded.as_ref();
+        if spill {
             return token.replace(MENTION, "/kloop/");
         }
         if token.contains("..") {
@@ -769,8 +774,7 @@ fn mask_exempt_kloop_tokens(command: &str) -> String {
 }
 
 fn raw_mentions_sensitive_path(command: &str) -> bool {
-    let folded = fs_fold(command);
-    mentions_sensitive_needle(&mask_exempt_kloop_tokens(folded.as_ref()))
+    mentions_sensitive_needle(&mask_exempt_kloop_tokens(command))
 }
 
 /// 文本层只认目录拼写：`~/name` 与 `/name/`，`.kloop` 也按名字认。文件名
@@ -784,7 +788,7 @@ fn mentions_sensitive_needle(command: &str) -> bool {
 }
 
 fn powershell_mentions_sensitive_path(command: &str) -> bool {
-    let normalized = mask_exempt_kloop_tokens(&command.to_lowercase().replace('\\', "/"));
+    let normalized = mask_exempt_kloop_tokens(&command.replace('\\', "/")).to_lowercase();
     let normalized = normalized.as_str();
     sensitive::SECRET_DIRS
         .iter()
@@ -1031,7 +1035,7 @@ fn path_tail_is_spill(normalized: &Path) -> bool {
     let Some(name) = normalized.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    if !is_spill_file_name(fs_fold(name).as_ref()) {
+    if !is_spill_file_name(name) {
         return false;
     }
     normalized
@@ -1168,6 +1172,43 @@ fn starts_with_folded(path: &Path, base: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spill_ids_are_checked_before_case_folding() {
+        for name in ["off-aL23456789Z.txt", "bg-aL23456789Z.out"] {
+            let path = format!("/home/u/.kloop/projects/v1/p1_test/offload/{name}");
+            assert_eq!(
+                (
+                    raw_mentions_sensitive_path(&format!("tail -45 {path}")),
+                    path_sensitivity(Path::new(&path), Access::ReadUnlocated),
+                    powershell_mentions_sensitive_path(&format!("Get-Content {path}")),
+                ),
+                (false, None, false),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_token_exemptions_keep_sensitive_neighbors_blocked() {
+        let spill = "/home/u/.kloop/projects/v1/p1_test/offload/bg-aL23456789Z.out";
+        for path in [
+            "/home/u/.kloop/config.toml",
+            "/home/u/.kloop/projects/v1/p1_test/sessions/session.jsonl",
+            "/home/u/.kloop/projects/v1/p1_test/offload/bg-al23456789Z.out",
+            "/home/u/.kloop/projects/v1/p1_test/offload/bg-aL234567890.out",
+            "/home/u/.kloop/projects/v1/p1_test/offload/../../../config.toml",
+        ] {
+            assert_eq!(
+                (
+                    raw_mentions_sensitive_path(&format!("cat {spill} {path}")),
+                    powershell_mentions_sensitive_path(&format!("Get-Content {spill}, {path}")),
+                ),
+                (true, true),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn plan239_partial_commands_keep_sensitive_reads() {
