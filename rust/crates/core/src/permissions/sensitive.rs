@@ -10,15 +10,10 @@ pub(super) const VCS_DIR: &str = ".git";
 /// 拒读写同一份名单。
 pub(crate) const SECRET_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws"];
 
-/// kloop 的目录名。判定看它下面第一层的名字，不看它在哪：落点能被 glob、`..`、
-/// `cd`、`tar -C` 一类拼写改写，名字不会。
+/// kloop 的目录名。私有状态根 `~/.kloop` 存 provider 凭据、OAuth token 与所有项目的
+/// 转录；项目里的 `.kloop/` 只放 worktree 与 rules、skills、commands。按名字判，
+/// 但读取时能证明不是私有状态根的整个放行，见 `facts::Access`。
 pub(super) const KLOOP_DIR: &str = ".kloop";
-
-/// `.kloop` 下第一层里可读的项：kloop 建的 worktree，以及它当作用户输入读取的
-/// rules、skills、commands。其余（`config.toml` 及备份、`mcp-oauth.json`、
-/// `projects/`、`scheduler/`，以及以后新加的状态文件）一律按凭据处理。写入只豁免
-/// `worktrees`：其余几项写进去会引导以后的会话。
-pub(super) const KLOOP_READABLE: &[&str] = &["worktrees", "rules", "skills", "commands"];
 
 /// shell / git 的启动文件：进程一启动就会执行里面的内容。
 pub(super) const SECRET_FILES: &[&str] = &[
@@ -38,9 +33,8 @@ pub(super) const ENV_PREFIX: &str = ".env";
 /// 敏感路径的类别，决定元数据访问是否算读取。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Sensitivity {
-    /// 只有内容访问算读取：仓库内部（`.git`），以及 `.kloop` 目录本身——列目录
-    /// 无害，整体读取会把受保护项一起带走。
-    ContentOnly,
+    /// 仓库内部（`.git`）：元数据访问不是读取，内容访问仍是硬边界。
+    Vcs,
     /// 凭据或 agent state：元数据也按读取处理。
     Secret,
 }
@@ -98,15 +92,10 @@ pub(super) fn glob_component_sensitivity(pattern: &str, last: bool) -> Option<Se
     {
         return Some(Sensitivity::Secret);
     }
-    vcs.then_some(Sensitivity::ContentOnly)
+    vcs.then_some(Sensitivity::Vcs)
 }
 
-/// `.kloop` 下第一层的名字是否可读，见 [`KLOOP_READABLE`]。
-pub(super) fn kloop_entry_is_readable(name: &str) -> bool {
-    KLOOP_READABLE.contains(&fs_fold(name).as_ref())
-}
-
-/// 未引用的 glob 分量能否拼出 [`KLOOP_DIR`]；其后的条目由调用方判定。
+/// 未引用的 glob 分量能否拼出 [`KLOOP_DIR`]；落点由调用方判定。
 pub(super) fn glob_component_may_be_kloop(pattern: &str) -> bool {
     pattern.starts_with('.')
         && pattern.contains(['*', '?', '[', '{'])
@@ -242,11 +231,11 @@ mod tests {
         );
         assert_eq!(
             glob_component_sensitivity(".gi?", /*last*/ false),
-            Some(Sensitivity::ContentOnly)
+            Some(Sensitivity::Vcs)
         );
         assert_eq!(
             glob_component_sensitivity(".gi?", /*last*/ true),
-            Some(Sensitivity::ContentOnly)
+            Some(Sensitivity::Vcs)
         );
 
         // 拼不出敏感名字的形状、不以点开头的 glob、以及没有元字符的字面量
@@ -302,14 +291,8 @@ mod tests {
         assert!(file_name_is_secret(".env.production"));
         assert!(!file_name_is_secret("environment.rs"));
         assert!(!dir_name_is_secret(".git"));
-        // `.kloop` 按它下面第一层的条目判定，不进按名字匹配的凭据名单。
+        // `.kloop` 由路径判定按落点处理，不进按名字匹配的凭据名单。
         assert!(!name_is_secret(KLOOP_DIR));
-        for name in KLOOP_READABLE {
-            assert!(kloop_entry_is_readable(name));
-        }
-        assert!(!kloop_entry_is_readable("config.toml"));
-        assert!(!kloop_entry_is_readable("projects"));
-        assert!(!kloop_entry_is_readable("worktreesx"));
     }
 
     #[test]

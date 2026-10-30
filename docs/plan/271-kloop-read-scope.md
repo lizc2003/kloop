@@ -1,11 +1,11 @@
-# Plan 271 — `.kloop` 的读取按第一层条目判
+# Plan 271 — 项目 `.kloop` 可读，`~/.kloop` 照旧硬拦
 
-> 2026-10-29 立并完成。来源：kloop 会话审查 skyrouter 时，
+> 2026-10-29 立，2026-10-30 定稿。来源：kloop 会话审查 skyrouter 时，
 > `cd <repo> && grep -rn "EndpointGeminiNative" --include='*.go' . | grep -v _test.go`
 > 被“reading this sensitive path is blocked”硬拒。
-> 状态：✅ 已完成（2026-10-29）。首版按位置判（只认 `~/.kloop`，`f02a6b4`），同日审查发现
-> 落点能被拼写改写，改为按 `.kloop` 下第一层条目判，见末节「审查后改」。「决定」「做法」
-> 「验收」三节记的是首版，已被末节取代。
+> 状态：✅ 已完成（2026-10-30）。三版：首版只认私有状态根（`f02a6b4`），审查发现证明的
+> 方向反了；第二版按 `.kloop` 下第一层条目判（`855a9b8`），审查发现 `~/.kloop` 里的可读
+> 条目是跳板；定稿见末节「第二轮审查后改」。中间各节按时间保留，已被末节取代。
 
 ## 问题
 
@@ -136,3 +136,57 @@ needle；`Access { Read, Write }` 只决定 `.kloop` 条目的口径，由 `kloo
 已知未改：递归根在 `cd` 之后仍按会话 cwd 解析（plan 243 之前就有）。按第一层条目判后，
 `cd ~ && grep -rn token .` 在会话 cwd 只有可读 `.kloop` 时会放行——与会话 cwd 没有 `.kloop`
 时同一个缺口，修它需要静态跟踪字面 `cd` 目标。
+
+## 第二轮审查后改：项目 `.kloop` 可读，`~/.kloop` 照旧硬拦（2026-10-30）
+
+审查 `855a9b8` 的三条（均复核成立）：
+
+1. **非重定向写入不确认**：Bash 的写目标只有输出重定向。`cp /tmp/payload.md
+   .kloop/rules/style.md` 在读取门按可读条目放行、没有写目标、`cp` 也不危险，于是走到
+   allow 规则（如 `bash(cp *)`）静默放行——写进 `rules/` 的文件会在以后的会话里被当作输入。
+   `mv`/`ln`/`tee`/`install`/`sed -i` 同理。271 之前读取门按名字拦住了它们。
+2. **可读条目当跳板**：`ln -s ~/.kloop/skills /tmp/kx` 读门放行；`cat /tmp/kx/../config.toml`
+   被词法归一化成 `/tmp/config.toml`，内核却解析成 `~/.kloop/config.toml`。更直接的写法
+   `cd ~/.kloop/skills && cat ../config.toml` 连链接都不用：第二步的拼写里已经没有 `.kloop`。
+3. **尾斜杠**：`ls -la /w/proj/.kloop/` 被原文扫描的 `/.kloop/` 硬拒，无尾斜杠却放行。
+
+讨论（用户 2026-10-30）：问过“只拦 config、mcp-oauth，其他放行”与“完全放开”。都不行：
+`~/.kloop` 里只要有一项可读，就能 `cd`/链接进去再 `..` 回来，拼写不再含 `.kloop`；完全放开
+则 provider key、OAuth token 会进上下文、能被注入外泄（`read_file` 与内置 grep 在进程内，
+macOS 沙箱管不到），所有项目的转录也能跨项目读；写入放开等于让 agent 改自己的 hook、
+沙箱开关与授权记录。用户同意定稿方案。
+
+**定稿规则**：
+
+- 秘密只在私有状态根。读取时，**能证明**不是 `~/.kloop` 的 `.kloop`（项目里的）整个放行，
+  里面的凭据名与嵌套 `.kloop` 照旧再判；`~/.kloop` 与证明不了的按名字硬拦，只豁免溢出文件
+  与 worktree（与 271 之前相同）。
+- 证明 = 拼写落点可信 + 目录真实存在且与 `~/.kloop` 不是同一个文件（unix 比 dev+inode，
+  其它平台比规范路径）。落点可信：原生工具的物理路径；Bash 只读命令（`git` 除外）的绝对
+  拼写，cwd 已知时加上相对拼写；含 `..` 或 Windows 有根无盘符的不算。会写或未知的命令
+  一律不定位——它们可能自带 `-C`、`--bind` 之类换目录换根的选项，所以第 1 条的 `cp`
+  在读取门就按名字硬拦（271 之前的行为），不需要另建写目标。
+- 原文扫描按名字认 `~/.kloop`、`/.kloop/`，逐 token 中和 worktree 与溢出文件；只读命令里
+  已证明落在项目 `.kloop` 的词与读重定向按字节范围抹掉再扫（第 3 条）。`echo`/`printf`
+  的文本不抹。PowerShell 只中和 worktree 与溢出文件。
+- Bash 拼写含 `..` 时另按物理落点再判一次（`canonicalize` 未归一化的拼写），只会多拦；
+  这同时补上了“已存在的符号链接 + `..`”这一类既有缺口。
+- 写入不变：任何 `.kloop` 只豁免 worktree。`Sensitivity::ContentOnly` 改回 `Vcs`，
+  `KLOOP_READABLE` 名单删除；`SECRET_DIRS` 与沙箱凭据根的合并保留。
+
+**验收**：
+
+- gate 回归改写：项目 `.kloop` 在相对、`./`、绝对、尾斜杠、`.k*`、`rg` 递归根、读重定向、
+  `cd` 之后的绝对拼写下放行，`read_file`/`read_path_blocked` 放行——在 `855a9b8` 上先红；
+  `~/.kloop` 的条目（含 `skills/`）、`${HOME}`、花括号、glob、Git Bash 根、firmlink、`..`、
+  `cd ~ && cat .kloop/…`、`cd ~/.kloop/skills && cat ../config.toml`、`ln -s ~/.kloop/skills`、
+  `tar -C ~`、`echo … | xargs cat`、`cp` 进项目 `.kloop/rules`（相对与绝对）、包住 home 的
+  递归根全部硬拒——同样先红；写入询问照旧。✅
+- facts 单测：项目放行与证明失败的各种情形、别名落回状态根、经符号链接的 `..` 按物理落点
+  判、递归根定位 `.kloop`。项目 `.kloop` 不再是秘密，拿临时 `.kloop/config.toml` 当秘密的
+  四条夹具（符号链接读、两条读绑定 TOCTOU、grep 打开 inode）改用 `.ssh/`。✅
+- 外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 2124 项通过、本机 parity）；
+  DESIGN 改写 `.kloop` 一段、递归搜索、元数据、文件写入、grep/glob 过滤与 `--mock` 存储。✅
+
+已知未改：递归根在 `cd` 之后仍按会话 cwd 解析（plan 243 之前就有）；`cd <repo> && cat
+.kloop/rules/x` 这类 `cd` 之后的相对拼写按名字拦，要放行需要静态跟踪字面 `cd` 目标。

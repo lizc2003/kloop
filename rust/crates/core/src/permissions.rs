@@ -1815,9 +1815,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("kloop-sensitive-read-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let secret_dir = root.join(".kloop");
+        let secret_dir = root.join(".ssh");
         std::fs::create_dir_all(&secret_dir).unwrap();
-        let secret = secret_dir.join("config.toml");
+        let secret = secret_dir.join("id_rsa");
         std::fs::write(&secret, "SENTINEL").unwrap();
         let alias = root.join("innocent.toml");
         std::os::unix::fs::symlink(&secret, &alias).unwrap();

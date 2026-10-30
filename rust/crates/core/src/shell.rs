@@ -18,7 +18,7 @@
 mod facts;
 mod word;
 pub(crate) use facts::analyze as analyze_bash_facts;
-pub(crate) use facts::{BashFacts, CommandFact, Direction, WordValue};
+pub(crate) use facts::{BashFacts, CommandFact, Context, Direction, WordValue};
 pub(crate) use word::{ShellWord, WordEvaluation};
 
 use tree_sitter::Node;
