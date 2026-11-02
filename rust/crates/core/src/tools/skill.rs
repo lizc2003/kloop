@@ -13,7 +13,6 @@ use super::str_arg;
 use crate::config::EffectiveWorkspace;
 use crate::skills::Skill;
 use crate::skills::SkillContext;
-use crate::skills::expand_body;
 use kloop_protocol::ToolDef;
 
 /// The `skill` tool definition: how the model triggers a skill. Registered only
@@ -50,18 +49,26 @@ pub(super) async fn skill_tool(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> anyhow::Result<String> {
+    // Depth 0 is where `turn_rounds` appends the tool; a sub-agent gets a
+    // focused task, not the skills catalog. `unoffered` leaves `Elsewhere`
+    // tools to their owner, so the owner checks it here.
+    if ctx.depth > 0 {
+        anyhow::bail!("{}", super::builtin::Unoffered::RootOnly.message("skill"));
+    }
     let name = str_arg(input, "name", "skill")?;
     let args = input.get("arguments").and_then(Value::as_str).unwrap_or("");
     // Only model-invocable skills: a user command (`.kloop/commands/*.md`) is
     // `/name`-only and must not be reachable here even if the model guesses it.
     let candidates = ctx.cfg.skills.iter().filter(|s| s.source.model_invocable());
     let skill = Skill::lookup(candidates, name).map_err(|e| anyhow::anyhow!(e))?;
-    let body = expand_body(&skill.body, &skill.dir, args);
-    // Then run any `!cmd` / `@file` injections (plan 36 slice 3), gated exactly
-    // like a bash/read call. A `fork` skill expands before forking, so its
-    // sub-agent sees the resolved output; a blocked/failed `!cmd` propagates as
-    // an is_error tool_result. This is the same expansion the slash path runs.
-    let body = super::inject::expand(&body, ctx, workspace).await?;
+    // Injections are found on the author-written body, then `$ARGUMENTS` /
+    // `${CLAUDE_SKILL_DIR}` substitution runs around them: `arguments` is
+    // model-supplied text and must not be able to introduce `!cmd` / `@file`
+    // markers. A fork skill expands before forking, so its sub-agent sees the
+    // resolved output; a blocked/failed `!cmd` propagates as an is_error
+    // tool_result.
+    let body =
+        super::inject::expand_skill_body(&skill.body, &skill.dir, args, ctx, workspace).await?;
     match skill.context {
         SkillContext::Inline => Ok(body),
         SkillContext::Fork => fork_skill(ctx, workspace, skill, body).await,
@@ -172,6 +179,152 @@ mod tests {
         assert!(is_error);
         assert!(
             out.contains("blocked by a deny permission rule"),
+            "got: {out}"
+        );
+    }
+
+    /// Model-supplied `arguments` are text, not script: a `!cmd` / `@file` marker
+    /// in them is never scanned, because injections are found on the author-written
+    /// body only.
+    #[tokio::test]
+    async fn arguments_cannot_smuggle_injections_into_a_skill() {
+        let skills = vec![Skill {
+            name: "plain".into(),
+            description: "d".into(),
+            body: "No placeholders here.".into(),
+            ..Default::default()
+        }];
+        let ctx = with_skills(test_ctx(0, "skill-args-inject"), skills);
+        let (out, is_error) = run_tool(
+            "skill",
+            json!({"name": "plain", "arguments": "!`printf PWNED` @/etc/hosts"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error);
+        assert_eq!(
+            out, "No placeholders here.\n\nARGUMENTS: !`printf PWNED` @/etc/hosts",
+            "the markers must stay literal text"
+        );
+    }
+
+    /// Substitution still reaches an embedded command's own text, so a skill can
+    /// pass its arguments to the command it authorizes.
+    #[tokio::test]
+    async fn embedded_command_sees_arguments() {
+        let skills = vec![Skill {
+            name: "echo".into(),
+            description: "d".into(),
+            body: "Result: !`printf '%s' $ARGUMENTS`".into(),
+            ..Default::default()
+        }];
+        let ctx = with_skills(test_ctx(0, "skill-cmd-args"), skills);
+        let (out, is_error) =
+            run_tool("skill", json!({"name": "echo", "arguments": "alpha"}), &ctx).await;
+        assert!(!is_error);
+        assert_eq!(out, "Result: alpha");
+    }
+
+    /// A skill's `!cmd` runs inside a turn, so it faces the same `pre_tool`
+    /// hook a bash call would; a blocking hook stops the command.
+    #[tokio::test]
+    async fn skill_injection_runs_pre_tool_hooks() {
+        let marker = std::env::temp_dir().join(format!("kloop-skill-hook-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let skills = vec![Skill {
+            name: "run".into(),
+            description: "d".into(),
+            body: format!("!`touch {}`", marker.display()),
+            ..Default::default()
+        }];
+        let ctx = test_ctx(0, "skill-hook");
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.session_id = "skill-hook".into();
+        cfg.skills = std::sync::Arc::new(skills);
+        cfg.hooks = std::sync::Arc::new(crate::hooks::Hooks {
+            defs: vec![crate::hooks::HookDef {
+                event: crate::hooks::HookEvent::PreTool,
+                command: crate::hooks::test_shell_command("echo no touch 1>&2; exit 2"),
+                matcher: None,
+                timeout_ms: crate::hooks::DEFAULT_TIMEOUT_MS,
+            }],
+        });
+        let ctx = ToolCtx {
+            cfg: std::sync::Arc::new(cfg),
+            ..ctx
+        };
+        let (out, is_error) = run_tool("skill", json!({"name": "run"}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("blocked by hook"), "got: {out}");
+        assert!(!marker.exists(), "the blocked command must not run");
+    }
+
+    /// A Stop answer to a skill's `!cmd` ends the turn (and is not turned into
+    /// an ordinary denial the model could route around).
+    #[tokio::test]
+    async fn a_stop_answer_to_a_skill_injection_ends_the_turn() {
+        struct Stopping;
+        impl crate::permissions::Approver for Stopping {
+            fn confirm(
+                &self,
+                _: crate::permissions::ConfirmRequest,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::permissions::Decision> + Send + '_>,
+            > {
+                Box::pin(async { crate::permissions::Decision::Stop })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("kloop-skill-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let skills = vec![Skill {
+            name: "writes".into(),
+            description: "d".into(),
+            body: "!`printf x > one.txt`".into(),
+            ..Default::default()
+        }];
+        let ctx = test_ctx(0, "skill-stop");
+        let mut cfg = ctx.cfg.test_clone();
+        cfg.cwd = dir.clone();
+        cfg.skills = std::sync::Arc::new(skills);
+        cfg.permissions = std::sync::Arc::new(
+            crate::permissions::Permissions::new(
+                crate::permissions::Mode::Manual,
+                &crate::permissions::PermissionRules::default(),
+                dir.clone(),
+                Some(std::sync::Arc::new(Stopping)),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolCtx {
+            cfg: std::sync::Arc::new(cfg),
+            ..ctx
+        };
+        let (out, is_error) = run_tool("skill", json!({"name": "writes"}), &ctx).await;
+        assert!(is_error);
+        assert!(out.contains("stopped the turn"), "got: {out}");
+        assert!(ctx.stop.is_cancelled());
+        assert!(!dir.join("one.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tool is appended to depth-0 requests only; a sub-agent call that
+    /// reaches dispatch anyway is refused by the owner.
+    #[tokio::test]
+    async fn skill_tool_rejects_a_sub_agent() {
+        let skills = vec![Skill {
+            name: "x".into(),
+            description: "d".into(),
+            body: "body".into(),
+            ..Default::default()
+        }];
+        let ctx = with_skills(test_ctx(1, "skill-depth"), skills);
+        let (out, is_error) = run_tool("skill", json!({"name": "x"}), &ctx).await;
+        assert!(is_error);
+        assert!(
+            out.contains("only available to the root agent"),
             "got: {out}"
         );
     }

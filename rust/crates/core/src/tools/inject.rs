@@ -2,17 +2,24 @@
 //! (`` !`cmd` `` inline and ```` ```!\n…\n``` ```` blocks) executed through the
 //! real bash permission gate with its output inlined, plus `@file` mentions
 //! whose contents are appended (subject to the read-path gate). These run at
-//! expansion time — after `$ARGUMENTS`/`${CLAUDE_SKILL_DIR}` substitution,
-//! before the turn — so the model sees fresh command output and file contents,
-//! not the raw markers.
+//! expansion time — before the turn — so the model sees fresh command output
+//! and file contents, not the raw markers.
 //!
 //! Both trigger paths expand injections, on the same body: the user-initiated
 //! slash path ([`expand_slash_injections`], from `commands::run`, which builds a
-//! minimal top-level context) and a model-activated skill ([`expand`], from the
-//! `skill` tool, which already holds a real [`ToolCtx`]). A `!cmd` faces the
-//! bash gate either way, so "the model picked a skill that runs bash" is gated
-//! exactly like the model calling bash itself. kloop has no remote/MCP skills,
-//! so cc's "never execute an MCP skill's `!cmd`" carve-out has no analogue here.
+//! minimal top-level context) and a model-activated skill ([`expand_skill_body`],
+//! from the `skill` tool, which already holds a real [`ToolCtx`]). A `!cmd` faces
+//! the bash gate either way, so "the model picked a skill that runs bash" is gated
+//! exactly like the model calling bash itself. The skill path also runs the same
+//! `pre_tool` hook a bash call would (the slash path is outside a turn and keeps
+//! its original shape). kloop has no remote/MCP skills, so cc's "never execute an
+//! MCP skill's `!cmd`" carve-out has no analogue here.
+//!
+//! Arguments are never trusted to drive injections. The slash path substitutes
+//! `$ARGUMENTS`/`${CLAUDE_SKILL_DIR}` first because the user typing the slash
+//! command is the one who would run the command; the model's `skill` tool scans
+//! markers on the author-written body only, so a model-supplied `arguments`
+//! string containing `` !`cmd` `` or `@path` stays literal text.
 //!
 //! Both gates are the security boundary and are never bypassed here: `!cmd` runs
 //! through the same `check_call("bash", …)` a real bash tool call faces (deny /
@@ -21,11 +28,15 @@
 //! expansion; the caller shows the error instead of running a turn.
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -33,6 +44,12 @@ use super::ToolCtx;
 use super::bash;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
+use crate::event::Event;
+use crate::permissions::PermissionNotice;
+use crate::permissions::Refusal;
+use crate::permissions::user_stop;
+use crate::skills::expand_body;
+use crate::skills::substitute;
 
 /// A referenced file's contents are truncated to this many bytes before being
 /// appended, so a `@big.log` mention can't blow the context window.
@@ -67,9 +84,9 @@ pub(crate) async fn expand_slash_injections(
 
 /// Run `!cmd` (inline output in place) then append `@file` contents. `@file`
 /// mentions are scanned on the original `body`, not the bash-expanded result, so
-/// command output can never drive a file read. Called directly by the `skill`
-/// tool (which holds a real [`ToolCtx`]); the slash path reaches it through
-/// [`expand_slash_injections`]. A body with no markers returns unchanged.
+/// command output can never drive a file read. The slash path reaches this
+/// through [`expand_slash_injections`]. A body with no markers returns
+/// unchanged.
 pub(super) async fn expand(
     body: &str,
     ctx: &ToolCtx,
@@ -79,8 +96,56 @@ pub(super) async fn expand(
         return Ok(body.to_string());
     }
     let with_bash = run_embedded_bash(body, ctx, workspace).await?;
-    let attachments = collect_file_attachments(body, workspace);
+    let attachments = collect_file_attachments(body, workspace).await;
     Ok(format!("{with_bash}{attachments}"))
+}
+
+/// Expand a skill body for the `skill` tool. Markers are found on the
+/// author-written `body` itself; `$ARGUMENTS`/`${CLAUDE_SKILL_DIR}` are then
+/// substituted segment by segment, so arguments substituted *into* text — or
+/// appended as the `ARGUMENTS:` line — are never scanned for injections. A
+/// command's own text is substituted first, so `$ARGUMENTS` inside a `!cmd`
+/// still works.
+pub(super) async fn expand_skill_body(
+    body: &str,
+    skill_dir: &str,
+    args: &str,
+    ctx: &ToolCtx,
+    workspace: &EffectiveWorkspace,
+) -> Result<String> {
+    if !has_injections(body) {
+        return Ok(expand_body(body, skill_dir, args));
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut used_args = false;
+    let mut last = 0;
+    for marker in find_embedded(body) {
+        let (text, used) = substitute(&body[last..marker.start], skill_dir, args);
+        used_args |= used;
+        out.push_str(&text);
+        let (command, used) = substitute(&marker.command, skill_dir, args);
+        used_args |= used;
+        let output = run_gated_bash(&command, ctx, workspace, Trigger::Skill).await?;
+        out.push_str(output.trim_end());
+        last = marker.end;
+    }
+    let (tail, used) = substitute(&body[last..], skill_dir, args);
+    used_args |= used;
+    out.push_str(&tail);
+    out.push_str(&collect_file_attachments(body, workspace).await);
+    if !used_args && !args.trim().is_empty() {
+        out.push_str(&format!("\n\nARGUMENTS: {}", args.trim()));
+    }
+    Ok(out)
+}
+
+/// Which surface asked for the expansion. The slash path runs before a turn
+/// exists and keeps its original shape; the model-activated skill runs inside
+/// a turn, so its `!cmd` faces the `pre_tool` hook a bash call would.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trigger {
+    Slash,
+    Skill,
 }
 
 /// One embedded-bash occurrence: its byte span in the body and the command.
@@ -158,7 +223,7 @@ async fn run_embedded_bash(
     let mut result = String::with_capacity(body.len());
     let mut last = 0;
     for m in &markers {
-        let output = run_gated_bash(&m.command, ctx, workspace).await?;
+        let output = run_gated_bash(&m.command, ctx, workspace, Trigger::Slash).await?;
         result.push_str(&body[last..m.start]);
         result.push_str(output.trim_end());
         last = m.end;
@@ -175,58 +240,145 @@ async fn run_gated_bash(
     command: &str,
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
+    trigger: Trigger,
 ) -> Result<String> {
     let input = json!({ "command": command });
+    if trigger == Trigger::Skill {
+        super::run_pre_tool_hook("bash", &input, ctx)
+            .await
+            .map_err(|e| anyhow!("!`{command}`: {e:#}"))?;
+    }
     let sandbox_auto = bash::execution_context("bash", &input, workspace, &ctx.cfg.shell_login_env);
-    workspace
-        .permissions
-        .check_call_with_execution("bash", &input, ctx.depth, sandbox_auto)
-        .await
-        .map_err(|reason| anyhow!("!`{command}`: {reason}"))?;
+    match trigger {
+        // The slash path runs outside a turn and keeps its original gate and
+        // error text. The skill path runs inside one, so it must distinguish
+        // a Stop (end the turn) from a denial and surface a notice.
+        Trigger::Slash => {
+            workspace
+                .permissions
+                .check_call_with_execution("bash", &input, ctx.depth, sandbox_auto)
+                .await
+                .map_err(|reason| anyhow!("!`{command}`: {reason}"))?;
+        }
+        Trigger::Skill => {
+            let verdict = workspace
+                .permissions
+                .check_call_with_resolved_path("bash", &input, None, None, ctx.depth, sandbox_auto)
+                .await;
+            accept_permission(verdict, command, ctx)?;
+        }
+    }
     bash::bash_tool(&input, ctx, workspace).await
+}
+
+/// Apply the permission gate's verdict. `Stopped` must end the turn just as it
+/// does for a real tool call — a skill that runs `!cmd` cannot turn the user's
+/// No into an ordinary denial the model is free to route around — and a
+/// `notice` (e.g. "project rule not saved") is surfaced, not dropped.
+fn accept_permission(
+    verdict: std::result::Result<Option<PermissionNotice>, Refusal>,
+    command: &str,
+    ctx: &ToolCtx,
+) -> Result<()> {
+    match verdict {
+        Ok(Some(notice)) => ctx.ui.emit(&Event::Note(notice.message)),
+        Ok(None) => {}
+        Err(Refusal::Denied(reason)) => bail!("!`{command}`: {reason}"),
+        Err(Refusal::Stopped) => {
+            ctx.stop.cancel();
+            bail!("!`{command}`: {}", user_stop("bash"));
+        }
+    }
+    Ok(())
 }
 
 /// Append the contents of each `@file` mention that resolves to a readable file.
 /// A mention that isn't an existing file is left alone (it's prose, e.g.
 /// `@someone`); one blocked by the read gate is noted, not inlined (no leak);
-/// duplicates and unreadable/binary files are skipped.
-fn collect_file_attachments(body: &str, workspace: &EffectiveWorkspace) -> String {
-    let cwd = &workspace.cwd;
-    let perms = &workspace.permissions;
+/// duplicates and unreadable/binary files are skipped. Reads run on the blocking
+/// pool and stop at [`MAX_ATTACH_BYTES`], so a multi-gigabyte log cannot stall a
+/// runtime worker while it is read whole and then discarded.
+async fn collect_file_attachments(body: &str, workspace: &EffectiveWorkspace) -> String {
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut out = String::new();
+    let mut planned: Vec<(String, Option<PathBuf>)> = Vec::new();
     for mention in find_mentions(body) {
-        let path = cwd.join(&mention);
+        let path = workspace.cwd.join(&mention);
         if !path.is_file() {
             continue;
         }
         if !seen.insert(path.clone()) {
             continue;
         }
-        if perms.read_path_blocked(&path) {
-            out.push_str(&format!(
-                "\n\n@{mention}: [access blocked by deny/sensitive rules]"
-            ));
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            // Unreadable or non-UTF-8 (binary): skip silently.
-            continue;
-        };
-        let (content, truncated) = if content.len() > MAX_ATTACH_BYTES {
-            (
-                &content[..floor_char_boundary(&content, MAX_ATTACH_BYTES)],
-                true,
-            )
+        if workspace.permissions.read_path_blocked(&path) {
+            planned.push((mention, None));
         } else {
-            (content.as_str(), false)
-        };
-        out.push_str(&format!("\n\n@{mention}:\n{content}"));
-        if truncated {
-            out.push_str(&format!("\n[truncated to {MAX_ATTACH_BYTES} bytes]"));
+            planned.push((mention, Some(path)));
+        }
+    }
+    let read = tokio::task::spawn_blocking(move || {
+        planned
+            .into_iter()
+            .map(|(mention, path)| match path {
+                None => (mention, Attachment::Blocked),
+                Some(path) => match read_attachment(&path) {
+                    Some((text, truncated)) => (mention, Attachment::Content { text, truncated }),
+                    None => (mention, Attachment::Skipped),
+                },
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let mut out = String::new();
+    for (mention, attachment) in read {
+        match attachment {
+            Attachment::Blocked => out.push_str(&format!(
+                "\n\n@{mention}: [access blocked by deny/sensitive rules]"
+            )),
+            Attachment::Skipped => {}
+            Attachment::Content { text, truncated } => {
+                out.push_str(&format!("\n\n@{mention}:\n{text}"));
+                if truncated {
+                    out.push_str(&format!("\n[truncated to {MAX_ATTACH_BYTES} bytes]"));
+                }
+            }
         }
     }
     out
+}
+
+/// One mention's outcome after the blocking read pass.
+enum Attachment {
+    /// Deny/sensitive rules forbid the read: say so without inlining.
+    Blocked,
+    /// Gone, unreadable, or binary.
+    Skipped,
+    Content {
+        text: String,
+        truncated: bool,
+    },
+}
+
+/// Read at most [`MAX_ATTACH_BYTES`] plus a little. A prefix that is valid
+/// UTF-8 is kept; invalid bytes inside the cap still mean a binary file and
+/// skip it, while an incomplete sequence cut by the cap is just truncation.
+fn read_attachment(path: &Path) -> Option<(String, bool)> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_ATTACH_BYTES as u64 + 4)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let truncated = bytes.len() > MAX_ATTACH_BYTES;
+    let cut = MAX_ATTACH_BYTES.min(bytes.len());
+    let text = match std::str::from_utf8(&bytes[..cut]) {
+        Ok(text) => text.to_string(),
+        Err(e) if e.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned()
+        }
+        Err(_) => return None,
+    };
+    Some((text, truncated))
 }
 
 /// Find `@path` mentions: an `@` at start-of-line or after whitespace, followed
@@ -259,16 +411,6 @@ fn find_mentions(body: &str) -> Vec<String> {
 /// expansion) and `#` (line ranges) — both deferred.
 fn is_path_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'/' | b'-')
-}
-
-/// Largest byte index `<= max` that is a char boundary (stable-Rust stand-in for
-/// `str::floor_char_boundary`), so truncation never splits a UTF-8 sequence.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    let mut i = max.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 #[cfg(test)]
@@ -307,10 +449,65 @@ mod tests {
     }
 
     #[test]
-    fn floor_char_boundary_never_splits_utf8() {
-        let s = "aé"; // 'é' is two bytes (indices 1..3)
-        assert_eq!(floor_char_boundary(s, 2), 1);
-        assert_eq!(floor_char_boundary(s, 3), 3);
-        assert_eq!(floor_char_boundary(s, 99), 3);
+    fn read_attachment_stops_at_the_cap_and_ignores_late_binary_bytes() {
+        let dir = std::env::temp_dir().join(format!("kloop-inject-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.log");
+        // A full cap of text, then bytes that are not UTF-8: the prefix is
+        // still text, so the file is attached, truncated — not skipped whole.
+        let mut body = vec![b'a'; MAX_ATTACH_BYTES];
+        body.extend_from_slice(&[0xff, 0xfe, 0xff]);
+        std::fs::write(&path, &body).unwrap();
+        let (text, truncated) = read_attachment(&path).expect("prefix is text");
+        assert_eq!(text.len(), MAX_ATTACH_BYTES);
+        assert!(truncated);
+
+        // A multi-byte char straddling the cap is dropped, not split.
+        let path = dir.join("edge.md");
+        let mut body = "a".repeat(MAX_ATTACH_BYTES - 1).into_bytes();
+        body.extend_from_slice("é".as_bytes());
+        std::fs::write(&path, &body).unwrap();
+        let (text, truncated) = read_attachment(&path).unwrap();
+        assert_eq!(text.len(), MAX_ATTACH_BYTES - 1);
+        assert!(truncated);
+
+        // Invalid UTF-8 inside the cap is still a binary file.
+        let path = dir.join("bin.dat");
+        std::fs::write(&path, [0x00, 0xff, 0x00]).unwrap();
+        assert!(read_attachment(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A notice the gate attaches (e.g. "project rule not saved") reaches the
+    /// UI; the expansion still runs. A `Stop` answer ends the turn.
+    #[tokio::test]
+    async fn permission_verdicts_surface_notices_and_end_the_turn_on_stop() {
+        struct Recording(std::sync::Mutex<Vec<String>>);
+        impl crate::agent::Ui for Recording {
+            fn emit(&self, event: &Event) {
+                if let Event::Note(note) = event {
+                    self.0.lock().unwrap().push(note.clone());
+                }
+            }
+        }
+
+        let mut ctx = crate::tools::testutil::test_ctx(0, "inject-permission");
+        let recording = std::sync::Arc::new(Recording(Default::default()));
+        ctx.ui = recording.clone();
+        accept_permission(
+            Ok(Some(PermissionNotice {
+                message: "rule not saved".into(),
+            })),
+            "echo x",
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(*recording.0.lock().unwrap(), vec!["rule not saved"]);
+
+        let err = accept_permission(Err(Refusal::Stopped), "echo x", &ctx).unwrap_err();
+        assert!(err.to_string().contains("stopped the turn"), "got: {err}");
+        assert!(ctx.stop.is_cancelled());
+        assert!(!ctx.cancel.is_cancelled(), "a stop is not an interrupt");
     }
 }

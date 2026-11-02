@@ -1,7 +1,7 @@
 # Plan 246 — 指令文件与注入的信任边界
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
+> 状态：✅ 2026-11-02。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
 > 先读代码确认，不成立就在本文件划掉并写明原因。
 
 ## 问题
@@ -60,3 +60,33 @@
   notice;`@file` 读大文件只读前 100KB、后段非 UTF-8 不影响前段;depth≥1 调用 skill 被拒。
 - DESIGN 改写约 2279 行指令文件边界与约 1195 行注入一节;外层执行沙箱之外 `make check`;
   HANDOFF 记进展与教训。
+
+## 实施记录
+
+- 第 1 条按用户选 (a)：`Discovery::expand` 在 `canonicalize` 之后统一检查 Project/Local
+  scope 是否落在 canonical git root（无 git root 时 cwd）内，顶层 `AGENTS.md`、
+  `AGENTS.local.md`、`.kloop/rules/*.md` 和 `@import` 走同一处；越界不再读取，记
+  `instruction file outside the project, skipped: <spelling>`。原先按词法路径判断 import 的
+  `is_external` 随之删除，避免保留一条会被符号链接绕过的旧检查。Global scope 不受限。
+- 第 2 条按用户同意给 skill 路径的 `!cmd` 补 `pre_tool` hook。`inject.rs` 新增
+  `expand_skill_body`：先在作者正文上找 `!cmd`/`@file` 标记，再分段替换
+  `$ARGUMENTS`/`$N`/`${CLAUDE_SKILL_DIR}`；命令自身文本先替换（`!`cmd $ARGUMENTS`` 仍可用），
+  参数替换进来的文本与末尾 `ARGUMENTS:` 行都不再参与扫描。`skills.rs` 抽出
+  `substitute` 供分段调用，`expand_body` 行为不变。slash 路径顺序与语义保持原样。
+- 第 3 条：skill 路径改走 `check_call_with_resolved_path` 并区分 `Refusal`；`Stopped` 时
+  `ctx.stop.cancel()` 并返回 `user_stop("bash")`，`Ok(Some(notice))` 经 `ctx.ui.emit` 发出。
+  slash 路径仍用 `check_call_with_execution`，错误文本不变，因为它不在 turn 内、没有可取消
+  的 turn。
+- 第 4 条：`@file` 由 `File::open(..).take(MAX_ATTACH_BYTES + 4)` 有界读取，整段放进
+  `spawn_blocking`；前缀按 UTF-8 解码，截断落在多字节字符中间时截到前一个字符边界，
+  100KB 之后才出现的非 UTF-8 字节不再导致整份文件被跳过；cap 内的非法 UTF-8 仍按二进制
+  跳过。
+- 第 5 条：`skill_tool` 开头检查 `ctx.depth > 0`，用 `Unoffered::RootOnly` 的同一句
+  `tool 'skill' is only available to the root agent` 拒绝；`unoffered` 保持把 `Elsewhere`
+  交给 owner 复查的设计。
+- 验证（2026-11-02）：`cli/src/context.rs` 新增顶层 `AGENTS.md`、rules、`@./link.md` 三种
+  越界符号链接与项目内互链测试；`tools/skill.rs` 新增参数注入两条、命令内 `$ARGUMENTS`、
+  `pre_tool` 阻断、Stop 结束 turn、depth≥1 拒绝；`tools/inject.rs` 新增大文件截断/后段二进制、
+  notice 与 Stop 语义。先按旧代码意图断言（参数里的标记展开、Stop 只当普通拒绝），改后全绿。
+  外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 全量测试，本机 parity baseline
+  verified）。Windows 未实测。

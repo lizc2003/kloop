@@ -397,6 +397,20 @@ pub fn skills_catalog(skills: &[Skill]) -> Option<String> {
 /// placeholder at all but arguments were given, they are appended as an
 /// `ARGUMENTS:` line so nothing the user typed is silently dropped.
 pub fn expand_body(body: &str, skill_dir: &str, args: &str) -> String {
+    let (mut out, used_args) = substitute(body, skill_dir, args);
+    if !used_args && !args.trim().is_empty() {
+        out.push_str(&format!("\n\nARGUMENTS: {}", args.trim()));
+    }
+    out
+}
+
+/// The substitution half of [`expand_body`], usable on a fragment. Returns
+/// whether the fragment used an argument placeholder, so a caller that
+/// substitutes one segment at a time can still decide whether arguments were
+/// dropped. The model's `skill` tool expands injections on the author-written
+/// body first and substitutes segments around them, so `arguments` never
+/// reaches the injection scanner.
+pub(crate) fn substitute(body: &str, skill_dir: &str, args: &str) -> (String, bool) {
     let words = split_words(args);
     let mut out = String::with_capacity(body.len());
     let mut used_args = false;
@@ -436,10 +450,7 @@ pub fn expand_body(body: &str, skill_dir: &str, args: &str) -> String {
         out.push(ch);
         i += ch.len_utf8();
     }
-    if !used_args && !args.trim().is_empty() {
-        out.push_str(&format!("\n\nARGUMENTS: {}", args.trim()));
-    }
-    out
+    (out, used_args)
 }
 
 /// Minimal shell-style word split for `$N`: whitespace separates words, single

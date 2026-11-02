@@ -127,7 +127,9 @@ struct Discovery {
     warnings: Vec<String>,
     /// Canonical paths already loaded — shared by top-level files and imports.
     processed: HashSet<PathBuf>,
-    /// Canonical git root (or cwd); imports outside it are external.
+    /// Canonical git root (or cwd); a project/local file that resolves outside
+    /// it is skipped — symlinks included, since the check runs on the canonical
+    /// target.
     boundary: PathBuf,
     home: Option<PathBuf>,
 }
@@ -171,6 +173,11 @@ impl Discovery {
     /// Returns whether a non-empty file was loaded. `warn_missing` is set only
     /// for imports that look file-like (so a missing top-level file, or a prose
     /// `@mention`, stays silent, while a typo'd `@./file.md` warns).
+    ///
+    /// Project/local files are checked against the canonical project boundary
+    /// *after* resolving symlinks: a repo can check in `AGENTS.md -> ~/.ssh/…`
+    /// and the bytes read here bypass the sandbox's private-state denial, so
+    /// what counts is where the file actually lives, not how it was named.
     fn expand(
         &mut self,
         path: &Path,
@@ -195,6 +202,13 @@ impl Discovery {
                 return false;
             }
         };
+        if scope != InstructionScope::Global && !canon.starts_with(&self.boundary) {
+            self.warnings.push(format!(
+                "instruction file outside the project, skipped: {}",
+                path.display()
+            ));
+            return false;
+        }
         if !self.processed.insert(canon.clone()) {
             return false; // already loaded, or an import cycle
         }
@@ -216,13 +230,6 @@ impl Discovery {
             let Some(resolved) = self.resolve_import(&spec, &base) else {
                 continue;
             };
-            if scope != InstructionScope::Global && self.is_external(&resolved) {
-                self.warnings.push(format!(
-                    "instruction import outside the project, skipped: {}",
-                    resolved.display()
-                ));
-                continue;
-            }
             // A spec with a path separator or extension is a real file
             // reference; a bare word is likely prose — don't warn if it misses.
             let warn = spec.contains('/') || spec.contains('.');
@@ -242,11 +249,6 @@ impl Discovery {
             base.join(spec)
         };
         Some(lexical_normalize(&raw))
-    }
-
-    /// Whether a resolved import lands outside the project boundary.
-    fn is_external(&self, resolved: &Path) -> bool {
-        !resolved.starts_with(&self.boundary)
     }
 }
 
@@ -516,6 +518,60 @@ mod tests {
         );
         let d2 = discover_instruction_files(&repo, Some(&global), Some(&repo));
         assert!(d2.files.iter().any(|f| f.content == "shared"));
+    }
+
+    /// A symlink is only a name: the boundary check runs on the canonical target,
+    /// so every project/local entry point (top-level file, rules file, `@import`)
+    /// that resolves outside the project is skipped with a warning.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_that_resolve_outside_the_project_are_skipped() {
+        let base = test_tree("symlink-outside");
+        let outside = base.join("outside");
+        write(&outside, "AGENTS.md", "outside rules");
+        write(&outside, "rule.md", "outside rule");
+        write(&outside, "shared.md", "outside shared");
+        let root = base.join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(outside.join("AGENTS.md"), root.join("AGENTS.md")).unwrap();
+        std::fs::create_dir_all(root.join(".kloop").join("rules")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("rule.md"),
+            root.join(".kloop").join("rules").join("10-rule.md"),
+        )
+        .unwrap();
+        write(&root, "AGENTS.local.md", "local\n@./link.md");
+        std::os::unix::fs::symlink(outside.join("shared.md"), root.join("link.md")).unwrap();
+
+        let d = discover_instruction_files(&root, None, Some(&root));
+        let contents: Vec<&str> = d.files.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(contents, vec!["local\n@./link.md"]);
+        assert_eq!(
+            d.warnings
+                .iter()
+                .filter(|w| w.contains("outside the project"))
+                .count(),
+            3,
+            "got: {:?}",
+            d.warnings
+        );
+    }
+
+    /// A symlink to another file inside the project still loads: the rule is
+    /// the resolved target's location, not the use of a link.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_that_stay_inside_the_project_load_normally() {
+        let root = test_tree("symlink-inside");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write(&root, "AGENTS.md", "main\n@./link.md");
+        write(&root, "notes.md", "linked notes");
+        std::os::unix::fs::symlink(root.join("notes.md"), root.join("link.md")).unwrap();
+
+        let d = discover_instruction_files(&root, None, Some(&root));
+        let contents: Vec<&str> = d.files.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(contents, vec!["main\n@./link.md", "linked notes"]);
+        assert!(d.warnings.is_empty(), "got: {:?}", d.warnings);
     }
 
     #[test]

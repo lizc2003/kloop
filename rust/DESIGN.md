@@ -2438,10 +2438,19 @@ At startup kloop assembles what the model knows about where it is:
   broken by path), with the imported content placed right after the file that
   references it. `@` only triggers at a line start or after whitespace (so
   `a@b.com` and prose `@mentions` are left alone) and imports inside fenced
-  code blocks are ignored. Project/local files may only import from within the
-  project (git root); a global `~/.kloop/` file may import from anywhere. A
-  missing or out-of-project import is skipped with a startup warning, never an
-  error.
+  code blocks are ignored. A missing import is skipped with a startup warning,
+  never an error.
+- **The project boundary is the resolved file's location, not its name**:
+  every project/local file — the top-level `AGENTS.md`, each
+  `.kloop/rules/*.md`, `AGENTS.local.md`, and every `@import` — is
+  canonicalized before it is read and skipped with a startup warning when the
+  target lands outside the project (git root, or cwd without one). A global
+  `~/.kloop/` file may point anywhere. Symlinks are followed first: a repo
+  that checks in `AGENTS.md -> ~/.ssh/id_rsa` gets a warning, not the file's
+  bytes in `<project-instructions>`, because this read happens inside kloop
+  and would otherwise bypass the sandbox's private-state denial. Sharing one
+  rules file across repositories means placing it in the global layer, not
+  linking outside the tree.
 - Following cc and codex, instruction files do **not** go into the system
   prompt: they ride every sampling request as a synthetic first user message
   (`<project-instructions>…</project-instructions>`) that is never recorded
@@ -4556,9 +4565,14 @@ directory form is fuller), so a command only fills a name no skill claimed. A
 malformed command is skipped with a startup warning, never an error; `--mock`
 skips discovery entirely.
 
-**Injections** (`` !`cmd` `` and `@file`) run at `/name` expansion time — after
-argument substitution, before the turn — so the model sees fresh output, not the
-raw markers (`core/src/tools/inject.rs`):
+**Injections** (`` !`cmd` `` and `@file`) run at `/name` expansion time — before
+the turn — so the model sees fresh output, not the raw markers
+(`core/src/tools/inject.rs`). The two trigger paths differ in when argument
+substitution happens: a user-typed `/name` substitutes first (the user typing
+the command is the one who would run it), while the model's `skill` tool scans
+the author-written body first and substitutes around the markers, so a
+model-supplied `arguments` string that contains `` !`cmd` `` or `@path` stays
+literal text.
 
 - **`` !`cmd` `` / ```` ```!\n…\n``` ````** — an embedded shell command is
   executed and its output inlined in place. It runs through the **same permission
@@ -4566,14 +4580,21 @@ raw markers (`core/src/tools/inject.rs`):
   then the OS sandbox): a `!cmd` is not privileged because a command author wrote
   it. A blocked or failed command aborts the expansion — the error is shown and
   no turn runs — while a command that merely exits non-zero inlines its output
-  (with the `[exit N]` tail), like the bash tool. The inline form only fires when
-  `!` sits at line start or after whitespace (so `foo!`bar`` and `$!` don't).
+  (with the `[exit N]` tail), like the bash tool. A Stop answer cancels the turn
+  exactly as it does for a real call, and a permission notice (e.g. a project
+  rule that could not be saved) is surfaced. On the `skill` path the command also
+  runs the `pre_tool` hook a bash call would — it executes inside a turn, where
+  hooks are the automation policy; the slash path predates turn hooks and keeps
+  its original shape. The inline form only fires when `!` sits at line start or
+  after whitespace (so `foo!`bar`` and `$!` don't).
 - **`@file`** — a `@path` mention that resolves to a readable file has its
   contents appended to the prompt (the mention stays in place). It honors the
   **read-path gate** (`read_path_blocked`: deny rules + the sensitive-path list,
   plan 31) — a blocked file is noted, never inlined — and a mention that isn't an
-  existing file is left alone (so `@someone` prose is untouched). Contents are
-  truncated to 100 KB.
+  existing file is left alone (so `@someone` prose is untouched). The read is
+  bounded (at most 100 KB plus a few bytes, on the blocking pool) and decoded as
+  UTF-8, so a large log cannot stall a runtime worker and binary bytes after the
+  cap do not discard the text before them; contents are truncated to 100 KB.
 
 Both trigger paths expand injections on the same body: the user's `/name` and a
 model-activated skill (the `skill` tool). Because a `!cmd` always faces the bash

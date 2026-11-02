@@ -1,5 +1,18 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 246 ✅：指令文件与注入的信任边界（2026-11-02）**：项目/本地指令文件现在按
+canonical 落点划边界：顶层 `AGENTS.md`、`.kloop/rules/*.md`、`AGENTS.local.md` 与
+`@import` 走同一处检查，符号链接指向仓库外一律跳过并给启动警告，项目内互链照常，
+`~/.kloop` 全局层不受限。skill 工具改为先在作者正文上找 `` !`cmd` ``/`@file`，再分段做
+`$ARGUMENTS`/`${CLAUDE_SKILL_DIR}` 替换，模型传入的 `arguments` 不再能触发注入；
+命令自身文本仍可引用参数。skill 路径的 `!cmd` 补跑 `pre_tool` hook，权限结果改走区分
+`Refusal` 的入口：Stop 会 cancel turn 并返回 `user_stop`，notice 经 UI 发出；slash 路径
+保持原语义。`@file` 改成 `take(100KB+4)` 的有界读取并放入 `spawn_blocking`，后段非
+UTF-8 不再让整份文件被跳过。`skill_tool` 补 depth>0 拒绝。新增回归覆盖三类越界符号
+链接、参数注入、hook、Stop、depth、截断与 notice；外层执行沙箱之外 `make check` 全绿
+（fmt、clippy、workspace 全量测试，本机 parity baseline verified）。Windows 未实测。
+教训 298。
+
 **Plan 245 ✅：沙箱升级与实际执行对齐（2026-11-02）**：通配升级（opaque 脚本的 `a`）
 现在只在沙箱真的拒绝后生效，`sandbox_escalation_remembered` 只认逐命令记忆，普通门里
 `disable_sandbox` 的会话缓存也不再吃通配；逐命令记忆仍可在执行前跳过沙箱。可解析但
@@ -3920,3 +3933,17 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    （`deny_alias` / `deny_alias_relative`）只给 `matches_path` 的 deny/ask 方向。判据：
    同一份路径事实里，**“能证明安全”和“能证明危险”需要的可信度不同**——前者要物理落点，
    后者宁可多拦。回归要同时断言 deny 命中、allow 不命中，否则修好一边会掩盖另一边。
+
+298. **信任边界要看“读到的字节实际属于谁”，也要看“这段字节是谁写的”。** 指令文件原先
+   只对 `@import` 做词法路径判断，顶层文件、rules 目录与符号链接都不经过它：指向私有
+   凭据文件的顶层 `AGENTS.md` 也会整份进入每次请求。词法 `..` 判断拦不住符号链接，正确
+   判据是 canonical 落点——先解析再比较，且四个入口共用同一段代码，否则修好 import
+   仍会从 rules 目录漏。同类读取发生在 kloop 进程内，沙箱的私有状态拒读不覆盖它，
+   边界只能由这个读取者自己保证。注入这边同理：旧顺序是“先拼参数再扫描”，等于把模型
+   给的 `arguments` 当成作者正文；应先在作者写下的字节上找标记，再分段替换，参数插入的
+   文本与末尾 `ARGUMENTS:` 行都不参与扫描。保留“命令内部可用 `$ARGUMENTS`”要靠单独
+   替换命令文本，而不是把扫描挪到替换之后。共享的权限 helper 也有同形问题：
+   `check_call_with_execution` 会把 Stop 抹成普通拒绝串，turn 内的入口必须改用返回
+   `Refusal` 的变体，并保留 notice；turn 外的 slash 路径则继续用旧入口，因为那里没有
+   可取消的 turn。回归要分别覆盖“越界符号链接不被读入”“参数里的标记保持字面”
+   “Stop 真的 cancel 且不执行命令”，三个都是行为分叉而不是同一断言的不同写法。
