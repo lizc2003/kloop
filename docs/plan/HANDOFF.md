@@ -5,7 +5,7 @@ canonical 落点划边界：顶层 `AGENTS.md`、`.kloop/rules/*.md`、`AGENTS.l
 `@import` 走同一处检查，符号链接指向仓库外一律跳过并给启动警告，项目内互链照常，
 `~/.kloop` 全局层不受限。skill 工具改为先在作者正文上找 `` !`cmd` ``/`@file`，再分段做
 `$ARGUMENTS`/`${CLAUDE_SKILL_DIR}` 替换，模型传入的 `arguments` 不再能触发注入；
-命令自身文本仍可引用参数。skill 路径的 `!cmd` 补跑 `pre_tool` hook，权限结果改走区分
+作者写的 `@${CLAUDE_SKILL_DIR}/…` 仍会附上文件。命令自身文本仍可引用参数。skill 路径的 `!cmd` 补跑 `pre_tool` hook，权限结果改走区分
 `Refusal` 的入口：Stop 会 cancel turn 并返回 `user_stop`，notice 经 UI 发出；slash 路径
 保持原语义。`@file` 改成 `take(100KB+4)` 的有界读取并放入 `spawn_blocking`，后段非
 UTF-8 不再让整份文件被跳过。`skill_tool` 补 depth>0 拒绝。新增回归覆盖三类越界符号
@@ -3947,3 +3947,6 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    `Refusal` 的变体，并保留 notice；turn 外的 slash 路径则继续用旧入口，因为那里没有
    可取消的 turn。回归要分别覆盖“越界符号链接不被读入”“参数里的标记保持字面”
    “Stop 真的 cancel 且不执行命令”，三个都是行为分叉而不是同一断言的不同写法。
+   审查补了一层：避免参数注入不能靠“整体不替换”；可信来源要分开处理——作者写下的
+   `${CLAUDE_SKILL_DIR}` 可以先展开再扫描 `@file`，模型给的 `$ARGUMENTS` 不能。只按
+   “扫描原始正文”一刀切，会把作者正常的目录引用一起弄丢，这是比漏洞更隐蔽的功能回退。

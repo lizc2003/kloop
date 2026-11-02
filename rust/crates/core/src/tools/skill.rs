@@ -225,6 +225,50 @@ mod tests {
         assert_eq!(out, "Result: alpha");
     }
 
+    /// Even through a placeholder, `arguments` cannot become an `@file` mention:
+    /// the scan sees the author's `@$ARGUMENTS` text, where `$` ends the path.
+    #[tokio::test]
+    async fn arguments_cannot_add_a_file_mention() {
+        let skills = vec![Skill {
+            name: "echo".into(),
+            description: "d".into(),
+            body: "See @$ARGUMENTS".into(),
+            ..Default::default()
+        }];
+        let ctx = with_skills(test_ctx(0, "skill-args-mention"), skills);
+        let (out, is_error) = run_tool(
+            "skill",
+            json!({"name": "echo", "arguments": "/etc/hosts"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error);
+        assert_eq!(out, "See @/etc/hosts", "nothing may be attached");
+    }
+
+    /// An author-written `@${CLAUDE_SKILL_DIR}/...` still attaches the file: the
+    /// skill directory is trusted configuration, so it is substituted before the
+    /// mention scan even though model arguments never are.
+    #[tokio::test]
+    async fn skill_dir_mention_attaches_the_referenced_file() {
+        let dir = std::env::temp_dir().join(format!("kloop-skill-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reference.md"), "REFERENCE-BODY").unwrap();
+        let skills = vec![Skill {
+            name: "docs".into(),
+            description: "d".into(),
+            body: "Read @${CLAUDE_SKILL_DIR}/reference.md now.".into(),
+            dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        }];
+        let ctx = with_skills(test_ctx(0, "skill-dir-mention"), skills);
+        let (out, is_error) = run_tool("skill", json!({"name": "docs"}), &ctx).await;
+        assert!(!is_error);
+        assert!(out.contains("REFERENCE-BODY"), "got: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A skill's `!cmd` runs inside a turn, so it faces the same `pre_tool`
     /// hook a bash call would; a blocking hook stops the command.
     #[tokio::test]

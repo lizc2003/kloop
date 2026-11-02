@@ -50,6 +50,7 @@ use crate::permissions::Refusal;
 use crate::permissions::user_stop;
 use crate::skills::expand_body;
 use crate::skills::substitute;
+use crate::skills::substitute_skill_dir;
 
 /// A referenced file's contents are truncated to this many bytes before being
 /// appended, so a `@big.log` mention can't blow the context window.
@@ -132,7 +133,11 @@ pub(super) async fn expand_skill_body(
     let (tail, used) = substitute(&body[last..], skill_dir, args);
     used_args |= used;
     out.push_str(&tail);
-    out.push_str(&collect_file_attachments(body, workspace).await);
+    // Mentions resolve against the author's text with only the skill directory
+    // substituted: the directory is trusted, while `$ARGUMENTS` stays literal so
+    // arguments cannot smuggle a `@path`.
+    let mentions = substitute_skill_dir(body, skill_dir);
+    out.push_str(&collect_file_attachments(&mentions, workspace).await);
     if !used_args && !args.trim().is_empty() {
         out.push_str(&format!("\n\nARGUMENTS: {}", args.trim()));
     }

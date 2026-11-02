@@ -404,6 +404,15 @@ pub fn expand_body(body: &str, skill_dir: &str, args: &str) -> String {
     out
 }
 
+/// Replace only `${CLAUDE_SKILL_DIR}`, leaving `$ARGUMENTS`/`$N` alone. The
+/// skill's own directory is trusted configuration — the author wrote it and the
+/// loader resolved it — so a mention like `@${CLAUDE_SKILL_DIR}/ref.md` must
+/// still resolve. Model-supplied arguments are not trusted and are deliberately
+/// left unexpanded here, so they cannot introduce a mention either.
+pub(crate) fn substitute_skill_dir(body: &str, skill_dir: &str) -> String {
+    body.replace("${CLAUDE_SKILL_DIR}", skill_dir)
+}
+
 /// The substitution half of [`expand_body`], usable on a fragment. Returns
 /// whether the fragment used an argument placeholder, so a caller that
 /// substitutes one segment at a time can still decide whether arguments were

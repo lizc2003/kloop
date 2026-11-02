@@ -84,6 +84,11 @@
 - 第 5 条：`skill_tool` 开头检查 `ctx.depth > 0`，用 `Unoffered::RootOnly` 的同一句
   `tool 'skill' is only available to the root agent` 拒绝；`unoffered` 保持把 `Elsewhere`
   交给 owner 复查的设计。
+- 审查补丁：第 2 条首版把 `@file` 扫描放在未替换的原始正文上，作者写的
+  `@${CLAUDE_SKILL_DIR}/reference.md` 因此不再附上文件（相对父提交的功能回退）。改为
+  `substitute_skill_dir` 只替换可信的 skill 目录后再扫描；`$ARGUMENTS`/`$N` 仍不替换，
+  参数依旧无法引入标记。新增两条回归：目录引用能附上文件、`@$ARGUMENTS` 不产生附件。
+  复跑外层执行沙箱之外 `make check` 全绿。
 - 验证（2026-11-02）：`cli/src/context.rs` 新增顶层 `AGENTS.md`、rules、`@./link.md` 三种
   越界符号链接与项目内互链测试；`tools/skill.rs` 新增参数注入两条、命令内 `$ARGUMENTS`、
   `pre_tool` 阻断、Stop 结束 turn、depth≥1 拒绝；`tools/inject.rs` 新增大文件截断/后段二进制、
