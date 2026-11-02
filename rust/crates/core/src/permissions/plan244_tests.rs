@@ -636,11 +636,6 @@ async fn plan244_literal_and_replacement_roles_agree() {
         "git -c core.pager=cat commit -m marker",
         "ls --color=marker src",
         "stat --format=marker src",
-        "tree -o marker src",
-        "tree --outfile=marker src",
-        "find . -fprint marker",
-        "find . -fprint0 marker",
-        "find . -fprintf marker '%p\\n'",
     ] {
         for command in [tail.replace("marker", "notes.txt"), format!("xargs -I marker {tail}")] {
             let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
@@ -806,11 +801,13 @@ async fn plan244_secret_writes_are_hard_limits_across_output_forms() {
             }
         }
         for name in ["write_file", "edit_file", "notebook_edit"] {
-            let input = if name == "notebook_edit" {
-                json!({"notebook_path": ".env"})
-            } else { file(".env") };
-            let error = p.check_call(name, &input, 0, true).await.expect_err(name);
-            assert!(error.contains("writing this sensitive path"), "{name}: {error}");
+            for path in [".env", ".aws/note.ipynb"] {
+                let input = if name == "notebook_edit" {
+                    json!({"notebook_path": path})
+                } else { file(path) };
+                let error = p.check_call(name, &input, 0, true).await.expect_err(name);
+                assert!(error.contains("writing this sensitive path"), "{name}: {error}");
+            }
         }
         assert_eq!(approver.ask_count(), 0);
     }
@@ -855,6 +852,54 @@ async fn plan244_data_roles_preserve_sensitive_directory_evidence() {
             let p = gate(mode, rules(&[], &[], &[]), approver.clone());
             let error = p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
             assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan244_unknown_output_targets_cannot_bypass_secret_write_limits() {
+    for tail in [
+        "tree -o marker src", "tree --outfile=marker src", "tree -so marker src",
+        "find . -fprint marker", "find . -fprint0 marker", "find . -fprintf marker '%p'",
+        "find . -fls marker",
+    ] {
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 16]);
+            let p = gate(mode, rules(&["bash", "bash_write(**)"], &[], &[]), approver.clone());
+            for command in [
+                format!("xargs -I marker {tail}"),
+                format!("printf '.env\\n' | xargs -I marker {tail}"),
+                tail.replace("marker", "\"$TARGET\""),
+                tail.replace("marker", ".env"),
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    let error = p.check_call("bash", &bash(&command), 0, sandbox_auto_allow)
+                        .await.expect_err(&command);
+                    assert!(error.contains("writing this sensitive path"), "{command}: {error}");
+                }
+            }
+            assert_eq!(approver.ask_count(), 0, "{tail}");
+            let ordinary = tail.replace("marker", "out.txt");
+            p.check_call("bash", &bash(&ordinary), 0, true).await.expect(&ordinary);
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan244_unknown_redirect_targets_keep_the_hard_write_boundary() {
+    for command in [
+        "printf x > \"$TARGET\"", "printf x > \"$DIR/notes.txt\"",
+        "printf x > \"$(cat target.txt)\"", "printf x > *.txt",
+    ] {
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+            let p = gate(mode, rules(&["bash", "bash_write(**)"], &[], &[]), approver.clone());
+            for sandbox_auto_allow in [false, true] {
+                let error = p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                    .await.expect_err(command);
+                assert!(error.contains("writing this sensitive path"), "{command}: {error}");
+            }
             assert_eq!(approver.ask_count(), 0, "{command}");
         }
     }

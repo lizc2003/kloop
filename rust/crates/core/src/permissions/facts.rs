@@ -69,7 +69,12 @@ pub(super) struct OpaqueScript {
 /// 未知效果不能从规则输入中消失；只有 Resolved 可按确切路径排除 deny/ask。
 pub(super) enum WriteTarget {
     Resolved(PathFacts),
-    Partial { sensitivity: Option<Sensitivity> },
+    Partial {
+        sensitivity: Option<Sensitivity>,
+        /// 未知词值可能直接指定敏感路径；仅 cwd 未知时沿用按拼写判定。
+        value_unknown: bool,
+    },
+    /// 未建模的执行可能写入，尚未识别出具体的写目标。
     Unknown,
 }
 
@@ -82,15 +87,18 @@ impl WriteTarget {
                         && !is_stream_device(&path.original)
                         && !is_stream_device(&path.normalized))
             }
-            Self::Partial { sensitivity } => sensitivity.is_some(),
+            Self::Partial { sensitivity, .. } => sensitivity.is_some(),
             Self::Unknown => false,
         }
     }
 
-    fn secret(&self) -> bool {
+    fn blocks_sensitive_write(&self) -> bool {
         match self {
             Self::Resolved(path) => path.sensitivity(Access::Write) == Some(Sensitivity::Secret),
-            Self::Partial { sensitivity } => *sensitivity == Some(Sensitivity::Secret),
+            Self::Partial {
+                sensitivity,
+                value_unknown,
+            } => *value_unknown || *sensitivity == Some(Sensitivity::Secret),
             Self::Unknown => false,
         }
     }
@@ -199,7 +207,7 @@ impl CallFacts {
         let risk_writes = bash_facts
             .as_ref()
             .map_or_else(Vec::new, |facts| write_targets(facts, cwd, execution));
-        let sensitive_write = risk_writes.iter().any(WriteTarget::secret)
+        let sensitive_write = risk_writes.iter().any(WriteTarget::blocks_sensitive_write)
             || (matches!(name, "write_file" | "edit_file" | "notebook_edit")
                 && path.as_ref().is_some_and(|path| {
                     path.sensitivity(Access::Write) == Some(Sensitivity::Secret)
@@ -965,11 +973,16 @@ fn write_targets(
             sensitivity: evaluation_sensitivity(&WordEvaluation::Partial(path), cwd, false, |_| {
                 Access::Write
             }),
+            value_unknown: false,
         }),
         WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
             sensitivity: evaluation_sensitivity(&target, cwd, false, |_| Access::Write),
+            value_unknown: true,
         }),
-        WordEvaluation::Unknown => Some(WriteTarget::Unknown),
+        WordEvaluation::Unknown => Some(WriteTarget::Partial {
+            sensitivity: None,
+            value_unknown: true,
+        }),
     };
     let mut writes: Vec<_> = facts
         .redirects

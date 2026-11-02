@@ -705,7 +705,7 @@ impl Permissions {
         }
 
         if call.sensitive_write {
-            // 已识别的凭据与 agent state 写入和读取一样，不能用审批或 bypass 覆盖。
+            // 敏感写入或无法排除敏感落点的明确写目标，不能用审批或 bypass 覆盖。
             return Err(Refusal::Denied(format!(
                 "{name}: writing this sensitive path is blocked. Do not retry or work around the protection."
             )));
@@ -1484,7 +1484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sensitive_paths_ask_every_time_and_never_remember() {
+    async fn vcs_writes_ask_each_time_and_secret_writes_are_hard_blocked() {
         let approver = ScriptedApprover::new(vec![
             Decision::Allow(ApprovalScope::Once),
             Decision::Allow(ApprovalScope::Once),
@@ -1510,8 +1510,7 @@ mod tests {
         );
         assert!(asked.iter().all(|r| r.remember_rules.is_none()));
 
-        // more of the sensitive list, incl. escapes out of cwd
-        let approver = ScriptedApprover::new(vec![]);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 4]);
         let p = gate(
             Mode::Manual,
             rules(&["write_file"], &[], &[]),
@@ -1523,7 +1522,14 @@ mod tests {
             "sub/.kloop/config.toml",
             "/x/.ssh/id_rsa",
         ] {
-            assert!(!ok(&p, "write_file", file(path)).await, "{path}");
+            let error = p
+                .check_call("write_file", &file(path), 0, false)
+                .await
+                .expect_err(path);
+            assert!(
+                error.contains("writing this sensitive path"),
+                "{path}: {error}"
+            );
         }
         assert_eq!(
             approver.ask_count(),

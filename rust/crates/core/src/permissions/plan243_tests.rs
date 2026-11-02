@@ -383,17 +383,17 @@ async fn plan243_home_concatenation_keeps_the_real_path() {
 
 #[tokio::test]
 async fn plan243_unknown_writes_keep_explicit_rules_effective() {
-    for command in [
-        "printf x > \"$TARGET\"",
-        "printf x > \"$DIR/notes.txt\"",
-        "printf x > *.txt",
-        "cd /tmp; printf x > notes.txt",
-        "HOME=/tmp; printf x > \"$HOME/notes.txt\"",
-        "HOME=/tmp; bash -c 'printf x > \"$HOME/notes.txt\"'",
-        "printf -v HOME /tmp; echo x > \"$HOME/notes.txt\"",
-        "bash -lc 'printf x > \"$HOME/notes.txt\"'",
-        "$CMD 'HOME=/tmp'; echo x > \"$HOME/notes.txt\"",
-        "for HOME in /tmp; do echo x > \"$HOME/notes.txt\"; done",
+    for (command, expected_error) in [
+        ("printf x > \"$TARGET\"", Some("writing this sensitive path")),
+        ("printf x > \"$DIR/notes.txt\"", Some("writing this sensitive path")),
+        ("printf x > *.txt", Some("writing this sensitive path")),
+        ("cd /tmp; printf x > notes.txt", None),
+        ("HOME=/tmp; printf x > \"$HOME/notes.txt\"", Some("writing this sensitive path")),
+        ("HOME=/tmp; bash -c 'printf x > \"$HOME/notes.txt\"'", Some("writing this sensitive path")),
+        ("printf -v HOME /tmp; echo x > \"$HOME/notes.txt\"", Some("writing this sensitive path")),
+        ("bash -lc 'printf x > \"$HOME/notes.txt\"'", Some("writing this sensitive path")),
+        ("$CMD 'HOME=/tmp'; echo x > \"$HOME/notes.txt\"", Some("reading this sensitive path")),
+        ("for HOME in /tmp; do echo x > \"$HOME/notes.txt\"; done", Some("writing this sensitive path")),
     ] {
         let p = gate(
             Mode::Bypass,
@@ -413,22 +413,22 @@ async fn plan243_unknown_writes_keep_explicit_rules_effective() {
             approver.clone(),
         );
         let result = p.check_call("bash", &bash(command), 0, true).await;
-        if command.starts_with("$CMD") {
+        if let Some(expected_error) = expected_error {
             let error = result.expect_err(command);
-            assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert!(error.contains(expected_error), "{command}: {error}");
             assert_eq!(approver.ask_count(), 0, "{command}");
         } else {
             result.unwrap_or_else(|error| panic!("{command}: {error}"));
             assert_eq!(approver.ask_count(), 1, "{command}");
         }
 
-        // 没有显式规则、也没有敏感证据时，保留现有沙箱免审批。
+        // 未知词值硬拒绝；只有 cwd 未知、目标拼写已知时沿用已有沙箱免审批。
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         let result = p.check_call("bash", &bash(command), 0, true).await;
-        if command.starts_with("$CMD") {
+        if let Some(expected_error) = expected_error {
             let error = result.expect_err(command);
-            assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert!(error.contains(expected_error), "{command}: {error}");
         } else {
             result.unwrap_or_else(|error| panic!("{command}: {error}"));
         }
@@ -442,12 +442,10 @@ async fn plan243_unknown_writes_keep_explicit_rules_effective() {
         rules(&["bash_write(**)"], &[], &[]),
         approver.clone(),
     );
-    assert!(
-        p.check_call("bash", &bash("printf x > \"$TARGET\""), 0, false)
-            .await
-            .is_err()
-    );
-    assert_eq!(approver.ask_count(), 1);
+    let error = p.check_call("bash", &bash("printf x > \"$TARGET\""), 0, false)
+        .await.expect_err("未知输出不能由文件范围 allow 或审批放行");
+    assert!(error.contains("writing this sensitive path"), "{error}");
+    assert_eq!(approver.ask_count(), 0);
 }
 
 #[tokio::test]
@@ -494,7 +492,7 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
     use crate::sandbox::ExecutionContext;
 
     let inner = "bash -c 'printf x > \"$HOME/locked.txt\"'";
-    for command in [
+    for (command, expected_error) in [
         "env HOME=/w/proj",
         "env -- HOME=/w/proj",
         "env -i HOME=/w/proj",
@@ -509,12 +507,12 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
         "timeout -s TERM 5 env HOME=/w/proj",
         "nice -n -10 env HOME=/w/proj",
         "env HOME=\"$DIR\"",
-        "env --unsupported value",
-        "timeout --unsupported value 5 env HOME=/w/proj",
     ]
     .into_iter()
-    .map(|wrapper| format!("{wrapper} {inner}"))
-    .chain(["sudo -R /w/proj bash -c 'printf x > /locked.txt'".into()])
+    .map(|wrapper| (format!("{wrapper} {inner}"), Some("writing this sensitive path")))
+    .chain(["env --unsupported value", "timeout --unsupported value 5 env HOME=/w/proj"]
+        .into_iter().map(|wrapper| (format!("{wrapper} {inner}"), None)))
+    .chain([("sudo -R /w/proj bash -c 'printf x > /locked.txt'".into(), None)])
     {
         let p = gate(
             Mode::Bypass,
@@ -538,15 +536,21 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
             rules(&[], &[], &["bash_write(/w/proj/locked.txt)"]),
             approver.clone(),
         );
-        p.check_call_with_execution(
+        let result = p.check_call_with_execution(
             "bash",
             &bash(&command),
             0,
             ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
         )
-        .await
-        .unwrap();
-        assert_eq!(approver.ask_count(), 1, "{command}");
+        .await;
+        if let Some(expected_error) = expected_error {
+            let error = result.expect_err(&command);
+            assert!(error.contains(expected_error), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(approver.ask_count(), 1, "{command}");
+        }
     }
 
     // env 只改子进程：外层重定向与后续兄弟命令仍使用原 HOME。
