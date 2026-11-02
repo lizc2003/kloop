@@ -22,6 +22,7 @@ mod execution_provenance;
 mod file_io;
 pub mod file_state;
 pub mod fs_complete;
+pub mod git;
 pub mod history;
 pub mod hooks;
 pub mod image;

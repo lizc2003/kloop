@@ -7,7 +7,6 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 
 use sha2::Digest as _;
@@ -18,26 +17,6 @@ const WORKSPACE_GIT_DOMAIN: &[u8] = b"kloop-workspace/git/v1\0";
 const PROJECT_DIRECTORY_DOMAIN: &[u8] = b"kloop-project/directory/v1\0";
 const WORKSPACE_DIRECTORY_DOMAIN: &[u8] = b"kloop-workspace/directory/v1\0";
 const WORKSPACE_UNAVAILABLE_DOMAIN: &[u8] = b"kloop-workspace/unavailable/v1\0";
-const GIT_IDENTITY_ENV_VARS: [&str; 12] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_INDEX_FILE",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_SYSTEM",
-];
-#[cfg(unix)]
-const GIT_NULL_CONFIG: &str = "/dev/null";
-#[cfg(windows)]
-const GIT_NULL_CONFIG: &str = "NUL";
-#[cfg(not(any(unix, windows)))]
-const GIT_NULL_CONFIG: &str = "/dev/null";
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProjectId(String);
@@ -145,30 +124,8 @@ pub struct WorkspaceIdentity {
     cwd: PathBuf,
     workspace_root: PathBuf,
     project_anchor: Option<PathBuf>,
+    git: bool,
     status: ProjectIdentityStatus,
-}
-
-fn git_probe_command(canonical_cwd: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(canonical_cwd)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--is-inside-work-tree",
-            "--show-toplevel",
-            "--git-common-dir",
-        ])
-        .env("LC_ALL", "C")
-        .env("LANG", "C");
-    for name in GIT_IDENTITY_ENV_VARS {
-        command.env_remove(name);
-    }
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", GIT_NULL_CONFIG);
-    command
 }
 
 fn git_marker_root(canonical_cwd: &Path) -> Option<&Path> {
@@ -204,7 +161,14 @@ impl WorkspaceIdentity {
             }
         };
 
-        let mut command = git_probe_command(&canonical_cwd);
+        let mut command = crate::git::hermetic_command(&canonical_cwd);
+        command.args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--is-inside-work-tree",
+            "--show-toplevel",
+            "--git-common-dir",
+        ]);
         let output = match kloop_process_spawn::output_std(&mut command) {
             Ok(output) => output,
             Err(_) => {
@@ -260,6 +224,7 @@ impl WorkspaceIdentity {
             cwd: canonical_cwd,
             workspace_root,
             project_anchor: Some(project_anchor),
+            git: true,
             status: ProjectIdentityStatus::Available,
         }
     }
@@ -279,6 +244,7 @@ impl WorkspaceIdentity {
             workspace_root: canonical_cwd.clone(),
             project_anchor: Some(canonical_cwd.clone()),
             cwd: canonical_cwd,
+            git: false,
             status: ProjectIdentityStatus::Available,
         }
     }
@@ -294,6 +260,7 @@ impl WorkspaceIdentity {
             workspace_root: cwd.clone(),
             project_anchor: None,
             cwd,
+            git: false,
             status: ProjectIdentityStatus::Unavailable(reason),
         }
     }
@@ -334,6 +301,20 @@ impl WorkspaceIdentity {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// The checkout root, but only when the probe proved a Git worktree. A
+    /// plain directory and an unavailable identity both answer `None`, so
+    /// instruction discovery stays bounded to cwd instead of treating a
+    /// directory project as a repository.
+    pub fn git_root(&self) -> Option<&Path> {
+        self.git.then_some(self.workspace_root.as_path())
+    }
+
+    /// Durable scheduler partition: one key per project, shared by every
+    /// linked worktree, without a second Git process or a fallible path.
+    pub fn scheduler_key(&self) -> String {
+        self.session_partition().as_str().to_string()
     }
 
     pub fn status(&self) -> ProjectIdentityStatus {
@@ -393,15 +374,10 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) {
-        let mut command = Command::new("git");
-        command.arg("-C").arg(cwd).args(args).env("LC_ALL", "C");
-        for name in GIT_IDENTITY_ENV_VARS {
-            command.env_remove(name);
-        }
-        command
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", GIT_NULL_CONFIG);
-        let status = command.status().unwrap();
+        let status = crate::git::hermetic_command(cwd)
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed");
     }
 
@@ -466,6 +442,13 @@ mod tests {
         assert_eq!(main.project_id(), second.project_id());
         assert_ne!(main.workspace_id(), first.workspace_id());
         assert_ne!(first.workspace_id(), second.workspace_id());
+        assert_eq!(main.scheduler_key(), first.scheduler_key());
+        assert_eq!(
+            first.scheduler_key(),
+            first.session_partition().as_str(),
+            "the scheduler partition is the project partition"
+        );
+        assert_eq!(main.scheduler_key().len(), 28);
         assert!(main.project_id().unwrap().as_str().starts_with("p1_"));
         assert_eq!(main.project_id().unwrap().as_str().len(), 28);
 
@@ -488,6 +471,10 @@ mod tests {
             child.workspace_root(),
             std::fs::canonicalize(&root).unwrap()
         );
+        assert_eq!(
+            child.git_root(),
+            Some(std::fs::canonicalize(&root).unwrap().as_path())
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -505,6 +492,11 @@ mod tests {
             identity.workspace_id().as_str().trim_start_matches("w1_")
         );
         assert_eq!(identity.cwd(), std::fs::canonicalize(&root).unwrap());
+        assert_eq!(identity.git_root(), None);
+        assert_eq!(
+            identity.scheduler_key(),
+            identity.session_partition().as_str()
+        );
 
         #[cfg(unix)]
         {
@@ -520,29 +512,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn git_probe_ignores_repository_selection_environment() {
-        let command = git_probe_command(Path::new("/tmp"));
-        for name in GIT_IDENTITY_ENV_VARS {
-            assert!(
-                command
-                    .get_envs()
-                    .any(|(key, value)| key == OsStr::new(name) && value.is_none()),
-                "{name} was inherited by the identity probe"
-            );
-        }
-        let configured = |name: &str| {
-            command
-                .get_envs()
-                .find(|(key, _)| *key == OsStr::new(name))
-                .and_then(|(_, value)| value)
-        };
-        assert_eq!(configured("GIT_CONFIG_NOSYSTEM"), Some(OsStr::new("1")));
-        assert_eq!(
-            configured("GIT_CONFIG_GLOBAL"),
-            Some(OsStr::new(GIT_NULL_CONFIG))
-        );
-    }
     #[test]
     fn local_core_worktree_cannot_redirect_workspace_identity() {
         let root = init_repository("core-worktree");
@@ -577,7 +546,18 @@ mod tests {
             identity.status(),
             ProjectIdentityStatus::Unavailable(IdentityUnavailableReason::GitProbeFailed)
         );
+        assert_eq!(identity.git_root(), None);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unavailable_identity_still_names_a_scheduler_partition() {
+        let identity = WorkspaceIdentity::ephemeral(temp_dir("ephemeral"));
+        assert_eq!(
+            identity.scheduler_key(),
+            identity.session_partition().as_str()
+        );
+        assert_eq!(identity.scheduler_key().len(), 28);
     }
 
     #[test]

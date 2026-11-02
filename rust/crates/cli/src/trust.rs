@@ -57,8 +57,10 @@ pub(crate) fn asks_for_trust(serve: bool, headless: bool, mock: bool, stdin_is_t
 /// directory under the private state root answers, whether it holds a grant
 /// record, transcripts, or durable approvals (see `ProjectStore`). `false` means the human
 /// declined and the caller should exit without starting anything.
-pub(crate) fn ensure_trusted(store: Option<&Arc<ProjectStore>>, cwd: &Path) -> bool {
-    let identity = WorkspaceIdentity::resolve(cwd);
+pub(crate) fn ensure_trusted(
+    store: Option<&Arc<ProjectStore>>,
+    identity: &WorkspaceIdentity,
+) -> bool {
     let project = identity.project_id().zip(store);
     if let Some((project_id, store)) = project
         && store.trusted_blocking(project_id)

@@ -1431,9 +1431,7 @@ mod tests {
             &["commit", "-qm", "active-only"],
         ] {
             assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&active)
+                crate::git::hermetic_command(&active)
                     .args(args)
                     .status()
                     .unwrap()
@@ -1537,9 +1535,7 @@ mod tests {
             trees.is_empty(),
             "the untouched tree was removed: {trees:?}"
         );
-        let branches = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let branches = crate::git::command(&repo)
             .args(["branch", "--list", "kloop-worktree-*"])
             .output()
             .unwrap();

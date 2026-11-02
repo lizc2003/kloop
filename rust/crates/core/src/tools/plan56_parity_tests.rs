@@ -88,9 +88,7 @@ impl Approver for ScriptedApprover {
 }
 
 fn git(repository: &std::path::Path, arguments: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(crate::worktree::git_compatible_path(repository))
+    let output = crate::git::command(repository)
         .args(arguments)
         .output()
         .unwrap();

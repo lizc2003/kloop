@@ -247,21 +247,8 @@ impl ToolSource for SeamSource {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let home = repo.join(".plan59-home");
-    let xdg = home.join(".config");
-    std::fs::create_dir_all(&xdg).unwrap();
-    let mut command = std::process::Command::new("git");
-    command.args(args).current_dir(repo).env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
-    let output = command
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("LC_ALL", "C")
+    let output = crate::git::hermetic_command(repo)
+        .args(args)
         .output()
         .unwrap();
     assert!(
@@ -302,6 +289,7 @@ async fn file_search_bash_worktree_report() -> Value {
     init_repo(root.path());
     let isolated_home = root.path().join(".plan59-home");
     let isolated_xdg = isolated_home.join(".config");
+    std::fs::create_dir_all(&isolated_xdg).unwrap();
     std::fs::write(isolated_home.join(".gitconfig"), "[invalid\n").unwrap();
     let _git_environment =
         crate::worktree::isolate_test_git_environment(root.path(), &isolated_home, &isolated_xdg);

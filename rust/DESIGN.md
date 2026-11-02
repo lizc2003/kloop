@@ -533,6 +533,14 @@ Base36 编码，分别加 `p1_` / `w1_` 前缀，目录名共 28 字符。
 共用 `project.lock`，在锁内读改写，再以排他创建的临时文件原子替换，避免多个
 实例丢掉对方刚写的 `granted_at`。
 
+所有 Git 调用都经 `crates/core/src/git.rs`：统一加 `-C <目录>`，清掉从 hook 或
+包装器继承的仓库选择变量（`GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、
+`GIT_COMMON_DIR` 等），并固定 `LC_ALL=LANG=C`。worktree 生命周期、启动时的分支与
+status 快照、TUI 分支、scheduler 分区都用这个入口，不再各自拼环境或重复解析 cwd。
+需要屏蔽用户全局/系统配置的身份探测走 `hermetic_command`；worktree 变更与快照走
+`command`，保留用户自己的 Git 配置。一次启动只 `WorkspaceIdentity::resolve` 一次
+cwd，会话分区、权限层、信任询问与 scheduler key 共用同一份身份。
+
 That label is **written once and never rewritten while it still agrees with the
 project it names**, and the anchor is why that is safe: the `ProjectId` is a
 hash *of* the anchor, so the anchor a launch resolves is the same one an earlier
@@ -3061,10 +3069,12 @@ Durable jobs are stored at:
 ~/.kloop/scheduler/<project-key>/scheduled_tasks.lock
 ```
 
-The project key derives from the canonical Git common directory, so a primary checkout and
-its worktrees share one base-project identity; a non-Git project uses its canonical cwd.
-项目键取 SHA-256 的前 128 位，编码为固定 25 位全小写 Base36，多个实例仍定位同一
-目录。任务 ID 为 `job-` 加 11 位随机 Base58；持久任务的查重与插入在同一个
+The project key is the `ProjectId` of `WorkspaceIdentity::session_partition` — the same
+partition sessions and durable approvals use — so a primary checkout and its worktrees share
+one key and a non-Git project uses its own canonical cwd. Scheduling therefore never runs Git
+itself: the identity is already resolved for the session, an unavailable probe still yields a
+directory-domain key, and paths are hashed by their raw OS bytes rather than a lossy spelling.
+任务 ID 为 `job-` 加 11 位随机 Base58；持久任务的查重与插入在同一个
 存储锁事务内，内存任务在注册表互斥锁内完成。不查找或迁移旧目录。
 A durable job is bound to its creating session/thread owner. Other owners cannot list,
 delete, or claim it; competing runtimes of the same owner claim under the store lock and
@@ -5516,6 +5526,8 @@ crates/core/        kloop-core — the agent, network-free
   src/shell/facts.rs 局部命令/重定向/正文事实与不确定上下文
   src/shell/word.rs 有引用状态的词片段与受限统一求值
   src/project.rs   machine-local ProjectId/WorkspaceId resolution
+  src/git.rs       the one Git entry: -C, inherited repository env cleared, optional
+                   hermetic global/system config
   src/permissions.rs 公开门面、完整权限管线、审批/升级与模式切换
   src/permissions/rule.rs 规则语言、解析与 allow/deny/ask 两个方向的匹配
   src/permissions/policy.rs 全局约束、项目策略、工作区会话状态与 epoch 发布

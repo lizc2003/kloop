@@ -80,21 +80,29 @@ impl SessionStore {
     }
 
     /// Resolve this working directory's partition without touching the disk.
-    /// The global store probes Git here (once per call — callers resolve once
-    /// and pass the result around); the hermetic store never does.
+    /// Resolves an identity of its own; callers that already have one use
+    /// [`Self::dirs_with`].
     pub fn dirs(&self, cwd: &Path) -> SessionDirs {
+        self.dirs_with(&WorkspaceIdentity::resolve(cwd))
+    }
+
+    /// [`Self::dirs`] for a caller that already resolved the cwd's identity.
+    /// The hermetic store never probes Git, so it ignores the identity.
+    pub fn dirs_with(&self, identity: &WorkspaceIdentity) -> SessionDirs {
         match self {
             Self::Hermetic(root) => dirs_under(root),
-            Self::Global(root) => {
-                let identity = WorkspaceIdentity::resolve(cwd);
-                dirs_under(&partition_dir(root, &identity.session_partition()))
-            }
+            Self::Global(root) => dirs_under(&partition_dir(root, &identity.session_partition())),
         }
     }
 
     /// [`Self::dirs`] plus the directory tree, created owner-only, and the
     /// partition's `project.json` label.
     pub fn ensure(&self, cwd: &Path) -> io::Result<SessionDirs> {
+        self.ensure_with(&WorkspaceIdentity::resolve(cwd))
+    }
+
+    /// [`Self::ensure`] for a caller that already resolved the cwd's identity.
+    pub fn ensure_with(&self, identity: &WorkspaceIdentity) -> io::Result<SessionDirs> {
         let dirs = match self {
             Self::Hermetic(root) => {
                 let dirs = dirs_under(root);
@@ -102,7 +110,6 @@ impl SessionStore {
                 dirs
             }
             Self::Global(root) => {
-                let identity = WorkspaceIdentity::resolve(cwd);
                 let partition = identity.session_partition();
                 let dir = partition_dir(root, &partition);
                 create_private_dir_all(&dir)?;
@@ -281,7 +288,6 @@ fn read_project_anchor(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
@@ -302,11 +308,8 @@ mod tests {
 
     fn init_repository(tag: &str) -> PathBuf {
         let root = temp_dir(tag);
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&root)
+        let status = crate::git::hermetic_command(&root)
             .args(["init", "-q"])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .status()
             .unwrap();
         assert!(status.success(), "git init failed");

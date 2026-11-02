@@ -4,20 +4,10 @@
 //! revalidates that provenance under the process-wide Git mutation lock. Session
 //! and task handles use the same Git operations but never share lifecycle state.
 
-#[cfg(windows)]
-use std::ffi::OsString;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt as _;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStringExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LockResult;
-#[cfg(test)]
-use std::sync::Mutex as StdMutex;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::RwLockWriteGuard;
@@ -34,6 +24,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::config::Config;
 use crate::permissions::Permissions;
 use crate::sandbox::SandboxPolicy;
+
+pub(crate) use crate::git::git_compatible_path;
+#[cfg(test)]
+pub(crate) use crate::git::isolate_test_git_environment;
 
 /// Managed worktrees live in kloop's own repository namespace, not in another
 /// agent's directory (cc's `.claude/worktrees`).
@@ -58,58 +52,6 @@ const WORKTREE_BRANCH_PREFIX: &str = "kloop-worktree-";
 static WORKTREE_MUTATION_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 #[cfg(test)]
 static GENERATED_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-#[cfg(test)]
-#[derive(Clone)]
-struct TestGitEnvironment {
-    root: PathBuf,
-    home: PathBuf,
-    xdg_config_home: PathBuf,
-}
-
-#[cfg(test)]
-static TEST_GIT_ENVIRONMENTS: OnceLock<StdMutex<Vec<TestGitEnvironment>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct TestGitEnvironmentGuard {
-    root: PathBuf,
-}
-
-#[cfg(test)]
-impl Drop for TestGitEnvironmentGuard {
-    fn drop(&mut self) {
-        let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
-        environments
-            .lock()
-            .unwrap()
-            .retain(|environment| environment.root != self.root);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn isolate_test_git_environment(
-    root: &Path,
-    home: &Path,
-    xdg_config_home: &Path,
-) -> TestGitEnvironmentGuard {
-    let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
-    let mut environments = environments.lock().unwrap();
-    assert!(
-        environments
-            .iter()
-            .all(|environment| environment.root != root),
-        "duplicate test Git environment for {}",
-        root.display()
-    );
-    environments.push(TestGitEnvironment {
-        root: root.to_path_buf(),
-        home: home.to_path_buf(),
-        xdg_config_home: xdg_config_home.to_path_buf(),
-    });
-    TestGitEnvironmentGuard {
-        root: root.to_path_buf(),
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorktreeOwner {
@@ -872,60 +814,9 @@ fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
 }
 
 fn git_command(dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(git_compatible_path(dir)).args(args);
-    #[cfg(test)]
-    {
-        let environments = TEST_GIT_ENVIRONMENTS.get_or_init(|| StdMutex::new(Vec::new()));
-        let environment = environments
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|environment| dir.starts_with(&environment.root))
-            .max_by_key(|environment| environment.root.components().count())
-            .cloned();
-        if let Some(environment) = environment {
-            let path = std::env::var_os("PATH");
-            command.env_clear();
-            if let Some(path) = path {
-                command.env("PATH", path);
-            }
-            command
-                .env("HOME", environment.home)
-                .env("XDG_CONFIG_HOME", environment.xdg_config_home)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .env("LC_ALL", "C");
-        }
-    }
+    let mut command = crate::git::tokio_command(dir);
+    command.args(args);
     command
-}
-
-#[cfg(windows)]
-pub(crate) fn git_compatible_path(path: &Path) -> PathBuf {
-    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
-    const UNC: &[u16] = &[b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
-
-    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if !units.starts_with(VERBATIM) {
-        return path.to_path_buf();
-    }
-    let suffix = &units[VERBATIM.len()..];
-    let compatible = if suffix.starts_with(UNC) {
-        [b'\\' as u16, b'\\' as u16]
-            .into_iter()
-            .chain(suffix[UNC.len()..].iter().copied())
-            .collect()
-    } else {
-        suffix.to_vec()
-    };
-    PathBuf::from(OsString::from_wide(&compatible))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn git_compatible_path(path: &Path) -> PathBuf {
-    path.to_path_buf()
 }
 
 async fn git_success(dir: &Path, args: &[&str]) -> Result<bool> {
@@ -969,9 +860,22 @@ mod tests {
             vec!["config", "user.name", "t"],
             vec!["commit", "--allow-empty", "-qm", "base"],
         ] {
-            git_text(&root, &args).await.unwrap();
+            fixture_git(&root, &args).await;
         }
         root
+    }
+
+    /// Fixture commits stay off the host's Git configuration, so a global
+    /// `commit.gpgSign` or hooks path cannot fail the setup.
+    async fn fixture_git(dir: &Path, args: &[&str]) {
+        let mut command = crate::git::tokio_hermetic_command(dir);
+        command.args(args);
+        let output = kloop_process_spawn::output(&mut command).await.unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn config_for_repo(root: &Path, tag: &str) -> Config {
@@ -1020,8 +924,8 @@ mod tests {
     async fn ignored_files_are_content_changes() {
         let root = temp_repo("ignored").await;
         std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
-        git_text(&root, &["add", ".gitignore"]).await.unwrap();
-        git_text(&root, &["commit", "-qm", "ignore"]).await.unwrap();
+        fixture_git(&root, &["add", ".gitignore"]).await;
+        fixture_git(&root, &["commit", "-qm", "ignore"]).await;
         let worktree = create(&root, "agent-ignored").await.unwrap();
         std::fs::write(worktree.path.join("ignored.txt"), "work").unwrap();
         let changes = inspect_changes(&worktree).await.unwrap();

@@ -380,11 +380,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
+        let status = kloop_core::git::hermetic_command(&repo)
             .args(["init", "-q"])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .status()
             .unwrap();
         assert!(status.success(), "git init failed");

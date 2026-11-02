@@ -641,9 +641,7 @@ async fn permission_report() -> Value {
 }
 
 fn git(repository: &Path, arguments: &[&str]) {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repository)
+    let output = crate::git::command(repository)
         .args(arguments)
         .output()
         .unwrap();

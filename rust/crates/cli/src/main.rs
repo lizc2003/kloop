@@ -29,6 +29,7 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use kloop_core::history::History;
+use kloop_core::project::WorkspaceIdentity;
 use kloop_core::skills::Skill;
 use kloop_core::tools::ToolSource;
 use kloop_core::tools::tool_merge_warnings;
@@ -174,6 +175,9 @@ impl ProcessState {
 /// never reaches here: it does the same work per thread, against that thread's
 /// own cwd, inside [`serve_config_factory`].
 struct SessionState {
+    /// Resolved once for this cwd; trust, the session partition, the permission
+    /// layer and the scheduler key all read this copy.
+    identity: WorkspaceIdentity,
     project: context::GatheredContext,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     skills: Arc<Vec<Skill>>,
@@ -192,11 +196,12 @@ impl SessionState {
         cwd: &std::path::Path,
         process: &ProcessState,
         session_store: &SessionStore,
+        identity: WorkspaceIdentity,
     ) -> Result<Option<Self>> {
         let project = if args.mock {
             context::mock(cwd)
         } else {
-            context::gather(cwd, process.runtime.base_system())
+            context::gather(cwd, process.runtime.base_system(), &identity)
         };
         for warning in &project.warnings {
             eprintln!("\x1b[2m[{warning}]\x1b[0m");
@@ -204,7 +209,7 @@ impl SessionState {
         // Ahead of the sandbox: the policy carves this project's offload directory
         // back out of the otherwise denied private state root.
         let session_dirs = session_store
-            .ensure(cwd)
+            .ensure_with(&identity)
             .context("cannot create the session directory")?;
         let sandbox = build_sandbox(
             args,
@@ -255,6 +260,7 @@ impl SessionState {
             image::load_images(&args.images)?
         };
         Ok(Some(Self {
+            identity,
             project,
             sandbox,
             skills,
@@ -363,6 +369,16 @@ async fn run_front_end(
     session_store: SessionStore,
     cwd: std::path::PathBuf,
 ) -> Result<ExitCode> {
+    if args.serve {
+        return run_serve(args, process, session_store).await;
+    }
+    // One probe for this cwd: trust, the session partition, the permission
+    // layer and the scheduler key all read the same identity.
+    let identity = if args.mock {
+        WorkspaceIdentity::ephemeral(cwd.clone())
+    } else {
+        WorkspaceIdentity::resolve(&cwd)
+    };
     // Workspace trust (plan 193) comes before everything a front-end does —
     // before a session file exists, before the directory is read. A declined
     // directory is not an error: the human chose to leave.
@@ -370,14 +386,11 @@ async fn run_front_end(
         // One rule per interactive launch, so several launches in one
         // scrollback are told apart at a glance.
         launch_rule();
-        if !trust::ensure_trusted(process.runtime.project_store(), &cwd) {
+        if !trust::ensure_trusted(process.runtime.project_store(), &identity) {
             return Ok(ExitCode::SUCCESS);
         }
     }
-    if args.serve {
-        return run_serve(args, process, session_store).await;
-    }
-    let Some(session) = SessionState::open(&args, &cwd, &process, &session_store)? else {
+    let Some(session) = SessionState::open(&args, &cwd, &process, &session_store, identity)? else {
         return Ok(ExitCode::SUCCESS);
     };
     // Headless (`--headless`) takes precedence over the interactive
@@ -406,10 +419,15 @@ fn serve_config_factory(
     let runtime = process.runtime.clone();
     let tool_sources = process.tool_sources.clone();
     Arc::new(move |options, catalog, approver, questioner, notify| {
+        let identity = if args.mock {
+            WorkspaceIdentity::ephemeral(options.cwd.clone())
+        } else {
+            WorkspaceIdentity::resolve(&options.cwd)
+        };
         let project = if args.mock {
             context::mock(&options.cwd)
         } else {
-            context::gather(&options.cwd, runtime.base_system())
+            context::gather(&options.cwd, runtime.base_system(), &identity)
         };
         for warning in &project.warnings {
             notify(warning);
@@ -418,7 +436,7 @@ fn serve_config_factory(
         // project partition rather than inheriting the process one.
         // Resolved before the sandbox because the policy carves the
         // partition's offload directory back out of the denied store.
-        let session_dirs = session_store.ensure(&options.cwd)?;
+        let session_dirs = session_store.ensure_with(&identity)?;
         let sandbox = build_sandbox(
             &args,
             &options.cwd,
@@ -446,6 +464,7 @@ fn serve_config_factory(
             notify,
             &tool_sources,
             &project,
+            &identity,
             sandbox,
             skills,
             &options.cwd,
@@ -524,6 +543,7 @@ async fn run_headless_turn(
         notify,
         &process.tool_sources,
         &session.project,
+        &session.identity,
         session.sandbox,
         session.skills,
         cwd,
@@ -583,6 +603,7 @@ async fn run_tui(
     cwd: std::path::PathBuf,
 ) -> Result<ExitCode> {
     let SessionState {
+        identity,
         project,
         sandbox,
         skills,
@@ -659,6 +680,7 @@ async fn run_tui(
                 notify,
                 &tool_sources,
                 &project,
+                &identity,
                 sandbox.clone(),
                 skills.clone(),
                 &cwd,

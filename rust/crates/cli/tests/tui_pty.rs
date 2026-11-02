@@ -224,8 +224,6 @@ async fn startup_paints_mcp_progress_and_gates_input_until_connected() -> Result
 /// gate opens, the delivery request already carries the server's tool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
-    use sha2::Digest as _;
-
     let _guard = PTY_TEST_LOCK.lock().await;
     let fixture = ChatFixture::start(vec![sse_text("timer delivered")]).await;
     let mcp = McpFixture::start_gated_with_tools(&[("echo", "echo back")]).await;
@@ -280,9 +278,8 @@ async fn restored_scheduled_wake_waits_for_the_mcp_startup() -> Result<()> {
             dirs.sessions.join(format!("{SESSION_ID}.jsonl")),
             format!("{header}\n{route}\n"),
         )?;
-        let canonical = workspace.canonicalize()?;
-        let digest = sha2::Sha256::digest(canonical.to_string_lossy().as_bytes());
-        let project_key = kloop_core::resource_id::encode_digest(digest.into());
+        let project_key =
+            kloop_core::project::WorkspaceIdentity::resolve(workspace).scheduler_key();
         let scheduler_dir = home.join(".kloop").join("scheduler").join(&project_key);
         std::fs::create_dir_all(&scheduler_dir)?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;

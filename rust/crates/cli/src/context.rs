@@ -16,6 +16,7 @@ use kloop_core::context::InstructionScope;
 use kloop_core::context::assemble_instructions;
 use kloop_core::context::assemble_system;
 use kloop_core::context::utc_today;
+use kloop_core::project::WorkspaceIdentity;
 
 /// 按会话 cwd 组装的上下文；服务端线程共用基础正文，各自收集项目与环境。
 #[derive(Clone)]
@@ -26,13 +27,13 @@ pub struct GatheredContext {
     pub warnings: Vec<String>,
 }
 
-pub fn gather(cwd: &Path, base_system: &str) -> GatheredContext {
+pub fn gather(cwd: &Path, base_system: &str, identity: &WorkspaceIdentity) -> GatheredContext {
     let global_dir = std::env::home_dir().map(|home| home.join(".kloop"));
-    let git_root = find_git_root(cwd);
+    let git_root = identity.git_root();
     let Discovered {
         files,
         mut warnings,
-    } = discover_instruction_files(cwd, global_dir.as_deref(), git_root.as_deref());
+    } = discover_instruction_files(cwd, global_dir.as_deref(), git_root);
     let assembled = assemble_instructions(&files, INSTRUCTIONS_MAX_BYTES);
     warnings.extend(assembled.warnings);
     let env = EnvInfo {
@@ -337,27 +338,19 @@ fn project_dirs(cwd: &Path, git_root: Option<&Path>) -> Vec<PathBuf> {
     chain
 }
 
-/// Nearest ancestor (including cwd) containing `.git` — a directory in a
-/// normal checkout, a file in a worktree, so only existence is checked.
-fn find_git_root(cwd: &Path) -> Option<PathBuf> {
-    cwd.ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .map(Path::to_path_buf)
-}
-
 /// Opening git snapshot; any failing command (e.g. an empty repo without
 /// commits) drops the whole block rather than injecting a partial one.
 fn git_info(cwd: &Path) -> Option<GitInfo> {
     let git = |args: &[&str]| -> Option<String> {
-        let mut command = std::process::Command::new("git");
-        command.args(args).current_dir(cwd);
+        let mut command = kloop_core::git::command(cwd);
+        command.args(args);
         let out = kloop_process_spawn::output_std(&mut command).ok()?;
         out.status
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     };
     Some(GitInfo {
-        branch: git(&["rev-parse", "--abbrev-ref", "HEAD"])?,
+        branch: kloop_core::git::branch(cwd)?,
         status: git(&["status", "--short"])?,
         recent_commits: git(&["log", "--oneline", "-n", "5"])?,
     })
@@ -441,14 +434,37 @@ mod tests {
     }
 
     #[test]
-    fn find_git_root_walks_up_from_cwd() {
+    fn gather_takes_the_git_root_from_the_resolved_identity() {
         let base = test_tree("git-root");
         let root = base.join("repo");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let status = kloop_core::git::hermetic_command(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "--allow-empty", "-qm", "base"]);
+        write(&root, "AGENTS.md", "root rules");
         let cwd = root.join("deep").join("dir");
         std::fs::create_dir_all(&cwd).unwrap();
-        assert_eq!(find_git_root(&cwd), Some(root));
-        assert_eq!(find_git_root(&base.join("elsewhere")), None);
+        write(&cwd, "AGENTS.md", "leaf rules");
+
+        let identity = WorkspaceIdentity::resolve(&cwd);
+        assert_eq!(
+            identity.git_root(),
+            Some(std::fs::canonicalize(&root).unwrap().as_path())
+        );
+        let gathered = gather(&cwd, "base", &identity);
+        let instructions = gathered.instructions.expect("instructions from the chain");
+        assert!(instructions.contains("root rules"));
+        assert!(instructions.contains("leaf rules"));
+        assert!(gathered.system.contains("- Is a git repository: true"));
+        assert!(gathered.system.contains("Current branch: main"));
     }
 
     #[test]

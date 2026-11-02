@@ -684,9 +684,7 @@ fn temp_git_repo(tag: &str) -> PathBuf {
         &["commit", "--allow-empty", "-qm", "base"],
     ] {
         assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&root)
+            kloop_core::git::hermetic_command(&root)
                 .args(a)
                 .status()
                 .unwrap()

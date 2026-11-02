@@ -1,5 +1,17 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 247 ✅：git 调用收成一个入口（2026-11-02）**：core 新增 `git` 模块，`-C`、清空
+12 个仓库选择/配置注入变量与固定 locale 都在一处；`hermetic_command` 额外压掉全局与系统
+配置供身份探测，普通 `command` 保留用户的 Git 配置给 worktree 与启动快照。worktree、CLI
+的 `git_info`、TUI 分支都改走它，Windows verbatim 路径转换与测试 Git 环境钩子一并挪入。
+`WorkspaceIdentity` 新增 `git_root()`（只有探测成功的 worktree 才返回 checkout root）与
+`scheduler_key()`（即 `session_partition()`）；按用户决定不兼容旧 key，旧 scheduler 目录
+不再读取。`find_git_root` 删除；`gather`、权限、信任、会话分区与调度共用
+`run_front_end` / server 每线程各解析一次的同一身份，`SessionStore` 新增 `*_with` 入口。
+测试夹具全部改走统一入口，宿主机 `commit.gpgSign`/hooks 不再影响 seed commit。外层执行
+沙箱之外 `make check` 全绿（fmt、clippy、workspace 全量测试，core 1296 项、TUI 313 项，
+本机 parity baseline verified）。Linux 与 Windows 未实测。教训 299、300。
+
 **Plan 246 ✅：指令文件与注入的信任边界（2026-11-02）**：项目/本地指令文件现在按
 canonical 落点划边界：顶层 `AGENTS.md`、`.kloop/rules/*.md`、`AGENTS.local.md` 与
 `@import` 走同一处检查，符号链接指向仓库外一律跳过并给启动警告，项目内互链照常，
@@ -3950,3 +3962,21 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    审查补了一层：避免参数注入不能靠“整体不替换”；可信来源要分开处理——作者写下的
    `${CLAUDE_SKILL_DIR}` 可以先展开再扫描 `@file`，模型给的 `$ARGUMENTS` 不能。只按
    “扫描原始正文”一刀切，会把作者正常的目录引用一起弄丢，这是比漏洞更隐蔽的功能回退。
+
+299. **同一件事有多个调用点时，加固要收在一个入口，而不是在每个调用点重复。** Git 的
+   仓库选择来自父进程环境：hook / `rebase -x` 里的 `GIT_DIR`、`GIT_WORK_TREE`、
+   `GIT_INDEX_FILE` 会让 `git -C` 仍然读另一个仓库。身份探测早就清了这些变量，但
+   worktree、启动快照、TUI 分支和 scheduler 各自起进程，于是同一个 cwd 在不同界面有
+   不同答案，共享的 `GIT_INDEX_FILE` 还会让一个 worktree 的 status 改写另一个仓库的
+   index。把 `-C`、`env_remove` 与 locale 收进一个模块，再给“是否屏蔽全局/系统配置”
+   一个显式变体：身份探测要 hermetic，worktree 变更与状态快照要尊重用户的 Git 配置。
+   判据是“这次调用代表谁”——探测代表 kloop 对仓库拓扑的判断，变更代表用户自己的
+   Git。测试 Git 环境钩子也放进同一入口，夹具才不会各写一套隔离。
+
+300. **已经解析过的稳定身份，不要在调用点重新算一遍 key。** scheduler 原先自己再跑一次
+   `rev-parse --git-common-dir`，对 `to_string_lossy()` 做摘要，同时留下三条失败路径
+   （工作区输出非 UTF-8、common dir canonicalize 失败、非 UTF-8 路径撞 key），而同一
+   进程里 `WorkspaceIdentity` 已经解析过 common dir。key 直接取 `session_partition()`
+   后，仓库与 linked worktree 共享、普通目录自成一区、探测失败也总有目录域 key，启动
+   不再因为 git 失败而失败。用户明确说不需要兼容时，不要为旧目录加双读或迁移分支——
+   兼容代码本身也是要长期维护的失败面。

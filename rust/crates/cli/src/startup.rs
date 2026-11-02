@@ -11,7 +11,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use kloop_core::Config;
 use kloop_core::agent_type::AgentType;
@@ -441,7 +440,7 @@ fn load_project_permission_policy(
 /// project registry, and a fresh session scope.
 fn build_permissions(
     args: &CliArgs,
-    cwd: &Path,
+    identity: &WorkspaceIdentity,
     settings: &RuntimeSettings,
     approver: Arc<dyn Approver>,
     notify: kloop_tui::NoteFn,
@@ -450,7 +449,6 @@ fn build_permissions(
         return Ok(Permissions::allow_all());
     }
 
-    let identity = WorkspaceIdentity::resolve(cwd);
     let project = match (
         identity.project_id().cloned(),
         settings.project_store.as_ref(),
@@ -473,7 +471,7 @@ fn build_permissions(
         Arc::clone(&settings.global_permissions),
         project,
         Arc::new(PermissionSession::new(args.permission_mode, Some(approver))),
-        identity,
+        identity.clone(),
     ))
 }
 
@@ -958,47 +956,16 @@ pub(crate) fn server_config_snapshot(
     })
 }
 
-fn scheduler_project_identity(cwd: &Path) -> Result<PathBuf> {
-    let canonical = cwd
-        .canonicalize()
-        .with_context(|| format!("canonicalize scheduler project root {}", cwd.display()))?;
-    let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(&canonical).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-    ]);
-    let output = kloop_process_spawn::output_std(&mut command);
-    let Ok(output) = output else {
-        return Ok(canonical);
-    };
-    if !output.status.success() {
-        return Ok(canonical);
-    }
-    let common = std::str::from_utf8(&output.stdout)
-        .context("git common directory is not UTF-8")?
-        .trim();
-    PathBuf::from(common)
-        .canonicalize()
-        .context("canonicalize scheduler git common directory")
-}
-
-fn scheduler_project_key(cwd: &Path) -> Result<String> {
-    let base = scheduler_project_identity(cwd)?;
-    let digest = Sha256::digest(base.to_string_lossy().as_bytes());
-    Ok(kloop_core::resource_id::encode_digest(digest.into()))
-}
-
 fn scheduler_for_session(
     args: &CliArgs,
     runtime: &RuntimeSettings,
-    cwd: &Path,
+    identity: &WorkspaceIdentity,
     inbox: Arc<kloop_core::inbox::Inbox>,
 ) -> Result<Arc<kloop_core::scheduler::Scheduler>> {
     if args.mock {
         return Ok(kloop_core::scheduler::Scheduler::in_memory(inbox));
     }
-    let project_key = scheduler_project_key(cwd)?;
+    let project_key = identity.scheduler_key();
     let global = runtime
         .config_path
         .parent()
@@ -1027,16 +994,19 @@ pub(crate) fn config_from_settings(
     notify: kloop_tui::NoteFn,
     tool_sources: &[Arc<dyn ToolSource>],
     project: &context::GatheredContext,
+    identity: &WorkspaceIdentity,
     sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
     skills: Arc<Vec<Skill>>,
     cwd: &Path,
     session_dirs: &SessionDirs,
 ) -> Result<Config> {
-    let permissions = Arc::new(build_permissions(args, cwd, runtime, approver, notify)?);
+    let permissions = Arc::new(build_permissions(
+        args, identity, runtime, approver, notify,
+    )?);
     let inbox: Arc<kloop_core::inbox::Inbox> = Default::default();
-    let scheduler = scheduler_for_session(args, runtime, cwd, Arc::clone(&inbox))?;
-    // The main agent's cwd anchor is the process cwd (same value build_permissions
-    // reads); a worktree sub-agent later rewires its own clone off this.
+    let scheduler = scheduler_for_session(args, runtime, identity, Arc::clone(&inbox))?;
+    // The main agent's cwd anchor is the process cwd, carried by the identity;
+    // a worktree sub-agent later rewires its own clone off this.
     let cwd = cwd.to_path_buf();
     let questions_enabled = questioner.is_some();
     scheduler.set_missed_confirmation_available(questions_enabled);
@@ -1372,9 +1342,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&repository).unwrap();
         let git = |cwd: &Path, args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(cwd)
+            let status = kloop_core::git::hermetic_command(cwd)
                 .args(args)
                 .status()
                 .unwrap();
@@ -1406,16 +1374,16 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             ],
         );
 
-        let base_identity = scheduler_project_identity(&repository).unwrap();
-        let worktree_identity = scheduler_project_identity(&worktree).unwrap();
-        assert_eq!(base_identity, worktree_identity);
-        let base_key = scheduler_project_key(&repository).unwrap();
-        assert_eq!(base_key, scheduler_project_key(&worktree).unwrap());
-        assert_eq!(base_key.len(), 25);
-        assert_eq!(base_key, base_key.to_lowercase());
+        let base_identity = WorkspaceIdentity::resolve(&repository);
+        let worktree_identity = WorkspaceIdentity::resolve(&worktree);
+        assert_eq!(base_identity.project_id(), worktree_identity.project_id());
+        let base_key = base_identity.scheduler_key();
+        assert_eq!(base_key, worktree_identity.scheduler_key());
+        assert_eq!(base_key, base_identity.session_partition().as_str());
+        assert_eq!(base_key.len(), 28);
         assert_eq!(
-            base_identity,
-            repository.join(".git").canonicalize().unwrap()
+            base_identity.partition_anchor(),
+            repository.join(".git").canonicalize().unwrap().as_path()
         );
 
         std::fs::remove_dir_all(root).unwrap();

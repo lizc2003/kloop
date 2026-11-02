@@ -2235,9 +2235,7 @@ pub(crate) mod testutil {
             &["commit", "--allow-empty", "-qm", "base"],
         ] {
             assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&root)
+                crate::git::hermetic_command(&root)
                     .args(a)
                     .status()
                     .unwrap()
