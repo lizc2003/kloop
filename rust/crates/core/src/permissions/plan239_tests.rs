@@ -45,7 +45,6 @@ async fn plan239_partial_risks_reach_the_real_gate() {
         "echo $V; rm -rf build",
         "rm $TARGET -rf build",
         "echo $V > /dev/disk0",
-        "cd elsewhere; echo $V > .env",
     ] {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
@@ -66,7 +65,7 @@ async fn plan239_unknown_arguments_cannot_be_deleted_to_match_rules() {
     assert!(
         p.check_call("bash", &bash("git $ACTION push origin"), 0, true)
             .await
-            .is_ok()
+            .unwrap_err().contains("sensitive path")
     );
     let approver = ScriptedApprover::new(vec![Decision::Deny]);
     let p = gate(
@@ -79,7 +78,7 @@ async fn plan239_unknown_arguments_cannot_be_deleted_to_match_rules() {
             .await
             .is_err()
     );
-    assert_eq!(approver.ask_count(), 1);
+    assert_eq!(approver.ask_count(), 0, "未知访问不能由普通审批解除");
 }
 
 #[cfg(target_os = "macos")]

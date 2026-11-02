@@ -99,15 +99,11 @@ async fn plan243_home_spelled_write_targets_follow_the_redirect_checks() {
     ] {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        p.check_call("bash", &bash(command), 0, false)
+        let error = p.check_call("bash", &bash(command), 0, false)
             .await
-            .unwrap_or_else(|error| panic!("{command}: {error}"));
-        assert_eq!(approver.ask_count(), 1, "{command}");
-        assert_eq!(
-            approver.asked()[0].notice.as_deref(),
-            Some("sensitive redirect path"),
-            "{command}"
-        );
+            .expect_err(command);
+        assert!(error.contains("writing this sensitive path"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
     }
 
     // 展开后的绝对目标参与 deny 匹配，bypass 也挡得住。
@@ -211,15 +207,11 @@ async fn plan243_quoted_home_suffix_is_decoded() {
     for command in ["echo x > ~/\".bashrc\"", "echo x >> ~/.bas\"hrc\""] {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        p.check_call("bash", &bash(command), 0, false)
+        let error = p.check_call("bash", &bash(command), 0, false)
             .await
-            .unwrap_or_else(|error| panic!("{command}: {error}"));
-        assert_eq!(approver.ask_count(), 1, "{command}");
-        assert_eq!(
-            approver.asked()[0].notice.as_deref(),
-            Some("sensitive redirect path"),
-            "{command}"
-        );
+            .expect_err(command);
+        assert!(error.contains("writing this sensitive path"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
 
         let p = gate(
             Mode::Bypass,
@@ -304,15 +296,11 @@ async fn plan243_home_prefix_quoting_is_independent_of_the_suffix() {
     for command in ["echo x >> $HOME/'.bashrc'", "echo x >> $HOME/\".zshrc\""] {
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        p.check_call("bash", &bash(command), 0, false)
+        let error = p.check_call("bash", &bash(command), 0, false)
             .await
-            .unwrap_or_else(|error| panic!("{command}: {error}"));
-        assert_eq!(approver.ask_count(), 1, "{command}");
-        assert_eq!(
-            approver.asked()[0].notice.as_deref(),
-            Some("sensitive redirect path"),
-            "{command}"
-        );
+            .expect_err(command);
+        assert!(error.contains("writing this sensitive path"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
     }
 
     let p = gate(
@@ -345,15 +333,11 @@ async fn plan243_equivalent_words_have_the_same_write_policy() {
         let command = format!("echo x >> {target}");
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        p.check_call("bash", &bash(&command), 0, true)
+        let error = p.check_call("bash", &bash(&command), 0, true)
             .await
-            .unwrap();
-        assert_eq!(approver.ask_count(), 1, "{target}");
-        assert_eq!(
-            approver.asked()[0].notice.as_deref(),
-            Some("sensitive redirect path"),
-            "{target}"
-        );
+            .expect_err(target);
+        assert!(error.contains("writing this sensitive path"), "{target}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{target}");
 
         let p = gate(
             Mode::Bypass,
@@ -428,13 +412,26 @@ async fn plan243_unknown_writes_keep_explicit_rules_effective() {
             rules(&[], &[], &["bash_write(**/locked.txt)"]),
             approver.clone(),
         );
-        p.check_call("bash", &bash(command), 0, true).await.unwrap();
-        assert_eq!(approver.ask_count(), 1, "{command}");
+        let result = p.check_call("bash", &bash(command), 0, true).await;
+        if command.starts_with("$CMD") {
+            let error = result.expect_err(command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(approver.ask_count(), 1, "{command}");
+        }
 
         // 没有显式规则、也没有敏感证据时，保留现有沙箱免审批。
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        p.check_call("bash", &bash(command), 0, true).await.unwrap();
+        let result = p.check_call("bash", &bash(command), 0, true).await;
+        if command.starts_with("$CMD") {
+            let error = result.expect_err(command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+        } else {
+            result.unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
         assert_eq!(approver.ask_count(), 0, "{command}");
     }
 
@@ -577,13 +574,12 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
 #[tokio::test]
 async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
     for command in [
-        "cat $F",
-        "sudo cat $F",
-        "env FOO=1 grep -n $P file",
-        "nice -n 10 cat $F",
-        "timeout 5 sudo cat $F",
-        "env bash -c 'cat file' \"$ARG\"",
-        "env bash -c 'cat file' name \"$ARG\"",
+        "echo $F",
+        "sudo echo $F",
+        "env FOO=1 grep -n -e \"$P\" file",
+        "nice -n 10 echo $F",
+        "timeout 5 sudo echo $F",
+        "env bash -c 'cat file' name arg",
     ] {
         for ruleset in [
             rules(&[], &["bash_write(/etc/**)"], &[]),
@@ -598,17 +594,24 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
         }
     }
 
-    for command in [
-        "$CMD file",
-        "env $CMD file",
-        "env FOO=1 $CMD file",
-        "env -u $V cat file",
-        "sudo -u $USER cat file",
-        "timeout $SECONDS cat file",
-        "bash -c \"$SCRIPT\"",
-        "env bash -c \"$SCRIPT\"",
-        "env bash -c 'printf x > /etc/locked.txt' name \"$ARG\"",
-        "sudo cat $F > /etc/locked.txt",
+    for (command, expected_error) in [
+        ("cat $F", "sensitive path"),
+        ("sudo cat $F", "sensitive path"),
+        ("env FOO=1 grep -n $P file", "sensitive path"),
+        ("nice -n 10 cat $F", "sensitive path"),
+        ("timeout 5 sudo cat $F", "sensitive path"),
+        ("env bash -c 'cat file' \"$ARG\"", "sensitive path"),
+        ("env bash -c 'cat file' name \"$ARG\"", "sensitive path"),
+        ("$CMD file", "deny permission rule"),
+        ("env $CMD file", "deny permission rule"),
+        ("env FOO=1 $CMD file", "deny permission rule"),
+        ("env -u $V cat file", "deny permission rule"),
+        ("sudo -u $USER cat file", "deny permission rule"),
+        ("timeout $SECONDS cat file", "deny permission rule"),
+        ("bash -c \"$SCRIPT\"", "deny permission rule"),
+        ("env bash -c \"$SCRIPT\"", "deny permission rule"),
+        ("env bash -c 'printf x > /etc/locked.txt' name \"$ARG\"", "deny permission rule"),
+        ("sudo cat $F > /etc/locked.txt", "deny permission rule"),
     ] {
         let p = gate(
             Mode::Bypass,
@@ -619,7 +622,7 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
             .check_call("bash", &bash(command), 0, true)
             .await
             .expect_err(command);
-        assert!(error.contains("deny permission rule"), "{command}: {error}");
+        assert!(error.contains(expected_error), "{command}: {error}");
 
         let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
         let p = gate(
@@ -628,17 +631,9 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
             approver.clone(),
         );
         let result = p.check_call("bash", &bash(command), 0, true).await;
-        if matches!(command,
-            "env $CMD file" | "env FOO=1 $CMD file" | "env -u $V cat file"
-            | "sudo -u $USER cat file" | "timeout $SECONDS cat file") {
-            // 包装器控制无法定位时，未知读取在写入审批之前硬拒绝。
-            let error = result.expect_err(command);
-            assert!(error.contains("sensitive path"), "{command}: {error}");
-            assert_eq!(approver.ask_count(), 0, "{command}");
-        } else {
-            result.unwrap_or_else(|error| panic!("{command}: {error}"));
-            assert_eq!(approver.ask_count(), 1, "{command}");
-        }
+        let error = result.expect_err(command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+        assert_eq!(approver.ask_count(), 0, "{command}");
     }
     for command in [
         "env bash -c 'cat .env' \"$ARG\"",
@@ -666,10 +661,10 @@ async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
     let policy =
         SandboxPolicy::workspace(&home, &[], /*allow_network*/ false).with_credential_roots(&home);
     for prefix in [
-        "cat $F",
-        "sudo cat $F",
-        "env FOO=1 grep -n $P file",
-        "nice -n 10 cat $F",
+        "cat file",
+        "sudo cat file",
+        "env FOO=1 grep -n -e \"$P\" file",
+        "nice -n 10 cat file",
     ] {
         let command = format!("{prefix}\ncat > /tmp/probe <<'EOF'\n~/.ssh/id_rsa\nEOF");
         let p = gate(
@@ -687,6 +682,7 @@ async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
         .unwrap_or_else(|error| panic!("{command}: {error}"));
     }
     for prefix in [
+        "cat $F", "sudo cat $F", "env FOO=1 grep -n $P file", "nice -n 10 cat $F",
         "env $CMD file",
         "sudo -u $USER cat file",
         "cat ~/.ssh/id_rsa",

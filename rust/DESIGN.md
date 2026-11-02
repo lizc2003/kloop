@@ -984,7 +984,7 @@ Every tool call passes a layered gate before executing
 pipeline, with the bash analysis ported from codex's `shell-command` crate:
 
 ```
-global deny → sensitive-read hard block → plan-mode read-only gate → bypass →
+global deny → sensitive-read/write hard block → plan-mode read-only gate → bypass →
 safety checks → global ask → session scheduler controls → sandbox auto-allow →
 read-only self-verdict → contained writes → project allow → WorkspaceId-scoped session
 cache → ask the user
@@ -999,7 +999,7 @@ shell、路径和危险特征，`argv_roles.rs` 持有各命令的参数角色�
 由父模块保留，内部状态与帮助项仅向实际调用者开放。
 
 **deny 始终优先于 allow 与 bypass**。`bypass` 是用户显式选择的免审批模式：
-危险命令、敏感路径写入、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
+危险命令、仓库内部写入的确认、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
 普通调用仍使用已配置的 OS 沙箱；只有调用主动脱沙箱或失败后升级才脱离沙箱。
 Credential-bearing/read-sensitive
 paths are an even earlier hard boundary: `read_file` refuses them, grep/glob filter
@@ -1007,6 +1007,9 @@ them before reading, and Bash checks literal plus canonical paths before
 sandbox/read-only/bypass. 名字只有一份（`permissions/sensitive.rs`）：凭据目录
 （`.ssh`、`.gnupg`、`.aws`）、kloop 目录名 `.kloop`、rc 文件与 `.env*` 的判定同时供路径检查、
 Bash 原文扫描、递归搜索、glob 拼写与沙箱凭据根使用。
+已识别的凭据与 agent state 写入同样在审批之前硬拒绝，覆盖原生文件工具、重定向和
+角色表中的输出；保留字面、规范路径及未知词中的已知敏感分量。未知写效果仍保留给
+显式 deny/ask，不据此宣称完整文件隔离；实际沙箱的保护范围另行核验。
 `.kloop` 的读取分两种（plan 271）。凭据、OAuth token 与所有项目的转录只在私有状态根
 `~/.kloop`；项目里的 `.kloop/` 只放 worktree 与 rules、skills、commands，没有秘密。读取时
 **能证明**不是私有状态根的 `.kloop` 整个放行（里面的凭据名、嵌套的 `.kloop` 照旧再判）；
@@ -1021,7 +1024,7 @@ Bash 原文扫描、递归搜索、glob 拼写与沙箱凭据根使用。
 不再出现 `.kloop`，按名字永远拦不住。写入不分位置，只豁免 worktree；Bash 里会写的命令
 本就不定位，`cp x .kloop/rules/` 在读取门就按名字硬拦。原文扫描按名字认 `~/.kloop` 与
 `/.kloop/`，逐 token 中和 worktree；只读命令里已证明落在项目 `.kloop` 的词（含读重定向）
-按字节范围抹掉后再扫；角色已证明是数据或纯输出的词另行排除，这些词不用于证明项目路径。
+按字节范围抹掉后再扫；数据与输出角色不能删除敏感目录的原文证据。
 迭代记录：首版只认私有状态根、证明的方向反了（证明不了就放行）；第二版按 `.kloop` 下
 第一层条目判，留下了 `~/.kloop` 里的跳板。两版都在审查中被具体输入推翻，见 plan 271。
 Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
@@ -1031,7 +1034,8 @@ Bash 的判定按“访问方式 × 路径类别”两轴：`.git` 是仓库
 和 rc 文件是凭据或 agent state，元数据访问也硬拦。元数据判定按命令的真实选项解析：du 的 `-X`/
 `--exclude-from`/`--files0-from` 无论独立、组合（`-sX`）还是附着（`-XFILE`）
 都算打开文件；tree 的 `-o`/`--outfile` 和 find 的 `-fprint*`/`-fprintf`/`-fls`
-是输出文件，进入写入规则与敏感写确认，不算内容读取。tree 的 `-R` 会在每层生成
+是输出文件，进入写入规则；凭据和 agent state 输出硬拒绝，仓库内部输出逐次确认，
+不算内容读取。tree 的 `-R` 会在每层生成
 `00Tree.html`，仍作为未建模执行形状保守检查。tree 的
 `--fromfile`/`--fromtabfile`/`--gitignore`/`--gitfile`/`--infofile`/`--hintro`/
 `--houtro` 读文件，find 的 `-files0-from` 读文件，按内容访问处理。这些
@@ -1054,7 +1058,7 @@ grep/rg 的 `-e`/`--regexp` 与 `-f`/`--file` 两种模式来源。搜索根（�
 不参与路径检查。未知命令、缺参、不完整表达式或未建模的执行/写入动作退回逐参数检查；
 元数据命令的未知选项逐值按元数据路径检查，其他未知选项按内容访问保守处理。
 `grep`/`rg` 带执行效果的形式不消费角色豁免；`sed`/`awk`/解释器的程序文本继续整体扫描。
-Bash 原文的敏感 needle 仍优先，但会排除角色明确的数据与输出词；对边界明确、带引用
+Bash 原文的敏感目录 needle 仍优先，数据与输出词也保留；对边界明确、带引用
 分隔符的 `cat` heredoc 写固定文件，可只跳过
 正文中已确认由实际 macOS 策略保护的 home 凭据路径。每处命中都要落在当前 home 的
 `.ssh`、`.aws` 或 `.gnupg` 根内，并核对原文与规范路径的读写拒绝、根自身的符号链接
@@ -1151,7 +1155,8 @@ heredoc 加一个默认 stdout 的 `>` 固定文件输出；支持完整单/双�
 heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记住工作区会话，不生成项目或升级前缀。
 `2>&1` / `>&2` / `…>/dev/null` 等纯流重定向继续不增加文件效果。
 `WithWrites` 永远不是只读调用，也不能并发批处理；已识别 argv 继续经过 deny、危险命令
-和敏感读取检查，输出路径的敏感类别与非流 `/dev` 目标在 manual 下强制逐次确认
+和敏感读写检查；已识别的凭据与 agent state 输出硬拒绝，仓库内部与非流 `/dev` 目标
+在 manual 下强制逐次确认
 （`/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty` 是纯流设备，不在此列）。
 只读分类器同时检查命令选项：`find -delete`、`rg --pre`、`git -C` / `--git-dir` /
 `log --output`、`base64 -o` 与超出 `sed -n Np` 查询形式的调用都不算只读。
@@ -1176,9 +1181,13 @@ shell 的参数或 `-c` 正文，或后续动态参数无法排除替换，则�
 字面值与替换后的未知片段共用参数角色表，角色保留内容读取、元数据访问、元数据写入
 与输出文件的方向，独立于只读授权。Git commit 先消费全局选项再定位子命令；ls/stat
 的格式值不是路径，tree 的 `-o`/`--outfile` 与 find 的 `-fprint*`/`-fprintf`/`-fls`
-是输出，进入与重定向相同的写入 deny/ask 和敏感写确认。已证明是数据或输出的字面词
-不再被原文读取扫描误认；未知语法继续逐参数保守检查。命令身份未知、选项无法确定或未知值占据
-读取位置时硬拒绝无法排除的敏感读取（如 `cat marker`、`git commit -F marker`）。
+是输出，与重定向共用写入 deny/ask、凭据或 agent state 的硬拒绝以及仓库内部写确认。
+角色不再屏蔽原文；未知语法继续逐参数保守检查。读取判定区分明确敏感、无法确定和未命中，
+命令身份未知、选项无法确定或未知值占据读取位置时硬拒绝无法排除的敏感读取。
+这条规则同时作用于变量、命令替换、xargs 与读重定向；不再以是否发生参数改写分流。
+双引号单值赋值只证明参数边界，不证明值安全：`echo .env > list` 可作为数据写出，
+随后 `env FOO="$(cat list)" sh -c 'cat "$FOO"'` 的未知读取必须拒绝。
+单值赋值后只操作已知普通目标（如 touch notes.txt）仍允许。
 凭据与 agent state 的名称和元数据同样受保护：`touch`/`mkdir`/`chmod`、ls/stat 等
 命令的已知敏感元数据目标硬拒绝，替换后的未知元数据目标也因不能排除敏感路径而硬拒绝；
 已知普通目标照常允许。元数据操作不因此成为危险命令，元数据写入仍保留写入方向。
@@ -1250,11 +1259,11 @@ deny / ask 仍同时匹配原文与规范路径。
 持久模式。会话缓存也同时包含命令与目录，换日志名、测试参数仍可复用，换目录或追加未批准
 写入则重新询问；重启后由同一项目规则复核。
 
-**File writes** get path safety: `.git`/`.kloop`/`.ssh`/`.gnupg`/`.aws`
-directories, shell/git rc files, and `.env*` are sensitive：manual 下每次确认，
-allow 规则和目录内写入自动放行不能覆盖它；bypass 下免审批。`.kloop` 下只有 `worktrees/`
-免确认；项目 `.kloop` 读取放行，但写进 `rules/`、`skills/`、`commands/` 会引导以后的
-会话，照旧确认。
+**File writes** get path safety：`.kloop`/`.ssh`/`.gnupg`/`.aws`、shell/git rc 文件与
+`.env*` 的已识别写入硬拒绝，bypass、allow 与审批都不能覆盖。`.git` 写入在 manual 下
+每次确认，allow 规则和目录内自动放行不能覆盖，bypass 下免审批。`.kloop` 下只有
+`worktrees/` 豁免；项目 `.kloop` 读取放行，但写进 `rules/`、`skills/`、`commands/`
+会引导以后的会话，仍按 agent state 硬拒绝。
 目录外写入不享有 contained-writes 自动放行，仍可由 bypass 或对应批准放行。
 
 **Asking**: `y` allows once. `a` allows for this session in the current
@@ -1354,7 +1363,7 @@ apart for a frontend that lays a prompt out over several lines.
 
 **Modes**: one flag `--permission-mode <mode>` picks the gate mode — `manual`
 (the default when the flag is omitted — ask for anything the gate cannot vouch
-for on its own), `bypass`（跳过全部工具权限审批，保留 deny 与敏感读取硬拦截，
+for on its own), `bypass`（跳过全部工具权限审批，保留 deny 与敏感读写硬拦截，
 默认仍在已配置的 OS 沙箱内执行）, or
 `plan` (read-only until the plan is approved, below). `--mock` disables the gate
 entirely — nobody is at the keyboard. In the TUI, **shift+Tab** cycles the mode
@@ -3385,7 +3394,7 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   包括复杂脚本、危险命令和带 `disable_sandbox: true` 的主动脱沙箱调用。
   它不关闭已配置的 OS 沙箱；普通调用仍先在沙箱内执行，模型主动脱沙箱和程序失败后
   自动升级通常也免审批。依赖字面正文例外的调用必须保留凭据隔离，任何模式都不能升级移除它。
-  用户选择该模式即接受这些调用的执行代价；deny 与敏感读取
+  用户选择该模式即接受这些调用的执行代价；deny 与敏感读写
   硬拦截仍优先，权限模式本身不提供命令内容或文件系统隔离保证。
 
 On platforms without an OS shell sandbox, worktree separation still anchors
@@ -5057,7 +5066,7 @@ cargo run -- --fork <id>       # branch off a session at its end
 # project approvals persist in ~/.kloop/projects/v1/<ProjectId>/permissions.json
 # in-cwd file writes are contained and never ask; [permissions].ask =
 # ["edit_file(**)"] brings a confirmation back for every edit
-cargo run -- --permission-mode bypass              # 免审批，deny/敏感读取硬拦截仍生效
+cargo run -- --permission-mode bypass              # 免审批，deny/敏感读写硬拦截仍生效
 
 # OS sandbox (macOS Seatbelt; see OS sandbox above): [sandbox] enabled = false
 # turns it off. This never disables Unix process groups or Windows Job Objects.

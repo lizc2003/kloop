@@ -121,9 +121,9 @@ async fn plan271_unplaced_kloop_reads_stay_blocked() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 项目 `.kloop/rules`、`skills`、`commands` 会引导以后的会话：写入照旧逐次确认。
+/// 项目 `.kloop/rules`、`skills`、`commands` 会引导以后的会话：已识别写入硬拒绝。
 #[tokio::test]
-async fn plan271_project_kloop_writes_still_ask() {
+async fn plan271_project_kloop_writes_are_hard_blocked() {
     let root = plan271_repo("write");
     let approver = ScriptedApprover::new(vec![]);
     let p = Permissions::new(
@@ -135,18 +135,6 @@ async fn plan271_project_kloop_writes_still_ask() {
     .unwrap();
     assert!(!ok(&p, "write_file", file(".kloop/rules/style.md")).await);
     assert!(!ok(&p, "bash", bash("echo x > .kloop/rules/style.md")).await);
-    let tags: Vec<_> = approver
-        .asked()
-        .iter()
-        .map(|request| {
-            ["[sensitive path]", "[sensitive redirect path]"]
-                .into_iter()
-                .find(|tag| request.description.contains(tag))
-        })
-        .collect();
-    assert_eq!(
-        tags,
-        vec![Some("[sensitive path]"), Some("[sensitive redirect path]")]
-    );
+    assert_eq!(approver.ask_count(), 0);
     let _ = std::fs::remove_dir_all(&root);
 }

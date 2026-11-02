@@ -657,7 +657,7 @@ async fn plan244_literal_and_replacement_roles_agree() {
         "git -C repo commit -m marker", "git --no-pager commit -m marker",
         "git -c core.pager=cat commit -m marker", "ls --color=marker src", "stat --format=marker src",
     ] {
-        for value in [".env", "~/.ssh/key"] {
+        for value in [".env", "notes.txt"] {
             let command = tail.replace("marker", value);
             let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
             p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
@@ -753,5 +753,109 @@ async fn plan244_sensitive_metadata_keeps_known_and_replaced_targets_blocked() {
         let command = format!("xargs -I marker {tail}");
         let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
         assert!(!call.hazard("bash").is_some_and(|hazard| hazard.tag == "destructive"), "{command}");
+    }
+}
+
+#[tokio::test]
+async fn plan244_dynamic_reads_fail_closed_after_data_and_scalar_assignments() {
+    for mode in [Mode::Manual, Mode::Bypass] {
+        let approver = ScriptedApprover::new(vec![]);
+        let p = gate(mode, rules(&["bash"], &[], &[]), approver.clone());
+        for command in [
+            "echo .env > list", "find . -name .env", "rg -e .env notes.txt",
+            "git commit -m .env", "env FOO=\"$(cat list)\" touch notes.txt",
+            "env FOO=\"$(pwd)\" touch notes.txt", "env FOO=\"$*\" touch notes.txt",
+            "echo \"$FOO\"", "git commit -m \"$FOO\"", "cat list",
+        ] {
+            p.check_call("bash", &bash(command), 0, true).await.expect(command);
+        }
+        for command in [
+            "env FOO=\"$(cat list)\" sh -c 'cat \"$FOO\"'",
+            "echo .env > list; env FOO=\"$(cat list)\" sh -c 'cat \"$FOO\"'",
+            "FOO=$(cat list); cat \"$FOO\"", "cat \"$(cat list)\"",
+            "cat \"$FOO\"", "cat \"$DIR/notes.txt\"", "sudo cat \"$FOO\"",
+            "cat < \"$FOO\"", "xargs -I marker cat marker",
+        ] {
+            for sandbox_auto_allow in [false, true] {
+                let error = p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
+                    .await.expect_err(command);
+                assert!(error.contains("sensitive path"), "{command}: {error}");
+            }
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn plan244_secret_writes_are_hard_limits_across_output_forms() {
+    for mode in [Mode::Manual, Mode::Bypass] {
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once); 32]);
+        let p = gate(mode, rules(&["bash", "write_file", "edit_file", "notebook_edit"], &[], &[]), approver.clone());
+        for target in [".env", ".env.local", "\"$DIR/.env\"", "~/.bashrc"] {
+            for command in [
+                format!("tree -o {target} ."), format!("tree --outfile={target} ."),
+                format!("find . -fprint {target}"), format!("find . -fprintf {target} '%p'"),
+                format!("printf x > {target}"),
+                format!("cd elsewhere; printf x > {target}"),
+            ] {
+                for sandbox_auto_allow in [false, true] {
+                    let error = p.check_call("bash", &bash(&command), 0, sandbox_auto_allow)
+                        .await.expect_err(&command);
+                    assert!(error.contains("writing this sensitive path"), "{command}: {error}");
+                }
+            }
+        }
+        for name in ["write_file", "edit_file", "notebook_edit"] {
+            let input = if name == "notebook_edit" {
+                json!({"notebook_path": ".env"})
+            } else { file(".env") };
+            let error = p.check_call(name, &input, 0, true).await.expect_err(name);
+            assert!(error.contains("writing this sensitive path"), "{name}: {error}");
+        }
+        assert_eq!(approver.ask_count(), 0);
+    }
+    for target in [".git/config", "/dev/disk0"] {
+        let command = format!("tree -o {target} .");
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
+            assert_eq!(approver.ask_count(), usize::from(mode == Mode::Manual));
+        }
+    }
+    #[cfg(unix)]
+    {
+        let root = plan244_temp("secret-write-alias");
+        std::fs::write(root.join(".env"), "dummy fixture").unwrap();
+        std::os::unix::fs::symlink(root.join(".env"), root.join("notes.txt")).unwrap();
+        let target = root.join("notes.txt").display().to_string();
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let p = gate(mode, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+            for (name, input) in [
+                ("write_file", file(&target)),
+                ("bash", bash(&format!("tree -o '{target}' ."))),
+            ] {
+                let error = p.check_call(name, &input, 0, true).await.expect_err(&target);
+                assert!(error.contains("writing this sensitive path"), "{name}: {error}");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn plan244_data_roles_preserve_sensitive_directory_evidence() {
+    for command in [
+        "echo ~/.ssh/key > list", "find . -name ~/.ssh/key",
+        "rg -e ~/.ssh/key notes.txt", "git commit -m ~/.ssh/key",
+        "tree -o ~/.ssh/key .", "find . -fprint ~/.ssh/key",
+    ] {
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            let error = p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        }
     }
 }

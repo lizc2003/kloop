@@ -1,13 +1,13 @@
 //! permissions — the layered gate run before every tool execution, shaped
 //! after claude-code's `hasPermissionsToUseToolInner` pipeline:
 //!
-//! deny rules → sensitive-read hard block → plan-mode read-only gate → bypass →
+//! deny rules → sensitive-read/write hard block → plan-mode read-only gate → bypass →
 //! safety checks → ask rules → session scheduler controls → sandbox
 //! auto-allow → read-only self-verdict → contained writes → allow
 //! rules → session cache → ask the user.
 //!
-//! deny 与敏感读取硬拦截优先于所有模式，不能通过审批解除。
-//! bypass 是用户显式选择的工具免审批模式：危险命令、敏感写入、ask 规则、
+//! deny 与敏感读写硬拦截优先于所有模式，不能通过审批解除。
+//! bypass 是用户显式选择的工具免审批模式：危险命令、仓库内部写入确认、ask 规则、
 //! 复杂脚本与主动脱沙箱全部跳过审批。拒绝转换为 is_error tool_result，模型可改道，
 //! 不会因此结束当前 turn。
 //!
@@ -30,7 +30,7 @@
 //! construction — the same argument that lets a sandboxed bash call skip the
 //! human. Containment is a property of the call, not a trust level, so the
 //! layer is unconditional instead of a mode. Manual 模式下，上方的 deny、
-//! safety 与显式 ask 仍优先；`.git`、`.kloop`、`.ssh`、`.env*` 即使在 cwd 内也每次问。
+//! safety 与显式 ask 仍优先；`.git` 每次问，已识别的凭据或 agent state 写入硬拒绝。
 //! Explicit ask rules —
 //! one `ask = ["edit_file(**)"]` restores review-every-edit exactly, which is
 //! why that behavior never needed a mode of its own. A write that
@@ -701,6 +701,13 @@ impl Permissions {
         if call.sensitive_read {
             return Err(Refusal::Denied(format!(
                 "{name}: reading this sensitive path is blocked. Do not retry or work around the protection."
+            )));
+        }
+
+        if call.sensitive_write {
+            // 已识别的凭据与 agent state 写入和读取一样，不能用审批或 bypass 覆盖。
+            return Err(Refusal::Denied(format!(
+                "{name}: writing this sensitive path is blocked. Do not retry or work around the protection."
             )));
         }
 
@@ -1518,7 +1525,11 @@ mod tests {
         ] {
             assert!(!ok(&p, "write_file", file(path)).await, "{path}");
         }
-        assert_eq!(approver.ask_count(), 4);
+        assert_eq!(
+            approver.ask_count(),
+            0,
+            "凭据和 agent state 写入不能审批解除"
+        );
     }
 
     /// The spill exemption is the model reading back its own oversized output.
@@ -1649,7 +1660,6 @@ mod tests {
                 "find . -path ./.git -print",
                 "find . -path ./.git -prune -a -print",
                 "find . -path ./.git -prune -o -path ./.git/config -print",
-                "find . -path ~/.kloop/config.toml -prune -o -print",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
@@ -1686,6 +1696,7 @@ mod tests {
                 "find . -path ./.git -o -o -print",
                 "cat -path ./.git -prune -o",
                 "find . -path ./.git -prune -o -print; cat ~/.kloop/config.toml",
+                "find . -path ~/.kloop/config.toml -prune -o -print",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
@@ -1994,7 +2005,7 @@ mod tests {
             (
                 "bash",
                 json!({
-                    "command": "export QUERY=\"${TOOLS_HOME:-$HOME/.tools}/query\"\n\"$QUERY\" rename",
+                    "command": "export QUERY=tools/query\n\"tools/query\" rename",
                     "disable_sandbox": true
                 }),
             ),
@@ -2006,9 +2017,9 @@ mod tests {
             ("write_file", file(".git/config")),
             (
                 "edit_file",
-                json!({"path": ".env.local", "old_string": "a", "new_string": "b"}),
+                json!({"path": ".git/config", "old_string": "a", "new_string": "b"}),
             ),
-            ("notebook_edit", json!({"notebook_path": ".aws/note.ipynb"})),
+            ("notebook_edit", json!({"notebook_path": ".git/note.ipynb"})),
             ("enter_worktree", json!({"path": "existing"})),
             ("exit_worktree", json!({"action": "remove"})),
             ("powershell", json!({"command": "Set-Content x y"})),
@@ -2291,7 +2302,11 @@ mod tests {
             !ok(&p, "bash", bash("cargo $(evil)")).await,
             "opaque never matches allow"
         );
-        assert_eq!(approver.ask_count(), 4);
+        assert_eq!(
+            approver.ask_count(),
+            3,
+            "未知参数的访问风险先于 allow 硬拒绝"
+        );
     }
 
     // ── layer 12: session cache and remember payloads ──────────────────
@@ -3360,7 +3375,7 @@ mod tests {
     async fn sandbox_auto_allow_skips_asking_for_contained_calls_only() {
         let approver = ScriptedApprover::new(vec![]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        for cmd in ["echo x > f.txt", "cargo build", "ls $(evil)"] {
+        for cmd in ["echo x > f.txt", "cargo build", "echo $(evil)"] {
             assert!(
                 p.check_call("bash", &bash(cmd), 0, /*sandbox_auto_allow*/ true)
                     .await

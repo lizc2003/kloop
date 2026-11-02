@@ -42,6 +42,7 @@ pub(crate) struct CallFacts {
     pub(super) path: Option<PathFacts>,
     pub(super) path_key: Option<&'static str>,
     pub(super) sensitive_read: bool,
+    pub(super) sensitive_write: bool,
     pub(super) risk_commands: Vec<CommandFact>,
     pub(super) risk_writes: Vec<WriteTarget>,
     /// 可解析 Bash 的原文，供逐字会话记忆与升级授权使用；其它工具为空。
@@ -68,7 +69,7 @@ pub(super) struct OpaqueScript {
 /// 未知效果不能从规则输入中消失；只有 Resolved 可按确切路径排除 deny/ask。
 pub(super) enum WriteTarget {
     Resolved(PathFacts),
-    Partial { sensitive: bool },
+    Partial { sensitivity: Option<Sensitivity> },
     Unknown,
 }
 
@@ -81,7 +82,15 @@ impl WriteTarget {
                         && !is_stream_device(&path.original)
                         && !is_stream_device(&path.normalized))
             }
-            Self::Partial { sensitive } => *sensitive,
+            Self::Partial { sensitivity } => sensitivity.is_some(),
+            Self::Unknown => false,
+        }
+    }
+
+    fn secret(&self) -> bool {
+        match self {
+            Self::Resolved(path) => path.sensitivity(Access::Write) == Some(Sensitivity::Secret),
+            Self::Partial { sensitivity } => *sensitivity == Some(Sensitivity::Secret),
             Self::Unknown => false,
         }
     }
@@ -190,6 +199,11 @@ impl CallFacts {
         let risk_writes = bash_facts
             .as_ref()
             .map_or_else(Vec::new, |facts| write_targets(facts, cwd, execution));
+        let sensitive_write = risk_writes.iter().any(WriteTarget::secret)
+            || (matches!(name, "write_file" | "edit_file" | "notebook_edit")
+                && path.as_ref().is_some_and(|path| {
+                    path.sensitivity(Access::Write) == Some(Sensitivity::Secret)
+                }));
         let no_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
         CallFacts {
             shell,
@@ -197,6 +211,7 @@ impl CallFacts {
             path,
             path_key,
             sensitive_read,
+            sensitive_write,
             risk_commands: bash_facts
                 .as_ref()
                 .map_or_else(Vec::new, |facts| facts.commands.clone()),
@@ -381,7 +396,7 @@ impl Placement {
     }
 }
 
-/// 未知词换成不可执行的占位符，只用来判断命令是否只读。
+/// 未知片段保留成不可执行占位符，只供风险与角色判定，不提供授权证明。
 fn placeholder_argv(words: &[WordEvaluation]) -> Vec<String> {
     words
         .iter()
@@ -392,7 +407,7 @@ fn placeholder_argv(words: &[WordEvaluation]) -> Vec<String> {
         .collect()
 }
 
-fn argv_reads_sensitive_path(argv: &[String], cwd: &Path, placement: Placement) -> bool {
+fn argv_sensitive_access(argv: &[String], cwd: &Path, placement: Placement) -> ReadVerdict {
     let wrappers = analyze_wrappers(argv);
     let (prefix, argv) = if wrappers.complete {
         (&argv[..argv.len() - wrappers.argv.len()], wrappers.argv)
@@ -405,7 +420,7 @@ fn argv_reads_sensitive_path(argv: &[String], cwd: &Path, placement: Placement) 
         .skip(1)
         .any(|arg| path_argument_is_sensitive(arg, cwd, false, placement.access(arg)))
     {
-        return true;
+        return ReadVerdict::Sensitive;
     }
     let paths = argv_roles::path_arguments(argv);
     let sensitive = match paths {
@@ -436,49 +451,13 @@ fn argv_reads_sensitive_path(argv: &[String], cwd: &Path, placement: Placement) 
             evaluation_is_sensitive(&word, cwd, false, |value| placement.access(value))
         }),
     };
-    sensitive || recursive_search_covers_sensitive_path(argv, cwd)
-}
-
-fn mask_nonreading_arguments(masked: &mut String, facts: &BashFacts, home: Option<&Path>) {
-    for command in &facts.commands {
-        if command.context.script_depth != 0 {
-            continue;
-        }
-        let words: Vec<_> = command
-            .words
-            .iter()
-            .map(|word| {
-                word.syntax
-                    .evaluate(home.filter(|_| !command.context.home_unknown))
-            })
-            .collect();
-        let argv = placeholder_argv(&words);
-        let wrappers = analyze_wrappers(&argv);
-        if !wrappers.complete {
-            continue;
-        }
-        let Some(paths) = argv_roles::path_arguments(wrappers.argv) else {
-            continue;
-        };
-        let skipped = argv.len() - wrappers.argv.len();
-        for (index, argument) in wrappers.argv.iter().enumerate().skip(1) {
-            if !matches!(words[skipped + index], WordEvaluation::Resolved(_)) {
-                continue;
-            }
-            let start = argument.as_ptr() as usize;
-            let end = start + argument.len();
-            // 角色可能只借用了 --opt=value 的后半段；按来源对齐，不能按字符串相等猜位置。
-            let may_read = paths.iter().any(|path| {
-                let value_start = path.value.as_ptr() as usize;
-                path.access != argv_roles::PathAccess::Write
-                    && value_start >= start
-                    && value_start + path.value.len() <= end
-            });
-            if !may_read {
-                let range = &command.words[skipped + index].range;
-                masked.replace_range(range.clone(), &" ".repeat(range.len()));
-            }
-        }
+    if sensitive || recursive_search_covers_sensitive_path(argv, cwd) {
+        ReadVerdict::Sensitive
+    } else if argv_roles::unknown_effects(argv).unresolved_access {
+        // 单值边界只证明 argv 位置；变量、命令替换和 xargs 的未知目标使用同一硬限制。
+        ReadVerdict::Unresolved
+    } else {
+        ReadVerdict::Clear
     }
 }
 
@@ -539,7 +518,6 @@ fn bash_reads_sensitive_path(
 ) -> ReadVerdict {
     let home = execution.shell_home();
     let mut masked = command.to_string();
-    mask_nonreading_arguments(&mut masked, facts, home.as_deref());
     if facts.reliable {
         mask_project_kloop_words(&mut masked, facts, cwd, home.as_deref());
     }
@@ -569,14 +547,10 @@ fn bash_reads_sensitive_path(
                 .iter()
                 .map(|word| word.syntax.evaluate(home))
                 .collect();
-            if command.context.argument_rewrite
-                && argv_roles::unknown_effects(&placeholder_argv(&words)).reads
-            {
-                return ReadVerdict::Unresolved;
-            }
             let placement = Placement::of_command(&placeholder_argv(&words), &command.context);
-            if argv_reads_sensitive_path(&placeholder_argv(&words), cwd, placement) {
-                return ReadVerdict::Sensitive;
+            match argv_sensitive_access(&placeholder_argv(&words), cwd, placement) {
+                ReadVerdict::Clear => {}
+                verdict => return verdict,
             }
         }
         for redirect in &facts.redirects {
@@ -588,6 +562,11 @@ fn bash_reads_sensitive_path(
             let placement = Placement::of_shell(&redirect.context);
             if evaluation_is_sensitive(&target, cwd, false, |spelling| placement.access(spelling)) {
                 return ReadVerdict::Sensitive;
+            }
+            if matches!(&target, WordEvaluation::Unknown)
+                || matches!(&target, WordEvaluation::Partial(value) if value.contains('\0'))
+            {
+                return ReadVerdict::Unresolved;
             }
         }
     }
@@ -641,6 +620,18 @@ pub(crate) fn bash_protection_requirement(
 }
 
 fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool, access: Access) -> bool {
+    sensitivity_blocks_read(
+        path_argument_sensitivity(raw, cwd, metadata, access),
+        metadata,
+    )
+}
+
+fn path_argument_sensitivity(
+    raw: &str,
+    cwd: &Path,
+    metadata: bool,
+    access: Access,
+) -> Option<Sensitivity> {
     let path = lexical_normalize(cwd, Path::new(raw));
     // 词法归一化先消掉 `..`，可能跨过了符号链接；再按物理落点判一次，只会多拦。
     let physical = Path::new(raw)
@@ -648,13 +639,16 @@ fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool, access: Acc
         .any(|component| matches!(component, Component::ParentDir))
         .then(|| canonicalize_nearest_existing(&cwd.join(raw)))
         .flatten();
-    let sensitivity = [
+    [
         PathFacts::gather(&path, cwd).sensitivity(access),
         glob_spelling_sensitivity(&path, metadata, access),
         physical.and_then(|physical| path_sensitivity(&physical, access)),
     ]
     .into_iter()
-    .fold(None, merge_sensitivity);
+    .fold(None, merge_sensitivity)
+}
+
+fn sensitivity_blocks_read(sensitivity: Option<Sensitivity>, metadata: bool) -> bool {
     match sensitivity {
         None => false,
         // 凭据和 agent state 连名字都算敏感，元数据访问也不例外。
@@ -671,12 +665,24 @@ fn evaluation_is_sensitive(
     metadata: bool,
     access_of: impl Fn(&str) -> Access,
 ) -> bool {
+    sensitivity_blocks_read(
+        evaluation_sensitivity(word, cwd, metadata, access_of),
+        metadata,
+    )
+}
+
+fn evaluation_sensitivity(
+    word: &WordEvaluation,
+    cwd: &Path,
+    metadata: bool,
+    access_of: impl Fn(&str) -> Access,
+) -> Option<Sensitivity> {
     match word {
         WordEvaluation::Resolved(path) => {
-            path_argument_is_sensitive(path, cwd, metadata, access_of(path))
+            path_argument_sensitivity(path, cwd, metadata, access_of(path))
         }
         WordEvaluation::Partial(spelling) if !spelling.contains('\0') => {
-            path_argument_is_sensitive(spelling, cwd, metadata, access_of(spelling))
+            path_argument_sensitivity(spelling, cwd, metadata, access_of(spelling))
         }
         WordEvaluation::Partial(spelling) => {
             // 未知片段不能假装成文件系统落点，但已知的敏感分量仍然成立。
@@ -685,16 +691,12 @@ fn evaluation_is_sensitive(
                 other => other,
             };
             let path = Path::new(spelling);
-            match merge_sensitivity(
+            merge_sensitivity(
                 path_sensitivity(path, access),
                 glob_spelling_sensitivity(path, metadata, access),
-            ) {
-                Some(Sensitivity::Secret) => true,
-                Some(Sensitivity::Vcs) => !metadata,
-                None => false,
-            }
+            )
         }
-        WordEvaluation::Unknown => false,
+        WordEvaluation::Unknown => None,
     }
 }
 
@@ -960,12 +962,12 @@ fn write_targets(
             WriteTarget::Resolved(PathFacts::gather(Path::new(&path), cwd)),
         ),
         WordEvaluation::Resolved(path) => Some(WriteTarget::Partial {
-            sensitive: evaluation_is_sensitive(&WordEvaluation::Partial(path), cwd, false, |_| {
+            sensitivity: evaluation_sensitivity(&WordEvaluation::Partial(path), cwd, false, |_| {
                 Access::Write
             }),
         }),
         WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
-            sensitive: evaluation_is_sensitive(&target, cwd, false, |_| Access::Write),
+            sensitivity: evaluation_sensitivity(&target, cwd, false, |_| Access::Write),
         }),
         WordEvaluation::Unknown => Some(WriteTarget::Unknown),
     };

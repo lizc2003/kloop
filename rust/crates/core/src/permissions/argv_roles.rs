@@ -32,13 +32,13 @@ pub(super) struct PathArgument<'a> {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct UnknownEffects {
-    pub reads: bool,
+    pub unresolved_access: bool,
     pub dangerous: bool,
 }
 
 impl UnknownEffects {
     const UNKNOWN: Self = Self {
-        reads: true,
+        unresolved_access: true,
         dangerous: true,
     };
 }
@@ -54,7 +54,7 @@ pub(super) fn unknown_effects(argv: &[String]) -> UnknownEffects {
     let paths = match name.rsplit('/').next().unwrap_or(name) {
         "rm" => {
             return UnknownEffects {
-                reads: false,
+                unresolved_access: false,
                 dangerous: true,
             };
         }
@@ -63,7 +63,7 @@ pub(super) fn unknown_effects(argv: &[String]) -> UnknownEffects {
     match paths {
         Some(paths) => UnknownEffects {
             // 凭据与 agent state 的名称也受保护，未知元数据目标不能排除这些路径。
-            reads: paths
+            unresolved_access: paths
                 .iter()
                 .any(|path| path.access != PathAccess::Write && path.value.contains('\0')),
             dangerous: false,
