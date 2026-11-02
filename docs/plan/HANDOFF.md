@@ -9,11 +9,14 @@
 回归通过。解析失败/节点或包装器上限新增 `facts_complete`，这类脚本不再吃第 8 层自动
 放行；未知包装器效果仍保留命令事实，plan 244 的自动放行不变。权限与沙箱改用
 `path_resolve::resolve_nearest_existing`：`..` 先穿符号链接再回退，断链无可信落点，
-`PathFacts.resolved` 为假时 allow 与记忆都不生成，deny 仍看原拼写。升级审批同时监听
-turn cancel，`run_process_foreground` 在 spawn 前查取消，并用不存在的可执行文件让
-“取消后不 spawn” 可确定复现。9 条新回归在 HEAD 临时 worktree 上先红；外层执行沙箱
-之外 `make check` 全绿（fmt、clippy、workspace 全量测试，core 1284 项，本机 parity
-baseline verified）。Linux 与 Windows 未实测。教训 296。
+`PathFacts.resolved` 为假时 allow 与记忆都不生成，deny 仍看原拼写。审查补丁把“可信落点”
+与“保守别名”分开：断链叶子仍保留最近祖先的 `deny_alias` / `deny_alias_relative`，
+只供 deny/ask 匹配相对与绝对规则，绝对别名穿过指向 cwd 的符号链接时不会漏 deny。
+升级审批同时监听 turn cancel，`run_process_foreground` 在 spawn 前查取消，并用不存在的
+可执行文件让“取消后不 spawn” 可确定复现。9 条新回归在 HEAD 临时 worktree 上先红，
+断链别名 gate 回归在 `237fb88` 上也先红；外层执行沙箱
+之外 `make check` 全绿（fmt、clippy、workspace 全量测试，core 1285 项，本机 parity
+baseline verified）。Linux 与 Windows 未实测。教训 296、297。
 
 **溢出日志的 Base58 大小写误拦修复（2026-10-30）**：后台命令完成后读取它自己的
 `offload/bg-*.out` 被敏感读取门硬拒：权限层先折叠文件名大小写，再校验随机 ID，合法
@@ -3907,3 +3910,13 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    “解析失败”必须显式传播到 allow 与记忆，不能拿词法拼写顶替物理落点。最后，验证“取消后不
    spawn”不能靠子进程是否来得及写标记——用不存在的可执行文件，旧代码报 spawn 失败、新代码
    报 interrupted，才是不依赖调度时机的红。
+
+297. **“无法可信解析”不等于“什么都不知道”，但保守别名只能进入拒绝方向。** 断链叶子让
+   `resolve_nearest_existing` 返回 `None` 是对的（不能假装知道物理落点），可 `PathFacts`
+   随即把 `relative` 清空，而绝对别名又无法 `strip_prefix(cwd)`，于是相对
+   `bash_write(logs/**)` 同时失去两条证据：`/work/alias/logs/out`（alias 指向 cwd）不再
+   命中 deny，第 8 层沙箱自动放行后真的创建了文件。修法不是让未解析目标重新变成“可信”，
+   而是把两件事拆开存：`resolved` 继续管 allow/containment/记忆；另存宽松的最近祖先别名
+   （`deny_alias` / `deny_alias_relative`）只给 `matches_path` 的 deny/ask 方向。判据：
+   同一份路径事实里，**“能证明安全”和“能证明危险”需要的可信度不同**——前者要物理落点，
+   后者宁可多拦。回归要同时断言 deny 命中、allow 不命中，否则修好一边会掩盖另一边。

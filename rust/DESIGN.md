@@ -3372,7 +3372,8 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   新名字下写 hooks，`require-not subpath .git/hooks` 就不再生效。权限门和沙箱
   共用同一个“最近存在的祖先 + 缺失后缀”解析函数：`..` 先经过符号链接再回退，
   断链或解析失败返回无可信落点，不能退到父目录；没有落点时 allow 规则不生成
-  也不匹配，deny 仍按原拼写命中。The user-private `~/.kloop` state tree is a
+  也不匹配，deny/ask 仍按原拼写和最近祖先的保守别名命中。The user-private
+  `~/.kloop` state tree is a
   separate recursive deny-read/deny-write boundary. 当前 home 下 `.ssh`、`.aws`、`.gnupg`
   同样递归拒读与拒写；它们不享受 offload 的读取例外。
 - **Reads** are full-disk apart from explicit credential/state denies; **network** is off unless configured — with one

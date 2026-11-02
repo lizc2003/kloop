@@ -9,6 +9,16 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub(crate) fn resolve_nearest_existing(path: &Path) -> Option<PathBuf> {
+    resolve(path, /*dangling_is_failure*/ true)
+}
+
+/// 同一次逐分量解析，但把断链叶子当成缺失分量。只供 deny/ask 的别名证据：
+/// 它可能把目标归到父目录下，不能据此生成 allow 或记忆授权。
+pub(crate) fn resolve_nearest_existing_loose(path: &Path) -> Option<PathBuf> {
+    resolve(path, /*dangling_is_failure*/ false)
+}
+
+fn resolve(path: &Path, dangling_is_failure: bool) -> Option<PathBuf> {
     let mut ancestor = path;
     let mut missing = Vec::new();
     loop {
@@ -20,7 +30,7 @@ pub(crate) fn resolve_nearest_existing(path: &Path) -> Option<PathBuf> {
                 return Some(resolved);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if std::fs::symlink_metadata(ancestor).is_ok() {
+                if dangling_is_failure && std::fs::symlink_metadata(ancestor).is_ok() {
                     return None;
                 }
                 missing.push(ancestor.file_name()?.to_os_string());

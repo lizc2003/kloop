@@ -125,8 +125,16 @@ impl Rule {
                             .original_relative
                             .as_ref()
                             .is_some_and(|rel| glob.is_match(rel))
+                        || facts
+                            .deny_alias_relative
+                            .as_ref()
+                            .is_some_and(|rel| glob.is_match(rel))
                         || glob.is_match(&facts.normalized)
-                        || glob.is_match(&facts.original))
+                        || glob.is_match(&facts.original)
+                        || facts
+                            .deny_alias
+                            .as_ref()
+                            .is_some_and(|path| glob.is_match(path)))
             }
             Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
         }

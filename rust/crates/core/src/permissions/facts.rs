@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::path_resolve::resolve_nearest_existing;
+use crate::path_resolve::resolve_nearest_existing_loose;
 use crate::sandbox::ExecutionContext;
 use crate::shell::BashAnalysis;
 use crate::shell::analyze_wrappers;
@@ -119,6 +120,10 @@ pub(super) struct PathFacts {
     pub(super) original_relative: Option<PathBuf>,
     /// 物理落点是否可信；断链或解析失败时为 false，只保留原拼写供 deny 使用。
     pub(super) resolved: bool,
+    /// 未解析目标的保守祖先别名，仅供 deny/ask 兼顾相对/绝对规则；
+    /// allow、containment 与记忆都不消费它。
+    pub(super) deny_alias: Option<PathBuf>,
+    pub(super) deny_alias_relative: Option<PathBuf>,
     pub(super) inside_cwd: bool,
 }
 
@@ -1081,6 +1086,14 @@ impl PathFacts {
             .and_then(|path| path.strip_prefix(&canonical_cwd).ok())
             .map(Path::to_path_buf);
         let original_relative = original.strip_prefix(cwd).ok().map(Path::to_path_buf);
+        let deny_alias = resolved
+            .is_none()
+            .then(|| resolve_nearest_existing_loose(&original))
+            .flatten();
+        let deny_alias_relative = deny_alias
+            .as_ref()
+            .and_then(|path| path.strip_prefix(&canonical_cwd).ok())
+            .map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
         PathFacts {
             normalized,
@@ -1088,6 +1101,8 @@ impl PathFacts {
             original,
             original_relative,
             resolved: resolved.is_some(),
+            deny_alias,
+            deny_alias_relative,
             inside_cwd,
         }
     }

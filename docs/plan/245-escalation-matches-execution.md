@@ -79,12 +79,16 @@
   解析失败时 allow 与记忆都不生成，deny 继续看原拼写。
 - 第 6 条升级审批 `select!` 同时监听 stop 与 cancel；取消按 `interrupted` 结束，
   `run_process_foreground` 在 spawn 前再查一次取消。
+- 审查补丁：`resolved == false` 时 `PathFacts` 另存 `deny_alias` / `deny_alias_relative`
+  （宽松的“最近存在祖先 + 缺失后缀”），只供 deny/ask 兼顾相对与绝对别名；
+  allow、containment 与记忆仍只认可信落点。绝对别名穿过指向 cwd 的符号链接、叶子又是
+  断链时，相对 `bash_write(logs/**)` 不再漏。该 gate 回归在 `237fb88` 上先红。
 
 - 验证（2026-11-02）：新增 9 条回归在 HEAD（96fb4d5）的临时 worktree 上回跑，通配跳过沙箱、
   remember 为 None 落通配、语法错误自动放行、改名 `.git` 写 hooks、`..` 穿符号链接、
   断链、取消后仍 spawn 均先红；另 1 条 allow 未解析目标的规则测试随 `resolved` 字段新增。
   改后全绿。外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 全量测试，
-  core 1284 项，本机 parity baseline verified）。Linux 与 Windows 未实测。
+  core 1285 项，本机 parity baseline verified）。Linux 与 Windows 未实测。
 
 ## 验收
 
