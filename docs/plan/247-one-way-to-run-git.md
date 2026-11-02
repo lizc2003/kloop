@@ -96,5 +96,10 @@
   注入当前分支；不可用身份仍有 scheduler key。宿主机全局 `commit.gpgSign`/hooks 的
   隔离由 `hermetic_command` 固定配置源保证，三处夹具都已改走它；未再单独用敌意
   `HOME` 复跑。
+- **审查补（2026-11-02）**：`SessionStore::dirs`/`ensure` 原先在分支前就解析身份，导致
+  `--mock --serve` / `--mock --list-sessions` 这类 Hermetic 路径也会启动 Git；现在只有
+  Global 分支解析，并新增线程内命令计数回归（旧行为下先红）。TUI 分支回归夹具恢复了
+  被误删的 `env_clear`、HOME/XDG 与空 `core.hooksPath`，避免宿主 `GIT_TEMPLATE_DIR`
+  里的钩子进入 seed commit。
 - `make check` 在外层执行沙箱之外全绿（fmt、clippy、workspace 全量测试，core 1296 项、
   TUI 313 项，本机 parity baseline verified）。Linux 与 Windows 未实测。

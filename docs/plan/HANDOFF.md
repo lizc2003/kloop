@@ -8,9 +8,12 @@
 `scheduler_key()`（即 `session_partition()`）；按用户决定不兼容旧 key，旧 scheduler 目录
 不再读取。`find_git_root` 删除；`gather`、权限、信任、会话分区与调度共用
 `run_front_end` / server 每线程各解析一次的同一身份，`SessionStore` 新增 `*_with` 入口。
-测试夹具全部改走统一入口，宿主机 `commit.gpgSign`/hooks 不再影响 seed commit。外层执行
-沙箱之外 `make check` 全绿（fmt、clippy、workspace 全量测试，core 1296 项、TUI 313 项，
-本机 parity baseline verified）。Linux 与 Windows 未实测。教训 299、300。
+测试夹具全部改走统一入口，宿主机的全局配置不再影响 seed commit。审查补了两处：Hermetic
+store 的 `dirs`/`ensure` 必须在分支之后才解析身份，否则 `--mock --serve`、
+`--mock --list-sessions` 也会启动 Git；TUI 夹具恢复被误删的 `env_clear`、HOME/XDG 与空
+`core.hooksPath`，挡住 `GIT_TEMPLATE_DIR` 这类没进统一名单的宿主输入。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace 全量测试，core 1296 项、TUI 313 项，本机 parity
+baseline verified）。Linux 与 Windows 未实测。教训 299、300、301。
 
 **Plan 246 ✅：指令文件与注入的信任边界（2026-11-02）**：项目/本地指令文件现在按
 canonical 落点划边界：顶层 `AGENTS.md`、`.kloop/rules/*.md`、`AGENTS.local.md` 与
@@ -3980,3 +3983,11 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    后，仓库与 linked worktree 共享、普通目录自成一区、探测失败也总有目录域 key，启动
    不再因为 git 失败而失败。用户明确说不需要兼容时，不要为旧目录加双读或迁移分支——
    兼容代码本身也是要长期维护的失败面。
+
+301. **早返回的分支要把“准备工作”一起早返回，有副作用的东西永远放在分支之后。** 为省一行，
+   `SessionStore::dirs`/`ensure` 先 `WorkspaceIdentity::resolve` 再进 Hermetic 分支，
+   于是 `--mock --serve`、`--mock --list-sessions` 也会启动 Git，PATH 上的包装脚本还能
+   让它们阻塞。判据是副作用（进程、文件、网络）只能在确定要用的分支里发生。回归可在线程
+   内计“构建了几条 Git 命令”，不必改进程环境，就不会和并行测试互相污染。反方向同样要
+   记住：统一入口只覆盖它明确列出的输入；测试夹具原有的 `env_clear`、空 `core.hooksPath`
+   是独立契约，删掉后 `GIT_TEMPLATE_DIR` 这类没进名单的宿主输入仍会漏进来。

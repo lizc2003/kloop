@@ -1600,12 +1600,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        // The unified Git entry keeps the fixture off the host's global and
-        // system configuration, so a host with `commit.gpgSign = true` cannot
-        // fail the seed commit for reasons unrelated to kloop.
+        // The fixture owns every input Git can read: the host's global and
+        // system config, its HOME/XDG lookup, its template directory and its
+        // hooks. `hermetic_command` covers config sources; clearing the rest
+        // here keeps a host with `commit.gpgSign = true`, a hook-bearing
+        // `GIT_TEMPLATE_DIR`, or a poisoned `GIT_DIR` out of the seed commit.
+        let home = root.join(".git-home");
+        let xdg = home.join(".config");
+        let hooks = home.join("hooks");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&hooks).unwrap();
+        let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
         let git = |args: &[&str]| {
-            let output = kloop_core::git::hermetic_command(&root)
-                .args(args)
+            let mut command = kloop_core::git::hermetic_command(&root);
+            command.args(args).env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+            let output = command
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null_config)
+                .env("GIT_CONFIG_SYSTEM", null_config)
+                .env("LC_ALL", "C")
                 .output()
                 .unwrap();
             assert!(
@@ -1617,6 +1635,8 @@ mod tests {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@example.com"]);
         git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgSign", "false"]);
+        git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
         git(&["commit", "--allow-empty", "-qm", "base"]);
         let expected = git_branch(&root).expect("temp repo has a branch");
         let event = AgentEvent::Core(CoreEvent::CwdChanged {

@@ -62,6 +62,14 @@ pub enum SessionStore {
     Hermetic(PathBuf),
 }
 
+fn ensure_hermetic(root: &Path) -> io::Result<SessionDirs> {
+    let dirs = dirs_under(root);
+    create_private_dir_all(root)?;
+    create_private_dir_all(&dirs.sessions)?;
+    create_private_dir_all(&dirs.offload)?;
+    Ok(dirs)
+}
+
 impl SessionStore {
     /// `root` is the private state directory itself (`~/.kloop`), the same one
     /// that holds `config.toml` and the project permission store.
@@ -81,9 +89,13 @@ impl SessionStore {
 
     /// Resolve this working directory's partition without touching the disk.
     /// Resolves an identity of its own; callers that already have one use
-    /// [`Self::dirs_with`].
+    /// [`Self::dirs_with`]. The probe happens only for the global store: a
+    /// hermetic store must not start Git at all.
     pub fn dirs(&self, cwd: &Path) -> SessionDirs {
-        self.dirs_with(&WorkspaceIdentity::resolve(cwd))
+        match self {
+            Self::Hermetic(root) => dirs_under(root),
+            Self::Global(_) => self.dirs_with(&WorkspaceIdentity::resolve(cwd)),
+        }
     }
 
     /// [`Self::dirs`] for a caller that already resolved the cwd's identity.
@@ -96,19 +108,19 @@ impl SessionStore {
     }
 
     /// [`Self::dirs`] plus the directory tree, created owner-only, and the
-    /// partition's `project.json` label.
+    /// partition's `project.json` label. Like [`Self::dirs`], only the global
+    /// store resolves an identity.
     pub fn ensure(&self, cwd: &Path) -> io::Result<SessionDirs> {
-        self.ensure_with(&WorkspaceIdentity::resolve(cwd))
+        match self {
+            Self::Hermetic(root) => ensure_hermetic(root),
+            Self::Global(_) => self.ensure_with(&WorkspaceIdentity::resolve(cwd)),
+        }
     }
 
     /// [`Self::ensure`] for a caller that already resolved the cwd's identity.
     pub fn ensure_with(&self, identity: &WorkspaceIdentity) -> io::Result<SessionDirs> {
         let dirs = match self {
-            Self::Hermetic(root) => {
-                let dirs = dirs_under(root);
-                create_private_dir_all(root)?;
-                dirs
-            }
+            Self::Hermetic(root) => return ensure_hermetic(root),
             Self::Global(root) => {
                 let partition = identity.session_partition();
                 let dir = partition_dir(root, &partition);
@@ -361,12 +373,16 @@ mod tests {
     fn hermetic_store_stays_cwd_local_and_unpartitioned() {
         let cwd = temp_dir("hermetic");
         let store = SessionStore::hermetic(&cwd);
+        let before = crate::git::test_git_command_count();
         let dirs = store.ensure(&cwd).unwrap();
+        let elsewhere = store.dirs(Path::new("/somewhere/else"));
 
         assert_eq!(dirs.sessions, cwd.join(".kloop/sessions"));
         assert_eq!(dirs.offload, cwd.join(".kloop/offload"));
         // A different cwd argument cannot move a hermetic store.
-        assert_eq!(store.dirs(Path::new("/somewhere/else")), dirs);
+        assert_eq!(elsewhere, dirs);
+        // `--mock` promises not to touch Git, so neither entry may probe.
+        assert_eq!(crate::git::test_git_command_count(), before);
     }
 
     /// The partition is shared with the durable permission store, which refuses

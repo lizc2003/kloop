@@ -80,7 +80,21 @@ pub fn branch(dir: &Path) -> Option<String> {
     (!branch.is_empty()).then_some(branch)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_GIT_COMMANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many Git commands the current test thread has built. Lets a test pin
+/// "this path never starts Git" without touching the process environment.
+#[cfg(test)]
+pub(crate) fn test_git_command_count() -> usize {
+    TEST_GIT_COMMANDS.with(std::cell::Cell::get)
+}
+
 fn configure(command: &mut Command, dir: &Path) {
+    #[cfg(test)]
+    TEST_GIT_COMMANDS.with(|count| count.set(count.get() + 1));
     command.arg("-C").arg(git_compatible_path(dir));
     command.env("LC_ALL", "C").env("LANG", "C");
     for name in REPOSITORY_SELECTION_ENV_VARS {
