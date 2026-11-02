@@ -17,6 +17,7 @@ pub(super) enum PartKind {
     Home,
     Variable(String),
     Pattern(String),
+    ScalarExpansion,
     Unknown,
 }
 
@@ -70,7 +71,7 @@ impl ShellWord {
         word
     }
 
-    /// 带引号的变量值不会把 env 赋值拆成新选项或命令；数组及未知展开不获此例外。
+    /// 带引号的单值展开不会把 env 赋值拆成新选项或命令；多值展开不获此例外。
     pub fn fixed_assignment(&self) -> Option<String> {
         let WordEvaluation::Partial(value) = self.evaluate(None) else {
             return None;
@@ -80,9 +81,8 @@ impl ShellWord {
             .is_some_and(|(name, _)| !name.is_empty() && !name.contains('\0'))
             && self.parts.iter().all(|part| match &part.kind {
                 PartKind::Text(_) => true,
-                PartKind::Variable(name) => {
-                    part.quoting == Quoting::Double && !matches!(name.as_str(), "@" | "*")
-                }
+                PartKind::Variable(name) => part.quoting == Quoting::Double && name != "@",
+                PartKind::ScalarExpansion => part.quoting == Quoting::Double,
                 PartKind::Home | PartKind::Pattern(_) | PartKind::Unknown => false,
             }))
         .then_some(value)
@@ -123,7 +123,7 @@ impl ShellWord {
                         partial = true;
                     }
                 }
-                PartKind::Unknown => {
+                PartKind::ScalarExpansion | PartKind::Unknown => {
                     text.push('\0');
                     partial = true;
                 }
@@ -207,6 +207,10 @@ impl ShellWord {
                 quoting: Quoting::Single,
             }),
             "simple_expansion" | "expansion" => {
+                if matches!(raw, "$*" | "${*}") {
+                    self.push(PartKind::ScalarExpansion, quoting);
+                    return;
+                }
                 let mut cursor = node.walk();
                 let children: Vec<_> = node.named_children(&mut cursor).collect();
                 let name = children
@@ -242,6 +246,9 @@ impl ShellWord {
                 } else {
                     self.text(raw, quoting);
                 }
+            }
+            "command_substitution" | "arithmetic_expansion" => {
+                self.push(PartKind::ScalarExpansion, quoting);
             }
             _ => self.push(PartKind::Unknown, quoting),
         }

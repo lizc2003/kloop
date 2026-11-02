@@ -1649,6 +1649,7 @@ mod tests {
                 "find . -path ./.git -print",
                 "find . -path ./.git -prune -a -print",
                 "find . -path ./.git -prune -o -path ./.git/config -print",
+                "find . -path ~/.kloop/config.toml -prune -o -print",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
@@ -1675,9 +1676,6 @@ mod tests {
                 "find . -path ./.git -prune -o -execdir cat '{}' ';'",
                 "find . -path ./.git -prune -o -ok cat '{}' ';'",
                 "find . -path ./.git -prune -o -okdir cat '{}' ';'",
-                "find . -path ./.git -prune -o -fprint result.txt",
-                "find . -path ./.git -prune -o -fprintf result.txt '%p'",
-                "find . -path ./.git -prune -o -fls result.txt",
                 "find . -path ./.git -prune -o -delete",
                 "find . -newer -path ./.git -prune -o -print",
                 "find . -path ./.git -unknown -print",
@@ -1688,7 +1686,6 @@ mod tests {
                 "find . -path ./.git -o -o -print",
                 "cat -path ./.git -prune -o",
                 "find . -path ./.git -prune -o -print; cat ~/.kloop/config.toml",
-                "find . -path ~/.kloop/config.toml -prune -o -print",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
@@ -1807,8 +1804,8 @@ mod tests {
                 "du --files0-from=./.git/config",
                 "tree --fromfile ./.git/config",
                 "find . -files0-from ./.git/config",
-                "sudo find . -path ./.git -prune -o -print",
-                "xargs find . -path ./.git -prune -o -print",
+                "sudo find . -files0-from ./.git/config",
+                "xargs find . -files0-from ./.git/config",
             ] {
                 for sandbox_auto_allow in [false, true] {
                     assert_eq!(
@@ -1871,9 +1868,7 @@ mod tests {
                 "tree --fromfile .git/config",
                 "tree --gitignore .git",
                 "tree -R -L 1 -H . .git",
-                "tree -so .git/config .",
                 "tree --compress -- -o .git/config .",
-                "tree -o .git/config .",
                 "find .git -files0-from .git/config",
                 "find .git -exec cat '{}' ';'",
                 "find .git -delete",

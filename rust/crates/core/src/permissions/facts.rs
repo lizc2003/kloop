@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::sandbox::ExecutionContext;
 use crate::shell::BashAnalysis;
+use crate::shell::analyze_wrappers;
 use crate::shell::argv_is_dangerous;
 use crate::shell::argv_is_readonly;
 use crate::shell::risk_wrapper_views;
@@ -249,7 +250,7 @@ impl CallFacts {
                     .iter()
                     .map(|word| word.syntax.evaluate(None))
                     .collect();
-                if argv_roles::replacement_effects(&placeholder_argv(&words)).dangerous {
+                if argv_roles::unknown_effects(&placeholder_argv(&words)).dangerous {
                     return true;
                 }
             }
@@ -392,25 +393,93 @@ fn placeholder_argv(words: &[WordEvaluation]) -> Vec<String> {
 }
 
 fn argv_reads_sensitive_path(argv: &[String], cwd: &Path, placement: Placement) -> bool {
+    let wrappers = analyze_wrappers(argv);
+    let (prefix, argv) = if wrappers.complete {
+        (&argv[..argv.len() - wrappers.argv.len()], wrappers.argv)
+    } else {
+        (&[][..], argv)
+    };
+    // 包装器自己的操作数仍须检查，例如 xargs -a 的输入文件。
+    if prefix
+        .iter()
+        .skip(1)
+        .any(|arg| path_argument_is_sensitive(arg, cwd, false, placement.access(arg)))
+    {
+        return true;
+    }
     let paths = argv_roles::path_arguments(argv);
-    // 已建模命令解析失败时角色不明，按内容访问处理；未建模命令（`ls`、
-    // `stat`）没有角色表可失败，元数据判定直接生效。
-    let metadata = argv_roles::is_metadata_access(argv)
-        && (paths.is_some() || !argv_roles::is_modeled_command(argv));
     let sensitive = match paths {
         // 识别出参数角色：只检查命令真正会打开的值。
         Some(paths) => paths
             .into_iter()
-            .any(|arg| path_argument_is_sensitive(arg, cwd, metadata, placement.access(arg))),
+            .filter(|path| path.access != argv_roles::PathAccess::Write)
+            .any(|path| {
+                let word = if path.value.contains('\0') {
+                    WordEvaluation::Partial(path.value.into())
+                } else {
+                    WordEvaluation::Resolved(path.value.into())
+                };
+                evaluation_is_sensitive(&word, cwd, path.access.is_metadata(), |value| {
+                    placement.access(value)
+                })
+            }),
         // 未知命令或语法：退回逐参数检查。
         None => argv.iter().skip(1).any(|arg| {
             if arg.starts_with('-') && !arg.contains('/') {
                 return false;
             }
-            path_argument_is_sensitive(arg, cwd, metadata, placement.access(arg))
+            let word = if arg.contains('\0') {
+                WordEvaluation::Partial(arg.clone())
+            } else {
+                WordEvaluation::Resolved(arg.clone())
+            };
+            evaluation_is_sensitive(&word, cwd, false, |value| placement.access(value))
         }),
     };
     sensitive || recursive_search_covers_sensitive_path(argv, cwd)
+}
+
+fn mask_nonreading_arguments(masked: &mut String, facts: &BashFacts, home: Option<&Path>) {
+    for command in &facts.commands {
+        if command.context.script_depth != 0 {
+            continue;
+        }
+        let words: Vec<_> = command
+            .words
+            .iter()
+            .map(|word| {
+                word.syntax
+                    .evaluate(home.filter(|_| !command.context.home_unknown))
+            })
+            .collect();
+        let argv = placeholder_argv(&words);
+        let wrappers = analyze_wrappers(&argv);
+        if !wrappers.complete {
+            continue;
+        }
+        let Some(paths) = argv_roles::path_arguments(wrappers.argv) else {
+            continue;
+        };
+        let skipped = argv.len() - wrappers.argv.len();
+        for (index, argument) in wrappers.argv.iter().enumerate().skip(1) {
+            if !matches!(words[skipped + index], WordEvaluation::Resolved(_)) {
+                continue;
+            }
+            let start = argument.as_ptr() as usize;
+            let end = start + argument.len();
+            // 角色可能只借用了 --opt=value 的后半段；按来源对齐，不能按字符串相等猜位置。
+            let may_read = paths.iter().any(|path| {
+                let value_start = path.value.as_ptr() as usize;
+                path.access != argv_roles::PathAccess::Write
+                    && value_start >= start
+                    && value_start + path.value.len() <= end
+            });
+            if !may_read {
+                let range = &command.words[skipped + index].range;
+                masked.replace_range(range.clone(), &" ".repeat(range.len()));
+            }
+        }
+    }
 }
 
 /// 只读命令里能定位、且落在项目 `.kloop` 的参数，原文层不再按名字筛：它们已由
@@ -470,6 +539,7 @@ fn bash_reads_sensitive_path(
 ) -> ReadVerdict {
     let home = execution.shell_home();
     let mut masked = command.to_string();
+    mask_nonreading_arguments(&mut masked, facts, home.as_deref());
     if facts.reliable {
         mask_project_kloop_words(&mut masked, facts, cwd, home.as_deref());
     }
@@ -500,28 +570,12 @@ fn bash_reads_sensitive_path(
                 .map(|word| word.syntax.evaluate(home))
                 .collect();
             if command.context.argument_rewrite
-                && argv_roles::replacement_effects(&placeholder_argv(&words)).reads
+                && argv_roles::unknown_effects(&placeholder_argv(&words)).reads
             {
                 return ReadVerdict::Unresolved;
             }
             let placement = Placement::of_command(&placeholder_argv(&words), &command.context);
-            // 不删除未知参数：角色表只有在每个位置都有完整拼写时才能使用。
-            let argv: Option<Vec<_>> = words
-                .iter()
-                .map(|word| match word {
-                    WordEvaluation::Resolved(text) => Some(text.clone()),
-                    WordEvaluation::Partial(_) | WordEvaluation::Unknown => None,
-                })
-                .collect();
-            if let Some(argv) = argv {
-                if argv_reads_sensitive_path(&argv, cwd, placement) {
-                    return ReadVerdict::Sensitive;
-                }
-            } else if !arguments_are_text(command)
-                && words.iter().skip(1).any(|word| {
-                    evaluation_is_sensitive(word, cwd, false, |spelling| placement.access(spelling))
-                })
-            {
+            if argv_reads_sensitive_path(&placeholder_argv(&words), cwd, placement) {
                 return ReadVerdict::Sensitive;
             }
         }
@@ -900,39 +954,68 @@ fn write_targets(
     execution: ExecutionContext<'_>,
 ) -> Vec<WriteTarget> {
     let home = execution.shell_home();
+    let write_target = |target: WordEvaluation, cwd_unknown: bool| match target {
+        WordEvaluation::Resolved(path) if path == "/dev/null" => None,
+        WordEvaluation::Resolved(path) if !cwd_unknown || Path::new(&path).is_absolute() => Some(
+            WriteTarget::Resolved(PathFacts::gather(Path::new(&path), cwd)),
+        ),
+        WordEvaluation::Resolved(path) => Some(WriteTarget::Partial {
+            sensitive: evaluation_is_sensitive(&WordEvaluation::Partial(path), cwd, false, |_| {
+                Access::Write
+            }),
+        }),
+        WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
+            sensitive: evaluation_is_sensitive(&target, cwd, false, |_| Access::Write),
+        }),
+        WordEvaluation::Unknown => Some(WriteTarget::Unknown),
+    };
     let mut writes: Vec<_> = facts
         .redirects
         .iter()
         .filter(|redirect| redirect.direction == Direction::Write)
         .filter_map(|redirect| {
             let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
-            let target = redirect.syntax.evaluate(home);
-            match target {
-                // `/dev/null` 只是丢掉输出，没有写效果。
-                WordEvaluation::Resolved(path) if path == "/dev/null" => None,
-                WordEvaluation::Resolved(path)
-                    if !redirect.context.cwd_unknown || Path::new(&path).is_absolute() =>
-                {
-                    Some(WriteTarget::Resolved(PathFacts::gather(
-                        Path::new(&path),
-                        cwd,
-                    )))
-                }
-                WordEvaluation::Resolved(path) => Some(WriteTarget::Partial {
-                    sensitive: evaluation_is_sensitive(
-                        &WordEvaluation::Partial(path),
-                        cwd,
-                        false,
-                        |_| Access::Write,
-                    ),
-                }),
-                WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
-                    sensitive: evaluation_is_sensitive(&target, cwd, false, |_| Access::Write),
-                }),
-                WordEvaluation::Unknown => Some(WriteTarget::Unknown),
-            }
+            write_target(
+                redirect.syntax.evaluate(home),
+                /*cwd_unknown*/ redirect.context.cwd_unknown,
+            )
         })
         .collect();
+    for command in &facts.commands {
+        let words: Vec<_> = command
+            .words
+            .iter()
+            .map(|word| {
+                word.syntax
+                    .evaluate(home.as_deref().filter(|_| !command.context.home_unknown))
+            })
+            .collect();
+        let argv = placeholder_argv(&words);
+        let wrappers = analyze_wrappers(&argv);
+        if !wrappers.complete || wrappers.rewrites_wrapper() {
+            continue;
+        }
+        let Some(paths) = argv_roles::path_arguments(wrappers.argv) else {
+            continue;
+        };
+        for path in paths.into_iter().filter(|path| path.access.writes()) {
+            // 改写后的子命令已有自己的词事实，不能再把原始 marker 当真实输出。
+            if wrappers.arguments_unknown && wrappers.rewrites_argument(path.value) {
+                continue;
+            }
+            let value = if path.value.contains('\0') {
+                WordEvaluation::Partial(path.value.into())
+            } else {
+                WordEvaluation::Resolved(path.value.into())
+            };
+            if let Some(target) = write_target(
+                value,
+                /*cwd_unknown*/ command.context.cwd_unknown || wrappers.cwd_unknown,
+            ) {
+                writes.push(target);
+            }
+        }
+    }
     if !facts.reliable {
         // 达到解析界限时不能用空效果列表证明“不写文件”。
         writes.push(WriteTarget::Unknown);

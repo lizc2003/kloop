@@ -1,53 +1,74 @@
 //! 命令参数的角色：哪些值会被命令当作文件打开，哪些只是匹配模式或字面量。
 //!
-//! 只认识下面列出的命令与选项。任何未识别的命令、选项、缺参或不完整表达式都
-//! 返回 `None`，由调用方退回逐参数路径检查——角色表只能减少误报，不能放宽未知
-//! 语法。读取类参数（模式文件、参考文件、搜索根）永远留在检查一侧；执行/写入类
-//! 选项由 [`argv_is_readonly`] 提前排除。
+//! 只认识下面列出的命令与选项。元数据命令的未知选项仍逐值检查元数据路径；其它
+//! 未识别的命令、选项、缺参或不完整表达式返回 `None`，由调用方逐参数保守检查。
+//! 路径分别保留内容读取、元数据访问和写入方向；只读授权另行判定。
 
 use crate::shell::argv_is_readonly;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PathAccess {
+    Read,
+    Metadata,
+    MetadataWrite,
+    Write,
+}
+
+impl PathAccess {
+    pub fn is_metadata(self) -> bool {
+        matches!(self, Self::Metadata | Self::MetadataWrite)
+    }
+
+    pub fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::MetadataWrite)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PathArgument<'a> {
+    pub value: &'a str,
+    pub access: PathAccess,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct ReplacementEffects {
+pub(super) struct UnknownEffects {
     pub reads: bool,
     pub dangerous: bool,
 }
 
-impl ReplacementEffects {
+impl UnknownEffects {
     const UNKNOWN: Self = Self {
         reads: true,
         dangerous: true,
     };
 }
 
-/// 只消费改写后的 exec 参数。NUL 是词事实的未知片段，不是可能传给进程的字节。
-pub(super) fn replacement_effects(argv: &[String]) -> ReplacementEffects {
+/// 与字面参数共用角色表。NUL 是词事实的未知片段，不是可能传给进程的字节。
+pub(super) fn unknown_effects(argv: &[String]) -> UnknownEffects {
     if !argv.iter().any(|word| word.contains('\0')) {
-        return ReplacementEffects::default();
+        return UnknownEffects::default();
     }
     let Some(name) = argv.first().filter(|word| !word.contains('\0')) else {
-        return ReplacementEffects::UNKNOWN;
+        return UnknownEffects::UNKNOWN;
     };
     let paths = match name.rsplit('/').next().unwrap_or(name) {
-        // 参数可改变文本或文件元数据，不会打开目标的正文，也不属于危险短名单。
-        "echo" | "printf" | "touch" | "mkdir" | "chmod" => return ReplacementEffects::default(),
         "rm" => {
-            return ReplacementEffects {
+            return UnknownEffects {
                 reads: false,
                 dangerous: true,
             };
         }
-        "git" if argv.get(1).is_some_and(|word| word == "commit") => {
-            option_paths(&argv[1..], &GIT_COMMIT, Positionals::AllPaths)
-        }
         _ => path_arguments(argv),
     };
     match paths {
-        Some(paths) => ReplacementEffects {
-            reads: paths.iter().any(|path| path.contains('\0')),
+        Some(paths) => UnknownEffects {
+            // 凭据与 agent state 的名称也受保护，未知元数据目标不能排除这些路径。
+            reads: paths
+                .iter()
+                .any(|path| path.access != PathAccess::Write && path.value.contains('\0')),
             dangerous: false,
         },
-        None => ReplacementEffects::UNKNOWN,
+        None => UnknownEffects::UNKNOWN,
     }
 }
 
@@ -55,23 +76,62 @@ pub(super) fn replacement_effects(argv: &[String]) -> ReplacementEffects {
 /// `--opt=value` / `-Xvalue` 中 `=` 或短选项之后的那一段。
 ///
 /// 返回 `None` 表示未识别：调用方必须检查 `argv[1..]` 的每个参数。
-pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<&str>> {
+pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<PathArgument<'_>>> {
     let command = argv.first()?.rsplit('/').next()?;
     // echo/printf 的参数只是文本，也没有会打开文件的选项。
     if matches!(command, "echo" | "printf") {
         return Some(Vec::new());
     }
-    if !argv_is_readonly(argv) {
-        return None;
-    }
     match command {
         "find" => parse_find(argv).map(|found| found.paths),
-        "grep" => option_paths(argv, &GREP, Positionals::PatternThenPaths),
-        "rg" => option_paths(argv, &RG, Positionals::PatternThenPaths),
+        "grep" if argv_is_readonly(argv) => {
+            option_paths(argv, &GREP, Positionals::PatternThenPaths)
+        }
+        "rg" if argv_is_readonly(argv) => option_paths(argv, &RG, Positionals::PatternThenPaths),
         "du" => option_paths(argv, &DU, Positionals::AllPaths),
-        "tree" => option_paths(argv, &TREE, Positionals::AllPaths),
+        "tree" => {
+            let mut walked = walk_options(argv, &TREE, Positionals::AllPaths)?;
+            if walked.short_flags.contains(&'R') {
+                return None;
+            }
+            if walked
+                .long_flags
+                .iter()
+                .any(|flag| matches!(*flag, "fromfile" | "gitignore"))
+            {
+                for path in &mut walked.paths {
+                    if path.access == PathAccess::Metadata {
+                        path.access = PathAccess::Read;
+                    }
+                }
+            }
+            Some(walked.paths)
+        }
+        "ls" => Some(metadata_paths(argv, &LS, Positionals::AllPaths)),
+        "stat" => Some(metadata_paths(argv, &STAT, Positionals::AllPaths)),
+        "git" => git_paths(argv),
+        "touch" => Some(metadata_paths(argv, &TOUCH, Positionals::AllPaths)),
+        "mkdir" => Some(metadata_paths(argv, &MKDIR, Positionals::AllPaths)),
+        "chmod" => Some(metadata_paths(argv, &CHMOD, Positionals::PatternThenPaths)),
         _ => None,
     }
+}
+
+fn metadata_paths<'a>(
+    argv: &'a [String],
+    spec: &Spec,
+    positionals: Positionals,
+) -> Vec<PathArgument<'a>> {
+    // 这些命令没有打开目标正文的选项；角色不明时仍检查所有值的元数据访问。
+    option_paths(argv, spec, positionals).unwrap_or_else(|| {
+        argv.iter()
+            .skip(1)
+            .map(|value| PathArgument {
+                value,
+                access: spec.positionals,
+            })
+            .collect()
+    })
 }
 
 /// grep/rg 实际遍历的搜索根：位置参数才是根，`-f patterns.txt` 这类选项读取
@@ -85,15 +145,6 @@ pub(super) fn search_roots(argv: &[String]) -> Option<Vec<&str>> {
             .map(|walked| walked.positional_paths),
         _ => None,
     }
-}
-
-/// 命令是否在参数角色表里。已建模命令解析失败时不能拿"元数据访问"替它担保：
-/// 角色不明，路径可能被当成模式或读取目标。
-pub(super) fn is_modeled_command(argv: &[String]) -> bool {
-    let Some(command) = argv.first().and_then(|arg| arg.rsplit('/').next()) else {
-        return false;
-    };
-    matches!(command, "find" | "grep" | "rg" | "du" | "tree")
 }
 
 /// grep/rg 是否在搜索根下递归。共用同一套选项簇解析：`-rn`、`-d recurse`、
@@ -186,42 +237,10 @@ fn rg_recursion_fallback(argv: &[String]) -> bool {
 
 /// 只 stat 或列目录、不打开文件内容的调用。未知命令一律按内容访问处理，
 /// 所以这里只放行明确确认过"没有读取内容选项"的命令。
-pub(super) fn is_metadata_access(argv: &[String]) -> bool {
-    let Some(command) = argv.first().and_then(|arg| arg.rsplit('/').next()) else {
-        return false;
-    };
-    match command {
-        "ls" | "stat" => true,
-        // du 只统计目录；带 Path 操作数的选项（-X、--exclude-from、
-        // --files0-from，含 -sX 这类组合）会打开文件。
-        "du" => option_opens_file(argv, &DU) == Some(false),
-        // tree 只 stat；-o/-R 写文件，--from* / --gitignore / --gitfile /
-        // --infofile / --h* 读文件。只看实际作为选项消费的开关，
-        // `-I --gitignore` 里的 `--gitignore` 是模式，不是开关。
-        "tree" => match walk_options(argv, &TREE, Positionals::AllPaths) {
-            Some(walked) => {
-                !walked.opens_file
-                    && !walked.short_flags.contains(&'R')
-                    && !walked.long_flags.iter().any(|name| {
-                        matches!(
-                            *name,
-                            "outfile"
-                                | "fromfile"
-                                | "fromtabfile"
-                                | "gitignore"
-                                | "gitfile"
-                                | "infofile"
-                                | "hintro"
-                                | "houtro"
-                        )
-                    })
-            }
-            None => false,
-        },
-        // 普通 find 谓词只 stat / 输出名字；`-files0-from` 会读取根列表文件。
-        "find" => parse_find(argv).is_some_and(|found| !found.opens_file),
-        _ => false,
-    }
+#[cfg(test)]
+fn is_metadata_access(argv: &[String]) -> bool {
+    path_arguments(argv)
+        .is_some_and(|paths| paths.iter().all(|path| path.access == PathAccess::Metadata))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -234,12 +253,33 @@ enum Operand {
     Literal,
     /// 操作数会被命令打开。
     Path,
+    MetadataPath,
+    WritePath,
     /// 操作数是模式，且出现后位置参数全是路径（`-e` / `--regexp`）。
     Pattern,
     /// 操作数是模式文件，且出现后位置参数全是路径（`-f` / `--file`）。
     PatternPath,
+    MetadataReference,
     /// 没有操作数，但命令进入“没有模式”的模式（`rg --files`）。
     NoPattern,
+}
+
+impl Operand {
+    fn access(self) -> Option<PathAccess> {
+        match self {
+            Self::Path | Self::PatternPath => Some(PathAccess::Read),
+            Self::MetadataPath | Self::MetadataReference => Some(PathAccess::Metadata),
+            Self::WritePath => Some(PathAccess::Write),
+            Self::None | Self::Optional | Self::Literal | Self::Pattern | Self::NoPattern => None,
+        }
+    }
+
+    fn supplies_pattern(self) -> bool {
+        matches!(
+            self,
+            Self::Pattern | Self::PatternPath | Self::MetadataReference
+        )
+    }
 }
 
 enum ShortOperands {
@@ -254,6 +294,7 @@ struct Spec {
     short_operands: ShortOperands,
     /// grep 的 `-5` 是 `-C 5` 的简写：纯数字短参数不消耗操作数。
     digits_are_context: bool,
+    positionals: PathAccess,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -263,12 +304,10 @@ enum Positionals {
 }
 
 struct Walked<'a> {
-    paths: Vec<&'a str>,
+    paths: Vec<PathArgument<'a>>,
     /// 位置参数里会被遍历/打开的路径。与 `paths` 的区别是它不含选项读取的
     /// 文件（`-f patterns.txt` 是模式来源，不是搜索根）。
     positional_paths: Vec<&'a str>,
-    /// 消费了某个选项的 Path 类操作数（会打开或写入文件）；位置参数不算。
-    opens_file: bool,
     /// 实际作为选项消费的长选项名（`--name=value` 取 `name`）。
     long_flags: Vec<&'a str>,
     /// 实际作为无操作数开关消费的短选项字母。
@@ -284,14 +323,8 @@ fn option_paths<'a>(
     argv: &'a [String],
     spec: &Spec,
     positionals: Positionals,
-) -> Option<Vec<&'a str>> {
+) -> Option<Vec<PathArgument<'a>>> {
     walk_options(argv, spec, positionals).map(|walked| walked.paths)
-}
-
-/// 命令是否消费了带 Path 角色的选项操作数。用来区分“只 stat 位置参数”的
-/// 元数据调用和会打开文件的调用（`du -sX file`、`tree -so file`）。
-fn option_opens_file(argv: &[String], spec: &Spec) -> Option<bool> {
-    walk_options(argv, spec, Positionals::AllPaths).map(|walked| walked.opens_file)
 }
 
 fn walk_options<'a>(
@@ -302,7 +335,6 @@ fn walk_options<'a>(
     let mut walked = Walked {
         paths: Vec::new(),
         positional_paths: Vec::new(),
-        opens_file: false,
         long_flags: Vec::new(),
         short_flags: Vec::new(),
         short_values: Vec::new(),
@@ -324,14 +356,20 @@ fn walk_options<'a>(
         if options_done || !arg.starts_with('-') || arg == "-" {
             match positionals {
                 Positionals::AllPaths => {
-                    walked.paths.push(arg);
+                    walked.paths.push(PathArgument {
+                        value: arg,
+                        access: spec.positionals,
+                    });
                     walked.positional_paths.push(arg);
                 }
                 Positionals::PatternThenPaths => {
                     if first_positional.is_none() && !pattern_source {
                         first_positional = Some(arg);
                     } else {
-                        walked.paths.push(arg);
+                        walked.paths.push(PathArgument {
+                            value: arg,
+                            access: spec.positionals,
+                        });
                         walked.positional_paths.push(arg);
                     }
                 }
@@ -357,29 +395,38 @@ fn walk_options<'a>(
                     pattern_source = true;
                     index += 1;
                 }
-                (Operand::Literal | Operand::Pattern, Some(value)) => {
-                    pattern_source |= role == Operand::Pattern;
+                (
+                    Operand::Literal
+                    | Operand::Pattern
+                    | Operand::Path
+                    | Operand::PatternPath
+                    | Operand::MetadataPath
+                    | Operand::MetadataReference
+                    | Operand::WritePath,
+                    Some(value),
+                ) => {
+                    pattern_source |= role.supplies_pattern();
+                    if let Some(access) = role.access() {
+                        walked.paths.push(PathArgument { value, access });
+                    }
                     walked.long_values.push((name, value));
                     index += 1;
                 }
-                (Operand::Literal | Operand::Pattern, None) => {
+                (
+                    Operand::Literal
+                    | Operand::Pattern
+                    | Operand::Path
+                    | Operand::PatternPath
+                    | Operand::MetadataPath
+                    | Operand::MetadataReference
+                    | Operand::WritePath,
+                    None,
+                ) => {
                     let value = argv.get(index + 1)?.as_str();
-                    pattern_source |= role == Operand::Pattern;
-                    walked.long_values.push((name, value));
-                    index += 2;
-                }
-                (Operand::Path | Operand::PatternPath, Some(value)) => {
-                    pattern_source |= role == Operand::PatternPath;
-                    walked.opens_file = true;
-                    walked.paths.push(value);
-                    walked.long_values.push((name, value));
-                    index += 1;
-                }
-                (Operand::Path | Operand::PatternPath, None) => {
-                    let value = argv.get(index + 1)?.as_str();
-                    pattern_source |= role == Operand::PatternPath;
-                    walked.opens_file = true;
-                    walked.paths.push(value);
+                    pattern_source |= role.supplies_pattern();
+                    if let Some(access) = role.access() {
+                        walked.paths.push(PathArgument { value, access });
+                    }
                     walked.long_values.push((name, value));
                     index += 2;
                 }
@@ -417,11 +464,10 @@ fn walk_options<'a>(
                     ShortOperands::Tree => return None,
                 }
             };
-            pattern_source |= matches!(role, Operand::Pattern | Operand::PatternPath);
+            pattern_source |= role.supplies_pattern();
             walked.short_values.push((ch, value));
-            if matches!(role, Operand::Path | Operand::PatternPath) {
-                walked.opens_file = true;
-                walked.paths.push(value);
+            if let Some(access) = role.access() {
+                walked.paths.push(PathArgument { value, access });
             }
             break;
         }
@@ -431,23 +477,21 @@ fn walk_options<'a>(
         && pattern_source
         && let Some(first) = first_positional
     {
-        walked.paths.push(first);
+        walked.paths.push(PathArgument {
+            value: first,
+            access: spec.positionals,
+        });
         walked.positional_paths.push(first);
     }
     Some(walked)
 }
 
 struct Found<'a> {
-    paths: Vec<&'a str>,
-    /// `-files0-from` 读取文件内容（根列表），不是元数据访问。
-    opens_file: bool,
+    paths: Vec<PathArgument<'a>>,
 }
 
 fn parse_find(argv: &[String]) -> Option<Found<'_>> {
-    let mut found = Found {
-        paths: Vec::new(),
-        opens_file: false,
-    };
+    let mut found = Found { paths: Vec::new() };
     let mut index = 1;
     // GNU 的前置选项与 BSD 的 `-f` 根：它们把“表达式从哪开始”往后推。
     while let Some(arg) = argv.get(index) {
@@ -455,7 +499,10 @@ fn parse_find(argv: &[String]) -> Option<Found<'_>> {
             "-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x" => index += 1,
             "-f" => {
                 // BSD `-f` 后面是搜索根，即使它恰好叫 `-path` 也不是谓词。
-                found.paths.push(argv.get(index + 1)?.as_str());
+                found.paths.push(PathArgument {
+                    value: argv.get(index + 1)?,
+                    access: PathAccess::Metadata,
+                });
                 index += 2;
             }
             "-D" => {
@@ -473,7 +520,10 @@ fn parse_find(argv: &[String]) -> Option<Found<'_>> {
         if arg.starts_with('-') || matches!(arg.as_str(), "(" | r"\(" | "!" | r"\!") {
             break;
         }
-        found.paths.push(arg.as_str());
+        found.paths.push(PathArgument {
+            value: arg,
+            access: PathAccess::Metadata,
+        });
         index += 1;
     }
     // 没有表达式也是合法调用（`find .git` 只列目录），此时只有搜索根是路径。
@@ -512,19 +562,40 @@ fn parse_find(argv: &[String]) -> Option<Found<'_>> {
             // 参考文件：只 stat，路径仍要检查。
             "-anewer" | "-cnewer" | "-mnewer" | "-Bnewer" | "-samefile" => {
                 index += 1;
-                found.paths.push(argv.get(index)?.as_str());
+                found.paths.push(PathArgument {
+                    value: argv.get(index)?,
+                    access: PathAccess::Metadata,
+                });
                 needs_operand = false;
             }
             _ if arg.starts_with("-newer") => {
                 index += 1;
-                found.paths.push(argv.get(index)?.as_str());
+                found.paths.push(PathArgument {
+                    value: argv.get(index)?,
+                    access: PathAccess::Metadata,
+                });
                 needs_operand = false;
             }
             // 根列表文件：读取内容，按内容访问处理。
             "-files0-from" => {
                 index += 1;
-                found.paths.push(argv.get(index)?.as_str());
-                found.opens_file = true;
+                found.paths.push(PathArgument {
+                    value: argv.get(index)?,
+                    access: PathAccess::Read,
+                });
+                needs_operand = false;
+            }
+            "-fprint" | "-fprint0" | "-fls" | "-fprintf" => {
+                let formatted = arg == "-fprintf";
+                index += 1;
+                found.paths.push(PathArgument {
+                    value: argv.get(index)?,
+                    access: PathAccess::Write,
+                });
+                if formatted {
+                    index += 1;
+                    argv.get(index)?;
+                }
                 needs_operand = false;
             }
             // 字面量操作数：类型、大小、模式、格式串……都不是路径。
@@ -573,6 +644,174 @@ fn is_find_optimization_level(arg: &str) -> bool {
         .is_some_and(|level| !level.is_empty() && level.chars().all(|c| c.is_ascii_digit()))
 }
 
+fn git_paths(argv: &[String]) -> Option<Vec<PathArgument<'_>>> {
+    let mut paths = Vec::new();
+    let mut index = 1;
+    while let Some(arg) = argv.get(index).filter(|arg| arg.starts_with('-')) {
+        let value = match arg.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" => {
+                index += 1;
+                argv.get(index)?.as_str()
+            }
+            "--no-pager"
+            | "--paginate"
+            | "-P"
+            | "-p"
+            | "--bare"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-optional-locks" => {
+                index += 1;
+                continue;
+            }
+            _ if arg.starts_with("-C") || arg.starts_with("-c") => &arg[2..],
+            _ if arg.starts_with("--git-dir=") || arg.starts_with("--work-tree=") => {
+                arg.split_once('=')?.1
+            }
+            _ => return None,
+        };
+        if value.contains('\0') {
+            return None;
+        }
+        // 配置值也可能是 include.path 一类读取来源，不能把整个 -c 操作数当消息。
+        let value = if arg.starts_with("-c") {
+            value.split_once('=').map_or(value, |(_, value)| value)
+        } else {
+            value
+        };
+        paths.push(PathArgument {
+            value,
+            access: PathAccess::Read,
+        });
+        index += 1;
+    }
+    if argv.get(index)? != "commit" {
+        return None;
+    }
+    paths.extend(option_paths(
+        &argv[index..],
+        &GIT_COMMIT,
+        Positionals::AllPaths,
+    )?);
+    Some(paths)
+}
+
+const LS: Spec = Spec {
+    short: |flag| match flag {
+        'I' | 'T' | 'w' if !cfg!(target_os = "macos") => Some(Operand::Literal),
+        '1' | 'A' | 'B' | 'C' | 'F' | 'G' | 'H' | 'L' | 'N' | 'Q' | 'R' | 'S' | 'U' | 'X' | 'Z'
+        | 'a' | 'b' | 'c' | 'd' | 'f' | 'g' | 'h' | 'i' | 'k' | 'l' | 'm' | 'n' | 'o' | 'p'
+        | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' | 'I' | 'T' | 'w' => Some(Operand::None),
+        _ => None,
+    },
+    long: |flag| match flag {
+        "color" | "hyperlink" => Some(Operand::Optional),
+        "block-size" | "format" | "hide" | "ignore" | "indicator-style" | "quoting-style"
+        | "sort" | "tabsize" | "time" | "time-style" | "width" => Some(Operand::Literal),
+        "all"
+        | "almost-all"
+        | "author"
+        | "classify"
+        | "context"
+        | "directory"
+        | "escape"
+        | "file-type"
+        | "full-time"
+        | "group-directories-first"
+        | "human-readable"
+        | "ignore-backups"
+        | "inode"
+        | "literal"
+        | "no-group"
+        | "numeric-uid-gid"
+        | "quote-name"
+        | "recursive"
+        | "reverse"
+        | "si"
+        | "size"
+        | "dereference"
+        | "dereference-command-line"
+        | "help"
+        | "version" => Some(Operand::None),
+        _ => None,
+    },
+    short_operands: ShortOperands::AttachedOrNext,
+    digits_are_context: false,
+    positionals: PathAccess::Metadata,
+};
+
+const STAT: Spec = Spec {
+    short: |flag| match flag {
+        'c' => Some(Operand::Literal),
+        'f' | 't' if cfg!(target_os = "macos") => Some(Operand::Literal),
+        'f' | 't' => Some(Operand::None),
+        'F' | 'H' | 'L' | 'n' | 'q' | 'r' | 's' | 'x' => Some(Operand::None),
+        _ => None,
+    },
+    long: |flag| match flag {
+        "format" | "printf" => Some(Operand::Literal),
+        "cached" => Some(Operand::Optional),
+        "dereference" | "file-system" | "terse" | "help" | "version" => Some(Operand::None),
+        _ => None,
+    },
+    short_operands: ShortOperands::AttachedOrNext,
+    digits_are_context: false,
+    positionals: PathAccess::Metadata,
+};
+
+const TOUCH: Spec = Spec {
+    short: |flag| match flag {
+        'r' => Some(Operand::MetadataPath),
+        'd' | 't' => Some(Operand::Literal),
+        'a' | 'c' | 'f' | 'h' | 'm' => Some(Operand::None),
+        _ => None,
+    },
+    long: |flag| match flag {
+        "reference" => Some(Operand::MetadataPath),
+        "date" | "time" => Some(Operand::Literal),
+        "no-create" | "no-dereference" | "help" | "version" => Some(Operand::None),
+        _ => None,
+    },
+    short_operands: ShortOperands::AttachedOrNext,
+    digits_are_context: false,
+    positionals: PathAccess::MetadataWrite,
+};
+
+const MKDIR: Spec = Spec {
+    short: |flag| match flag {
+        'm' => Some(Operand::Literal),
+        'p' | 'v' => Some(Operand::None),
+        _ => None,
+    },
+    long: |flag| match flag {
+        "mode" => Some(Operand::Literal),
+        "context" => Some(Operand::Optional),
+        "parents" | "verbose" | "help" | "version" => Some(Operand::None),
+        _ => None,
+    },
+    short_operands: ShortOperands::AttachedOrNext,
+    digits_are_context: false,
+    positionals: PathAccess::MetadataWrite,
+};
+
+const CHMOD: Spec = Spec {
+    short: |flag| match flag {
+        'R' | 'c' | 'f' | 'v' | 'H' | 'L' | 'P' | 'h' => Some(Operand::None),
+        _ => None,
+    },
+    long: |flag| match flag {
+        "reference" => Some(Operand::MetadataReference),
+        "recursive" | "changes" | "silent" | "quiet" | "verbose" | "preserve-root"
+        | "no-preserve-root" | "help" | "version" => Some(Operand::None),
+        _ => None,
+    },
+    short_operands: ShortOperands::AttachedOrNext,
+    digits_are_context: false,
+    positionals: PathAccess::MetadataWrite,
+};
+
 const GIT_COMMIT: Spec = Spec {
     short: |flag| match flag {
         'm' => Some(Operand::Literal),
@@ -597,6 +836,7 @@ const GIT_COMMIT: Spec = Spec {
     },
     short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: false,
+    positionals: PathAccess::Read,
 };
 
 const GREP: Spec = Spec {
@@ -604,6 +844,7 @@ const GREP: Spec = Spec {
     long: grep_long,
     short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: true,
+    positionals: PathAccess::Read,
 };
 
 fn grep_short(ch: char) -> Option<Operand> {
@@ -671,6 +912,7 @@ const RG: Spec = Spec {
     long: rg_long,
     short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: false,
+    positionals: PathAccess::Read,
 };
 
 fn rg_short(ch: char) -> Option<Operand> {
@@ -796,6 +1038,7 @@ const DU: Spec = Spec {
     long: du_long,
     short_operands: ShortOperands::AttachedOrNext,
     digits_are_context: false,
+    positionals: PathAccess::Metadata,
 };
 
 fn du_short(ch: char) -> Option<Operand> {
@@ -826,6 +1069,7 @@ const TREE: Spec = Spec {
     long: tree_long,
     short_operands: ShortOperands::Tree,
     digits_are_context: false,
+    positionals: PathAccess::Metadata,
 };
 
 fn tree_depth_operand(rest: &str) -> Option<&str> {
@@ -842,7 +1086,7 @@ fn tree_depth_operand(rest: &str) -> Option<&str> {
 fn tree_short(ch: char) -> Option<Operand> {
     match ch {
         'H' | 'I' | 'L' | 'P' | 'T' => Some(Operand::Literal),
-        'o' => Some(Operand::Path),
+        'o' => Some(Operand::WritePath),
         'A' | 'C' | 'F' | 'J' | 'N' | 'Q' | 'R' | 'S' | 'U' | 'X' | 'a' | 'd' | 'f' | 'h' | 'i'
         | 'l' | 'n' | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' => Some(Operand::None),
         _ => None,
@@ -853,7 +1097,7 @@ fn tree_long(name: &str) -> Option<Operand> {
     match name {
         "ignore" | "match" | "level" | "title" | "baseHREF" | "charset" | "filelimit"
         | "timefmt" | "sort" => Some(Operand::Literal),
-        "outfile" => Some(Operand::Path),
+        "outfile" => Some(Operand::WritePath),
         "all" | "ansi" | "color" | "device" | "dirs-only" | "dirsfirst" | "du" | "full-path"
         | "fromfile" | "gitignore" | "help" | "inodes" | "json" | "no-indent" | "nocolor"
         | "noreport" | "prune" | "quote" | "version" | "xml" => Some(Operand::None),
@@ -867,8 +1111,12 @@ mod tests {
 
     fn assert_paths(words: &[&str], expected: Option<&[&str]>) {
         let argv: Vec<String> = words.iter().map(|word| (*word).to_string()).collect();
-        let actual = path_arguments(&argv)
-            .map(|paths| paths.into_iter().map(str::to_string).collect::<Vec<_>>());
+        let actual = path_arguments(&argv).map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.value.to_string())
+                .collect::<Vec<_>>()
+        });
         let expected = expected.map(|values| {
             values
                 .iter()
@@ -977,7 +1225,7 @@ mod tests {
             &["tree", "--fromfile", "./.git/config"],
             Some(&["./.git/config"]),
         );
-        assert_paths(&["tree", "-o", "out.txt", "."], None);
+        assert_paths(&["tree", "-o", "out.txt", "."], Some(&["out.txt", "."]));
     }
 
     #[test]

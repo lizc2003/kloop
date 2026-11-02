@@ -575,8 +575,7 @@ async fn plan244_dynamic_wrapper_controls_keep_execution_unknown() {
 #[tokio::test]
 async fn plan244_replacement_roles_preserve_nonreading_arguments() {
     for tail in [
-        "touch marker", "mkdir marker", "chmod 644 marker",
-        "touch -r marker notes.txt", "mkdir -m marker notes", "chmod --reference=marker notes.txt",
+        "mkdir -m marker notes",
         "git commit -m marker", "git commit --message=marker", "git commit -mmarker",
         "command echo marker", "command -p echo marker",
         "rg -e marker notes.txt", "rg --glob marker PATTERN notes.txt",
@@ -626,5 +625,133 @@ async fn plan244_replacement_roles_keep_reads_and_command_rules() {
         let p = gate(Mode::Bypass, rules(&[], &[deny], &[]), ScriptedApprover::new(vec![]));
         let error = p.check_call("bash", &bash(command), 0, true).await.unwrap_err();
         assert!(error.contains("deny permission rule"), "{command}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn plan244_literal_and_replacement_roles_agree() {
+    for tail in [
+        "git -C repo commit -m marker",
+        "git --no-pager commit -m marker",
+        "git -c core.pager=cat commit -m marker",
+        "ls --color=marker src",
+        "stat --format=marker src",
+        "tree -o marker src",
+        "tree --outfile=marker src",
+        "find . -fprint marker",
+        "find . -fprint0 marker",
+        "find . -fprintf marker '%p\\n'",
+    ] {
+        for command in [tail.replace("marker", "notes.txt"), format!("xargs -I marker {tail}")] {
+            let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
+            assert!(!call.hazard("bash").is_some_and(|hazard| hazard.tag == "destructive"), "{command}");
+            for mode in [Mode::Manual, Mode::Bypass] {
+                let approver = ScriptedApprover::new(vec![]);
+                let p = gate(mode, rules(&[], &["bash(rm *)"], &[]), approver.clone());
+                p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
+                assert_eq!(approver.ask_count(), 0, "{command}");
+            }
+        }
+    }
+    for tail in [
+        "git -C repo commit -m marker", "git --no-pager commit -m marker",
+        "git -c core.pager=cat commit -m marker", "ls --color=marker src", "stat --format=marker src",
+    ] {
+        for value in [".env", "~/.ssh/key"] {
+            let command = tail.replace("marker", value);
+            let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+            p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
+        }
+    }
+    for command in ["sudo find . -path ./.git -prune -o -print", "xargs find . -path ./.git -prune -o -print"] {
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+        p.check_call("bash", &bash(command), 0, true).await.expect(command);
+    }
+}
+
+#[tokio::test]
+async fn plan244_output_roles_keep_write_rules_and_reads() {
+    for tail in ["tree -o marker src", "find . -fprint marker"] {
+        for command in [tail.replace("marker", "out.txt"), format!("xargs -I marker {tail}")] {
+            let p = gate(Mode::Bypass, rules(&[], &["bash_write(**)"], &[]), ScriptedApprover::new(vec![]));
+            let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+            assert!(error.contains("deny permission rule"), "{command}: {error}");
+        }
+    }
+    for command in [
+        "tree -o .git/config .", "tree -so .git/config .",
+        "find . -path ./.git -prune -o -fprint result.txt",
+        "find . -path ./.git -prune -o -fprintf result.txt '%p'",
+        "find . -path ./.git -prune -o -fls result.txt",
+    ] {
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+        p.check_call("bash", &bash(command), 0, true).await.expect(command);
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(command), 0, false).await.expect(command);
+        assert_eq!(approver.ask_count(), 1, "{command}");
+    }
+    for tail in [
+        "git -C repo commit -F marker", "git --no-pager commit --file=marker",
+        "git -c core.pager=cat commit -F marker", "tree --fromfile marker",
+        "find . -files0-from marker",
+    ] {
+        for command in [tail.replace("marker", ".env"), format!("xargs -I marker {tail}")] {
+            let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+            let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+            assert!(error.contains("sensitive path"), "{command}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan244_quoted_assignment_values_keep_execution_and_nested_risks() {
+    for tail in ["env FOO=\"$(pwd)\" touch notes.txt", "env FOO=\"$*\" touch notes.txt"] {
+        for command in [tail.to_string(), format!("xargs -I marker {tail}")] {
+            let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
+            assert_eq!(call.hazard("bash").map(|hazard| hazard.tag), None, "{command}");
+            let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+            p.check_call("bash", &bash(&command), 0, true).await.expect(&command);
+        }
+    }
+    for tail in ["env FOO=\"$(cat .env)\" touch notes.txt", "env FOO=\"$@\" touch notes.txt"] {
+        let command = format!("xargs -I marker {tail}");
+        let p = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+        let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+        assert!(error.contains("sensitive path"), "{command}: {error}");
+    }
+    for command in ["env FOO=\"$(pwd)\" touch notes.txt", "xargs -I marker env FOO=\"$(pwd)\" touch notes.txt"] {
+        for deny in ["bash(pwd *)", "bash(touch *)"] {
+            let p = gate(Mode::Bypass, rules(&[], &[deny], &[]), ScriptedApprover::new(vec![]));
+            let error = p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
+            assert!(error.contains("deny permission rule"), "{command}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan244_sensitive_metadata_keeps_known_and_replaced_targets_blocked() {
+    for tail in [
+        "touch marker", "mkdir marker", "chmod 644 marker", "touch -r marker notes.txt",
+        "chmod --reference=marker notes.txt", "ls -l marker", "stat marker",
+        "du -- marker", "tree -- marker", "find -f marker -maxdepth 0",
+    ] {
+        let benign = tail.replace("marker", "notes.txt");
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            p.check_call("bash", &bash(&benign), 0, true).await.expect(&benign);
+            for command in [
+                tail.replace("marker", ".env"), tail.replace("marker", "~/.ssh/id_rsa"),
+                tail.replace("marker", "~/.kloop/config.toml"), format!("xargs -I marker {tail}"),
+            ] {
+                let error = p.check_call("bash", &bash(&command), 0, true).await.expect_err(&command);
+                assert!(error.contains("sensitive path"), "{command}: {error}");
+            }
+            assert_eq!(approver.ask_count(), 0, "{tail}");
+        }
+        let command = format!("xargs -I marker {tail}");
+        let call = CallFacts::gather("bash", &bash(&command), &test_cwd(), None);
+        assert!(!call.hazard("bash").is_some_and(|hazard| hazard.tag == "destructive"), "{command}");
     }
 }

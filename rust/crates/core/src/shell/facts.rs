@@ -90,7 +90,6 @@ impl CommandFact {
                     // 只越过 env 控制区中的固定赋值，不能把 -c 正文或其它参数猜成字面词。
                     let fixed_assignment = wrappers.complete
                         && wrappers.argv.is_empty()
-                        && !wrappers.arguments_unknown
                         && wrappers
                             .wrapper_commands
                             .last()
@@ -113,7 +112,10 @@ impl CommandFact {
             .iter()
             .map(|word| match &word.value {
                 WordValue::Literal(value) => value.clone(),
-                WordValue::Unknown => "\0unknown".into(),
+                WordValue::Unknown => word
+                    .syntax
+                    .fixed_assignment()
+                    .unwrap_or_else(|| "\0unknown".into()),
             })
             .collect()
     }
