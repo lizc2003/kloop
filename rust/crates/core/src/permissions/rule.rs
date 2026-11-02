@@ -43,6 +43,9 @@ pub(super) enum Rule {
 /// Allow 方向的路径判定只有一条：绝对 glob 对规范绝对目标，相对 glob 只对 cwd 内的
 /// 规范相对目标。`**` 能跨 `/`，所以相对 glob 不能顺手拿去匹配绝对路径。
 fn glob_allows_path(glob: &GlobMatcher, facts: &PathFacts) -> bool {
+    if !facts.resolved {
+        return false;
+    }
     if Path::new(glob.glob().glob()).is_absolute() {
         glob.is_match(&facts.normalized)
     } else {
@@ -385,5 +388,23 @@ mod tests {
         // spell one — including a store written by an older build.
         assert!(parse_rule("bash_script(cat > f <<EOF)").is_err());
         assert!(parse_rule("bash_script_no_sandbox(cat > f)").is_err());
+    }
+
+    /// 没有可信物理落点时，allow 不能拿词法拼写顶替；deny 仍看原拼写。
+    #[cfg(unix)]
+    #[test]
+    fn plan245_unresolved_targets_never_match_an_allow_glob() {
+        let base = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan245-rule-").expect("fresh id"));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        std::os::unix::fs::symlink(base.join("missing"), base.join("broken")).unwrap();
+
+        let facts = PathFacts::gather(Path::new("broken"), &base);
+        assert!(!facts.resolved);
+        let allow = parse_rule(&format!("write_file({}/**)", base.display())).unwrap();
+        assert!(!allow.matches_allow_path("write_file", &facts));
+        assert!(allow.matches_path("write_file", &facts));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

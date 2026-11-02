@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::path_resolve::resolve_nearest_existing;
 use crate::sandbox::ExecutionContext;
 use crate::shell::BashAnalysis;
 use crate::shell::analyze_wrappers;
@@ -38,6 +39,8 @@ pub(super) enum ShellFacts {
 /// module's gate.
 pub(crate) struct CallFacts {
     pub(super) shell: Option<ShellFacts>,
+    /// Shell 解析树与局部事实是否完整；语法错误或节点上限为 false。
+    pub(super) shell_facts_complete: bool,
     pub(super) writes: Vec<PathFacts>,
     pub(super) path: Option<PathFacts>,
     pub(super) path_key: Option<&'static str>,
@@ -114,6 +117,8 @@ pub(super) struct PathFacts {
     /// aliases in addition to the resolved target.
     pub(super) original: PathBuf,
     pub(super) original_relative: Option<PathBuf>,
+    /// 物理落点是否可信；断链或解析失败时为 false，只保留原拼写供 deny 使用。
+    pub(super) resolved: bool,
     pub(super) inside_cwd: bool,
 }
 
@@ -215,6 +220,9 @@ impl CallFacts {
         let no_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
         CallFacts {
             shell,
+            shell_facts_complete: bash_facts
+                .as_ref()
+                .is_some_and(|facts| facts.facts_complete),
             writes,
             path,
             path_key,
@@ -645,7 +653,7 @@ fn path_argument_sensitivity(
     let physical = Path::new(raw)
         .components()
         .any(|component| matches!(component, Component::ParentDir))
-        .then(|| canonicalize_nearest_existing(&cwd.join(raw)))
+        .then(|| resolve_nearest_existing(&cwd.join(raw)))
         .flatten();
     [
         PathFacts::gather(&path, cwd).sensitivity(access),
@@ -1047,7 +1055,7 @@ fn is_stream_device(path: &Path) -> bool {
 }
 
 impl PathFacts {
-    fn gather(raw: &Path, cwd: &Path) -> Self {
+    pub(super) fn gather(raw: &Path, cwd: &Path) -> Self {
         Self::gather_with_resolved(raw, cwd, None)
     }
 
@@ -1059,12 +1067,18 @@ impl PathFacts {
         let original = lexical_normalize(cwd, raw);
         let canonical_cwd =
             std::fs::canonicalize(cwd).unwrap_or_else(|_| lexical_normalize(Path::new("/"), cwd));
-        let normalized = resolved_path.map(Path::to_path_buf).unwrap_or_else(|| {
-            canonicalize_nearest_existing(&original).unwrap_or_else(|| original.clone())
-        });
-        let relative = normalized
-            .strip_prefix(&canonical_cwd)
-            .ok()
+        let target = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            cwd.join(raw)
+        };
+        let resolved = resolved_path
+            .map(Path::to_path_buf)
+            .or_else(|| resolve_nearest_existing(&target));
+        let normalized = resolved.clone().unwrap_or_else(|| original.clone());
+        let relative = resolved
+            .as_ref()
+            .and_then(|path| path.strip_prefix(&canonical_cwd).ok())
             .map(Path::to_path_buf);
         let original_relative = original.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
@@ -1073,6 +1087,7 @@ impl PathFacts {
             relative,
             original,
             original_relative,
+            resolved: resolved.is_some(),
             inside_cwd,
         }
     }
@@ -1083,29 +1098,6 @@ impl PathFacts {
             path_sensitivity(&self.original, access),
             path_sensitivity(&self.normalized, access),
         )
-    }
-}
-
-/// Canonicalize the nearest existing ancestor and reattach a missing suffix.
-/// This resolves parent symlinks even when the final write target does not yet
-/// exist, so permissions judge the same path the filesystem executor will use.
-fn canonicalize_nearest_existing(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path;
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::canonicalize(ancestor) {
-            Ok(mut resolved) => {
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                }
-                return Some(resolved);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(ancestor.file_name()?.to_os_string());
-                ancestor = ancestor.parent()?;
-            }
-            Err(_) => return None,
-        }
     }
 }
 
@@ -1255,7 +1247,7 @@ fn private_state_roots() -> Vec<PathBuf> {
         return Vec::new();
     };
     let root = home.join(sensitive::KLOOP_DIR);
-    let canonical = canonicalize_nearest_existing(&root).filter(|canonical| *canonical != root);
+    let canonical = resolve_nearest_existing(&root).filter(|canonical| *canonical != root);
     std::iter::once(root).chain(canonical).collect()
 }
 
@@ -1670,6 +1662,49 @@ mod tests {
             Some("sensitive redirect path")
         );
         assert_eq!(hazard("echo x > \"$DIR/out.json\""), None);
+    }
+
+    /// `..` 必须穿过符号链接再回退；词法消掉 `logs/la/..` 会把外面的落点
+    /// 伪装成 cwd 内。
+    #[cfg(unix)]
+    #[test]
+    fn plan245_symlink_parent_then_dotdot_uses_the_physical_target() {
+        let base = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan245-symlink-").expect("fresh id"));
+        let repo = base.join("repo");
+        let home = base.join("home");
+        std::fs::create_dir_all(repo.join("logs")).unwrap();
+        std::fs::create_dir_all(home.join("Library")).unwrap();
+        std::fs::create_dir_all(home.join("LaunchAgents")).unwrap();
+        let repo = std::fs::canonicalize(repo).unwrap();
+        let home = std::fs::canonicalize(home).unwrap();
+        std::os::unix::fs::symlink(home.join("Library"), repo.join("logs/la")).unwrap();
+
+        let facts = PathFacts::gather(Path::new("logs/la/../LaunchAgents/x.plist"), &repo);
+        assert!(facts.resolved);
+        assert_eq!(facts.normalized, home.join("LaunchAgents/x.plist"));
+        assert!(!facts.inside_cwd);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 断链不能退到父目录继续 canonicalize；没有物理落点就不生成可靠的相对目标。
+    #[cfg(unix)]
+    #[test]
+    fn plan245_broken_symlink_has_no_trusted_target() {
+        let base = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan245-broken-").expect("fresh id"));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("logs")).unwrap();
+        let repo = std::fs::canonicalize(repo).unwrap();
+        std::os::unix::fs::symlink(base.join("missing"), repo.join("logs/broken")).unwrap();
+
+        for raw in ["logs/broken", "logs/broken/../x"] {
+            let facts = PathFacts::gather(Path::new(raw), &repo);
+            assert!(!facts.resolved, "{raw}");
+            assert!(!facts.inside_cwd, "{raw}");
+            assert_eq!(facts.relative, None, "{raw}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

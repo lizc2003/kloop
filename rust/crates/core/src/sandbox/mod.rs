@@ -17,6 +17,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::path_resolve::resolve_nearest_existing;
 use crate::permissions::EscalationApproval;
 
 /// Hardcoded absolute path (codex does the same): resolving `sandbox-exec`
@@ -272,10 +273,10 @@ impl SandboxPolicy {
                 if !path.starts_with(&root) {
                     return false;
                 }
-                let Some(root_resolved) = resolve_existing(&root) else {
+                let Some(root_resolved) = resolve_nearest_existing(&root) else {
                     return false;
                 };
-                let Some(path_resolved) = resolve_existing(path) else {
+                let Some(path_resolved) = resolve_nearest_existing(path) else {
                     return false;
                 };
                 if !path_resolved.starts_with(&root_resolved) {
@@ -287,7 +288,7 @@ impl SandboxPolicy {
                     denied(&self.denied_read_paths)
                         && denied(&self.denied_write_paths)
                         && !self.allowed_read_paths.iter().any(|allow| {
-                            let Some(resolved) = resolve_existing(allow) else {
+                            let Some(resolved) = resolve_nearest_existing(allow) else {
                                 return true;
                             };
                             [allow, &resolved]
@@ -310,31 +311,6 @@ fn read_ranges_might_overlap(left: &Path, right: &Path) -> bool {
         left.starts_with(&right) || right.starts_with(&left)
     } else {
         left.starts_with(right) || right.starts_with(left)
-    }
-}
-
-/// 不存在的叶子仍须解析最近祖先；权限错误或断链不能当成覆盖成功。
-fn resolve_existing(path: &Path) -> Option<PathBuf> {
-    let mut ancestor = path;
-    let mut suffix = Vec::new();
-    loop {
-        match std::fs::canonicalize(ancestor) {
-            Ok(mut root) => {
-                for part in suffix.iter().rev() {
-                    root.push(part);
-                }
-                return Some(root);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // 断链与缺失叶子不同，不能通过退到父目录吞掉符号链接。
-                if std::fs::symlink_metadata(ancestor).is_ok() {
-                    return None;
-                }
-                suffix.push(ancestor.file_name()?.to_os_string());
-                ancestor = ancestor.parent()?;
-            }
-            Err(_) => return None,
-        }
     }
 }
 
@@ -418,7 +394,7 @@ fn user_cache_dir() -> Option<PathBuf> {
 fn push_path_aliases(paths: &mut Vec<PathBuf>, path: &Path) {
     for candidate in [
         path.to_path_buf(),
-        resolve_existing(path).unwrap_or_else(|| path.to_path_buf()),
+        resolve_nearest_existing(path).unwrap_or_else(|| path.to_path_buf()),
     ] {
         if !paths.contains(&candidate) {
             paths.push(candidate);
@@ -520,6 +496,22 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
                 && !rename_denies.iter().any(|path| path == ancestor)
             {
                 rename_denies.push(ancestor.to_path_buf());
+            }
+        }
+    }
+    // 可写根内的只读子路径同样怕父目录被改名：`(require-not subpath .git/hooks)`
+    // 在 `.git` 被改成别的名字后就不再有意义，新名字下写入也不受它约束。
+    // 只固定严格位于可写根内的祖先（关键是 `<root>/.git`），不动根本身。
+    for root in &policy.writable_roots {
+        for subpath in &root.read_only_subpaths {
+            for ancestor in subpath.ancestors().skip(1) {
+                if ancestor.starts_with(&root.root)
+                    && ancestor != root.root
+                    && !ancestor.as_os_str().is_empty()
+                    && !rename_denies.iter().any(|path| path == ancestor)
+                {
+                    rename_denies.push(ancestor.to_path_buf());
+                }
             }
         }
     }
@@ -838,6 +830,37 @@ mod tests {
         assert_eq!(params, expected);
         assert!(profile.contains("(deny file-write-unlink (literal (param \"DENIED_RENAME_0\"))"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 只读子路径的父目录也必须固定：先把 `.git` 改名，再去写新名字下的
+    /// hooks，`require-not subpath .git/hooks` 就完全失效。
+    #[test]
+    fn read_only_subpath_ancestors_are_rename_denied_within_the_root() {
+        let root = PathBuf::from("/work/proj");
+        let policy = policy_with(
+            vec![WritableRoot {
+                root: root.clone(),
+                origins: vec![WritableRootOrigin::Workspace],
+                read_only_subpaths: vec![
+                    root.join(".git/hooks"),
+                    root.join(".git/config"),
+                    root.join(".kloop"),
+                ],
+            }],
+            false,
+        );
+        let (profile, params) = seatbelt_profile(&policy);
+        let renames: Vec<&PathBuf> = params
+            .iter()
+            .filter(|(key, _)| key.starts_with("DENIED_RENAME_"))
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(
+            renames,
+            vec![&root.join(".git")],
+            "root itself stays renamable"
+        );
+        assert!(profile.contains("(deny file-write-unlink (literal (param \"DENIED_RENAME_0\"))"));
     }
 
     #[test]

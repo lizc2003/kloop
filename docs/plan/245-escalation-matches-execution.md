@@ -1,8 +1,7 @@
 # Plan 245 — 沙箱升级与实际执行对齐
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。
+> 状态：✅ 已实现（2026-11-02）。行号是 2026-10-28 的读数。
 
 ## 问题
 
@@ -62,6 +61,30 @@
    时不生成也不匹配 allow。
 6. 升级审批同时 select `ctx.cancel`;`run_process_foreground` 在 spawn 前检查
    `cancel.is_cancelled()`。
+
+## 实施记录
+
+- 第 1 条按用户「尽量避免打扰用户」选 (a)。`sandbox_escalation_remembered` 只认逐命令
+  记忆；通配只在拒绝后的 `escalate_sandbox` 里查。普通门里 `disable_sandbox` 的会话缓存
+  同样不再吃通配——主动脱沙箱是另一种同意，必须逐次询问。
+- 第 2 条：升级载荷为 `None` 且脚本不是 opaque 时只提供 `Once`；即使前端返回
+  `WorkspaceSession` 也拒绝，`remember_rules` 留空。opaque 仍可通配，但只在拒绝后生效。
+- 第 3 条：只固定严格位于可写根内的祖先（`.git`），不固定根本身；真实 seatbelt 测试
+  覆盖 `mv .git .g && printf x > .g/hooks/pre-commit`。
+- 第 4 条选第一种，但用更窄的 `facts_complete` 而不是 `reliable`：语法错误、节点上限、
+  包装器深度上限会丢掉局部事实，必须询问；`xargs -I`/`time -o` 的未知效果仍保留命令
+  事实，plan 244 的自动放行与风险判定保持不变。按 `;` 粗分会重复实现 shell 语法，且
+  仍对未建模构造失明，不采用。
+- 第 5 条新增 `core/src/path_resolve.rs`，权限与沙箱共用；`PathFacts` 增加 `resolved`，
+  解析失败时 allow 与记忆都不生成，deny 继续看原拼写。
+- 第 6 条升级审批 `select!` 同时监听 stop 与 cancel；取消按 `interrupted` 结束，
+  `run_process_foreground` 在 spawn 前再查一次取消。
+
+- 验证（2026-11-02）：新增 9 条回归在 HEAD（96fb4d5）的临时 worktree 上回跑，通配跳过沙箱、
+  remember 为 None 落通配、语法错误自动放行、改名 `.git` 写 hooks、`..` 穿符号链接、
+  断链、取消后仍 spawn 均先红；另 1 条 allow 未解析目标的规则测试随 `resolved` 字段新增。
+  改后全绿。外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace 全量测试，
+  core 1284 项，本机 parity baseline verified）。Linux 与 Windows 未实测。
 
 ## 验收
 

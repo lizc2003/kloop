@@ -8,6 +8,7 @@ use super::facts::CallFacts;
 use super::facts::PathFacts;
 use super::facts::ShellFacts;
 use crate::shell::BashAnalysis;
+use crate::shell::BashFacts;
 use crate::shell::analyze_bash_facts;
 use crate::shell::argv_is_readonly;
 use crate::shell::argv_prefix_is_unstable;
@@ -54,7 +55,24 @@ pub(super) const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this 
 /// are different permissions. 已定位但带未知效果的包装器只记原文，不让未知效果
 /// 进入持久规则匹配；其它 opaque 脚本或无法表示的前缀返回 `None`。
 pub(super) fn escalation_remember_payload(command: &str, cwd: &Path) -> Option<Remember> {
+    escalation_memory(command, cwd).remember
+}
+
+/// 升级记忆的形状：可复用的载荷，以及脚本是否根本没法按键值描述。
+/// Opaque 才能使用会话通配；非 opaque 但载荷为 `None` 的形状只值得再问一次本命令。
+pub(super) struct EscalationMemory {
+    pub(super) remember: Option<Remember>,
+    pub(super) opaque: bool,
+}
+
+pub(super) fn escalation_memory(command: &str, cwd: &Path) -> EscalationMemory {
     let facts = analyze_bash_facts(command);
+    let opaque = matches!(facts.analysis, BashAnalysis::Opaque);
+    let remember = escalation_payload_from_facts(facts, command, cwd);
+    EscalationMemory { remember, opaque }
+}
+
+fn escalation_payload_from_facts(facts: BashFacts, command: &str, cwd: &Path) -> Option<Remember> {
     if facts.verbatim_escalation {
         return Some(verbatim_remember(
             "sandbox_escalate",
@@ -258,6 +276,9 @@ fn verbatim_remember(
 /// 文件工具的记忆粒度是父目录。与 Bash 写入记忆同一套边界：cwd 本身没有可授权的
 /// 父目录，根部文件锚回规范 cwd；目录含 glob 元字符或位于文件系统根时不生成模式。
 fn path_memory_scope(path: &PathFacts) -> Option<String> {
+    if !path.resolved {
+        return None;
+    }
     let parent = match path.relative.as_deref() {
         Some(relative) => {
             let parent = relative.parent()?;

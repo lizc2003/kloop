@@ -79,6 +79,7 @@ use describe::describe_denial;
 use describe::describe_escalation;
 use describe::describe_parts;
 use describe::describe_plan_exit;
+use describe::escalation_memory;
 use describe::escalation_remember_payload;
 use describe::join_notices;
 use describe::remember_payload;
@@ -763,8 +764,10 @@ impl Permissions {
         // nothing below (parse-level vetting, rules, the human) needs to be
         // consulted. Sits under deny/safety/ask: those keep their say. A call
         // that opted out of the sandbox is not contained no matter what the
-        // dispatcher says, so it never takes this layer.
+        // dispatcher says, so it never takes this layer. 解析不可信时同样不
+        // 自动放行：局部命令事实可能整体缺失，而 bash 仍会逐条执行。
         if execution.auto_allow
+            && call.shell_facts_complete
             && !call.no_sandbox
             && matches!(call.shell, Some(ShellFacts::Bash(_)))
         {
@@ -797,8 +800,9 @@ impl Permissions {
 
         // 12. Session cache. A `disable_sandbox` call asks about a different
         // permission — running uncontained — so neither a contained run's
-        // `bash(...)` rules nor its session key may answer it; only escalation
-        // consent can. 已定位但带未知效果的包装器复用升级的逐字键；其它 opaque
+        // `bash(...)` rules nor its session key may answer it; only per-command
+        // escalation consent can. 通配同意只免去“沙箱拒绝之后”的询问，不能
+        // 预先批准模型主动脱沙箱。已定位但带未知效果的包装器复用升级的逐字键；其它 opaque
         // 脚本仍用按 containment 分开的普通逐字键（[`remember_payload`]）。
         let opaque_bash = matches!(call.shell, Some(ShellFacts::Bash(BashAnalysis::Opaque)));
         let escalation_memory = call.no_sandbox && (!opaque_bash || call.verbatim_escalation);
@@ -810,10 +814,9 @@ impl Permissions {
             remember_payload(name, &call)
         };
         if escalation_memory {
-            if self.blanket_escalation_granted()
-                || remember
-                    .as_ref()
-                    .is_some_and(|remember| self.escalation_remembered(remember))
+            if remember
+                .as_ref()
+                .is_some_and(|remember| self.escalation_remembered(remember))
             {
                 return Ok(None);
             }
@@ -995,7 +998,8 @@ impl Permissions {
         // A remembered escalation answers before the ask, exactly as a durable
         // allow rule does for the ordinary gate. 固定输出还需写入范围；已定位但
         // 带未知效果的包装器只记原文，其余 opaque 仍用本工作区会话的通配同意。
-        let remember = escalation_remember_payload(command, self.identity.cwd());
+        let memory = escalation_memory(command, self.identity.cwd());
+        let remember = memory.remember;
         if self.blanket_escalation_granted()
             || remember
                 .as_ref()
@@ -1006,9 +1010,18 @@ impl Permissions {
         let Some(approver) = &self.session.approver else {
             return Escalation::new(EscalationOutcome::NotAttempted);
         };
-        // The session scope is offered either way; only the durable one needs a
-        // rule it can be written down as. A verbatim memory has no rule.
-        let mut approval_scopes = vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession];
+        // Opaque 脚本只能按整条会话通配记住；有载荷的按载荷粒度记住。可解析但
+        // 载荷为 `None` 的形状（父目录是根、目标含元字符等）没有任何安全的复用
+        // 范围，只提供 Once，不能借机落进最宽的通配。
+        let mut approval_scopes = vec![ApprovalScope::Once];
+        let mut remember_rules = None;
+        if let Some(remember) = &remember {
+            approval_scopes.push(ApprovalScope::WorkspaceSession);
+            remember_rules = Some(remember.echo.clone());
+        } else if memory.opaque {
+            approval_scopes.push(ApprovalScope::WorkspaceSession);
+            remember_rules = Some(vec![BLANKET_ESCALATION_RULE.to_string()]);
+        }
         if remember.as_ref().is_some_and(Remember::persistable) && self.project.can_persist() {
             approval_scopes.push(ApprovalScope::Project);
         }
@@ -1021,11 +1034,7 @@ impl Permissions {
                 &describe_denial(denial),
             )),
             approval_scopes: approval_scopes.clone(),
-            // 无法逐字记忆的 opaque 脚本必须明示通配范围，留白会被读成“只记这条”。
-            remember_rules: Some(remember.as_ref().map_or_else(
-                || vec![BLANKET_ESCALATION_RULE.to_string()],
-                |remember| remember.echo.clone(),
-            )),
+            remember_rules,
             preview: None,
         };
         let scope = match approver.confirm(req).await {
@@ -1041,10 +1050,14 @@ impl Permissions {
                 Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
             }
             ApprovalScope::WorkspaceSession => {
-                let signatures = remember.map_or_else(
-                    || vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
-                    |remember| remember.signatures,
-                );
+                let Some(signatures) = remember.map(|remember| remember.signatures).or_else(|| {
+                    memory
+                        .opaque
+                        .then(|| vec![BLANKET_ESCALATION_SIGNATURE.to_string()])
+                }) else {
+                    // 非 opaque 且无法安全描述的范围不能被一次“会话记住”变成通配。
+                    return Escalation::new(EscalationOutcome::Declined);
+                };
                 self.remember_in_session(signatures);
                 Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
             }
@@ -1074,19 +1087,19 @@ impl Permissions {
         }
     }
 
-    /// Whether consent to run this command uncontained is already on record —
-    /// asked *before* the sandboxed attempt, not after it failed. Remembering
-    /// the answer only skips the question; skipping the attempt is what the
-    /// answer was actually for, because the contained run is the expensive half
-    /// (a test suite compiles, binds a port, and only then finds out it may
-    /// not). Bypass mode is deliberately not consulted here: it means "do not
-    /// ask", not "do not contain".
+    /// Whether a *per-command* consent to run this command uncontained is
+    /// already on record — asked before the sandboxed attempt, not after it
+    /// failed. Remembering the answer only skips the question; skipping the
+    /// attempt is what the answer was actually for, because the contained run
+    /// is the expensive half (a test suite compiles, binds a port, and only
+    /// then finds out it may not). The session-wide blanket consent is
+    /// deliberately not consulted here: it is granted only after the sandbox
+    /// refused something, so it may skip the *question* but never the
+    /// contained attempt. Bypass mode is likewise not consulted: it means "do
+    /// not ask", not "do not contain".
     pub fn sandbox_escalation_remembered(&self, command: &str) -> bool {
         if self.allow_everything {
             return false;
-        }
-        if self.blanket_escalation_granted() {
-            return true;
         }
         escalation_remember_payload(command, self.identity.cwd())
             .is_some_and(|remember| self.escalation_remembered(&remember))
@@ -1150,6 +1163,7 @@ mod tests {
     include!("permissions/plan239_tests.rs");
     include!("permissions/plan243_tests.rs");
     include!("permissions/plan244_tests.rs");
+    include!("permissions/plan245_tests.rs");
     include!("permissions/plan271_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
@@ -3636,9 +3650,10 @@ mod tests {
         );
         assert_eq!(approver.ask_count(), 1, "asked once for the whole session");
 
-        // It also reaches the pre-execution check, so the sandboxed attempt that
-        // was going to fail is skipped rather than run and thrown away.
-        assert!(p.sandbox_escalation_remembered(opaque));
+        // It does not reach the pre-execution check: the blanket only skips
+        // the question after a denial, so every new script still runs sandboxed
+        // first (plan 245).
+        assert!(!p.sandbox_escalation_remembered(opaque));
     }
 
     /// What the sandbox refused rides the prompt. Without it the notice tells

@@ -3367,7 +3367,12 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   writable root, `.git/hooks`, `.git/config` and `.kloop` stay read-only (they
   are privilege-escalation surfaces — hooks and git config run code, and project
   `.kloop` contains agent instructions/state; the rest of `.git` stays writable
-  so `git commit` works sandboxed). The user-private `~/.kloop` state tree is a
+  so `git commit` works sandboxed). 这些只读子路径在可写根内的祖先（关键是
+  `<root>/.git`）同时被固定为不可 rename/unlink：否则先把 `.git` 改名，再往
+  新名字下写 hooks，`require-not subpath .git/hooks` 就不再生效。权限门和沙箱
+  共用同一个“最近存在的祖先 + 缺失后缀”解析函数：`..` 先经过符号链接再回退，
+  断链或解析失败返回无可信落点，不能退到父目录；没有落点时 allow 规则不生成
+  也不匹配，deny 仍按原拼写命中。The user-private `~/.kloop` state tree is a
   separate recursive deny-read/deny-write boundary. 当前 home 下 `.ssh`、`.aws`、`.gnupg`
   同样递归拒读与拒写；它们不享受 offload 的读取例外。
 - **Reads** are full-disk apart from explicit credential/state denies; **network** is off unless configured — with one
@@ -3390,9 +3395,12 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   one exception — see below — because those belong to this process, not to the
   command.
 - **Sandboxed = fewer questions** (`trust_sandboxed`, default on): a bash call
-  the sandbox will contain skips the asking layers of the permission gate —
-  opaque scripts (substitutions, subshells) included, since OS containment
-  replaces parse-level vetting. Deny rules, safety checks (a visible
+  the sandbox will contain skips the asking layers of the permission gate when
+  its parse tree and local facts are complete — including opaque control flow
+  that the strict whitelist cannot authorize but can still analyze. A script
+  whose parse failed, or that hit the node/wrapper limit, keeps the asking
+  layers: bash still executes the lines it did parse, and missing facts must not
+  be read as safety. Deny rules, safety checks (a visible
   `rm -rf` still confirms) and explicit ask rules stay in force above it.
   The accepted trade-off: a contained command can still modify the workspace
   without a prompt — protected `.git` internals aside, git history is the
@@ -3443,27 +3451,37 @@ rule. 可解析但两词前缀不描述命令本身的调用（`timeout 600 carg
 `sandbox_escalate_write(<glob>)`，会话缓存也包含相同写入范围。升级继续记住每个命令
 （包括只读段），与普通审批跳过只读段的粒度区别保留；普通 `bash_write` 与升级写入规则
 不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
-A remembered rule is consulted **before** the sandboxed attempt, not after
-it fails: the command runs uncontained from the start and the result says so
-(`[Ran without the sandbox: a remembered sandbox_escalate rule …]`). Consulting
-it only at the denial would save the question but still pay for the contained
-run — which is the expensive half, the one that compiles the test binary and
-binds the port before finding out it may not. It is deliberately not a `bash(...)` rule: *may run* and *may run
-uncontained* are different permissions, so neither form matches the other's
-check. Other opaque scripts (an assignment, a substitution) cannot be keyed on at
-all here, so its `a` is blanket — *every* sandbox escalation for the rest of this
+A remembered **per-command** rule is consulted **before** the sandboxed attempt,
+not after it fails: the command runs uncontained from the start and the result
+says so (`[Ran without the sandbox: a remembered sandbox_escalate rule …]`).
+Consulting it only at the denial would save the question but still pay for the
+contained run — which is the expensive half, the one that compiles the test
+binary and binds the port before finding out it may not. It is deliberately not
+a `bash(...)` rule: *may run* and *may run uncontained* are different
+permissions, so neither form matches the other's check.
+
+Other opaque scripts (an assignment, a substitution) cannot be keyed on at all
+here, so their `a` is blanket — *every* sandbox escalation for the rest of this
 workspace session, said in as many words on the prompt, session-only and never
-persisted. That is wider than the ordinary gate's verbatim memory on purpose:
-the gate is the first door and still asks about each new command, so this one
-only ever waives containment for commands that already got through it. Without
-this a test suite that binds a local
-port re-asked on every run — one measured review spent 20 minutes of its 63 on
-escalation round-trips, against 1 minute for the same review without them.
+persisted. The blanket is consulted **only inside the denial handler**: every
+new command still runs contained first, and only a command the sandbox actually
+refused is re-run uncontained without another ask. It therefore cannot
+pre-approve a model-chosen `disable_sandbox` call, which remains a separate
+consent. That is still wider than the ordinary gate's verbatim memory on purpose:
+it waives only the escalation question, never the first contained attempt, so a
+review's probes do not re-ask after the first refusal. A parseable command whose
+memory cannot be expressed safely — a write whose parent scope is `/`, glob
+characters, an unwritable rule token — offers only `Once`; the widest scope must
+not be the fallback for a narrower one that is unavailable. Without the
+per-command half, a test suite that binds a local port re-asked on every run —
+one measured review spent 20 minutes of its 63 on escalation round-trips,
+against 1 minute for the same review without them.
 
 字面正文例外使用独立的执行上下文，不能用 `trust_sandboxed` 或免审批 bool 代替实际保护。
 关闭自动放行但保留沙箱时仍可通过敏感门，随后按 opaque 规则审批。前景、背景和直接前景执行器
-（包括 scheduler）在启动前重新核对传入的同一份策略。已有升级记忆（含会话通配记忆）若会跳过
-沙箱，须在第一次执行前硬拒绝；沙箱失败也不询问或自动脱沙箱重跑，不提示 `disable_sandbox`。
+（包括 scheduler）在启动前重新核对传入的同一份策略。已有逐命令升级记忆若会跳过
+沙箱，须在第一次执行前硬拒绝；会话通配不再跳过首次沙箱尝试，保护要求改由拒绝后的
+分支优先处理。沙箱失败也不询问或自动脱沙箱重跑，不提示 `disable_sandbox`。
 主动脱沙箱、无策略、平台不支持或缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。
 未依赖这次正文例外的调用保持现有升级行为。
 

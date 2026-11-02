@@ -310,12 +310,18 @@ pub(crate) async fn run_foreground_bash(
                 .escalate_sandbox(command, Some(&denial), ctx.depth);
             // A prompt withdrawn by another call's stop leaves the sandboxed
             // failure standing, exactly as a decline would; the turn is ending.
-            let escalation = super::unless_stopped(&ctx.stop, asking)
-                .await
-                .unwrap_or(Escalation {
+            // Cancelling the turn itself withdraws it too, but must end the
+            // call as interrupted rather than let the stale failure read as an
+            // answer.
+            let escalation = tokio::select! {
+                biased;
+                _ = ctx.stop.cancelled() => Escalation {
                     outcome: EscalationOutcome::Declined,
                     notice: None,
-                });
+                },
+                _ = ctx.cancel.cancelled() => bail!("interrupted"),
+                escalation = asking => escalation,
+            };
             if let Some(notice) = &escalation.notice {
                 ctx.ui.emit(&Event::Note(notice.message.clone()));
             }
@@ -383,6 +389,10 @@ pub(super) async fn run_process_foreground(
     cancel: &CancellationToken,
     tool: &'static str,
 ) -> Result<ForegroundOutput> {
+    // 审批与 spawn 之间也可能收到取消；此时进程还没出现，不能再 spawn 后再杀。
+    if cancel.is_cancelled() {
+        bail!("interrupted");
+    }
     spec.stdin = ProcessStdio::Null;
     spec.stdout = ProcessStdio::Pipe;
     spec.stderr = ProcessStdio::Pipe;
@@ -632,6 +642,25 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("SENTINEL"), "{text}");
         assert!(text.contains("KEEP_ME=visible"), "{text}");
+    }
+
+    /// 取消发生在审批与 spawn 之间时，进程树根本不能出现。故意用一个不存在的
+    /// 可执行文件：旧代码会先尝试 spawn 并报 “failed to spawn shell”，新代码
+    /// 必须在 spawn 前返回 interrupted，结果不依赖子进程调度时机。
+    #[tokio::test]
+    async fn cancelled_foreground_process_never_spawns() {
+        let spec = super::ProcessSpec::new(
+            std::path::PathBuf::from("/nonexistent/kloop-cancel-spawn-probe"),
+            std::env::current_dir().unwrap(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let error = super::run_process_foreground(spec, 10_000, &cancel, "bash")
+            .await
+            .expect_err("a cancelled call must not spawn")
+            .to_string();
+        assert!(error.contains("interrupted"), "{error}");
+        assert!(!error.contains("failed to spawn shell"), "{error}");
     }
 
     /// The shell's environment is the user's, minus this process's own

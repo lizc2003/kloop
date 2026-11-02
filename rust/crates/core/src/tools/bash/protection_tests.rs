@@ -258,24 +258,118 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
         EscalationOutcome::Approved(_)
     ));
     assert!(
-        probe
+        !probe
             .ctx
             .cfg
             .permissions
-            .sandbox_escalation_remembered(&probe.command("compare"))
+            .sandbox_escalation_remembered(&probe.command("compare")),
+        "blanket escalation must not skip the contained attempt"
     );
+    // 通配不再跳过沙箱：compare 在沙箱内正常跑完，不产生脱沙箱重试。
     let (out, error) = run_tool("bash", bash_input(&probe.command("compare")), &probe.ctx).await;
-    assert!(error, "{out}");
+    assert!(!error, "{out}");
+    assert!(out.contains("literal-ok"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(probe.root.join("attempts")).unwrap(),
+        "attempt\n"
+    );
+    // 真正读取凭据的那次被沙箱拒绝后也不能升级：requires_protection 在拒绝
+    // 分支里优先于通配同意。
+    let (out, error) = run_tool("bash", bash_input(&probe.command("read")), &probe.ctx).await;
+    assert!(!error, "{out}");
     assert!(
         out.contains("requires credential read/write protection"),
         "{out}"
     );
-    assert!(!probe.root.join("attempts").exists());
+    assert!(!out.contains("PLAN239-SYNTHETIC-SECRET"), "{out}");
+    assert!(!out.contains("Re-ran without"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(probe.root.join("attempts")).unwrap(),
+        "attempt\nattempt\n"
+    );
     assert_eq!(
         probe.asked.load(Ordering::SeqCst),
         1,
         "preflight never asks to discard protection"
     );
+}
+
+/// 只读子路径的父目录不能靠改名绕开：先 `.git -> .g` 再写 `.g/hooks`
+/// 必须在第一步就被 seatbelt 拒绝。
+#[tokio::test]
+async fn plan245_git_hooks_survive_renaming_the_git_directory() {
+    let root = std::env::temp_dir().join(format!("kloop-plan245-git-{}", std::process::id()));
+    let root = std::fs::canonicalize({
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        root
+    })
+    .unwrap();
+    let policy = crate::sandbox::SandboxPolicy::workspace(&root, &[], false);
+    let ctx = with_sandbox(test_ctx(0, "plan245-git"), policy);
+    let moved = root.join(".g");
+    let command = format!(
+        "mv {}/.git {} && printf x > {}/hooks/pre-commit",
+        root.display(),
+        moved.display(),
+        moved.display()
+    );
+    let (out, _) = run_tool("bash", bash_input(&command), &ctx).await;
+    assert!(
+        out.contains("Operation not permitted") || out.contains("Permission denied"),
+        "{out}"
+    );
+    assert!(root.join(".git").is_dir(), "{out}");
+    assert!(!moved.exists(), "{out}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// 通配升级只能省掉“被拒之后的询问”，不能省掉沙箱内的第一次尝试。
+#[tokio::test]
+async fn plan245_blanket_escalation_still_runs_the_sandboxed_attempt_first() {
+    use crate::permissions::{Decision, EscalationOutcome};
+
+    let (ctx, asked) = escalating_ctx(
+        "plan245-blanket",
+        Decision::Allow(crate::permissions::ApprovalScope::WorkspaceSession),
+    );
+    let root = ctx.cfg.sandbox.as_ref().unwrap().writable_roots[0]
+        .root
+        .clone();
+    let attempts = root.join("plan245-attempts");
+    let escaped = outside_dir("plan245-blanket").join("escaped");
+    let _ = std::fs::remove_file(&attempts);
+    let _ = std::fs::remove_file(&escaped);
+
+    assert!(matches!(
+        ctx.cfg
+            .permissions
+            .escalate_sandbox("value=$DYNAMIC", None, 0)
+            .await
+            .outcome,
+        EscalationOutcome::Approved(_)
+    ));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+    let command = format!(
+        "if true; then echo attempt >> {}; echo escaped > {}; fi",
+        attempts.display(),
+        escaped.display()
+    );
+    let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+    assert!(!is_error, "{out}");
+    assert!(
+        out.contains("Re-ran without the sandbox under a remembered"),
+        "{out}"
+    );
+    assert!(escaped.exists(), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&attempts).unwrap(),
+        "attempt\nattempt\n",
+        "the sandboxed attempt must run before the remembered escalation: {out}"
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "blanket still skips the ask");
+    let _ = std::fs::remove_file(attempts);
+    let _ = std::fs::remove_file(escaped);
 }
 
 #[tokio::test]

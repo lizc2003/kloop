@@ -157,6 +157,9 @@ pub(crate) struct BashFacts {
     pub literal_inputs: Vec<LiteralInput>,
     pub unknown: Vec<String>,
     pub reliable: bool,
+    /// 解析树和各层局部事实是否完整；语法错误或节点上限会丢掉整段证据，
+    /// 未知包装器效果只是不可严格授权，两者不能混为一谈。
+    pub facts_complete: bool,
     /// 语法仍是完整的字面命令，但包装器带未知效果：升级只可逐字记忆，不能退到通配。
     pub verbatim_escalation: bool,
 }
@@ -173,6 +176,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
         literal_inputs: Vec::new(),
         unknown: Vec::new(),
         reliable: false,
+        facts_complete: false,
         verbatim_escalation: false,
     };
     if src.len() > MAX_SCRIPT_BYTES {
@@ -192,6 +196,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
     while let Some((node, tree_depth)) = stack.pop() {
         if nodes.len() == MAX_NODES || tree_depth > MAX_TREE_DEPTH || node.is_missing() {
             facts.unknown.push("node limit or missing node".into());
+            facts.facts_complete = false;
             return facts;
         }
         nodes.push(node);
@@ -223,6 +228,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                 }))
     });
     facts.reliable = true;
+    facts.facts_complete = true;
     let strict = word_only_commands_sequence(&tree, src);
     let mut nested_analyses = Vec::new();
     let mut joined_words = false;
@@ -349,12 +355,14 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                         nested_analyses.push((argv.clone(), nested.analysis.clone()));
                         wrapper_effects_unknown |= nested.verbatim_escalation;
                         facts.reliable &= nested.reliable;
+                        facts.facts_complete &= nested.facts_complete;
                         facts.commands.extend(nested.commands);
                         facts.redirects.extend(nested.redirects);
                         facts.unknown.extend(nested.unknown);
                         // 嵌套文本经过引号解码；本轮不从它生成外层正文豁免。
                     } else {
                         facts.reliable = false;
+                        facts.facts_complete = false;
                         facts.unknown.push("wrapper limit".into());
                     }
                 }
