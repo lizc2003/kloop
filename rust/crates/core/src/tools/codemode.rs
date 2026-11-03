@@ -541,11 +541,7 @@ fn classify_program(
 }
 
 fn truncate_program_error(e: &str) -> String {
-    if e.chars().count() <= MAX_PROGRAM_ERROR_CHARS {
-        return e.to_string();
-    }
-    let truncated: String = e.chars().take(MAX_PROGRAM_ERROR_CHARS).collect();
-    format!("{truncated}… (error truncated)")
+    kloop_protocol::clip_chars(e, MAX_PROGRAM_ERROR_CHARS, "… (error truncated)").into_owned()
 }
 
 /// The bridge core hands the engine: it owns a [`ToolCtx`] clone and turns each

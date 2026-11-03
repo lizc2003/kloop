@@ -12,7 +12,6 @@
 //! policy store rejects a partition any group or other can reach.
 
 use std::io;
-use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -277,16 +276,7 @@ fn write_project_label(dir: &Path, project_id: &ProjectId, anchor: &Path) -> io:
         .and_then(|value| value.get("granted_at"))
         .and_then(serde_json::Value::as_str);
     let bytes = project_label_bytes(project_id, anchor, granted_at)?;
-    let (_, temp, mut file) = crate::resource_id::create_file(dir, ".project-", ".tmp")?;
-    let result = (|| {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp, &path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-    }
-    result
+    crate::resource_id::replace_atomically(dir, ".project-", &path, &bytes, false)
 }
 
 fn read_project_anchor(dir: &Path) -> Option<PathBuf> {

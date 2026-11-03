@@ -77,12 +77,10 @@ pub(crate) fn validate_value(schema: &Value, value: &Value) -> Result<(), String
         Ok(()) => Ok(()),
         Err(error) => {
             let raw = error.to_string();
-            let message: String = raw.chars().take(MAX_ERROR_CHARS).collect();
-            Err(if raw.chars().count() > MAX_ERROR_CHARS {
-                format!("{message}… (validation error truncated)")
-            } else {
-                message
-            })
+            Err(
+                kloop_protocol::clip_chars(&raw, MAX_ERROR_CHARS, "… (validation error truncated)")
+                    .into_owned(),
+            )
         }
     }
 }

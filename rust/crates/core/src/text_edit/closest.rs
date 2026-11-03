@@ -446,10 +446,12 @@ fn first_difference(yours: &str, file: &str) -> FirstDifference {
 }
 
 fn quoted(line: &str) -> String {
-    match line.char_indices().nth(MAX_QUOTED_CHARS) {
-        Some((cut, _)) => format!("{:?}...", &line[..cut]),
-        None => format!("{line:?}"),
+    let (prefix, truncated) = kloop_protocol::char_prefix(line, MAX_QUOTED_CHARS);
+    let mut out = format!("{prefix:?}");
+    if truncated {
+        out.push_str("...");
     }
+    out
 }
 
 #[cfg(test)]

@@ -28,7 +28,6 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::file_state::normalize_absolute_path;
 use crate::history::estimate_text_tokens;
 use crate::tools::ToolCtx;
 
@@ -150,7 +149,7 @@ fn successful_reads(messages: &[Message], cwd: &Path) -> Vec<ReadSpan> {
                     continue;
                 };
                 reads.push(ReadSpan {
-                    path: normalize_absolute_path(cwd, Path::new(raw)),
+                    path: crate::paths::lexically_normalize(cwd, Path::new(raw)),
                     range,
                 });
             }

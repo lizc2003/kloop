@@ -43,7 +43,6 @@ use crate::file_state::FileState;
 use crate::file_state::FileStateUpdate;
 use crate::file_state::FileVersion;
 use crate::file_state::ReadDrift;
-use crate::file_state::normalize_absolute_path;
 use kloop_protocol::ContentBlock;
 
 use crate::image::MAX_IMAGE_BYTES;
@@ -780,7 +779,7 @@ fn prepare_mutation(
     tool: &str,
     display_path: &str,
 ) -> Result<PreparedMutation> {
-    let lexical = normalize_absolute_path(cwd, requested);
+    let lexical = crate::paths::lexically_normalize(cwd, requested);
     let parent = lexical
         .parent()
         .with_context(|| format!("{tool}: {display_path} has no parent directory"))?;
@@ -856,7 +855,7 @@ fn prepare_mutation(
 
     let canonical_cwd = std::fs::canonicalize(cwd)
         .with_context(|| format!("{tool}: cannot inspect working directory"))?;
-    let lexical_cwd = normalize_absolute_path(cwd, cwd);
+    let lexical_cwd = crate::paths::lexically_normalize(cwd, cwd);
     if lexical.starts_with(&lexical_cwd) && !parent_path.starts_with(&canonical_cwd) {
         bail!(
             "{tool}: {display_path} escapes the working directory through a symbolic-link ancestor"

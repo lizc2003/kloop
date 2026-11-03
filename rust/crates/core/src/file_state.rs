@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
@@ -703,30 +703,6 @@ fn observation_memory_bytes(observations: &BTreeMap<PathBuf, Entry>) -> usize {
         .sum()
 }
 
-/// Lexically normalize a path after anchoring it at an absolute cwd. Existing
-/// file reads replace this with `canonicalize`, but writes to a not-yet-created
-/// path still need one stable key that collapses `.` and `..` aliases.
-pub(crate) fn normalize_absolute_path(cwd: &Path, raw: &Path) -> PathBuf {
-    let path = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        cwd.join(raw)
-    };
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-        }
-    }
-    normalized
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,7 +867,7 @@ mod tests {
             PathBuf::from("/workspace/root")
         };
         assert_eq!(
-            normalize_absolute_path(&cwd, Path::new("src/../README.md")),
+            crate::paths::lexically_normalize(&cwd, Path::new("src/../README.md")),
             cwd.join("README.md")
         );
     }

@@ -342,20 +342,10 @@ pub async fn run(
     result
 }
 
-/// The cwd for the session banner, with `$HOME` contracted to `~` (the common
-/// case) so the header stays short.
+/// The cwd for the session banner, with the process home contracted to `~`
+/// (the common case) so the header stays short.
 fn display_cwd(cwd: &std::path::Path) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::Path::new(&home);
-        if let Ok(rest) = cwd.strip_prefix(home) {
-            return if rest.as_os_str().is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", rest.display())
-            };
-        }
-    }
-    cwd.display().to_string()
+    kloop_core::paths::display_with_tilde(cwd)
 }
 
 /// The slash-menu catalog: the built-in commands, then the loaded skills and
@@ -1560,6 +1550,15 @@ mod tests {
     use ratatui::layout::Size;
 
     use super::*;
+
+    #[test]
+    fn banner_contracts_the_process_home() {
+        let Some(home) = std::env::home_dir() else {
+            return;
+        };
+        assert_eq!(display_cwd(&home), "~");
+        assert_eq!(display_cwd(&home.join("repo")), "~/repo");
+    }
 
     #[test]
     fn a_pending_startup_only_passes_the_quit_chords() {

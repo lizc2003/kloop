@@ -513,15 +513,9 @@ impl ThreadProjection {
 }
 
 fn new_generation() -> Result<String, getrandom::Error> {
-    use std::fmt::Write as _;
-
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes)?;
-    let mut generation = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(&mut generation, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(generation)
+    Ok(kloop_protocol::hex_lower(&bytes))
 }
 
 fn normalized_input(input: &Value) -> Vec<Value> {

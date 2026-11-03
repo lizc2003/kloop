@@ -1,5 +1,18 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 248 ✅：文本、路径与文件 helper 收口（2026-11-03）**：protocol 新增
+`char_prefix` / `clip_chars` / `hex_lower`，core 新增 `paths::{lexically_normalize,
+expand_tilde, display_with_tilde}`。十多处按字符截断、六处 hex、三份路径规范化、
+CLI import 与沙箱的 `~` 展开都改调共享实现；notebook/history/closest/web 的复制
+删除。`context.rs` 改用 `str::floor_char_boundary`（1.98.1 已稳定），两处调用先把
+上限夹到 `len`。`resource_id::replace_atomically` 合并 session label 与
+`info/exclude` 两处原子替换，并沿用目标已有权限位——`.git/info/exclude` 不再从
+0644 变成 0600；该回归在关闭 `set_permissions` 的版本上先红。`ScheduledOrigin`
+并入 `ScheduledTaskOrigin::label()`，`id_prefix` 删除，skills 描述截断共用
+`skills::abbreviate`。TUI 路径缩写改用 `std::env::home_dir()`。外层执行沙箱之外
+`make check` 全绿（core 1299、TUI 314，本机 parity baseline verified）。Windows
+未实测。教训 302、303。
+
 **Plan 247 ✅：git 调用收成一个入口（2026-11-02）**：core 新增 `git` 模块，`-C`、清空
 12 个仓库选择/配置注入变量与固定 locale 都在一处；`hermetic_command` 额外压掉全局与系统
 配置供身份探测，普通 `command` 保留用户的 Git 配置给 worktree 与启动快照。worktree、CLI
@@ -3991,3 +4004,14 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    内计“构建了几条 Git 命令”，不必改进程环境，就不会和并行测试互相污染。反方向同样要
    记住：统一入口只覆盖它明确列出的输入；测试夹具原有的 `env_clear`、空 `core.hooksPath`
    是独立契约，删掉后 `GIT_TEMPLATE_DIR` 这类没进名单的宿主输入仍会漏进来。
+
+302. **换标准库实现时，边界条件也要一起换。** `str::floor_char_boundary(index)` 接收索引，
+   在 `index > len` 时 panic；旧的自写 helper 先比较 `s.len() <= max` 再直接返回。把
+   `truncate_at_char_boundary(s, max)` 机械替换成 `s.floor_char_boundary(max)`，短输入
+   (预算大于内容)会炸，只有超长输入的回归反而全绿。判据：被替换函数的契约包括它接受的
+   定义域；共享 helper 的回归要同时覆盖超限与未超限两种输入。
+
+303. **原子替换的权限来自目标，不来自临时文件。** `create_file` 以 0600 建临时文件，
+   `rename` 会把这个 mode 一起带过去；用它覆盖用户拥有的文件(如 `.git/info/exclude`)
+   就把 0644 悄悄改成 0600。共享替换函数要在写入前读取目标已有权限并 `set_permissions`，
+   回归要先构造 0644 再断言替换后仍是 0644——只断言内容会漏掉这类丢失。

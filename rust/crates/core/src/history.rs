@@ -934,10 +934,7 @@ fn shape_hint(content: &str) -> Option<String> {
 
 /// `text` cut to at most `max` characters, marked when anything was dropped.
 fn clipped(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text.to_string(),
-    }
+    kloop_protocol::clip_chars(text, max, "…").into_owned()
 }
 
 #[derive(Debug)]

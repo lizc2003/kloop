@@ -8,6 +8,7 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use serde::de::Error as _;
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -61,6 +62,36 @@ pub fn is_resource_id(value: &str, prefix: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     })
+}
+
+/// Longest prefix of `text` that is at most `max_chars` characters long.
+pub fn char_prefix(text: &str, max_chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => (&text[..end], true),
+        None => (text, false),
+    }
+}
+
+/// [`char_prefix`] with a marker for the dropped remainder. Borrowed when the
+/// whole text fits, so a bounded display path does not allocate for the common
+/// under-limit case.
+pub fn clip_chars<'a>(text: &'a str, max_chars: usize, suffix: &str) -> Cow<'a, str> {
+    match char_prefix(text, max_chars) {
+        (prefix, false) => Cow::Borrowed(prefix),
+        (prefix, true) => Cow::Owned(format!("{prefix}{suffix}")),
+    }
+}
+
+/// Lowercase hex for an opaque digest or id. The caller owns the display
+/// contract (length, separators); this is only the encoding.
+pub fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
 }
 
 impl FromStr for LocalAgentId {
@@ -1079,6 +1110,21 @@ pub struct ToolDef {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn char_prefix_never_splits_a_character() {
+        assert_eq!(char_prefix("a界b", 2), ("a界", true));
+        assert_eq!(char_prefix("a界b", 3), ("a界b", false));
+        assert_eq!(char_prefix("a界b", 99), ("a界b", false));
+        assert_eq!(clip_chars("a界b", 2, "…"), "a界…");
+        assert!(matches!(clip_chars("a界b", 3, "…"), Cow::Borrowed("a界b")));
+    }
+
+    #[test]
+    fn hex_lower_is_fixed_width_and_lowercase() {
+        assert_eq!(hex_lower(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+        assert_eq!(hex_lower(&[]), "");
+    }
 
     /// The fallback each rail asks for when nothing is declared. Mock keeps
     /// its old value so scripted turns keep predicting the same growth.

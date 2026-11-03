@@ -222,12 +222,7 @@ fn new_file_preview(content: &str) -> String {
 /// line from dominating the preview.
 fn clip(line: &str) -> String {
     let line = line.trim_end_matches(['\n', '\r']);
-    if line.chars().count() > MAX_LINE_LEN {
-        let head: String = line.chars().take(MAX_LINE_LEN).collect();
-        format!("{head}…")
-    } else {
-        line.to_string()
-    }
+    kloop_protocol::clip_chars(line, MAX_LINE_LEN, "…").into_owned()
 }
 
 /// Join the preview lines, capping the total with a remainder marker.

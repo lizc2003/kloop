@@ -37,7 +37,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::file_state::normalize_absolute_path;
 use crate::history::estimate_text_tokens;
 use crate::history::is_offload_pointer;
 use crate::tools::Builtin;
@@ -625,7 +624,7 @@ impl ReadSpan {
     fn of(input: &Value, cwd: &Path) -> Option<Self> {
         let path = input.get("path")?.as_str()?;
         Some(Self {
-            path: normalize_absolute_path(cwd, Path::new(path)),
+            path: crate::paths::lexically_normalize(cwd, Path::new(path)),
             offset: input.get("offset").and_then(Value::as_u64).unwrap_or(1),
             limit: input.get("limit").and_then(Value::as_u64),
         })
@@ -683,7 +682,7 @@ fn read_invalidated_by(
         let Some(path) = later.input.get(path_key).and_then(Value::as_str) else {
             continue;
         };
-        if normalize_absolute_path(cwd, Path::new(path)) == read.path {
+        if crate::paths::lexically_normalize(cwd, Path::new(path)) == read.path {
             return Some(format!("stale, changed by a later {}", later.name));
         }
     }

@@ -1063,11 +1063,7 @@ fn background_terminal_detail(
 }
 
 fn truncate_error(e: &str) -> String {
-    if e.chars().count() <= MAX_REINJECT_ERROR_CHARS {
-        return e.to_string();
-    }
-    let truncated: String = e.chars().take(MAX_REINJECT_ERROR_CHARS).collect();
-    format!("{truncated}… (error truncated)")
+    kloop_protocol::clip_chars(e, MAX_REINJECT_ERROR_CHARS, "… (error truncated)").into_owned()
 }
 
 /// Build a child through Config's lifecycle constructor, freezing the one

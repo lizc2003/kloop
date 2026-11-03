@@ -196,13 +196,7 @@ impl OpaqueRef {
         digest.update(domain);
         digest.update((raw.len() as u64).to_be_bytes());
         digest.update(raw.as_bytes());
-        Self(
-            digest
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-        )
+        Self(kloop_protocol::hex_lower(&digest.finalize()))
     }
 
     fn validate(&self) -> Result<()> {

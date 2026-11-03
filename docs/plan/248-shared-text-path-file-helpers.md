@@ -1,7 +1,7 @@
 # Plan 248 — 共享的文本、路径与文件 helper
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量。
+> 状态：✅ 已实现(2026-11-03)。行号是 2026-10-28 的读数，开工先自己量。
 
 ## 背景
 
@@ -51,6 +51,29 @@
      `agent.rs:1458-1463` 的转换与 `inbox.rs:246-249`、`event.rs:325-328` 两份
      `"cron"/"loop wakeup"` 字符串 → 复用一个枚举并给它 `label()`;
    - `history.rs:936` `clipped` 改调 `char_prefix`。
+
+## 实现记录(2026-11-03)
+
+- 截断统一到 `kloop_protocol::{char_prefix, clip_chars}`；web 因此显式依赖 protocol。
+  notebook 的 `char_prefix_owned`、history 的 `clipped`、closest 的 `quoted`、web 的
+  `truncate_chars` 都改成调用它；七处“先数字符再拼后缀”同改。
+- `str::floor_char_boundary` 在 1.98.1 可用；`tools/inject.rs` 的自写版本已在 plan 246
+  删除，本轮只剩 `context.rs` 一处。上限要先夹到 `len`——标准库在 `index > len` 时 panic，
+  旧 helper 是先比较长度。
+- `resource_id::replace_atomically` 合并 session label 与 `info/exclude` 两处；
+  `scheduler/store.rs` 与 `run_store` 仍保留各自的私有打开/目录 fsync 变体(按“不强求”)。
+- 路径规范化搬到 `core::paths::lexically_normalize`，`file_state`、权限事实与 CLI 的
+  `@import` 三处共用；没有把 `file_state` 的私有函数直接 `pub`，而是给了它一个明确的
+  共享模块。
+- `paths::expand_tilde` / `display_with_tilde` 落在 core；CLI import 与沙箱的
+  `protected_literal_path` 已改调。计划里的 `permissions/facts.rs` 展开点已不存在
+  (shell 词求值自己消费 home)，TUI 改为 `home_dir()`。
+- `hex_lower`、`skills::abbreviate`、`session_id_of`、`ScheduledTaskOrigin::label()` 分别
+  收掉 hex、描述截断、`id_prefix` 与两份调度 origin。
+- exclude 权限回归在去掉 `set_permissions` 的版本上先红(0600 vs 0644)，恢复后绿；
+  `make check` 在执行器沙箱外全绿(core 1299、TUI 314，parity baseline verified)。
+  TUI 的 `HOME`→`home_dir()` 差异在 macOS 测试进程里无法靠改环境稳定区分，回归覆盖的是
+  缩写契约本身。
 
 ## 验收
 

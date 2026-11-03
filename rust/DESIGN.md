@@ -1574,7 +1574,9 @@ dropped (the body of an HTTP error is only bounded at 64 KiB upstream).
 The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
 box): `>_ kloop` — with the build stamp dim beside the title, `v0.1.0 (2319ea3)`
 (plan 161) — over the model, cwd, git branch, and starting mode, then it
-scrolls into scrollback as the conversation grows. The stamp is the crate
+scrolls into scrollback as the conversation grows. The cwd contracts the process
+home directory (`std::env::home_dir`, not `$HOME`) to `~`, so the header stays
+short and names the same home the permission layer judged. The stamp is the crate
 version plus the commit `crates/cli/build.rs` embedded at compile time, so a
 running kloop says which source it was built from; the sha names the commit the
 build sat on, not a claim that the tree was clean. Outside a checkout there is
@@ -3322,7 +3324,9 @@ worktree with the same Git common directory. Entering by path grants
 省略名称时生成 `wt-` 加 11 位随机 Base58；子 agent 隔离树使用其随机 agent ID。
 明确指定的名称仍拒绝重名，Git 负责分支与目录的排他创建。共享 Git common
 directory 的 `info/exclude` 更新使用 `.kloop-exclude.lock`，锁内重新读取，写入
-排他创建的临时文件后原子替换，避免不同进程的读改写互相覆盖。
+排他创建的临时文件后原子替换，避免不同进程的读改写互相覆盖。替换沿用目标文件
+已有的权限位：`info/exclude` 属于用户的仓库（通常 0644），不能因为 kloop 的
+临时文件是 0600 就把它变成私有文件。
 
 Nesting the trees under `.kloop/` costs one exemption, because `.kloop` is
 otherwise a sensitive path component: a write there is privilege escalation and

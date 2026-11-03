@@ -653,7 +653,7 @@ fn path_argument_sensitivity(
     metadata: bool,
     access: Access,
 ) -> Option<Sensitivity> {
-    let path = lexical_normalize(cwd, Path::new(raw));
+    let path = crate::paths::lexically_normalize(cwd, Path::new(raw));
     // 词法归一化先消掉 `..`，可能跨过了符号链接；再按物理落点判一次，只会多拦。
     let physical = Path::new(raw)
         .components()
@@ -914,7 +914,7 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
     let roots: Option<Vec<PathBuf>> = argv_roles::search_roots(argv).map(|paths| {
         paths
             .iter()
-            .map(|path| lexical_normalize(cwd, Path::new(path)))
+            .map(|path| crate::paths::lexically_normalize(cwd, Path::new(path)))
             .collect()
     });
     match roots {
@@ -931,7 +931,7 @@ fn recursive_search_covers_sensitive_path(argv: &[String], cwd: &Path) -> bool {
             let roots: Vec<PathBuf> = argv[1..]
                 .iter()
                 .filter(|arg| !arg.starts_with('-'))
-                .map(|arg| lexical_normalize(cwd, Path::new(arg)))
+                .map(|arg| crate::paths::lexically_normalize(cwd, Path::new(arg)))
                 .filter(|path| path.is_dir())
                 .collect();
             if roots.is_empty() {
@@ -1069,9 +1069,9 @@ impl PathFacts {
         cwd: &Path,
         resolved_path: Option<&Path>,
     ) -> Self {
-        let original = lexical_normalize(cwd, raw);
-        let canonical_cwd =
-            std::fs::canonicalize(cwd).unwrap_or_else(|_| lexical_normalize(Path::new("/"), cwd));
+        let original = crate::paths::lexically_normalize(cwd, raw);
+        let canonical_cwd = std::fs::canonicalize(cwd)
+            .unwrap_or_else(|_| crate::paths::lexically_normalize(Path::new("/"), cwd));
         let target = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
@@ -1114,27 +1114,6 @@ impl PathFacts {
             path_sensitivity(&self.normalized, access),
         )
     }
-}
-
-/// Resolve `.`/`..` lexically (no filesystem access — the target of a write
-/// may not exist yet), anchoring relative paths at `cwd`.
-fn lexical_normalize(cwd: &Path, path: &Path) -> PathBuf {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    let mut out = PathBuf::new();
-    for comp in joined.components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Whether a normalized path ends in `offload/<spill file>` — the structural

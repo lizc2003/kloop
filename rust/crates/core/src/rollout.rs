@@ -177,7 +177,7 @@ impl Rollout {
     }
 
     fn with_origin(path: PathBuf, subagent_of: Option<String>) -> Self {
-        let prefix = id_prefix(&path);
+        let prefix = sessions::session_id_of(&path);
         Self {
             lease: None,
             // A file already on disk belongs to a resumed or forked session:
@@ -416,13 +416,6 @@ impl Rollout {
         })?;
         Ok(())
     }
-}
-
-fn id_prefix(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string()
 }
 
 #[cfg(test)]

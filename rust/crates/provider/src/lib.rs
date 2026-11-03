@@ -261,11 +261,7 @@ pub(crate) fn error_detail(error: &Value, secret: &str) -> Option<String> {
         return None;
     }
     let safe = stream::redact_secret(message, secret)?;
-    if safe.chars().count() <= MAX_ERROR_DETAIL_CHARS {
-        return Some(safe);
-    }
-    let truncated: String = safe.chars().take(MAX_ERROR_DETAIL_CHARS).collect();
-    Some(format!("{truncated}…"))
+    Some(kloop_protocol::clip_chars(&safe, MAX_ERROR_DETAIL_CHARS, "…").into_owned())
 }
 
 const MAX_ERROR_DETAIL_CHARS: usize = 300;
@@ -399,11 +395,7 @@ impl Provider {
     pub fn endpoint_fingerprint_for(api_family: ProviderApiFamily, endpoint: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(format!("{api_family:?}\n{endpoint}"));
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        kloop_protocol::hex_lower(&hasher.finalize())
     }
 
     pub fn endpoint_fingerprint(&self) -> String {

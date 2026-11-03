@@ -209,10 +209,12 @@ fn bound_text_blocks(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, bool) {
                     visible.push(ContentBlock::Text { text });
                     continue;
                 }
-                let (mut prefix, _) = char_prefix_owned(&text, remaining);
-                prefix.push_str(
+                let prefix = kloop_protocol::clip_chars(
+                    &text,
+                    remaining,
                     "\n\n[notebook output truncated; remove large cell outputs or split the notebook before editing it]",
-                );
+                )
+                .into_owned();
                 visible.push(ContentBlock::Text { text: prefix });
                 truncated = true;
                 break;
@@ -597,7 +599,7 @@ fn generated_cell_id() -> Result<String> {
     let mut bytes = [0u8; 4];
     getrandom::fill(&mut bytes)
         .map_err(|error| anyhow!("notebook_edit: could not generate a cell id: {error}"))?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(kloop_protocol::hex_lower(&bytes))
 }
 
 fn optional_string(input: &Value, key: &str, tool: &str) -> Result<Option<String>> {
@@ -609,19 +611,7 @@ fn optional_string(input: &Value, key: &str, tool: &str) -> Result<Option<String
 }
 
 fn result_source(source: &str) -> String {
-    let (visible, truncated) = char_prefix_owned(source, MAX_RESULT_SOURCE_CHARS);
-    if truncated {
-        format!("{visible}…")
-    } else {
-        visible
-    }
-}
-
-fn char_prefix_owned(text: &str, max_chars: usize) -> (String, bool) {
-    match text.char_indices().nth(max_chars) {
-        Some((end, _)) => (text[..end].to_string(), true),
-        None => (text.to_string(), false),
-    }
+    kloop_protocol::clip_chars(source, MAX_RESULT_SOURCE_CHARS, "…").into_owned()
 }
 
 fn escape_attribute(value: &str) -> String {

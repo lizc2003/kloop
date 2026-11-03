@@ -371,11 +371,7 @@ fn persist_error(run_dir: &RunDir, error: String) -> (ExecutionStatus, String, s
 }
 
 fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let prefix: String = text.chars().take(max).collect();
-    format!("{prefix}… (truncated; see output file)")
+    kloop_protocol::clip_chars(text, max, "… (truncated; see output file)").into_owned()
 }
 
 fn execution_status_detail(status: ExecutionStatus) -> Option<String> {

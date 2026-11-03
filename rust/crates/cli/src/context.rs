@@ -3,7 +3,6 @@
 //! assembled by `kloop_core::context` (pure functions, tested there).
 
 use std::collections::HashSet;
-use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -242,31 +241,16 @@ impl Discovery {
     /// Resolve an `@import` spec against the importing file's directory.
     /// Supports `@./rel`, `@../rel`, `@~/home`, `@/abs`, and bare `@rel`.
     fn resolve_import(&self, spec: &str, base: &Path) -> Option<PathBuf> {
-        let raw = if let Some(rest) = spec.strip_prefix("~/") {
-            self.home.as_ref()?.join(rest)
+        let raw = if spec.starts_with("~/") {
+            let home = self.home.as_deref()?;
+            kloop_core::paths::expand_tilde(spec, Some(home))
         } else if spec.starts_with('/') {
             PathBuf::from(spec)
         } else {
             base.join(spec)
         };
-        Some(lexical_normalize(&raw))
+        Some(kloop_core::paths::lexically_normalize(base, &raw))
     }
-}
-
-/// Resolve `.`/`..` components without touching the filesystem (the target may
-/// not exist yet when we test whether an import is external).
-fn lexical_normalize(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Collect `@import` targets from instruction text. A token counts only when

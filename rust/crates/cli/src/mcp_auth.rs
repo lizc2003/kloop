@@ -159,15 +159,10 @@ impl CredentialStore {
 /// both references.
 fn credential_key(name: &str, url: &str) -> String {
     let digest = Sha256::digest(url.as_bytes());
-    format!("{name}|{}", hex16(&digest))
-}
-
-fn hex16(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
+    let head: [u8; 8] = digest[..8]
+        .try_into()
+        .expect("SHA-256 has at least 8 bytes");
+    format!("{name}|{}", kloop_protocol::hex_lower(&head))
 }
 
 /// `kloop mcp login <name>`: resolve the server's OAuth config, run the

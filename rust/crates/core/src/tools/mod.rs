@@ -1830,12 +1830,7 @@ fn execute_tool<'a>(
     })
 }
 
-pub(crate) fn char_prefix(text: &str, max_chars: usize) -> (&str, bool) {
-    match text.char_indices().nth(max_chars) {
-        Some((end, _)) => (&text[..end], true),
-        None => (text, false),
-    }
-}
+pub(crate) use kloop_protocol::char_prefix;
 
 pub(crate) const MAX_DISPLAY_DESCRIPTION_CHARS: usize = 200;
 
@@ -4440,13 +4435,6 @@ mod tests {
         assert!(!is_concurrency_safe("bash", &bash_input("git push")));
         assert!(!is_concurrency_safe("bash", &bash_input("   ")));
         assert!(!is_concurrency_safe("bash", &json!({})));
-    }
-
-    #[test]
-    fn char_prefix_never_splits_utf8() {
-        assert_eq!(char_prefix("a界b", 2), ("a界", true));
-        assert_eq!(char_prefix("a界b", 3), ("a界b", false));
-        assert_eq!(char_prefix("a界b", 99), ("a界b", false));
     }
 
     #[tokio::test]

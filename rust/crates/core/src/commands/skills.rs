@@ -23,11 +23,7 @@ pub const SUMMARY: &str = "list the loaded skills, or print one's instructions";
 /// chars with an ellipsis. The full text is one `/skills <name>` away.
 pub(super) fn one_line(description: &str) -> String {
     let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > 100 {
-        format!("{}...", flat.chars().take(97).collect::<String>())
-    } else {
-        flat
-    }
+    crate::skills::abbreviate(&flat)
 }
 
 /// Where an entry came from, for the listing. A disk skill shows its directory

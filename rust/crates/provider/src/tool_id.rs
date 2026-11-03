@@ -77,10 +77,7 @@ fn rewrite(id: &str) -> String {
         .take(PREFIX_LEN)
         .map(|c| if is_plain(c) { c } else { '_' })
         .collect();
-    let hash: String = Sha256::digest(id.as_bytes())[..HASH_BYTES]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let hash = kloop_protocol::hex_lower(&Sha256::digest(id.as_bytes())[..HASH_BYTES]);
     format!("{prefix}_{hash}")
 }
 

@@ -29,6 +29,7 @@ pub mod image;
 pub mod inbox;
 pub mod interaction;
 mod path_resolve;
+pub mod paths;
 pub mod permissions;
 mod process_tree;
 pub mod project;

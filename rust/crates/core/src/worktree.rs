@@ -800,17 +800,14 @@ fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
     }
     next.push_str(&line);
     next.push('\n');
-    use std::io::Write as _;
-    let (_, temp, mut file) = crate::resource_id::create_file(parent, ".kloop-exclude-", ".tmp")?;
-    let result = (|| {
-        file.write_all(next.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temp, &exclude)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-    }
-    result.context("updating git info exclude")
+    crate::resource_id::replace_atomically(
+        parent,
+        ".kloop-exclude-",
+        &exclude,
+        next.as_bytes(),
+        false,
+    )
+    .context("updating git info exclude")
 }
 
 fn git_command(dir: &Path, args: &[&str]) -> Command {
@@ -876,6 +873,38 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// `.git/info/exclude` belongs to the user's repository, not to kloop's
+    /// private store: replacing it must not hand it the 0600 temp-file mode.
+    #[cfg(unix)]
+    #[test]
+    fn excluding_worktrees_keeps_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "kloop-wt-exclude-{}-{}",
+            std::process::id(),
+            GENERATED_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let info = root.join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        std::fs::write(&exclude, "existing\n").unwrap();
+        std::fs::set_permissions(&exclude, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        exclude_worktrees_dir(&root).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&exclude).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            "existing\n.kloop/worktrees/\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn config_for_repo(root: &Path, tag: &str) -> Config {

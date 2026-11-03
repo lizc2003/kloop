@@ -118,6 +118,16 @@ pub enum ScheduledTaskOrigin {
     LoopWakeup,
 }
 
+impl ScheduledTaskOrigin {
+    /// The human-facing label shared by the prompt framing and the event line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cron => "cron",
+            Self::LoopWakeup => "loop wakeup",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduledTaskStatus {
     Scheduled,
@@ -322,10 +332,7 @@ impl Event {
                 ))
             }
             Event::ScheduledTaskUpdated(task) => {
-                let origin = match task.origin {
-                    ScheduledTaskOrigin::Cron => "cron",
-                    ScheduledTaskOrigin::LoopWakeup => "loop wakeup",
-                };
+                let origin = task.origin.label();
                 let state = match task.status {
                     ScheduledTaskStatus::Scheduled => "scheduled",
                     ScheduledTaskStatus::Fired => "fired",

@@ -370,9 +370,7 @@ impl<'a> ExecutionContext<'a> {
         let Some(home) = &policy.credential_home else {
             return false;
         };
-        let path = raw
-            .strip_prefix("~/")
-            .map_or_else(|| PathBuf::from(raw), |rest| home.join(rest));
+        let path = crate::paths::expand_tilde(raw, Some(home));
         policy.protects_credential_path(&path)
     }
 }
@@ -734,11 +732,7 @@ pub fn classify_sandbox_denial(
 }
 
 fn clip_evidence(line: &str) -> String {
-    if line.chars().count() <= MAX_DENIAL_EVIDENCE_CHARS {
-        return line.to_string();
-    }
-    let head: String = line.chars().take(MAX_DENIAL_EVIDENCE_CHARS).collect();
-    format!("{head}…")
+    kloop_protocol::clip_chars(line, MAX_DENIAL_EVIDENCE_CHARS, "…").into_owned()
 }
 
 #[cfg(test)]

@@ -12,7 +12,6 @@ use super::line::{LineMeta, RolloutLine};
 use super::validate::{intact_lines, parse_session, seq_of};
 use super::{
     PairingRepairStats, Rollout, SESSION_FORMAT_VERSION, SessionSnapshot, SnapshotTerminal,
-    id_prefix,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,7 +81,7 @@ impl SessionRead {
         let mut rollout = Rollout {
             lease: Some(lease),
             path: self.path.clone(),
-            prefix: id_prefix(&self.path),
+            prefix: session_id_of(&self.path),
             next_seq,
             last_id: self.last_id,
             subagent_of: None,
@@ -214,8 +213,8 @@ pub fn fork_session(src: &Path, cut: Option<u64>, sessions_dir: &Path) -> io::Re
 
 /// The kept prefix, re-enveloped under the fork's own stem.
 fn fork_lines(lines: Vec<RolloutLine>, cut: u64, src: &Path, path: &Path) -> io::Result<String> {
-    let prefix = id_prefix(path);
-    let mut parent = Some(format!("{}#{cut}", id_prefix(src)));
+    let prefix = session_id_of(path);
+    let mut parent = Some(format!("{}#{cut}", session_id_of(src)));
     let mut out = String::new();
     for (n, line) in lines
         .into_iter()

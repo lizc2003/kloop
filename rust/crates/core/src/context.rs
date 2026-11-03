@@ -225,7 +225,10 @@ pub fn assemble_system(base: &str, env: &EnvInfo, git: Option<&GitInfo>) -> Stri
         git_repo = env.is_git_repo,
     );
     if let Some(git) = git {
-        let status = match truncate_at_char_boundary(&git.status, GIT_STATUS_MAX_BYTES) {
+        let status = &git.status[..git
+            .status
+            .floor_char_boundary(GIT_STATUS_MAX_BYTES.min(git.status.len()))];
+        let status = match status {
             s if s.len() < git.status.len() => format!("{s}\n…[status truncated]"),
             "" => "(clean)".to_string(),
             s => s.to_string(),
@@ -260,7 +263,7 @@ pub fn assemble_instructions(files: &[InstructionFile], max_bytes: usize) -> Ass
             ));
             continue;
         }
-        let kept = truncate_at_char_boundary(content, remaining);
+        let kept = &content[..content.floor_char_boundary(remaining.min(content.len()))];
         if kept.len() < content.len() {
             warnings.push(format!(
                 "instructions budget ({max_bytes} bytes) exceeded; truncated {}",
@@ -290,18 +293,6 @@ pub fn assemble_instructions(files: &[InstructionFile], max_bytes: usize) -> Ass
         message: Some(message),
         warnings,
     }
-}
-
-/// Largest prefix of `s` that fits `max` bytes without splitting a char.
-fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 /// UTC calendar date for a unix timestamp, `YYYY-MM-DD`.

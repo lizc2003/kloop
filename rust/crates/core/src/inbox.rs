@@ -73,11 +73,9 @@ pub fn steering_body(text: &str) -> &str {
     text.split_once('\n').map(|(_, body)| body).unwrap_or(text)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduledOrigin {
-    Cron,
-    LoopWakeup,
-}
+/// The scheduler origin shared by the inbox prompt and the UI event. The alias
+/// keeps the inbox's vocabulary without a second enum that could drift.
+pub use crate::event::ScheduledTaskOrigin as ScheduledOrigin;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentMessageFailure {
@@ -243,10 +241,7 @@ impl InboxItem {
                 prompt,
                 missed,
             } => {
-                let origin = match origin {
-                    ScheduledOrigin::Cron => "cron",
-                    ScheduledOrigin::LoopWakeup => "loop wakeup",
-                };
+                let origin = origin.label();
                 let reason = reason
                     .as_deref()
                     .map(|value| format!("\nreason: {value}"))

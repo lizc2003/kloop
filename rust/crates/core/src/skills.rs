@@ -188,13 +188,19 @@ fn description_from_body(body: &str) -> String {
         } else {
             trimmed
         };
-        return if text.chars().count() > 100 {
-            format!("{}...", text.chars().take(97).collect::<String>())
-        } else {
-            text.to_string()
-        };
+        return abbreviate(text);
     }
     "Custom command".to_string()
+}
+
+/// `text` bounded to 100 characters including the ellipsis; 98–100 characters
+/// already fit and keep their exact spelling.
+pub(crate) fn abbreviate(text: &str) -> String {
+    if text.chars().count() > 100 {
+        format!("{}...", text.chars().take(97).collect::<String>())
+    } else {
+        text.to_string()
+    }
 }
 
 impl Skill {

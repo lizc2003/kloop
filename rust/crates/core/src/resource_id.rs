@@ -89,6 +89,41 @@ pub(crate) fn create_file(
     create_file_with(dir, suffix, || fresh(prefix))
 }
 
+/// Replace `target` with `bytes` through a newly created private temp file in
+/// `dir`, so a reader never sees a partial write. An existing target keeps its
+/// permission bits: the rename would otherwise hand a user-owned file the 0600
+/// mode of the temp.
+pub(crate) fn replace_atomically(
+    dir: &Path,
+    prefix: &str,
+    target: &Path,
+    bytes: &[u8],
+    sync_dir: bool,
+) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let permissions = std::fs::metadata(target)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let (_, temp, mut file) = create_file(dir, prefix, ".tmp")?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temp, target)?;
+        if sync_dir {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
 fn create_file_with(
     dir: &Path,
     suffix: &str,

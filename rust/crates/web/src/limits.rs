@@ -19,11 +19,10 @@ pub(crate) const MAX_SEARCH_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 pub(crate) const MAX_TEXT_CHARS: usize = 50_000;
 
 pub(crate) fn truncate_chars(mut text: String, max: usize) -> (String, bool) {
-    match text.char_indices().nth(max).map(|(cut, _)| cut) {
-        Some(cut) => {
-            text.truncate(cut);
-            (text, true)
-        }
-        None => (text, false),
-    }
+    let (len, truncated) = {
+        let (prefix, truncated) = kloop_protocol::char_prefix(&text, max);
+        (prefix.len(), truncated)
+    };
+    text.truncate(len);
+    (text, truncated)
 }

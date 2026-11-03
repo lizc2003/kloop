@@ -1455,12 +1455,7 @@ fn inject_pending(
                 ..
             } => ui.emit(&Event::ScheduledTaskUpdated(crate::event::ScheduledTask {
                 id: id.clone(),
-                origin: match origin {
-                    crate::inbox::ScheduledOrigin::Cron => crate::event::ScheduledTaskOrigin::Cron,
-                    crate::inbox::ScheduledOrigin::LoopWakeup => {
-                        crate::event::ScheduledTaskOrigin::LoopWakeup
-                    }
-                },
+                origin: *origin,
                 status: crate::event::ScheduledTaskStatus::Fired,
                 scheduled_for_ms: Some(*scheduled_for_ms),
                 reason: reason.clone(),
