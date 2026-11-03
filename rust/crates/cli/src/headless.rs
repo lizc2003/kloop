@@ -364,6 +364,7 @@ mod tests {
             todos: Default::default(),
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
+            cleanup_tasks: Default::default(),
             program_limits: Default::default(),
             request_reduction: true,
             skills: Default::default(),

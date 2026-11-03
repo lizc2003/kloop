@@ -1053,6 +1053,7 @@ pub(crate) fn config_from_settings(
         shell_login_env: Arc::clone(&runtime.shell_login_env),
         powershell_execution_gate: Default::default(),
         background_executions: kloop_core::tools::BackgroundExecutions::new(),
+        cleanup_tasks: Default::default(),
         sandbox,
         agent_types: Arc::clone(&runtime.agent_types),
         tool_allowlist: None,

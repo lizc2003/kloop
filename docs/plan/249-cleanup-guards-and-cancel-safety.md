@@ -1,7 +1,7 @@
 # Plan 249 — 资源守卫与"工具 future 可被丢弃"的契约
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
+> 状态：✅ 已实现(2026-11-03)。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
 > 先读代码确认，不成立就在本文件划掉并写明原因。
 
 ## 问题
@@ -44,6 +44,29 @@ await 处被丢弃"没有写成契约。
 3. 第 3–5 条：用守卫包住新建的文件，成功后解除。
 4. DESIGN 的工具分发一节写明：工具 future 可能在任意 await 处被丢弃，跨 await 持有
    需要清理的资源必须由守卫或 supervisor 持有。
+
+## 实现记录(2026-11-03)
+
+- 五条均成立并修复。异步清理按问答选 (b)：`Config` 新增
+  `cleanup_tasks: TaskTracker`(workspace 打开 `tokio-util = ["rt"]`)，
+  `shutdown_background_work` 先 `close()`，再以现有的 2s 上限等待；超时按 `len()`
+  计入 missed。
+- 前台 `run_agent` 与 workflow 的 `agent` 都改成两层任务：worker 只跑子 agent，
+  supervisor 持有 worktree、在 worker 结束后 `finish`、发 agent-end，并登记进
+  `cleanup_tasks`。工具 future 在 `run_one` 的取消出口被丢弃时 supervisor 仍在，
+  所以 worktree 不会跟着被 drop；session 关闭也会等它。
+- `core::cleanup::RemoveFileOnDrop` 在创建后立即生效、成功路径 `disarm()`，用于
+  后台 bash 的 `bg-*.out`、rewind 的分支文件与 server `thread/fork` 的 fork 文件。
+  rewind 的 `open_fork` 把「fork 成功到 replace 提交」整段纳入守卫，取消分支不再
+  手写删除；server fork 的三处失败出口也只剩一个 return。
+- 回归：前台 worktree 子 agent 在 provider 中取消并 abort 工具 future，断言树与分支
+  删除、agent-end 以 false 关闭；registry 关闭后的后台 bash 不新增 `bg-*.out`；
+  `open_fork` 遇到不可读文件删除它；rewind 在 `replace_session`(scheduler store
+  不可读)失败时不新增 `.jsonl`；server fork 在缺 runtime 时不留文件。
+- `make check` 在执行器沙箱外全绿(fmt、clippy、workspace 全量测试，core 1303 项、
+  TUI 314 项，本机 parity baseline verified)；期间 parity 的
+  `explicit fixture restore` 自检偶发失败一次，单独重跑通过(同 plan 242 记录)。DESIGN
+  新增「Dropped tool futures (Plan 249)」契约。Linux 与 Windows 未实测。
 
 ## 验收
 

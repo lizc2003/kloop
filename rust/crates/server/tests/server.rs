@@ -282,6 +282,7 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
+            cleanup_tasks: Default::default(),
             program_limits: Default::default(),
             request_reduction: true,
             skills: Default::default(),
@@ -750,6 +751,7 @@ fn worktree_factory(
             inbox: Arc::clone(&inbox),
             scheduler: kloop_core::scheduler::Scheduler::in_memory(inbox),
             background_executions: Default::default(),
+            cleanup_tasks: Default::default(),
             program_limits: Default::default(),
             request_reduction: true,
             skills: Default::default(),
@@ -2342,6 +2344,67 @@ async fn early_prefix_fork_restores_route_and_runtime_at_the_cut() {
         std::fs::canonicalize(&dirs.root).unwrap().to_string_lossy()
     );
     let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A source whose snapshot has no runtime metadata forks fine, but the fork
+/// cannot be resumed (`resume_options` rejects it). The fork file must not
+/// survive that failure, or `thread/list` grows one orphan per retry (plan
+/// 249).
+#[tokio::test]
+async fn a_fork_that_cannot_resume_leaves_no_session_file() {
+    let dirs = test_dirs("fork-no-runtime");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let source_id = "no-runtime";
+    let mut rollout = Rollout::new(dirs.sessions.join(format!("{source_id}.jsonl")));
+    rollout.append_message(&Message::user_text("q")).unwrap();
+    rollout
+        .append_message(&Message::assistant(vec![ContentBlock::Text {
+            text: "a".into(),
+        }]))
+        .unwrap();
+    drop(rollout);
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    let files_before = session_jsonl(&dirs.sessions);
+    let request = client
+        .request("thread/fork", json!({"thread_id": source_id}))
+        .await;
+    let response = client.recv_until(|message| message["id"] == request).await;
+    let reply = response
+        .iter()
+        .find(|message| message["id"] == request)
+        .unwrap();
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("runtime")),
+        "{reply}"
+    );
+    client.shutdown().await;
+    assert_eq!(
+        session_jsonl(&dirs.sessions),
+        files_before,
+        "the fork that could not be resumed was removed"
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// Session files only: opening a fork for writing also leaves its `.lock`,
+/// which is not a session and is not what `thread/list` enumerates.
+fn session_jsonl(dir: &std::path::Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+    files
 }
 
 /// A thread whose model enters a worktree, writes inside it, and exits: the

@@ -59,7 +59,7 @@ pub async fn rewind(
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<RewindOutcome> {
-    let (session_id, resumed) = fork_here(history, seq)?;
+    let (session_id, resumed, mut fork_guard) = fork_here(history, seq)?;
     // Summarized from the live session, before anything is swapped: the
     // abandoned turns are what it has past the branch, and the transcript
     // pointer has to name this session's file, not the branch's.
@@ -71,13 +71,9 @@ pub async fn rewind(
                 Ok(summary) => summary,
                 // Cancelling takes the whole rewind back, not just the summary:
                 // rewinding without one is a different key. The branch file is
-                // this rewind's own and nothing points at it yet.
-                Err(_) if cancel.is_cancelled() => {
-                    let branch = resumed.rollout.path().to_path_buf();
-                    drop(resumed);
-                    let _ = std::fs::remove_file(branch);
-                    return Ok(RewindOutcome::Cancelled);
-                }
+                // this rewind's own and nothing points at it yet; `fork_guard`
+                // removes it on the way out.
+                Err(_) if cancel.is_cancelled() => return Ok(RewindOutcome::Cancelled),
                 // The rewind is what the user asked for; the summary rode
                 // along, and its failure does not get to stop the rewind.
                 Err(error) => {
@@ -118,6 +114,8 @@ pub async fn rewind(
     if let Some(summary) = summary {
         summary.record(history);
     }
+    // The branch is the live session now: the guard must not remove it.
+    fork_guard.disarm();
     Ok(RewindOutcome::Rewound(Box::new(Rewound {
         cfg,
         report,
@@ -129,7 +127,10 @@ pub async fn rewind(
 /// and a rollout writer pointed at the fork file. The session's own directory is
 /// the sessions dir (branches are siblings). Errors if the history isn't backed
 /// by a file or the fork/reload fails.
-fn fork_here(history: &History, seq: u64) -> anyhow::Result<(String, ResumedSession)> {
+fn fork_here(
+    history: &History,
+    seq: u64,
+) -> anyhow::Result<(String, ResumedSession, crate::cleanup::RemoveFileOnDrop)> {
     let src = history
         .rollout_path()
         .context("this session is not being saved, so it cannot be rewound")?;
@@ -137,8 +138,19 @@ fn fork_here(history: &History, seq: u64) -> anyhow::Result<(String, ResumedSess
         .parent()
         .context("session file has no parent directory")?;
     let fork_path = fork_session(src, Some(seq), sessions_dir)?;
-    let resumed = inspect_session(&fork_path)?.recover_for_writing()?;
-    Ok((session_id_of(&fork_path), resumed))
+    let (resumed, guard) = open_fork(fork_path.clone())?;
+    Ok((session_id_of(&fork_path), resumed, guard))
+}
+
+/// Open a fresh fork for writing while holding its removal guard. The guard
+/// outlives this call because `replace_session` in the caller can still fail;
+/// every exit before that commit leaves the guard to remove the file.
+fn open_fork(
+    path: std::path::PathBuf,
+) -> anyhow::Result<(ResumedSession, crate::cleanup::RemoveFileOnDrop)> {
+    let guard = crate::cleanup::RemoveFileOnDrop::new(path.clone());
+    let resumed = inspect_session(&path)?.recover_for_writing()?;
+    Ok((resumed, guard))
 }
 
 #[cfg(test)]
@@ -381,6 +393,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fork that cannot be opened for writing is not a session: the guard
+    /// removes it so `--continue` cannot pick a half-finished file.
+    #[test]
+    fn a_fork_that_cannot_be_opened_is_removed() {
+        let dir = temp_dir("open-failure");
+        let path = dir.join("20260101-000000.jsonl");
+        std::fs::write(&path, b"not a session\n").unwrap();
+
+        assert!(open_fork(path.clone()).is_err());
+        assert!(!path.exists(), "the unreadable fork was removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `replace_session` failing after the fork succeeded is the other exit the
+    /// guard has to cover: `fresh_session` binds the successor scheduler, and a
+    /// store that cannot be read fails that bind.
+    #[tokio::test]
+    async fn a_rewind_that_cannot_replace_the_session_leaves_no_branch() {
+        let dir = temp_dir("replace-failure");
+        let (mut cfg, mut history, cut, _seen) = live_session("replace-failure", &dir, Vec::new());
+        let before = session_files(&dir);
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        cfg.scheduler = crate::scheduler::Scheduler::persistent(
+            Arc::new(crate::inbox::Inbox::default()),
+            crate::scheduler::DurableStore::new(
+                blocker.join("scheduled_tasks.json"),
+                "test".into(),
+            ),
+            cfg.scheduler.timezone(),
+        );
+
+        let outcome = rewind(
+            &cfg,
+            &mut history,
+            cut,
+            AbandonedBranch::Drop,
+            &ui(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(outcome.is_err(), "the successor scheduler cannot bind");
+        assert_eq!(session_files(&dir), before, "the fork file is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Rewinding without a summary sends nothing and adds nothing.
     #[tokio::test]
     async fn a_plain_rewind_sends_no_request() {
@@ -421,7 +479,8 @@ mod tests {
         history.record(text("bye"));
 
         // Route receipt + two messages keeps the first turn only.
-        let (id, resumed) = fork_here(&history, 3).unwrap();
+        let (id, resumed, mut guard) = fork_here(&history, 3).unwrap();
+        guard.disarm();
         assert_ne!(id, "session");
         assert_eq!(
             resumed.messages,

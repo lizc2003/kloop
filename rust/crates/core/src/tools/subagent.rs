@@ -346,51 +346,56 @@ pub(crate) async fn structured_agent_admitted(
             .await
         }
     });
-    let outcome = match handle.await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let cleanup_error = if let Some(worktree) = worktree {
-                worktree::finish(worktree).await.err()
-            } else {
-                None
+    // Same contract as the foreground `run_agent` supervisor: the worktree is
+    // owned here so a dropped tool future cannot take it down unfinished.
+    let supervisor = ctx.cfg.cleanup_tasks.spawn({
+        let ui = ui.clone();
+        let agent = agent.clone();
+        async move {
+            let mut result = match handle.await {
+                Ok(outcome) => match outcome.reason {
+                    EndReason::Completed => outcome.structured_output.ok_or_else(|| {
+                        anyhow!("workflow agent: child completed without valid structured_output")
+                    }),
+                    EndReason::MaxRounds => Err(anyhow!(
+                        "workflow agent: child stopped at its round limit without valid structured_output"
+                    )),
+                    EndReason::Aborted => Err(anyhow!("workflow agent: child was interrupted")),
+                    // The No may have come from a sibling: a workflow starts children after
+                    // the stop too, and those end before their first round.
+                    EndReason::Stopped => Err(anyhow!(
+                        "workflow agent: the user declined an approval and stopped the turn"
+                    )),
+                    EndReason::Error(error) => {
+                        Err(anyhow!("workflow agent: child failed: {error}"))
+                    }
+                },
+                Err(error) => Err(anyhow!("workflow agent: sub-agent panicked: {error}")),
             };
-            emit_agent_end(&ui, &agent, false);
-            return match cleanup_error {
-                Some(cleanup) => Err(anyhow!(
-                    "workflow agent: sub-agent panicked: {error}; worktree cleanup failed: {cleanup:#}"
-                )),
-                None => Err(anyhow!("workflow agent: sub-agent panicked: {error}")),
-            };
-        }
-    };
-    let mut result = match outcome.reason {
-        EndReason::Completed => outcome.structured_output.ok_or_else(|| {
-            anyhow!("workflow agent: child completed without valid structured_output")
-        }),
-        EndReason::MaxRounds => Err(anyhow!(
-            "workflow agent: child stopped at its round limit without valid structured_output"
-        )),
-        EndReason::Aborted => Err(anyhow!("workflow agent: child was interrupted")),
-        // The No may have come from a sibling: a workflow starts children after
-        // the stop too, and those end before their first round.
-        EndReason::Stopped => Err(anyhow!(
-            "workflow agent: the user declined an approval and stopped the turn"
-        )),
-        EndReason::Error(error) => Err(anyhow!("workflow agent: child failed: {error}")),
-    };
-    if let Some(worktree) = worktree {
-        match worktree::finish(worktree).await {
-            Ok(Some(note)) => ui.emit(&Event::Note(note.trim().to_string())),
-            Ok(None) => {}
-            Err(error) => {
-                result = Err(anyhow!(
-                    "workflow agent: worktree cleanup failed: {error:#}"
-                ));
+            if let Some(worktree) = worktree {
+                match worktree::finish(worktree).await {
+                    Ok(Some(note)) => ui.emit(&Event::Note(note.trim().to_string())),
+                    Ok(None) => {}
+                    Err(error) => {
+                        result = Err(anyhow!(
+                            "workflow agent: worktree cleanup failed: {error:#}"
+                        ));
+                    }
+                }
             }
+            emit_agent_end(&ui, &agent, result.is_ok());
+            result
+        }
+    });
+    match supervisor.await {
+        Ok(result) => result.map(|value| Admitted { value, receipt }),
+        Err(error) => {
+            emit_agent_end(&ui, &agent, false);
+            Err(anyhow!(
+                "workflow agent: sub-agent supervisor panicked: {error}"
+            ))
         }
     }
-    emit_agent_end(&ui, &agent, result.is_ok());
-    result.map(|value| Admitted { value, receipt })
 }
 
 /// Point a sub-agent's cwd anchors at its worktree: cwd, the permission gate
@@ -596,7 +601,7 @@ async fn run_sub_agent_sync(
     .await?;
     emit_agent_start(&ui, &agent, &preview);
     let execution = receipt.as_execution_ref();
-    let handle = tokio::spawn({
+    let worker = tokio::spawn({
         let ui = ui.clone();
         async move {
             let _lease = lease;
@@ -617,56 +622,64 @@ async fn run_sub_agent_sync(
             .await
         }
     });
-    let outcome = match handle.await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            let cleanup_error = if let Some(wt) = worktree {
-                worktree::finish(wt).await.err()
-            } else {
-                None
+    // The worktree belongs to this supervisor, not to the tool future: a
+    // cancelled turn drops that future where it awaits the supervisor, and a
+    // worktree dropped with it would never be finished. Tracking the
+    // supervisor keeps session shutdown from ending before the teardown does.
+    let who_label = who.to_string();
+    let supervisor = ctx.cfg.cleanup_tasks.spawn({
+        let ui = ui.clone();
+        let agent = agent.clone();
+        let who = who_label.clone();
+        async move {
+            let mut result = match worker.await {
+                Ok(outcome) => match outcome.reason {
+                    EndReason::Completed => Ok(outcome.final_text),
+                    EndReason::MaxRounds => Ok(format!(
+                        "[sub-agent stopped at its round limit]\n{}",
+                        outcome.final_text
+                    )),
+                    EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
+                    // Not an error the model should work around: the parent's turn ends with
+                    // this batch, and the user's next message says what to do instead.
+                    EndReason::Stopped => Ok(format!(
+                        "[the user declined an approval in this sub-agent and stopped the turn to tell you what to do instead]\n{}",
+                        outcome.final_text
+                    )),
+                    EndReason::Error(e) => Err(anyhow!("{who}: sub-agent failed: {e}")),
+                },
+                Err(e) => Err(anyhow!("{who}: sub-agent panicked: {e}")),
             };
-            emit_agent_end(&ui, &agent, false);
-            return match cleanup_error {
-                Some(cleanup) => Err(anyhow!(
-                    "{who}: sub-agent panicked: {e}; worktree cleanup failed: {cleanup:#}"
-                )),
-                None => Err(anyhow!("{who}: sub-agent panicked: {e}")),
-            };
-        }
-    };
-    let mut result = match outcome.reason {
-        EndReason::Completed => Ok(outcome.final_text),
-        EndReason::MaxRounds => Ok(format!(
-            "[sub-agent stopped at its round limit]\n{}",
-            outcome.final_text
-        )),
-        EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
-        // Not an error the model should work around: the parent's turn ends with
-        // this batch, and the user's next message says what to do instead.
-        EndReason::Stopped => Ok(format!(
-            "[the user declined an approval in this sub-agent and stopped the turn to tell you what to do instead]\n{}",
-            outcome.final_text
-        )),
-        EndReason::Error(e) => Err(anyhow!("{who}: sub-agent failed: {e}")),
-    };
-    // Tear down or preserve the worktree, and tell the model where a preserved
-    // one lives (only on a success result — an error already routes to is_error
-    // guidance; the changes still sit on the branch for the user).
-    if let Some(wt) = worktree {
-        match worktree::finish(wt).await {
-            Ok(Some(note)) => {
-                if let Ok(text) = &mut result {
-                    text.push_str(&note);
+            // Tear down or preserve the worktree, and tell the model where a
+            // preserved one lives (only on a success result — an error already
+            // routes to is_error guidance; the changes still sit on the branch
+            // for the user).
+            if let Some(wt) = worktree {
+                match worktree::finish(wt).await {
+                    Ok(Some(note)) => {
+                        if let Ok(text) = &mut result {
+                            text.push_str(&note);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        result = Err(anyhow!("{who}: worktree cleanup failed: {error:#}"));
+                    }
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
-                result = Err(anyhow!("{who}: worktree cleanup failed: {error:#}"));
-            }
+            emit_agent_end(&ui, &agent, result.is_ok());
+            result
+        }
+    });
+    match supervisor.await {
+        Ok(result) => result.map(|value| Admitted { value, receipt }),
+        Err(error) => {
+            emit_agent_end(&ui, &agent, false);
+            Err(anyhow!(
+                "{who_label}: sub-agent supervisor panicked: {error}"
+            ))
         }
     }
-    emit_agent_end(&ui, &agent, result.is_ok());
-    result.map(|value| Admitted { value, receipt })
 }
 
 /// Run a `context: fork` skill (plan 28 slice 2) as an isolated sub-agent: the
@@ -1538,6 +1551,87 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
             "branch deleted"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A cancelled foreground worktree sub-agent: dispatch drops the tool
+    /// future at its cancel exit, so the worktree can only be finished by a
+    /// supervisor that outlives it. The untouched tree and branch go, and the
+    /// agent row is closed (plan 249).
+    #[tokio::test]
+    async fn cancelled_worktree_subagent_tears_down_and_reports_the_end() {
+        use kloop_provider::MockTurn;
+
+        let repo = temp_git_repo("cancel-worktree");
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        // Hold the sender: the child stays inside the provider until cancelled.
+        let (_release, release) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![MockTurn::Gate {
+            started,
+            release,
+            blocks: vec![AssistantBlock::Text {
+                text: "never produced".into(),
+            }],
+        }]);
+        let rec = Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        let ui: Arc<dyn Ui> = rec.clone();
+        let mut ctx = ctx_in(
+            with_provider(test_ctx(0, "cancel-worktree"), provider),
+            &repo,
+        );
+        ctx.ui = ui.clone();
+        let cfg = Arc::clone(&ctx.cfg);
+        let cancel = ctx.cancel.clone();
+        let call = tokio::spawn(async move {
+            run_tool(
+                "run_agent",
+                json!({"prompt": "go", "isolation": "worktree"}),
+                &ctx,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+            .await
+            .expect("the child never reached the provider")
+            .unwrap();
+        cancel.cancel();
+        call.abort();
+        let _ = call.await;
+
+        // The supervisor is session-tracked; waiting on it (with a generous
+        // bound) is what makes this assertion independent of machine load.
+        cfg.cleanup_tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(10), cfg.cleanup_tasks.wait())
+            .await
+            .expect("the supervisor finished");
+        assert_eq!(cfg.shutdown_background_work(&ui).await, 0);
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop/worktrees"))
+            .map(|dir| dir.filter_map(|entry| entry.ok()).collect())
+            .unwrap_or_default();
+        assert!(
+            trees.is_empty(),
+            "the cancelled tree was removed: {trees:?}"
+        );
+        let branches = crate::git::command(&repo)
+            .args(["branch", "--list", "kloop-worktree-*"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the branch was deleted"
+        );
+        let events = rec.0.lock().unwrap();
+        assert!(
+            events.iter().any(|event| event.starts_with("start agent-")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with("end agent-") && event.ends_with("false")),
+            "the agent row was closed as failed: {events:?}"
         );
         let _ = std::fs::remove_dir_all(&repo);
     }

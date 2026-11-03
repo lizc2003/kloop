@@ -96,7 +96,9 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 similar = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "signal", "fs", "time", "sync", "test-util"] }
-tokio-util = "0.7"
+# `rt` for `TaskTracker`: session-scoped cleanup supervisors that must outlive
+# the tool future which started them (plan 249).
+tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1.1"
 tree-sitter = "0.27"
 tree-sitter-bash = "0.25"

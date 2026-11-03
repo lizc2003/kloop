@@ -420,6 +420,12 @@ pub struct Config {
     /// Kept separate from `background_shells`, whose result is an output file plus
     /// a terminal inbox pointer rather than a reinjected body.
     pub background_executions: Arc<BackgroundExecutions>,
+    /// Supervisors for resources a tool future may be dropped with — currently
+    /// the worktree teardown of an isolated sub-agent (plan 249). Dispatch can
+    /// abandon a tool future at any await once the turn is cancelled, so the
+    /// task holding the resource is tracked here instead; Config clones share
+    /// it, and [`Config::shutdown_background_work`] waits for it.
+    pub cleanup_tasks: tokio_util::task::TaskTracker,
     /// Resource ceilings for a `run_program` (code-mode) run — engine limits
     /// (memory/stack/cpu burst) plus orchestration caps (max agents/items/
     /// concurrency). Defaults are sensible; the CLI overrides from `[codemode]`
@@ -602,6 +608,7 @@ impl Config {
             inbox: _,
             scheduler,
             background_executions: _,
+            cleanup_tasks: _,
             active_worktree: _,
         } = self;
         let inbox = Arc::new(Inbox::default());
@@ -640,6 +647,9 @@ impl Config {
             scheduler: scheduler.successor(Arc::clone(&inbox)),
             inbox,
             background_executions: BackgroundExecutions::new(),
+            // A new session starts with no cleanup work; the old session's
+            // tracker is closed by its own shutdown.
+            cleanup_tasks: Default::default(),
             // A worktree the old session entered belongs to the old session;
             // the new one starts back in `cwd`.
             active_worktree: Arc::new(crate::worktree::ActiveWorktreeState::default()),
@@ -720,12 +730,21 @@ impl Config {
     pub async fn shutdown_background_work(&self, ui: &Arc<dyn crate::agent::Ui>) -> usize {
         self.local_agent.shutdown(ui);
         let timeout = Duration::from_secs(2);
+        self.cleanup_tasks.close();
         let scheduler = self.scheduler.shutdown().await;
         let (tasks, shells) = tokio::join!(
             self.background_executions.shutdown(timeout),
             self.background_shells.shutdown(timeout)
         );
-        scheduler + tasks + shells
+        let cleanup = if tokio::time::timeout(timeout, self.cleanup_tasks.wait())
+            .await
+            .is_err()
+        {
+            self.cleanup_tasks.len()
+        } else {
+            0
+        };
+        scheduler + tasks + shells + cleanup
     }
 
     /// One field of the workspace in effect right now. These used to go through
@@ -918,6 +937,10 @@ mod subagent_contract_tests {
             &parent.background_executions,
             &child.background_executions
         ));
+        assert!(tokio_util::task::TaskTracker::ptr_eq(
+            &parent.cleanup_tasks,
+            &child.cleanup_tasks
+        ));
         assert!(Arc::ptr_eq(&parent.skills, &child.skills));
 
         assert_eq!(child.project_instructions, parent.project_instructions);
@@ -983,6 +1006,10 @@ mod fresh_session_tests {
         assert!(!Arc::ptr_eq(
             &old.background_executions,
             &fresh.background_executions
+        ));
+        assert!(!tokio_util::task::TaskTracker::ptr_eq(
+            &old.cleanup_tasks,
+            &fresh.cleanup_tasks
         ));
         assert!(!Arc::ptr_eq(&old.permissions, &fresh.permissions));
         assert!(!Arc::ptr_eq(&old.active_worktree, &fresh.active_worktree));

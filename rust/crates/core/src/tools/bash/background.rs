@@ -252,6 +252,10 @@ impl BackgroundShells {
             .with_context(|| format!("bash: cannot create {}", offload_dir.display()))?;
         let (id, path, stdout) = crate::resource_id::create_file(offload_dir, "bg-", ".out")
             .context("bash: cannot allocate output file")?;
+        // The file is ours from here on: every failure before the registry
+        // takes it (mint, clone, spawn, a closed registry) must remove it, or
+        // the offload dir fills with empty `bg-*.out` that no tool can reach.
+        let mut output_guard = crate::cleanup::RemoveFileOnDrop::new(path.clone());
         let receipt = ExecutionProvenanceReceipt::mint(ResolvedExecutionAdmission {
             session_id: &ctx.cfg.session_id,
             parent: ctx.enclosing_execution.clone(),
@@ -316,6 +320,9 @@ impl BackgroundShells {
             );
             (child, killer, kill)
         };
+        // The monitor owns the output file from here; a later failure cannot
+        // leave an unowned file behind.
+        output_guard.disarm();
         ctx.ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
             id: id.clone(),
             run_id: None,
@@ -1076,6 +1083,39 @@ mod tests {
         let (out, is_error) = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
         assert!(is_error);
         assert!(out.contains("not running"), "{out}");
+    }
+
+    /// A registry that is already closed refuses the command, and the output
+    /// file created before that check is removed (plan 249). Without the guard
+    /// every refused call would leave an empty `bg-*.out` no tool can reach.
+    #[tokio::test]
+    async fn a_closed_registry_leaves_no_empty_output_file() {
+        let ctx = test_ctx(0, "bg-closed-file");
+        let offload = ctx.cfg.offload_dir.clone();
+        let _ = std::fs::remove_dir_all(&offload);
+        assert_eq!(
+            ctx.cfg
+                .background_shells
+                .shutdown(std::time::Duration::from_secs(1))
+                .await,
+            0
+        );
+
+        let (out, is_error) =
+            run_tool("bash", json!({"command": "true", "background": true}), &ctx).await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("session is closing"), "{out}");
+
+        let outputs: Vec<_> = std::fs::read_dir(&offload)
+            .map(|dir| {
+                dir.filter_map(|entry| entry.ok())
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("bg-") && name.ends_with(".out"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(outputs.is_empty(), "left behind: {outputs:?}");
+        let _ = std::fs::remove_dir_all(&offload);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod agent_mailbox;
 pub mod agent_type;
+pub mod cleanup;
 pub mod commands;
 pub mod compact;
 pub mod config;

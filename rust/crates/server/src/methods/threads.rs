@@ -190,11 +190,14 @@ impl Server {
         let new_path = rollout::fork_session(&src, cut, &dirs.sessions)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
+        // Until `spawn_thread` takes the history, every failure must remove the
+        // fork: it is `preexisting` to its writer, so nothing else will, and
+        // each retry would add another orphan to `thread/list`.
+        let mut fork_guard = kloop_core::cleanup::RemoveFileOnDrop::new(new_path.clone());
         let resumed =
             match rollout::inspect_session(&new_path).and_then(|read| read.recover_for_writing()) {
                 Ok(resumed) => resumed,
                 Err(error) => {
-                    let _ = std::fs::remove_file(&new_path);
                     return Err((wire::SERVER_ERROR, format!("cannot resume fork: {error}")));
                 }
             };
@@ -202,16 +205,14 @@ impl Server {
         let count = resumed.messages.len();
         let seed = resumed.snapshot.clone();
         let history = History::resume(dirs.offload.clone(), resumed);
-        if let Err(error) = self.spawn_thread(
+        self.spawn_thread(
             new_id.clone(),
             history,
             options.clone(),
             RecoverySource::Resumed,
             seed,
-        ) {
-            let _ = std::fs::remove_file(&new_path);
-            return Err(error);
-        }
+        )?;
+        fork_guard.disarm();
         let route = self
             .threads
             .get(&new_id)

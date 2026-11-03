@@ -1,5 +1,19 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 249 ✅：资源守卫与工具 future 可丢弃契约（2026-11-03）**：core 新增
+`cleanup::RemoveFileOnDrop`（创建即生效、成功 `disarm`），后台 bash 的 `bg-*.out`、
+rewind 的 fork 分支与 server `thread/fork` 的 fork 文件都由它兜住失败出口；rewind 的
+取消分支不再手写删除。异步 worktree 清理按用户确认选 (b)：`Config` 新增
+`cleanup_tasks: TaskTracker`（workspace 打开 `tokio-util = ["rt"]`），前台
+`run_agent` 与 workflow `agent` 的 worker 只跑子 agent，supervisor 持有 worktree、
+`finish` 并补发 agent-end 后登记进 tracker；`shutdown_background_work` 先 `close()`
+再按现有 2s 上限等待。四类回归覆盖取消后的树/分支与 agent 行、关闭 registry 的空文件、
+两个 rewind 失败出口与 server fork 的 resume_options 失败。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace 全量测试，core 1303 项、TUI 314 项，本机
+parity baseline verified）。DESIGN 增加「Dropped tool futures (Plan 249)」。`make check`
+期间 parity 的 `explicit fixture restore` 自检偶发失败一次，单独重跑 `make parity`
+通过（同 plan 242 记录的本机偶发）。Linux 与 Windows 未实测。教训 304、305。
+
 **Plan 248 ✅：文本、路径与文件 helper 收口（2026-11-03）**：protocol 新增
 `char_prefix` / `clip_chars` / `hex_lower`，core 新增 `paths::{lexically_normalize,
 expand_tilde, display_with_tilde}`。十多处按字符截断、六处 hex、三份路径规范化、
@@ -4016,3 +4030,18 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    `rename` 会把这个 mode 一起带过去；用它覆盖用户拥有的文件(如 `.git/info/exclude`)
    就把 0644 悄悄改成 0600。共享替换函数要在写入前读取目标已有权限并 `set_permissions`，
    回归要先构造 0644 再断言替换后仍是 0644——只断言内容会漏掉这类丢失。
+
+304. **“取消时会等清理”不是 dispatch 的通用契约，只有三个出口例外。** `run_one` 的取消
+   分支只在 deadline 已到期、前台 Bash 已 spawn、本地 send 已提交时继续等 future，其余
+   调用直接丢弃它。资源若“先创建、后面某个 `?` 才成功提交”，清理代码就永远到不了；
+   文件类资源用创建即生效的 Drop 守卫，成功后再 `disarm`，不要写在可能失败的步骤之后。
+   异步资源（worktree finish）要由一个比工具 future 更长寿的 supervisor 持有，并登记进
+   会话级 `TaskTracker`；退出时先 `close()` 再按既有的 2s 上限等待，不能只靠裸
+   `tokio::spawn`，也不能让 `fresh_session` 继承旧会话的 tracker。
+
+305. **保护一个新建文件，直到“另一个所有者真的接手”才算提交。** rewind 的 fork 分支在
+   `inspect/recover`、`replace_session`、路由采纳之前都不是任何会话的文件；server fork
+   在 `resume_options` 与 `spawn_thread` 之前也一样。守卫必须把这段整个跨过去，并且在
+   `history.rebase`/`spawn_thread` 之后才 `disarm`；只在取消分支手写一次
+   `remove_file` 会漏掉其余失败出口，而它们的 mtime 最新，正好会被 `--continue` 或
+   `thread/list` 选中。

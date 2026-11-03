@@ -2696,6 +2696,31 @@ background`. One timeout never fails the rest of its concurrent batch, and a
 call that finished despite the cancellation keeps its real result rather than
 being overwritten with a timeout.
 
+### Dropped tool futures (Plan 249)
+
+Dispatch can drop a tool future at any await, not only at the two explicit
+"timed out / interrupted" results. Once the turn is cancelled, `run_one`'s
+`select!` keeps waiting only for a foreground Bash that already spawned, a
+committed local send, or an expired budget; every other call has its future
+dropped, and a tool that ignores cancellation may still be running. So a
+resource created before that point is released by whoever owns it, never by
+code after the next `?`. Synchronous resources use
+`cleanup::RemoveFileOnDrop`: it is armed when the file is created and disarmed
+only once a lasting owner has taken it, which covers a cancelled turn as well
+as an early error. Asynchronous teardown is owned by a session-tracked
+supervisor (`Config::cleanup_tasks`, a `TaskTracker`): a foreground or workflow
+sub-agent's worktree lives in that supervisor rather than in the tool future,
+so cancellation still runs `worktree::finish` and emits the agent-end event;
+session shutdown closes the tracker and waits for it under the same 2 s bound
+as the other background workers.
+
+Session forks follow the same rule from the other direction: the fresh branch
+file is guarded from the moment `fork_session` creates it and disarmed only
+after the history or thread that owns it takes over — a failure in
+`recover_for_writing`, `replace_session`, or `resume_options` removes it
+instead of leaving a newer-mtime file for `--continue` or `thread/list` to
+pick up.
+
 ### Notebook cells (Plan 57)
 
 A lowercase `.ipynb` path passed to `read_file` is rendered cell-by-cell rather

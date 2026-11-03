@@ -2113,6 +2113,7 @@ pub(crate) mod testutil {
                 inbox: Arc::clone(&inbox),
                 scheduler: crate::scheduler::Scheduler::in_memory(inbox),
                 background_executions: Default::default(),
+                cleanup_tasks: Default::default(),
                 program_limits: Default::default(),
                 request_reduction: true,
                 skills: Default::default(),
