@@ -83,6 +83,21 @@ await 处被丢弃"没有写成契约。
   `cargo clippy -p kloop-core --all-targets --all-features -D warnings` 全绿；提交前
   完整 `make check` 也全绿(core 1305 项、TUI 314 项，parity baseline verified)。
 
+### 第二轮审查(2026-11-03)
+
+- **add 失败不再回滚**：进程内 mutex 不跨进程。另一个 kloop 可能在 pre-check 与
+  `git worktree add` 之间创建同名树/分支；add 失败不能证明资源属于本次调用，强制删除
+  会毁掉对方的树和未提交工作。只有 add 返回成功后才允许回滚。
+- 回滚的 `worktree remove --force` / `branch -D` 改为最多 5 次短退避重试；被
+  `kill_on_drop` 结束的 add 留下的 initializing 锁，不再让第一次失败就被当成清理完成。
+- 保留分支的 Note 现在**无条件**发布。子 agent 已 Completed、supervisor 正在 finish 时
+  调用方取消，结果已经没人读，Note 仍能到 UI；成功路径继续把位置附在工具结果里。
+- 已知缺口(按“允许有遗漏”收口)：取消恰好落在 `git worktree add` 运行中时，直接子进程
+  会被 kill，但 Git 派出的 checkout 子进程/initializing 锁仍可能让重试预算内的回滚失败；
+  失败后不再进一步上报。add 失败留下的本次 partial 资源也不清理，因为无法与对方的资源
+  区分。新增回归覆盖“add 失败不删对方的树/分支”和“成功保留也发 Note”；第二条在只把
+  Note 追加到结果时先红。
+
 ## 验收
 
 - 单测/集成(旧代码先红):前台 worktree 子 agent 在运行中被取消，worktree 被清理或按

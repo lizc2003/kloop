@@ -659,10 +659,12 @@ async fn run_sub_agent_sync(
             if let Some(wt) = worktree {
                 match worktree::finish(wt).await {
                     Ok(Some(note)) => {
+                        // Always publish: the caller may already be gone (a
+                        // cancelled turn drops the tool future), in which case
+                        // appending to the result would lose the location.
+                        ui.emit(&Event::Note(note.trim().to_string()));
                         if let Ok(text) = &mut result {
                             text.push_str(&note);
-                        } else {
-                            ui.emit(&Event::Note(note.trim().to_string()));
                         }
                     }
                     Ok(None) => {}
@@ -1384,7 +1386,10 @@ mod tests {
                 text: "done".into(),
             }],
         ]);
-        let ctx = ctx_in(with_provider(test_ctx(0, "confine"), provider), &repo);
+        let rec = Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        let ui: Arc<dyn Ui> = rec.clone();
+        let mut ctx = ctx_in(with_provider(test_ctx(0, "confine"), provider), &repo);
+        ctx.ui = ui;
 
         let (out, is_error) = run_tool(
             "run_agent",
@@ -1401,6 +1406,14 @@ mod tests {
             out.contains("kloop-worktree-agent-"),
             "the kept tree's branch is named: {out}"
         );
+        let events = rec.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with("note ") && event.contains("kloop-worktree-agent-")),
+            "the kept branch is published even if the result is never read: {events:?}"
+        );
+        drop(events);
 
         // The write is in the worktree, NOT the main repo.
         assert!(

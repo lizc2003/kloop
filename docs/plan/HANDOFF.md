@@ -10,9 +10,12 @@ rewind 的 fork 分支与 server `thread/fork` 的 fork 文件都由它兜住失
 再按现有 2s 上限等待。四类回归覆盖取消后的树/分支与 agent 行、关闭 registry 的空文件、
 两个 rewind 失败出口与 server fork 的 resume_options 失败。审查补丁把 `worktree::create`
 也纳入守卫：`git worktree add` 前武装 `CreationGuard`，取消落在 `verify_provenance`
-时由 tracker 执行 `worktree remove --force` + `branch -D`，add 自身 `kill_on_drop`；
-保留脏树与清理失败改走 `Event::Note`，不再随被丢弃的返回值消失。外层执行沙箱之外
-`make check` 全绿（fmt、clippy、workspace 全量测试，core 1305 项、TUI 314 项，本机
+时由 tracker 执行 `worktree remove --force` + `branch -D`，add 自身 `kill_on_drop`。
+第二轮审查后 add 失败不再回滚（进程内锁不跨进程，失败可能属于另一个同名创建者），
+回滚加 5 次短退避重试；保留脏树/清理失败以及成功保留的 Note 都无条件发布，不再依赖
+无人读取的返回值。已知缺口：取消恰逢 `git worktree add` 运行中时，Git 的 checkout
+子进程/initializing 锁仍可能让重试预算内的回滚失败，失败后不再上报。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace 全量测试，core 1306 项、TUI 314 项，本机
 parity baseline verified）。DESIGN 增加「Dropped tool futures (Plan 249)」。此前一次
 parity 的 `explicit fixture restore` 自检偶发失败，单独重跑 `make parity` 通过（同
 plan 242 记录的本机偶发），提交前最后一次完整 `make check` 干净通过。Linux 与 Windows
@@ -4054,11 +4057,13 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    `git worktree add` 成功后还要 canonicalize、`verify_provenance` 两次 git 查询；
    取消点若落在那里，函数永远走不到自己的错误回滚，调用方也只拿到一个被丢弃的
    future。守卫要在这条命令之前武装，Drop 把异步回滚交给会话 tracker；命令本身设
-   `kill_on_drop`，否则回滚拿锁时 git 还在写同一棵树。测试别只等 provider 启动，
-   用 `#[cfg(test)]` 闸门停在 add 与 verify 之间，abort 创建 future 才能覆盖这个阶段。
+   `kill_on_drop`。但 **add 失败不能回滚**：进程内锁不跨进程，失败可能只是另一个 kloop
+   先创建了同名树/分支，强制删除会毁掉对方的未提交工作——只有 add 成功才证明资源属于
+   本次调用。回滚命令要考虑被 kill 的 add 留下的 initializing 锁，短退避重试几次。
 
-307. **取消后的“结果”已经没有人读，清理信息必须另走 UI。** 前台子 agent 的 supervisor
-   返回的 `Result` 只对还在等它的调用方有意义；turn 被取消时那个 future 已被丢弃，
-   把保留路径拼进 `Ok` 文本、或把清理错误塞进 `Err`，用户都看不到。`finish` 决定保留
-   脏树或自己失败时，要在 supervisor 里直接发 `Event::Note`；成功路径继续把位置附在
-   工具结果里，避免重复提示。
+307. **取消后的“结果”已经没有人读，清理信息必须独立发布。** 前台子 agent 的 supervisor
+   返回的 `Result` 只对还在等它的调用方有意义；turn 被取消时那个 future 已被丢弃。
+   不能只在 `Err` 分支发 Note：子 agent 已经 Completed、supervisor 正在 `finish` 时
+   取消，`result` 仍是 `Ok`，把保留路径拼进文本一样没人读。保留位置和清理失败都应在
+   supervisor 里无条件发 `Event::Note`；成功路径可以继续把位置附在工具结果里，
+   两者不互相替代。

@@ -249,15 +249,26 @@ async fn rollback_created(repository_root: &Path, branch: &str, path: &Path) {
     rollback_created_locked(repository_root, branch, path).await;
 }
 
-/// The caller already holds the mutation lock.
+/// The caller already holds the mutation lock. A killed `git worktree add` can
+/// leave Git's `initializing` lock behind, so give removal a few short retries
+/// instead of treating the first failure as a completed cleanup.
 async fn rollback_created_locked(repository_root: &Path, branch: &str, path: &Path) {
     let path_text = git_compatible_path(path).to_string_lossy().to_string();
-    let _ = git_text(
-        repository_root,
-        &["worktree", "remove", "--force", &path_text],
-    )
-    .await;
-    let _ = git_text(repository_root, &["branch", "-D", branch]).await;
+    for attempt in 0..5 {
+        let removed = git_text(
+            repository_root,
+            &["worktree", "remove", "--force", &path_text],
+        )
+        .await
+        .is_ok();
+        let deleted = git_text(repository_root, &["branch", "-D", branch])
+            .await
+            .is_ok();
+        if removed && deleted {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt + 1))).await;
+    }
 }
 
 #[cfg(test)]
@@ -272,13 +283,26 @@ pub(crate) mod creation_probe {
     }
 
     static PROBES: Mutex<Vec<(String, Probe)>> = Mutex::new(Vec::new());
+    static BEFORE_ADD_PROBES: Mutex<Vec<(String, Probe)>> = Mutex::new(Vec::new());
 
     /// Pause the named creation after `git worktree add`. The returned sender
     /// releases it; keeping it alive parks the creation at the gate.
     pub(crate) fn install(name: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        install_into(&PROBES, name)
+    }
+
+    /// Pause before `git worktree add`, after the pre-checks passed.
+    pub(crate) fn install_before_add(name: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        install_into(&BEFORE_ADD_PROBES, name)
+    }
+
+    fn install_into(
+        gates: &Mutex<Vec<(String, Probe)>>,
+        name: &str,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, reached_rx) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
-        PROBES.lock().unwrap().push((
+        gates.lock().unwrap().push((
             name.to_string(),
             Probe {
                 reached,
@@ -289,8 +313,16 @@ pub(crate) mod creation_probe {
     }
 
     pub(crate) async fn pause(name: &str) {
+        pause_in(&PROBES, name).await;
+    }
+
+    pub(crate) async fn pause_before_add(name: &str) {
+        pause_in(&BEFORE_ADD_PROBES, name).await;
+    }
+
+    async fn pause_in(gates: &Mutex<Vec<(String, Probe)>>, name: &str) {
         let probe = {
-            let mut probes = PROBES.lock().unwrap();
+            let mut probes = gates.lock().unwrap();
             probes
                 .iter()
                 .position(|(candidate, _)| candidate == name)
@@ -348,8 +380,14 @@ async fn create_managed(
 
     // From this point a dropped future can leave a real tree and branch behind.
     let mut creation = CreationGuard::new(cleanup_tasks, &repository.root, &branch, &path);
+    #[cfg(test)]
+    creation_probe::pause_before_add(name).await;
     if let Err(error) = git_worktree_add(&repository.root, &branch, &path, &base).await {
-        rollback_created_locked(&repository.root, &branch, &path).await;
+        // A concurrently started kloop (the process-wide lock is not a
+        // cross-process one) may have created this exact path/branch between
+        // our pre-check and `add`. A failed add therefore proves nothing about
+        // ownership, and force-removing here could delete another session's
+        // tree, branch, and uncommitted work. Leave whatever exists in place.
         creation.disarm();
         return Err(error.context(format!("git worktree add for branch {branch}")));
     }
@@ -1092,6 +1130,57 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
             "the half-created branch was removed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A failed `git worktree add` proves nothing about ownership: another
+    /// kloop process can create the same name between our pre-check and add.
+    /// The loser must not force-remove the winner's tree, branch, or work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_add_does_not_remove_another_creators_worktree() {
+        let root = temp_repo("create-race").await;
+        let name = "shared-name";
+        let (reached, release) = creation_probe::install_before_add(name);
+        let tasks = cleanup_tasks();
+        let loser = tokio::spawn({
+            let root = root.clone();
+            let tasks = tasks.clone();
+            async move { create(&root, name, &tasks).await }
+        });
+
+        reached.await.expect("the loser reached the pre-add gate");
+        // Simulate the other process winning while this one is paused.
+        let path = root.join(WORKTREES_DIR).join(name);
+        let path_text = path.to_string_lossy().into_owned();
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "kloop-worktree-shared-name",
+                path_text.as_str(),
+                "HEAD",
+            ],
+        )
+        .await;
+        std::fs::write(path.join("winner.txt"), "keep").unwrap();
+        release.send(()).unwrap();
+
+        let _error = loser.await.unwrap().unwrap_err();
+        assert!(
+            path.join("winner.txt").exists(),
+            "the winner's tree and uncommitted work survived"
+        );
+        let branches = crate::git::command(&root)
+            .args(["branch", "--list", "kloop-worktree-shared-name"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the winner's branch survived"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
