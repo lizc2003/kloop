@@ -1027,6 +1027,72 @@ async fn structured_output_waits_for_a_late_peer_message() {
     }));
 }
 
+/// The value was already validated when the late work pulled the turn onward.
+/// The model then answers in plain text, as it would after any delivery; that
+/// is a completed structured turn carrying the accepted value, not a miss that
+/// burns a retry nudge (and eventually fails the turn).
+#[tokio::test]
+async fn an_accepted_structured_value_survives_late_work() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct SteerWhileToolsRun {
+        inbox: Arc<Inbox>,
+        fired: AtomicBool,
+    }
+    impl Ui for SteerWhileToolsRun {
+        fn emit(&self, event: &Event) {
+            if matches!(event, Event::ItemStarted { item: Item::ToolCall { name, .. }, .. } if name == "bash")
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                self.inbox
+                    .push(InboxItem::steer("also fold in the late note"));
+            }
+        }
+    }
+
+    let schema = json!({
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "required": ["count"],
+        "additionalProperties": false,
+    });
+    let (cfg, seen) = structured_config(vec![
+        MockTurn::Blocks(vec![
+            tool_use_named("s1", "structured_output", json!({"count": 1})),
+            tool_use_named("b1", "bash", json!({"command": "echo hi"})),
+        ]),
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "delivered".into(),
+        }]),
+    ]);
+    let ui: Arc<dyn Ui> = Arc::new(SteerWhileToolsRun {
+        inbox: cfg.inbox.clone(),
+        fired: AtomicBool::new(false),
+    });
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("produce structured output"));
+
+    let outcome = run_structured_turn(
+        &cfg,
+        &mut history,
+        &ui,
+        &CancellationToken::new(),
+        1,
+        schema,
+    )
+    .await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.rounds, 2);
+    assert_eq!(
+        outcome.structured_output,
+        Some(json!({"count": 1})),
+        "the value accepted before the late work is the turn's result"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn structured_turn_cancellation_never_accepts_a_late_value() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1517,6 +1583,9 @@ async fn overflow_compacts_and_retries() {
 
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(outcome.final_text, "recovered answer");
+    // The main request's rejection is a measurement, not just a retry trigger:
+    // the configured 200k no longer governs predictive compaction.
+    assert!(history.effective_window(200_000) < 200_000);
     let ContentBlock::Text { text } = &history.messages()[1].content[0] else {
         panic!("expected text summary at history start");
     };
@@ -1886,6 +1955,40 @@ async fn truncated_response_recovers_with_continuation() {
         Message::injected(Injected::Harness, super::TRUNCATION_CONTINUE_MSG),
         "the continuation nudge must be recorded so history stays legal"
     );
+}
+
+/// A continuation that ends in a tool call breaks the truncation chain: the
+/// next text is a new segment, not the remainder, and the tool round's own
+/// text sits between them. `final_text` has to carry all three in order —
+/// prefixing the last round with the cut-off half used to drop the tool
+/// round's text and glue the other two together with no separator.
+#[tokio::test]
+async fn truncation_continued_through_a_tool_round_keeps_every_segment() {
+    use kloop_provider::MockTurn;
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Truncated(text("part one, cut off mid-")),
+        MockTurn::Blocks(vec![
+            AssistantBlock::Text {
+                text: "part two, said while checking".into(),
+            },
+            tool_use("t1", "echo hi"),
+        ]),
+        MockTurn::Blocks(text("part three, complete.")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "truncation-tool");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let cancel = CancellationToken::new();
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("write something long and check it"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(
+        outcome.final_text,
+        "part one, cut off mid-\n\npart two, said while checking\n\npart three, complete."
+    );
+    assert_eq!(outcome.rounds, 3);
 }
 
 /// Truncation nudges are bounded: after the limit the turn returns an error
@@ -5008,6 +5111,110 @@ mod a_turn_that_never_happened {
         // Only the opening route line: no message, and no `aborted` terminal
         // for a turn that has nothing to stand for.
         assert_eq!(line_kinds(&session), vec!["provider_route_initial"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A caller that records the message itself (`run_turn`, not
+    /// `run_turn_with_input`) still has a real turn when the interrupt lands
+    /// before the first token, so it gets its terminal. But the pre-turn hook
+    /// context staged for it must not survive: left behind, the next
+    /// interrupted turn hands that hook text back as if it were the input.
+    #[tokio::test]
+    async fn an_abort_before_output_drops_the_hook_context_it_staged() {
+        use crate::hooks::HookEvent;
+        let dir = session_dir("hook-abort");
+        let session = dir.join("session.jsonl");
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_release_tx, first_release_rx) = tokio::sync::oneshot::channel();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let (second_release_tx, second_release_rx) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Gate {
+                started: first_started_tx,
+                release: first_release_rx,
+                blocks: text("too late"),
+            },
+            MockTurn::Gate {
+                started: second_started_tx,
+                release: second_release_rx,
+                blocks: text("also too late"),
+            },
+        ]);
+        let cfg = hooked_cfg(
+            provider,
+            vec![hook(HookEvent::PreTurn, "echo repo rule ahead")],
+            "hook-abort",
+        );
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let session_path = session.clone();
+        let turn_cfg = cfg.clone();
+        let handle = tokio::spawn(async move {
+            let ui: Arc<dyn Ui> = Arc::new(NullUi);
+            let mut history = History::new(turn_cfg.offload_dir.clone());
+            history.attach_rollout(crate::rollout::Rollout::new(session_path));
+            history.record(Message::user_text("a question the hook colors"));
+            let outcome = run_turn(&turn_cfg, &mut history, &ui, &child_cancel, 0).await;
+            (outcome, history)
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_started_rx)
+            .await
+            .expect("sampling did not start")
+            .expect("sampling gate dropped");
+        cancel.cancel();
+        let (outcome, mut history) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the turn ignored cancellation")
+            .expect("the turn panicked");
+        drop(first_release_tx);
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(
+            history.messages(),
+            &[Message::user_text("a question the hook colors")],
+            "the hook context never reached a request"
+        );
+        assert!(!history.has_staged(), "the hook context outlived its turn");
+        assert_eq!(
+            line_kinds(&session),
+            vec!["provider_route_initial", "message", "turn_terminal"],
+            "the recorded input keeps a terminal"
+        );
+
+        // The next turn is staged, as a front-end sends it. It must come back
+        // as itself, not as the previous turn's hook text.
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let ui: Arc<dyn Ui> = Arc::new(NullUi);
+            let (outcome, returned) = run_turn_with_input(
+                &cfg,
+                &mut history,
+                &ui,
+                &child_cancel,
+                0,
+                Message::user_text("the next thing I typed"),
+            )
+            .await;
+            (outcome, returned, history)
+        });
+        tokio::time::timeout(Duration::from_secs(2), second_started_rx)
+            .await
+            .expect("second sampling did not start")
+            .expect("second sampling gate dropped");
+        cancel.cancel();
+        let (outcome, returned, history) = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the second turn ignored cancellation")
+            .expect("the second turn panicked");
+        drop(second_release_tx);
+
+        assert_eq!(outcome.reason, EndReason::Aborted);
+        assert_eq!(returned, Some(Message::user_text("the next thing I typed")));
+        assert_eq!(
+            history.messages(),
+            &[Message::user_text("a question the hook colors")]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

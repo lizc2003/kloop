@@ -1114,25 +1114,65 @@ pub fn estimate_tool_def_tokens(tool: &kloop_protocol::ToolDef) -> u64 {
     counter.tokens()
 }
 
+/// What one image costs the context estimate. The APIs bill visual tokens by
+/// the resolution they downscale the image to — low thousands per image — not
+/// by the base64 payload, which inflates 4/3 over the raw bytes. Serializing
+/// the data put a 400 KB screenshot near 130 000 tokens and made an ordinary
+/// conversation look like it was over the window, so a large image triggered
+/// predictive compaction and a `/context` number that was wrong by two orders
+/// of magnitude. The estimate only feeds overflow prediction, where erring high
+/// is harmless; decoding every header on every round would not buy enough to
+/// pay for itself.
+pub const ESTIMATED_IMAGE_TOKENS: u64 = 1600;
+
 /// [`TokenCounter`] over the provider-visible message form. Internal replay
 /// provenance is persisted with history but never enters the provider prompt,
-/// so it must not inflate context estimates.
+/// so it must not inflate context estimates. Images are counted at
+/// [`ESTIMATED_IMAGE_TOKENS`] each and their `data` is never serialized, at the
+/// top level or inside a tool result's block list.
 pub fn estimate_message_tokens(message: &Message) -> u64 {
-    #[derive(serde::Serialize)]
-    struct ProviderMessage<'a> {
-        role: Role,
-        content: &'a [ContentBlock],
-    }
-
     // Count while serializing, without materializing the string — this runs
     // per message on every predictive-overflow check and every compaction
     // candidate.
-    let provider_message = ProviderMessage {
-        role: message.role,
-        content: &message.content,
-    };
     let mut counter = TokenCounter::default();
-    serde_json::to_writer(&mut counter, &provider_message).map_or(0, |()| counter.tokens())
+    let mut images = 0u64;
+    let _ = serde_json::to_writer(&mut counter, &message.role);
+    for block in &message.content {
+        count_block_tokens(&mut counter, block, &mut images);
+    }
+    counter.tokens() + images * ESTIMATED_IMAGE_TOKENS
+}
+
+fn count_block_tokens(counter: &mut TokenCounter, block: &ContentBlock, images: &mut u64) {
+    match block {
+        ContentBlock::Image { .. } => *images += 1,
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content: ToolResultContent::Blocks(blocks),
+            is_error,
+        } => {
+            #[derive(serde::Serialize)]
+            struct Head<'a> {
+                tool_use_id: &'a str,
+                content: [(); 0],
+                is_error: bool,
+            }
+            let _ = serde_json::to_writer(
+                &mut *counter,
+                &Head {
+                    tool_use_id,
+                    content: [],
+                    is_error: *is_error,
+                },
+            );
+            for block in blocks {
+                count_block_tokens(counter, block, images);
+            }
+        }
+        other => {
+            let _ = serde_json::to_writer(counter, other);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1230,22 +1270,57 @@ mod tests {
         assert_eq!(counter.tokens(), 1);
     }
 
-    /// ASCII-only content — code, English, base64 image data — is estimated
-    /// exactly as the old bytes/4 rule did, so only non-ASCII text moves.
+    /// An image is context at the cost of what the model sees, not of its
+    /// base64 payload: the same picture at 100× the bytes costs the same, and
+    /// the difference from the text-only message is the fixed per-image charge.
+    /// A tool result's nested image is charged the same way and its payload is
+    /// never serialized.
     #[test]
-    fn ascii_messages_keep_the_bytes_over_four_estimate() {
-        let message = Message::user_with_blocks(
-            "look at this",
-            vec![ContentBlock::Image {
-                source: kloop_protocol::ImageSource::Base64 {
-                    media_type: "image/png".into(),
-                    data: "iVBORw0KGgo".repeat(100),
-                },
-            }],
+    fn images_cost_a_fixed_estimate_not_their_payload() {
+        let image = |data: String| ContentBlock::Image {
+            source: kloop_protocol::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data,
+            },
+        };
+        let small = Message::user_with_blocks("look at this", vec![image("iVBORw0KGgo".into())]);
+        let large =
+            Message::user_with_blocks("look at this", vec![image("iVBORw0KGgo".repeat(100_000))]);
+        assert_eq!(
+            estimate_message_tokens(&small),
+            estimate_message_tokens(&large)
         );
-        let json = serde_json::json!({"role": message.role, "content": message.content});
-        let bytes = serde_json::to_string(&json).unwrap().len() as u64;
-        assert_eq!(estimate_message_tokens(&message), bytes.div_ceil(4));
+        assert_eq!(
+            estimate_message_tokens(&large),
+            estimate_message_tokens(&Message::user_text("look at this")) + ESTIMATED_IMAGE_TOKENS
+        );
+
+        let nested = Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "rendered".into(),
+                },
+                image("iVBORw0KGgo".repeat(100_000)),
+            ]),
+            is_error: false,
+        }]);
+        let nested_small = Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: ToolResultContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "rendered".into(),
+                },
+                image("iVBORw0KGgo".into()),
+            ]),
+            is_error: false,
+        }]);
+        assert_eq!(
+            estimate_message_tokens(&nested),
+            estimate_message_tokens(&nested_small),
+            "a nested image's base64 data must not be counted"
+        );
+        assert!(estimate_message_tokens(&nested) < 2_000);
     }
     use kloop_protocol::Role;
 

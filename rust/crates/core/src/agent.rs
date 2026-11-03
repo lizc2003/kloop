@@ -285,6 +285,11 @@ async fn run_turn_with_options(
     } else {
         cfg.agent_type()
     };
+    // Read before the pre-turn hook stages its own context: only an input the
+    // caller staged is the turn the front end can still take back. A run_turn
+    // caller records its message itself, and an interrupt then must not read
+    // the hook context as "the input is still staged".
+    let input_staged = history.has_staged();
     let start = if agent.is_empty() {
         cfg.hooks.pre_turn(&cfg.session_id, ui.as_ref()).await
     } else {
@@ -345,16 +350,25 @@ async fn run_turn_with_options(
             .await
     };
     // A turn the user interrupted before the model produced anything is a turn
-    // that did not happen. Its input is still staged — nothing has been written
-    // all turn, because every write commits the stage first — so the session
-    // file has no record of it, and writing a terminal (or the stop hook's
-    // context) here would both commit that input and leave an `aborted` line
-    // standing for a turn with no content. Two interrupts stay on the recorded
-    // path: an `Error` is worth keeping ("this one failed" is history), and an
-    // interrupt with steering queued behind it must keep the message that
-    // steering answers.
-    if outcome.reason == EndReason::Aborted && history.has_staged() && cfg.inbox.is_empty() {
-        return outcome;
+    // that did not happen. Its input is still staged — the hook context staged
+    // above is not what this asks about — so the session file has no record of
+    // it, and writing a terminal (or the stop hook's context) here would both
+    // commit that input and leave an `aborted` line standing for a turn with no
+    // content. Two interrupts stay on the recorded path: an `Error` is worth
+    // keeping ("this one failed" is history), and an interrupt with steering
+    // queued behind it must keep the message that steering answers.
+    if outcome.reason == EndReason::Aborted && cfg.inbox.is_empty() {
+        if input_staged && history.has_staged() {
+            return outcome;
+        }
+        if !input_staged {
+            // The caller recorded the input itself, so this turn did happen and
+            // is about to get its terminal. The pre-turn hook context underneath
+            // never reached a request; leaving it staged would prepend it to the
+            // next turn, and hand it back as that turn's input if the next one
+            // is interrupted.
+            history.take_staged();
+        }
     }
     for text in stop_context {
         history.record(Message::injected(Injected::Hook, text));
@@ -504,11 +518,21 @@ struct Turn<'a> {
     /// Cut-off text from truncated rounds, prepended to the final answer so a
     /// truncated-then-continued turn returns the whole deliverable.
     truncated_prefix: String,
+    /// Set when a tool-use round interrupts a truncation chain. The cut-off
+    /// text then lives in [`Turn::produced_text`] together with the tool
+    /// round's own text, so the answer must be assembled from there rather
+    /// than by prefixing only the last round's text.
+    truncation_broken: bool,
     /// Turn-unique counter for streamed assistant/reasoning item ids (`msg-N`,
     /// `reasoning-N`): owned here so ids don't reset each round.
     item_seq: u64,
     rounds: usize,
     structured_failures: usize,
+    /// A validated `structured_output` value already accepted this turn. Late
+    /// work can pull the turn into another round after the model delivered; the
+    /// value stays here so an EndTurn without a fresh call still completes with
+    /// what the model already produced, instead of spending a failure nudge.
+    accepted_structured: Option<Value>,
     /// Everything the assistant said across the turn's rounds. Every exit inside
     /// the loop hands this back, because the caller — a parent agent, most of all
     /// — receives only `final_text`, and an empty string there is indistinguishable
@@ -610,7 +634,12 @@ impl Turn<'_> {
 
     /// Reactive: the provider rejected the request for size. Compact once per
     /// turn and retry; a second overflow is an error.
-    async fn recover_from_overflow(&mut self, round: usize) -> RoundStep {
+    async fn recover_from_overflow(&mut self, round: usize, estimated: u64) -> RoundStep {
+        // The rejected request is the only true reading of the window this
+        // session gets from the main path; record it before anything else so
+        // the next predictive check stops aiming at a configured number the
+        // provider has already refused.
+        self.history.note_overflow_at(estimated);
         if self.cfg.context_window.is_none() || self.overflow_compact_attempted {
             return RoundStep::Stop(Ending {
                 reason: EndReason::Error(
@@ -709,10 +738,11 @@ impl Turn<'_> {
         &mut self,
         sampled: Sampled,
         round: usize,
+        estimated: u64,
     ) -> std::result::Result<SampleOk, RoundStep> {
         match sampled {
             Sampled::Ok(ok) => Ok(ok),
-            Sampled::Overflow => Err(self.recover_from_overflow(round).await),
+            Sampled::Overflow => Err(self.recover_from_overflow(round, estimated).await),
             Sampled::Cancelled {
                 partial,
                 produced_nothing,
@@ -861,6 +891,17 @@ impl Turn<'_> {
             }
             AssistantOutcome::EndTurn => {
                 if self.options.structured_schema.is_some() {
+                    if let Some(value) = self.accepted_structured.take() {
+                        // A value was already validated this turn; the model
+                        // spent the extra round answering late work and now says
+                        // it is done. That is a delivery, not a miss.
+                        return Some(RoundStep::Stop(Ending {
+                            reason: EndReason::Completed,
+                            text: None,
+                            rounds: round + 1,
+                            structured: Some(value),
+                        }));
+                    }
                     return Some(self.nudge_structured(
                         "structured output was not produced after 3 attempts",
                         round,
@@ -874,7 +915,11 @@ impl Turn<'_> {
                     return Some(step);
                 }
                 let round_text = text_content(blocks);
-                let final_text = if self.truncated_prefix.is_empty() {
+                let final_text = if self.truncation_broken {
+                    // A tool round stood between the cut-off text and this one;
+                    // `produced_text` holds every segment in order.
+                    self.produced_text.clone()
+                } else if self.truncated_prefix.is_empty() {
                     round_text
                 } else {
                     format!("{}{round_text}", self.truncated_prefix)
@@ -886,7 +931,18 @@ impl Turn<'_> {
                     structured: None,
                 }))
             }
-            AssistantOutcome::ToolUse => None,
+            AssistantOutcome::ToolUse => {
+                if !self.truncated_prefix.is_empty() {
+                    // The continuation ended in a tool call instead of more
+                    // text: the chain is over. Both cut-off halves are already
+                    // in `produced_text` with the tool round's own text, so
+                    // keeping the prefix here would stitch old text onto
+                    // whatever the turn finally says and drop the round between.
+                    self.truncated_prefix.clear();
+                    self.truncation_broken = true;
+                }
+                None
+            }
         }
     }
 
@@ -1000,6 +1056,7 @@ impl Turn<'_> {
             });
         }
         if let Some(value) = structured_output {
+            self.accepted_structured = Some(value);
             if let Some(step) = self.keep_going_for_late_work() {
                 return step;
             }
@@ -1007,7 +1064,7 @@ impl Turn<'_> {
                 reason: EndReason::Completed,
                 text: None,
                 rounds: round + 1,
-                structured: Some(value),
+                structured: self.accepted_structured.take(),
             });
         }
         if self.options.structured_schema.is_some() {
@@ -1059,9 +1116,11 @@ async fn turn_rounds(
         truncation_recoveries: 0,
         stream_resumes: 0,
         truncated_prefix: String::new(),
+        truncation_broken: false,
         item_seq: 0,
         rounds: 0,
         structured_failures: 0,
+        accepted_structured: None,
         produced_text: String::new(),
     };
     let ending = 'turn: loop {
@@ -1148,7 +1207,7 @@ async fn turn_rounds(
             usage,
             outcome,
             invalid_tool_inputs,
-        } = match turn.settle_sample(sampled, round).await {
+        } = match turn.settle_sample(sampled, round, estimated).await {
             Ok(ok) => ok,
             Err(RoundStep::Retry) => continue,
             Err(RoundStep::Stop(ending)) => break 'turn ending,

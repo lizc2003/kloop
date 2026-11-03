@@ -1,5 +1,23 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 250 ✅：agent 主循环与上下文估算（2026-11-03）**：`run_turn` 在 stage pre_turn
+hook 上下文之前记下 `input_staged`；“整 turn 撤回”现在要求输入确实仍是 staged
+（`input_staged && has_staged()`），调用方已自己 `record` 输入时不再把 hook 上下文误当成
+可撤回输入：中断照样写 terminal，并丢掉这一轮 stage 的 hook 上下文，下一轮
+`take_staged().next()` 拿回的是用户新输入。图片估算改为每张固定 1600 token，
+`ContentBlock::Image`（含 tool_result Blocks 内嵌图）不再序列化 base64；`/context`、
+预测压缩与 `keep_from_index` 同步回落。主请求 `Sampled::Overflow` 现在把本轮 `estimated`
+写进 `note_overflow_at`，实测上限不再只由摘要请求提供。截断续写链被带文字的工具轮打断时
+清空 `truncated_prefix` 并标记，EndTurn 改用逐轮累积的 `produced_text`，A／文字+tool／C
+不再丢 B 或粘成 AC。`shrink_to_newest` 退到 0 时把首个 assistant tool_use 及其
+tool_result 整体丢掉再继续，只有请求本身就是这一对才报“无法再缩”。结构化 turn 校验
+通过的值存入 `accepted_structured`，迟到消息把 turn 拉进下一轮后若模型直接 EndTurn，
+仍以该值 Completed，不再消耗失败次数。新增 6 条回归（其中 3 条在 HEAD 的 `agent.rs`
+上先红：hook 上下文残留、A/B+tool/C、结构化值丢失）；外层执行沙箱之外 `make check`
+全绿（fmt、clippy、workspace 全量测试，core 1312 项、TUI 314 项、TUI PTY 25、
+plain PTY 8，本机 parity baseline verified）。DESIGN 更新估算、溢出上限、撤回语义、
+截断拼接与结构化输出段落。Linux 与 Windows 未实测。教训 309、310、311。
+
 **Plan 249 ✅：资源守卫与工具 future 可丢弃契约（2026-11-03）**：core 新增
 `cleanup::RemoveFileOnDrop`（创建即生效、成功 `disarm`），后台 bash 的 `bg-*.out`、
 rewind 的 fork 分支与 server `thread/fork` 的 fork 文件都由它兜住失败出口；rewind 的
@@ -4074,3 +4092,20 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    删除权应由已确认的成功建立，不能靠某个返回出口补救。回归分别覆盖返回错误和丢弃
    future：暂停竞争败方、让另一创建者写入文件，再取消败方并等待 tracker，核对成功方
    的文件内容与分支仍在；只检查正常错误返回的测试不能代表取消出口。
+
+309. **`staged` 在同一个 `History` 上表示两件事：本轮的输入，和 hook 输出的上下文。** 判断
+   “这一轮是不是没发生”只能问前者：`has_staged()` 在 `run_turn` 的调用方先 `record`
+   了输入后仍会因 hook 上下文为真，于是终止行被跳过、hook 文本留到下一轮，被
+   `take_staged().next()` 当成输入还给用户。入口处记下 `input_staged`，并且还要再查一次
+   `has_staged()`：轮内一旦有输出，stage 已被提交，此时 abort 是真实的一轮。两类调用方
+   （自己记输入的 `run_turn`、stage 输入的 `run_turn_with_input`）都要有回归。
+
+310. **上下文估算要模拟计费，不要模拟线缆字节。** 图片按 base64 原样序列化会让 400 KB
+   的截图估成十几万 token，预测压缩、`keep_from_index`、`/context` 一起虚高；API 按
+   降采样后的视觉分辨率计费，固定按每图 1600 估比读头部换来的精度更值。凡是“把请求
+   序列化一遍再数”的估算，都要先问这个块在 provider 那里按什么计费。
+
+311. **分段文本的拼接要跟踪来源，不要用“前缀 + 最后一轮”。** 截断续写链的前提是下一轮
+   只返回剩余部分；一旦中间夹了带文字的工具轮，这个前提就没了，前缀式拼接会丢掉工具
+   轮的文字并把两段无关的文粘在一起。链在工具轮处结束，最终答案改用逐轮累积的
+   `produced_text`；单测直接钉 A／文字+tool／C 的顺序与分隔。

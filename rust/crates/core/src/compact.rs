@@ -15,6 +15,7 @@ use kloop_protocol::AssistantOutcome;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::Injected;
 use kloop_protocol::Message;
+use kloop_protocol::Role;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
 
@@ -685,6 +686,9 @@ fn is_overflow(error: &anyhow::Error) -> bool {
 /// on. Returns how many were dropped. Never empties the slice — a request of
 /// zero messages has nothing to summarize.
 fn shrink_to_newest(request: &mut Vec<Message>, target: u64) -> usize {
+    if request.len() < 2 {
+        return 0;
+    }
     let mut keep_from = request.len();
     let mut kept = 0u64;
     while keep_from > 1 {
@@ -703,7 +707,26 @@ fn shrink_to_newest(request: &mut Vec<Message>, target: u64) -> usize {
         keep_from -= 1;
     }
     if keep_from == 0 {
-        return 0;
+        // The boundary retreated past the request's first message: what was
+        // being kept starts with a tool_result whose issuing assistant is
+        // `request[0]`. Drop that pair (and any sibling tool_results it issued)
+        // and keep going — it is the oldest thing here, and dropping it is what
+        // "newest" asks for. Only a request that *is* the pair has nothing left
+        // to shrink.
+        let leading_pair = request[0].role == Role::Assistant
+            && request[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        let mut drop = if leading_pair { 1 } else { 0 };
+        while drop < request.len() && starts_with_tool_result(&request[drop]) {
+            drop += 1;
+        }
+        if drop == 0 || drop >= request.len() {
+            return 0;
+        }
+        request.drain(..drop);
+        return drop;
     }
     request.drain(..keep_from);
     keep_from
@@ -2183,6 +2206,28 @@ cause\n</focus>"
         assert!(!predicted_overflow(1_900, growth, 2_000));
     }
 
+    /// The payload of an image is not context: one 400 KB picture in the
+    /// history must not look like a window that has to be compacted.
+    #[test]
+    fn a_large_image_does_not_predict_overflow() {
+        let dir = std::env::temp_dir().join(format!("kloop-image-{}", std::process::id()));
+        let mut history = History::new(dir);
+        history.record(Message::user_with_blocks(
+            "look at this",
+            vec![ContentBlock::Image {
+                source: kloop_protocol::ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo".repeat(50_000),
+                },
+            }],
+        ));
+        let estimated = history.estimated_tokens();
+        assert!(
+            !predicted_overflow(estimated, max_turn_growth(8_192), 200_000),
+            "one image estimated at {estimated} tokens must fit a 200k window"
+        );
+    }
+
     #[test]
     fn keep_boundary_never_splits_a_tool_pair() {
         let tool_use = Message::assistant(vec![ContentBlock::ToolUse {
@@ -2210,5 +2255,45 @@ cause\n</focus>"
         // on the tool_result (index 2) with its tool_use (index 1) dropped.
         assert_ne!(keep_from, 2, "boundary would orphan the tool_result");
         assert!(keep_from >= 1);
+    }
+
+    /// A refused summary request is shrunk from the newest end. When the budget
+    /// lands on a tool_result whose issuing assistant is the request's first
+    /// message, the boundary retreats to 0 — that pair is the oldest thing
+    /// there, so dropping it whole leaves a request that can still be
+    /// summarized. Before, this returned "nothing dropped" and the turn died.
+    #[test]
+    fn shrinking_past_a_leading_tool_pair_keeps_going() {
+        let assistant = Message::assistant(vec![ContentBlock::ToolUse {
+            id: "t1".into(),
+            name: "bash".into(),
+            input: json!({"command": "cat big.log"}),
+        }]);
+        let result = Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "x".repeat(4_000).into(),
+            is_error: false,
+        }]);
+        let newest = Message::user_text("current request");
+        let mut request = vec![assistant, result.clone(), newest.clone()];
+        // The tail fits, the tool result is refused, so the walk stops with only
+        // the assistant left to keep; pairing then pulls the boundary to 0.
+        let target = crate::history::estimate_message_tokens(&result)
+            + crate::history::estimate_message_tokens(&newest);
+        assert_eq!(shrink_to_newest(&mut request, target), 2);
+        assert_eq!(request, vec![newest]);
+
+        // The pair alone is the whole request: there is nothing left to
+        // summarize, and the caller should hear that instead of a silent no-op.
+        let mut only_pair = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "bash".into(),
+                input: json!({"command": "ls"}),
+            }]),
+            result,
+        ];
+        assert_eq!(shrink_to_newest(&mut only_pair, 0), 0);
+        assert_eq!(only_pair.len(), 2, "an unshrinkable request is untouched");
     }
 }
