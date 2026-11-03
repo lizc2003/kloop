@@ -45,9 +45,9 @@ pub fn expand_tilde(raw: &str, home: Option<&Path>) -> PathBuf {
 }
 
 /// `path` with the process home directory written as `~`, for banners and
-/// listings. `$HOME` is deliberately not consulted: kloop's path decisions use
-/// the process home, and a display that disagreed with them would name a
-/// directory the session is not actually in.
+/// listings. This uses `std::env::home_dir()` like the rest of kloop — on Unix
+/// that reads `$HOME`, on Windows `USERPROFILE` — so the banner names the same
+/// home the permission layer judged.
 pub fn display_with_tilde(path: &Path) -> String {
     display_with_tilde_at(path, std::env::home_dir().as_deref())
 }

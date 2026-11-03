@@ -1575,8 +1575,8 @@ The session opens with a **banner** (plan 38 slice 6, a rounded brand-coloured
 box): `>_ kloop` — with the build stamp dim beside the title, `v0.1.0 (2319ea3)`
 (plan 161) — over the model, cwd, git branch, and starting mode, then it
 scrolls into scrollback as the conversation grows. The cwd contracts the process
-home directory (`std::env::home_dir`, not `$HOME`) to `~`, so the header stays
-short and names the same home the permission layer judged. The stamp is the crate
+home directory (`std::env::home_dir()`, the same lookup the permission layer
+uses) to `~`, so the header stays short. The stamp is the crate
 version plus the commit `crates/cli/build.rs` embedded at compile time, so a
 running kloop says which source it was built from; the sha names the commit the
 build sat on, not a claim that the tree was clean. Outside a checkout there is

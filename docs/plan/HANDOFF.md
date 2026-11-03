@@ -4,8 +4,8 @@
 `char_prefix` / `clip_chars` / `hex_lower`，core 新增 `paths::{lexically_normalize,
 expand_tilde, display_with_tilde}`。十多处按字符截断、六处 hex、三份路径规范化、
 CLI import 与沙箱的 `~` 展开都改调共享实现；notebook/history/closest/web 的复制
-删除。`context.rs` 改用 `str::floor_char_boundary`（1.98.1 已稳定），两处调用先把
-上限夹到 `len`。`resource_id::replace_atomically` 合并 session label 与
+删除。`context.rs` 改用 `str::floor_char_boundary`（1.98.1 已稳定），越界或非字符边界
+的索引由标准库回退到最近的边界。`resource_id::replace_atomically` 合并 session label 与
 `info/exclude` 两处原子替换，并沿用目标已有权限位——`.git/info/exclude` 不再从
 0644 变成 0600；该回归在关闭 `set_permissions` 的版本上先红。`ScheduledOrigin`
 并入 `ScheduledTaskOrigin::label()`，`id_prefix` 删除，skills 描述截断共用
@@ -4005,11 +4005,12 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    记住：统一入口只覆盖它明确列出的输入；测试夹具原有的 `env_clear`、空 `core.hooksPath`
    是独立契约，删掉后 `GIT_TEMPLATE_DIR` 这类没进名单的宿主输入仍会漏进来。
 
-302. **换标准库实现时，边界条件也要一起换。** `str::floor_char_boundary(index)` 接收索引，
-   在 `index > len` 时 panic；旧的自写 helper 先比较 `s.len() <= max` 再直接返回。把
-   `truncate_at_char_boundary(s, max)` 机械替换成 `s.floor_char_boundary(max)`，短输入
-   (预算大于内容)会炸，只有超长输入的回归反而全绿。判据：被替换函数的契约包括它接受的
-   定义域；共享 helper 的回归要同时覆盖超限与未超限两种输入。
+302. **换标准库实现前先把它的定义域量一遍，不要凭印象补防御。** 把
+   `truncate_at_char_boundary` 换成 `str::floor_char_boundary` 时，因为以为
+   `index > len` 会 panic，额外加了 `.min(len)`；实测 1.98.1 在 `index >= len` 时直接
+   返回 `len`，这层夹取只是冗余代码，却让实现、注释和教训一起假设了一个不存在的契约。
+   判据：替换 helper 时先在空串、恰好 `len`、超过 `len`、多字节中间各跑一次，再决定
+   是否需要防御；标准库文档或实测才是契约，不是记忆。
 
 303. **原子替换的权限来自目标，不来自临时文件。** `create_file` 以 0600 建临时文件，
    `rename` 会把这个 mode 一起带过去；用它覆盖用户拥有的文件(如 `.git/info/exclude`)

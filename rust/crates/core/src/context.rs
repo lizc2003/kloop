@@ -225,9 +225,7 @@ pub fn assemble_system(base: &str, env: &EnvInfo, git: Option<&GitInfo>) -> Stri
         git_repo = env.is_git_repo,
     );
     if let Some(git) = git {
-        let status = &git.status[..git
-            .status
-            .floor_char_boundary(GIT_STATUS_MAX_BYTES.min(git.status.len()))];
+        let status = &git.status[..git.status.floor_char_boundary(GIT_STATUS_MAX_BYTES)];
         let status = match status {
             s if s.len() < git.status.len() => format!("{s}\n…[status truncated]"),
             "" => "(clean)".to_string(),
@@ -263,7 +261,7 @@ pub fn assemble_instructions(files: &[InstructionFile], max_bytes: usize) -> Ass
             ));
             continue;
         }
-        let kept = &content[..content.floor_char_boundary(remaining.min(content.len()))];
+        let kept = &content[..content.floor_char_boundary(remaining)];
         if kept.len() < content.len() {
             warnings.push(format!(
                 "instructions budget ({max_bytes} bytes) exceeded; truncated {}",

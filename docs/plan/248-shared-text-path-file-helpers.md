@@ -58,8 +58,8 @@
   notebook 的 `char_prefix_owned`、history 的 `clipped`、closest 的 `quoted`、web 的
   `truncate_chars` 都改成调用它；七处“先数字符再拼后缀”同改。
 - `str::floor_char_boundary` 在 1.98.1 可用；`tools/inject.rs` 的自写版本已在 plan 246
-  删除，本轮只剩 `context.rs` 一处。上限要先夹到 `len`——标准库在 `index > len` 时 panic，
-  旧 helper 是先比较长度。
+  删除，本轮只剩 `context.rs` 一处。`index >= len` 时标准库直接返回 `len`，不需要先
+  夹取上限。
 - `resource_id::replace_atomically` 合并 session label 与 `info/exclude` 两处；
   `scheduler/store.rs` 与 `run_store` 仍保留各自的私有打开/目录 fsync 变体(按“不强求”)。
 - 路径规范化搬到 `core::paths::lexically_normalize`，`file_state`、权限事实与 CLI 的
