@@ -410,7 +410,10 @@ the `min`** — if it took part, declaring a real 1M window would still compact 
 200000. A window set too low is invisible (it just compacts earlier than it had
 to); a window set too high costs one rejected request — the turn's own sampling
 or a compaction summary, whichever hits it first — before the measured ceiling
-takes over for the rest of the session.
+takes over for the rest of the session. The sampling path measures the request
+it actually sends: after predictive compaction has rewritten history and the
+step-boundary reminders are in, so the ceiling describes what the provider
+refused rather than the pre-compaction estimate.
 
 `[models."<id>"]` may also declare `efforts`, the reasoning levels that model
 accepts. Omitting the key declares nothing and every level is allowed — the
@@ -4258,7 +4261,10 @@ Workflow promise rather than falling back to unvalidated text. A valid value
 ends the child turn and reaches JavaScript as its native JSON type. A value
 accepted just before late work pulls the child into another round is kept with
 the turn: if the model then ends without calling the tool again, that value is
-the result rather than a missed-delivery nudge. This
+the result rather than a missed-delivery nudge. That final ending drains late
+work before taking the value, so a message that lands during the closing
+sampling is answered instead of being completed past and then dropped when the
+child's lease closes. This
 synthetic tool never appears in the main registry, `run_program`, a frontend
 capability, or an ordinary child without `schema`.
 
@@ -5096,11 +5102,12 @@ cargo run -- --mock
 # output cap with none spent all of it reasoning, which the next request may not
 # see (one gateway was measured not counting it as input), so asking again only
 # redraws the round. It ends the turn instead, as its own error naming the cap,
-# keeping whatever text earlier rounds produced. Cut-off segments are stitched
-# in order without separators only while each next round is a pure
-# continuation; a tool-use round ends that chain, so the answer is assembled
-# from every round's recorded text instead of prefixing the last round (which
-# used to drop the tool round's text and glue the other two together). A truncated Responses terminal (incomplete_details.reason length or
+# keeping whatever text earlier rounds produced. The answer is accumulated as
+# segments: a round that follows a truncation nudge (or stream resume) appends
+# to the last segment without a separator, any other round starts a new
+# paragraph. Success and error exits both return that accumulated text, so a
+# tool round between the halves neither drops its own text nor rewrites the
+# concatenation of the cut-off pieces. A truncated Responses terminal (incomplete_details.reason length or
 # max_output_tokens — one event, two vendor spellings) is an output limit, and
 # the complete tool calls such a response already emitted still dispatch as
 # ToolUse, since truncation lands on item boundaries and those calls carry the

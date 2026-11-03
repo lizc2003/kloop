@@ -6,17 +6,21 @@ hook 上下文之前记下 `input_staged`；“整 turn 撤回”现在要求输
 可撤回输入：中断照样写 terminal，并丢掉这一轮 stage 的 hook 上下文，下一轮
 `take_staged().next()` 拿回的是用户新输入。图片估算改为每张固定 1600 token，
 `ContentBlock::Image`（含 tool_result Blocks 内嵌图）不再序列化 base64；`/context`、
-预测压缩与 `keep_from_index` 同步回落。主请求 `Sampled::Overflow` 现在把本轮 `estimated`
-写进 `note_overflow_at`，实测上限不再只由摘要请求提供。截断续写链被带文字的工具轮打断时
-清空 `truncated_prefix` 并标记，EndTurn 改用逐轮累积的 `produced_text`，A／文字+tool／C
-不再丢 B 或粘成 AC。`shrink_to_newest` 退到 0 时把首个 assistant tool_use 及其
+预测压缩与 `keep_from_index` 同步回落。主请求 `Sampled::Overflow` 现在把请求
+真正发出前的 `estimated` 写进 `note_overflow_at`（预测压缩与轮首提醒之后重算），
+实测上限不再只由摘要请求提供，也不再记录压缩前的尺寸。文本统一成
+`answer_segments` + `answers_continue`：紧跟截断/流恢复的轮次直接续接，其余轮次另起一段，
+成功与错误出口都从同一份 `deliverable_text()` 取结果，A1/A2/B+tool/C 保留
+`A1A2B\n\nC`，reasoning-only 的失败出口也不再丢已产出文本。
+`shrink_to_newest` 退到 0 时把首个 assistant tool_use 及其
 tool_result 整体丢掉再继续，只有请求本身就是这一对才报“无法再缩”。结构化 turn 校验
 通过的值存入 `accepted_structured`，迟到消息把 turn 拉进下一轮后若模型直接 EndTurn，
-仍以该值 Completed，不再消耗失败次数。新增 6 条回归（其中 3 条在 HEAD 的 `agent.rs`
-上先红：hook 上下文残留、A/B+tool/C、结构化值丢失）；外层执行沙箱之外 `make check`
-全绿（fmt、clippy、workspace 全量测试，core 1312 项、TUI 314 项、TUI PTY 25、
+仍以该值 Completed；结束取缓存值前还要再走一次 `keep_going_for_late_work()`，关闭
+采样期到达的消息而不是越过它。新增 6 条首轮回归（3 条在当时的 `agent.rs` 上先红）
+与审查后 4 条回归（在上一提交上均先红）；外层执行沙箱之外 `make check`
+全绿（fmt、clippy、workspace 全量测试，core 1316 项、TUI 314 项、TUI PTY 25、
 plain PTY 8，本机 parity baseline verified）。DESIGN 更新估算、溢出上限、撤回语义、
-截断拼接与结构化输出段落。Linux 与 Windows 未实测。教训 309、310、311。
+截断拼接与结构化输出段落。Linux 与 Windows 未实测。教训 309–313。
 
 **Plan 249 ✅：资源守卫与工具 future 可丢弃契约（2026-11-03）**：core 新增
 `cleanup::RemoveFileOnDrop`（创建即生效、成功 `disarm`），后台 bash 的 `bg-*.out`、
@@ -4107,5 +4111,15 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
 
 311. **分段文本的拼接要跟踪来源，不要用“前缀 + 最后一轮”。** 截断续写链的前提是下一轮
    只返回剩余部分；一旦中间夹了带文字的工具轮，这个前提就没了，前缀式拼接会丢掉工具
-   轮的文字并把两段无关的文粘在一起。链在工具轮处结束，最终答案改用逐轮累积的
-   `produced_text`；单测直接钉 A／文字+tool／C 的顺序与分隔。
+   轮的文字。用“片段 + 续接标志”累积：紧跟截断或流恢复的轮次直接接上，其余另起一段，
+   成功与错误出口共用同一份结果；单测钉 A1/A2/B+tool/C = `A1A2B\n\nC`。
+
+312. **同一份事实不要维护两份派生状态。** `truncated_prefix`、`produced_text`、
+   `truncation_broken` 三份状态在工具轮、错误出口和续接之间很容易各说各话；收敛成一个
+   片段列表加一个“下一轮是否续接”的标志后，拼接规则只有一个入口，成功、截断耗尽、
+   流失败、取消都读同一个 `deliverable_text()`。审查要专门走一遍每个 exit，确认它们
+   看到的是同一份文本。
+
+313. **被拒绝请求的尺寸必须在请求真正发出前量。** 预测压缩会改写 history，轮首提醒还会
+   追加消息；在压缩前算出的 `estimated` 记录成窗口上限，等于拿一个从未发出的尺寸当
+   测量值。任何“失败后记录当前大小”的路径，都要在最后一次可能改变内容的步骤之后重算。

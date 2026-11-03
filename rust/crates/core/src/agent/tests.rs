@@ -1093,6 +1093,92 @@ async fn an_accepted_structured_value_survives_late_work() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
+/// The cached value must not short-circuit the late-work check on the round
+/// that actually ends the turn. A message that arrives during that final
+/// sampling has to be answered; otherwise the turn completes past it and the
+/// child's lease closes with it undeliverable.
+#[tokio::test]
+async fn an_accepted_structured_value_still_answers_a_late_message() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    struct SteerOnToolAndText {
+        inbox: Arc<Inbox>,
+        steered_on_tool: AtomicBool,
+        steered_on_text: AtomicBool,
+    }
+    impl Ui for SteerOnToolAndText {
+        fn emit(&self, event: &Event) {
+            match event {
+                Event::ItemStarted {
+                    item: Item::ToolCall { name, .. },
+                    ..
+                } if name == "bash" => {
+                    if !self.steered_on_tool.swap(true, Ordering::SeqCst) {
+                        self.inbox.push(InboxItem::steer("late during the tools"));
+                    }
+                }
+                Event::ItemDelta {
+                    delta: Delta::Text(_),
+                    ..
+                } if !self.steered_on_text.swap(true, Ordering::SeqCst) => {
+                    self.inbox
+                        .push(InboxItem::steer("late during the final sampling"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let schema = json!({
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "required": ["count"],
+        "additionalProperties": false,
+    });
+    let (cfg, seen) = structured_config(vec![
+        MockTurn::Blocks(vec![
+            tool_use_named("s1", "structured_output", json!({"count": 1})),
+            tool_use_named("b1", "bash", json!({"command": "echo hi"})),
+        ]),
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "first ending".into(),
+        }]),
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "second ending".into(),
+        }]),
+    ]);
+    let ui: Arc<dyn Ui> = Arc::new(SteerOnToolAndText {
+        inbox: cfg.inbox.clone(),
+        steered_on_tool: AtomicBool::new(false),
+        steered_on_text: AtomicBool::new(false),
+    });
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("produce structured output"));
+
+    let outcome = run_structured_turn(
+        &cfg,
+        &mut history,
+        &ui,
+        &CancellationToken::new(),
+        0,
+        schema,
+    )
+    .await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.rounds, 3, "the late message must buy a third round");
+    assert_eq!(outcome.structured_output, Some(json!({"count": 1})));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert!(history.messages().iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("late during the final sampling")))
+    }));
+    assert!(cfg.inbox.is_empty(), "the late message was answered");
+}
+
 #[tokio::test]
 async fn structured_turn_cancellation_never_accepts_a_late_value() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1592,6 +1678,46 @@ async fn overflow_compacts_and_retries() {
     assert!(text.starts_with(crate::compact::SUMMARY_PREFIX));
 }
 
+/// The ceiling recorded from a rejection must describe the request the provider
+/// actually refused. Predictive compaction runs before that request is built,
+/// so an estimate taken before it overstates the compacted request by the whole
+/// folded prefix — and a summary request that never overflows adds no second
+/// measurement to correct it.
+#[tokio::test]
+async fn a_rejection_after_predictive_compaction_records_the_compacted_size() {
+    use kloop_provider::MockTurn;
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Blocks(vec![AssistantBlock::Text {
+            text: "summary".into(),
+        }]),
+        MockTurn::Overflow,
+    ]);
+    let cfg = compaction_cfg(provider, 30_000, "measured-after-predictive");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let cancel = CancellationToken::new();
+    let mut history = History::new(cfg.offload_dir.clone());
+    let fat = crate::compact::keep_recent_tokens() as usize * 4;
+    history.record(Message::user_text("x".repeat(fat)));
+    history.record(Message::assistant(vec![ContentBlock::Text {
+        text: "y".repeat(fat),
+    }]));
+    history.record(Message::user_text("now answer briefly"));
+    let before = crate::agent::context_estimate(&cfg, &history);
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+
+    // Predictive compaction folds the fat prefix, then the (now small) main
+    // request is rejected. Reactive compaction has nothing left to fold, so the
+    // turn ends there — the measurement is the point of this test.
+    assert!(matches!(outcome.reason, EndReason::Error(_)));
+    let measured = history.effective_window(u64::MAX);
+    assert!(
+        measured < before,
+        "recorded {measured}, which still describes the pre-compaction request \
+         (estimated at {before})"
+    );
+}
+
 /// A second overflow after a successful compaction must surface as an
 /// error instead of looping.
 #[tokio::test]
@@ -1957,11 +2083,10 @@ async fn truncated_response_recovers_with_continuation() {
     );
 }
 
-/// A continuation that ends in a tool call breaks the truncation chain: the
-/// next text is a new segment, not the remainder, and the tool round's own
-/// text sits between them. `final_text` has to carry all three in order —
-/// prefixing the last round with the cut-off half used to drop the tool
-/// round's text and glue the other two together with no separator.
+/// A continuation that ends in a tool call: the round's text is still the
+/// remainder of the cut-off answer (so it joins without a separator), while the
+/// round after the tool call starts a new segment. Dropping the cut-off half
+/// used to glue the last round onto it with no separator and lose the middle.
 #[tokio::test]
 async fn truncation_continued_through_a_tool_round_keeps_every_segment() {
     use kloop_provider::MockTurn;
@@ -1986,8 +2111,69 @@ async fn truncation_continued_through_a_tool_round_keeps_every_segment() {
     assert_eq!(outcome.reason, EndReason::Completed);
     assert_eq!(
         outcome.final_text,
-        "part one, cut off mid-\n\npart two, said while checking\n\npart three, complete."
+        "part one, cut off mid-part two, said while checking\n\npart three, complete."
     );
+    assert_eq!(outcome.rounds, 3);
+}
+
+/// A pure continuation chain stays concatenated even when a tool round sits in
+/// the middle: A1 and A2 are two halves of one answer, B is the remainder that
+/// round returned, and only C starts a new paragraph.
+#[tokio::test]
+async fn a_pure_continuation_chain_stays_concatenated_across_a_tool_round() {
+    use kloop_provider::MockTurn;
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Truncated(text("A1")),
+        MockTurn::Truncated(text("A2")),
+        MockTurn::Blocks(vec![
+            AssistantBlock::Text { text: "B".into() },
+            tool_use("t1", "echo hi"),
+        ]),
+        MockTurn::Blocks(text("C")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "truncation-chain-tool");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("write it in pieces"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "A1A2B\n\nC");
+    assert_eq!(outcome.rounds, 4);
+}
+
+/// An error exit is a deliverable too. Once a tool round has broken the
+/// truncation chain, a later round that spends its whole cap reasoning must not
+/// return an empty string — the cut-off halves and the tool round's text were
+/// already produced and belong to the caller.
+#[tokio::test]
+async fn a_broken_truncation_chain_survives_a_reasoning_only_error() {
+    use kloop_provider::MockTurn;
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Truncated(text("first half ")),
+        MockTurn::Blocks(vec![
+            AssistantBlock::Text {
+                text: "second half ".into(),
+            },
+            tool_use("t1", "echo hi"),
+        ]),
+        MockTurn::Truncated(thought("let me re-read everything")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "truncation-tool-reasoning");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("write and check"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(
+        outcome.reason,
+        EndReason::Error(TurnError::OutputSpentOnReasoning {
+            max_output_tokens: 8_192
+        })
+    );
+    assert_eq!(outcome.final_text, "first half second half ");
     assert_eq!(outcome.rounds, 3);
 }
 

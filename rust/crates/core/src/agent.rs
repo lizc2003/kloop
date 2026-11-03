@@ -515,14 +515,20 @@ struct Turn<'a> {
     /// How many times a retryable stream error was resumed in this turn.
     /// Bounded so a persistently failing upstream still terminates the turn.
     stream_resumes: u32,
-    /// Cut-off text from truncated rounds, prepended to the final answer so a
-    /// truncated-then-continued turn returns the whole deliverable.
-    truncated_prefix: String,
-    /// Set when a tool-use round interrupts a truncation chain. The cut-off
-    /// text then lives in [`Turn::produced_text`] together with the tool
-    /// round's own text, so the answer must be assembled from there rather
-    /// than by prefixing only the last round's text.
-    truncation_broken: bool,
+    /// The answer's segments in order. A round that continues a cut-off
+    /// response appends to the last segment; a fresh response starts another
+    /// one. Joining with a blank line is what `final_text` used to do per
+    /// round, but pieces of one capped answer were never separate paragraphs.
+    answer_segments: Vec<String>,
+    /// The next round's text continues the last segment rather than starting a
+    /// new one. Set after a truncation nudge and after a stream resume, and
+    /// consumed by the next accepted round.
+    answers_continue: bool,
+    /// A cut-off round (output limit or stream resume) occurred, so EndTurn
+    /// must hand back the whole accumulated answer instead of the last round's
+    /// text. `false` keeps the ordinary behavior: a steer's answer supersedes
+    /// what the model said before it.
+    saw_truncation: bool,
     /// Turn-unique counter for streamed assistant/reasoning item ids (`msg-N`,
     /// `reasoning-N`): owned here so ids don't reset each round.
     item_seq: u64,
@@ -533,18 +539,55 @@ struct Turn<'a> {
     /// value stays here so an EndTurn without a fresh call still completes with
     /// what the model already produced, instead of spending a failure nudge.
     accepted_structured: Option<Value>,
-    /// Everything the assistant said across the turn's rounds. Every exit inside
-    /// the loop hands this back, because the caller — a parent agent, most of all
-    /// — receives only `final_text`, and an empty string there is indistinguishable
-    /// from "produced nothing". History and the UI already hold the work; this is
-    /// the one channel that used to drop it. `MaxRounds` was the instance that got
-    /// measured; enumerating the exits found seven more of the same shape, so the
-    /// rule is now uniform: an early exit never spells its result `String::new()`.
-    /// (Exits *before* the loop legitimately do — nothing has been produced yet.)
-    produced_text: String,
 }
 
 impl Turn<'_> {
+    /// Take one accepted round's text into the answer. A round that follows a
+    /// truncation nudge (or a stream resume) is the remainder of that same
+    /// answer, so it appends without a separator; anything else starts a new
+    /// segment. Every accepted round consumes the continuation flag, even one
+    /// that produced no text: a tool-only answer to a "continue" nudge ends the
+    /// chain just as surely as a new paragraph does.
+    fn absorb_answer_text(&mut self, text: &str) {
+        let continues = std::mem::replace(&mut self.answers_continue, false);
+        if text.trim().is_empty() {
+            return;
+        }
+        if continues {
+            match self.answer_segments.last_mut() {
+                Some(last) => last.push_str(text),
+                None => self.answer_segments.push(text.to_owned()),
+            }
+        } else {
+            self.answer_segments.push(text.to_owned());
+        }
+    }
+
+    /// Everything the turn has said so far, in order. This is the deliverable
+    /// every early exit hands back: history and the UI already hold it, and a
+    /// parent agent sees only `final_text`, so an empty string there is
+    /// indistinguishable from "produced nothing". `MaxRounds` was the instance
+    /// that got measured; the same rule now covers every in-loop exit, error
+    /// exits included — a round that fails after a tool call must not take the
+    /// text before it down with it.
+    fn deliverable_text(&self) -> String {
+        self.answer_segments.join("\n\n")
+    }
+
+    /// The size of the request this round would send. Recomputed after
+    /// predictive compaction and the pre-sampling reminders, because a rejected
+    /// request's size is the measurement that becomes the session ceiling.
+    fn next_request_estimate(&self) -> u64 {
+        let workspace = self.cfg.effective_workspace();
+        estimate_request(self.history, || {
+            request_overhead_tokens(
+                &workspace.system,
+                &self.tools,
+                injected_context(self.cfg, &workspace, self.depth).as_deref(),
+            )
+        })
+    }
+
     /// MCP list_changed publishes a new source generation between sampling
     /// rounds. Never mutate an in-flight request; rebuild the next round from
     /// one fresh source snapshot instead.
@@ -708,7 +751,8 @@ impl Turn<'_> {
         let round_text = text_content(&blocks);
         let partial_landed = !blocks.is_empty();
         record_provider_assistant(self.history, &self.active_attempt, blocks);
-        append_produced(&mut self.produced_text, &round_text);
+        self.absorb_answer_text(&round_text);
+        self.saw_truncation = true;
         if partial_landed && error.is_retryable() && self.stream_resumes < STREAM_RESUME_LIMIT {
             self.stream_resumes += 1;
             let resumes = self.stream_resumes;
@@ -717,16 +761,15 @@ impl Turn<'_> {
             )));
             // Same carry as a truncated round, and for the same reason:
             // the model is told to continue where it stopped, so the next
-            // round returns only the remainder. Without this the resumed
-            // half is the whole answer the caller sees.
-            self.truncated_prefix.push_str(&round_text);
+            // round returns only the remainder.
+            self.answers_continue = true;
             self.history
                 .record(Message::injected(Injected::Harness, STREAM_RESUME_MSG));
             return RoundStep::Retry;
         }
         RoundStep::Stop(Ending {
             reason: EndReason::Error(TurnError::ProviderFailure(error)),
-            text: Some(format!("{}{round_text}", self.truncated_prefix)),
+            text: Some(self.deliverable_text()),
             rounds: round,
             structured: None,
         })
@@ -756,9 +799,10 @@ impl Turn<'_> {
                     self.history.commit_staged();
                 }
                 record_provider_assistant(self.history, &self.active_attempt, partial);
+                self.absorb_answer_text(&final_text);
                 Err(RoundStep::Stop(Ending {
                     reason: EndReason::Aborted,
-                    text: Some(final_text),
+                    text: Some(self.deliverable_text()),
                     rounds: round,
                     structured: None,
                 }))
@@ -808,7 +852,7 @@ impl Turn<'_> {
                 ));
         }
         record_provider_assistant(self.history, &self.active_attempt, blocks.to_vec());
-        append_produced(&mut self.produced_text, &text_content(blocks));
+        self.absorb_answer_text(&text_content(blocks));
         if let Some(usage) = usage {
             // total() = uncached + cached input + output = full context size
             // at this request; anchors the char-heuristic estimate for items
@@ -821,15 +865,7 @@ impl Turn<'_> {
         // whole time). A sub-agent's History is its own, so only the main
         // loop's estimate describes the session.
         if self.depth == 0 {
-            let estimated = estimate_request(self.history, || {
-                let workspace = self.cfg.effective_workspace();
-                request_overhead_tokens(
-                    &workspace.system,
-                    &self.tools,
-                    injected_context(self.cfg, &workspace, self.depth).as_deref(),
-                )
-            });
-            self.ui.emit(&Event::Usage(estimated));
+            self.ui.emit(&Event::Usage(self.next_request_estimate()));
         }
         Ok(())
     }
@@ -847,11 +883,12 @@ impl Turn<'_> {
             | AssistantOutcome::Filtered
             | AssistantOutcome::Incomplete(_) => Some(RoundStep::Stop(Ending {
                 reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
-                text: Some(text_content(blocks)),
+                text: Some(self.deliverable_text()),
                 rounds: round + 1,
                 structured: None,
             })),
             AssistantOutcome::OutputLimit(kind) => {
+                self.saw_truncation = true;
                 let round_text = text_content(blocks);
                 // "Continue where you left off" needs visible output to continue
                 // from. A round that spent the whole cap reasoning has none, and
@@ -864,18 +901,19 @@ impl Turn<'_> {
                         reason: EndReason::Error(TurnError::OutputSpentOnReasoning {
                             max_output_tokens: self.active_attempt.max_output_tokens(),
                         }),
-                        text: Some(format!("{}{round_text}", self.truncated_prefix)),
+                        text: Some(self.deliverable_text()),
                         rounds: round + 1,
                         structured: None,
                     }));
                 }
                 if self.truncation_recoveries < TRUNCATION_RECOVERY_LIMIT {
                     self.truncation_recoveries += 1;
-                    self.truncated_prefix.push_str(&round_text);
                     let recoveries = self.truncation_recoveries;
                     self.ui.emit(&Event::Note(format!(
                         "response truncated by output limit; asking the model to continue ({recoveries}/{TRUNCATION_RECOVERY_LIMIT})"
                     )));
+                    // The next round returns only the remainder of this answer.
+                    self.answers_continue = true;
                     self.history.record(Message::injected(
                         Injected::Harness,
                         TRUNCATION_CONTINUE_MSG,
@@ -884,17 +922,26 @@ impl Turn<'_> {
                 }
                 Some(RoundStep::Stop(Ending {
                     reason: EndReason::Error(TurnError::ProviderOutcome(outcome.clone())),
-                    text: Some(format!("{}{round_text}", self.truncated_prefix)),
+                    text: Some(self.deliverable_text()),
                     rounds: round + 1,
                     structured: None,
                 }))
             }
             AssistantOutcome::EndTurn => {
                 if self.options.structured_schema.is_some() {
-                    if let Some(value) = self.accepted_structured.take() {
-                        // A value was already validated this turn; the model
-                        // spent the extra round answering late work and now says
-                        // it is done. That is a delivery, not a miss.
+                    if self.accepted_structured.is_some() {
+                        // The value was validated in an earlier round. Ask the
+                        // same late-work question as an ordinary ending before
+                        // taking it: a message that landed during this final
+                        // sampling would otherwise be completed past and then
+                        // dropped as undeliverable when the lease closes.
+                        if let Some(step) = self.keep_going_for_late_work() {
+                            return Some(step);
+                        }
+                        let value = self
+                            .accepted_structured
+                            .take()
+                            .expect("checked immediately above");
                         return Some(RoundStep::Stop(Ending {
                             reason: EndReason::Completed,
                             text: None,
@@ -915,14 +962,15 @@ impl Turn<'_> {
                     return Some(step);
                 }
                 let round_text = text_content(blocks);
-                let final_text = if self.truncation_broken {
-                    // A tool round stood between the cut-off text and this one;
-                    // `produced_text` holds every segment in order.
-                    self.produced_text.clone()
-                } else if self.truncated_prefix.is_empty() {
-                    round_text
+                let final_text = if self.saw_truncation {
+                    // The answer is assembled from every round: cut-off pieces
+                    // already joined their continuations, and a tool round
+                    // between them starts the next segment.
+                    self.deliverable_text()
                 } else {
-                    format!("{}{round_text}", self.truncated_prefix)
+                    // An ordinary ending is this round's answer; earlier text
+                    // answered a steer and is superseded by it.
+                    round_text
                 };
                 Some(RoundStep::Stop(Ending {
                     reason: EndReason::Completed,
@@ -931,18 +979,7 @@ impl Turn<'_> {
                     structured: None,
                 }))
             }
-            AssistantOutcome::ToolUse => {
-                if !self.truncated_prefix.is_empty() {
-                    // The continuation ended in a tool call instead of more
-                    // text: the chain is over. Both cut-off halves are already
-                    // in `produced_text` with the tool round's own text, so
-                    // keeping the prefix here would stitch old text onto
-                    // whatever the turn finally says and drop the round between.
-                    self.truncated_prefix.clear();
-                    self.truncation_broken = true;
-                }
-                None
-            }
+            AssistantOutcome::ToolUse => None,
         }
     }
 
@@ -1115,13 +1152,13 @@ async fn turn_rounds(
         overflow_compact_attempted: false,
         truncation_recoveries: 0,
         stream_resumes: 0,
-        truncated_prefix: String::new(),
-        truncation_broken: false,
+        answer_segments: Vec::new(),
+        answers_continue: false,
+        saw_truncation: false,
         item_seq: 0,
         rounds: 0,
         structured_failures: 0,
         accepted_structured: None,
-        produced_text: String::new(),
     };
     let ending = 'turn: loop {
         // A No answered during the last batch ends the turn here, before the
@@ -1165,17 +1202,16 @@ async fn turn_rounds(
         // injected context are estimated here; a dynamic MCP refresh may have
         // replaced the tools or the deferred-tool notice since last round.
         let workspace = cfg.effective_workspace();
-        let estimated = estimate_request(turn.history, || {
-            request_overhead_tokens(
-                &workspace.system,
-                &turn.tools,
-                injected_context(cfg, &workspace, depth).as_deref(),
-            )
-        });
-        if let Some(ending) = turn.compact_predictively(estimated, round).await {
+        let predicted = turn.next_request_estimate();
+        if let Some(ending) = turn.compact_predictively(predicted, round).await {
             break 'turn ending;
         }
         remind_background_shells(cfg, turn.history);
+        // Measure the request that is actually about to go out: predictive
+        // compaction may have rewritten history, and the reminder above may
+        // have added a message. If the provider rejects it, this is the number
+        // recorded as the session's ceiling.
+        let estimated = turn.next_request_estimate();
         let reduction = cfg.request_reduction.then(|| RequestReduction {
             cwd: &workspace.cwd,
             now: std::time::SystemTime::now(),
@@ -1235,7 +1271,7 @@ async fn turn_rounds(
     // has been produced yet, and there is nothing to lose.
     TurnOutcome {
         reason: ending.reason,
-        final_text: ending.text.unwrap_or(turn.produced_text),
+        final_text: ending.text.unwrap_or_else(|| turn.deliverable_text()),
         rounds: ending.rounds,
         structured_output: ending.structured,
     }
@@ -1449,18 +1485,6 @@ struct Ending {
 const STREAM_RESUME_LIMIT: u32 = 3;
 const STREAM_RESUME_MSG: &str = "Your previous response was cut off by a transient \
 connection failure, not by you. Continue exactly where you left off.";
-
-/// Append one round's assistant text to the turn's running record, keeping the
-/// rounds separated and skipping the (common) rounds that only issued tool calls.
-fn append_produced(produced: &mut String, round_text: &str) {
-    if round_text.trim().is_empty() {
-        return;
-    }
-    if !produced.is_empty() {
-        produced.push_str("\n\n");
-    }
-    produced.push_str(round_text);
-}
 
 const TRUNCATION_RECOVERY_LIMIT: u32 = 3;
 const TRUNCATION_CONTINUE_MSG: &str = "Your previous response was cut off by the output token \
