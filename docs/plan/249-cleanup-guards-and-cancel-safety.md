@@ -68,6 +68,21 @@ await 处被丢弃"没有写成契约。
   `explicit fixture restore` 自检偶发失败一次，单独重跑通过(同 plan 242 记录)。DESIGN
   新增「Dropped tool futures (Plan 249)」契约。Linux 与 Windows 未实测。
 
+### 审查补丁：创建阶段与取消通知(2026-11-03)
+
+- `worktree::create` 现在接收会话 tracker，并在 `git worktree add` 之前武装
+  `CreationGuard`；只有正常提交或已同步回滚才 `disarm`。取消落在 add 之后、
+  `verify_provenance` 期间时，Drop 把 `worktree remove --force` + `branch -D` 作为
+  tracker 任务执行；`git worktree add` 自身设 `kill_on_drop`，回滚开始后不会还有
+  git 在继续写。回归用 `#[cfg(test)] creation_probe` 在 add 之后停住创建 future，
+  abort 后断言树和分支都被删除。
+- `finish` 保留脏树或清理失败时，前台 supervisor 用 `Event::Note` 发布位置/错误；
+  取消后工具结果已不存在，不能只靠返回值。wf 的清理失败同样补 Note。新增脏树取消
+  回归，断言 note 含 `kloop-worktree-agent-` 且分支保留。
+- 三条相关回归(创建取消、脏树取消、原 provider 取消)全绿，
+  `cargo clippy -p kloop-core --all-targets --all-features -D warnings` 全绿；提交前
+  完整 `make check` 也全绿(core 1305 项、TUI 314 项，parity baseline verified)。
+
 ## 验收
 
 - 单测/集成(旧代码先红):前台 worktree 子 agent 在运行中被取消，worktree 被清理或按

@@ -20,6 +20,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::task::TaskTracker;
 
 use crate::config::Config;
 use crate::permissions::Permissions;
@@ -186,14 +187,120 @@ enum BasePolicy {
 
 /// Create an owned worktree for a task. Task isolation deliberately preserves
 /// its established HEAD base semantics; session creation uses the fresh policy.
-pub async fn create(cwd: &Path, name: &str) -> Result<Worktree> {
+pub async fn create(cwd: &Path, name: &str, cleanup_tasks: &TaskTracker) -> Result<Worktree> {
     create_managed(
         cwd,
         name,
         WorktreeOwner::Task(name.to_string()),
         BasePolicy::Head,
+        cleanup_tasks,
     )
     .await
+}
+
+/// A worktree creation whose git mutation succeeded but whose caller was
+/// dropped before it committed. Rollback needs the mutation lock and git, so it
+/// runs as a tracked task rather than in `Drop`; `tasks` is the session tracker,
+/// so shutdown waits for it like any other cleanup supervisor.
+struct CreationGuard {
+    tasks: TaskTracker,
+    repository_root: PathBuf,
+    branch: String,
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CreationGuard {
+    fn new(tasks: &TaskTracker, repository_root: &Path, branch: &str, path: &Path) -> Self {
+        Self {
+            tasks: tasks.clone(),
+            repository_root: repository_root.to_path_buf(),
+            branch: branch.to_string(),
+            path: path.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let root = self.repository_root.clone();
+        let branch = self.branch.clone();
+        let path = self.path.clone();
+        self.tasks.spawn_on(
+            async move { rollback_created(&root, &branch, &path).await },
+            &handle,
+        );
+    }
+}
+
+async fn rollback_created(repository_root: &Path, branch: &str, path: &Path) {
+    let _mutation = WORKTREE_MUTATION_LOCK.lock().await;
+    rollback_created_locked(repository_root, branch, path).await;
+}
+
+/// The caller already holds the mutation lock.
+async fn rollback_created_locked(repository_root: &Path, branch: &str, path: &Path) {
+    let path_text = git_compatible_path(path).to_string_lossy().to_string();
+    let _ = git_text(
+        repository_root,
+        &["worktree", "remove", "--force", &path_text],
+    )
+    .await;
+    let _ = git_text(repository_root, &["branch", "-D", branch]).await;
+}
+
+#[cfg(test)]
+pub(crate) mod creation_probe {
+    use std::sync::Mutex;
+
+    use tokio::sync::oneshot;
+
+    struct Probe {
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static PROBES: Mutex<Vec<(String, Probe)>> = Mutex::new(Vec::new());
+
+    /// Pause the named creation after `git worktree add`. The returned sender
+    /// releases it; keeping it alive parks the creation at the gate.
+    pub(crate) fn install(name: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, reached_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        PROBES.lock().unwrap().push((
+            name.to_string(),
+            Probe {
+                reached,
+                release: release_rx,
+            },
+        ));
+        (reached_rx, release)
+    }
+
+    pub(crate) async fn pause(name: &str) {
+        let probe = {
+            let mut probes = PROBES.lock().unwrap();
+            probes
+                .iter()
+                .position(|(candidate, _)| candidate == name)
+                .map(|index| probes.swap_remove(index))
+        };
+        if let Some((_, Probe { reached, release })) = probe {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 async fn create_managed(
@@ -201,6 +308,7 @@ async fn create_managed(
     name: &str,
     owner: WorktreeOwner,
     base_policy: BasePolicy,
+    cleanup_tasks: &TaskTracker,
 ) -> Result<Worktree> {
     validate_name(name)?;
     let repository = discover_repository(cwd)
@@ -238,21 +346,15 @@ async fn create_managed(
         .context("creating managed worktree directory")?;
     exclude_worktrees_dir(&repository.common_dir)?;
 
-    let path_text = git_compatible_path(&path).to_string_lossy().to_string();
-    git_text(
-        &repository.root,
-        &[
-            "worktree",
-            "add",
-            "--no-track",
-            "-b",
-            &branch,
-            &path_text,
-            &base,
-        ],
-    )
-    .await
-    .with_context(|| format!("git worktree add for branch {branch}"))?;
+    // From this point a dropped future can leave a real tree and branch behind.
+    let mut creation = CreationGuard::new(cleanup_tasks, &repository.root, &branch, &path);
+    if let Err(error) = git_worktree_add(&repository.root, &branch, &path, &base).await {
+        rollback_created_locked(&repository.root, &branch, &path).await;
+        creation.disarm();
+        return Err(error.context(format!("git worktree add for branch {branch}")));
+    }
+    #[cfg(test)]
+    creation_probe::pause(name).await;
 
     let created = async {
         let canonical_path = std::fs::canonicalize(&path)
@@ -273,14 +375,37 @@ async fn create_managed(
     }
     .await;
     if created.is_err() {
-        let _ = git_text(
-            &repository.root,
-            &["worktree", "remove", "--force", &path_text],
-        )
-        .await;
-        let _ = git_text(&repository.root, &["branch", "-D", &branch]).await;
+        rollback_created_locked(&repository.root, &branch, &path).await;
     }
+    creation.disarm();
     created
+}
+
+/// `git worktree add` is the one mutation whose child must not outlive a
+/// cancelled creation: the rollback guard removes what exists once this future
+/// is gone, and a still-running add would race it.
+async fn git_worktree_add(root: &Path, branch: &str, path: &Path, base: &str) -> Result<()> {
+    let path_text = git_compatible_path(path).to_string_lossy().to_string();
+    let mut command = git_command(
+        root,
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            &path_text,
+            base,
+        ],
+    );
+    command.kill_on_drop(true);
+    let output = kloop_process_spawn::output(&mut command)
+        .await
+        .context("spawning git")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
 }
 
 async fn fresh_base(repository_root: &Path) -> Result<String> {
@@ -403,7 +528,8 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
         );
     }
     let owner = WorktreeOwner::Session(cfg.session_id.clone());
-    let worktree = create_managed(&cfg.cwd, name, owner, BasePolicy::Fresh).await?;
+    let worktree =
+        create_managed(&cfg.cwd, name, owner, BasePolicy::Fresh, &cfg.cleanup_tasks).await?;
     let message = format!(
         "Created worktree at {path} on branch {branch}. The session is now working in the worktree. Use exit_worktree to leave mid-session.",
         path = worktree.path.display(),
@@ -923,10 +1049,57 @@ mod tests {
         cfg
     }
 
+    /// Creation needs an owner for a cancelled rollback; these tests do not
+    /// inspect that tracker.
+    fn cleanup_tasks() -> TaskTracker {
+        TaskTracker::default()
+    }
+
+    /// A creation cancelled after `git worktree add` — here parked at the
+    /// post-add gate — must give back the tree and branch it already made; the
+    /// tool future is dropped with no chance to run the error path (plan 249).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_creation_rolls_back_the_tree_and_branch() {
+        let root = temp_repo("cancel-create").await;
+        let name = "cancel-create";
+        let (reached, _release) = creation_probe::install(name);
+        let tasks = cleanup_tasks();
+        let create = tokio::spawn({
+            let root = root.clone();
+            let tasks = tasks.clone();
+            async move { create(&root, name, &tasks).await }
+        });
+
+        reached.await.expect("creation reached the post-add gate");
+        create.abort();
+        let _ = create.await;
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(10), tasks.wait())
+            .await
+            .expect("the rollback finished");
+
+        let trees: Vec<_> = std::fs::read_dir(root.join(WORKTREES_DIR))
+            .map(|entries| entries.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(
+            trees.is_empty(),
+            "the half-created tree was removed: {trees:?}"
+        );
+        let branches = crate::git::command(&root)
+            .args(["branch", "--list", "kloop-worktree-*"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the half-created branch was removed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn create_records_owned_provenance_and_removes_clean_tree() {
         let root = temp_repo("create").await;
-        let worktree = create(&root, "agent-1").await.unwrap();
+        let worktree = create(&root, "agent-1", &cleanup_tasks()).await.unwrap();
         let path = worktree.path.clone();
         assert_eq!(worktree.custody, WorktreeCustody::Managed);
         assert_eq!(worktree.owner, WorktreeOwner::Task("agent-1".into()));
@@ -940,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn finish_keeps_dirty_task_tree() {
         let root = temp_repo("dirty").await;
-        let worktree = create(&root, "agent-2").await.unwrap();
+        let worktree = create(&root, "agent-2", &cleanup_tasks()).await.unwrap();
         std::fs::write(worktree.path.join("new.txt"), "work").unwrap();
         let path = worktree.path.clone();
         let note = finish(worktree).await.unwrap().unwrap();
@@ -955,7 +1128,9 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
         fixture_git(&root, &["add", ".gitignore"]).await;
         fixture_git(&root, &["commit", "-qm", "ignore"]).await;
-        let worktree = create(&root, "agent-ignored").await.unwrap();
+        let worktree = create(&root, "agent-ignored", &cleanup_tasks())
+            .await
+            .unwrap();
         std::fs::write(worktree.path.join("ignored.txt"), "work").unwrap();
         let changes = inspect_changes(&worktree).await.unwrap();
         assert_eq!(changes.changed_files, 1);
@@ -967,7 +1142,9 @@ mod tests {
     async fn workspace_overrides_reject_project_drift_from_loaded_permissions() {
         let trusted = temp_repo("trusted-policy").await;
         let changed = temp_repo("changed-policy").await;
-        let candidate = create(&changed, "candidate").await.unwrap();
+        let candidate = create(&changed, "candidate", &cleanup_tasks())
+            .await
+            .unwrap();
         let permissions = Arc::new(
             crate::permissions::Permissions::new(
                 crate::permissions::Mode::Manual,
@@ -1063,7 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn session_remove_does_not_touch_task_owned_tree() {
         let root = temp_repo("owners").await;
-        let task = create(&root, "task-owner").await.unwrap();
+        let task = create(&root, "task-owner", &cleanup_tasks()).await.unwrap();
         let task_path = task.path.clone();
         std::fs::write(task_path.join("task.txt"), "task").unwrap();
 
@@ -1096,7 +1273,11 @@ mod tests {
     #[tokio::test]
     async fn parallel_task_create_and_finish_are_serialized() {
         let root = temp_repo("parallel").await;
-        let (first, second) = tokio::join!(create(&root, "agent-a"), create(&root, "agent-b"));
+        let tasks = cleanup_tasks();
+        let (first, second) = tokio::join!(
+            create(&root, "agent-a", &tasks),
+            create(&root, "agent-b", &tasks)
+        );
         let first = first.unwrap();
         let second = second.unwrap();
         assert!(finish(first).await.unwrap().is_none());

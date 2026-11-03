@@ -159,7 +159,7 @@ pub(crate) async fn run_agent_admitted(
     // anchors onto it. Fail-closed: a creation error is the tool's error, never
     // a fall back to the shared cwd (cc's shape).
     let worktree = if isolate {
-        let wt = worktree::create(&workspace.cwd, &agent)
+        let wt = worktree::create(&workspace.cwd, &agent, &ctx.cfg.cleanup_tasks)
             .await
             .map_err(|e| anyhow!("run_agent: {e:#}"))?;
         Some(bind_subagent_worktree(&mut sub, wt, "run_agent").await?)
@@ -280,7 +280,7 @@ pub(crate) async fn structured_agent_admitted(
         None => agent_preview(&prompt),
     };
     let worktree = if isolate {
-        let worktree = worktree::create(&workspace.cwd, &agent)
+        let worktree = worktree::create(&workspace.cwd, &agent, &ctx.cfg.cleanup_tasks)
             .await
             .map_err(|error| anyhow!("workflow agent: {error:#}"))?;
         Some(bind_subagent_worktree(&mut sub, worktree, "workflow agent").await?)
@@ -377,9 +377,11 @@ pub(crate) async fn structured_agent_admitted(
                     Ok(Some(note)) => ui.emit(&Event::Note(note.trim().to_string())),
                     Ok(None) => {}
                     Err(error) => {
-                        result = Err(anyhow!(
+                        let note = format!(
                             "workflow agent: worktree cleanup failed: {error:#}"
-                        ));
+                        );
+                        ui.emit(&Event::Note(note.clone()));
+                        result = Err(anyhow!(note));
                     }
                 }
             }
@@ -650,20 +652,24 @@ async fn run_sub_agent_sync(
                 },
                 Err(e) => Err(anyhow!("{who}: sub-agent panicked: {e}")),
             };
-            // Tear down or preserve the worktree, and tell the model where a
-            // preserved one lives (only on a success result — an error already
-            // routes to is_error guidance; the changes still sit on the branch
-            // for the user).
+            // A retained tree keeps its branch for the user. On a success the
+            // model hears about it in the tool result; after a cancellation or
+            // another error there is no result left to read, so publish the
+            // location (and any cleanup failure) as a session note instead.
             if let Some(wt) = worktree {
                 match worktree::finish(wt).await {
                     Ok(Some(note)) => {
                         if let Ok(text) = &mut result {
                             text.push_str(&note);
+                        } else {
+                            ui.emit(&Event::Note(note.trim().to_string()));
                         }
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        result = Err(anyhow!("{who}: worktree cleanup failed: {error:#}"));
+                        let note = format!("{who}: worktree cleanup failed: {error:#}");
+                        ui.emit(&Event::Note(note.clone()));
+                        result = Err(anyhow!(note));
                     }
                 }
             }
@@ -1636,6 +1642,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A dirty tree is deliberately kept. When the cancellation means the tool
+    /// result can never reach the model, the retained branch is published as a
+    /// session note instead of disappearing with the dropped JoinHandle.
+    #[tokio::test]
+    async fn cancelled_dirty_worktree_reports_the_kept_branch() {
+        use kloop_provider::MockTurn;
+
+        let repo = temp_git_repo("cancel-dirty");
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (_release, release) = tokio::sync::oneshot::channel();
+        let provider = Provider::mock_scripted(vec![
+            MockTurn::Blocks(vec![AssistantBlock::ToolUse {
+                id: "w1".into(),
+                name: "write_file".into(),
+                input: json!({"path": "kept.txt", "content": "work"}),
+            }]),
+            MockTurn::Gate {
+                started,
+                release,
+                blocks: Vec::new(),
+            },
+        ]);
+        let rec = Arc::new(RecUi(std::sync::Mutex::new(Vec::new())));
+        let ui: Arc<dyn Ui> = rec.clone();
+        let mut ctx = ctx_in(with_provider(test_ctx(0, "cancel-dirty"), provider), &repo);
+        ctx.ui = ui.clone();
+        let cfg = Arc::clone(&ctx.cfg);
+        let cancel = ctx.cancel.clone();
+        let call = tokio::spawn(async move {
+            run_tool(
+                "run_agent",
+                json!({"prompt": "go", "isolation": "worktree"}),
+                &ctx,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+            .await
+            .expect("the child never reached the second provider call")
+            .unwrap();
+        cancel.cancel();
+        call.abort();
+        let _ = call.await;
+
+        cfg.cleanup_tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(10), cfg.cleanup_tasks.wait())
+            .await
+            .expect("the supervisor finished");
+
+        let events = rec.0.lock().unwrap();
+        assert!(
+            events.iter().any(|event| {
+                event.starts_with("note ") && event.contains("kloop-worktree-agent-")
+            }),
+            "the kept branch was reported: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with("end agent-") && event.ends_with("false")),
+            "the agent row was closed as failed: {events:?}"
+        );
+        drop(events);
+
+        let trees: Vec<_> = std::fs::read_dir(repo.join(".kloop/worktrees"))
+            .map(|dir| dir.filter_map(|entry| entry.ok()).collect())
+            .unwrap_or_default();
+        assert_eq!(trees.len(), 1, "the dirty tree was kept: {trees:?}");
+        assert!(
+            trees[0].path().join("kept.txt").exists(),
+            "the child's write is still in the kept tree"
+        );
+        let branches = crate::git::command(&repo)
+            .args(["branch", "--list", "kloop-worktree-*"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the kept branch still exists"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[tokio::test]
     async fn registration_failure_cleans_an_already_bound_worktree() {
         let repo = temp_git_repo("register-close");
@@ -1643,7 +1733,9 @@ mod tests {
         let workspace = ctx.cfg.effective_workspace();
         let agent = "agent-9000".to_string();
         let mut sub = build_sub_config(&ctx, &workspace, None, agent.clone(), None).unwrap();
-        let worktree = worktree::create(&workspace.cwd, &agent).await.unwrap();
+        let worktree = worktree::create(&workspace.cwd, &agent, &ctx.cfg.cleanup_tasks)
+            .await
+            .unwrap();
         let worktree = bind_subagent_worktree(&mut sub, worktree, "test")
             .await
             .unwrap();

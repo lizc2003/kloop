@@ -8,11 +8,15 @@ rewind 的 fork 分支与 server `thread/fork` 的 fork 文件都由它兜住失
 `run_agent` 与 workflow `agent` 的 worker 只跑子 agent，supervisor 持有 worktree、
 `finish` 并补发 agent-end 后登记进 tracker；`shutdown_background_work` 先 `close()`
 再按现有 2s 上限等待。四类回归覆盖取消后的树/分支与 agent 行、关闭 registry 的空文件、
-两个 rewind 失败出口与 server fork 的 resume_options 失败。外层执行沙箱之外
-`make check` 全绿（fmt、clippy、workspace 全量测试，core 1303 项、TUI 314 项，本机
-parity baseline verified）。DESIGN 增加「Dropped tool futures (Plan 249)」。`make check`
-期间 parity 的 `explicit fixture restore` 自检偶发失败一次，单独重跑 `make parity`
-通过（同 plan 242 记录的本机偶发）。Linux 与 Windows 未实测。教训 304、305。
+两个 rewind 失败出口与 server fork 的 resume_options 失败。审查补丁把 `worktree::create`
+也纳入守卫：`git worktree add` 前武装 `CreationGuard`，取消落在 `verify_provenance`
+时由 tracker 执行 `worktree remove --force` + `branch -D`，add 自身 `kill_on_drop`；
+保留脏树与清理失败改走 `Event::Note`，不再随被丢弃的返回值消失。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace 全量测试，core 1305 项、TUI 314 项，本机
+parity baseline verified）。DESIGN 增加「Dropped tool futures (Plan 249)」。此前一次
+parity 的 `explicit fixture restore` 自检偶发失败，单独重跑 `make parity` 通过（同
+plan 242 记录的本机偶发），提交前最后一次完整 `make check` 干净通过。Linux 与 Windows
+未实测。教训 304、305、306、307。
 
 **Plan 248 ✅：文本、路径与文件 helper 收口（2026-11-03）**：protocol 新增
 `char_prefix` / `clip_chars` / `hex_lower`，core 新增 `paths::{lexically_normalize,
@@ -4045,3 +4049,16 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    `history.rebase`/`spawn_thread` 之后才 `disarm`；只在取消分支手写一次
    `remove_file` 会漏掉其余失败出口，而它们的 mtime 最新，正好会被 `--continue` 或
    `thread/list` 选中。
+
+306. **所有权从资源第一次落盘开始，不是从函数正常返回开始。** `worktree::create` 在
+   `git worktree add` 成功后还要 canonicalize、`verify_provenance` 两次 git 查询；
+   取消点若落在那里，函数永远走不到自己的错误回滚，调用方也只拿到一个被丢弃的
+   future。守卫要在这条命令之前武装，Drop 把异步回滚交给会话 tracker；命令本身设
+   `kill_on_drop`，否则回滚拿锁时 git 还在写同一棵树。测试别只等 provider 启动，
+   用 `#[cfg(test)]` 闸门停在 add 与 verify 之间，abort 创建 future 才能覆盖这个阶段。
+
+307. **取消后的“结果”已经没有人读，清理信息必须另走 UI。** 前台子 agent 的 supervisor
+   返回的 `Result` 只对还在等它的调用方有意义；turn 被取消时那个 future 已被丢弃，
+   把保留路径拼进 `Ok` 文本、或把清理错误塞进 `Err`，用户都看不到。`finish` 决定保留
+   脏树或自己失败时，要在 supervisor 里直接发 `Event::Note`；成功路径继续把位置附在
+   工具结果里，避免重复提示。
