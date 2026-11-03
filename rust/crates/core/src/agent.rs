@@ -548,17 +548,23 @@ impl Turn<'_> {
     /// segment. Every accepted round consumes the continuation flag, even one
     /// that produced no text: a tool-only answer to a "continue" nudge ends the
     /// chain just as surely as a new paragraph does.
+    ///
+    /// In a continuation, whitespace is content: the model may return the rest
+    /// of a sentence as `" "` followed by `"world"` after a stream drop, and
+    /// trimming that to nothing would glue the words together. Outside a
+    /// continuation a whitespace-only round starts no segment, which is the
+    /// old `append_produced` rule.
     fn absorb_answer_text(&mut self, text: &str) {
         let continues = std::mem::replace(&mut self.answers_continue, false);
-        if text.trim().is_empty() {
-            return;
-        }
         if continues {
+            if text.is_empty() {
+                return;
+            }
             match self.answer_segments.last_mut() {
                 Some(last) => last.push_str(text),
                 None => self.answer_segments.push(text.to_owned()),
             }
-        } else {
+        } else if !text.trim().is_empty() {
             self.answer_segments.push(text.to_owned());
         }
     }

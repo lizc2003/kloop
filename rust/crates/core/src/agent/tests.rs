@@ -3409,6 +3409,31 @@ async fn retryable_stream_failure_after_output_continues_the_turn() {
     assert_eq!(outcome.rounds, 2);
 }
 
+/// Whitespace in a continuation is content. A round that is only `" "` after a
+/// cut-off answer, followed by a stream drop and `"world"`, must yield
+/// `"hello world"` — trimming the space away glued the two words together.
+#[tokio::test]
+async fn a_whitespace_only_continuation_keeps_its_space() {
+    let provider = Provider::mock_scripted(vec![
+        MockTurn::Truncated(text("hello")),
+        MockTurn::BlocksThenError(
+            vec![AssistantBlock::Text { text: " ".into() }],
+            ProviderFailure::transport("connection reset"),
+        ),
+        MockTurn::Blocks(text("world")),
+    ]);
+    let cfg = compaction_cfg(provider, 200_000, "whitespace-continuation");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.record(Message::user_text("say hello world"));
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(outcome.final_text, "hello world");
+    assert_eq!(outcome.rounds, 3);
+}
+
 /// The resume is for transient failures only: a fatal one after partial output
 /// still ends the turn, and still hands back what was produced.
 #[tokio::test]

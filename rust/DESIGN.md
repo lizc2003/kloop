@@ -5105,9 +5105,10 @@ cargo run -- --mock
 # keeping whatever text earlier rounds produced. The answer is accumulated as
 # segments: a round that follows a truncation nudge (or stream resume) appends
 # to the last segment without a separator, any other round starts a new
-# paragraph. Success and error exits both return that accumulated text, so a
-# tool round between the halves neither drops its own text nor rewrites the
-# concatenation of the cut-off pieces. A truncated Responses terminal (incomplete_details.reason length or
+# paragraph. A whitespace-only continuation is kept — it can be the space
+# between two words split across a dropped stream. Success and error exits both
+# return that accumulated text, so a tool round between the halves neither
+# drops its own text nor rewrites the concatenation of the cut-off pieces. A truncated Responses terminal (incomplete_details.reason length or
 # max_output_tokens — one event, two vendor spellings) is an output limit, and
 # the complete tool calls such a response already emitted still dispatch as
 # ToolUse, since truncation lands on item boundaries and those calls carry the
