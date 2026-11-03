@@ -128,7 +128,7 @@ impl History {
             .and_then(|metadata| metadata.modified())
             .ok();
         Self {
-            items: resumed.messages,
+            items: resumed.snapshot.messages,
             offload_dir,
             cap: OFFLOAD_CAP_CHARS,
             usage_anchor: None,
@@ -158,9 +158,9 @@ impl History {
     pub fn rebase(&mut self, resumed: ResumedSession) {
         let carried = self
             .reduction
-            .unrecorded_for(&resumed.messages, &resumed.request_stubs);
+            .unrecorded_for(&resumed.snapshot.messages, &resumed.request_stubs);
         self.reduction.adopt(resumed.request_stubs);
-        self.items = resumed.messages;
+        self.items = resumed.snapshot.messages;
         self.provider_usage = resumed.provider_usage;
         self.provider_routes = resumed.snapshot.provider_routes.clone();
         self.next_memory_boundary = resumed.rollout.next_boundary();
@@ -2158,7 +2158,7 @@ mod tests {
         assert_eq!(view, canonical);
         drop(history);
         let reread = crate::rollout::resume_session(&session).unwrap();
-        assert_eq!(reread.messages, canonical);
+        assert_eq!(reread.messages(), canonical);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::history::History;
 use crate::rollout::ResumedSession;
 use crate::rollout::fork_session;
-use crate::rollout::inspect_session;
+use crate::rollout::inspect_session_for_writing;
 use crate::rollout::session_id_of;
 
 /// What a rewind does with the turns it drops. Either way they stay in the old
@@ -67,7 +67,7 @@ pub async fn rewind(
     let summary = match abandoned {
         AbandonedBranch::Drop => None,
         AbandonedBranch::Summarize => {
-            match summarize_abandoned_branch(cfg, history, &resumed.messages, cancel).await {
+            match summarize_abandoned_branch(cfg, history, resumed.messages(), cancel).await {
                 Ok(summary) => summary,
                 // Cancelling takes the whole rewind back, not just the summary:
                 // rewinding without one is a different key. The branch file is
@@ -96,21 +96,8 @@ pub async fn rewind(
     // running on right now — `/provider` included — carries onto the branch,
     // and the cut's own route is not restored. Adopting writes to the forked
     // rollout, so it runs after the rebase.
-    let cfg = match history.adopt_provider_route(&cfg.provider_route) {
-        Ok((route, reopened)) => {
-            if let Some(reopened) = reopened {
-                notes.push(format!("rewind: {reopened}"));
-            }
-            fresh.clone_with_provider_route(route)
-        }
-        Err(error) => {
-            notes.push(format!(
-                "rewind landed on the new branch but its provider route \
-                 could not be adopted: {error}"
-            ));
-            fresh
-        }
-    };
+    let (cfg, route_notes) = adopt_branch_route(&fresh, history);
+    notes.extend(route_notes);
     if let Some(summary) = summary {
         summary.record(history);
     }
@@ -149,8 +136,59 @@ fn open_fork(
     path: std::path::PathBuf,
 ) -> anyhow::Result<(ResumedSession, crate::cleanup::RemoveFileOnDrop)> {
     let guard = crate::cleanup::RemoveFileOnDrop::new(path.clone());
-    let resumed = inspect_session(&path)?.recover_for_writing()?;
+    let resumed = inspect_session_for_writing(&path)?.recover_for_writing()?;
     Ok((resumed, guard))
+}
+
+/// Put the live route onto the branch and return the Config the branch will
+/// run on. When writing the route change fails, fall back to the route the
+/// branch's own timeline ends with: new assistant messages stamp that
+/// revision as their provenance, and a revision the branch never recorded
+/// makes the whole branch fail `validate_provenance` on the next resume. The
+/// front-end's route is the old session's, so it is never the fallback.
+fn adopt_branch_route(fresh: &Config, history: &mut History) -> (Config, Vec<String>) {
+    match history.adopt_provider_route(&fresh.provider_route) {
+        Ok((route, reopened)) => (
+            fresh.clone_with_provider_route(route),
+            reopened
+                .map(|reopened| vec![format!("rewind: {reopened}")])
+                .unwrap_or_default(),
+        ),
+        Err(error) => {
+            let mut notes = vec![format!(
+                "rewind landed on the new branch but its provider route \
+                 could not be adopted: {error}"
+            )];
+            let Some(receipt) = history.provider_routes().last() else {
+                // A branch with no timeline holds no user turn, so it has no
+                // rewind point; keep the caller's route rather than inventing
+                // a revision the file would reject.
+                return (fresh.clone(), notes);
+            };
+            match fresh.provider_catalog.restore_route(receipt) {
+                Ok(route) => {
+                    notes.push(format!(
+                        "rewind: continuing on the branch's last recorded route \
+                         ({} / {})",
+                        route.provider_id(),
+                        route.model()
+                    ));
+                    (fresh.clone_with_provider_route(route), notes)
+                }
+                // The receipt came from this catalog when it was written, so
+                // drift here means the catalog changed in-process; keeping the
+                // branch's timeline intact still beats stamping an unknown
+                // revision onto it.
+                Err(restore) => {
+                    notes.push(format!(
+                        "rewind: the branch's last route could not be restored \
+                         either ({restore}); restart kloop to reopen the branch"
+                    ));
+                    (fresh.clone(), notes)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +272,84 @@ mod tests {
 
     fn ui() -> Arc<dyn Ui> {
         Arc::new(SilentUi)
+    }
+
+    fn set_read_only(path: &Path, read_only: bool) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    /// A rewind carries the live route onto the branch by appending a route
+    /// revision. When that write fails, the fallback must be the branch's own
+    /// last receipt, never the live route: new assistant messages stamp the
+    /// fallback's revision as provenance, and a revision the branch never
+    /// recorded makes the whole transcript fail to read on the next resume.
+    #[test]
+    fn a_failed_route_adoption_falls_back_to_the_branch_route() {
+        let dir = temp_dir("route-fallback");
+        let (provider, _seen) = Provider::mock_recording(Vec::new());
+        let mut cfg = TestConfig::new("rewind-route-fallback")
+            .dirs(&dir)
+            .provider(provider)
+            .models("mock", &["mock", "other"])
+            .build()
+            .test_clone();
+        cfg.bind_session(LIVE_ID.into()).unwrap();
+        let mut history = History::new(dir.to_path_buf());
+        history.attach_rollout(
+            Rollout::new_with_initial_route(session_path(&dir, LIVE_ID), &cfg.provider_route)
+                .unwrap(),
+        );
+        for message in first_turn() {
+            history.record(message);
+        }
+        history.record(Message::user_text("make it iterative"));
+        history.record(text("done"));
+
+        // Fork and rebase exactly as `rewind` does before it adopts the route.
+        let cut = fork_points(history.rollout_path().unwrap()).unwrap()[0].seq;
+        let fork_path = fork_session(history.rollout_path().unwrap(), Some(cut), &dir).unwrap();
+        let resumed = inspect_session_for_writing(&fork_path)
+            .unwrap()
+            .recover_for_writing()
+            .unwrap();
+        history.rebase(resumed);
+
+        // The branch is written on `mock`; a live `other` route forces the
+        // adoption to append, which a read-only transcript refuses.
+        let live = cfg.clone_with_provider_route(
+            cfg.provider_catalog
+                .initial_route("test", Some("other"))
+                .unwrap(),
+        );
+        set_read_only(&fork_path, true);
+        let (adopted, notes) = adopt_branch_route(&live, &mut history);
+        set_read_only(&fork_path, false);
+
+        assert_eq!(adopted.provider_route.model(), "mock");
+        assert_eq!(adopted.provider_route.revision(), 1);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("could not be adopted")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("last recorded route")),
+            "{notes:?}"
+        );
+        drop(history);
+
+        // Nothing was written by the failed adoption, and the branch still
+        // reads: its provenance and timeline still agree.
+        let reread = crate::rollout::resume_session(&fork_path).unwrap();
+        assert_eq!(reread.snapshot.provider_routes.len(), 1);
+        assert_eq!(reread.snapshot.provider_routes[0].model, "mock");
+        drop(reread);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn session_files(dir: &Path) -> Vec<PathBuf> {
@@ -483,7 +599,7 @@ mod tests {
         guard.disarm();
         assert_ne!(id, "session");
         assert_eq!(
-            resumed.messages,
+            resumed.messages(),
             vec![Message::user_text("one"), text("done")]
         );
         let _ = std::fs::remove_dir_all(dir);

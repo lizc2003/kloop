@@ -139,7 +139,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&old_path).unwrap(), before);
         drop(history);
         assert_eq!(
-            crate::rollout::resume_session(&old_path).unwrap().messages,
+            crate::rollout::resume_session(&old_path)
+                .unwrap()
+                .messages(),
             [Message::user_text("before the clear")]
         );
         let new_path = fresh.history.rollout_path().unwrap().to_path_buf();

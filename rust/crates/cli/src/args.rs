@@ -20,14 +20,11 @@ use kloop_core::rollout::SessionDigest;
 use kloop_core::rollout::SessionOrigin;
 use kloop_core::rollout::checked_session_path;
 use kloop_core::rollout::claim_new_session;
-use kloop_core::rollout::first_user_snippet;
 use kloop_core::rollout::fork_origin;
 use kloop_core::rollout::fork_session;
-use kloop_core::rollout::load_session;
 use kloop_core::rollout::resume_session;
 use kloop_core::rollout::session_digest;
 use kloop_core::rollout::session_id_of;
-use kloop_core::rollout::session_origin;
 use kloop_core::rollout::sessions_by_recency;
 use kloop_core::session_store::ProjectBucket;
 use kloop_core::session_store::SessionDirs;
@@ -304,18 +301,23 @@ fn format_version(pkg: &str, sha: Option<&str>) -> String {
 
 fn session_line(path: &Path) -> String {
     let id = session_id_of(path);
-    let origin = match session_origin(path) {
-        Some(SessionOrigin::Fork(o)) => format!("  [forked from {o}]"),
-        Some(SessionOrigin::SubAgent(o)) => format!("  [sub-agent of {o}]"),
-        None => String::new(),
-    };
-    match load_session(path) {
-        Ok(messages) => format!(
-            "{id}  {} message(s)  {}{origin}",
-            messages.len(),
-            first_user_snippet(&messages)
-        ),
-        Err(e) => format!("{id}  (unreadable: {e}){origin}"),
+    match session_digest(path) {
+        Ok(digest) => {
+            let origin = match digest.origin {
+                Some(SessionOrigin::Fork(o)) => format!("  [forked from {o}]"),
+                Some(SessionOrigin::SubAgent(o)) => format!("  [sub-agent of {o}]"),
+                None => String::new(),
+            };
+            let title = if digest.title.is_empty() {
+                "(no messages yet)"
+            } else {
+                &digest.title
+            };
+            format!("{id}  {title}{origin}")
+        }
+        // The digest opens the file; this is the metadata/open failure it
+        // cannot describe. Lineage is unavailable for the same reason.
+        Err(e) => format!("{id}  (unreadable: {e})"),
     }
 }
 
@@ -425,10 +427,16 @@ struct Resumable {
 /// one of these rows before the first keystroke, and replaying dozens of
 /// megabyte-sized transcripts to learn their first line is the cost that made
 /// the old numbered list feel instant only because it was short.
-fn resumable_sessions(sessions_dir: &Path) -> Vec<Resumable> {
-    sessions_by_recency(sessions_dir)
-        .into_iter()
-        .map(|path| match session_digest(&path) {
+///
+/// Nothing is collected here: `--continue` wants only the first row and must
+/// not digest every session behind it. The digest function is a parameter so a
+/// test can count how far a lazy caller actually reads.
+fn resumable_rows(
+    paths: impl Iterator<Item = PathBuf>,
+    mut digest: impl FnMut(&Path) -> std::io::Result<SessionDigest>,
+) -> impl Iterator<Item = Resumable> {
+    paths.filter_map(move |path| {
+        let row = match digest(&path) {
             Ok(digest) => Resumable {
                 path,
                 digest,
@@ -446,14 +454,22 @@ fn resumable_sessions(sessions_dir: &Path) -> Vec<Resumable> {
                 path,
                 error: Some(error.to_string()),
             },
-        })
-        .filter(|session| !matches!(session.digest.origin, Some(SessionOrigin::SubAgent(_))))
+        };
+        let top_level = !matches!(row.digest.origin, Some(SessionOrigin::SubAgent(_)));
         // A session holding nothing but its opening preamble replays as an empty
         // conversation — there is nothing to continue into. A writer no longer
         // leaves one behind, but the ones already on disk (and any left by a
         // hard kill) would still win `--continue` on recency alone.
-        .filter(|session| session.digest.has_content)
-        .collect()
+        (top_level && row.digest.has_content).then_some(row)
+    })
+}
+
+fn resumable_sessions(sessions_dir: &Path) -> Vec<Resumable> {
+    resumable_rows(
+        sessions_by_recency(sessions_dir).into_iter(),
+        session_digest,
+    )
+    .collect()
 }
 
 /// The row text for one session, shared by the picker and the stdio fallback.
@@ -563,11 +579,13 @@ pub(crate) fn open_history(
         }
         SessionChoice::Resume(id) => session_in_this_project(store, dirs, id)?,
         SessionChoice::Continue => {
-            resumable_sessions(sessions_dir)
-                .into_iter()
-                .next()
-                .context("no saved sessions to continue")?
-                .path
+            resumable_rows(
+                sessions_by_recency(sessions_dir).into_iter(),
+                session_digest,
+            )
+            .next()
+            .context("no saved sessions to continue")?
+            .path
         }
         SessionChoice::Pick => match pick_session(sessions_dir)? {
             Some(path) => path,
@@ -592,7 +610,7 @@ pub(crate) fn open_history(
         .with_context(|| format!("cannot resume session {}", resume_path.display()))?;
     println!(
         "[resumed session {id}: {} message(s)]",
-        resumed.messages.len()
+        resumed.messages().len()
     );
     let history = History::resume(offload_dir, resumed);
     Ok(Some((history, id)))
@@ -997,6 +1015,92 @@ mod tests {
             .map(|session| session.path)
             .collect();
         assert_eq!(offered, vec![real]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn digest(id: &str, origin: Option<SessionOrigin>, has_content: bool) -> SessionDigest {
+        SessionDigest {
+            id: id.into(),
+            title: id.into(),
+            origin,
+            modified: SystemTime::UNIX_EPOCH,
+            bytes: 0,
+            has_content,
+        }
+    }
+
+    /// `--continue` takes the first row it can use and stops: collecting every
+    /// digest first is what the old `resumable_sessions(..).into_iter().next()`
+    /// did, reading every transcript behind the one it picked.
+    #[test]
+    fn continue_digests_only_until_the_first_resumable_session() {
+        let paths: Vec<PathBuf> = ["empty", "subagent", "real", "later"]
+            .iter()
+            .map(|id| PathBuf::from(format!("/sessions/{id}.jsonl")))
+            .collect();
+        let reads = std::cell::Cell::new(0);
+        let first = resumable_rows(paths.into_iter(), |path| {
+            reads.set(reads.get() + 1);
+            let id = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let origin = (id == "subagent").then(|| SessionOrigin::SubAgent("parent#1".into()));
+            Ok(digest(&id, origin, id != "empty"))
+        })
+        .next()
+        .expect("a session to continue");
+
+        assert_eq!(first.path, PathBuf::from("/sessions/real.jsonl"));
+        assert_eq!(reads.get(), 3, "the fourth session is never digested");
+    }
+
+    /// A damaged line before the first prompt must not turn the row into an
+    /// unreadable one with no lineage: the sub-agent transcript would slip
+    /// back into the picker.
+    #[test]
+    fn a_subagent_with_a_damaged_line_stays_out_of_the_picker() {
+        let dir = std::env::temp_dir().join(format!(
+            "kloop-args-damaged-{}-{}",
+            std::process::id(),
+            "subagent"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let agent = dir.join("20260101-000001-agent-1.jsonl");
+        std::fs::write(
+            &agent,
+            [
+                br#"{"type":"session","id":"20260101-000001-agent-1#1","ts":0,"format_version":1,"subagent_of":"parent#1","runtime":{"cwd":"/work"}}"#.as_slice(),
+                b"\n",
+                b"\xff torn\n",
+                br#"{"type":"message","id":"20260101-000001-agent-1#3","parent":"20260101-000001-agent-1#2","ts":0,"role":"user","content":[{"type":"text","text":"spawned task"}]}"#.as_slice(),
+                b"\n",
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let real = dir.join("20260102-000002.jsonl");
+        std::fs::write(
+            &real,
+            concat!(
+                r#"{"type":"session","id":"20260102-000002#1","ts":0,"format_version":1,"runtime":{"cwd":"/work"}}"#,
+                "\n",
+                r#"{"type":"message","id":"20260102-000002#2","parent":"20260102-000002#1","ts":0,"role":"user","content":[{"type":"text","text":"the real one"}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let offered: Vec<PathBuf> = resumable_sessions(&dir)
+            .into_iter()
+            .map(|session| session.path)
+            .collect();
+        assert_eq!(offered, vec![real]);
+
+        // `--list-sessions` keeps it, labelled and with its title read past
+        // the damaged line.
+        let line = session_line(&agent);
+        assert!(line.contains("[sub-agent of parent#1]"), "{line}");
+        assert!(line.contains("spawned task"), "{line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

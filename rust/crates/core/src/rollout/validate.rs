@@ -173,16 +173,29 @@ fn validate_provider_routes(lines: &[RolloutLine]) -> io::Result<()> {
         }
         routes.push(receipt.clone());
     }
-    validate_timeline(&routes).map_err(|_| invalid("provider route timeline is invalid".into()))?;
-
     let first_message = lines.iter().find_map(|line| match line {
         RolloutLine::Message { meta, .. } => Some(seq_of(meta)),
         _ => None,
     });
-    if first_message.is_some_and(|boundary| routes[0].route_boundary >= boundary) {
-        return Err(invalid(
-            "initial provider route must precede the first history message".into(),
-        ));
+    if routes.is_empty() {
+        // A writer killed between its opening preamble and the first turn's
+        // initial route leaves a file with no timeline. It holds no
+        // conversation, so it reads as an empty session and the first turn
+        // opens the route later; anything that would have needed the timeline
+        // is refused by the checks below.
+        if first_message.is_some() {
+            return Err(invalid(
+                "provider route timeline is missing before the first history message".into(),
+            ));
+        }
+    } else {
+        validate_timeline(&routes)
+            .map_err(|_| invalid("provider route timeline is invalid".into()))?;
+        if first_message.is_some_and(|boundary| routes[0].route_boundary >= boundary) {
+            return Err(invalid(
+                "initial provider route must precede the first history message".into(),
+            ));
+        }
     }
 
     for line in lines {
@@ -288,6 +301,16 @@ fn validate_provider_message(
 
 pub(super) fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
     let (lines, intact_end) = intact_lines(raw)?;
+    // A file with nothing intact but bytes before the first line is not an
+    // empty session — its opening line is corrupt, and treating it as a torn
+    // tail would let recovery truncate the whole transcript. An actually empty
+    // file (or one with only whitespace lines) is a freshly claimed session.
+    if lines.is_empty() && intact_end != raw.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session does not start with an intact line",
+        ));
+    }
     validate_format(&lines)?;
     validate_provider_routes(&lines)?;
     validate_envelope(&lines)?;
@@ -479,7 +502,7 @@ mod tests {
 
         drop(rollout);
         let resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages, vec![Message::user_text("[summary]")]);
+        assert_eq!(resumed.messages(), vec![Message::user_text("[summary]")]);
         assert_eq!(
             resumed.provider_usage.records(),
             &[usage_record("before", 10), usage_record("after", 20)]

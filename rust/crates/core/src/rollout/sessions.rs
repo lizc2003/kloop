@@ -16,8 +16,6 @@ use super::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PairingRepair {
-    pub(super) messages: Vec<Message>,
-    pub(super) terminals: Vec<SnapshotTerminal>,
     pub(super) stats: PairingRepairStats,
     changed: bool,
 }
@@ -34,11 +32,14 @@ pub struct SessionRead {
     intact_end: usize,
     last_id: Option<String>,
     max_seq: u64,
+    /// Held from a read taken under the writer lease, so recovery operates on
+    /// exactly the bytes that were validated.
+    lease: Option<crate::state_lock::StateLock>,
 }
 
 impl SessionRead {
-    pub fn snapshot(&self) -> SessionSnapshot {
-        self.snapshot.clone()
+    pub fn snapshot(&self) -> &SessionSnapshot {
+        &self.snapshot
     }
 
     pub fn provider_usage(&self) -> &UsageLedger {
@@ -49,27 +50,37 @@ impl SessionRead {
         &self.repair.stats
     }
 
-    /// Take this session's writer lease, then perform the only on-disk recovery
-    /// operation: truncate an intact prefix and, when necessary, append one
-    /// canonical pairing marker.
+    /// Perform the only on-disk recovery operation — truncate a torn tail and,
+    /// when necessary, append one canonical pairing marker — under the lease
+    /// the read was taken with. A read taken without the lease ([`inspect_session`])
+    /// cannot be recovered: something could have appended in between.
     ///
     /// The lease is why this can fail on a transcript that reads perfectly
     /// well: one writer at a time, so a session another process currently has
     /// open comes back as an error rather than as a second writer. Read-only
     /// callers ([`load_session`], [`load_session_snapshot`], [`inspect_session`])
     /// are the ones that work on a live session.
-    pub fn recover_for_writing(self) -> io::Result<ResumedSession> {
-        let lease = crate::state_lock::StateLock::try_acquire(&self.path.with_extension("lock"))
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "session is already active or cannot be locked: {error}"
-                ))
-            })?;
-        inspect_session(&self.path)?.recover_locked(lease)
+    pub fn recover_for_writing(mut self) -> io::Result<ResumedSession> {
+        let lease = self.lease.take().ok_or_else(|| {
+            io::Error::other("session must be read under its writer lease before recovery")
+        })?;
+        self.recover_locked(lease)
     }
 
     fn recover_locked(self, lease: crate::state_lock::StateLock) -> io::Result<ResumedSession> {
-        let next_seq = self.max_seq.checked_add(1).ok_or_else(|| {
+        let Self {
+            snapshot,
+            provider_usage,
+            request_stubs,
+            repair,
+            path,
+            raw_len,
+            intact_end,
+            last_id,
+            max_seq,
+            ..
+        } = self;
+        let next_seq = max_seq.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "session sequence exhausted")
         })?;
         if next_seq == u64::MAX {
@@ -80,45 +91,71 @@ impl SessionRead {
         }
         let mut rollout = Rollout {
             lease: Some(lease),
-            path: self.path.clone(),
-            prefix: session_id_of(&self.path),
+            path: path.clone(),
+            prefix: session_id_of(&path),
             next_seq,
-            last_id: self.last_id,
+            last_id,
             subagent_of: None,
-            route_timeline: self.snapshot.provider_routes.clone(),
+            route_timeline: snapshot.provider_routes.clone(),
             // A resumed session's file is on disk and belongs to whoever wrote
             // it; this writer only continues it.
             preexisting: true,
             wrote_content: true,
+            poisoned: false,
         };
-        if self.intact_end < self.raw_len {
+        if intact_end < raw_len {
             std::fs::OpenOptions::new()
                 .write(true)
-                .open(&self.path)?
-                .set_len(self.intact_end as u64)?;
+                .open(&path)?
+                .set_len(intact_end as u64)?;
         }
-        if self.repair.changed {
-            rollout.append_repaired(&self.repair)?;
+        if repair.changed {
+            rollout.append_repaired(&snapshot, &repair.stats)?;
         }
         Ok(ResumedSession {
-            messages: self.snapshot.messages.clone(),
-            provider_usage: self.provider_usage,
-            request_stubs: self.request_stubs,
-            snapshot: self.snapshot,
-            repair: self.repair.stats,
+            provider_usage,
+            request_stubs,
+            snapshot,
+            repair: repair.stats,
             rollout,
         })
     }
 }
 
+/// Test-only count of transcript reads per path: it makes the one-read
+/// guarantee of `resume_session` observable without a filesystem shim. Keyed
+/// by path so tests running in parallel cannot see each other's reads.
+#[cfg(test)]
+mod read_probe {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+
+    static READS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn record(path: &Path) {
+        *READS.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+    }
+
+    /// Reads of `path` since the last call.
+    pub(super) fn take(path: &Path) -> usize {
+        READS.lock().unwrap().remove(path).unwrap_or(0)
+    }
+}
+
 pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
+    #[cfg(test)]
+    read_probe::record(path);
     let raw = std::fs::read(path)?;
     let parsed = parse_session(&raw)?;
-    let repair = repair_pairing(parsed.items, parsed.terminals, &parsed.started);
+    let (messages, terminals, repair) =
+        repair_pairing(parsed.items, parsed.terminals, &parsed.started);
     let snapshot = SessionSnapshot {
-        messages: repair.messages.clone(),
+        messages,
         runtime: parsed.runtime,
-        terminals: repair.terminals.clone(),
+        terminals,
         provider_routes: parsed.route_timeline,
     };
     Ok(SessionRead {
@@ -131,11 +168,29 @@ pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
         intact_end: parsed.intact_end,
         last_id: parsed.last_id,
         max_seq: parsed.max_seq,
+        lease: None,
     })
 }
 
-/// Read-only replay (used by `--list-sessions`): a malformed tail is ignored,
-/// and orphaned tool pairing is repaired only in the returned history.
+/// Inspect a session while holding its writer lease. Recovery must start from
+/// this read and not [`inspect_session`]: taking the lease after validating
+/// leaves a window in which another writer can append, after which this
+/// reader's `max_seq`/`intact_end` would truncate or overwrite its lines.
+pub fn inspect_session_for_writing(path: &Path) -> io::Result<SessionRead> {
+    let lease = crate::state_lock::StateLock::try_acquire(&path.with_extension("lock")).map_err(
+        |error| {
+            io::Error::other(format!(
+                "session is already active or cannot be locked: {error}"
+            ))
+        },
+    )?;
+    let mut read = inspect_session(path)?;
+    read.lease = Some(lease);
+    Ok(read)
+}
+
+/// Read-only replay: a malformed tail is ignored, and orphaned tool pairing is
+/// repaired only in the returned history.
 pub fn load_session(path: &Path) -> io::Result<Vec<Message>> {
     Ok(inspect_session(path)?.snapshot.messages)
 }
@@ -147,21 +202,28 @@ pub fn load_session_snapshot(path: &Path) -> io::Result<SessionSnapshot> {
 }
 
 pub struct ResumedSession {
-    pub messages: Vec<Message>,
+    /// The one copy of the replayed history: messages and terminals are moved
+    /// into it, not cloned beside it.
+    pub snapshot: SessionSnapshot,
     pub provider_usage: UsageLedger,
     /// Stubs recorded since the last compaction (plan 200).
     pub(crate) request_stubs: Vec<FrozenStub>,
-    pub snapshot: SessionSnapshot,
     pub repair: PairingRepairStats,
     pub rollout: Rollout,
 }
 
+impl ResumedSession {
+    pub fn messages(&self) -> &[Message] {
+        &self.snapshot.messages
+    }
+}
+
 /// Open a session for continuation. Unlike the read-only load functions this
 /// explicitly truncates torn tail bytes and persists canonical pairing repair —
-/// and it takes the session's writer lease, so a session another process
-/// currently has open cannot be resumed here.
+/// and it takes the session's writer lease before reading, so a session another
+/// process currently has open cannot be resumed here.
 pub fn resume_session(path: &Path) -> io::Result<ResumedSession> {
-    inspect_session(path)?.recover_for_writing()
+    inspect_session_for_writing(path)?.recover_for_writing()
 }
 
 /// Fork a session: copy lines `#1..=#{cut}` of `src` into a brand-new
@@ -485,18 +547,23 @@ pub fn session_digest(path: &Path) -> io::Result<SessionDigest> {
         has_content: false,
     };
     let mut reader = std::io::BufReader::new(file);
-    let mut raw = String::new();
+    let mut raw = Vec::new();
     let mut at_first_line = true;
     loop {
         raw.clear();
-        if reader.read_line(&mut raw)? == 0 {
+        if reader.read_until(b'\n', &mut raw)? == 0 {
             break;
         }
         // Lineage rides the first line only, and an unparseable line is skipped
         // rather than fatal — `parse_session` tolerates a torn tail the same
-        // way, and a damaged session must still be listable.
+        // way, and a damaged session must still be listable. That includes a
+        // torn multi-byte character: it is bytes, not `String`, so one bad
+        // line cannot fail the whole digest and hide the session's lineage.
         let first = std::mem::take(&mut at_first_line);
-        let Ok(line) = serde_json::from_str::<RolloutLine>(raw.trim()) else {
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            continue;
+        };
+        let Ok(line) = serde_json::from_str::<RolloutLine>(text.trim()) else {
             continue;
         };
         if first {
@@ -534,7 +601,7 @@ fn repair_pairing(
     items: Vec<Message>,
     terminals: Vec<SnapshotTerminal>,
     started: &HashSet<String>,
-) -> PairingRepair {
+) -> (Vec<Message>, Vec<SnapshotTerminal>, PairingRepair) {
     #[derive(Debug)]
     struct Entry {
         message: Message,
@@ -637,7 +704,6 @@ fn repair_pairing(
         i += 1;
     }
 
-    let messages: Vec<Message> = repaired.iter().map(|entry| entry.message.clone()).collect();
     let original_terminals = terminals.clone();
     let mut canonical_terminals = Vec::with_capacity(terminals.len());
     for terminal in terminals {
@@ -659,6 +725,7 @@ fn repair_pairing(
         .filter(|entry| entry.origin.is_none())
         .count()
         + dropped_messages;
+    let messages: Vec<Message> = repaired.into_iter().map(|entry| entry.message).collect();
     let stats = PairingRepairStats {
         messages_before,
         messages_after: messages.len(),
@@ -672,12 +739,11 @@ fn repair_pairing(
         || dropped_messages != 0
         || inserted_tool_results != 0
         || canonical_terminals != original_terminals;
-    PairingRepair {
+    (
         messages,
-        terminals: canonical_terminals,
-        stats,
-        changed,
-    }
+        canonical_terminals,
+        PairingRepair { stats, changed },
+    )
 }
 
 /// What a crash left a call that never reported back. The two texts differ
@@ -937,7 +1003,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         drop(writer);
         let resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages, [message]);
+        assert_eq!(resumed.messages(), [message]);
         drop(resumed);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -960,7 +1026,7 @@ mod tests {
         drop(rollout);
 
         let mut resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages.len(), 2);
+        assert_eq!(resumed.messages().len(), 2);
         resumed
             .rollout
             .append_message(&Message::user_text("three"))
@@ -1005,14 +1071,14 @@ mod tests {
         assert_eq!(resumed.request_stubs, vec![stub("t1")]);
         let mut with_next = conversation.clone();
         with_next.push(Message::user_text("next"));
-        assert_eq!(resumed.messages, with_next);
+        assert_eq!(resumed.messages(), with_next);
         drop(resumed);
 
         let sessions = path.with_extension("forks");
         let fork = fork_session(&path, Some(stub_seq), &sessions).unwrap();
         let forked = resume_session(&fork).unwrap();
         assert_eq!(forked.request_stubs, vec![stub("t1")]);
-        assert_eq!(forked.messages, conversation);
+        assert_eq!(forked.messages(), conversation);
         drop(forked);
 
         let mut rollout = resume_session(&path).unwrap().rollout;
@@ -1176,12 +1242,16 @@ mod tests {
         // A fork copies the started lines with the prefix, so its own resume
         // repairs the same way.
         let fork = fork_session(&path, None, &dir).unwrap();
-        assert_eq!(resume_session(&fork).unwrap().messages, expected, "fork");
+        assert_eq!(resume_session(&fork).unwrap().messages(), expected, "fork");
 
-        assert_eq!(resume_session(&path).unwrap().messages, expected, "resume");
+        assert_eq!(
+            resume_session(&path).unwrap().messages(),
+            expected,
+            "resume"
+        );
         // The repair marker persisted by that resume carries the texts; a
         // second resume reads them back instead of repairing again.
-        assert_eq!(resume_session(&path).unwrap().messages, expected, "again");
+        assert_eq!(resume_session(&path).unwrap().messages(), expected, "again");
         let kinds: Vec<Value> = raw_lines(&path)
             .into_iter()
             .map(|line| line["type"].clone())
@@ -1241,7 +1311,7 @@ mod tests {
 
         // Second run: resume from disk and continue the conversation.
         let resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages, before_restart);
+        assert_eq!(resumed.messages(), before_restart);
         let cfg = cfg_with(
             Provider::mock(vec![vec![kloop_protocol::AssistantBlock::Text {
                 text: "it was kumquat".into(),
@@ -1648,6 +1718,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One line that is not UTF-8 — a torn multi-byte character, a stray
+    /// byte — must not fail the whole digest and turn the row into an
+    /// `origin: None, modified: EPOCH` error row: the picker would stop
+    /// filtering a sub-agent transcript and `--list-sessions` would lose the
+    /// title it could still read.
+    #[test]
+    fn session_digest_skips_a_non_utf8_line_and_keeps_reading() {
+        let path = temp_file("digest-bad-line");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            [
+                // Lineage rides the first line and survives the damage below.
+                br#"{"type":"session","id":"session#1","ts":0,"format_version":1,"subagent_of":"parent#1","runtime":{"cwd":"/work"}}"#.as_slice(),
+                b"\n",
+                b"\xff\xfe torn\n",
+                br#"{"type":"message","id":"session#3","parent":"session#2","ts":0,"role":"user","content":[{"type":"text","text":"resume me"}]}"#.as_slice(),
+                b"\n",
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let digest = session_digest(&path).unwrap();
+        assert_eq!(
+            digest.origin,
+            Some(SessionOrigin::SubAgent("parent#1".into()))
+        );
+        assert_eq!(digest.title, "resume me");
+        assert!(digest.has_content);
+        cleanup(&path);
+    }
+
+    /// A writer killed between its runtime line and the first turn's initial
+    /// route leaves a file with a runtime and no route timeline. It holds no
+    /// conversation, so it is an empty session rather than a corrupt one:
+    /// listing and resuming both work, and the first turn opens the route.
+    #[test]
+    fn a_preamble_only_file_without_a_route_is_readable_and_resumable() {
+        let path = temp_file("pending-route");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","id":"session#1","ts":0,"format_version":1,"runtime":{"cwd":"/work"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let snapshot = load_session_snapshot(&path).unwrap();
+        assert!(snapshot.messages.is_empty());
+        assert!(snapshot.provider_routes.is_empty());
+        assert_eq!(snapshot.runtime.unwrap().cwd, "/work");
+
+        let resumed = resume_session(&path).unwrap();
+        assert!(resumed.messages().is_empty());
+        assert!(resumed.snapshot.provider_routes.is_empty());
+        drop(resumed);
+        cleanup(&path);
+    }
+
+    /// Resume takes the writer lease first and reads the transcript once. The
+    /// old path read it, locked, then read it again — paying for the whole
+    /// parse twice and racing the second read against a writer that could
+    /// have appended in between.
+    #[test]
+    fn resume_reads_the_transcript_once() {
+        let path = temp_file("resume-once");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        drop(rollout);
+        // Ignore anything the setup itself read.
+        read_probe::take(&path);
+
+        let resumed = resume_session(&path).unwrap();
+        assert_eq!(read_probe::take(&path), 1);
+        drop(resumed);
+        cleanup(&path);
+    }
+
     #[test]
     fn session_origin_distinguishes_fork_subagent_and_fresh() {
         let path = temp_file("origin");
@@ -1784,7 +1935,7 @@ mod tests {
 
         drop(rollout);
         let resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages[1].provider_provenance, Some(provenance));
+        assert_eq!(resumed.messages()[1].provider_provenance, Some(provenance));
         let fork = fork_session(&path, None, &dir).unwrap();
         assert_eq!(load_session_snapshot(&fork).unwrap().messages[1], assistant);
         assert_eq!(raw_lines(&fork)[3]["typed_error"], raw[3]["typed_error"]);
@@ -1828,7 +1979,7 @@ mod tests {
         drop(rollout);
         let resumed = resume_session(&path).unwrap();
         assert!(resumed.provider_usage.records().is_empty());
-        assert_eq!(resumed.messages, vec![Message::user_text("intact")]);
+        assert_eq!(resumed.messages(), vec![Message::user_text("intact")]);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
         cleanup(&path);
     }
@@ -1850,7 +2001,7 @@ mod tests {
 
         drop(rollout);
         let mut resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages, vec![Message::user_text("intact")]);
+        assert_eq!(resumed.messages(), vec![Message::user_text("intact")]);
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             good_len,
@@ -1884,14 +2035,19 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         drop(rollout);
-        let resumed = inspected.recover_for_writing().unwrap();
+        // Recovery starts from a read taken under the lease, never from the
+        // read-only inspection above.
+        let resumed = inspect_session_for_writing(&path)
+            .unwrap()
+            .recover_for_writing()
+            .unwrap();
         assert_eq!(resumed.repair.inserted_tool_results, 1);
         let lines = raw_lines(&path);
         assert_eq!(lines.last().unwrap()["type"], "repaired");
         let after_marker = lines.len();
         drop(resumed);
 
-        let inspected = inspect_session(&path).unwrap();
+        let inspected = inspect_session_for_writing(&path).unwrap();
         assert_eq!(
             inspected.repair_stats(),
             &PairingRepairStats {

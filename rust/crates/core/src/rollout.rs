@@ -38,14 +38,13 @@ pub use line::{
 pub use sessions::{
     ClaimedSession, ForkPoint, ResumedSession, SessionDigest, SessionOrigin, SessionRead,
     checked_session_path, claim_new_session, first_user_snippet, fork_origin, fork_points,
-    fork_session, inspect_session, is_subagent_session, load_session, load_session_snapshot,
-    resume_session, session_digest, session_id_of, session_origin, session_path,
-    sessions_by_recency,
+    fork_session, inspect_session, inspect_session_for_writing, is_subagent_session, load_session,
+    load_session_snapshot, resume_session, session_digest, session_id_of, session_origin,
+    session_path, sessions_by_recency,
 };
 pub(crate) use sessions::{civil_from_days, timestamp_id};
 
 use line::{LineMeta, RolloutLine};
-use sessions::PairingRepair;
 
 /// Append-only writer for one session file. A new session's file is created
 /// by [`claim_new_session`], which is what reserves its id against a
@@ -69,6 +68,11 @@ pub struct Rollout {
     /// Something past the opening preamble has been appended, i.e. the file now
     /// holds a session worth resuming.
     wrote_content: bool,
+    /// A write failed after it may have put bytes on disk. The tail is now a
+    /// partial line that the next append would glue itself to, so this writer
+    /// refuses every write from here on — recovery truncates the tail once the
+    /// session is read again.
+    poisoned: bool,
 }
 
 impl Drop for Rollout {
@@ -81,6 +85,13 @@ impl Drop for Rollout {
         // `--continue` picks that empty shell over the last real conversation.
         // Only a file this writer created can be removed here.
         let _ = std::fs::remove_file(&self.path);
+        // The lease goes with the file: every session would otherwise leave a
+        // zero-byte `.lock` behind for its whole lifetime. Unlinking one while
+        // any writer could still be using it is a double-writer race, but this
+        // file never held a conversation and its writer is the only one that
+        // ever leased it (the lease is still held right here), so the lock path
+        // goes with the transcript.
+        let _ = std::fs::remove_file(self.path.with_extension("lock"));
     }
 }
 
@@ -121,11 +132,17 @@ impl Rollout {
         Ok(rollout)
     }
 
+    /// A new server thread's file, holding the runtime pinned at
+    /// `thread/start` until the route catalog resolves and the initial receipt
+    /// is appended. Like [`Rollout::claimed_with_initial_route`], the writer
+    /// owns the claimed file: a thread that never runs a turn leaves nothing
+    /// behind.
     pub fn new_with_runtime_pending_route(
-        path: PathBuf,
+        claim: ClaimedSession,
         runtime: SessionRuntime,
     ) -> io::Result<Self> {
-        let mut rollout = Self::with_origin(path, None);
+        let mut rollout = Self::with_origin(claim.path, None);
+        rollout.preexisting = false;
         rollout.append_runtime(&runtime)?;
         Ok(rollout)
     }
@@ -190,6 +207,7 @@ impl Rollout {
             subagent_of,
             route_timeline: Vec::new(),
             wrote_content: false,
+            poisoned: false,
         }
     }
 
@@ -342,13 +360,17 @@ impl Rollout {
         })
     }
 
-    fn append_repaired(&mut self, repair: &PairingRepair) -> io::Result<()> {
+    fn append_repaired(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        stats: &PairingRepairStats,
+    ) -> io::Result<()> {
         self.append_line(RolloutLine::Repaired {
             meta: self.next_meta(),
             kind: "pairing".into(),
-            replacement: repair.messages.clone(),
-            terminals: repair.terminals.clone(),
-            stats: repair.stats.clone(),
+            replacement: snapshot.messages.clone(),
+            terminals: snapshot.terminals.clone(),
+            stats: stats.clone(),
         })
     }
 
@@ -388,6 +410,22 @@ impl Rollout {
     }
 
     fn append_line(&mut self, line: RolloutLine) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "session writer is poisoned by a failed append",
+            ));
+        }
+        let result = self.append_line_unchecked(line);
+        if result.is_err() {
+            // We cannot know how much of the line reached disk. Writing again
+            // would append behind a partial line, which no reader can recover
+            // past; leaving the writer alone is the only safe move.
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn append_line_unchecked(&mut self, line: RolloutLine) -> io::Result<()> {
         self.ensure_lease()?;
         if self.next_seq == u64::MAX {
             return Err(io::Error::new(
@@ -530,7 +568,7 @@ mod tests {
             &[usage_record("actual-model", 120)]
         );
         assert_eq!(
-            resumed.messages,
+            resumed.messages(),
             vec![
                 Message::user_text("one"),
                 Message::assistant(vec![ContentBlock::Text {
@@ -539,11 +577,11 @@ mod tests {
             ]
         );
         let snapshot = load_session_snapshot(&path).unwrap();
-        assert_eq!(snapshot.messages, resumed.messages);
+        assert_eq!(snapshot.messages, resumed.messages());
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             json!({
-                "messages": resumed.messages,
+                "messages": resumed.messages(),
                 "runtime": null,
                 "terminals": [],
             })
@@ -656,8 +694,11 @@ mod tests {
         let path = temp_file("preamble-only");
         let rollout = Rollout::new(path.clone());
         assert!(path.exists(), "the id is reserved while the writer lives");
+        let lock = path.with_extension("lock");
+        assert!(lock.exists(), "the writer leases the session it writes");
         drop(rollout);
         assert!(!path.exists());
+        assert!(!lock.exists(), "the empty session's lease goes with it");
         cleanup(&path);
     }
 
@@ -679,6 +720,7 @@ mod tests {
         let quiet = claim.path().to_path_buf();
         drop(Rollout::claimed_with_initial_route(claim, &route).unwrap());
         assert!(!quiet.exists());
+        assert!(!quiet.with_extension("lock").exists());
 
         let claim = claim_new_session(&dir).unwrap();
         let kept = claim.path().to_path_buf();
@@ -686,6 +728,10 @@ mod tests {
         rollout.append_message(&Message::user_text("hi")).unwrap();
         drop(rollout);
         assert_eq!(load_session_snapshot(&kept).unwrap().messages.len(), 1);
+        assert!(
+            kept.with_extension("lock").exists(),
+            "a used session keeps its lease file"
+        );
         cleanup(&path);
     }
 
@@ -699,6 +745,43 @@ mod tests {
         drop(rollout);
         assert!(path.exists());
         assert_eq!(load_session_snapshot(&path).unwrap().messages.len(), 1);
+        cleanup(&path);
+    }
+
+    /// A write that fails may have put part of its line on disk. Appending
+    /// again would glue the next line to that fragment — and `intact_lines`
+    /// stops at the first line it cannot parse, so recovery would truncate
+    /// everything after it. The writer therefore stays poisoned even once the
+    /// file is writable again.
+    #[test]
+    fn a_failed_append_poisons_the_writer() {
+        let path = temp_file("poisoned-append");
+        let mut rollout = Rollout::new(path.clone());
+        rollout
+            .append_message(&Message::user_text("before"))
+            .unwrap();
+
+        let read_only = |read_only: bool| {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(read_only);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        };
+        read_only(true);
+        assert!(
+            rollout.append_message(&Message::user_text("lost")).is_err(),
+            "a read-only file cannot take the append"
+        );
+        read_only(false);
+        let error = rollout
+            .append_message(&Message::user_text("after"))
+            .unwrap_err();
+        assert!(error.to_string().contains("poisoned"), "{error}");
+
+        drop(rollout);
+        assert_eq!(
+            load_session(&path).unwrap(),
+            vec![Message::user_text("before")]
+        );
         cleanup(&path);
     }
 

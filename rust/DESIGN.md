@@ -615,7 +615,19 @@ past its opening preamble — the
 is dropped** (plan 115): launching kloop and quitting without a word leaves no
 session, and cannot beat the last real conversation to `--continue`. Only a file
 that writer created is ever removed, and only while it holds nothing else — a
-resumed or forked session's file is never touched. A `provider_usage` line preserves
+resumed or forked session's file is never touched. The `.lock` goes with it
+(plan 251): unlinking a lease another opener might already hold is a
+double-writer race, but this file never held a conversation and its writer is
+the only process that leased it; a session with content keeps its zero-byte
+lock, so the lock count never exceeds the session count. A preamble-only file a
+hard kill leaves behind is an empty session rather than a corrupt one: its
+timeline may not have its initial route yet, which replay accepts as long as no
+history message or usage line needs one, and the first turn writes it. A file
+whose **first** line is not intact is still refused instead of reading as an
+empty session, so recovery can never truncate a transcript it could not begin
+to read. A failed append poisons its writer for the rest of its life: the
+partial `writeln!` may have left a fragment the next line would glue itself
+to, and no reader can recover past that. A `provider_usage` line preserves
 the actual model, operation (`sampling` or `compaction`), and all four canonical
 provider-reported categories (input, output, cache-read input, cache-creation
 input). It is historical transcript data, separate from the resettable context
@@ -723,7 +735,10 @@ Resume replays the file, then makes the history legal and consistent again. Read
 - a torn tail (crash mid-append) is truncated to the last intact line —
   physically, before appending resumes, so the partial bytes can't merge
   with the next line and orphan everything after (read-only paths never modify
-  the file, including invalid UTF-8 tail bytes);
+  the file, including invalid UTF-8 tail bytes). Recovery reads the file once,
+  already holding the writer lease, so the bytes it validated are the bytes it
+  truncates; taking the lease after the read would leave a window in which
+  another writer appends past the computed sequence;
 - when in-memory pairing repair changes a legacy session, explicit resume
   appends one `repaired` rollout marker containing the canonical messages,
   terminal boundaries and repair statistics. The marker is replay-only metadata:
@@ -743,9 +758,11 @@ claims its JSONL with that same create-new step, so a timestamp collision can
 neither truncate nor share an existing transcript.
 
 每份可写 rollout 在首次追加前持有同名 `.lock` 的跨进程独占租约，直到 writer
-销毁；恢复已有会话先尝试取得租约，再重新读取、修复或截断尾部。已有实例
-仍持有会话时，第二个 writer 明确报错。只读列表、inspect 与快照不取得写租约，
-也不会为查看记录截断文件。子 agent 的 JSONL 同样用排他创建，禁止把新历史
+销毁；恢复已有会话先取得租约、再读取一次文件，校验、修复或截断都在同一份字节上
+进行。已有实例仍持有会话时，第二个 writer 明确报错。只读列表、inspect 与快照
+不取得写租约，也不会为查看记录截断文件。空会话被 Drop 删除时同名 `.lock` 一并
+删除；已有内容的会话保留租约文件，因为在别人可能已经打开它的路径上 unlink 会
+造出两个同时持有的 writer。子 agent 的 JSONL 同样用排他创建，禁止把新历史
 追加到已有同名日志。
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
@@ -764,7 +781,13 @@ prints where the picker began. Off a terminal (a pipe, a harness, a terminal
 that refuses raw mode) it falls back to the numbered stdout list it used to be.
 Rows are built from `session_digest`, which reads each file only up to its first
 user line: replaying dozens of megabyte-sized transcripts just to label them is
-what a list of 74 sessions cannot afford. Native-protocol
+what a list of 74 sessions cannot afford. A line that is not UTF-8 is skipped
+like any other unparseable line, so a torn multi-byte tail cannot turn a row
+into an unreadable error row and lose its lineage (which would put a sub-agent
+transcript back in the picker). `--list-sessions` reads the same digest instead
+of replaying every transcript, and `--continue` takes the first row that
+qualifies, digesting no session behind it; the listing therefore reports the
+prompt and lineage, not a message count. Native-protocol
 sessions additionally restore the exact canonical cwd and resolved model that
 were pinned at `thread/start`; a legacy rollout without this metadata remains
 readable but requires its original `cwd` once on `thread/resume` before it is
@@ -888,7 +911,12 @@ forkable/resumable, and holds the abandoned turns in full. Esc cancels. The
 picker's points are exactly the cuts `fork_session` accepts, so a selection can
 never be rejected. Rewind is idle-only — a running turn owns History (Ctrl+C
 first). The orchestration lives in core (`rewind::rewind`) and the TUI swaps
-in the Config and History it hands back — the split `/clear` has.
+in the Config and History it hands back — the split `/clear` has. The live
+route is carried onto the branch as one `reopened` revision; if that write
+fails, the branch stays on the last route its own timeline records (and a note
+says so) instead of on the live route, whose revision the branch never
+recorded — stamping it onto later messages would make the whole branch fail
+provenance validation on the next resume.
 
 **A rewind does not undo anything on disk** — kloop keeps no file snapshots.
 The files the abandoned turns changed stay changed while the branch's model

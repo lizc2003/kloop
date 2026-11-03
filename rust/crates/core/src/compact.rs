@@ -1562,7 +1562,7 @@ compactions]\n\nOriginal request:\n  old request",
         let expected_routes = history.provider_routes().to_vec();
         drop(history);
         let resumed = resume_session(&path).unwrap();
-        assert_eq!(resumed.messages, expected_messages);
+        assert_eq!(resumed.messages(), expected_messages);
         assert_eq!(resumed.provider_usage.records(), expected_usage);
         assert_eq!(resumed.snapshot.provider_routes, expected_routes);
         let _ = std::fs::remove_dir_all(root);

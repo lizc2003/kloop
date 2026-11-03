@@ -3920,6 +3920,134 @@ async fn sessions_survive_a_server_restart() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// A thread that is started and never gets a turn leaves no session behind.
+/// The file is this writer's own from the claim on, even though it exists
+/// before the opening runtime line is appended, so the writer's Drop removes
+/// it (and its lease) exactly like a CLI session that was closed at once.
+#[tokio::test]
+async fn a_thread_started_and_never_used_leaves_no_session() {
+    let dirs = test_dirs("unused-thread");
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    let thread_id = client.init_and_start().await;
+    let path = dirs.sessions.join(format!("{thread_id}.jsonl"));
+    assert!(path.exists(), "the live thread owns its transcript");
+
+    client.shutdown().await;
+    // The worker is a detached task; it removes the file when its thread
+    // handle (and with it History) drops, just after the server returns.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while path.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !path.exists(),
+        "a thread with no turn left its session file"
+    );
+    assert!(
+        !path.with_extension("lock").exists(),
+        "the empty session's lease went with it"
+    );
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A writer killed between its runtime line and the initial route leaves a
+/// file the old parser refused ("provider route timeline is invalid"). It is
+/// an empty session: `thread/list` shows it and `thread/resume` opens it,
+/// writing the initial route with the first turn.
+#[tokio::test]
+async fn a_preamble_only_session_is_listed_and_resumed() {
+    let dirs = test_dirs("pending-route");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    let thread_id = "20260101-000001";
+    let cwd = std::fs::canonicalize(&dirs.root).unwrap();
+    std::fs::write(
+        dirs.sessions.join(format!("{thread_id}.jsonl")),
+        format!(
+            concat!(
+                r#"{{"type":"session","id":"20260101-000001#1","ts":0,"format_version":1,"runtime":{{"cwd":"{}"}}}}"#,
+                "\n"
+            ),
+            cwd.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    client.request("thread/list", json!({})).await;
+    let list = client.recv().await;
+    let entry = list["result"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == thread_id)
+        .unwrap_or_else(|| panic!("preamble-only session is not listed: {list}"));
+    assert_eq!(entry["messages"], 0);
+    assert_eq!(entry["resumable"], true);
+
+    client
+        .request("thread/resume", json!({"thread_id": thread_id}))
+        .await;
+    let resumed = client.recv().await;
+    assert_eq!(resumed["result"]["thread"]["id"], thread_id);
+    assert_eq!(resumed["result"]["message_count"], 0);
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// Pages are filled with readable threads. The old `skip(offset).take(limit)`
+/// paged first and then dropped unreadable transcripts, so a broken file
+/// inside a page silently shortened it and the cursor kept stepping over it.
+#[tokio::test]
+async fn thread_list_pages_past_unreadable_transcripts() {
+    let dirs = test_dirs("list-paging");
+    std::fs::create_dir_all(&dirs.sessions).unwrap();
+    for (id, prompt) in [
+        ("20260101-000001", "one"),
+        ("20260102-000002", "two"),
+        ("20260103-000003", "three"),
+    ] {
+        let mut rollout = Rollout::new(dirs.sessions.join(format!("{id}.jsonl")));
+        rollout.append_message(&Message::user_text(prompt)).unwrap();
+        drop(rollout);
+    }
+    // Written last, so it sorts first: the page boundary lands on it. A
+    // complete line that is not a legal session line, not a torn tail (which
+    // reads as an empty session and is listable).
+    std::fs::write(
+        dirs.sessions.join("20260109-000009.jsonl"),
+        "{\"type\":\"session\",\"id\":\"20260109-000009#1\",\"ts\":0}\n",
+    )
+    .unwrap();
+
+    let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let request = client
+            .request("thread/list", json!({"limit": 1, "cursor": cursor}))
+            .await;
+        let log = client.recv_until(|message| message["id"] == request).await;
+        let reply = log.iter().find(|message| message["id"] == request).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        let threads = reply["result"]["threads"].as_array().unwrap();
+        assert_eq!(
+            threads.len(),
+            1,
+            "an unreadable transcript shortened a page: {reply}"
+        );
+        pages += 1;
+        cursor = reply["result"]["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 3, "every readable session is reachable by paging");
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 /// `thread/fork` copies a session prefix into a fresh thread and spawns it
 /// live: the client can turn/start on the fork immediately, the fork's lineage
 /// points back into the source at the cut, and the source file is untouched.
@@ -4092,10 +4220,10 @@ async fn slash_commands_surface_as_system_notifications() {
             .contains("unknown command")
     );
 
-    client.shutdown().await;
-    // Commands record no user turns: the session stayed empty.
-    let messages =
-        kloop_core::rollout::load_session(&dirs.sessions.join(format!("{tid}.jsonl"))).unwrap();
+    // Commands record no user turns: while the thread is live its file holds
+    // only the opening preamble.
+    let path = dirs.sessions.join(format!("{tid}.jsonl"));
+    let messages = kloop_core::rollout::load_session(&path).unwrap();
     assert!(
         messages.is_empty(),
         "slash commands must not record user turns: {messages:?}"
@@ -4103,15 +4231,17 @@ async fn slash_commands_surface_as_system_notifications() {
     // Nor a terminal. The terminal is written by run_turn, which a command line
     // never reaches — a command reads and rewrites History, but nothing is
     // sampled, so there is no turn to end.
-    let terminals =
-        kloop_core::rollout::inspect_session(&dirs.sessions.join(format!("{tid}.jsonl")))
-            .unwrap()
-            .snapshot()
-            .terminals;
+    let inspected = kloop_core::rollout::inspect_session(&path).unwrap();
     assert!(
-        terminals.is_empty(),
-        "a slash command is not a model turn: {terminals:?}"
+        inspected.snapshot().terminals.is_empty(),
+        "a slash command is not a model turn: {:?}",
+        inspected.snapshot().terminals
     );
+    drop(inspected);
+    client.shutdown().await;
+    // Nothing past the preamble was ever written, so shutdown removes the
+    // file like any thread that never ran a turn (plan 251).
+    assert!(!path.exists(), "an unused thread left its session file");
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

@@ -1,5 +1,27 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 251 ✅：会话持久化与恢复（2026-11-03）**：复核后第 1 条有一半已过期——`thread/start`
+现在在 `spawn_thread` 里就写 initial route，不再等第一轮；仍成立的是 claim 建的文件被
+`path.exists()` 判成别人的，空线程退出不删，以及硬杀留下的「只有 preamble、没有 route」
+文件被空 timeline 判成损坏。`new_with_runtime_pending_route` 改收 `ClaimedSession` 并显式
+`preexisting = false`；空 timeline 在没有任何消息/usage 时读成空会话，首行就不完整的文件
+仍然拒绝（否则恢复会把整份垃圾截成 0 字节）；`thread/list` 先筛可读再分页，坏文件不再
+缩短一页。rewind 换路由失败时回退到分支 timeline 自己的最后一条 receipt（经
+`ProviderCatalog::restore_route`），不再拿旧会话的当前 route 给分支消息盖 provenance。
+`session_digest` 改 `read_until` 到 bytes 再 `from_utf8`，坏行跳过；列表与 `--continue`
+都改走 digest，`--continue` 惰性迭代到第一个可用会话就停（因此 `--list-sessions` 不再报
+消息数，plan 162 的旧理由被 251 取代）。`Rollout` 失败 append 后中毒，后续写入一律拒绝。
+resume 改为先取租约、再只读一次：`inspect_session_for_writing` 持有租约返回
+`SessionRead`，`recover_for_writing` 只接受带租约的读；`PairingRepair` 不再复制
+messages/terminals，`ResumedSession` 只保存 snapshot 一份，`resume_options` 借用快照。
+空会话 Drop 删除 `.jsonl` 时顺带删同名 `.lock`（有内容的会话保留锁，见教训 317）。
+新增 10 条回归（core 5、CLI 2、server 3；其中 resume 只读一次用按路径计数夹具，失败路由
+adopt 用只读文件强制 append 失败），另把两条 Drop 锁断言加进既有测试、两条旧测试
+随新语义更新。外层执行沙箱之外 `make check` 全绿（fmt、clippy、
+workspace 全量测试，core 1322 项、TUI 314、server contract 46 项、2 项真 provider ignored，
+本机 parity baseline verified）。DESIGN 更新 preamble/锁/损坏首行、恢复只读一次、digest、
+rewind 路由回退段落。Linux 与 Windows 未实测。教训 315–321。
+
 **Plan 250 ✅：agent 主循环与上下文估算（2026-11-03）**：`run_turn` 在 stage pre_turn
 hook 上下文之前记下 `input_staged`；“整 turn 撤回”现在要求输入确实仍是 staged
 （`input_staged && has_staged()`），调用方已自己 `record` 输入时不再把 hook 上下文误当成
@@ -4128,3 +4150,36 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
 314. **“空内容”在不同阶段含义不同。** 一轮本身的纯空白文本可以不算一段回答，但在续接链里，
    `" "` 可能正是被截断句子的词间空格；用 `trim().is_empty()` 统一跳过会得到
    `helloworld`。续接状态只忽略真正的空串，另起段时才沿用空白跳过规则。
+
+315. **“没有 route 时间线”不等于“没有会话”，但“首行坏了”也不等于“空会话”。** 旧校验用
+   空 timeline 拒绝一切无 route 文件，顺手兜住了首行损坏的文件；放宽成允许 preamble-only
+   之后，`intact_lines` 会把一行语法错误的开头当成断尾，恢复再把整份文件截成 0 字节。
+   判据要落在“有没有任何完整行”：`lines.is_empty() && intact_end != raw.len()` 必须报错；
+   真正空的 claim 文件（0 字节或只有空行）才是空会话。
+
+316. **先读后加锁的恢复路径，不能只删掉第二次读。** 原实现是 inspect → 取 lease →
+   再 inspect 一遍；把重复读去掉时，租约必须提前到读之前，否则 `max_seq`/`intact_end`
+   是按“别人还可能追加”的字节算出来的，截断会吃掉新行。让 `recover_for_writing` 只接受
+   带租约的 `SessionRead`，比在每个调用点写注释可靠。
+
+317. **锁文件只能和数据文件同生共死。** 在仍持有租约时 unlink `.lock`，`open` 与
+   `try_lock` 之间有窗口：后到者可能拿到旧 inode 的锁，同时第三个进程新建同名文件并
+   加锁，于是两个 writer 同时写一份 append-only 会话。只在 Drop 同时删掉“从未写过内容”
+   的 `.jsonl` 时删锁；有内容的会话保留 0 字节锁，锁数量与会话数量同阶。
+
+318. **`read_line` 到 `String` 会把一行的坏字节升级成整个文件的错误。** 需要“坏行跳过”的
+   读取一律 `read_until` 到 `Vec<u8>` 再 `from_utf8`：否则一个截断的多字节字符会让
+   `session_digest` 整体失败，picker 丢掉 `origin`（子 agent 重新出现）和 mtime。
+
+319. **append 失败后不能“下次再试”。** `writeln!` 可能只写进半行，下一次 append 会粘在
+   残段后面，形成永远解析不了的行；`intact_lines` 在那里停下，恢复会丢掉它后面的全部
+   内容。writer 必须在第一次写失败后中毒，即使文件权限/磁盘空间已经恢复。
+
+320. **collect 之后取 `next()` 不是惰性。** `resumable_sessions(dir).into_iter().next()`
+   会为“只取第一个”digest 全部会话；要的是迭代器链上的 `.next()`。把 digest 函数做成
+   参数，就能用计数闭包钉住“只读到第几个”，而不是靠代码形状自律。
+
+321. **失败回退要退回目标自己的状态，不是调用方当前的状态。** rewind 把 live route 写进
+   分支失败时，回退到旧会话的当前 revision，会让之后每一条 assistant 消息的 provenance
+   指向分支 timeline 里不存在的 revision，下次 resume 整份分支都读不出来。回退必须是
+   分支最后一条 receipt 经 catalog 还原出的 route。

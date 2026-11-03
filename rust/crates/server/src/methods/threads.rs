@@ -81,10 +81,11 @@ impl Server {
         let thread_id = claim.id().to_string();
         let path = claim.path().to_path_buf();
         let runtime = runtime_from_options(&options);
-        let rollout = match Rollout::new_with_runtime_pending_route(path.clone(), runtime.clone()) {
+        let rollout = match Rollout::new_with_runtime_pending_route(claim, runtime.clone()) {
             Ok(rollout) => rollout,
             Err(error) => {
                 let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(path.with_extension("lock"));
                 return Err((
                     wire::SERVER_ERROR,
                     format!("cannot initialize session: {error}"),
@@ -107,6 +108,7 @@ impl Server {
             seed,
         ) {
             let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("lock"));
             return Err(error);
         }
         let route = self
@@ -129,13 +131,13 @@ impl Server {
             ));
         }
         let (path, dirs) = self.locate_thread(thread_id)?;
-        let inspected = rollout::inspect_session(&path)
+        let inspected = rollout::inspect_session_for_writing(&path)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?;
-        let options = resume_options(&inspected.snapshot(), params, &self.default_cwd)?;
+        let options = resume_options(inspected.snapshot(), params, &self.default_cwd)?;
         let resumed = inspected
             .recover_for_writing()
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot resume: {e}")))?;
-        let count = resumed.messages.len();
+        let count = resumed.snapshot.messages.len();
         let seed = resumed.snapshot.clone();
         let history = History::resume(dirs.offload.clone(), resumed);
         self.spawn_thread(
@@ -194,15 +196,16 @@ impl Server {
         // fork: it is `preexisting` to its writer, so nothing else will, and
         // each retry would add another orphan to `thread/list`.
         let mut fork_guard = kloop_core::cleanup::RemoveFileOnDrop::new(new_path.clone());
-        let resumed =
-            match rollout::inspect_session(&new_path).and_then(|read| read.recover_for_writing()) {
-                Ok(resumed) => resumed,
-                Err(error) => {
-                    return Err((wire::SERVER_ERROR, format!("cannot resume fork: {error}")));
-                }
-            };
+        let resumed = match rollout::inspect_session_for_writing(&new_path)
+            .and_then(|read| read.recover_for_writing())
+        {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                return Err((wire::SERVER_ERROR, format!("cannot resume fork: {error}")));
+            }
+        };
         let options = resume_options(&resumed.snapshot, params, &self.default_cwd)?;
-        let count = resumed.messages.len();
+        let count = resumed.snapshot.messages.len();
         let seed = resumed.snapshot.clone();
         let history = History::resume(dirs.offload.clone(), resumed);
         self.spawn_thread(
@@ -262,7 +265,16 @@ impl Server {
             .filter(|path| !rollout::is_subagent_session(path))
             .collect();
         let mut threads = Vec::new();
-        for path in paths.iter().skip(offset).take(limit) {
+        let mut next_cursor = None;
+        // Filtering past unreadable transcripts happens *inside* the page: the
+        // old `skip(offset).take(limit)` filled a page with paths and then
+        // dropped the broken ones, so one bad file silently shortened a page
+        // and the cursor still stepped over it.
+        for (index, path) in paths.iter().enumerate().skip(offset) {
+            if threads.len() == limit {
+                next_cursor = Some(index.to_string());
+                break;
+            }
             let snapshot = match rollout::load_session_snapshot(path) {
                 Ok(snapshot) => snapshot,
                 Err(_) => continue,
@@ -303,8 +315,6 @@ impl Server {
                 "updated_at_ms": updated_at_ms,
             }));
         }
-        let consumed = offset.saturating_add(limit).min(paths.len());
-        let next_cursor = (consumed < paths.len()).then(|| consumed.to_string());
         Ok(json!({"threads": threads, "next_cursor": next_cursor}))
     }
 

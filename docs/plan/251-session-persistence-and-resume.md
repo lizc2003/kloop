@@ -1,8 +1,7 @@
 # Plan 251 — 会话持久化与恢复
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。
+> 状态：✅ 已完成(2026-11-03)。原行号是 2026-10-28 的读数；复核结果与偏差见文末「完成」。
 
 ## 问题
 
@@ -65,3 +64,31 @@
   且 sub-agent 会话照常被过滤;append 失败后再写被拒;resume 只读一次文件(可用计数夹具);
   `--continue` 只 digest 到第一个可用会话。
 - 外层执行沙箱之外 `make check`;DESIGN 涉及恢复语义的段落先读再改;HANDOFF 记进展与教训。
+
+## 完成(2026-11-03)
+
+- **第 1 条**：复核发现「首个 route 要等第一轮才写」已不成立——`thread/start` 在
+  `spawn_thread` 里就 `ensure_initial_provider_route`，成功建起的线程文件是
+  runtime+route、0 消息。其余仍成立并已修：claim 建好的文件被 `path.exists()` 判成
+  别人的，空线程退出不删；「只有 preamble、没有 route」的文件（硬杀）被空 timeline
+  判成损坏。做法：`new_with_runtime_pending_route` 改收 `ClaimedSession` 并显式
+  `preexisting = false`；空 timeline 只在没有消息/usage 时视为空会话；`thread/list`
+  先筛可读再分页（游标指向下一个未读路径）。另补了一条 fail-closed：整份文件连首行
+  都不完整的仍然报错，不能被当成空会话再被恢复截断。
+- **第 2 条**：adoption 失败回退到分支 timeline 最后一条 receipt（经
+  `ProviderCatalog::restore_route`），并记录 note；不再回退到旧会话的当前 route。
+- **第 3 条**：`session_digest` 改 `read_until` + `from_utf8`，非法 UTF-8 行跳过。
+- **第 4 条**：`Rollout` 增加 `poisoned`，任何 append 失败后拒绝后续写入（权限恢复
+  之后也一样）；下一次显式 resume 会先截断残行。
+- **第 5 条**：新增 `inspect_session_for_writing`：先取租约、再读一次；
+  `recover_for_writing` 只接受带租约的读。`PairingRepair` 不再复制
+  messages/terminals，`ResumedSession` 只持有 snapshot 一份，`resume_options` 直接
+  借用快照。回归用按路径的读取计数断言 resume 只读一次。
+- **第 6 条**：`--list-sessions` 改走 `session_digest`；`--continue` 用惰性的
+  `resumable_rows(..).next()`，不再先 digest 全部。注意：列表不再报消息数——plan 162
+  曾专门为诊断视图保留它；251 的指令是改用 digest，本计划按 251 执行。
+- **第 7 条**：按用户确认的 A 做：只在 Drop 删除自己那份「从未写过内容」的 `.jsonl`
+  时顺带删同名 `.lock`；有内容的会话保留锁——在别人可能已打开的路径上 unlink 会造出
+  两个同时持有的 writer。
+
+验证：外层执行沙箱之外 `make check`（fmt + clippy + workspace 全量测试 + parity）。
