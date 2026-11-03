@@ -249,9 +249,7 @@ async fn rollback_created(repository_root: &Path, branch: &str, path: &Path) {
     rollback_created_locked(repository_root, branch, path).await;
 }
 
-/// The caller already holds the mutation lock. A killed `git worktree add` can
-/// leave Git's `initializing` lock behind, so give removal a few short retries
-/// instead of treating the first failure as a completed cleanup.
+/// 调用方已持有修改锁；只回滚 add 已成功的资源，短暂失败沿用有界重试。
 async fn rollback_created_locked(repository_root: &Path, branch: &str, path: &Path) {
     let path_text = git_compatible_path(path).to_string_lossy().to_string();
     for attempt in 0..5 {
@@ -378,8 +376,6 @@ async fn create_managed(
         .context("creating managed worktree directory")?;
     exclude_worktrees_dir(&repository.common_dir)?;
 
-    // From this point a dropped future can leave a real tree and branch behind.
-    let mut creation = CreationGuard::new(cleanup_tasks, &repository.root, &branch, &path);
     #[cfg(test)]
     creation_probe::pause_before_add(name).await;
     if let Err(error) = git_worktree_add(&repository.root, &branch, &path, &base).await {
@@ -388,9 +384,10 @@ async fn create_managed(
         // our pre-check and `add`. A failed add therefore proves nothing about
         // ownership, and force-removing here could delete another session's
         // tree, branch, and uncommitted work. Leave whatever exists in place.
-        creation.disarm();
         return Err(error.context(format!("git worktree add for branch {branch}")));
     }
+    // add 成功才确认删除权；此前取消也不能强制删除并发创建者的同名资源。
+    let mut creation = CreationGuard::new(cleanup_tasks, &repository.root, &branch, &path);
     #[cfg(test)]
     creation_probe::pause(name).await;
 
@@ -419,9 +416,7 @@ async fn create_managed(
     created
 }
 
-/// `git worktree add` is the one mutation whose child must not outlive a
-/// cancelled creation: the rollback guard removes what exists once this future
-/// is gone, and a still-running add would race it.
+/// 取消时结束直接子进程；add 尚未返回成功时不取得删除权，可能留下部分资源。
 async fn git_worktree_add(root: &Path, branch: &str, path: &Path, base: &str) -> Result<()> {
     let path_text = git_compatible_path(path).to_string_lossy().to_string();
     let mut command = git_command(
@@ -1181,6 +1176,50 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
             "the winner's branch survived"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 尚未确认 add 成功就取消，不能把并发创建者的资源当成本次调用的资源删除。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_add_does_not_remove_another_creators_worktree() {
+        let root = temp_repo("cancel-create-race").await;
+        let name = "cancelled-shared-name";
+        let (reached, _release) = creation_probe::install_before_add(name);
+        let tasks = cleanup_tasks();
+        let loser = tokio::spawn({
+            let root = root.clone();
+            let tasks = tasks.clone();
+            async move { create(&root, name, &tasks).await }
+        });
+
+        reached.await.expect("the loser reached the pre-add gate");
+        let path = root.join(WORKTREES_DIR).join(name);
+        let path_text = path.to_string_lossy().into_owned();
+        let branch = format!("{WORKTREE_BRANCH_PREFIX}{name}");
+        fixture_git(
+            &root,
+            &["worktree", "add", "-q", "-b", &branch, &path_text, "HEAD"],
+        )
+        .await;
+        std::fs::write(path.join("winner.txt"), "keep").unwrap();
+        let head = git_text(&root, &["rev-parse", &branch]).await.unwrap();
+
+        loser.abort();
+        assert!(loser.await.unwrap_err().is_cancelled());
+        tasks.close();
+        tokio::time::timeout(std::time::Duration::from_secs(10), tasks.wait())
+            .await
+            .expect("any rollback finished before checking the winner");
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("winner.txt")).ok(),
+            Some("keep".to_string()),
+            "the winner's uncommitted work survived the loser's cancellation"
+        );
+        assert_eq!(
+            git_text(&root, &["rev-parse", &branch]).await.unwrap(),
+            head
         );
         let _ = std::fs::remove_dir_all(&root);
     }

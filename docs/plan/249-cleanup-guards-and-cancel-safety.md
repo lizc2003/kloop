@@ -92,11 +92,26 @@ await 处被丢弃"没有写成契约。
   `kill_on_drop` 结束的 add 留下的 initializing 锁，不再让第一次失败就被当成清理完成。
 - 保留分支的 Note 现在**无条件**发布。子 agent 已 Completed、supervisor 正在 finish 时
   调用方取消，结果已经没人读，Note 仍能到 UI；成功路径继续把位置附在工具结果里。
-- 已知缺口(按“允许有遗漏”收口)：取消恰好落在 `git worktree add` 运行中时，直接子进程
+- 当时的已知缺口(按“允许有遗漏”收口；当前边界见下节)：取消恰好落在
+  `git worktree add` 运行中时，直接子进程
   会被 kill，但 Git 派出的 checkout 子进程/initializing 锁仍可能让重试预算内的回滚失败；
   失败后不再进一步上报。add 失败留下的本次 partial 资源也不清理，因为无法与对方的资源
   区分。新增回归覆盖“add 失败不删对方的树/分支”和“成功保留也发 Note”；第二条在只把
   Note 追加到结果时先红。
+
+### 第三轮审查修复 ✅：取消出口的删除权(2026-11-03)
+
+- 删除守卫移到 `git worktree add` 返回成功后再建立。此前只在 add 的 `Err` 出口
+  `disarm`，取消会绕过这个出口，把并发创建者的同名资源交给 Drop 强制删除；现在
+  add 失败和完成前取消都不取得删除权，成功后的验证失败与取消仍由守卫回滚。
+- 保留当前允许残留的范围：add 失败或运行中取消，可能留下本次调用的部分资源；
+  回滚仍沿用现有的有界重试。
+- 新增回归在 pre-check 后暂停败方，让另一创建者建好同名树并写入文件，再取消败方；
+  等待 tracker 完成后核对成功方的文件内容与分支指向。原有的 add 后取消回归继续验证
+  已确认所有权时的回滚。新回归修复前先红：成功方文件被删除，内容断言从 `Some("keep")`
+  变成 `None`。DESIGN 的 worktree 创建一节同步这一边界。
+- 外层执行沙箱之外 `make check` 全绿(fmt、clippy、workspace 全量测试，core 1307 项、
+  TUI 314 项，本机 parity baseline verified)。Linux 与 Windows 未实测。
 
 ## 验收
 

@@ -3353,6 +3353,11 @@ directory 的 `info/exclude` 更新使用 `.kloop-exclude.lock`，锁内重新�
 已有的权限位：`info/exclude` 属于用户的仓库（通常 0644），不能因为 kloop 的
 临时文件是 0600 就把它变成私有文件。
 
+创建的删除守卫 `CreationGuard` 只在 `git worktree add` 返回成功后建立。add 失败或
+完成前取消时，尚不能证明同名树/分支属于本次调用，因此不按名称强制回滚；这段期间
+可能留下本次调用的部分资源。add 成功后的验证失败在锁内回滚，验证期间取消则把回滚
+交给会话的 `cleanup_tasks`，通过验证后才解除守卫。
+
 Nesting the trees under `.kloop/` costs one exemption, because `.kloop` is
 otherwise a sensitive path component: a write there is privilege escalation and
 a *read* is a hard, unapprovable deny. `.kloop` immediately followed by

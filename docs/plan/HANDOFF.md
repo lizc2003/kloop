@@ -9,17 +9,18 @@ rewind 的 fork 分支与 server `thread/fork` 的 fork 文件都由它兜住失
 `finish` 并补发 agent-end 后登记进 tracker；`shutdown_background_work` 先 `close()`
 再按现有 2s 上限等待。四类回归覆盖取消后的树/分支与 agent 行、关闭 registry 的空文件、
 两个 rewind 失败出口与 server fork 的 resume_options 失败。审查补丁把 `worktree::create`
-也纳入守卫：`git worktree add` 前武装 `CreationGuard`，取消落在 `verify_provenance`
-时由 tracker 执行 `worktree remove --force` + `branch -D`，add 自身 `kill_on_drop`。
-第二轮审查后 add 失败不再回滚（进程内锁不跨进程，失败可能属于另一个同名创建者），
-回滚加 5 次短退避重试；保留脏树/清理失败以及成功保留的 Note 都无条件发布，不再依赖
-无人读取的返回值。已知缺口：取消恰逢 `git worktree add` 运行中时，Git 的 checkout
-子进程/initializing 锁仍可能让重试预算内的回滚失败，失败后不再上报。外层执行沙箱之外
-`make check` 全绿（fmt、clippy、workspace 全量测试，core 1306 项、TUI 314 项，本机
+的后续验证纳入守卫：`git worktree add` 返回成功后才建立 `CreationGuard`，取消落在
+`verify_provenance` 时由 tracker 执行 `worktree remove --force` + `branch -D`，add 自身 `kill_on_drop`。
+add 失败或完成前取消都不按名称回滚（进程内锁不跨进程，同名资源可能属于另一个创建者），
+回滚沿用 5 次短退避重试；保留脏树/清理失败以及成功保留的 Note 都无条件发布，不再依赖
+无人读取的返回值。新增竞争取消回归核对成功方的文件内容与分支指向；add 后取消的回归
+继续覆盖已确认所有权的清理。已知缺口：add 失败或运行中取消时可能留下本次调用的部分
+资源；已启动的回滚超过重试预算后不再上报。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace 全量测试，core 1307 项、TUI 314 项，本机
 parity baseline verified）。DESIGN 增加「Dropped tool futures (Plan 249)」。此前一次
 parity 的 `explicit fixture restore` 自检偶发失败，单独重跑 `make parity` 通过（同
 plan 242 记录的本机偶发），提交前最后一次完整 `make check` 干净通过。Linux 与 Windows
-未实测。教训 304、305、306、307。
+未实测。教训 304、305、306、307、308。
 
 **Plan 248 ✅：文本、路径与文件 helper 收口（2026-11-03）**：protocol 新增
 `char_prefix` / `clip_chars` / `hex_lower`，core 新增 `paths::{lexically_normalize,
@@ -4053,13 +4054,13 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    `remove_file` 会漏掉其余失败出口，而它们的 mtime 最新，正好会被 `--continue` 或
    `thread/list` 选中。
 
-306. **所有权从资源第一次落盘开始，不是从函数正常返回开始。** `worktree::create` 在
-   `git worktree add` 成功后还要 canonicalize、`verify_provenance` 两次 git 查询；
+306. **创建函数内部也有资源已经属于本次调用、调用方却尚未接手的窗口。** `worktree::create` 在
+   `git worktree add` 成功后还要 canonicalize、`verify_provenance` 的 git 查询；
    取消点若落在那里，函数永远走不到自己的错误回滚，调用方也只拿到一个被丢弃的
-   future。守卫要在这条命令之前武装，Drop 把异步回滚交给会话 tracker；命令本身设
-   `kill_on_drop`。但 **add 失败不能回滚**：进程内锁不跨进程，失败可能只是另一个 kloop
-   先创建了同名树/分支，强制删除会毁掉对方的未提交工作——只有 add 成功才证明资源属于
-   本次调用。回滚命令要考虑被 kill 的 add 留下的 initializing 锁，短退避重试几次。
+   future。删除守卫要在 add 成功后、后续验证之前建立，Drop 把异步回滚交给会话 tracker。
+   **add 失败或完成前取消不能回滚**：进程内锁不跨进程，同名树/分支可能已由另一个
+   kloop 创建，强制删除会毁掉对方的未提交工作——只有 add 成功才证明资源属于
+   本次调用；此前取消允许残留部分资源。已取得删除权后的回滚沿用有界重试。
 
 307. **取消后的“结果”已经没有人读，清理信息必须独立发布。** 前台子 agent 的 supervisor
    返回的 `Result` 只对还在等它的调用方有意义；turn 被取消时那个 future 已被丢弃。
@@ -4067,3 +4068,9 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    取消，`result` 仍是 `Ok`，把保留路径拼进文本一样没人读。保留位置和清理失败都应在
    supervisor 里无条件发 `Event::Note`；成功路径可以继续把位置附在工具结果里，
    两者不互相替代。
+
+308. **在错误分支解除守卫，挡不住取消时的 Drop。** add 的 `Err` 出口即使不再删除，
+   只要守卫在 add 前已武装，等待期间取消仍会绕过错误分支，强删并发创建者的同名资源。
+   删除权应由已确认的成功建立，不能靠某个返回出口补救。回归分别覆盖返回错误和丢弃
+   future：暂停竞争败方、让另一创建者写入文件，再取消败方并等待 tracker，核对成功方
+   的文件内容与分支仍在；只检查正常错误返回的测试不能代表取消出口。
