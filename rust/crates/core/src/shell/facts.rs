@@ -333,14 +333,11 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                         // 命令串位置不明：正文按未知执行体处理，不能当普通参数逐个查路径。
                         facts.commands.push(command.rewritten_execution());
                     }
-                    if let Ok(Some(inner)) = inner {
+                    if let Ok(Some((inner, startup))) = inner {
                         if depth < MAX_UNWRAP_DEPTH {
                             let mut nested = analyze_depth(inner, depth + 1);
-                            // 只有 `shell -c 脚本` 不读启动文件；-l、-i 等其它选项一律按未知。
-                            let startup_unknown = stripped.get(1).is_none_or(|flag| flag != "-c")
-                                || stripped
-                                    .get(2)
-                                    .is_some_and(|script| script.starts_with(['-', '+']))
+                            // -e、-u、-o pipefail 不改启动文件；登录、交互 shell 会读 profile/rc。
+                            let startup_unknown = startup
                                 || stripped
                                     .first()
                                     .is_some_and(|shell| executable_name(shell) == "zsh");
@@ -685,35 +682,43 @@ fn preserves_variables(name: &str, first_argument: Option<WordEvaluation>) -> bo
     }
 }
 
-/// sh/bash/zsh 的 -c 命令串：三者都在选项结束后取第一个操作数。只越过不带值的
-/// 短选项簇、`-o 名字`、`--` 与几个无值长选项。Ok(None) 是不在 -c 模式或命令串
-/// 尚未给出（动态参数）；Err 是选项形状不认识、又可能进入 -c 模式。
-fn shell_command_string(args: &[String]) -> Result<Option<&str>, ()> {
+/// sh/bash/zsh 的 -c 命令串，以及是否读启动文件（-l、-i、--login）。三者都在选项结束后
+/// 取第一个操作数；只越过不带值的短选项簇、簇尾 `o` 加下一个词、`--` 与几个无值长选项。
+/// Ok(None) 是不在 -c 模式或命令串尚未给出（动态参数）；Err 是选项形状不认识、
+/// 又可能进入 -c 模式。
+fn shell_command_string(args: &[String]) -> Result<Option<(&str, bool)>, ()> {
     let mut command = false;
+    let mut startup = false;
     let mut rest = args;
     while let Some((arg, tail)) = rest.split_first() {
         if matches!(
             arg.as_str(),
             "--login" | "--noprofile" | "--norc" | "--posix"
         ) {
+            startup |= arg == "--login";
             rest = tail;
             continue;
         }
-        // bash 的 -O 取值而 zsh 的不取，不猜；-o 在三者中都取下一个词。
+        // bash 的 -O 取值而 zsh 的不取；o 后还有字符时 bash 取下一个词、zsh 取簇里余下的
+        // 部分（`-oshwordsplit`）。只认三者一致的形状：没有 O，o 至多一个且在簇尾。
         let Some(flags) = arg.strip_prefix('-').filter(|flags| {
             !flags.is_empty()
                 && flags
                     .chars()
                     .all(|ch| ch.is_ascii_alphabetic() && ch != 'O')
+                && flags.find('o').is_none_or(|index| index == flags.len() - 1)
         }) else {
             break;
         };
-        let values = flags.matches('o').count();
-        match tail.get(..values) {
-            Some(values) if !values.iter().any(|value| value.starts_with(['-', '+'])) => {}
-            _ => break,
+        let values = usize::from(flags.ends_with('o'));
+        if tail
+            .get(..values)
+            .is_none_or(|values| values.iter().any(|value| value.starts_with(['-', '+'])))
+        {
+            break;
         }
         command |= flags.contains('c');
+        startup |= flags.contains(['l', 'i']);
         rest = &tail[values..];
     }
     let ended = rest.first().is_some_and(|arg| arg == "--");
@@ -728,7 +733,7 @@ fn shell_command_string(args: &[String]) -> Result<Option<&str>, ()> {
                 });
             if maybe_command { Err(()) } else { Ok(None) }
         }
-        Some(script) if command => Ok(Some(script)),
+        Some(script) if command => Ok(Some((script, startup))),
         _ => Ok(None),
     }
 }
@@ -1031,18 +1036,24 @@ mod tests {
     #[test]
     fn shell_command_string_follows_option_parsing() {
         for (args, expected) in [
-            ("-c x n", Ok(Some("x"))),
-            ("-e -c x", Ok(Some("x"))),
-            ("-c -e x", Ok(Some("x"))),
-            ("-euo pipefail -c x", Ok(Some("x"))),
-            ("-c -- x", Ok(Some("x"))),
-            ("--noprofile --norc -c x", Ok(Some("x"))),
+            ("-c x n", Ok(Some(("x", false)))),
+            ("-e -c x", Ok(Some(("x", false)))),
+            ("-c -e x", Ok(Some(("x", false)))),
+            ("-euo pipefail -c x", Ok(Some(("x", false)))),
+            ("-c -- x", Ok(Some(("x", false)))),
+            ("--noprofile --norc -c x", Ok(Some(("x", false)))),
+            ("-lc x", Ok(Some(("x", true)))),
+            ("-c -i x", Ok(Some(("x", true)))),
+            ("--login -c x", Ok(Some(("x", true)))),
             ("-c", Ok(None)),
             ("-e script.sh", Ok(None)),
             ("script.sh -c x", Ok(None)),
             ("-O extglob -c x", Err(())),
             ("--rcfile rc -c x", Err(())),
             ("-o -c x", Err(())),
+            // zsh 把 o 后的字符当选项名，bash 取下一个词，两边的正文位置不同。
+            ("-c -oshwordsplit x n", Err(())),
+            ("-oe pipefail -c x", Err(())),
         ] {
             let args: Vec<_> = args.split(' ').map(String::from).collect();
             assert_eq!(shell_command_string(&args), expected, "{args:?}");

@@ -1353,12 +1353,16 @@ mod tests {
 
     #[tokio::test]
     async fn shell_options_around_c_keep_the_script_checked() {
-        // 前三条的正文位置不认识或曾被当普通参数；最后一条是常见写法，不能误拦。
+        // 正文位置不认识或曾被当普通参数的都要拒绝；常见写法不能误拦。
         for (command, blocked) in [
             ("bash -e -c 'cat .env'", true),
             ("bash -c -- 'cat .env'", true),
             ("bash -O extglob -c 'cat notes.txt'", true),
+            ("zsh -c -oshwordsplit 'cat .env' unused", true),
             ("bash -euo pipefail -c 'cat notes.txt'", false),
+            // 只有登录、交互 shell 让回放的 HOME 不可信；普通选项不影响。
+            ("bash -euo pipefail -c 'cat \"$HOME/public.txt\"'", false),
+            ("bash -l -c 'cat \"$HOME/public.txt\"'", true),
         ] {
             let p = gate(
                 Mode::Bypass,
