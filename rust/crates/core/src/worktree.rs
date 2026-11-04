@@ -18,6 +18,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::TaskTracker;
@@ -886,8 +887,9 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
             && let Some(dir) = path.strip_suffix('/')
         {
             // A fully ignored directory is collapsed to one trailing-slash
-            // entry, so a large target/ scan never walks its files. Ignored
-            // files stay individual and still count as content.
+            // entry, so a large target/ scan never walks its files. Whether it
+            // is build output needs the ignore rule below; ignored files stay
+            // individual and still count as content.
             ignored_dirs.push(dir.to_string());
             continue;
         }
@@ -895,6 +897,8 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
     }
     ignored_dirs.sort();
     ignored_dirs.dedup();
+    let (ignored_dirs, retained_dirs) = classify_ignored_dirs(worktree, &ignored_dirs).await;
+    changed_files += retained_dirs;
     let range = format!("{}..HEAD", worktree.base);
     let commits = git_text(&worktree.path, &["rev-list", "--count", &range])
         .await
@@ -909,13 +913,85 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
     })
 }
 
+/// A directory is build output only when the ignore pattern that decides it is
+/// directory-scoped (`target/`, `node_modules/`). `/*` and bare `secrets` also
+/// match directories but may contain hand-written files, and `logs/` collapsed
+/// because every file matched `*.log` is not a directory rule at all; those
+/// count as content. `check-ignore` runs once, only when a tree has ignored
+/// directories, and any failure retains everything rather than delete by guess.
+async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<String>, usize) {
+    if dirs.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let mut input = String::new();
+    for dir in dirs {
+        input.push_str(dir);
+        input.push('/');
+        input.push('\0');
+    }
+    let output = match git_text_with_stdin(
+        &worktree.path,
+        &["check-ignore", "-v", "-z", "--stdin"],
+        &input,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(_) => return (Vec::new(), dirs.len()),
+    };
+    let mut fields = output.split('\0');
+    let mut build_dirs = Vec::new();
+    while let (Some(_source), Some(_line), Some(pattern), Some(path)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    {
+        if pattern.ends_with('/') {
+            build_dirs.push(path.trim_end_matches('/').to_string());
+        }
+    }
+    build_dirs.sort();
+    build_dirs.dedup();
+    let retained = dirs.len().saturating_sub(build_dirs.len());
+    (build_dirs, retained)
+}
+
+async fn git_text_with_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
+    let mut command = git_command(dir, args);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = kloop_process_spawn::spawn(&mut command).context("spawning git")?;
+    let stdin_pipe = child.stdin.take();
+    let (written, output) = tokio::join!(
+        async {
+            if let Some(mut pipe) = stdin_pipe {
+                pipe.write_all(input.as_bytes()).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        },
+        child.wait_with_output()
+    );
+    let output = output.context("waiting for git")?;
+    if !output.status.success() {
+        bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    written.context("writing git stdin")?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Callers must have validated provenance under the same mutation lock; this
 /// is the single deletion path so a verification never runs twice.
 async fn remove_verified_managed_locked(worktree: &mut Worktree, force: bool) -> Result<()> {
     if worktree.custody != WorktreeCustody::Managed {
         bail!("refusing to remove an external worktree");
     }
-    let path = worktree.path.to_string_lossy().to_string();
+    let path = git_compatible_path(&worktree.path)
+        .to_string_lossy()
+        .to_string();
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -1411,6 +1487,42 @@ mod tests {
             !path.exists(),
             "a tree holding only build output is removed"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `/*`, bare `secrets`, and directories collapsed only because every file
+    /// matched `*.log` may hold hand-written work. Only a directory-scoped
+    /// pattern (`target/`) is build output.
+    #[tokio::test]
+    async fn ignored_directories_without_a_directory_rule_are_content() {
+        let root = temp_repo("ignored-broad").await;
+        std::fs::write(
+            root.join(".gitignore"),
+            "/*\n!/src/\n!/.gitignore\nsecrets\n*.log\nnode_modules\n",
+        )
+        .unwrap();
+        fixture_git(&root, &["add", ".gitignore"]).await;
+        fixture_git(&root, &["commit", "-qm", "ignore"]).await;
+        let worktree = create(&root, "agent-broad", &cleanup_tasks())
+            .await
+            .unwrap();
+        let path = worktree.path.clone();
+        for entry in [
+            "notes/plan.md",
+            "src/secrets/key",
+            "logs/run.log",
+            "node_modules/pkg/index.js",
+        ] {
+            let file = path.join(entry);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "hand-written").unwrap();
+        }
+
+        let changes = inspect_changes(&worktree).await.unwrap();
+        assert_eq!(changes.changed_files, 4, "{changes:?}");
+        assert!(changes.ignored_dirs.is_empty(), "{changes:?}");
+        assert!(finish(worktree).await.unwrap().is_some());
+        assert!(path.exists(), "the hand-written tree is retained");
         let _ = std::fs::remove_dir_all(root);
     }
 

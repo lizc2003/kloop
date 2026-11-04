@@ -67,11 +67,15 @@
    flock + 读改写整体放进 `spawn_blocking`；`compute_overrides` 改 async，只对 worktree
    做一次 `WorkspaceIdentity::resolve`（父 identity 复用 live permission policy），
    探测本身在 `spawn_blocking`。
-5. 第 5 条按用户确认走细化版 (b)：`git status --ignored=matching` 把完全忽略的目录折叠成
-   一条带尾 `/` 的记录，这类目录视为构建产物，只在没有 tracked/untracked 改动与提交时
-   随树删除，Note 列出被丢弃目录；ignored **文件**仍算内容（保住 `.env.local` 这类）。
-   回归：`target/` 单独存在时整树删除并报告；原 ignored 文件保留回归不变。
+5. 第 5 条按用户确认走细化版 (b)，再按复审收紧：`git status --ignored=matching` 折叠出的
+   目录先收集，再用一次 `git check-ignore -v -z --stdin` 看决定性忽略规则；只有规则本身
+   以 `/` 结尾（`target/`）才算构建产物，纯产物树随树删除并在 Note 列出目录。`/*`、裸名
+   `secrets`、仅因内容命中 `*.log` 而折叠的目录都退回内容，ignored **文件**也仍算内容；
+   `check-ignore` 失败则全部保留。另把 `worktree remove` 的路径参数也过
+   `git_compatible_path`，与 add/rollback 对齐 Windows 格式。
+   回归：`target/` 单独存在时整树删除并报告；`/*` + `secrets` + `*.log` + 裸 `node_modules`
+   的目录全部保留；原 ignored 文件保留回归不变。
 
 验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug 全量测试，core
-1338 项，本机 parity baseline verified）。DESIGN 的 worktree 两处生命周期、path 解析、
-注册表容错与删除判定已同步。Linux 与 Windows 未实测。
+1339 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
+worktree 两处生命周期、path 解析、注册表容错与删除判定已同步。Linux 与 Windows 未实测。

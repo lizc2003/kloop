@@ -9,11 +9,13 @@ create/enter/exit/finish 一起报“canonicalizing registered worktree”；仓
 `finish` 不再在同一把锁内验两遍 provenance，git 子进程从 8 个降到 6 个（线程局部计数
 回归钉住）。异步路径的 canonicalize 改 `tokio::fs`，`info/exclude` 的 flock + 读改写整体
 进 `spawn_blocking`；`compute_overrides` 改 async 并复用 live permission policy 的父
-identity，只对 worktree 做一次探测且放在阻塞池。第 5 条按用户确认走细化版 (b)：
-`--ignored=matching` 折叠出的、带尾 `/` 的 ignored 目录算构建产物，纯产物树随树删除并在
-Note 列出目录名；ignored 文件仍算内容，保住 `.env.local` 这类本地配置。新增 4 条回归
-（失效注册、相对 path、finish 单次校验、ignored 目录丢弃）。外层执行沙箱之外
-`make check` 全绿（fmt、clippy、workspace debug 全量测试，core 1338 项，本机 parity
+identity，只对 worktree 做一次探测且放在阻塞池。第 5 条按用户确认走细化版 (b)：只有
+决定性忽略规则本身带尾 `/`（`target/`）的目录算构建产物，纯产物树随树删除并在 Note 列出
+目录名；`/*`、裸名 `secrets`、`*.log` 折叠出的目录和 ignored 文件都仍算内容（一次
+`git check-ignore -v -z --stdin` 判定，失败则全部保留）。顺带把 `worktree remove` 的参数
+也过 `git_compatible_path`，对齐 add/rollback 的 Windows 路径格式。新增 5 条回归
+（失效注册、相对 path、finish 单次校验、ignored 目录丢弃、宽忽略规则保留）。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace debug 全量测试，core 1339 项，本机 parity
 baseline verified）。DESIGN 的 worktree 生命周期、path 解析、注册表容错与删除判定已同步。
 Linux 与 Windows 未实测。教训 333–338。
 
@@ -98,7 +100,7 @@ lease、无 timeline 初始化、CLI 端到端 resume preamble-only、抢锁失�
 不重试。Windows 目标用 `cargo-xwin` + MSVC SDK 实测 check/clippy 零警告，并新增按需手动
 `make check-windows`（workspace clippy `-D warnings`，缺工具跳过，**不进门禁**）。验证：
 `make check` 全绿（core 1334、TUI 314、server contract 46、2 项 ignored，本机 parity
-baseline verified）。教训 326–330。
+baseline verified）。教训 326–329、333。
 
 **Plan 250 ✅：agent 主循环与上下文估算（2026-11-03）**：`run_turn` 在 stage pre_turn
 hook 上下文之前记下 `input_staged`；“整 turn 撤回”现在要求输入确实仍是 staged
@@ -4346,11 +4348,13 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    provenance，多两个 Git 子进程；把“已校验”写成删除函数的入参契约（用命名而不是 bool 参数），
    并且用线程局部 git 计数钉住 `finish` 恰好 6 次调用，防止以后又长回去。
 
-337. **git 的 ignored 输出已经替我们分好了目录和文件。** `--ignored=matching` 把完全忽略的目录
-   折叠成一条带尾 `/` 的记录，ignored 文件保持逐条；用这个形态区分“可丢弃构建产物”和
-   “可能是本地配置的 ignored 文件”，不必猜目录名或遍历 `target/`。回源三家是分歧的（cc 全删、
-   codex 拒绝、codewhale 保留），按本项目“别丢 `.env.local`、也别让 target 堆满”的契约取中间线：
-   ignored 目录算产物，ignored 文件仍算内容。
+337. **“ignored 目录”不等于“构建产物”，判据要看到忽略规则本身。** `--ignored=matching` 把入口
+   折叠成一条带尾 `/` 的记录，但目录被折叠只说明它整体被忽略：`/*`、不带斜杠的 `secrets`、
+   甚至只是“里面每个文件都命中 `*.log`”都会产生这种记录，目录里完全可能是手写内容。用一次
+   `git check-ignore -v -z --stdin` 取每条目录的决定性 pattern，只有 pattern 本身以 `/` 结尾
+   （`target/`）才算构建产物；`/*`、裸名和内容折叠都退回保留。判据失败就保留全部，不能猜删。
+   回源三家是分歧的（cc 全删、codex 拒绝、codewhale 保留），按本项目“别丢用户内容、也别让
+   target 堆满”的契约取中间线。
 
 338. **异步路径里的阻塞 IO 要成组搬走，不是逐个 `.await` 化。** `info/exclude` 的 flock +
    读改写整体进 `spawn_blocking`，而不是在持异步锁时单独等一次 flock；identity 探测能复用
