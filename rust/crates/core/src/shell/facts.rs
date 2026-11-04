@@ -7,7 +7,8 @@ use super::*;
 const MAX_SCRIPT_BYTES: usize = 1_048_576;
 const MAX_NODES: usize = 20_000;
 const MAX_TREE_DEPTH: usize = 128;
-const MAX_LOOP_VALUES: usize = 32;
+/// 循环值个数 × 正文引用次数。
+const MAX_LOOP_BINDINGS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WordValue {
@@ -208,7 +209,8 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
         );
     }
     nodes.sort_by_key(Node::start_byte);
-    let literal_loop = literal_loop(&nodes, src);
+    // 只在顶层细化：绑定值可能再作为嵌套脚本分析，逐层展开会相乘。
+    let binding = (depth == 0).then(|| literal_loop(&nodes, src)).flatten();
     let cwd_unknown = nodes.iter().any(|node| {
         node.kind() == "command"
             && node
@@ -239,136 +241,143 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
         let context = context(node, depth, cwd_unknown, home_unknown);
         match node.kind() {
             "command" => {
-                let mut words = Vec::new();
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    if matches!(
-                        child.kind(),
-                        "comment" | "file_redirect" | "herestring_redirect" | "variable_assignment"
-                    ) {
+                let (words, joined) = command_words(node, src);
+                joined_words |= joined;
+                // 每个循环值各走一遍完整分析，与把值写在原处一致（含嵌套 -c 正文）。
+                for words in bind_loop(binding.as_ref(), node, words, |words, variable, value| {
+                    // WordValue 保留 Unknown：deny/ask 仍按未知词保守匹配，不能产生授权。
+                    words.iter_mut().fold(false, |bound, word| {
+                        word.syntax.bind_quoted_variable(variable, value) | bound
+                    })
+                }) {
+                    let command = CommandFact {
+                        words,
+                        range: node.byte_range(),
+                        context: context.clone(),
+                    };
+                    let argv = command.wrapper_prefix();
+                    let dynamic_argv = argv.len() != command.words.len();
+                    if dynamic_argv {
+                        facts.unknown.push("dynamic argument".into());
+                    }
+                    let wrappers = analyze_wrappers(&argv);
+                    // 剥离成功后仍有命令名，普通动态参数不等于未知执行体。
+                    if !wrappers.complete || (dynamic_argv && wrappers.argv.is_empty()) {
+                        facts.reliable = false;
+                        facts.unknown.push(
+                            if dynamic_argv {
+                                "dynamic wrapper argument"
+                            } else {
+                                "unsupported wrapper"
+                            }
+                            .into(),
+                        );
+                        if wrappers.arguments_unknown
+                            || (dynamic_argv && !wrappers.wrapper_commands.is_empty())
+                        {
+                            facts.commands.push(command.rewritten_execution());
+                        }
+                        facts.commands.push(command);
                         continue;
                     }
-                    let word = if child.kind() == "command_name" {
-                        child.named_child(0).unwrap_or(child)
-                    } else {
-                        child
-                    };
-                    joined_words |= push_word(&mut words, word, child.byte_range(), src);
-                }
-                let command = CommandFact {
-                    words,
-                    range: node.byte_range(),
-                    context,
-                };
-                let argv = command.wrapper_prefix();
-                let dynamic_argv = argv.len() != command.words.len();
-                if dynamic_argv {
-                    facts.unknown.push("dynamic argument".into());
-                }
-                let wrappers = analyze_wrappers(&argv);
-                // 剥离成功后仍有命令名，普通动态参数不等于未知执行体。
-                if !wrappers.complete || (dynamic_argv && wrappers.argv.is_empty()) {
-                    facts.reliable = false;
-                    facts.unknown.push(
-                        if dynamic_argv {
-                            "dynamic wrapper argument"
-                        } else {
-                            "unsupported wrapper"
-                        }
-                        .into(),
-                    );
-                    if wrappers.arguments_unknown
-                        || (dynamic_argv && !wrappers.wrapper_commands.is_empty())
+                    let unknown_effects = wrappers.arguments_unknown || wrappers.writes_unknown;
+                    wrapper_effects_unknown |= unknown_effects;
+                    facts.reliable &= !unknown_effects;
+                    let stripped = wrappers.argv;
+                    let rewritten_words = wrappers.arguments_unknown
+                        && stripped.iter().any(|word| wrappers.rewrites_argument(word));
+                    let shell = stripped
+                        .first()
+                        .is_some_and(|name| matches!(executable_name(name), "sh" | "bash" | "zsh"));
+                    if wrappers.rewrites_wrapper()
+                        || (wrappers.arguments_unknown && dynamic_argv)
+                        || (shell && rewritten_words)
                     {
+                        // 替换能改变包装器选项或给 -c 注入语法，整个执行体均未知。
+                        // 不能继续把替换前的脚本解析成“实际会执行”的字面命令。
+                        facts.commands.push(command.rewritten_execution());
+                        facts.commands.push(command);
+                        continue;
+                    }
+                    if rewritten_words {
+                        let mut child = command.clone();
+                        child.words.drain(..argv.len() - stripped.len());
+                        for (word, argument) in child.words.iter_mut().zip(stripped) {
+                            if wrappers.rewrites_argument(argument) {
+                                word.value = WordValue::Unknown;
+                                word.syntax = match wrappers.replacements.as_slice() {
+                                    [replacement] => {
+                                        ShellWord::replaced(argument, replacement.marker)
+                                    }
+                                    // 多层替换可能跨越未知片段与已知文本的边界。
+                                    _ => ShellWord::unknown(),
+                                };
+                            } else {
+                                word.value = WordValue::Literal(argument.clone());
+                            }
+                        }
+                        child.context.argument_rewrite = true;
+                        child.context.script_depth += 1;
+                        facts.commands.push(child);
+                    }
+                    // 风险事实可分析已知脚本及其后的位置参数；严格授权仍要求完整 argv。
+                    let inner = match stripped.split_first() {
+                        Some((_, args)) if shell => shell_command_string(args),
+                        _ => Ok(None),
+                    };
+                    if shell && !matches!(inner, Ok(Some(_))) {
+                        facts.reliable &= !dynamic_argv && inner.is_ok();
+                        facts.unknown.push("unsupported shell wrapper".into());
+                    }
+                    if inner.is_err() {
+                        // 命令串位置不明：正文按未知执行体处理，不能当普通参数逐个查路径。
                         facts.commands.push(command.rewritten_execution());
                     }
-                    facts.commands.push(command);
-                    continue;
-                }
-                let unknown_effects = wrappers.arguments_unknown || wrappers.writes_unknown;
-                wrapper_effects_unknown |= unknown_effects;
-                facts.reliable &= !unknown_effects;
-                let stripped = wrappers.argv;
-                let rewritten_words = wrappers.arguments_unknown
-                    && stripped.iter().any(|word| wrappers.rewrites_argument(word));
-                let shell = stripped
-                    .first()
-                    .is_some_and(|name| matches!(executable_name(name), "sh" | "bash" | "zsh"));
-                if wrappers.rewrites_wrapper()
-                    || (wrappers.arguments_unknown && dynamic_argv)
-                    || (shell && rewritten_words)
-                {
-                    // 替换能改变包装器选项或给 -c 注入语法，整个执行体均未知。
-                    // 不能继续把替换前的脚本解析成“实际会执行”的字面命令。
-                    facts.commands.push(command.rewritten_execution());
-                    facts.commands.push(command);
-                    continue;
-                }
-                if rewritten_words {
-                    let mut child = command.clone();
-                    child.words.drain(..argv.len() - stripped.len());
-                    for (word, argument) in child.words.iter_mut().zip(stripped) {
-                        if wrappers.rewrites_argument(argument) {
-                            word.value = WordValue::Unknown;
-                            word.syntax = match wrappers.replacements.as_slice() {
-                                [replacement] => ShellWord::replaced(argument, replacement.marker),
-                                // 多层替换可能跨越未知片段与已知文本的边界。
-                                _ => ShellWord::unknown(),
-                            };
+                    if let Ok(Some(inner)) = inner {
+                        if depth < MAX_UNWRAP_DEPTH {
+                            let mut nested = analyze_depth(inner, depth + 1);
+                            // 只有 `shell -c 脚本` 不读启动文件；-l、-i 等其它选项一律按未知。
+                            let startup_unknown = stripped.get(1).is_none_or(|flag| flag != "-c")
+                                || stripped
+                                    .get(2)
+                                    .is_some_and(|script| script.starts_with(['-', '+']))
+                                || stripped
+                                    .first()
+                                    .is_some_and(|shell| executable_name(shell) == "zsh");
+                            let nested_home_unknown = home_unknown
+                                || startup_unknown
+                                || wrappers.environment_unknown
+                                || wrappers.arguments_unknown;
+                            let nested_cwd_unknown = cwd_unknown
+                                || startup_unknown
+                                || wrappers.cwd_unknown
+                                || wrappers.arguments_unknown;
+                            if nested_home_unknown || nested_cwd_unknown {
+                                for command in &mut nested.commands {
+                                    command.context.home_unknown |= nested_home_unknown;
+                                    command.context.cwd_unknown |= nested_cwd_unknown;
+                                }
+                                for redirect in &mut nested.redirects {
+                                    redirect.context.home_unknown |= nested_home_unknown;
+                                    redirect.context.cwd_unknown |= nested_cwd_unknown;
+                                }
+                            }
+                            nested_analyses.push((argv.clone(), nested.analysis.clone()));
+                            wrapper_effects_unknown |= nested.verbatim_escalation;
+                            facts.reliable &= nested.reliable;
+                            facts.facts_complete &= nested.facts_complete;
+                            facts.commands.extend(nested.commands);
+                            facts.redirects.extend(nested.redirects);
+                            facts.unknown.extend(nested.unknown);
+                            // 嵌套文本经过引号解码；本轮不从它生成外层正文豁免。
                         } else {
-                            word.value = WordValue::Literal(argument.clone());
+                            facts.reliable = false;
+                            facts.facts_complete = false;
+                            facts.unknown.push("wrapper limit".into());
                         }
                     }
-                    child.context.argument_rewrite = true;
-                    child.context.script_depth += 1;
-                    facts.commands.push(child);
+                    facts.commands.push(command);
                 }
-                // 风险事实可分析已知脚本及其后的位置参数；严格授权仍要求完整 argv。
-                let inner = stripped.get(..3).and_then(extract_wrapped_script);
-                if shell && inner.is_none() {
-                    facts.reliable &= !dynamic_argv;
-                    facts.unknown.push("unsupported shell wrapper".into());
-                }
-                if let Some(inner) = inner {
-                    if depth < MAX_UNWRAP_DEPTH {
-                        let mut nested = analyze_depth(inner, depth + 1);
-                        let startup_unknown = stripped.get(1).is_some_and(|flag| flag == "-lc")
-                            || stripped
-                                .first()
-                                .is_some_and(|shell| executable_name(shell) == "zsh");
-                        let nested_home_unknown = home_unknown
-                            || startup_unknown
-                            || wrappers.environment_unknown
-                            || wrappers.arguments_unknown;
-                        let nested_cwd_unknown = cwd_unknown
-                            || startup_unknown
-                            || wrappers.cwd_unknown
-                            || wrappers.arguments_unknown;
-                        if nested_home_unknown || nested_cwd_unknown {
-                            for command in &mut nested.commands {
-                                command.context.home_unknown |= nested_home_unknown;
-                                command.context.cwd_unknown |= nested_cwd_unknown;
-                            }
-                            for redirect in &mut nested.redirects {
-                                redirect.context.home_unknown |= nested_home_unknown;
-                                redirect.context.cwd_unknown |= nested_cwd_unknown;
-                            }
-                        }
-                        nested_analyses.push((argv.clone(), nested.analysis.clone()));
-                        wrapper_effects_unknown |= nested.verbatim_escalation;
-                        facts.reliable &= nested.reliable;
-                        facts.facts_complete &= nested.facts_complete;
-                        facts.commands.extend(nested.commands);
-                        facts.redirects.extend(nested.redirects);
-                        facts.unknown.extend(nested.unknown);
-                        // 嵌套文本经过引号解码；本轮不从它生成外层正文豁免。
-                    } else {
-                        facts.reliable = false;
-                        facts.facts_complete = false;
-                        facts.unknown.push("wrapper limit".into());
-                    }
-                }
-                facts.commands.push(command);
             }
             "file_redirect" | "herestring_redirect" | "heredoc_redirect" => {
                 let direction = match node.kind() {
@@ -400,7 +409,14 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                 if targets.is_empty() {
                     targets.push(ShellWord::unknown());
                 }
-                for syntax in targets {
+                for syntax in targets.into_iter().flat_map(|syntax| {
+                    bind_loop(
+                        binding.as_ref(),
+                        node,
+                        syntax,
+                        ShellWord::bind_quoted_variable,
+                    )
+                }) {
                     facts.redirects.push(RedirectFact {
                         direction,
                         fd: fd.clone(),
@@ -481,9 +497,6 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
     {
         facts.analysis = strict_analysis(commands, paths, depth, &nested_analyses);
     }
-    if let Some(literal_loop) = literal_loop {
-        refine_literal_loop(&mut facts, &literal_loop, depth);
-    }
     facts
 }
 
@@ -518,13 +531,13 @@ fn literal_loop(nodes: &[Node<'_>], src: &str) -> Option<LiteralLoop> {
     if loops.next().is_some() || node.child(0)?.kind() != "for" {
         return None;
     }
-    let variable = node
-        .child_by_field_name("variable")?
-        .utf8_text(src.as_bytes())
-        .ok()?;
+    let text = |node: Node| node.utf8_text(src.as_bytes()).ok();
+    let variable = text(node.child_by_field_name("variable")?)?;
+    let body = node.child_by_field_name("body")?.byte_range();
     if !ordinary_loop_variable(variable) {
         return None;
     }
+    let mut references = 0;
     for node in nodes.iter().filter(|node| node.is_named()) {
         match node.kind() {
             "program"
@@ -533,7 +546,6 @@ fn literal_loop(nodes: &[Node<'_>], src: &str) -> Option<LiteralLoop> {
             | "do_group"
             | "pipeline"
             | "redirected_statement"
-            | "command"
             | "command_name"
             | "word"
             | "number"
@@ -544,14 +556,24 @@ fn literal_loop(nodes: &[Node<'_>], src: &str) -> Option<LiteralLoop> {
             | "comment"
             | "file_redirect"
             | "file_descriptor"
-            | "variable_name"
-            | "simple_expansion" => {}
-            "expansion" => {
-                let variable = node.named_child(0)?;
-                if node.named_child_count() != 1
-                    || variable.kind() != "variable_name"
-                    || node.utf8_text(src.as_bytes()).ok()?
-                        != format!("${{{}}}", variable.utf8_text(src.as_bytes()).ok()?)
+            | "variable_name" => {}
+            "simple_expansion" | "expansion" => {
+                let name = node.named_child(0)?;
+                if node.kind() == "expansion"
+                    && (node.named_child_count() != 1
+                        || name.kind() != "variable_name"
+                        || text(*node)? != format!("${{{}}}", text(name)?))
+                {
+                    return None;
+                }
+                references +=
+                    usize::from(text(name)? == variable && body.contains(&node.start_byte()));
+            }
+            "command" => {
+                let (words, _) = command_words(*node, src);
+                let mut argv = words.iter().map(|word| word.syntax.evaluate(None));
+                if !matches!(argv.next(),
+                    Some(WordEvaluation::Resolved(name)) if preserves_variables(&name, argv.next()))
                 {
                     return None;
                 }
@@ -560,98 +582,47 @@ fn literal_loop(nodes: &[Node<'_>], src: &str) -> Option<LiteralLoop> {
         }
     }
     let mut cursor = node.walk();
-    let values: Option<Vec<_>> = node
+    let values = node
         .children_by_field_name("value", &mut cursor)
-        .take(MAX_LOOP_VALUES + 1)
         .map(|value| match literal(value, src) {
             WordValue::Literal(value) => Some(value),
             WordValue::Unknown => None,
         })
-        .collect();
-    let values = values?;
+        .collect::<Option<Vec<_>>>()?;
+    // 每个绑定值都可能作为嵌套脚本再分析一遍，展开总数须有上限。
     // 不让未知词变成新选项；未建模命令的选项操作数仍须保守检查。
     if values.is_empty()
-        || values.len() > MAX_LOOP_VALUES
+        || values.len() * references > MAX_LOOP_BINDINGS
         || values.iter().any(|value| value.starts_with('-'))
     {
         return None;
     }
     Some(LiteralLoop {
-        body: node.child_by_field_name("body")?.byte_range(),
+        body,
         variable: variable.into(),
         values,
     })
 }
 
-fn refine_literal_loop(facts: &mut BashFacts, binding: &LiteralLoop, depth: u8) {
-    let mutates_state = facts
-        .commands
-        .iter()
-        .filter(|command| command.context.script_depth == depth)
-        .any(|command| {
-            let Some(WordEvaluation::Resolved(name)) =
-                command.words.first().map(|word| word.syntax.evaluate(None))
-            else {
-                return true;
-            };
-            // 外部进程不能改父 shell 的变量；裸命令只认已知不会改变量的这组。
-            // 不能只靠 Bash 的状态修改黑名单：Zsh 的 zstyle -s、vared 等也会赋值。
-            match name.as_str() {
-                "echo" | "cd" | "pwd" | ":" | "true" | "false" | "cargo" | "cat" | "grep"
-                | "rg" | "head" | "tail" | "wc" | "env" | "bash" | "sh" | "zsh" => false,
-                "printf" => !matches!(command.words.get(1).map(|word| word.syntax.evaluate(None)),
-                    Some(WordEvaluation::Resolved(format)) if !format.starts_with("-v")),
-                _ => !std::path::Path::new(&name).is_absolute(),
-            }
-        });
-    if mutates_state {
-        return;
-    }
-    let inside = |range: &Range<usize>, script_depth| {
-        script_depth == depth && binding.body.start <= range.start && range.end <= binding.body.end
+/// 循环正文里的事实按每个值各出一份；没有可绑定的引用就原样一份。
+fn bind_loop<T: Clone>(
+    binding: Option<&LiteralLoop>,
+    node: Node,
+    item: T,
+    bind: impl Fn(&mut T, &str, &str) -> bool,
+) -> Vec<T> {
+    let Some(binding) = binding.filter(|binding| binding.body.contains(&node.start_byte())) else {
+        return vec![item];
     };
-    facts.commands = std::mem::take(&mut facts.commands)
-        .into_iter()
-        .flat_map(|command| {
-            if !inside(&command.range, command.context.script_depth) {
-                return vec![command];
-            }
-            let mut alternatives = Vec::new();
-            for value in &binding.values {
-                let mut alternative = command.clone();
-                let mut changed = false;
-                for word in &mut alternative.words {
-                    changed |= word.syntax.bind_quoted_variable(&binding.variable, value);
-                    // WordValue 保留 Unknown：deny/ask 仍保守匹配，不能产生授权。
-                }
-                if !changed {
-                    return vec![command];
-                }
-                alternatives.push(alternative);
-            }
-            alternatives
-        })
-        .collect();
-    facts.redirects = std::mem::take(&mut facts.redirects)
-        .into_iter()
-        .flat_map(|redirect| {
-            if !inside(&redirect.range, redirect.context.script_depth) {
-                return vec![redirect];
-            }
-            let mut alternatives = Vec::new();
-            for value in &binding.values {
-                let mut alternative = redirect.clone();
-                if !alternative
-                    .syntax
-                    .bind_quoted_variable(&binding.variable, value)
-                {
-                    return vec![redirect];
-                }
-                alternatives.push(alternative);
-            }
-            alternatives
-        })
-        .collect();
+    let mut alternatives = Vec::new();
+    for value in &binding.values {
+        let mut alternative = item.clone();
+        if !bind(&mut alternative, &binding.variable, value) {
+            return vec![item];
+        }
+        alternatives.push(alternative);
+    }
+    alternatives
 }
 
 fn changes_directory(name: &str) -> bool {
@@ -700,6 +671,87 @@ fn changes_environment(name: &str) -> bool {
             | "enable"
             | "fc"
     )
+}
+
+/// 不会改父 shell 变量的命令：外部进程改不了，内建只收已知的这几个。不能反过来
+/// 列会改变量的命令——Zsh 的 zstyle -s、vared 等也会赋值。
+fn preserves_variables(name: &str, first_argument: Option<WordEvaluation>) -> bool {
+    match name {
+        "echo" | "cd" | "pwd" | ":" | "true" | "false" | "cargo" | "cat" | "grep" | "rg"
+        | "head" | "tail" | "wc" | "env" | "bash" | "sh" | "zsh" => true,
+        "printf" => matches!(first_argument,
+            Some(WordEvaluation::Resolved(format)) if !format.starts_with("-v")),
+        _ => std::path::Path::new(name).is_absolute(),
+    }
+}
+
+/// sh/bash/zsh 的 -c 命令串：三者都在选项结束后取第一个操作数。只越过不带值的
+/// 短选项簇、`-o 名字`、`--` 与几个无值长选项。Ok(None) 是不在 -c 模式或命令串
+/// 尚未给出（动态参数）；Err 是选项形状不认识、又可能进入 -c 模式。
+fn shell_command_string(args: &[String]) -> Result<Option<&str>, ()> {
+    let mut command = false;
+    let mut rest = args;
+    while let Some((arg, tail)) = rest.split_first() {
+        if matches!(
+            arg.as_str(),
+            "--login" | "--noprofile" | "--norc" | "--posix"
+        ) {
+            rest = tail;
+            continue;
+        }
+        // bash 的 -O 取值而 zsh 的不取，不猜；-o 在三者中都取下一个词。
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| {
+            !flags.is_empty()
+                && flags
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphabetic() && ch != 'O')
+        }) else {
+            break;
+        };
+        let values = flags.matches('o').count();
+        match tail.get(..values) {
+            Some(values) if !values.iter().any(|value| value.starts_with(['-', '+'])) => {}
+            _ => break,
+        }
+        command |= flags.contains('c');
+        rest = &tail[values..];
+    }
+    let ended = rest.first().is_some_and(|arg| arg == "--");
+    if ended {
+        rest = &rest[1..];
+    }
+    match rest.first() {
+        Some(arg) if !ended && arg.starts_with(['-', '+']) => {
+            let maybe_command = command
+                || rest.iter().any(|arg| {
+                    arg.starts_with(['-', '+']) && !arg.starts_with("--") && arg.contains('c')
+                });
+            if maybe_command { Err(()) } else { Ok(None) }
+        }
+        Some(script) if command => Ok(Some(script)),
+        _ => Ok(None),
+    }
+}
+
+fn command_words(node: Node, src: &str) -> (Vec<WordFact>, bool) {
+    let mut words = Vec::new();
+    let mut joined = false;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "comment" | "file_redirect" | "herestring_redirect" | "variable_assignment"
+        ) {
+            continue;
+        }
+        let word = if child.kind() == "command_name" {
+            child.named_child(0).unwrap_or(child)
+        } else {
+            child
+        };
+        joined |= push_word(&mut words, word, child.byte_range(), src);
+    }
+    (words, joined)
 }
 
 fn push_word(words: &mut Vec<WordFact>, node: Node, range: Range<usize>, src: &str) -> bool {
@@ -947,16 +999,54 @@ mod tests {
             ]
         );
 
-        let values = (0..=MAX_LOOP_VALUES)
-            .map(|index| format!("t{index}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let facts = analyze(&format!("for t in {values}; do cat \"$t\"; done"));
-        assert_eq!(facts.commands.len(), 1);
-        assert_eq!(
-            facts.commands[0].words[1].syntax.evaluate(None),
-            WordEvaluation::Unknown
+        // 上限按值数 × 引用数计；超出时整段不细化。
+        for (count, body) in [
+            (MAX_LOOP_BINDINGS + 1, "cat \"$t\""),
+            (MAX_LOOP_BINDINGS / 2 + 1, "cat \"$t\"; wc \"$t\""),
+        ] {
+            let values = (0..count)
+                .map(|index| format!("t{index}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let facts = analyze(&format!("for t in {values}; do {body}; done"));
+            assert!(
+                facts.commands.iter().all(|command| {
+                    command.words[1].syntax.evaluate(None) == WordEvaluation::Unknown
+                }),
+                "{facts:#?}"
+            );
+        }
+        // 只在顶层细化：绑定值会再作为嵌套脚本分析，逐层展开会相乘。
+        let facts = analyze("bash -c 'for t in a b; do cat \"$t\"; done'");
+        assert!(
+            facts
+                .commands
+                .iter()
+                .filter(|command| command.context.script_depth == 1)
+                .all(|command| command.words[1].syntax.evaluate(None) == WordEvaluation::Unknown),
+            "{facts:#?}"
         );
+    }
+
+    #[test]
+    fn shell_command_string_follows_option_parsing() {
+        for (args, expected) in [
+            ("-c x n", Ok(Some("x"))),
+            ("-e -c x", Ok(Some("x"))),
+            ("-c -e x", Ok(Some("x"))),
+            ("-euo pipefail -c x", Ok(Some("x"))),
+            ("-c -- x", Ok(Some("x"))),
+            ("--noprofile --norc -c x", Ok(Some("x"))),
+            ("-c", Ok(None)),
+            ("-e script.sh", Ok(None)),
+            ("script.sh -c x", Ok(None)),
+            ("-O extglob -c x", Err(())),
+            ("--rcfile rc -c x", Err(())),
+            ("-o -c x", Err(())),
+        ] {
+            let args: Vec<_> = args.split(' ').map(String::from).collect();
+            assert_eq!(shell_command_string(&args), expected, "{args:?}");
+        }
     }
 
     #[test]
@@ -1121,8 +1211,24 @@ mod tests {
         let facts = analyze(&src);
         assert!(!facts.reliable);
         assert_eq!(facts.analysis, BashAnalysis::Opaque);
+        // -c 前后的选项照样定位正文；认不出的形状把执行体当未知，而非当普通参数。
         let facts = analyze("bash -x -c 'cat .env'");
         assert_eq!(facts.analysis, BashAnalysis::Opaque);
-        assert!(facts.unknown.contains(&"unsupported shell wrapper".into()));
+        assert!(
+            facts.commands.iter().any(|command| {
+                command.context.script_depth == 1
+                    && command.argv() == Some(vec!["cat".into(), ".env".into()])
+            }),
+            "{facts:#?}"
+        );
+        let facts = analyze("bash -O extglob -c 'cat .env'");
+        assert!(!facts.reliable);
+        assert!(
+            facts.commands.iter().any(|command| {
+                command.context.argument_rewrite
+                    && command.words[0].syntax.evaluate(None) == WordEvaluation::Unknown
+            }),
+            "{facts:#?}"
+        );
     }
 }

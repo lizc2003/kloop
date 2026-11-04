@@ -1310,6 +1310,19 @@ mod tests {
                     "for f in notes.txt .env; do cat < \"$f\"; done",
                     "reading this sensitive path",
                 ),
+                // 绑定值作为 -c 正文时，要和字面写法一样递归分析。
+                (
+                    "for s in 'cat .env'; do bash -c \"$s\"; done",
+                    "reading this sensitive path",
+                ),
+                (
+                    "for s in 'cat .env'; do env bash -c \"$s\"; done",
+                    "reading this sensitive path",
+                ),
+                (
+                    "for s in 'cat .env'; do sh -c -- \"$s\"; done",
+                    "reading this sensitive path",
+                ),
             ] {
                 let approver = ScriptedApprover::new(vec![]);
                 let p = gate(mode, rules(&[], &[], &[]), approver.clone());
@@ -1336,6 +1349,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("deny permission rule"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn shell_options_around_c_keep_the_script_checked() {
+        // 前三条的正文位置不认识或曾被当普通参数；最后一条是常见写法，不能误拦。
+        for (command, blocked) in [
+            ("bash -e -c 'cat .env'", true),
+            ("bash -c -- 'cat .env'", true),
+            ("bash -O extglob -c 'cat notes.txt'", true),
+            ("bash -euo pipefail -c 'cat notes.txt'", false),
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            let result = p.check_call("bash", &bash(command), 0, true).await;
+            if blocked {
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("reading this sensitive path"),
+                    "{command}: {error}"
+                );
+            } else {
+                result.unwrap_or_else(|error| panic!("{command}: {error}"));
+            }
+        }
     }
 
     #[tokio::test]
