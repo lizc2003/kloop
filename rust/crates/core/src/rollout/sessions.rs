@@ -13,7 +13,8 @@ use kloop_protocol::{ContentBlock, Injected, Message, Role};
 use super::line::{LineMeta, RolloutLine};
 use super::validate::{intact_lines, parse_session, seq_of};
 use super::{
-    PairingRepairStats, Rollout, SESSION_FORMAT_VERSION, SessionSnapshot, SnapshotTerminal,
+    PairingRepairStats, Rollout, SESSION_FORMAT_VERSION, SessionLease, SessionSnapshot,
+    SnapshotTerminal,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,7 +37,7 @@ pub struct SessionRead {
     max_seq: u64,
     /// Held from a read taken under the writer lease, so recovery operates on
     /// exactly the bytes that were validated.
-    lease: Option<crate::state_lock::StateLock>,
+    lease: Option<SessionLease>,
 }
 
 impl SessionRead {
@@ -69,7 +70,7 @@ impl SessionRead {
         self.recover_locked(lease)
     }
 
-    fn recover_locked(self, lease: crate::state_lock::StateLock) -> io::Result<ResumedSession> {
+    fn recover_locked(self, lease: SessionLease) -> io::Result<ResumedSession> {
         let Self {
             snapshot,
             provider_usage,
@@ -92,9 +93,9 @@ impl SessionRead {
             ));
         }
         if intact_end < raw_len {
-            // Truncate through the leased handle, not the path: the name may
-            // already belong to a newer session.
-            lease.file().set_len(intact_end as u64)?;
+            // Truncate through the leased transcript, not the path: the name
+            // may already belong to a newer session.
+            lease.transcript().set_len(intact_end as u64)?;
         }
         let mut rollout = Rollout {
             lease: Some(lease),
@@ -184,17 +185,18 @@ fn read_session(path: &Path, raw: Vec<u8>) -> io::Result<SessionRead> {
 /// leaves a window in which another writer can append, after which this
 /// reader's `max_seq`/`intact_end` would truncate or overwrite its lines.
 pub fn inspect_session_for_writing(path: &Path) -> io::Result<SessionRead> {
-    let mut lease = crate::state_lock::StateLock::try_acquire_existing(path).map_err(|error| {
+    let mut lease = SessionLease::open_existing(path).map_err(|error| {
         io::Error::other(format!(
             "session is already active or cannot be locked: {error}"
         ))
     })?;
-    // Read from the locked handle itself. Re-opening the path here would leave
-    // a window in which the file could be unlinked and its id reused, making
-    // this reader validate one inode and later truncate or extend another.
+    // Read from the leased transcript handle itself. Re-opening the path here
+    // would leave a window in which the file could be unlinked and its id
+    // reused, making this reader validate one inode and later truncate or
+    // extend another.
     let mut raw = Vec::new();
-    lease.file_mut().seek(io::SeekFrom::Start(0))?;
-    lease.file_mut().read_to_end(&mut raw)?;
+    lease.transcript_mut().seek(io::SeekFrom::Start(0))?;
+    lease.transcript_mut().read_to_end(&mut raw)?;
     let mut read = read_session(path, raw)?;
     read.lease = Some(lease);
     Ok(read)
@@ -1012,6 +1014,7 @@ mod tests {
         );
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        #[cfg(not(windows))]
         assert!(
             !path.with_extension("lock").exists(),
             "the lease is the transcript, not a sidecar"
@@ -2249,6 +2252,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        #[cfg(not(windows))]
         assert!(
             !path.with_extension("lock").exists(),
             "the lease is the transcript, not a sidecar"
@@ -2268,6 +2272,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        #[cfg(not(windows))]
         assert!(
             !path.with_extension("lock").exists(),
             "the lease is the transcript, not a sidecar"

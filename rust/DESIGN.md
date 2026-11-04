@@ -615,14 +615,19 @@ past its opening preamble — the
 is dropped** (plan 115): launching kloop and quitting without a word leaves no
 session, and cannot beat the last real conversation to `--continue`. Only a file
 that writer created is ever removed, and only while it holds nothing else — a
-resumed or forked session's file is never touched. The writer leases the
-transcript itself (plan 251), so there is no sidecar to leave behind. Reads,
-truncation and appends all go through the one handle that lease locked — never
-through the path — so an unlink followed by the same id being reused cannot move
-this writer's bytes into the new owner's transcript. The empty file is unlinked
-while the lease is still held (releasing and retrying only where the platform
-refuses), so a concurrent opener cannot acquire the old inode before the name is
-gone. A preamble-only file a
+resumed or forked session's file is never touched. On Unix the writer leases the
+transcript itself (plan 251) — `flock` is advisory, so readers that never take it
+are unaffected — and no sidecar is ever created. Reads, truncation and appends
+go through the transcript handle that lease owns, never through the path, so an
+unlink followed by the same id being reused cannot move this writer's bytes into
+the new owner's transcript; the empty file is unlinked while the lease is still
+held (releasing and retrying only where the platform refuses). Windows
+`LockFileEx` is mandatory — a second handle, even in the same process, cannot
+read the locked bytes — so there the lease is a sidecar `.lock` and the
+transcript stays readable by `thread/read`, `thread/list` and forks; all I/O
+still uses the transcript handle, and an empty session removes both files.
+A writer that fails to acquire the lease removes nothing: the file then belongs
+to whoever won it. A preamble-only file a
 hard kill leaves behind is an empty session rather than a corrupt one: its
 timeline may not have its initial route yet, which replay accepts as long as no
 history message or usage line needs one, and the first turn writes it. A file
@@ -761,11 +766,14 @@ written. Every new session — CLI start, `/clear`, a fork, a server thread —
 claims its JSONL with that same create-new step, so a timestamp collision can
 neither truncate nor share an existing transcript.
 
-每份可写 rollout 持有会话文件自身的跨进程独占 flock，直到 writer 销毁。会话文件
-从不被替换或 rename，inode 就是稳定身份，所以不需要旁路锁文件：没有 `.lock` 可
-累积，也不存在“锁文件与数据文件谁先删”的竞态。锁随文件消失——空会话 Drop 时先
-释放租约再 unlink（Windows 不允许删除仍有打开句柄的文件）。恢复已有会话用
-`try_acquire_existing` 先锁住 transcript、再读取一次，缺失的文件报错而不会被
+可写 rollout 的租约在 Unix 上就是会话文件自身的跨进程独占 flock：会话文件从不
+被替换或 rename，inode 是稳定身份，所以没有 `.lock` 可累积，也没有“锁文件与
+数据文件谁先删”的竞态。Windows 的 `LockFileEx` 是**强制锁**，第二个句柄（同进程
+也算）读不到被锁字节，会把 `thread/read`、`thread/list` 和 fork 全部挡住，所以
+Windows 的租约落在同名 `.lock` sidecar 上，transcript 保持可读；两条平台的读写、
+截断都走租约持有的 transcript 句柄，空会话退出时由 writer 在持锁状态下删除
+（Windows 连同 sidecar）。**没抢到租约的 writer 不删除任何东西**：它创建的文件
+此时已归抢到租约的进程。恢复已有会话先锁租约再读一次，缺失的文件报错而不会被
 顺手创建成空会话；校验、修复或截断都在同一份字节上进行。已有实例仍持有会话时，
 第二个 writer 明确报错。只读列表、inspect 与快照不取锁，也不会为查看记录截断
 文件。`StateLock` 继续服务 `project.lock`、`mcp-oauth.lock` 这类没有数据文件可

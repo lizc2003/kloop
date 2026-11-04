@@ -4216,3 +4216,14 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
 325. **持有常驻 fd 之后，权限类失败注入会失效。** 旧测试靠 chmod/删父目录制造 append
    失败；writer 现在一直握着打开的文件，这些操作不再影响写入。失败路径要用显式的
    test-only 注入点（`inject_append_failure`），否则测试会悄悄变成“成功路径”。
+
+326. **平台锁语义不同，锁在数据文件上不是可移植的决定。** Unix `flock` 是 advisory，读者
+   不拿锁就能读，所以可以直接锁 transcript；Windows `LockFileEx` 是 mandatory，第二个
+   句柄（同进程也算）读不到被锁字节，会挡死 `thread/read`、`thread/list`、fork。要么
+   Windows 用 sidecar，要么接受活跃会话不可读。把“租约 = 排他 + 读写句柄”抽成一层，
+   平台差异只留在打开租约的那几行。
+
+327. **抢锁失败就等于没有所有权，清理不能只看“文件是我建的”。** `create_new` 与抢锁之间
+   有窗口：另一进程可以 resume 这个已存在的文件并拿到租约。失败方按 `preexisting=false`
+   去删，删的是赢家的 transcript（对方还通过打开句柄继续写）。Drop 的清理前提必须是
+   `lease.is_some()`——“我持有租约”才是所有权，创建动作不是。

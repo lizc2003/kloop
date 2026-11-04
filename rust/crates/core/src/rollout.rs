@@ -15,6 +15,7 @@
 //! Unknown fields in a line are ignored on read, so the format can grow
 //! additively.
 
+use std::fs::File;
 use std::io;
 use std::io::Seek as _;
 use std::io::Write as _;
@@ -47,16 +48,114 @@ pub(crate) use sessions::{civil_from_days, timestamp_id};
 
 use line::{LineMeta, RolloutLine};
 
+/// A writer's exclusive lease on one session, plus the transcript handle it
+/// reads and writes through.
+///
+/// Unix `flock` is advisory: a reader that never takes it is unaffected, so the
+/// lease lives on the transcript itself and no sidecar is ever created.
+/// Windows `LockFileEx` is mandatory — a second handle, even in the same
+/// process, cannot read the locked bytes — so there the lease lives on the
+/// sidecar and the transcript stays readable for `thread/read`, `thread/list`
+/// and forks.
+#[derive(Debug)]
+pub(crate) struct SessionLease {
+    lock: crate::state_lock::StateLock,
+    #[cfg(windows)]
+    transcript: File,
+}
+
+impl SessionLease {
+    /// Lease a session that must already exist.
+    pub(crate) fn open_existing(path: &Path) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        {
+            Ok(Self {
+                lock: crate::state_lock::StateLock::try_acquire_existing(path)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let transcript = crate::state_lock::StateLock::open(path, false)?;
+            let lock = crate::state_lock::StateLock::try_acquire(&lease_path(path))?;
+            Ok(Self { lock, transcript })
+        }
+    }
+
+    /// Lease a session this writer is about to write, creating the transcript
+    /// if it does not exist yet.
+    pub(crate) fn open_or_create(path: &Path) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        {
+            Ok(Self {
+                lock: crate::state_lock::StateLock::try_acquire(path)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let lock = crate::state_lock::StateLock::try_acquire(&lease_path(path))?;
+            let transcript = crate::state_lock::StateLock::open(path, true)?;
+            Ok(Self { lock, transcript })
+        }
+    }
+
+    pub(crate) fn transcript(&self) -> &File {
+        #[cfg(not(windows))]
+        {
+            self.lock.file()
+        }
+        #[cfg(windows)]
+        {
+            &self.transcript
+        }
+    }
+
+    pub(crate) fn transcript_mut(&mut self) -> &mut File {
+        #[cfg(not(windows))]
+        {
+            self.lock.file_mut()
+        }
+        #[cfg(windows)]
+        {
+            &mut self.transcript
+        }
+    }
+}
+
+/// The file a writer leases. On Unix this is the transcript itself; on Windows
+/// it cannot be (see `SessionLease`), so it is a sidecar.
+#[cfg(windows)]
+fn lease_path(transcript: &Path) -> PathBuf {
+    transcript.with_extension("lock")
+}
+
+/// Remove what an empty session leaves behind: its transcript, plus the lease
+/// sidecar where the platform keeps one. A missing file is success, so the
+/// release-and-retry path can run the whole removal again.
+fn remove_session_files(path: &Path) -> io::Result<()> {
+    remove_if_present(path)?;
+    #[cfg(windows)]
+    remove_if_present(&lease_path(path))?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Append-only writer for one session file. A new session's file is created
 /// by [`claim_new_session`], which is what reserves its id against a
 /// concurrent process; appending only ever adds to it. The writer holds an
-/// exclusive lease on the transcript itself for its whole life, so no sidecar
-/// `.lock` exists and the lock disappears with the file. A writer that owns its
+/// exclusive [`SessionLease`] for its whole life and performs every read,
+/// truncation and append through that lease's transcript handle. A writer that owns its
 /// file and never gets past the opening preamble removes the file again when
 /// it is dropped, so starting kloop and quitting without a word leaves nothing
 /// behind. Tracks the id chain: each line's `parent` is the previous line's id.
 pub struct Rollout {
-    lease: Option<crate::state_lock::StateLock>,
+    lease: Option<SessionLease>,
     path: PathBuf,
     prefix: String,
     next_seq: u64,
@@ -84,7 +183,11 @@ pub struct Rollout {
 
 impl Drop for Rollout {
     fn drop(&mut self) {
-        if self.preexisting || self.wrote_content {
+        // A writer that never got the lease does not own the session: another
+        // process may have taken over the file between its creation and this
+        // attempt (`new_subagent_with_route` creates, then leases), so it must
+        // leave the winner's transcript alone.
+        if self.preexisting || self.wrote_content || self.lease.is_none() {
             return;
         }
         // Nothing but the preamble was ever written: launching kloop and
@@ -94,10 +197,10 @@ impl Drop for Rollout {
         // still holding the lease: an opener that already has this inode
         // cannot acquire it before the name is gone, so a reused id can never
         // hand anyone a lock on one inode and a file on another.
-        if std::fs::remove_file(&self.path).is_err() {
+        if remove_session_files(&self.path).is_err() {
             // Windows may refuse while the handle is open; release and retry.
             self.lease.take();
-            let _ = std::fs::remove_file(&self.path);
+            let _ = remove_session_files(&self.path);
         }
     }
 }
@@ -418,13 +521,11 @@ impl Rollout {
 
     fn ensure_lease(&mut self) -> io::Result<()> {
         if self.lease.is_none() {
-            self.lease = Some(
-                crate::state_lock::StateLock::try_acquire(&self.path).map_err(|error| {
-                    io::Error::other(format!(
-                        "session is already active or cannot be locked: {error}"
-                    ))
-                })?,
-            );
+            self.lease = Some(SessionLease::open_or_create(&self.path).map_err(|error| {
+                io::Error::other(format!(
+                    "session is already active or cannot be locked: {error}"
+                ))
+            })?);
         }
         Ok(())
     }
@@ -463,7 +564,7 @@ impl Rollout {
         // unlink (and an id reused in the same second) move these bytes onto
         // another process's transcript.
         let lease = self.lease.as_mut().expect("ensure_lease just ran");
-        let file = lease.file_mut();
+        let file = lease.transcript_mut();
         file.seek(io::SeekFrom::End(0))?;
         writeln!(file, "{json}")?;
         if line.needs_sync() {
@@ -717,12 +818,46 @@ mod tests {
         let path = temp_file("preamble-only");
         let rollout = Rollout::new(path.clone());
         assert!(path.exists(), "the id is reserved while the writer lives");
+        #[cfg(not(windows))]
         assert!(
             !path.with_extension("lock").exists(),
-            "the transcript is its own lease; no sidecar is created"
+            "Unix leases the transcript; no sidecar is created"
+        );
+        #[cfg(windows)]
+        assert!(
+            path.with_extension("lock").exists(),
+            "Windows leases a sidecar so the transcript stays readable"
         );
         drop(rollout);
         assert!(!path.exists());
+        #[cfg(windows)]
+        assert!(!path.with_extension("lock").exists());
+        cleanup(&path);
+    }
+
+    /// The claimed file belongs to whoever holds its lease. If another process
+    /// resumed it between its creation and this writer's lease attempt, losing
+    /// that attempt must not delete the winner's transcript.
+    #[test]
+    fn a_writer_that_never_leased_does_not_delete_the_file() {
+        let path = temp_file("lease-lost");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let claim = claim_new_session(&dir).unwrap();
+        let claimed = claim.path().to_path_buf();
+        let _holder = SessionLease::open_or_create(&claimed).unwrap();
+
+        let error = Rollout::new_with_runtime_pending_route(
+            claim,
+            SessionRuntime {
+                cwd: "/work".into(),
+            },
+        );
+        assert!(error.is_err(), "the second writer got the lease");
+        assert!(
+            claimed.exists(),
+            "the writer that lost the lease deleted the winner's transcript"
+        );
         cleanup(&path);
     }
 
@@ -744,6 +879,7 @@ mod tests {
         let quiet = claim.path().to_path_buf();
         drop(Rollout::claimed_with_initial_route(claim, &route).unwrap());
         assert!(!quiet.exists());
+        #[cfg(not(windows))]
         assert!(!quiet.with_extension("lock").exists());
 
         let claim = claim_new_session(&dir).unwrap();
@@ -752,6 +888,7 @@ mod tests {
         rollout.append_message(&Message::user_text("hi")).unwrap();
         drop(rollout);
         assert_eq!(load_session_snapshot(&kept).unwrap().messages.len(), 1);
+        #[cfg(not(windows))]
         assert!(
             !kept.with_extension("lock").exists(),
             "a used session keeps only its transcript"

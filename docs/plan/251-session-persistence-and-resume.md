@@ -110,3 +110,15 @@
   “无 timeline 的历史初始化 route”、CLI 端到端 resume preamble-only 文件三条回归。
   外层沙箱之外 `make check` 全绿（core 1326、TUI 314、server contract 46、2 项 ignored，
   本机 parity baseline verified）。
+
+## 审查跟进二(2026-11-03)
+
+- Windows 的 `LockFileEx` 是强制锁：writer 锁住 transcript 会让同进程/其他进程的普通
+  读取失败，`thread/read`、`thread/list`、fork 都会坏。租约抽成 `SessionLease`：Unix 锁
+  transcript（flock 是 advisory，读不受影响，无 sidecar），Windows 锁同名 `.lock`
+  sidecar、transcript 保持可读；两个平台的读写/截断仍都走租约持有的 transcript 句柄。
+- 抢锁失败的 writer 不再触发删除：`new_subagent_with_route` 先 `create_new` 再抢锁，另一
+  进程可在窗口内 resume；失败者的 Drop 现在要求 `lease.is_some()` 才清理，文件归赢家。
+  回归：先持租约，再构造 pending-route writer，断言它失败且文件仍在。
+  外层沙箱之外 `make check` 全绿（core 1327、TUI 314、server contract 46、2 项 ignored，
+  本机 parity baseline verified）；Windows 目标因缺 Windows SDK 无法交叉 check，未实测。

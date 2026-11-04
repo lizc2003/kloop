@@ -20,7 +20,7 @@ impl StateLock {
         &mut self.file
     }
 
-    fn open(path: &Path, create: bool) -> io::Result<File> {
+    pub(crate) fn open(path: &Path, create: bool) -> io::Result<File> {
         if create && let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
