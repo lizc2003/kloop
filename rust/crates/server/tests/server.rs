@@ -3923,7 +3923,7 @@ async fn sessions_survive_a_server_restart() {
 /// A thread that is started and never gets a turn leaves no session behind.
 /// The file is this writer's own from the claim on, even though it exists
 /// before the opening runtime line is appended, so the writer's Drop removes
-/// it (and its lease) exactly like a CLI session that was closed at once.
+/// it exactly like a CLI session that was closed at once.
 #[tokio::test]
 async fn a_thread_started_and_never_used_leaves_no_session() {
     let dirs = test_dirs("unused-thread");
@@ -3945,7 +3945,7 @@ async fn a_thread_started_and_never_used_leaves_no_session() {
     );
     assert!(
         !path.with_extension("lock").exists(),
-        "the empty session's lease went with it"
+        "sessions lease their transcript; no sidecar is created"
     );
     let _ = std::fs::remove_dir_all(&dirs.root);
 }

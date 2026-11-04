@@ -177,13 +177,11 @@ pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
 /// leaves a window in which another writer can append, after which this
 /// reader's `max_seq`/`intact_end` would truncate or overwrite its lines.
 pub fn inspect_session_for_writing(path: &Path) -> io::Result<SessionRead> {
-    let lease = crate::state_lock::StateLock::try_acquire(&path.with_extension("lock")).map_err(
-        |error| {
-            io::Error::other(format!(
-                "session is already active or cannot be locked: {error}"
-            ))
-        },
-    )?;
+    let lease = crate::state_lock::StateLock::try_acquire_existing(path).map_err(|error| {
+        io::Error::other(format!(
+            "session is already active or cannot be locked: {error}"
+        ))
+    })?;
     let mut read = inspect_session(path)?;
     read.lease = Some(lease);
     Ok(read)
@@ -1001,11 +999,26 @@ mod tests {
         );
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the lease is the transcript, not a sidecar"
+        );
         drop(writer);
         let resumed = resume_session(&path).unwrap();
         assert_eq!(resumed.messages(), [message]);
         drop(resumed);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Resuming a path that is not there is an error and must not leave a
+    /// newly created empty transcript (the lease is the transcript itself).
+    #[test]
+    fn resuming_a_missing_session_creates_nothing() {
+        let path = temp_file("missing-resume");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(resume_session(&path).is_err());
+        assert!(!path.exists());
+        cleanup(&path);
     }
 
     #[test]
@@ -2223,6 +2236,10 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the lease is the transcript, not a sidecar"
+        );
         cleanup(&path);
     }
 
@@ -2238,6 +2255,10 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(resume_session(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the lease is the transcript, not a sidecar"
+        );
         cleanup(&path);
     }
 }

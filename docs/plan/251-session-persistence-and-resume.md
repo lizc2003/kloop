@@ -87,8 +87,10 @@
 - **第 6 条**：`--list-sessions` 改走 `session_digest`；`--continue` 用惰性的
   `resumable_rows(..).next()`，不再先 digest 全部。注意：列表不再报消息数——plan 162
   曾专门为诊断视图保留它；251 的指令是改用 digest，本计划按 251 执行。
-- **第 7 条**：按用户确认的 A 做：只在 Drop 删除自己那份「从未写过内容」的 `.jsonl`
-  时顺带删同名 `.lock`；有内容的会话保留锁——在别人可能已打开的路径上 unlink 会造出
-  两个同时持有的 writer。
+- **第 7 条**：先按推荐落了「只在 Drop 删除空 `.jsonl` 时顺带删 `.lock`」；随后按用户
+  「不用考虑兼容性」的要求去掉旁路锁：**会话文件本身就是锁**。writer 在生命周期内持有
+  transcript 的独占 flock，恢复用 `try_acquire_existing` 先锁再读；空会话 Drop 先释放
+  再 unlink。`StateLock` 只保留给 `project.lock`/`mcp-oauth.lock` 这类没有数据文件可
+  依附的锁。不再产生任何 `.lock` 文件。
 
 验证：外层执行沙箱之外 `make check`（fmt + clippy + workspace 全量测试 + parity）。

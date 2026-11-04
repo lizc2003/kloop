@@ -615,11 +615,10 @@ past its opening preamble — the
 is dropped** (plan 115): launching kloop and quitting without a word leaves no
 session, and cannot beat the last real conversation to `--continue`. Only a file
 that writer created is ever removed, and only while it holds nothing else — a
-resumed or forked session's file is never touched. The `.lock` goes with it
-(plan 251): unlinking a lease another opener might already hold is a
-double-writer race, but this file never held a conversation and its writer is
-the only process that leased it; a session with content keeps its zero-byte
-lock, so the lock count never exceeds the session count. A preamble-only file a
+resumed or forked session's file is never touched. The writer leases the
+transcript itself (plan 251), so there is no sidecar to leave behind; Drop
+releases that lease before unlinking, because Windows cannot remove a file whose
+handle is still open. A preamble-only file a
 hard kill leaves behind is an empty session rather than a corrupt one: its
 timeline may not have its initial route yet, which replay accepts as long as no
 history message or usage line needs one, and the first turn writes it. A file
@@ -757,13 +756,16 @@ written. Every new session — CLI start, `/clear`, a fork, a server thread —
 claims its JSONL with that same create-new step, so a timestamp collision can
 neither truncate nor share an existing transcript.
 
-每份可写 rollout 在首次追加前持有同名 `.lock` 的跨进程独占租约，直到 writer
-销毁；恢复已有会话先取得租约、再读取一次文件，校验、修复或截断都在同一份字节上
-进行。已有实例仍持有会话时，第二个 writer 明确报错。只读列表、inspect 与快照
-不取得写租约，也不会为查看记录截断文件。空会话被 Drop 删除时同名 `.lock` 一并
-删除；已有内容的会话保留租约文件，因为在别人可能已经打开它的路径上 unlink 会
-造出两个同时持有的 writer。子 agent 的 JSONL 同样用排他创建，禁止把新历史
-追加到已有同名日志。
+每份可写 rollout 持有会话文件自身的跨进程独占 flock，直到 writer 销毁。会话文件
+从不被替换或 rename，inode 就是稳定身份，所以不需要旁路锁文件：没有 `.lock` 可
+累积，也不存在“锁文件与数据文件谁先删”的竞态。锁随文件消失——空会话 Drop 时先
+释放租约再 unlink（Windows 不允许删除仍有打开句柄的文件）。恢复已有会话用
+`try_acquire_existing` 先锁住 transcript、再读取一次，缺失的文件报错而不会被
+顺手创建成空会话；校验、修复或截断都在同一份字节上进行。已有实例仍持有会话时，
+第二个 writer 明确报错。只读列表、inspect 与快照不取锁，也不会为查看记录截断
+文件。`StateLock` 继续服务 `project.lock`、`mcp-oauth.lock` 这类没有数据文件可
+依附的旁路串行化。子 agent 的 JSONL 同样用排他创建，禁止把新历史追加到已有同名
+日志。
 
 Session ids are UTC timestamps (`YYYYMMDD-HHMMSS`, no rand/chrono
 dependency; a second session in the same second gets `-2`, then `-3`);

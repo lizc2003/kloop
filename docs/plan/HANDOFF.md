@@ -14,12 +14,13 @@
 resume 改为先取租约、再只读一次：`inspect_session_for_writing` 持有租约返回
 `SessionRead`，`recover_for_writing` 只接受带租约的读；`PairingRepair` 不再复制
 messages/terminals，`ResumedSession` 只保存 snapshot 一份，`resume_options` 借用快照。
-空会话 Drop 删除 `.jsonl` 时顺带删同名 `.lock`（有内容的会话保留锁，见教训 317）。
-新增 10 条回归（core 5、CLI 2、server 3；其中 resume 只读一次用按路径计数夹具，失败路由
-adopt 用只读文件强制 append 失败），另把两条 Drop 锁断言加进既有测试、两条旧测试
-随新语义更新。外层执行沙箱之外 `make check` 全绿（fmt、clippy、
-workspace 全量测试，core 1322 项、TUI 314、server contract 46 项、2 项真 provider ignored，
-本机 parity baseline verified）。DESIGN 更新 preamble/锁/损坏首行、恢复只读一次、digest、
+会话文件自身就是锁：writer 在生命周期内持有 transcript 的独占 flock，不再产生
+`.lock` sidecar，空会话 Drop 先释放再 unlink（见教训 317）。
+新增 12 条回归（core 7、CLI 2、server 3；其中 resume 只读一次用按路径计数夹具，失败
+路由 adopt 用只读文件强制 append 失败，锁行为钉“不产生 sidecar / 恢复不创建缺失文件”），
+另把两条 Drop 锁断言加进既有测试、两条旧测试随新语义更新。外层执行沙箱之外 `make check`
+全绿（fmt、clippy、workspace 全量测试，core 1324 项、TUI 314、server contract 46 项、
+2 项真 provider ignored，本机 parity baseline verified）。DESIGN 更新 preamble/锁/损坏首行、恢复只读一次、digest、
 rewind 路由回退段落。Linux 与 Windows 未实测。教训 315–321。
 
 **Plan 250 ✅：agent 主循环与上下文估算（2026-11-03）**：`run_turn` 在 stage pre_turn
@@ -4162,10 +4163,13 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    是按“别人还可能追加”的字节算出来的，截断会吃掉新行。让 `recover_for_writing` 只接受
    带租约的 `SessionRead`，比在每个调用点写注释可靠。
 
-317. **锁文件只能和数据文件同生共死。** 在仍持有租约时 unlink `.lock`，`open` 与
-   `try_lock` 之间有窗口：后到者可能拿到旧 inode 的锁，同时第三个进程新建同名文件并
-   加锁，于是两个 writer 同时写一份 append-only 会话。只在 Drop 同时删掉“从未写过内容”
-   的 `.jsonl` 时删锁；有内容的会话保留 0 字节锁，锁数量与会话数量同阶。
+317. **锁要长在资源本身上，不要做成旁路文件。** 在仍持有租约时 unlink `.lock`，
+   `open` 与 `try_lock` 之间有窗口：后到者可能拿到旧 inode 的锁，同时第三个进程新建
+   同名文件并加锁，于是两个 writer 同时写一份 append-only 会话。会话文件从不替换或
+   rename，直接 flock transcript 就没有“锁文件与数据文件谁先删”的问题，也不会累积
+   sidecar；空会话 Drop 先释放再 unlink（Windows 不允许删除仍有打开句柄的文件）。恢复
+   用“必须已存在”的加锁变体，免得把缺失的路径顺手创建成空会话。`StateLock` 仍服务
+   `project.lock` 这类没有数据文件可依附的锁。
 
 318. **`read_line` 到 `String` 会把一行的坏字节升级成整个文件的错误。** 需要“坏行跳过”的
    读取一律 `read_until` 到 `Vec<u8>` 再 `from_utf8`：否则一个截断的多字节字符会让

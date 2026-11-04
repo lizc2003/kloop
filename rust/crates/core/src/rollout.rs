@@ -48,7 +48,9 @@ use line::{LineMeta, RolloutLine};
 
 /// Append-only writer for one session file. A new session's file is created
 /// by [`claim_new_session`], which is what reserves its id against a
-/// concurrent process; appending only ever adds to it. A writer that owns its
+/// concurrent process; appending only ever adds to it. The writer holds an
+/// exclusive lease on the transcript itself for its whole life, so no sidecar
+/// `.lock` exists and the lock disappears with the file. A writer that owns its
 /// file and never gets past the opening preamble removes the file again when
 /// it is dropped, so starting kloop and quitting without a word leaves nothing
 /// behind. Tracks the id chain: each line's `parent` is the previous line's id.
@@ -83,15 +85,11 @@ impl Drop for Rollout {
         // Nothing but the preamble was ever written: launching kloop and
         // quitting without a word must not leave a session behind, or
         // `--continue` picks that empty shell over the last real conversation.
-        // Only a file this writer created can be removed here.
+        // Only a file this writer created can be removed here. The transcript
+        // is its own lock, so release that first: Windows cannot unlink a file
+        // that still has a handle open.
+        self.lease.take();
         let _ = std::fs::remove_file(&self.path);
-        // The lease goes with the file: every session would otherwise leave a
-        // zero-byte `.lock` behind for its whole lifetime. Unlinking one while
-        // any writer could still be using it is a double-writer race, but this
-        // file never held a conversation and its writer is the only one that
-        // ever leased it (the lease is still held right here), so the lock path
-        // goes with the transcript.
-        let _ = std::fs::remove_file(self.path.with_extension("lock"));
     }
 }
 
@@ -181,14 +179,18 @@ impl Rollout {
         subagent_of: String,
         route: &FrozenProviderRoute,
     ) -> io::Result<Self> {
-        let lease = crate::state_lock::StateLock::try_acquire(&path.with_extension("lock"))?;
+        // `create_new` reserves the name before anything can write to it; the
+        // writer then leases the transcript it just created.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)?;
         let mut rollout = Self::with_origin(path, Some(subagent_of));
-        rollout.lease = Some(lease);
         rollout.preexisting = false;
+        rollout.ensure_lease()?;
         rollout.append_initial_route(route)?;
         Ok(rollout)
     }
@@ -398,12 +400,11 @@ impl Rollout {
     fn ensure_lease(&mut self) -> io::Result<()> {
         if self.lease.is_none() {
             self.lease = Some(
-                crate::state_lock::StateLock::try_acquire(&self.path.with_extension("lock"))
-                    .map_err(|error| {
-                        io::Error::other(format!(
-                            "session is already active or cannot be locked: {error}"
-                        ))
-                    })?,
+                crate::state_lock::StateLock::try_acquire(&self.path).map_err(|error| {
+                    io::Error::other(format!(
+                        "session is already active or cannot be locked: {error}"
+                    ))
+                })?,
             );
         }
         Ok(())
@@ -694,11 +695,12 @@ mod tests {
         let path = temp_file("preamble-only");
         let rollout = Rollout::new(path.clone());
         assert!(path.exists(), "the id is reserved while the writer lives");
-        let lock = path.with_extension("lock");
-        assert!(lock.exists(), "the writer leases the session it writes");
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the transcript is its own lease; no sidecar is created"
+        );
         drop(rollout);
         assert!(!path.exists());
-        assert!(!lock.exists(), "the empty session's lease goes with it");
         cleanup(&path);
     }
 
@@ -729,8 +731,8 @@ mod tests {
         drop(rollout);
         assert_eq!(load_session_snapshot(&kept).unwrap().messages.len(), 1);
         assert!(
-            kept.with_extension("lock").exists(),
-            "a used session keeps its lease file"
+            !kept.with_extension("lock").exists(),
+            "a used session keeps only its transcript"
         );
         cleanup(&path);
     }

@@ -8,12 +8,16 @@ pub struct StateLock {
 }
 
 impl StateLock {
-    fn open(path: &Path) -> io::Result<File> {
-        if let Some(parent) = path.parent() {
+    fn open(path: &Path, create: bool) -> io::Result<File> {
+        if create && let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .create(create);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -36,13 +40,22 @@ impl StateLock {
     }
 
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        let file = Self::open(path)?;
+        let file = Self::open(path, true)?;
         file.lock()?;
         Ok(Self { file })
     }
 
     pub fn try_acquire(path: &Path) -> io::Result<Self> {
-        let file = Self::open(path)?;
+        let file = Self::open(path, true)?;
+        file.try_lock().map_err(io::Error::other)?;
+        Ok(Self { file })
+    }
+
+    /// Lock a file that must already exist. Reading a session for recovery uses
+    /// this instead of [`StateLock::try_acquire`]: a missing transcript is an
+    /// error, not a new empty file.
+    pub fn try_acquire_existing(path: &Path) -> io::Result<Self> {
+        let file = Self::open(path, false)?;
         file.try_lock().map_err(io::Error::other)?;
         Ok(Self { file })
     }
@@ -93,6 +106,25 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Reading a session for recovery must not mint a transcript: a missing
+    /// path is an error, while an existing one is locked in place.
+    #[test]
+    fn an_existing_only_lease_never_creates_the_file() {
+        let dir = std::env::temp_dir().join(crate::resource_id::fresh("kloop-lock-open-").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        assert!(StateLock::try_acquire_existing(&path).is_err());
+        assert!(!path.exists(), "the failed lease left no file");
+
+        std::fs::write(&path, b"{}\n").unwrap();
+        let lease = StateLock::try_acquire_existing(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}\n");
+        assert!(StateLock::try_acquire_existing(&path).is_err());
+        drop(lease);
+        assert!(StateLock::try_acquire_existing(&path).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
