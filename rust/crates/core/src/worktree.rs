@@ -914,11 +914,12 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
 }
 
 /// A directory is build output only when the ignore pattern that decides it is
-/// directory-scoped (`target/`, `node_modules/`). `/*` and bare `secrets` also
-/// match directories but may contain hand-written files, and `logs/` collapsed
-/// because every file matched `*.log` is not a directory rule at all; those
-/// count as content. `check-ignore` runs once, only when a tree has ignored
-/// directories, and any failure retains everything rather than delete by guess.
+/// directory-scoped (`target/`, `secrets/`, `tmp/`). `/*` and bare `node_modules`
+/// also match directories but may contain hand-written files; those count as
+/// content. A directory whose contents merely match (`*.log`) is never
+/// collapsed, so it arrives as individual ignored files instead.
+/// `check-ignore` runs once, only when a tree has ignored directories, and any
+/// failure retains everything rather than delete by guess.
 async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<String>, usize) {
     if dirs.is_empty() {
         return (Vec::new(), 0);
@@ -944,7 +945,7 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
     while let (Some(_source), Some(_line), Some(pattern), Some(path)) =
         (fields.next(), fields.next(), fields.next(), fields.next())
     {
-        if pattern.ends_with('/') {
+        if pattern.ends_with('/') && !pattern.starts_with('!') {
             build_dirs.push(path.trim_end_matches('/').to_string());
         }
     }
@@ -1490,15 +1491,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// `/*`, bare `secrets`, and directories collapsed only because every file
-    /// matched `*.log` may hold hand-written work. Only a directory-scoped
-    /// pattern (`target/`) is build output.
+    /// A tree where ignored directories are classified one by one: `target/`
+    /// is decided by a directory-scoped rule and dropped, while `notes/` is
+    /// swept in by `/*` and keeps the tree.
+    #[tokio::test]
+    async fn ignored_directories_are_classified_one_by_one() {
+        let root = temp_repo("ignored-mixed").await;
+        std::fs::write(
+            root.join(".gitignore"),
+            "/*\n!/src/\n!/.gitignore\ntarget/\n",
+        )
+        .unwrap();
+        fixture_git(&root, &["add", ".gitignore"]).await;
+        fixture_git(&root, &["commit", "-qm", "ignore"]).await;
+        let worktree = create(&root, "agent-mixed", &cleanup_tasks())
+            .await
+            .unwrap();
+        let path = worktree.path.clone();
+        for entry in ["target/debug/artifact", "notes/plan.md"] {
+            let file = path.join(entry);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "content").unwrap();
+        }
+
+        let changes = inspect_changes(&worktree).await.unwrap();
+        assert_eq!(changes.ignored_dirs, vec!["target".to_string()]);
+        assert_eq!(changes.changed_files, 1, "{changes:?}");
+        assert!(finish(worktree).await.unwrap().is_some());
+        assert!(path.join("notes/plan.md").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `/*`, a bare `secrets`, and a bare `node_modules` match directories but
+    /// are not directory-scoped rules, so they may hold hand-written work and
+    /// must keep the tree.
     #[tokio::test]
     async fn ignored_directories_without_a_directory_rule_are_content() {
         let root = temp_repo("ignored-broad").await;
         std::fs::write(
             root.join(".gitignore"),
-            "/*\n!/src/\n!/.gitignore\nsecrets\n*.log\nnode_modules\n",
+            "/*\n!/src/\n!/.gitignore\nsecrets\nnode_modules\n",
         )
         .unwrap();
         fixture_git(&root, &["add", ".gitignore"]).await;
@@ -1510,7 +1542,6 @@ mod tests {
         for entry in [
             "notes/plan.md",
             "src/secrets/key",
-            "logs/run.log",
             "node_modules/pkg/index.js",
         ] {
             let file = path.join(entry);
@@ -1519,7 +1550,7 @@ mod tests {
         }
 
         let changes = inspect_changes(&worktree).await.unwrap();
-        assert_eq!(changes.changed_files, 4, "{changes:?}");
+        assert_eq!(changes.changed_files, 3, "{changes:?}");
         assert!(changes.ignored_dirs.is_empty(), "{changes:?}");
         assert!(finish(worktree).await.unwrap().is_some());
         assert!(path.exists(), "the hand-written tree is retained");

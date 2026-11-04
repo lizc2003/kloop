@@ -3406,12 +3406,13 @@ do not share ownership, an active slot, or deletion rights:
   agent-owned checkout from the current HEAD. A clean agent worktree is removed when
   the agent finishes; a worktree with uncommitted changes, commits, or an uncertain
   Git probe is retained and reported. A directory is build output only when the
-  ignore rule that decides it is directory-scoped (`target/`): a tree holding
-  only those is removed and the discarded names are reported. Directories swept
-  in by `/*`, a bare `secrets`, or `*.log`-collapsed contents may hold
-  hand-written files and stay content; so do ignored *files* (`.env.local`,
-  local configs). Parallel agent worktree mutations are serialized per Git
-  common directory.
+  ignore rule that decides it is directory-scoped (`target/`, `secrets/`,
+  `tmp/`): a tree holding only those is removed and the discarded names are
+  reported. Any such rule counts, because Git cannot distinguish a build cache
+  from a hand-written directory by pattern text. Directories matched only by a
+  non-directory rule (`/*`, a bare `node_modules`) stay content; so do ignored
+  *files* (`.env.local`, local configs). Parallel agent worktree mutations are
+  serialized per Git common directory.
 - **Session worktrees**: at depth zero, and only when the current frontend
   enables the worktree surface, the model may create or enter a worktree and
   move the whole session into it. `kloop --worktree[=<name>]` is the separate
@@ -3474,10 +3475,11 @@ write regardless of the repo root's read-only `.kloop`.
 and leaves the checkout and branch intact. `remove` may delete only the
 Managed tree created by this session. By default it refuses tracked, staged,
 untracked, or ignored *files* and commits after the recorded base. Only a
-directory whose deciding ignore rule is directory-scoped (`target/`) is
-discarded as build output; `/*`, bare-name, and content-collapsed directories
-stay content and block removal. Discarded names are reported.
-`discard_changes:true` may override only those successfully observed content changes. It never overrides
+directory whose deciding ignore rule is directory-scoped (`target/`,
+`secrets/`, `tmp/`) is discarded as build output; directories matched by a
+non-directory rule (`/*`, bare `node_modules`) stay content and block removal.
+Discarded names are reported. `discard_changes:true` may override only those
+successfully observed content changes. It never overrides
 repository/path/registration/branch/base/owner provenance failures, and it
 cannot delete an External, task-owned, or previous-session tree. A
 refused/failed removal keeps the active handle and cwd so the operation can be

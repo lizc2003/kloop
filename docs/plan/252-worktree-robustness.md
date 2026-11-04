@@ -68,14 +68,16 @@
    做一次 `WorkspaceIdentity::resolve`（父 identity 复用 live permission policy），
    探测本身在 `spawn_blocking`。
 5. 第 5 条按用户确认走细化版 (b)，再按复审收紧：`git status --ignored=matching` 折叠出的
-   目录先收集，再用一次 `git check-ignore -v -z --stdin` 看决定性忽略规则；只有规则本身
-   以 `/` 结尾（`target/`）才算构建产物，纯产物树随树删除并在 Note 列出目录。`/*`、裸名
-   `secrets`、仅因内容命中 `*.log` 而折叠的目录都退回内容，ignored **文件**也仍算内容；
-   `check-ignore` 失败则全部保留。另把 `worktree remove` 的路径参数也过
-   `git_compatible_path`，与 add/rollback 对齐 Windows 格式。
-   回归：`target/` 单独存在时整树删除并报告；`/*` + `secrets` + `*.log` + 裸 `node_modules`
-   的目录全部保留；原 ignored 文件保留回归不变。
+   目录先收集，再用一次 `git check-ignore -v -z --stdin` 看决定性忽略规则；任何目录作用域
+   规则（`target/`、`secrets/`、`tmp/`）都视为构建产物，纯产物树随树删除并在 Note 列出目录。
+   这条线看的是规则写法而不是用途，`secrets` 与 `secrets/` 结果不同；接受这个风险，不引入
+   构建目录白名单。`/*`、裸名规则和 ignored **文件**都仍算内容；仅内容命中 `*.log` 时 git
+   逐文件列出，不会折叠成目录记录。`check-ignore` 失败则全部保留。另把 `worktree remove`
+   的路径参数也过 `git_compatible_path`，与 add/rollback 对齐 Windows 格式。
+   回归：`target/` 单独存在时整树删除并报告；`target/` 与 `/*` 吞掉的 `notes/` 同树时只丢
+   `target`、`changed_files == 1`；`/*` + 裸 `secrets` + 裸 `node_modules` 的目录全部保留；
+   原 ignored 文件保留回归不变。
 
 验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug 全量测试，core
-1339 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
+1340 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
 worktree 两处生命周期、path 解析、注册表容错与删除判定已同步。Linux 与 Windows 未实测。
