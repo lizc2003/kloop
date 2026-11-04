@@ -410,14 +410,15 @@ pub(crate) async fn structured_agent_admitted(
 /// inherited: a HEAD-based worktree has byte-identical instruction files, and
 /// re-discovering them (plus a fresh worktree git snapshot) needs the CLI's IO
 /// and is left for a later slice.
-fn rewire_for_worktree(sub: &mut Config, wt: &worktree::Worktree) -> Result<()> {
+async fn rewire_for_worktree(sub: &mut Config, wt: &worktree::Worktree) -> Result<()> {
     let (permissions, sandbox, system) = worktree::compute_overrides(
         &sub.cwd,
         &sub.permissions,
         &sub.sandbox,
         &sub.system,
         &wt.path,
-    )?;
+    )
+    .await?;
     sub.cwd = wt.path.clone();
     sub.permissions = permissions;
     sub.sandbox = sandbox;
@@ -430,7 +431,7 @@ async fn bind_subagent_worktree(
     worktree: worktree::Worktree,
     who: &str,
 ) -> Result<worktree::Worktree> {
-    if let Err(error) = rewire_for_worktree(sub, &worktree) {
+    if let Err(error) = rewire_for_worktree(sub, &worktree).await {
         return match worktree::finish(worktree).await {
             Ok(_) => Err(anyhow!("{who}: {error:#}")),
             Err(cleanup) => Err(anyhow!(
@@ -652,10 +653,11 @@ async fn run_sub_agent_sync(
                 },
                 Err(e) => Err(anyhow!("{who}: sub-agent panicked: {e}")),
             };
-            // A retained tree keeps its branch for the user. On a success the
-            // model hears about it in the tool result; after a cancellation or
-            // another error there is no result left to read, so publish the
-            // location (and any cleanup failure) as a session note instead.
+            // A retained tree keeps its branch for the user; a removed tree can still
+            // carry a note naming the ignored build output it discarded. On a
+            // success the model hears about it in the tool result; after a
+            // cancellation or another error there is no result left to read, so
+            // publish the note as a session message instead.
             if let Some(wt) = worktree {
                 match worktree::finish(wt).await {
                     Ok(Some(note)) => {

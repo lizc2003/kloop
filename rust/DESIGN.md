@@ -3405,8 +3405,11 @@ do not share ownership, an active slot, or deletion rights:
 - **Agent isolation**: `run_agent {"prompt":"...","isolation":"worktree"}` creates an
   agent-owned checkout from the current HEAD. A clean agent worktree is removed when
   the agent finishes; a worktree with uncommitted changes, commits, or an uncertain
-  Git probe is retained and reported. Parallel agent worktree mutations are
-  serialized per Git common directory.
+  Git probe is retained and reported. Ignored *directories* (`target/`,
+  `node_modules/`) are build output: a tree holding only those is removed and the
+  discarded names are reported. Ignored *files* (`.env.local`, local configs)
+  still count as content and retain the tree. Parallel agent worktree mutations
+  are serialized per Git common directory.
 - **Session worktrees**: at depth zero, and only when the current frontend
   enables the worktree surface, the model may create or enter a worktree and
   move the whole session into it. `kloop --worktree[=<name>]` is the separate
@@ -3427,8 +3430,10 @@ types, and unknown fields are rejected. Names are at most 64 characters and
 may use `/`-separated ASCII letter/digit/dot/underscore/dash segments; `/` is
 encoded as `+`. Managed trees live at `.kloop/worktrees/<encoded-name>` on
 `kloop-worktree-<encoded-name>` — kloop's own namespace, not another agent's
-(cc uses `.claude/worktrees` + `worktree-<slug>`). An existing `path` must canonicalize to a registered
-worktree with the same Git common directory. Entering by path grants
+(cc uses `.claude/worktrees` + `worktree-<slug>`). An existing `path` is resolved
+against the session's effective cwd — never the process cwd, which differs in
+server threads and after entering a worktree — then it must canonicalize to a
+registered worktree with the same Git common directory. Entering by path grants
 **External** custody only.
 
 省略名称时生成 `wt-` 加 11 位随机 Base58；子 agent 隔离树使用其随机 agent ID。
@@ -3442,6 +3447,13 @@ directory 的 `info/exclude` 更新使用 `.kloop-exclude.lock`，锁内重新�
 完成前取消时，尚不能证明同名树/分支属于本次调用，因此不按名称强制回滚；这段期间
 可能留下本次调用的部分资源。add 成功后的验证失败在锁内回滚，验证期间取消则把回滚
 交给会话的 `cleanup_tasks`，通过验证后才解除守卫。
+
+注册表是逐条容错的：`git worktree list` 中某个目录已被手工删除或所在卷未挂载时，
+该条目在列表阶段跳过，不让整仓的 create/enter/exit/finish 一起失败；操作该目标
+本身仍会在 canonicalize 或注册匹配处给出明确错误。第一条注册（仓库根）例外：它
+不可解析就直接失败，不会把某个 linked worktree 提升成根。文件系统探测、`info/exclude`
+的 flock 和 identity 的 Git 探测都在阻塞线程池执行，worktree 的异步路径不持异步锁
+做阻塞 IO。
 
 Nesting the trees under `.kloop/` costs one exemption, because `.kloop` is
 otherwise a sensitive path component: a write there is privilege escalation and
@@ -3459,12 +3471,14 @@ write regardless of the repo root's read-only `.kloop`.
 `exit_worktree` always requires an explicit action. `keep` restores the base cwd
 and leaves the checkout and branch intact. `remove` may delete only the
 Managed tree created by this session. By default it refuses tracked, staged,
-untracked, or ignored changes and commits after the recorded base;
-`discard_changes:true` may override only those successfully observed content
-changes. It never overrides repository/path/registration/branch/base/owner
-provenance failures, and it cannot delete an External, task-owned, or
-previous-session tree. A refused/failed removal keeps the active handle and cwd
-so the operation can be retried or kept safely.
+untracked, or ignored *files* and commits after the recorded base; fully
+ignored directories are build output, so they do not block removal and their
+names are reported as discarded. `discard_changes:true` may override only those
+successfully observed content changes. It never overrides
+repository/path/registration/branch/base/owner provenance failures, and it
+cannot delete an External, task-owned, or previous-session tree. A
+refused/failed removal keeps the active handle and cwd so the operation can be
+retried or kept safely.
 
 Entering a session tree changes the complete effective workspace anchor:
 Read/Write/Edit, Glob/Grep, Bash, permissions, sandbox writable roots, fresh

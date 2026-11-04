@@ -80,10 +80,15 @@ pub enum ExitAction {
     Remove,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorktreeChanges {
     pub changed_files: usize,
     pub commits: usize,
+    /// Fully ignored directories (`target/`, `node_modules/`) created since the
+    /// checkout. They are build output, not work: a tree holding only these is
+    /// removed, with the names reported. Ignored files still count as content,
+    /// because `.env.local` and local configs live in that shape.
+    pub ignored_dirs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -349,7 +354,7 @@ async fn create_managed(
     let branch = format!("{WORKTREE_BRANCH_PREFIX}{encoded_name}");
 
     let _mutation = WORKTREE_MUTATION_LOCK.lock().await;
-    if path.symlink_metadata().is_ok() {
+    if tokio::fs::symlink_metadata(&path).await.is_ok() {
         bail!("worktree {} already exists", path.display());
     }
     if git_success(
@@ -372,9 +377,10 @@ async fn create_managed(
         BasePolicy::Fresh => fresh_base(&repository.root).await?,
     };
     let base = base.trim().to_string();
-    std::fs::create_dir_all(repository.root.join(WORKTREES_DIR))
+    tokio::fs::create_dir_all(repository.root.join(WORKTREES_DIR))
+        .await
         .context("creating managed worktree directory")?;
-    exclude_worktrees_dir(&repository.common_dir)?;
+    exclude_worktrees_dir(&repository.common_dir).await?;
 
     #[cfg(test)]
     creation_probe::pause_before_add(name).await;
@@ -392,7 +398,8 @@ async fn create_managed(
     creation_probe::pause(name).await;
 
     let created = async {
-        let canonical_path = std::fs::canonicalize(&path)
+        let canonical_path = tokio::fs::canonicalize(&path)
+            .await
             .with_context(|| format!("canonicalizing created worktree {}", path.display()))?;
         let worktree = Worktree {
             path: canonical_path.clone(),
@@ -477,7 +484,9 @@ async fn fresh_base(repository_root: &Path) -> Result<String> {
 }
 
 /// Task teardown: clean resources are removed, while any content or commit is
-/// retained. Probe/remove failures propagate and leave the resource in place.
+/// retained. Fully ignored directories are build output and go with the tree;
+/// the returned note names them. Probe/remove failures propagate and leave the
+/// resource in place.
 pub async fn finish(mut worktree: Worktree) -> Result<Option<String>> {
     let _mutation = WORKTREE_MUTATION_LOCK.lock().await;
     verify_provenance(&worktree).await?;
@@ -486,11 +495,11 @@ pub async fn finish(mut worktree: Worktree) -> Result<Option<String>> {
         worktree.lifecycle = WorktreeLifecycle::Kept;
         return Ok(Some(retained_note(&worktree)));
     }
-    remove_managed_locked(&mut worktree, /* force */ false).await?;
-    Ok(None)
+    remove_verified_managed_locked(&mut worktree, /* force */ false).await?;
+    Ok(discarded_ignored_note(&changes.ignored_dirs))
 }
 
-pub(crate) fn compute_overrides(
+pub(crate) async fn compute_overrides(
     base_cwd: &Path,
     base_permissions: &Arc<Permissions>,
     base_sandbox: &Option<Arc<SandboxPolicy>>,
@@ -498,12 +507,16 @@ pub(crate) fn compute_overrides(
     worktree_path: &Path,
 ) -> Result<(Arc<Permissions>, Option<Arc<SandboxPolicy>>, String)> {
     let expected_project = base_permissions.identity().project_id();
-    let parent_identity = crate::project::WorkspaceIdentity::resolve(base_cwd);
-    let worktree_identity = crate::project::WorkspaceIdentity::resolve(worktree_path);
-    if expected_project.is_none()
-        || parent_identity.project_id() != expected_project
-        || worktree_identity.project_id() != expected_project
-    {
+    let probe_path = worktree_path.to_path_buf();
+    // Identity probing canonicalizes and starts Git; keep it off the async
+    // workers. The parent identity is already carried by the live permission
+    // policy, so only the worktree needs a fresh probe.
+    let worktree_identity = tokio::task::spawn_blocking(move || {
+        crate::project::WorkspaceIdentity::resolve(&probe_path)
+    })
+    .await
+    .context("resolving worktree project identity")?;
+    if expected_project.is_none() || worktree_identity.project_id() != expected_project {
         bail!(
             "worktree project identity is unavailable or does not match the permission policy's project"
         );
@@ -568,7 +581,7 @@ pub async fn enter(cfg: &Config, name: &str) -> Result<String> {
         path = worktree.path.display(),
         branch = worktree.branch,
     );
-    let overrides = match active_overrides(cfg, &worktree) {
+    let overrides = match active_overrides(cfg, &worktree).await {
         Ok(overrides) => overrides,
         Err(error) => {
             return match finish(worktree).await {
@@ -588,8 +601,17 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
     let repository = discover_repository(&cfg.cwd)
         .await
         .context("cannot enter worktree outside a git repository")?;
-    let canonical_path = std::fs::canonicalize(path)
-        .with_context(|| format!("Cannot enter worktree: {}", path.display()))?;
+    // The tool resolves relative paths against the session's effective cwd,
+    // never the process cwd: server threads and a session already inside a
+    // worktree do not share the front-end's working directory.
+    let requested = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cfg.effective_cwd().join(path)
+    };
+    let canonical_path = tokio::fs::canonicalize(&requested)
+        .await
+        .with_context(|| format!("Cannot enter worktree: {}", requested.display()))?;
     let registered = registered_worktrees(&repository.root)
         .await?
         .into_iter()
@@ -640,14 +662,14 @@ pub async fn enter_existing(cfg: &Config, path: &Path) -> Result<String> {
         "Entered worktree at {path} on branch {branch}. The session is now working in the worktree. Use exit_worktree to leave mid-session.",
         path = worktree.path.display(),
     );
-    let overrides = active_overrides(cfg, &worktree)?;
+    let overrides = active_overrides(cfg, &worktree).await?;
     install_active(cfg, worktree, overrides);
     Ok(message)
 }
 
 type WorktreeOverrides = (Arc<Permissions>, Option<Arc<SandboxPolicy>>, String);
 
-fn active_overrides(cfg: &Config, worktree: &Worktree) -> Result<WorktreeOverrides> {
+async fn active_overrides(cfg: &Config, worktree: &Worktree) -> Result<WorktreeOverrides> {
     compute_overrides(
         &cfg.cwd,
         &cfg.permissions,
@@ -655,6 +677,7 @@ fn active_overrides(cfg: &Config, worktree: &Worktree) -> Result<WorktreeOverrid
         &cfg.system,
         &worktree.path,
     )
+    .await
 }
 
 fn install_active(cfg: &Config, worktree: Worktree, overrides: WorktreeOverrides) {
@@ -706,7 +729,10 @@ pub async fn exit(cfg: &Config, action: ExitAction, discard_changes: bool) -> Re
     match result {
         Ok(changes) => Ok(format_remove_message(&active.wt, &original_cwd, changes)),
         Err(error) => {
-            if active.wt.path.exists() {
+            if tokio::fs::try_exists(&active.wt.path)
+                .await
+                .unwrap_or(false)
+            {
                 cfg.active_worktree.restore_after_transition(active);
             }
             Err(error)
@@ -747,7 +773,7 @@ async fn remove_for_session(
             parts.join(" and ")
         );
     }
-    remove_managed_locked(worktree, discard_changes).await?;
+    remove_verified_managed_locked(worktree, discard_changes).await?;
     Ok(changes)
 }
 
@@ -773,15 +799,22 @@ fn format_remove_message(
         };
         discarded.push(format!("{} {suffix}", changes.commits));
     }
+    let ignored = if changes.ignored_dirs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Ignored build output removed: {}.",
+            describe_ignored_dirs(&changes.ignored_dirs)
+        )
+    };
     let detail = if discarded.is_empty() {
         String::new()
     } else {
         format!(" Discarded {}.", discarded.join(" and "))
     };
     format!(
-        "Exited and removed worktree at {}.{} Session is now back in {original_cwd}.",
+        "Exited and removed worktree at {}.{detail}{ignored} Session is now back in {original_cwd}.",
         worktree.path.display(),
-        detail,
     )
 }
 
@@ -802,6 +835,31 @@ fn retained_note(worktree: &Worktree) -> String {
     )
 }
 
+fn discarded_ignored_note(ignored_dirs: &[String]) -> Option<String> {
+    if ignored_dirs.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n[Worktree removed; build output in ignored directories was discarded: {}]",
+        describe_ignored_dirs(ignored_dirs)
+    ))
+}
+
+/// Bound the note: a checkout may have arbitrarily many ignored directories.
+fn describe_ignored_dirs(ignored_dirs: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let shown = ignored_dirs
+        .iter()
+        .take(SHOWN)
+        .map(|dir| format!("{dir}/"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match ignored_dirs.len().saturating_sub(SHOWN) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
 async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
     let status = git_text(
         &worktree.path,
@@ -817,13 +875,26 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
     .context("probing worktree status")?;
     let mut fields = status.split('\0').filter(|field| !field.is_empty());
     let mut changed_files = 0;
+    let mut ignored_dirs = Vec::new();
     while let Some(field) = fields.next() {
-        changed_files += 1;
         let status = field.get(..2).unwrap_or_default();
         if status.contains('R') || status.contains('C') {
             let _ = fields.next();
         }
+        let path = field.get(3..).unwrap_or_default();
+        if status == "!!"
+            && let Some(dir) = path.strip_suffix('/')
+        {
+            // A fully ignored directory is collapsed to one trailing-slash
+            // entry, so a large target/ scan never walks its files. Ignored
+            // files stay individual and still count as content.
+            ignored_dirs.push(dir.to_string());
+            continue;
+        }
+        changed_files += 1;
     }
+    ignored_dirs.sort();
+    ignored_dirs.dedup();
     let range = format!("{}..HEAD", worktree.base);
     let commits = git_text(&worktree.path, &["rev-list", "--count", &range])
         .await
@@ -834,14 +905,16 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
     Ok(WorktreeChanges {
         changed_files,
         commits,
+        ignored_dirs,
     })
 }
 
-async fn remove_managed_locked(worktree: &mut Worktree, force: bool) -> Result<()> {
+/// Callers must have validated provenance under the same mutation lock; this
+/// is the single deletion path so a verification never runs twice.
+async fn remove_verified_managed_locked(worktree: &mut Worktree, force: bool) -> Result<()> {
     if worktree.custody != WorktreeCustody::Managed {
         bail!("refusing to remove an external worktree");
     }
-    verify_provenance(worktree).await?;
     let path = worktree.path.to_string_lossy().to_string();
     let mut args = vec!["worktree", "remove"];
     if force {
@@ -866,7 +939,8 @@ async fn remove_managed_locked(worktree: &mut Worktree, force: bool) -> Result<(
 }
 
 async fn verify_provenance(worktree: &Worktree) -> Result<()> {
-    let actual_path = std::fs::canonicalize(&worktree.path)
+    let actual_path = tokio::fs::canonicalize(&worktree.path)
+        .await
         .with_context(|| format!("worktree path {} is unavailable", worktree.path.display()))?;
     if actual_path != worktree.canonical_path {
         bail!("worktree path identity changed; refusing lifecycle mutation");
@@ -889,11 +963,7 @@ async fn verify_provenance(worktree: &Worktree) -> Result<()> {
 async fn discover_repository(cwd: &Path) -> Result<Repository> {
     let common_dir = canonical_common_dir(cwd).await?;
     let current_root = git_text(cwd, &["rev-parse", "--show-toplevel"]).await?;
-    let entries = registered_worktrees(Path::new(current_root.trim())).await?;
-    let root = entries
-        .first()
-        .map(|entry| entry.path.clone())
-        .ok_or_else(|| anyhow!("git worktree registry is empty"))?;
+    let root = registered_repository_root(Path::new(current_root.trim())).await?;
     let root_common = canonical_common_dir(&root).await?;
     if root_common != common_dir {
         bail!("git worktree registry repository identity mismatch");
@@ -907,22 +977,63 @@ async fn canonical_common_dir(cwd: &Path) -> Result<PathBuf> {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .await?;
-    std::fs::canonicalize(path.trim()).context("canonicalizing git common directory")
+    tokio::fs::canonicalize(path.trim())
+        .await
+        .context("canonicalizing git common directory")
 }
 
 async fn registered_worktrees(repository_root: &Path) -> Result<Vec<RegisteredWorktree>> {
     let output = git_text(repository_root, &["worktree", "list", "--porcelain"]).await?;
+    let mut entries = Vec::new();
+    for registration in parse_registrations(&output) {
+        // One stale registration (a directory removed by hand, an unmounted
+        // volume) must not fail every worktree operation. An operation that
+        // targets it still fails on its own canonicalize/registration check.
+        let Ok(path) = tokio::fs::canonicalize(&registration.path).await else {
+            continue;
+        };
+        entries.push(RegisteredWorktree {
+            path,
+            head: registration.head,
+            branch: registration.branch,
+        });
+    }
+    Ok(entries)
+}
+
+/// The first registration is the repository root. Its disappearance is not a
+/// stale peer: nothing can place a managed tree without it, so fail loudly
+/// instead of promoting a linked worktree to root.
+async fn registered_repository_root(repository_root: &Path) -> Result<PathBuf> {
+    let output = git_text(repository_root, &["worktree", "list", "--porcelain"]).await?;
+    let first = parse_registrations(&output)
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("git worktree registry is empty"))?;
+    tokio::fs::canonicalize(&first.path).await.with_context(|| {
+        format!(
+            "canonicalizing registered worktree {}",
+            first.path.display()
+        )
+    })
+}
+
+#[derive(Debug)]
+struct Registration {
+    path: PathBuf,
+    head: String,
+    branch: Option<String>,
+}
+
+fn parse_registrations(output: &str) -> Vec<Registration> {
     let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut head = String::new();
     let mut branch = None;
     for line in output.lines().chain(std::iter::once("")) {
         if line.is_empty() {
-            if let Some(raw_path) = path.take() {
-                let path = std::fs::canonicalize(&raw_path).with_context(|| {
-                    format!("canonicalizing registered worktree {}", raw_path.display())
-                })?;
-                entries.push(RegisteredWorktree {
+            if let Some(path) = path.take() {
+                entries.push(Registration {
                     path,
                     head: std::mem::take(&mut head),
                     branch: branch.take(),
@@ -932,16 +1043,27 @@ async fn registered_worktrees(repository_root: &Path) -> Result<Vec<RegisteredWo
         }
         if let Some(value) = line.strip_prefix("worktree ") {
             path = Some(PathBuf::from(value));
+            head.clear();
+            branch = None;
         } else if let Some(value) = line.strip_prefix("HEAD ") {
             head = value.to_string();
         } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
             branch = Some(value.to_string());
         }
     }
-    Ok(entries)
+    entries
 }
 
-fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
+async fn exclude_worktrees_dir(common_dir: &Path) -> Result<()> {
+    let common_dir = common_dir.to_path_buf();
+    // The flock and the read/replace cycle are blocking; keep them off the
+    // async workers while the mutation lock is held.
+    tokio::task::spawn_blocking(move || exclude_worktrees_dir_blocking(&common_dir))
+        .await
+        .context("updating git info exclude")?
+}
+
+fn exclude_worktrees_dir_blocking(common_dir: &Path) -> Result<()> {
     let exclude = common_dir.join("info").join("exclude");
     let Some(parent) = exclude.parent() else {
         return Ok(());
@@ -1037,8 +1159,8 @@ mod tests {
     /// `.git/info/exclude` belongs to the user's repository, not to kloop's
     /// private store: replacing it must not hand it the 0600 temp-file mode.
     #[cfg(unix)]
-    #[test]
-    fn excluding_worktrees_keeps_existing_permissions() {
+    #[tokio::test]
+    async fn excluding_worktrees_keeps_existing_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = std::env::temp_dir().join(format!(
@@ -1053,7 +1175,7 @@ mod tests {
         std::fs::write(&exclude, "existing\n").unwrap();
         std::fs::set_permissions(&exclude, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        exclude_worktrees_dir(&root).unwrap();
+        exclude_worktrees_dir(&root).await.unwrap();
 
         assert_eq!(
             std::fs::metadata(&exclude).unwrap().permissions().mode() & 0o777,
@@ -1262,7 +1384,78 @@ mod tests {
         std::fs::write(worktree.path.join("ignored.txt"), "work").unwrap();
         let changes = inspect_changes(&worktree).await.unwrap();
         assert_eq!(changes.changed_files, 1);
+        assert!(changes.ignored_dirs.is_empty());
         assert!(finish(worktree).await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ignored_build_directories_are_discarded_not_retained() {
+        let root = temp_repo("ignored-dir").await;
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        fixture_git(&root, &["add", ".gitignore"]).await;
+        fixture_git(&root, &["commit", "-qm", "ignore"]).await;
+        let worktree = create(&root, "agent-build", &cleanup_tasks())
+            .await
+            .unwrap();
+        let path = worktree.path.clone();
+        std::fs::create_dir_all(path.join("target/debug")).unwrap();
+        std::fs::write(path.join("target/debug/artifact"), "bin").unwrap();
+
+        let changes = inspect_changes(&worktree).await.unwrap();
+        assert_eq!(changes.changed_files, 0);
+        assert_eq!(changes.ignored_dirs, vec!["target".to_string()]);
+        let note = finish(worktree).await.unwrap().expect("discard note");
+        assert!(note.contains("target/"), "{note}");
+        assert!(
+            !path.exists(),
+            "a tree holding only build output is removed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A registration whose directory was removed must not fail every
+    /// worktree operation of the repository.
+    #[tokio::test]
+    async fn a_stale_registration_does_not_break_other_worktree_operations() {
+        let root = temp_repo("stale-registration").await;
+        let first = create(&root, "first", &cleanup_tasks()).await.unwrap();
+        let stale = root.join(WORKTREES_DIR).join("stale");
+        let stale_text = stale.to_string_lossy().into_owned();
+        fixture_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "kloop-worktree-stale",
+                &stale_text,
+                "HEAD",
+            ],
+        )
+        .await;
+        std::fs::remove_dir_all(&stale).unwrap();
+
+        let second = create(&root, "second", &cleanup_tasks()).await.unwrap();
+        assert!(finish(first).await.unwrap().is_none());
+        let cfg = config_for_repo(&root, "stale-registration");
+        enter(&cfg, "session").await.unwrap();
+        exit(&cfg, ExitAction::Remove, true).await.unwrap();
+        assert!(finish(second).await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `finish` verifies provenance, probes changes, and removes: the deletion
+    /// itself must not repeat the two Git calls of the verification.
+    #[tokio::test]
+    async fn finish_verifies_provenance_once() {
+        let root = temp_repo("finish-git-count").await;
+        let worktree = create(&root, "counted", &cleanup_tasks()).await.unwrap();
+        let before = crate::git::test_git_command_count();
+        assert!(finish(worktree).await.unwrap().is_none());
+        let calls = crate::git::test_git_command_count() - before;
+        assert_eq!(calls, 6, "finish must verify provenance exactly once");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1284,6 +1477,7 @@ mod tests {
         );
         let system = format!("- Working directory: {}", changed.display());
         let error = match compute_overrides(&changed, &permissions, &None, &system, &candidate.path)
+            .await
         {
             Ok(_) => panic!("project drift reused the loaded permission policy"),
             Err(error) => error,

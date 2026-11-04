@@ -1,7 +1,7 @@
 # Plan 252 — worktree 健壮性
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
+> 状态：✅ 已完成（2026-11-04）。行号是 2026-10-28 的读数,开工先自己量;标「待复核」的条目开工第一步
 > 先读代码确认，不成立就在本文件划掉并写明原因。git 命令的统一入口在 plan 247,
 > 前台中断时的 worktree 泄漏在 plan 249,这里不重复。
 
@@ -51,3 +51,27 @@
   在 effective cwd 与进程 cwd 不同时进入正确目录;finish 路径 git 进程数减少(可用测试钩子计数)。
 - 测试 git 夹具照 plan 247 的隔离写法;外层执行沙箱之外 `make check`;DESIGN 的 worktree 一节
   先读再改;HANDOFF 记进展与教训。
+
+## 完成（2026-11-04）
+
+1. `registered_worktrees` 逐条解析后跳过 canonicalize 失败的条目；仓库根改由
+   `registered_repository_root` 单独解析，第一条注册不可用时明确失败，不会把某个
+   linked worktree 提升成根。回归：删掉一个已登记 worktree 目录后，同仓的 create、
+   session enter/exit、finish 全部可用。
+2. `enter_existing` 在 canonicalize 前把相对 `path` 拼到 `cfg.effective_cwd()`。回归同时
+   覆盖“未进入 worktree 的相对 path”和“已进入后用 `../second` 切换”。
+3. 删除路径改为 `remove_verified_managed_locked`，调用方在同一把 mutation lock 内已校验；
+   `finish` 的 git 子进程数由 8 降到 6，回归用线程局部计数钩子钉住。
+4. `create_managed`/`enter_existing`/`verify_provenance`/`canonical_common_dir`/
+   `registered_worktrees` 的 canonicalize 改用 `tokio::fs`；`exclude_worktrees_dir` 的
+   flock + 读改写整体放进 `spawn_blocking`；`compute_overrides` 改 async，只对 worktree
+   做一次 `WorkspaceIdentity::resolve`（父 identity 复用 live permission policy），
+   探测本身在 `spawn_blocking`。
+5. 第 5 条按用户确认走细化版 (b)：`git status --ignored=matching` 把完全忽略的目录折叠成
+   一条带尾 `/` 的记录，这类目录视为构建产物，只在没有 tracked/untracked 改动与提交时
+   随树删除，Note 列出被丢弃目录；ignored **文件**仍算内容（保住 `.env.local` 这类）。
+   回归：`target/` 单独存在时整树删除并报告；原 ignored 文件保留回归不变。
+
+验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug 全量测试，core
+1338 项，本机 parity baseline verified）。DESIGN 的 worktree 两处生命周期、path 解析、
+注册表容错与删除判定已同步。Linux 与 Windows 未实测。

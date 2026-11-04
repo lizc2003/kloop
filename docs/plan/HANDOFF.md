@@ -1,5 +1,22 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 252 ✅：worktree 健壮性（2026-11-04）**：`git worktree list` 现在逐条容错，
+canonicalize 失败的条目（手工删掉的目录、未挂载的卷）在列表阶段跳过，不再让同仓的
+create/enter/exit/finish 一起报“canonicalizing registered worktree”；仓库根单独解析，
+第一条注册不可用时明确失败，不会把 linked worktree 提升成根。`enter_worktree` 的相对
+`path` 先拼 `effective_cwd()` 再 canonicalize，覆盖 server 多 cwd 与树内 `../second`
+切换。`remove_managed_locked` 拆成“调用方已校验”的 `remove_verified_managed_locked`，
+`finish` 不再在同一把锁内验两遍 provenance，git 子进程从 8 个降到 6 个（线程局部计数
+回归钉住）。异步路径的 canonicalize 改 `tokio::fs`，`info/exclude` 的 flock + 读改写整体
+进 `spawn_blocking`；`compute_overrides` 改 async 并复用 live permission policy 的父
+identity，只对 worktree 做一次探测且放在阻塞池。第 5 条按用户确认走细化版 (b)：
+`--ignored=matching` 折叠出的、带尾 `/` 的 ignored 目录算构建产物，纯产物树随树删除并在
+Note 列出目录名；ignored 文件仍算内容，保住 `.env.local` 这类本地配置。新增 4 条回归
+（失效注册、相对 path、finish 单次校验、ignored 目录丢弃）。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace debug 全量测试，core 1338 项，本机 parity
+baseline verified）。DESIGN 的 worktree 生命周期、path 解析、注册表容错与删除判定已同步。
+Linux 与 Windows 未实测。教训 333–338。
+
 **`-c` 定位补两处（2026-11-04）**：复审指出上一条的两个问题。一是附着的 `-o`：
 `zsh -c -oshwordsplit 'cat .env' unused` 按字母 o 的个数吞掉了正文，返回“不在 -c 模式”，
 敏感读取放行而 zsh 实际执行 `cat .env`（父提交同样存在）。本机实测 `o` 后还有字符时 bash 取
@@ -4311,6 +4328,30 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    “可能读启动文件”的粗略代理，会把 `-e`、`-o pipefail` 这类无关选项一起判成 home 未知，
    硬拒绝本来安全的 `$HOME` 路径；该用真正决定启动行为的选项（`-l`、`-i`、`--login`）判断。
 
-330. **按需校验不要塞进提交门禁。** Windows 交叉检查依赖本机工具链、首次要下载 SDK 并全量
+333. **按需校验不要塞进提交门禁。** Windows 交叉检查依赖本机工具链、首次要下载 SDK 并全量
    编译（二十多分钟），日常提交不该背这笔成本。把它做成 `make check-windows`（缺工具跳过、
    与 `check-release` 同级手动运行），`make check` 保持本机门禁不变；用户 2026-11-04 明确。
+
+334. **一个失效的注册条目要跳过，不能整表失败；但“仓库根”不能这样降级。** `git worktree list`
+   的每个条目都 canonicalize `?` 时，一个被手工删掉或所在卷未挂载的无关 worktree 就让全仓
+   create/enter/finish 一起失败。逐条 `continue` 是正确粒度；但第一条注册是仓库根，它不可解析
+   还继续就会把某个 linked worktree 提升成根、把 `.kloop/worktrees` 建到错地方——同一个列表里
+   两种失败要两种处理。
+
+335. **工具参数里的相对路径属于会话工作区，不属于进程 cwd。** server 每个线程 cwd 不同，进入
+   worktree 后进程 cwd 也不会跟着变；`enter_worktree {path}` 必须在 canonicalize 前按
+   `effective_cwd()` 拼接，否则报“not a registered worktree”或进入与审批时不同的目录。
+
+336. **同一把锁里的第二次校验是重复的，性能回归要能计数。** `finish` 在删除函数里又验了一遍
+   provenance，多两个 Git 子进程；把“已校验”写成删除函数的入参契约（用命名而不是 bool 参数），
+   并且用线程局部 git 计数钉住 `finish` 恰好 6 次调用，防止以后又长回去。
+
+337. **git 的 ignored 输出已经替我们分好了目录和文件。** `--ignored=matching` 把完全忽略的目录
+   折叠成一条带尾 `/` 的记录，ignored 文件保持逐条；用这个形态区分“可丢弃构建产物”和
+   “可能是本地配置的 ignored 文件”，不必猜目录名或遍历 `target/`。回源三家是分歧的（cc 全删、
+   codex 拒绝、codewhale 保留），按本项目“别丢 `.env.local`、也别让 target 堆满”的契约取中间线：
+   ignored 目录算产物，ignored 文件仍算内容。
+
+338. **异步路径里的阻塞 IO 要成组搬走，不是逐个 `.await` 化。** `info/exclude` 的 flock +
+   读改写整体进 `spawn_blocking`，而不是在持异步锁时单独等一次 flock；identity 探测能复用
+   live permission policy 的父 identity 就不要再起一个 Git 子进程，剩下的一次才值得放进阻塞池。

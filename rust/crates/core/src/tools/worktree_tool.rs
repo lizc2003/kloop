@@ -264,6 +264,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A relative `path` is resolved against the session's effective cwd, not the
+    /// process cwd: the server runs threads with different cwds, and a session
+    /// already inside a worktree must be able to switch with `../<name>`.
+    #[tokio::test]
+    async fn relative_path_resolves_against_the_effective_cwd() {
+        let repo = temp_git_repo("relative-path");
+        let external = repo.join("entered-relative");
+        let external_text = crate::worktree::git_compatible_path(&external);
+        let output = crate::git::hermetic_command(&repo)
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "entered-relative-branch",
+                external_text.to_str().unwrap(),
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let ctx = git_ctx(test_ctx(0, "relative-path"), &repo, true);
+        let (out, is_error) =
+            run_tool("enter_worktree", json!({"path": "entered-relative"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert_eq!(ctx.cfg.effective_cwd(), external);
+        run_tool("exit_worktree", json!({"action": "keep"}), &ctx).await;
+
+        let (out, is_error) = run_tool("enter_worktree", json!({"name": "first"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        let first = ctx.cfg.effective_cwd();
+        let second = repo.join(".kloop/worktrees/second");
+        let second_text = crate::worktree::git_compatible_path(&second);
+        let output = crate::git::hermetic_command(&repo)
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "kloop-worktree-second",
+                second_text.to_str().unwrap(),
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (out, is_error) = run_tool("enter_worktree", json!({"path": "../second"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert_eq!(ctx.cfg.effective_cwd(), second, "resolved from {first:?}");
+        run_tool("exit_worktree", json!({"action": "keep"}), &ctx).await;
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The enter/exit tools are advertised only when worktree mode is on, and a
     /// call in a session without it is rejected (server threads / --mock).
     #[tokio::test]
