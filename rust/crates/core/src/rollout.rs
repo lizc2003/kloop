@@ -134,10 +134,26 @@ fn lease_path(transcript: &Path) -> PathBuf {
 /// sidecar where the platform keeps one. A missing file is success, so the
 /// release-and-retry path can run the whole removal again.
 fn remove_session_files(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_REMOVAL.with(|flag| flag.replace(false)) {
+        return Err(io::Error::other("injected removal failure"));
+    }
     remove_if_present(path)?;
     #[cfg(windows)]
     remove_if_present(&lease_path(path))?;
     Ok(())
+}
+
+// Test-only: fail the next empty-session cleanup. The cleanup is deliberately
+// not retried after the lease is released, and this makes that observable.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_removal_failure() {
+    FAIL_NEXT_REMOVAL.with(|flag| flag.set(true));
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -199,11 +215,12 @@ impl Drop for Rollout {
         // still holding the lease: an opener that already has this inode
         // cannot acquire it before the name is gone, so a reused id can never
         // hand anyone a lock on one inode and a file on another.
-        if remove_session_files(&self.path).is_err() {
-            // Windows may refuse while the handle is open; release and retry.
-            self.lease.take();
-            let _ = remove_session_files(&self.path);
-        }
+        //
+        // A failed removal is not retried. Releasing the lease to retry would
+        // let another process reuse the id in the gap, and the second delete
+        // would then remove *its* session; an empty file left behind is the
+        // safe outcome.
+        let _ = remove_session_files(&self.path);
     }
 }
 
@@ -859,6 +876,21 @@ mod tests {
         assert!(
             claimed.exists(),
             "the writer that lost the lease deleted the winner's transcript"
+        );
+        cleanup(&path);
+    }
+
+    /// A failed empty-session cleanup must not be retried after the lease is
+    /// released: another process could reuse the id in that gap, and the second
+    /// delete would remove its transcript.
+    #[test]
+    fn a_failed_empty_session_cleanup_is_not_retried() {
+        let path = temp_file("cleanup-once");
+        inject_removal_failure();
+        drop(Rollout::new(path.clone()));
+        assert!(
+            path.exists(),
+            "the failed cleanup was retried after releasing the lease"
         );
         cleanup(&path);
     }

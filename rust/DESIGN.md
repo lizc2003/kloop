@@ -621,7 +621,9 @@ are unaffected — and no sidecar is ever created. Reads, truncation and appends
 go through the transcript handle that lease owns, never through the path, so an
 unlink followed by the same id being reused cannot move this writer's bytes into
 the new owner's transcript; the empty file is unlinked while the lease is still
-held (releasing and retrying only where the platform refuses). Windows
+held, and a failed unlink leaves it in place rather than retrying after the
+lease is released (another process could have reused the id in that gap).
+Windows
 `LockFileEx` is mandatory — a second handle, even in the same process, cannot
 read the locked bytes — so there the lease is a sidecar `.lock` and the
 transcript stays readable by `thread/read`, `thread/list` and forks; all I/O

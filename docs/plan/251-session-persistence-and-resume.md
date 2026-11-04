@@ -123,3 +123,14 @@
   外层沙箱之外 `make check` 全绿（core 1327、TUI 314、server contract 46、2 项 ignored，
   本机 parity baseline verified）。Windows 目标用 `cargo-xwin` 实测 `cargo xwin check
   -p kloop-core --target x86_64-pc-windows-msvc` 通过（原生依赖同编），Windows 运行时未实测。
+
+## 审查跟进三(2026-11-03)
+
+- 空会话清理失败后不再释放租约重试：部分成功后重试会在“ID 同秒复用”的窗口里删掉新会话
+  的 transcript。失败就留下空文件；新增 test-only 删除失败注入的回归（第一次失败后文件
+  必须仍在，证明没有第二轮删除）。
+- Windows-only dead_code（`SessionLease.lock` 的 RAII 字段、`StateLock::file/file_mut`
+  的 Unix 专用访问器）已用 `cfg_attr`/`cfg` 收口，并用
+  `cargo xwin clippy -p kloop-core -- -D warnings` 复核为零警告。
+- 验证：外层沙箱之外 `make check` 全绿（core 1328、TUI 314、server contract 46、2 项
+  ignored，本机 parity baseline verified）；`cargo xwin check`/`clippy`（msvc target）通过。

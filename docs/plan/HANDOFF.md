@@ -4234,3 +4234,8 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    目标装 SDK/C 工具链（`cargo-xwin` + LLVM，或 mingw），不要改依赖树；真要在 Windows
    上保持原语义，也只能这么做。顺带：cross-check 会暴露 Windows-only dead_code
    （RAII 字段、只在 Unix 分支用的访问器），这些是 host clippy 看不到的。
+
+329. **释放租约后的“重试删除”会删掉别人刚复用的 ID。** 空会话清理可能部分成功（JSONL
+   已删、sidecar 没删）。如果失败后释放租约、再按路径重跑整组删除，另一进程可以在空隙里
+   用同一个 ID 新建会话并拿到旧 sidecar，第二次删除就删掉它的 JSONL。删除只在持锁时做
+   一次；失败就留下空文件（或孤儿 sidecar），绝不释放后再按路径删。
