@@ -7,6 +7,7 @@ use super::*;
 const MAX_SCRIPT_BYTES: usize = 1_048_576;
 const MAX_NODES: usize = 20_000;
 const MAX_TREE_DEPTH: usize = 128;
+const MAX_LOOP_VALUES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WordValue {
@@ -207,6 +208,7 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
         );
     }
     nodes.sort_by_key(Node::start_byte);
+    let literal_loop = literal_loop(&nodes, src);
     let cwd_unknown = nodes.iter().any(|node| {
         node.kind() == "command"
             && node
@@ -479,7 +481,177 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
     {
         facts.analysis = strict_analysis(commands, paths, depth, &nested_analyses);
     }
+    if let Some(literal_loop) = literal_loop {
+        refine_literal_loop(&mut facts, &literal_loop, depth);
+    }
     facts
+}
+
+struct LiteralLoop {
+    body: Range<usize>,
+    variable: String,
+    values: Vec<String>,
+}
+
+fn ordinary_loop_variable(name: &str) -> bool {
+    // Bash/Zsh 的大写及下划线特殊参数不推定为固定标量；Zsh 另有小写特殊参数。
+    const SPECIAL: &str = "aliases argv builtins cdpath commands dirstack dis_aliases
+        dis_builtins dis_functions dis_functions_source dis_galiases dis_patchars dis_reswords
+        dis_saliases errnos fignore fpath funcfiletrace funcsourcetrace funcstack functrace
+        functions functions_source galiases histchars history historywords jobdirs jobstates
+        jobtexts keymaps mailpath manpath module_path modules nameddirs options parameters
+        patchars path pipestatus prompt psvar reswords saliases signals status sysparams
+        termcap terminfo userdirs usergroups watch widgets zsh_eval_context zsh_scheduled_events";
+    name.starts_with(|ch: char| ch.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        && !SPECIAL
+            .split_ascii_whitespace()
+            .any(|special| special == name)
+}
+
+/// 只认识单个有限 for；不做通用变量传播，也不跨状态变更猜值。
+fn literal_loop(nodes: &[Node<'_>], src: &str) -> Option<LiteralLoop> {
+    let mut loops = nodes.iter().filter(|node| node.kind() == "for_statement");
+    let node = loops.next()?;
+    if loops.next().is_some() || node.child(0)?.kind() != "for" {
+        return None;
+    }
+    let variable = node
+        .child_by_field_name("variable")?
+        .utf8_text(src.as_bytes())
+        .ok()?;
+    if !ordinary_loop_variable(variable) {
+        return None;
+    }
+    for node in nodes.iter().filter(|node| node.is_named()) {
+        match node.kind() {
+            "program"
+            | "list"
+            | "for_statement"
+            | "do_group"
+            | "pipeline"
+            | "redirected_statement"
+            | "command"
+            | "command_name"
+            | "word"
+            | "number"
+            | "string"
+            | "raw_string"
+            | "string_content"
+            | "concatenation"
+            | "comment"
+            | "file_redirect"
+            | "file_descriptor"
+            | "variable_name"
+            | "simple_expansion" => {}
+            "expansion" => {
+                let variable = node.named_child(0)?;
+                if node.named_child_count() != 1
+                    || variable.kind() != "variable_name"
+                    || node.utf8_text(src.as_bytes()).ok()?
+                        != format!("${{{}}}", variable.utf8_text(src.as_bytes()).ok()?)
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let mut cursor = node.walk();
+    let values: Option<Vec<_>> = node
+        .children_by_field_name("value", &mut cursor)
+        .take(MAX_LOOP_VALUES + 1)
+        .map(|value| match literal(value, src) {
+            WordValue::Literal(value) => Some(value),
+            WordValue::Unknown => None,
+        })
+        .collect();
+    let values = values?;
+    // 不让未知词变成新选项；未建模命令的选项操作数仍须保守检查。
+    if values.is_empty()
+        || values.len() > MAX_LOOP_VALUES
+        || values.iter().any(|value| value.starts_with('-'))
+    {
+        return None;
+    }
+    Some(LiteralLoop {
+        body: node.child_by_field_name("body")?.byte_range(),
+        variable: variable.into(),
+        values,
+    })
+}
+
+fn refine_literal_loop(facts: &mut BashFacts, binding: &LiteralLoop, depth: u8) {
+    let mutates_state = facts
+        .commands
+        .iter()
+        .filter(|command| command.context.script_depth == depth)
+        .any(|command| {
+            let Some(WordEvaluation::Resolved(name)) =
+                command.words.first().map(|word| word.syntax.evaluate(None))
+            else {
+                return true;
+            };
+            // 外部进程不能改父 shell 的变量；裸命令只认已知不会改变量的这组。
+            // 不能只靠 Bash 的状态修改黑名单：Zsh 的 zstyle -s、vared 等也会赋值。
+            match name.as_str() {
+                "echo" | "cd" | "pwd" | ":" | "true" | "false" | "cargo" | "cat" | "grep"
+                | "rg" | "head" | "tail" | "wc" | "env" | "bash" | "sh" | "zsh" => false,
+                "printf" => !matches!(command.words.get(1).map(|word| word.syntax.evaluate(None)),
+                    Some(WordEvaluation::Resolved(format)) if !format.starts_with("-v")),
+                _ => !std::path::Path::new(&name).is_absolute(),
+            }
+        });
+    if mutates_state {
+        return;
+    }
+    let inside = |range: &Range<usize>, script_depth| {
+        script_depth == depth && binding.body.start <= range.start && range.end <= binding.body.end
+    };
+    facts.commands = std::mem::take(&mut facts.commands)
+        .into_iter()
+        .flat_map(|command| {
+            if !inside(&command.range, command.context.script_depth) {
+                return vec![command];
+            }
+            let mut alternatives = Vec::new();
+            for value in &binding.values {
+                let mut alternative = command.clone();
+                let mut changed = false;
+                for word in &mut alternative.words {
+                    changed |= word.syntax.bind_quoted_variable(&binding.variable, value);
+                    // WordValue 保留 Unknown：deny/ask 仍保守匹配，不能产生授权。
+                }
+                if !changed {
+                    return vec![command];
+                }
+                alternatives.push(alternative);
+            }
+            alternatives
+        })
+        .collect();
+    facts.redirects = std::mem::take(&mut facts.redirects)
+        .into_iter()
+        .flat_map(|redirect| {
+            if !inside(&redirect.range, redirect.context.script_depth) {
+                return vec![redirect];
+            }
+            let mut alternatives = Vec::new();
+            for value in &binding.values {
+                let mut alternative = redirect.clone();
+                if !alternative
+                    .syntax
+                    .bind_quoted_variable(&binding.variable, value)
+                {
+                    return vec![redirect];
+                }
+                alternatives.push(alternative);
+            }
+            alternatives
+        })
+        .collect();
 }
 
 fn changes_directory(name: &str) -> bool {
@@ -752,6 +924,39 @@ mod tests {
         }
         let facts = analyze("c\\\nd /tmp; echo x > notes.txt");
         assert!(facts.redirects[0].context.cwd_unknown, "{facts:#?}");
+    }
+
+    #[test]
+    fn literal_loop_refines_risk_values_without_authorizing_the_script() {
+        let facts = analyze("for t in first second; do cargo test -- \"${t}\"; done");
+        assert_eq!(facts.analysis, BashAnalysis::Opaque);
+        let values: Vec<_> = facts
+            .commands
+            .iter()
+            .map(|command| {
+                assert_eq!(command.words[3].value, WordValue::Unknown);
+                assert_eq!(command.risk_argv(), ["cargo", "test", "--", "\0unknown"]);
+                command.words[3].syntax.evaluate(None)
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [
+                WordEvaluation::Resolved("first".into()),
+                WordEvaluation::Resolved("second".into())
+            ]
+        );
+
+        let values = (0..=MAX_LOOP_VALUES)
+            .map(|index| format!("t{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let facts = analyze(&format!("for t in {values}; do cat \"$t\"; done"));
+        assert_eq!(facts.commands.len(), 1);
+        assert_eq!(
+            facts.commands[0].words[1].syntax.evaluate(None),
+            WordEvaluation::Unknown
+        );
     }
 
     #[test]

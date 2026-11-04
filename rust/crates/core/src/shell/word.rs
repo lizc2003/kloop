@@ -88,6 +88,21 @@ impl ShellWord {
         .then_some(value)
     }
 
+    /// 只细化风险事实；调用方须先证明循环值固定且正文不会改写变量。
+    pub(super) fn bind_quoted_variable(&mut self, name: &str, value: &str) -> bool {
+        let [part] = self.parts.as_mut_slice() else {
+            return false;
+        };
+        if part.quoting == Quoting::Double
+            && matches!(&part.kind, PartKind::Variable(variable) if variable == name)
+        {
+            part.kind = PartKind::Text(value.into());
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn evaluate(&self, home: Option<&Path>) -> WordEvaluation {
         let mut text = String::new();
         let mut partial = false;

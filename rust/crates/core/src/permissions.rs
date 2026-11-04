@@ -1257,6 +1257,131 @@ mod tests {
         json!({"path": path, "content": "x"})
     }
 
+    #[tokio::test]
+    async fn literal_for_loop_test_names_pass_the_sensitive_gate() {
+        let command = "cd rust && for t in an_existing_only_lease_never_creates_the_file \
+            resuming_a_missing_session_creates_nothing a_session_with_only_preamble_removes_itself \
+            a_claimed_session_is_removed_only_while_it_holds_nothing \
+            a_live_session_can_be_inspected_but_cannot_get_a_second_writer \
+            a_failed_append_poisons_the_writer a_failed_route_adoption resume_reads_the_transcript_once; \
+            do echo \"== $t\"; cargo test -q -p kloop-core --lib -- \"$t\" 2>&1 \
+            | grep -E \"^test result|FAILED\" | head -2; done";
+        for mode in [Mode::Manual, Mode::Bypass] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+            p.check_call("bash", &bash(command), 0, true).await.unwrap();
+            assert_eq!(approver.ask_count(), 0);
+        }
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        p.check_call("bash", &bash(command), 0, false)
+            .await
+            .unwrap();
+        assert_eq!(approver.ask_count(), 1);
+        for command in [
+            "for f in 'notes with spaces.txt' other.txt; do cat \"${f}\"; done",
+            "for f in first.txt second.txt; do echo x > \"$f\"; done",
+            "for f in first.txt second.txt; do cat < \"$f\"; done",
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            p.check_call("bash", &bash(command), 0, true)
+                .await
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn literal_for_loop_paths_keep_reads_writes_and_deny_protection() {
+        for mode in [Mode::Manual, Mode::Bypass] {
+            for (command, message) in [
+                (
+                    "for f in notes.txt .env; do cat \"$f\"; done",
+                    "reading this sensitive path",
+                ),
+                (
+                    "for f in notes.txt .env; do echo x > \"$f\"; done",
+                    "writing this sensitive path",
+                ),
+                (
+                    "for f in notes.txt .env; do cat < \"$f\"; done",
+                    "reading this sensitive path",
+                ),
+            ] {
+                let approver = ScriptedApprover::new(vec![]);
+                let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+                let error = p
+                    .check_call("bash", &bash(command), 0, true)
+                    .await
+                    .unwrap_err();
+                assert!(error.contains(message), "{command}: {error}");
+                assert_eq!(approver.ask_count(), 0);
+            }
+        }
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash(cargo *)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call(
+                "bash",
+                &bash("for t in first second; do cargo test -- \"$t\"; done"),
+                0,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("deny permission rule"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mutable_or_dynamic_for_loops_still_have_unknown_targets() {
+        for command in [
+            "cargo test -- \"$t\"",
+            "for t in $TESTS; do cargo test -- \"$t\"; done",
+            "for t in first --manifest-path=.env; do cargo test \"$t\"; done",
+            "for t in first .env; do cargo test --manifest-path=\"$t\"; done",
+            "for t in first second; do cat $t; done",
+            "for _ in first second; do : .env; cat \"$_\"; done",
+            "for RANDOM in 1 2; do cat \"$RANDOM\"; done",
+            "for SECONDS in 1 2; do cat \"$SECONDS\"; done",
+            "for status in 1 2; do false; cat \"$status\"; done",
+            "for pipestatus in 1 2; do false; cat \"$pipestatus\"; done",
+            "for t in *.txt; do cat \"$t\"; done",
+            "for t in first second; do t=.env; cat \"$t\"; done",
+            "for t in first second; do read t; cat \"$t\"; done",
+            "for t in first second; do vared t; cat \"$t\"; done",
+            "for t in first second; do zstyle -s :target name t; cat \"$t\"; done",
+            "for t in first second; do stat -A t notes.txt; cat \"$t\"; done",
+            "for t in first second; do printf -v t .env; cat \"$t\"; done",
+            "for t in first second; do printf \"$format\" t .env; cat \"$t\"; done",
+            "for t in first second; do eval 't=.env'; cat \"$t\"; done",
+            "for t in first second; do source setup.sh; cat \"$t\"; done",
+            "for t in first second; do \"$mutator\"; cat \"$t\"; done",
+            "for t in first second; do : \"${t:=.env}\"; cat \"$t\"; done",
+            "for t in first second; do for t in .env; do :; done; cat \"$t\"; done",
+            "select t in first second; do cat \"$t\"; done",
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            let error = p
+                .check_call("bash", &bash(command), 0, true)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("reading this sensitive path"),
+                "{command}: {error}"
+            );
+        }
+    }
+
     // ── layer 9: read-only self-verdict ────────────────────────────────
 
     #[tokio::test]
