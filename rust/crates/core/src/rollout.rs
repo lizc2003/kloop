@@ -59,6 +59,8 @@ use line::{LineMeta, RolloutLine};
 /// and forks.
 #[derive(Debug)]
 pub(crate) struct SessionLease {
+    /// Held for its Drop: on Windows the transcript is a separate handle.
+    #[cfg_attr(windows, allow(dead_code))]
     lock: crate::state_lock::StateLock,
     #[cfg(windows)]
     transcript: File,

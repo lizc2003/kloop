@@ -4227,3 +4227,10 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    有窗口：另一进程可以 resume 这个已存在的文件并拿到租约。失败方按 `preexisting=false`
    去删，删的是赢家的 transcript（对方还通过打开句柄继续写）。Drop 的清理前提必须是
    `lease.is_some()`——“我持有租约”才是所有权，创建动作不是。
+
+328. **Windows 交叉检查缺的是 C 工具链，不是 Rust bindings。** `aws-lc-sys` 的
+   `pregenerated` 类 feature 并不存在——预生成的是 bindings，且默认已启用；在 macOS 上
+   编 MSVC 目标失败，是 `jitterentropy*.c` 找不到 `windows.h`。要本地交叉 check 就给
+   目标装 SDK/C 工具链（`cargo-xwin` + LLVM，或 mingw），不要改依赖树；真要在 Windows
+   上保持原语义，也只能这么做。顺带：cross-check 会暴露 Windows-only dead_code
+   （RAII 字段、只在 Unix 分支用的访问器），这些是 host clippy 看不到的。

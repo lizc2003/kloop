@@ -12,10 +12,14 @@ impl StateLock {
     /// handle: readers and writers use this file, never the path, so an unlink
     /// (or an id reused in the same second) cannot redirect I/O to another
     /// inode while this lease is held.
+    /// The locked file, for a lease that keeps its I/O on that handle. On
+    /// Windows a session lease lives on a sidecar, so this is unused there.
+    #[cfg(not(windows))]
     pub(crate) fn file(&self) -> &File {
         &self.file
     }
 
+    #[cfg(not(windows))]
     pub(crate) fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }

@@ -121,4 +121,5 @@
   进程可在窗口内 resume；失败者的 Drop 现在要求 `lease.is_some()` 才清理，文件归赢家。
   回归：先持租约，再构造 pending-route writer，断言它失败且文件仍在。
   外层沙箱之外 `make check` 全绿（core 1327、TUI 314、server contract 46、2 项 ignored，
-  本机 parity baseline verified）；Windows 目标因缺 Windows SDK 无法交叉 check，未实测。
+  本机 parity baseline verified）。Windows 目标用 `cargo-xwin` 实测 `cargo xwin check
+  -p kloop-core --target x86_64-pc-windows-msvc` 通过（原生依赖同编），Windows 运行时未实测。
