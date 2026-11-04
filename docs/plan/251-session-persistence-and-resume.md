@@ -134,3 +134,11 @@
   `cargo xwin clippy -p kloop-core -- -D warnings` 复核为零警告。
 - 验证：外层沙箱之外 `make check` 全绿（core 1328、TUI 314、server contract 46、2 项
   ignored，本机 parity baseline verified）；`cargo xwin check`/`clippy`（msvc target）通过。
+
+## Windows 校验入口(2026-11-04)
+
+Windows 交叉检查固化为按需 `make check-windows`：msvc 目标的 workspace clippy
+`-D warnings`，需要 `cargo-xwin` + LLVM(Homebrew)，缺工具时像 parity 一样跳过；
+**不挂进 `make check`**。另修了 core 测试里 `TestConfig::login_env` 在 Windows test
+构建下的 dead_code（调用方全是 Unix-only 测试，改为 `cfg(unix)`）。最后一次
+`make check` 全绿(core 1334)，`make check-windows` 全 workspace 零警告通过。

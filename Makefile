@@ -23,7 +23,7 @@ CONFIG := $(KLOOP_DIR)/config.toml
 CONFIG_DEMO := config/config-demo.toml
 
 .DEFAULT_GOAL := all
-.PHONY: all build debug test test-release fmt fmt-check clippy clippy-release check check-release parity mock install install-config uninstall clean help
+.PHONY: all build debug test test-release fmt fmt-check clippy clippy-release check check-release check-windows parity mock install install-config uninstall clean help
 
 all: build
 
@@ -56,6 +56,24 @@ clippy-release:
 check: fmt-check clippy test parity
 
 check-release: fmt-check clippy-release test-release parity
+
+# Windows 目标的交叉检查(msvc)。按需手动运行,不属于 make check:本项目唯一的提交门禁
+# 是 check,Windows 日常不校验(2026-11-04 用户定)。需要 cargo-xwin 与
+# LLVM(Homebrew: brew install llvm;Rust 目标: rustup target add x86_64-pc-windows-msvc),
+# 缺工具时跳过而不是报错,和 parity 一样。
+check-windows:
+	@if ! command -v cargo-xwin >/dev/null 2>&1; then \
+	  echo "skipped: cargo-xwin is not installed (cargo install --locked cargo-xwin)"; \
+	  exit 0; \
+	fi; \
+	if ! rustup target list --installed 2>/dev/null | grep -qx x86_64-pc-windows-msvc; then \
+	  echo "skipped: run rustup target add x86_64-pc-windows-msvc"; \
+	  exit 0; \
+	fi; \
+	llvm_bin="$$(brew --prefix llvm 2>/dev/null)/bin"; \
+	if [ -x "$$llvm_bin/llvm-lib" ]; then export PATH="$$llvm_bin:$$PATH"; fi; \
+	cd $(RUST_DIR) && $(CARGO) xwin clippy --target x86_64-pc-windows-msvc \
+	  --workspace --all-targets -- -D warnings
 
 # Claude Code 2.1.220 的 parity 语料。语料不在版本控制里(见 .gitignore),
 # 只在当初生成它的机器上;别处跑 make parity 会跳过而不是报错。
@@ -115,6 +133,7 @@ help:
 	@echo "  clippy-release   clippy --release --all-targets --all-features -D warnings"
 	@echo "  check            fmt-check + clippy + test + parity"
 	@echo "  check-release    fmt-check + clippy-release + test-release + parity(手动运行)"
+	@echo "  check-windows    Windows 目标 clippy -D warnings(手动运行,需 cargo-xwin + LLVM)"
 	@echo "  parity           Claude Code 语料校验(只在有语料的机器上)"
 	@echo "  mock             cargo run -- --mock,无 key 冒烟"
 	@echo "  install          装到 $(BINDIR)/$(BIN);缺配置时铺一份 $(CONFIG)"

@@ -2042,7 +2042,8 @@ pub(crate) mod testutil {
         }
 
         /// Stand in for a captured login environment: the shell runs non-login
-        /// with these variables.
+        /// with these variables. Only the Unix bash tests capture one.
+        #[cfg(unix)]
         pub(crate) fn login_env(mut self, login_env: crate::shell_env::ShellLoginEnv) -> Self {
             self.login_env = Some(login_env);
             self

@@ -62,13 +62,26 @@ rewind 路由回退段落。Linux 与 Windows 未实测。教训 315–321。
 **Plan 251 审查跟进（2026-11-03）**：三条审查意见都成立并已修。server 的 `thread/start`
 失败路径不再按路径二次 `remove_file`——线程文件从 claim 起归 writer 所有，`spawn_thread`
 失败时 History 的 Drop 会删；再删一次会误伤同秒复用 ID 的另一进程会话。会话锁的读取、
-截断、追加全部改走被锁住的那个 `File`，不再按路径重开；空会话仍在持锁时 unlink，只有
-平台拒绝才释放后重试。这样“unlink 后同秒复用 ID”最多让后到者写进一个已脱离名字的
+截断、追加全部改走租约持有的 transcript 句柄，不再按路径重开；空会话仍在持锁时 unlink，
+失败就留下空文件（不释放租约重试）。这样“unlink 后同秒复用 ID”最多让后到者写进一个已脱离名字的
 inode（丢一次空会话的续写），不会让两个 writer 落到同一份 transcript。CLI 改走
 `History::adopt_or_initialize_provider_route`，与 server 共用“无 timeline 就写 initial
 route”的分支，preamble-only 文件现在 CLI 也能 resume。常驻 fd 让“改权限/删父目录”不再
 能失败写入，失败注入改成 test-only `inject_append_failure`；新增 writer 跟随 lease、
 无 timeline 初始化、CLI 端到端 resume 三条回归。教训 322–325。
+
+**Plan 251 审查跟进二/三与 Windows 校验（2026-11-03–04）**：租约抽成 `SessionLease`：
+Unix 锁 transcript（flock 是 advisory，没有 sidecar），Windows 锁 `.lock` sidecar、
+transcript 保持可读（`LockFileEx` 是强制锁，直接锁 transcript 会挡死 thread/read、
+thread/list 和 fork）；两平台的读取、截断、追加都走租约持有的 transcript 句柄。抢锁失败
+的 writer 不再清理文件——Drop 要求 `lease.is_some()`，文件归抢到租约的一方。空会话清理
+只在持锁时做一次，失败就留下空文件，不再释放租约后重试（重试会删掉同秒复用 ID 的新会话）。
+CLI 与 server 共用 `History::adopt_or_initialize_provider_route`。新增回归：writer 跟随
+lease、无 timeline 初始化、CLI 端到端 resume preamble-only、抢锁失败不删文件、清理失败
+不重试。Windows 目标用 `cargo-xwin` + MSVC SDK 实测 check/clippy 零警告，并新增按需手动
+`make check-windows`（workspace clippy `-D warnings`，缺工具跳过，**不进门禁**）。验证：
+`make check` 全绿（core 1334、TUI 314、server contract 46、2 项 ignored，本机 parity
+baseline verified）。教训 326–330。
 
 **Plan 250 ✅：agent 主循环与上下文估算（2026-11-03）**：`run_turn` 在 stage pre_turn
 hook 上下文之前记下 `input_staged`；“整 turn 撤回”现在要求输入确实仍是 staged
@@ -4297,3 +4310,7 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    的正文落进“值”里。交集之外一律按认不出处理。反方向也要收窄：“首个选项不是 `-c`”只是
    “可能读启动文件”的粗略代理，会把 `-e`、`-o pipefail` 这类无关选项一起判成 home 未知，
    硬拒绝本来安全的 `$HOME` 路径；该用真正决定启动行为的选项（`-l`、`-i`、`--login`）判断。
+
+330. **按需校验不要塞进提交门禁。** Windows 交叉检查依赖本机工具链、首次要下载 SDK 并全量
+   编译（二十多分钟），日常提交不该背这笔成本。把它做成 `make check-windows`（缺工具跳过、
+   与 `check-release` 同级手动运行），`make check` 保持本机门禁不变；用户 2026-11-04 明确。
