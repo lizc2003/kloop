@@ -94,3 +94,19 @@
   依附的锁。不再产生任何 `.lock` 文件。
 
 验证：外层执行沙箱之外 `make check`（fmt + clippy + workspace 全量测试 + parity）。
+
+## 审查跟进(2026-11-03)
+
+- server 的失败路径不再按路径二次删除：线程文件从 claim 起归 writer 所有，`spawn_thread`
+  失败时 History 的 Drop 已经删掉空文件；再按路径删一次，会在另一进程同秒复用该 ID 时删掉
+  对方的会话。构造失败分支同理。
+- 会话锁的 I/O 只走被锁住的那个句柄：读取、截断、追加都用 lease 里的 `File`，不再按路径
+  重开；空会话仍在持锁时 unlink（平台拒绝才先释放再重试）。这样即使文件被 unlink、ID 在同
+  一秒被复用，也不会出现“锁住旧 inode、却读写新文件”的两个 writer。
+- CLI 打开会话改走 `History::adopt_or_initialize_provider_route`，与 server 共用“没有
+  timeline 就写 initial route，否则 adopt”的分支；preamble-only 文件现在 CLI 也能 resume。
+- 有了常驻 fd 之后，改权限/删父目录不再能让 append 失败，失败注入改成 test-only 的
+  `inject_append_failure`；新增“writer 跟随自己的 lease（unlink+复用名字后不会写到新文件）”、
+  “无 timeline 的历史初始化 route”、CLI 端到端 resume preamble-only 文件三条回归。
+  外层沙箱之外 `make check` 全绿（core 1326、TUI 314、server contract 46、2 项 ignored，
+  本机 parity baseline verified）。

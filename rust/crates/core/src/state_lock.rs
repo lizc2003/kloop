@@ -8,6 +8,18 @@ pub struct StateLock {
 }
 
 impl StateLock {
+    /// The locked file itself. A session lease and its transcript are the same
+    /// handle: readers and writers use this file, never the path, so an unlink
+    /// (or an id reused in the same second) cannot redirect I/O to another
+    /// inode while this lease is held.
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
     fn open(path: &Path, create: bool) -> io::Result<File> {
         if create && let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

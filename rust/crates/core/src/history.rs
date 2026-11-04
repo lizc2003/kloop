@@ -338,6 +338,14 @@ impl History {
         Ok(receipt)
     }
 
+    /// Test-only: make the next rollout append fail.
+    #[cfg(test)]
+    pub(crate) fn inject_append_failure(&mut self) {
+        if let Some(rollout) = self.rollout.as_mut() {
+            rollout.inject_append_failure();
+        }
+    }
+
     pub fn provider_routes(&self) -> &[ProviderRouteReceipt] {
         &self.provider_routes
     }
@@ -443,6 +451,24 @@ impl History {
     /// left the file, which is what stops a config edit from making old
     /// transcripts unopenable. The hop is a durable route revision like any
     /// other, so the transcript says where each stretch of the session ran.
+    /// [`adopt_provider_route`](Self::adopt_provider_route) for a session that
+    /// may not have a timeline yet. A preamble-only file — a writer killed
+    /// between its runtime line and the first turn — replays as an empty
+    /// session, and opening it must write the initial route rather than adopt
+    /// onto a timeline that does not exist. Everything else still opens on the
+    /// configured default and records the hop.
+    pub fn adopt_or_initialize_provider_route(
+        &mut self,
+        opening: &FrozenProviderRoute,
+    ) -> Result<(FrozenProviderRoute, Option<RouteReopened>), ProviderSwitchError> {
+        if self.has_provider_route() {
+            return self.adopt_provider_route(opening);
+        }
+        self.ensure_initial_provider_route(opening)
+            .map_err(ProviderSwitchError::Persistence)?;
+        Ok((opening.clone(), None))
+    }
+
     pub fn adopt_provider_route(
         &mut self,
         opening: &FrozenProviderRoute,
@@ -2458,8 +2484,7 @@ mod tests {
         let session = root.join("session.jsonl");
         let mut history = History::new(root.join("offload"));
         history.attach_rollout(Rollout::new_with_initial_route(session, &initial).unwrap());
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::write(&root, b"blocks parent directory creation").unwrap();
+        history.inject_append_failure();
 
         let error = history
             .switch_provider(&state, 1, "b", None, EffortRequest::Inherit)
@@ -2469,7 +2494,7 @@ mod tests {
         assert_eq!(state.active_route().provider_id, "a");
         assert_eq!(state.remembered_models().get("b"), None);
         assert_eq!(history.provider_routes().len(), 1);
-        let _ = std::fs::remove_file(root);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// The dogfood failure of plan 132, and the rule it settled on: a session
@@ -2594,6 +2619,60 @@ mod tests {
         );
         assert_eq!(moved.revision(), 3);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A preamble-only session (a writer killed before its first turn) replays
+    /// with no timeline. Opening it must write the initial route instead of
+    /// adopting onto a timeline that does not exist — the CLI used to fail here
+    /// while the server branched on `has_provider_route`.
+    #[test]
+    fn a_timeline_less_history_initializes_its_route() {
+        use crate::provider_route::ProviderCatalog;
+        use kloop_provider::Provider;
+
+        let dir = temp_dir("no-route-timeline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("20260102-000002.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","id":"20260102-000002#1","ts":0,"format_version":1,"runtime":{"cwd":"/work"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let (_, opening) = ProviderCatalog::from_provider(
+            "test",
+            Provider::mock(Vec::new()),
+            "mock",
+            vec!["mock".into()],
+        )
+        .unwrap();
+        let mut history =
+            History::resume(dir.clone(), crate::rollout::resume_session(&path).unwrap());
+        assert!(!history.has_provider_route());
+
+        let (route, reopened) = history
+            .adopt_or_initialize_provider_route(&opening)
+            .unwrap();
+        assert_eq!(route.revision(), opening.revision());
+        assert!(reopened.is_none());
+        assert_eq!(history.provider_routes().len(), 1);
+
+        // Once the timeline exists, opening adopts instead of writing
+        // revision 1 again.
+        let (again, reopened) = history
+            .adopt_or_initialize_provider_route(&opening)
+            .unwrap();
+        assert_eq!(again.revision(), opening.revision());
+        assert!(reopened.is_none());
+        assert_eq!(history.provider_routes().len(), 1);
+        drop(history);
+
+        let reread = crate::rollout::inspect_session(&path).unwrap();
+        assert_eq!(reread.snapshot().provider_routes.len(), 1);
+        drop(reread);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

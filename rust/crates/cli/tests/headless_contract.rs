@@ -108,3 +108,46 @@ fn help_and_list_sessions_ignore_invalid_provider_environment() {
         }
     }
 }
+
+/// A writer killed between its runtime line and its first turn leaves a
+/// preamble-only session. Resuming it must open the initial route like a fresh
+/// session instead of failing to adopt a timeline that does not exist.
+#[test]
+fn mock_headless_resumes_a_preamble_only_session() {
+    let root = TestRoot::new("preamble-resume");
+    let id = "20260101-000001";
+    let path = root
+        .root
+        .join(".kloop/sessions")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let line = serde_json::json!({
+        "type": "session",
+        "id": format!("{id}#1"),
+        "ts": 0,
+        "format_version": 1,
+        "runtime": { "cwd": root.root.to_string_lossy() },
+    });
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+
+    let output = root
+        .command(&["--mock", "--headless", "--resume", id])
+        .output()
+        .expect("start kloop");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let transcript = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        transcript.contains("\"type\":\"provider_route_initial\""),
+        "the resumed session never opened its route: {transcript}"
+    );
+    assert!(
+        transcript.contains("\"type\":\"message\""),
+        "the mock turn did not run on the resumed session: {transcript}"
+    );
+}

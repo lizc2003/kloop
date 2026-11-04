@@ -79,19 +79,18 @@ impl Server {
         let claim = rollout::claim_new_session(&dirs.sessions)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot claim session: {e}")))?;
         let thread_id = claim.id().to_string();
-        let path = claim.path().to_path_buf();
         let runtime = runtime_from_options(&options);
-        let rollout = match Rollout::new_with_runtime_pending_route(claim, runtime.clone()) {
-            Ok(rollout) => rollout,
-            Err(error) => {
-                let _ = std::fs::remove_file(&path);
-                let _ = std::fs::remove_file(path.with_extension("lock"));
-                return Err((
+        // The writer owns the claimed file from here on; its Drop removes a
+        // session that never gets past the opening preamble. Cleaning up by
+        // path here would be a second delete: another process can reuse the id
+        // in the same second, and this call would remove *its* session.
+        let rollout =
+            Rollout::new_with_runtime_pending_route(claim, runtime.clone()).map_err(|error| {
+                (
                     wire::SERVER_ERROR,
                     format!("cannot initialize session: {error}"),
-                ));
-            }
-        };
+                )
+            })?;
         let mut history = History::new(dirs.offload.clone());
         history.attach_rollout(rollout);
         let seed = SessionSnapshot {
@@ -100,17 +99,16 @@ impl Server {
             terminals: Vec::new(),
             provider_routes: history.provider_routes().to_vec(),
         };
-        if let Err(error) = self.spawn_thread(
+        // `spawn_thread` owns `history`; every failure drops it before
+        // returning, so the writer removes its own empty file. No second
+        // unlink here (see the claim comment above).
+        self.spawn_thread(
             thread_id.clone(),
             history,
             options,
             RecoverySource::Fresh,
             seed,
-        ) {
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::remove_file(path.with_extension("lock"));
-            return Err(error);
-        }
+        )?;
         let route = self
             .threads
             .get(&thread_id)
@@ -438,29 +436,17 @@ impl Server {
         // configured default — recording the hop when the session was written on
         // something else. Rebuilding that as a revision-1 initial route instead
         // would refuse every session that ever switched providers.
-        if history.has_provider_route() {
-            let (route, reopened) =
-                history
-                    .adopt_provider_route(&cfg.provider_route)
-                    .map_err(|error| {
-                        (
-                            wire::SERVER_ERROR,
-                            format!("cannot adopt the session provider route: {error}"),
-                        )
-                    })?;
-            cfg.provider_route = route;
-            if let Some(reopened) = reopened {
-                ui.emit(&Event::Note(reopened.to_string()));
-            }
-        } else {
-            history
-                .ensure_initial_provider_route(&cfg.provider_route)
-                .map_err(|error| {
-                    (
-                        wire::SERVER_ERROR,
-                        format!("cannot persist initial provider route: {error}"),
-                    )
-                })?;
+        let (route, reopened) = history
+            .adopt_or_initialize_provider_route(&cfg.provider_route)
+            .map_err(|error| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot settle the session provider route: {error}"),
+                )
+            })?;
+        cfg.provider_route = route;
+        if let Some(reopened) = reopened {
+            ui.emit(&Event::Note(reopened.to_string()));
         }
         seed.provider_routes = history.provider_routes().to_vec();
         // The factory cannot know which thread it is building for; the hook

@@ -16,6 +16,7 @@
 //! additively.
 
 use std::io;
+use std::io::Seek as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,6 +76,10 @@ pub struct Rollout {
     /// refuses every write from here on — recovery truncates the tail once the
     /// session is read again.
     poisoned: bool,
+    /// Test-only: fail the next append after the lease is held. Permissions
+    /// cannot inject this any more — the writer already owns an open handle.
+    #[cfg(test)]
+    fail_next_append: bool,
 }
 
 impl Drop for Rollout {
@@ -85,11 +90,15 @@ impl Drop for Rollout {
         // Nothing but the preamble was ever written: launching kloop and
         // quitting without a word must not leave a session behind, or
         // `--continue` picks that empty shell over the last real conversation.
-        // Only a file this writer created can be removed here. The transcript
-        // is its own lock, so release that first: Windows cannot unlink a file
-        // that still has a handle open.
-        self.lease.take();
-        let _ = std::fs::remove_file(&self.path);
+        // Only a file this writer created can be removed here. Unlink while
+        // still holding the lease: an opener that already has this inode
+        // cannot acquire it before the name is gone, so a reused id can never
+        // hand anyone a lock on one inode and a file on another.
+        if std::fs::remove_file(&self.path).is_err() {
+            // Windows may refuse while the handle is open; release and retry.
+            self.lease.take();
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -210,6 +219,8 @@ impl Rollout {
             route_timeline: Vec::new(),
             wrote_content: false,
             poisoned: false,
+            #[cfg(test)]
+            fail_next_append: false,
         }
     }
 
@@ -397,6 +408,14 @@ impl Rollout {
         }
     }
 
+    /// Fail the next append without touching the filesystem. Test-only: the
+    /// writer holds an open handle, so chmod/the parent directory disappearing
+    /// no longer makes a write fail.
+    #[cfg(test)]
+    pub(crate) fn inject_append_failure(&mut self) {
+        self.fail_next_append = true;
+    }
+
     fn ensure_lease(&mut self) -> io::Result<()> {
         if self.lease.is_none() {
             self.lease = Some(
@@ -428,6 +447,10 @@ impl Rollout {
 
     fn append_line_unchecked(&mut self, line: RolloutLine) -> io::Result<()> {
         self.ensure_lease()?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_append) {
+            return Err(io::Error::other("injected append failure"));
+        }
         if self.next_seq == u64::MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -436,13 +459,12 @@ impl Rollout {
         }
         let json = serde_json::to_string(&line).map_err(io::Error::other)?;
         let content = !line.is_preamble();
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        // Write through the leased handle. Opening the path here would let an
+        // unlink (and an id reused in the same second) move these bytes onto
+        // another process's transcript.
+        let lease = self.lease.as_mut().expect("ensure_lease just ran");
+        let file = lease.file_mut();
+        file.seek(io::SeekFrom::End(0))?;
         writeln!(file, "{json}")?;
         if line.needs_sync() {
             file.sync_data()?;
@@ -737,6 +759,31 @@ mod tests {
         cleanup(&path);
     }
 
+    /// The lease is the transcript handle, not the name: if the file is
+    /// unlinked and its id reused in the same second, this writer's bytes must
+    /// keep going to the inode it leased. Opening the path per append would
+    /// put them into the new owner's session instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_follows_its_lease_when_the_name_is_reused() {
+        let path = temp_file("lease-follows-inode");
+        let mut rollout = Rollout::new(path.clone());
+        rollout.append_message(&Message::user_text("mine")).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"another session\n").unwrap();
+        rollout
+            .append_message(&Message::user_text("still mine"))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"another session\n",
+            "the writer appended through a reused name"
+        );
+        cleanup(&path);
+    }
+
     /// One recorded message is enough to keep it: the preamble it was holding
     /// is already in the file, so replay is unaffected.
     #[test]
@@ -753,8 +800,8 @@ mod tests {
     /// A write that fails may have put part of its line on disk. Appending
     /// again would glue the next line to that fragment — and `intact_lines`
     /// stops at the first line it cannot parse, so recovery would truncate
-    /// everything after it. The writer therefore stays poisoned even once the
-    /// file is writable again.
+    /// everything after it. The writer therefore stays poisoned even after the
+    /// condition that failed the write is gone.
     #[test]
     fn a_failed_append_poisons_the_writer() {
         let path = temp_file("poisoned-append");
@@ -763,17 +810,8 @@ mod tests {
             .append_message(&Message::user_text("before"))
             .unwrap();
 
-        let read_only = |read_only: bool| {
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_readonly(read_only);
-            std::fs::set_permissions(&path, permissions).unwrap();
-        };
-        read_only(true);
-        assert!(
-            rollout.append_message(&Message::user_text("lost")).is_err(),
-            "a read-only file cannot take the append"
-        );
-        read_only(false);
+        rollout.inject_append_failure();
+        assert!(rollout.append_message(&Message::user_text("lost")).is_err());
         let error = rollout
             .append_message(&Message::user_text("after"))
             .unwrap_err();

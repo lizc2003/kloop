@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::io;
+use std::io::Read as _;
+use std::io::Seek as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +91,11 @@ impl SessionRead {
                 "session sequence exhausted",
             ));
         }
+        if intact_end < raw_len {
+            // Truncate through the leased handle, not the path: the name may
+            // already belong to a newer session.
+            lease.file().set_len(intact_end as u64)?;
+        }
         let mut rollout = Rollout {
             lease: Some(lease),
             path: path.clone(),
@@ -102,13 +109,9 @@ impl SessionRead {
             preexisting: true,
             wrote_content: true,
             poisoned: false,
+            #[cfg(test)]
+            fail_next_append: false,
         };
-        if intact_end < raw_len {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)?
-                .set_len(intact_end as u64)?;
-        }
         if repair.changed {
             rollout.append_repaired(&snapshot, &repair.stats)?;
         }
@@ -146,9 +149,13 @@ mod read_probe {
 }
 
 pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
+    let raw = std::fs::read(path)?;
+    read_session(path, raw)
+}
+
+fn read_session(path: &Path, raw: Vec<u8>) -> io::Result<SessionRead> {
     #[cfg(test)]
     read_probe::record(path);
-    let raw = std::fs::read(path)?;
     let parsed = parse_session(&raw)?;
     let (messages, terminals, repair) =
         repair_pairing(parsed.items, parsed.terminals, &parsed.started);
@@ -177,12 +184,18 @@ pub fn inspect_session(path: &Path) -> io::Result<SessionRead> {
 /// leaves a window in which another writer can append, after which this
 /// reader's `max_seq`/`intact_end` would truncate or overwrite its lines.
 pub fn inspect_session_for_writing(path: &Path) -> io::Result<SessionRead> {
-    let lease = crate::state_lock::StateLock::try_acquire_existing(path).map_err(|error| {
+    let mut lease = crate::state_lock::StateLock::try_acquire_existing(path).map_err(|error| {
         io::Error::other(format!(
             "session is already active or cannot be locked: {error}"
         ))
     })?;
-    let mut read = inspect_session(path)?;
+    // Read from the locked handle itself. Re-opening the path here would leave
+    // a window in which the file could be unlinked and its id reused, making
+    // this reader validate one inode and later truncate or extend another.
+    let mut raw = Vec::new();
+    lease.file_mut().seek(io::SeekFrom::Start(0))?;
+    lease.file_mut().read_to_end(&mut raw)?;
+    let mut read = read_session(path, raw)?;
     read.lease = Some(lease);
     Ok(read)
 }

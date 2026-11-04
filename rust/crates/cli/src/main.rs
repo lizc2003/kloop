@@ -244,7 +244,7 @@ impl SessionState {
         // that ran it, not to the file it left behind, so reopening re-asserts the
         // configured default and records the hop when it differs.
         let (session_route, reopened) = history
-            .adopt_provider_route(&process.provider.initial_route())
+            .adopt_or_initialize_provider_route(&process.provider.initial_route())
             .map_err(anyhow::Error::new)?;
         if let Some(reopened) = &reopened {
             eprintln!("\x1b[2m[{reopened}]\x1b[0m");

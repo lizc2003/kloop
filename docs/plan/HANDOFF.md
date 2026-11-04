@@ -23,6 +23,17 @@ messages/terminals，`ResumedSession` 只保存 snapshot 一份，`resume_option
 2 项真 provider ignored，本机 parity baseline verified）。DESIGN 更新 preamble/锁/损坏首行、恢复只读一次、digest、
 rewind 路由回退段落。Linux 与 Windows 未实测。教训 315–321。
 
+**Plan 251 审查跟进（2026-11-03）**：三条审查意见都成立并已修。server 的 `thread/start`
+失败路径不再按路径二次 `remove_file`——线程文件从 claim 起归 writer 所有，`spawn_thread`
+失败时 History 的 Drop 会删；再删一次会误伤同秒复用 ID 的另一进程会话。会话锁的读取、
+截断、追加全部改走被锁住的那个 `File`，不再按路径重开；空会话仍在持锁时 unlink，只有
+平台拒绝才释放后重试。这样“unlink 后同秒复用 ID”最多让后到者写进一个已脱离名字的
+inode（丢一次空会话的续写），不会让两个 writer 落到同一份 transcript。CLI 改走
+`History::adopt_or_initialize_provider_route`，与 server 共用“无 timeline 就写 initial
+route”的分支，preamble-only 文件现在 CLI 也能 resume。常驻 fd 让“改权限/删父目录”不再
+能失败写入，失败注入改成 test-only `inject_append_failure`；新增 writer 跟随 lease、
+无 timeline 初始化、CLI 端到端 resume 三条回归。教训 322–325。
+
 **Plan 250 ✅：agent 主循环与上下文估算（2026-11-03）**：`run_turn` 在 stage pre_turn
 hook 上下文之前记下 `input_staged`；“整 turn 撤回”现在要求输入确实仍是 staged
 （`input_staged && has_staged()`），调用方已自己 `record` 输入时不再把 hook 上下文误当成
@@ -4187,3 +4198,21 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    分支失败时，回退到旧会话的当前 revision，会让之后每一条 assistant 消息的 provenance
    指向分支 timeline 里不存在的 revision，下次 resume 整份分支都读不出来。回退必须是
    分支最后一条 receipt 经 catalog 还原出的 route。
+
+322. **拥有文件的 Drop 之后，不要再按路径补一刀。** 线程文件从 `claim` 起就是 writer 的，
+   `spawn_thread` 失败时 History 的 Drop 已经删掉空文件；外层再 `remove_file(path)` 一次，
+   若另一进程在同一秒复用了这个 ID，删掉的是对方的会话。清理权只能有一个所有者，错误分支
+   不是第二个清理点。
+
+323. **锁和 I/O 必须是同一个句柄。** 先锁路径再按路径重开读写，中间隔着 unlink + ID 复用：
+   你可能锁着旧 inode、却把字节写进新会话。读取、截断、追加都用 lease 锁住的 `File`，
+   空会话也在持锁时 unlink；“锁身份校验”最好的形式就是根本不重新按名字打开。
+
+324. **CLI 与 server 的会话开启分支要共享在 core 里。** server 有 `has_provider_route`
+   分支、CLI 无条件 `adopt_provider_route`，于是同一个“只有 preamble”的文件一边能开、
+   一边报 timeline missing。把“先看有没有 timeline，再决定写 initial 还是 adopt”收成
+   `History::adopt_or_initialize_provider_route`，前端只调用它。
+
+325. **持有常驻 fd 之后，权限类失败注入会失效。** 旧测试靠 chmod/删父目录制造 append
+   失败；writer 现在一直握着打开的文件，这些操作不再影响写入。失败路径要用显式的
+   test-only 注入点（`inject_append_failure`），否则测试会悄悄变成“成功路径”。

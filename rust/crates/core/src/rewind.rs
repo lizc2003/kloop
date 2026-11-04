@@ -274,12 +274,6 @@ mod tests {
         Arc::new(SilentUi)
     }
 
-    fn set_read_only(path: &Path, read_only: bool) {
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_readonly(read_only);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
-
     /// A rewind carries the live route onto the branch by appending a route
     /// revision. When that write fails, the fallback must be the branch's own
     /// last receipt, never the live route: new assistant messages stamp the
@@ -317,15 +311,14 @@ mod tests {
         history.rebase(resumed);
 
         // The branch is written on `mock`; a live `other` route forces the
-        // adoption to append, which a read-only transcript refuses.
+        // adoption to append, which the injected failure refuses.
         let live = cfg.clone_with_provider_route(
             cfg.provider_catalog
                 .initial_route("test", Some("other"))
                 .unwrap(),
         );
-        set_read_only(&fork_path, true);
+        history.inject_append_failure();
         let (adopted, notes) = adopt_branch_route(&live, &mut history);
-        set_read_only(&fork_path, false);
 
         assert_eq!(adopted.provider_route.model(), "mock");
         assert_eq!(adopted.provider_route.revision(), 1);

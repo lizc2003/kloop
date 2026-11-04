@@ -616,9 +616,13 @@ is dropped** (plan 115): launching kloop and quitting without a word leaves no
 session, and cannot beat the last real conversation to `--continue`. Only a file
 that writer created is ever removed, and only while it holds nothing else — a
 resumed or forked session's file is never touched. The writer leases the
-transcript itself (plan 251), so there is no sidecar to leave behind; Drop
-releases that lease before unlinking, because Windows cannot remove a file whose
-handle is still open. A preamble-only file a
+transcript itself (plan 251), so there is no sidecar to leave behind. Reads,
+truncation and appends all go through the one handle that lease locked — never
+through the path — so an unlink followed by the same id being reused cannot move
+this writer's bytes into the new owner's transcript. The empty file is unlinked
+while the lease is still held (releasing and retrying only where the platform
+refuses), so a concurrent opener cannot acquire the old inode before the name is
+gone. A preamble-only file a
 hard kill leaves behind is an empty session rather than a corrupt one: its
 timeline may not have its initial route yet, which replay accepts as long as no
 history message or usage line needs one, and the first turn writes it. A file
@@ -734,9 +738,10 @@ Resume replays the file, then makes the history legal and consistent again. Read
 - a torn tail (crash mid-append) is truncated to the last intact line —
   physically, before appending resumes, so the partial bytes can't merge
   with the next line and orphan everything after (read-only paths never modify
-  the file, including invalid UTF-8 tail bytes). Recovery reads the file once,
-  already holding the writer lease, so the bytes it validated are the bytes it
-  truncates; taking the lease after the read would leave a window in which
+  the file, including invalid UTF-8 tail bytes). Recovery reads, truncates and
+  appends through the one handle the lease locked, so the bytes it validated
+  are the bytes it truncates even if the path is unlinked and its id reused
+  meanwhile; taking the lease after the read would also leave a window in which
   another writer appends past the computed sequence;
 - when in-memory pairing repair changes a legacy session, explicit resume
   appends one `repaired` rollout marker containing the canonical messages,
@@ -810,7 +815,10 @@ harmless: the recorded receipt is a record of what ran, never a claim about what
 is configured now, and earlier receipts are not re-checked against today's
 catalog at all. Reasoning the new rail cannot replay is dropped from the request
 view (`continuity: filtered`), exactly as after an explicit switch, while the
-canonical transcript keeps it.
+canonical transcript keeps it. A session that stopped after its preamble has no
+timeline to hop from: opening it writes the initial revision instead, exactly
+like a fresh session. The CLI and the server share that branch — the CLI used to
+call adopt unconditionally and refuse to open such a file.
 
 ### A turn that never happened
 
