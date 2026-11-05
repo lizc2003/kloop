@@ -1,5 +1,25 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 254 ✅：provider 三条轨去重与流解析性能（2026-11-05）**：第 6 条（Anthropic 第 4 个
+缓存断点）按用户决定跳过，理由仍是它需要真实 API 量 `cache_read_input_tokens` 才能判断，
+手上没有代理和 key。其余五条分成两个提交：先性能，再去重，现有 `provider/tests/*` 一行未改。
+SSE 解析不再逐帧 `drain` 后 `collect` 成 `Vec<u8>` 再 `String`，也不再为多行 data 建
+`Vec<String>` 后 join：帧直接在缓冲上校验 UTF-8、就地解析，消费前缀在 `feed` 结束时一次
+dropped，每个 payload 只长一个 `String`。一个 chunk 含几千帧时旧实现是整体平方的 memmove，
+新增回归用 5000 帧钉住结果（不断言耗时），另一条钉住同 chunk 里完整帧先于残片交付。
+去重方面：Anthropic 的 `content_block`/`delta` 不再为换 `&Value` 整份 clone；三条轨的完成
+块不再保留整份 `AssistantBlock`（大 `write_file` 入参会随 clone 复制两遍），只记
+`CompletedToolCalls` 的 (id, name, 输入是否对象)，Responses 另用 `landed_output` 代替
+“完成块非空”判断；Chat 轨删掉只写不读的 `text` 缓冲。`lib.rs` 收进 `Rail`（协议前缀、
+required_str/required_u64/event_type）、`display_conflict` + `DisplayKind`、带
+`EmptyIdentity::{Deferred,Rejected}` 的 `lock_identity`、`openai_usage` + `UsageFields`、
+`image_data_url`、`error_prefixed` 与 `tool_fields`，三个 adapter 只留调用点。可观察变化只有
+少数内部错误措辞统一（例如 `usage missing prompt_tokens` → `usage missing or invalid
+prompt_tokens`、Chat 的 `tool id changed during streaming` → `tool id changed`），测试均按
+错误类型断言，无需改动。外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug
+全量测试 2257 项通过、6 项 ignored，本机 parity baseline verified）。真实 provider 未实测。
+教训 344–345。
+
 **Plan 253 ✅：provider 流式读取与请求构造（2026-11-05）**：八条审查项全部成立。Chat 轨
 收到 `finish_reason` 后改为继续读 usage 尾帧，`SseFrames::finish_after` 给 5s 绝对宽限；
 终端之后的尾帧读取失败(超时、断连、未终止的 `[DONE]`)以已有结果收尾，只有 usage 丢失，
@@ -4411,3 +4431,14 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    错误"变成进程 panic，接收端只看到一次可重试的流中断；同一个表达式在 `Value` 上是安全的，
    类型一变语义也变。连续下标还有第二个坑：父字段类型错误(`"details": "bad"`)会被吞成
    Null，看起来像"没命中"。先验证父字段是对象或 null，再读子字段。
+
+344. **“每帧一次”的常数会叠加成整体平方。** SSE 每帧 `drain(..end).collect()` 再
+   `String::from_utf8`、`Vec<String>` 再 join，单帧看都是小常数；一个大 chunk 里几千帧时，
+   前者每帧 memmove 整个剩余缓冲，后者每帧四次分配，流越大越慢。改成读偏移 + 一次 drain、
+   帧就地借用后，每帧只剩 payload 的 `String`。性能修复的回归断言结果而不是耗时，先把形状
+   钉住，再靠实现保证量级。
+
+345. **去重不能顺带改掉失败路径的观察顺序。** 把“逐块校验”改成“先记录身份、最后集中校验”
+   时，输入类型、空身份、重复 id 的检查顺序与原实现逐块一致，否则多块坏数据的流会换一个
+   错误先报出来；为了不再复制大块，记录里只留校验真正需要的字段。真正无法保持的是几处
+   内部错误措辞，单独写进交接，别声称零变化。

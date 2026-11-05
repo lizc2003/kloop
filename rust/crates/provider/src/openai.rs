@@ -19,7 +19,6 @@ use kloop_protocol::Message;
 use kloop_protocol::OutputLimitKind;
 use kloop_protocol::Role;
 use kloop_protocol::ToolResultContent;
-use kloop_protocol::Usage;
 
 /// Left in the `tool` message when its image is relocated to a trailing user
 /// message (the `tool` role cannot carry images).
@@ -50,11 +49,10 @@ fn tail_interruption(error: &ProviderFailure) -> bool {
 
 /// One chat/completions `image_url` data-URL part from a canonical image source.
 fn image_url_part(source: &ImageSource) -> Value {
-    let ImageSource::Base64 { media_type, data } = source;
     json!({
         "type": "image_url",
         "image_url": {
-            "url": format!("data:{media_type};base64,{data}"),
+            "url": crate::image_data_url(source),
             "detail": "auto",
         },
     })
@@ -76,7 +74,7 @@ fn split_blocks_for_chat(blocks: &[ContentBlock]) -> Result<(String, Vec<Value>)
             }
             ContentBlock::Image { source } => images.push(image_url_part(source)),
             ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                return Err(protocol(
+                return Err(RAIL.protocol(
                     "received reasoning that was not removed by the authorized request view",
                 ));
             }
@@ -111,7 +109,7 @@ pub(super) fn to_openai_messages(
                             },
                         })),
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                            return Err(protocol(
+                            return Err(RAIL.protocol(
                                 "received reasoning that was not removed by the authorized request view",
                             ));
                         }
@@ -160,11 +158,7 @@ pub(super) fn to_openai_messages(
                                 }
                                 tool_text.push_str(IMAGE_RELOCATED_PLACEHOLDER);
                             }
-                            let tool_text = if *is_error {
-                                format!("[error] {tool_text}")
-                            } else {
-                                tool_text
-                            };
+                            let tool_text = crate::error_prefixed(tool_text, *is_error);
                             out.push(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
@@ -185,7 +179,7 @@ pub(super) fn to_openai_messages(
                         // no detail; kloop does not expose it yet).
                         ContentBlock::Image { source } => images.push(image_url_part(source)),
                         ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
-                            return Err(protocol(
+                            return Err(RAIL.protocol(
                                 "received reasoning that was not removed by the authorized request view",
                             ));
                         }
@@ -223,35 +217,7 @@ struct CallAcc {
     args: String,
 }
 
-fn protocol(message: impl Into<String>) -> ProviderFailure {
-    ProviderFailure::protocol(format!("openai-compat {}", message.into()))
-}
-
-fn lock_identity(
-    slot: &mut Option<String>,
-    value: &Value,
-    field: &str,
-) -> Result<(), ProviderFailure> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let value = value
-        .as_str()
-        .ok_or_else(|| protocol(format!("tool {field} was not a string")))?;
-    if value.is_empty() {
-        return Ok(());
-    }
-    match slot {
-        Some(current) if current != value => {
-            Err(protocol(format!("tool {field} changed during streaming")))
-        }
-        Some(_) => Ok(()),
-        None => {
-            *slot = Some(value.to_string());
-            Ok(())
-        }
-    }
-}
+const RAIL: super::Rail = super::Rail::new("openai-compat");
 
 fn map_finish_reason(reason: &str) -> Result<AssistantOutcome, ProviderFailure> {
     match reason {
@@ -262,46 +228,7 @@ fn map_finish_reason(reason: &str) -> Result<AssistantOutcome, ProviderFailure> 
         )),
         "content_filter" => Ok(AssistantOutcome::Filtered),
         "refusal" => Ok(AssistantOutcome::Refused),
-        _ => Err(protocol("returned an unknown finish reason")),
-    }
-}
-
-fn parse_usage(value: &Value) -> Result<Usage, ProviderFailure> {
-    let prompt = value["prompt_tokens"]
-        .as_u64()
-        .ok_or_else(|| protocol("usage missing prompt_tokens"))?;
-    let output = value["completion_tokens"]
-        .as_u64()
-        .ok_or_else(|| protocol("usage missing completion_tokens"))?;
-    let cached = cached_tokens(value)?;
-    if cached > prompt {
-        return Err(protocol("usage cached_tokens exceeded prompt_tokens"));
-    }
-    Ok(Usage {
-        input_tokens: prompt - cached,
-        output_tokens: output,
-        cache_read_input_tokens: cached,
-        cache_creation_input_tokens: 0,
-    })
-}
-
-/// The cached part of the prompt count. `prompt_tokens_details` absent or null
-/// means "no hit reported" and reads as 0; an object without the count says the
-/// same. A block or count of another type is bad data — chained indexing would
-/// turn a string or an array into `Null` and silently report a cache miss.
-fn cached_tokens(value: &Value) -> Result<u64, ProviderFailure> {
-    let details = &value["prompt_tokens_details"];
-    if details.is_null() {
-        return Ok(0);
-    }
-    if !details.is_object() {
-        return Err(protocol("usage prompt_tokens_details was not an object"));
-    }
-    match &details["cached_tokens"] {
-        Value::Null => Ok(0),
-        other => other
-            .as_u64()
-            .ok_or_else(|| protocol("usage cached_tokens was not an integer")),
+        _ => Err(RAIL.protocol("returned an unknown finish reason")),
     }
 }
 
@@ -312,14 +239,13 @@ fn semantic_string<'a>(
     match object.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value)),
-        Some(_) => Err(protocol(format!("delta {field} was not a string"))),
+        Some(_) => Err(RAIL.protocol(format!("delta {field} was not a string"))),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn apply_choice_payload(
     payload: &serde_json::Map<String, Value>,
-    text: &mut String,
     thinking: &mut String,
     display_text: &mut String,
     refusal_seen: &mut bool,
@@ -338,12 +264,12 @@ async fn apply_choice_payload(
         .keys()
         .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
     {
-        return Err(protocol("returned an unknown semantic delta field"));
+        return Err(RAIL.protocol("returned an unknown semantic delta field"));
     }
     if let Some(role) = semantic_string(payload, "role")?
         && role != "assistant"
     {
-        return Err(protocol("delta role was not assistant"));
+        return Err(RAIL.protocol("delta role was not assistant"));
     }
 
     let mut semantic = false;
@@ -351,7 +277,7 @@ async fn apply_choice_payload(
     let reasoning = semantic_string(payload, "reasoning")?;
     let reasoning_piece = match (reasoning_content, reasoning) {
         (Some(left), Some(right)) if left != right => {
-            return Err(protocol("reasoning aliases conflicted"));
+            return Err(RAIL.protocol("reasoning aliases conflicted"));
         }
         (Some(value), _) | (_, Some(value)) => Some(value),
         (None, None) => None,
@@ -367,7 +293,6 @@ async fn apply_choice_payload(
         && !piece.is_empty()
     {
         semantic = true;
-        text.push_str(piece);
         display_text.push_str(piece);
         sink.text_delta(piece.to_string()).await?;
     }
@@ -385,51 +310,59 @@ async fn apply_choice_payload(
             if tool_calls.is_null() {
                 return Ok(semantic);
             }
-            return Err(protocol("delta tool_calls was not an array"));
+            return Err(RAIL.protocol("delta tool_calls was not an array"));
         };
         for call in tool_calls {
             semantic = true;
             let call_object = call
                 .as_object()
-                .ok_or_else(|| protocol("tool call was not an object"))?;
+                .ok_or_else(|| RAIL.protocol("tool call was not an object"))?;
             let index = call["index"]
                 .as_u64()
-                .ok_or_else(|| protocol("tool call was missing its wire index"))?;
+                .ok_or_else(|| RAIL.protocol("tool call was missing its wire index"))?;
             if let Some(kind) = call.get("type")
                 && kind.as_str() != Some("function")
             {
-                return Err(protocol("tool call type was not function"));
+                return Err(RAIL.protocol("tool call type was not function"));
             }
             let acc = calls.entry(index).or_default();
-            lock_identity(&mut acc.id, &call["id"], "id")?;
+            crate::lock_identity(
+                RAIL,
+                &mut acc.id,
+                &call["id"],
+                "id",
+                crate::EmptyIdentity::Deferred,
+            )?;
             let function = call.get("function");
             if let Some(function) = function {
                 let function = function
                     .as_object()
-                    .ok_or_else(|| protocol("tool call function was not an object"))?;
-                lock_identity(
+                    .ok_or_else(|| RAIL.protocol("tool call function was not an object"))?;
+                crate::lock_identity(
+                    RAIL,
                     &mut acc.name,
                     function.get("name").unwrap_or(&Value::Null),
                     "name",
+                    crate::EmptyIdentity::Deferred,
                 )?;
                 if let Some(arguments) = function.get("arguments") {
                     let arguments = arguments
                         .as_str()
-                        .ok_or_else(|| protocol("tool arguments fragment was not a string"))?;
+                        .ok_or_else(|| RAIL.protocol("tool arguments fragment was not a string"))?;
                     acc.args.push_str(arguments);
                 }
                 if function
                     .keys()
                     .any(|field| !matches!(field.as_str(), "name" | "arguments"))
                 {
-                    return Err(protocol("tool function contained an unknown field"));
+                    return Err(RAIL.protocol("tool function contained an unknown field"));
                 }
             }
             if call_object
                 .keys()
                 .any(|field| !matches!(field.as_str(), "index" | "id" | "type" | "function"))
             {
-                return Err(protocol("tool call contained an unknown field"));
+                return Err(RAIL.protocol("tool call contained an unknown field"));
             }
         }
     }
@@ -446,7 +379,6 @@ pub(super) async fn stream(
     let resp = crate::send_checked(req, "openai-compat", url, cred.secret()).await?;
 
     let mut frames = SseFrames::new(resp.bytes_stream());
-    let mut text = String::new();
     let mut display_text = String::new();
     let mut thinking = String::new();
     let mut refusal_seen = false;
@@ -466,13 +398,13 @@ pub(super) async fn stream(
         };
         let Some(frame) = frame else { break };
         if transport_done {
-            return Err(protocol("SSE frame arrived after [DONE]"));
+            return Err(RAIL.protocol("SSE frame arrived after [DONE]"));
         }
         if !matches!(
             frame.event.as_deref(),
             None | Some("message") | Some("error")
         ) {
-            return Err(protocol("returned an unknown SSE event name"));
+            return Err(RAIL.protocol("returned an unknown SSE event name"));
         }
         if frame.data.trim() == "[DONE]" {
             transport_done = true;
@@ -497,29 +429,37 @@ pub(super) async fn stream(
         if let Some(raw_usage) = value.get("usage")
             && !raw_usage.is_null()
         {
-            usage = Some(parse_usage(raw_usage)?);
+            usage = Some(crate::openai_usage(
+                RAIL,
+                raw_usage,
+                crate::UsageFields {
+                    prompt: "prompt_tokens",
+                    output: "completion_tokens",
+                    details: "prompt_tokens_details",
+                },
+            )?);
         }
 
         let choices = value
             .get("choices")
             .and_then(Value::as_array)
-            .ok_or_else(|| protocol("frame was missing choices"))?;
+            .ok_or_else(|| RAIL.protocol("frame was missing choices"))?;
         if choices.is_empty() {
             if value.get("usage").is_none_or(Value::is_null) {
-                return Err(protocol("empty choices frame did not contain usage"));
+                return Err(RAIL.protocol("empty choices frame did not contain usage"));
             }
             continue;
         }
         if choices.len() != 1 {
-            return Err(protocol("returned more than one logical choice"));
+            return Err(RAIL.protocol("returned more than one logical choice"));
         }
         let choice = &choices[0];
         let index = choice["index"]
             .as_u64()
-            .ok_or_else(|| protocol("choice was missing its index"))?;
+            .ok_or_else(|| RAIL.protocol("choice was missing its index"))?;
         match choice_index {
             Some(current) if current != index => {
-                return Err(protocol("choice index changed during streaming"));
+                return Err(RAIL.protocol("choice index changed during streaming"));
             }
             None => choice_index = Some(index),
             Some(_) => {}
@@ -529,13 +469,12 @@ pub(super) async fn stream(
             (Some(Value::Object(delta)), None) => delta,
             (None, Some(Value::Object(message))) => message,
             (Some(Value::Object(_)), Some(Value::Object(_))) => {
-                return Err(protocol("choice contained both delta and final message"));
+                return Err(RAIL.protocol("choice contained both delta and final message"));
             }
-            _ => return Err(protocol("choice was missing a delta object")),
+            _ => return Err(RAIL.protocol("choice was missing a delta object")),
         };
         let semantic = apply_choice_payload(
             payload,
-            &mut text,
             &mut thinking,
             &mut display_text,
             &mut refusal_seen,
@@ -544,7 +483,7 @@ pub(super) async fn stream(
         )
         .await?;
         if outcome.is_some() && semantic {
-            return Err(protocol("semantic delta arrived after finish reason"));
+            return Err(RAIL.protocol("semantic delta arrived after finish reason"));
         }
 
         if let Some(reason) = choice.get("finish_reason")
@@ -552,9 +491,9 @@ pub(super) async fn stream(
         {
             let reason = reason
                 .as_str()
-                .ok_or_else(|| protocol("finish_reason was not a string"))?;
+                .ok_or_else(|| RAIL.protocol("finish_reason was not a string"))?;
             if outcome.is_some() {
-                return Err(protocol("received duplicate finish_reason"));
+                return Err(RAIL.protocol("received duplicate finish_reason"));
             }
             let mapped = map_finish_reason(reason)?;
             outcome = Some(if refusal_seen && mapped == AssistantOutcome::EndTurn {
@@ -591,10 +530,10 @@ pub(super) async fn stream(
     for (_, acc) in calls {
         let id = acc
             .id
-            .ok_or_else(|| protocol("tool call completed without an id"))?;
+            .ok_or_else(|| RAIL.protocol("tool call completed without an id"))?;
         let name = acc
             .name
-            .ok_or_else(|| protocol("tool call completed without a name"))?;
+            .ok_or_else(|| RAIL.protocol("tool call completed without a name"))?;
         blocks.push(crate::tool_use_block(id, name, &acc.args));
     }
     if refusal_seen
@@ -605,7 +544,7 @@ pub(super) async fn stream(
             )
         })
     {
-        return Err(protocol("response combined refusal with tool calls"));
+        return Err(RAIL.protocol("response combined refusal with tool calls"));
     }
     crate::validate_assistant_output("openai-compat", &outcome, &blocks)?;
     for block in blocks {

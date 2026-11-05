@@ -1,7 +1,8 @@
 # Plan 254 — provider 三条轨去重与流解析性能
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量。**先做 plan 253**:它会改到
+> 状态：✅ 已完成（2026-11-05）。第 1–5 条已实现；第 6 条按用户决定跳过，仍需真实 API 观测。
+> 行号是 2026-10-28 的读数，开工先自己量。**先做 plan 253**:它会改到
 > 这里要合并的几个函数(缓存计数宽松化只需在合并后的一处改)。
 
 ## 背景
@@ -44,3 +45,19 @@
 - 去重提交：现有 `provider/tests/*` 一行不改全部通过;diff 除调用点外接近零改动。
 - 性能提交：补一条"一个 chunk 含几千帧"的解析测试(断言结果，不断言耗时)。
 - 外层执行沙箱之外 `make check`;HANDOFF 记进展。
+
+## 完成记录（2026-11-05）
+
+- 第 1 条：`SseParser::feed` 改为读偏移，帧在缓冲上就地校验/解析，消费前缀结束时一次
+  `drain`；每个 payload 只分配一个 `String`。新增 5000 帧单 chunk 回归与“完整帧先于残片”
+  回归。
+- 第 2 条：Anthropic 的 `content_block`/`delta` 直接借用；三条轨的完成块改为
+  `CompletedToolCalls`（id、name、输入是否对象），Responses 另记 `landed_output` 布尔值。
+- 第 3 条：Chat 轨删除只写不读的 `text` 缓冲。
+- 第 4 条：`lib.rs` 新增 `Rail` 上下文、`display_conflict`/`DisplayKind`、带
+  `EmptyIdentity` 的 `lock_identity`。
+- 第 5 条：`openai_usage`/`UsageFields`、`image_data_url`、`error_prefixed`、`tool_fields`
+  统一两条 OpenAI 轨的翻译。
+- 第 6 条：按用户决定跳过（需要真实 API 观测缓存命中率）。
+- 验证：现有 provider 测试未改全部通过；外层执行沙箱之外 `make check` 全绿（workspace
+  2257 项通过、6 项 ignored，本机 parity baseline verified）。

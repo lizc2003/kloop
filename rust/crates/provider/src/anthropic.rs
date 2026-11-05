@@ -6,11 +6,12 @@ use std::collections::HashSet;
 use serde_json::Value;
 use serde_json::json;
 
+use super::CompletedToolCalls;
+use super::DisplayKind;
 use super::ProviderFailure;
 use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
-use super::sse::SseFrame;
 use super::tool_id::ToolIdRule;
 use super::tool_id::WireToolIds;
 use kloop_protocol::AssistantBlock;
@@ -132,21 +133,17 @@ enum BlockAcc {
     },
 }
 
-fn protocol(message: impl Into<String>) -> ProviderFailure {
-    ProviderFailure::protocol(format!("anthropic {}", message.into()))
+impl BlockAcc {
+    fn display_kind(&self) -> Option<DisplayKind> {
+        match self {
+            Self::Text { .. } => Some(DisplayKind::Text),
+            Self::Thinking { .. } => Some(DisplayKind::Reasoning),
+            Self::ToolUse { .. } | Self::RedactedThinking { .. } => None,
+        }
+    }
 }
 
-fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderFailure> {
-    value
-        .as_str()
-        .ok_or_else(|| protocol(format!("missing or invalid {field}")))
-}
-
-fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
-    value
-        .as_u64()
-        .ok_or_else(|| protocol(format!("missing or invalid {field}")))
-}
+const RAIL: super::Rail = super::Rail::new("anthropic");
 
 /// A usage field a gateway may omit or send as null; both mean "not reported".
 fn optional_u64(
@@ -155,18 +152,8 @@ fn optional_u64(
 ) -> Result<Option<u64>, ProviderFailure> {
     match usage.get(field) {
         None | Some(Value::Null) => Ok(None),
-        Some(value) => required_u64(value, field).map(Some),
+        Some(value) => RAIL.required_u64(value, field).map(Some),
     }
-}
-
-fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, ProviderFailure> {
-    let kind = required_str(&value["type"], "event type")?;
-    if let Some(wire) = frame.event.as_deref()
-        && wire != kind
-    {
-        return Err(protocol("SSE event name did not match payload type"));
-    }
-    Ok(kind)
 }
 
 fn map_stop_reason(reason: &str) -> Result<AssistantOutcome, ProviderFailure> {
@@ -181,27 +168,29 @@ fn map_stop_reason(reason: &str) -> Result<AssistantOutcome, ProviderFailure> {
         )),
         "refusal" => Ok(AssistantOutcome::Refused),
         "pause_turn" => Ok(AssistantOutcome::Incomplete(IncompleteReason::PauseTurn)),
-        _ => Err(protocol("returned an unknown stop reason")),
+        _ => Err(RAIL.protocol("returned an unknown stop reason")),
     }
 }
 
 fn start_block(content: &Value) -> Result<BlockAcc, ProviderFailure> {
-    let kind = required_str(&content["type"], "content block type")?;
+    let kind = RAIL.required_str(&content["type"], "content block type")?;
     match kind {
         "text" => Ok(BlockAcc::Text {
-            text: required_str(&content["text"], "text block text")?.to_string(),
+            text: RAIL
+                .required_str(&content["text"], "text block text")?
+                .to_string(),
         }),
         "tool_use" => {
-            let id = required_str(&content["id"], "tool id")?;
-            let name = required_str(&content["name"], "tool name")?;
+            let id = RAIL.required_str(&content["id"], "tool id")?;
+            let name = RAIL.required_str(&content["name"], "tool name")?;
             if id.is_empty() || name.is_empty() {
-                return Err(protocol("tool id and name must be non-empty"));
+                return Err(RAIL.protocol("tool id and name must be non-empty"));
             }
             let initial_input = content
                 .get("input")
                 .filter(|input| input.is_object())
                 .cloned()
-                .ok_or_else(|| protocol("tool start input must be an object"))?;
+                .ok_or_else(|| RAIL.protocol("tool start input must be an object"))?;
             Ok(BlockAcc::ToolUse {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -210,13 +199,19 @@ fn start_block(content: &Value) -> Result<BlockAcc, ProviderFailure> {
             })
         }
         "thinking" => Ok(BlockAcc::Thinking {
-            thinking: required_str(&content["thinking"], "thinking text")?.to_string(),
-            signature: required_str(&content["signature"], "thinking signature")?.to_string(),
+            thinking: RAIL
+                .required_str(&content["thinking"], "thinking text")?
+                .to_string(),
+            signature: RAIL
+                .required_str(&content["signature"], "thinking signature")?
+                .to_string(),
         }),
         "redacted_thinking" => Ok(BlockAcc::RedactedThinking {
-            data: required_str(&content["data"], "redacted thinking data")?.to_string(),
+            data: RAIL
+                .required_str(&content["data"], "redacted thinking data")?
+                .to_string(),
         }),
-        _ => Err(protocol("returned an unsupported content block type")),
+        _ => Err(RAIL.protocol("returned an unsupported content block type")),
     }
 }
 
@@ -240,9 +235,7 @@ fn finish_block(acc: BlockAcc) -> Result<AssistantBlock, ProviderFailure> {
                 .as_object()
                 .is_some_and(|object| !object.is_empty())
             {
-                return Err(protocol(
-                    "tool input appeared in both start and delta events",
-                ));
+                return Err(RAIL.protocol("tool input appeared in both start and delta events"));
             }
             Ok(crate::tool_use_block(id, name, &json))
         }
@@ -297,7 +290,7 @@ pub(super) async fn stream(
     let mut started = false;
     let mut open: HashMap<u64, BlockAcc> = HashMap::new();
     let mut seen_indices = HashSet::new();
-    let mut completed = Vec::new();
+    let mut completed = CompletedToolCalls::default();
     let mut outcome: Option<AssistantOutcome> = None;
     let mut completion = None;
     let mut input_tokens = None;
@@ -307,22 +300,22 @@ pub(super) async fn stream(
 
     while let Some(frame) = frames.next().await? {
         let value = crate::parse_sse_json("anthropic", &frame.data)?;
-        let event = event_type(&frame, &value)?;
+        let event = RAIL.event_type(&frame, &value)?;
         if completion.is_some() && event != "ping" {
-            return Err(protocol("semantic event arrived after message_stop"));
+            return Err(RAIL.protocol("semantic event arrived after message_stop"));
         }
         match event {
             "message_start" => {
                 if started {
-                    return Err(protocol("received duplicate message_start"));
+                    return Err(RAIL.protocol("received duplicate message_start"));
                 }
                 if outcome.is_some() || !open.is_empty() || !seen_indices.is_empty() {
-                    return Err(protocol("received message_start after message content"));
+                    return Err(RAIL.protocol("received message_start after message content"));
                 }
                 let usage = value["message"]["usage"]
                     .as_object()
-                    .ok_or_else(|| protocol("message_start missing usage"))?;
-                input_tokens = Some(required_u64(
+                    .ok_or_else(|| RAIL.protocol("message_start missing usage"))?;
+                input_tokens = Some(RAIL.required_u64(
                     usage.get("input_tokens").unwrap_or(&Value::Null),
                     "input_tokens",
                 )?);
@@ -332,114 +325,111 @@ pub(super) async fn stream(
             }
             "content_block_start" => {
                 if !started {
-                    return Err(protocol("content block arrived before message_start"));
+                    return Err(RAIL.protocol("content block arrived before message_start"));
                 }
                 if outcome.is_some() {
-                    return Err(protocol("content block arrived after message_delta"));
+                    return Err(RAIL.protocol("content block arrived after message_delta"));
                 }
-                let index = required_u64(&value["index"], "content block index")?;
+                let index = RAIL.required_u64(&value["index"], "content block index")?;
                 if !seen_indices.insert(index) {
-                    return Err(protocol("content block index was started more than once"));
+                    return Err(RAIL.protocol("content block index was started more than once"));
                 }
-                let content = value["content_block"]
-                    .as_object()
-                    .ok_or_else(|| protocol("content_block_start missing content_block"))?;
-                let acc = start_block(&Value::Object(content.clone()))?;
-                let display_kind_open = open.values().any(|current| {
-                    matches!(
-                        (&acc, current),
-                        (BlockAcc::Text { .. }, BlockAcc::Text { .. })
-                            | (BlockAcc::Thinking { .. }, BlockAcc::Thinking { .. })
-                    )
-                });
+                let content = &value["content_block"];
+                if !content.is_object() {
+                    return Err(RAIL.protocol("content_block_start missing content_block"));
+                }
+                let acc = start_block(content)?;
+                let display_kind_open = super::display_conflict(
+                    open.values().map(BlockAcc::display_kind),
+                    acc.display_kind(),
+                );
                 if display_kind_open {
-                    return Err(protocol(
-                        "concurrent display blocks had no canonical identity",
-                    ));
+                    return Err(
+                        RAIL.protocol("concurrent display blocks had no canonical identity")
+                    );
                 }
                 open.insert(index, acc);
             }
             "content_block_delta" => {
                 if !started {
-                    return Err(protocol("content delta arrived before message_start"));
+                    return Err(RAIL.protocol("content delta arrived before message_start"));
                 }
                 if outcome.is_some() {
-                    return Err(protocol("content delta arrived after message_delta"));
+                    return Err(RAIL.protocol("content delta arrived after message_delta"));
                 }
-                let index = required_u64(&value["index"], "content block index")?;
+                let index = RAIL.required_u64(&value["index"], "content block index")?;
                 let acc = open
                     .get_mut(&index)
-                    .ok_or_else(|| protocol("content delta referenced a non-open block"))?;
-                let delta = value["delta"]
-                    .as_object()
-                    .ok_or_else(|| protocol("content delta missing delta object"))?;
-                let delta = Value::Object(delta.clone());
-                let kind = required_str(&delta["type"], "content delta type")?;
+                    .ok_or_else(|| RAIL.protocol("content delta referenced a non-open block"))?;
+                let delta = &value["delta"];
+                if !delta.is_object() {
+                    return Err(RAIL.protocol("content delta missing delta object"));
+                }
+                let kind = RAIL.required_str(&delta["type"], "content delta type")?;
                 match (kind, acc) {
                     ("text_delta", BlockAcc::Text { text }) => {
-                        let piece = required_str(&delta["text"], "text delta text")?;
+                        let piece = RAIL.required_str(&delta["text"], "text delta text")?;
                         text.push_str(piece);
                         if !piece.is_empty() {
                             sink.text_delta(piece.to_string()).await?;
                         }
                     }
                     ("input_json_delta", BlockAcc::ToolUse { json, .. }) => {
-                        json.push_str(required_str(
-                            &delta["partial_json"],
-                            "tool input JSON delta",
-                        )?);
+                        json.push_str(
+                            RAIL.required_str(&delta["partial_json"], "tool input JSON delta")?,
+                        );
                     }
                     ("thinking_delta", BlockAcc::Thinking { thinking, .. }) => {
-                        let piece = required_str(&delta["thinking"], "thinking delta text")?;
+                        let piece = RAIL.required_str(&delta["thinking"], "thinking delta text")?;
                         thinking.push_str(piece);
                         if !piece.is_empty() {
                             sink.thinking_delta(piece.to_string()).await?;
                         }
                     }
                     ("signature_delta", BlockAcc::Thinking { signature, .. }) => {
-                        signature.push_str(required_str(
-                            &delta["signature"],
-                            "thinking signature delta",
-                        )?);
+                        signature.push_str(
+                            RAIL.required_str(&delta["signature"], "thinking signature delta")?,
+                        );
                     }
-                    _ => return Err(protocol("content delta type did not match its block")),
+                    _ => return Err(RAIL.protocol("content delta type did not match its block")),
                 }
             }
             "content_block_stop" => {
                 if !started {
-                    return Err(protocol("content block stop arrived before message_start"));
+                    return Err(RAIL.protocol("content block stop arrived before message_start"));
                 }
                 if outcome.is_some() {
-                    return Err(protocol("content block stop arrived after message_delta"));
+                    return Err(RAIL.protocol("content block stop arrived after message_delta"));
                 }
-                let index = required_u64(&value["index"], "content block index")?;
-                let acc = open
-                    .remove(&index)
-                    .ok_or_else(|| protocol("content block stop referenced a non-open block"))?;
+                let index = RAIL.required_u64(&value["index"], "content block index")?;
+                let acc = open.remove(&index).ok_or_else(|| {
+                    RAIL.protocol("content block stop referenced a non-open block")
+                })?;
                 let block = finish_block(acc)?;
                 if block.has_semantic_payload() {
-                    completed.push(block.clone());
+                    completed.record(&block);
                     sink.block_done(block).await?;
                 }
             }
             "message_delta" => {
                 if !started {
-                    return Err(protocol("message_delta arrived before message_start"));
+                    return Err(RAIL.protocol("message_delta arrived before message_start"));
                 }
                 if outcome.is_some() {
-                    return Err(protocol("received duplicate message_delta stop reason"));
+                    return Err(RAIL.protocol("received duplicate message_delta stop reason"));
                 }
                 if !open.is_empty() {
-                    return Err(protocol(
-                        "message_delta arrived with unfinished content blocks",
-                    ));
+                    return Err(
+                        RAIL.protocol("message_delta arrived with unfinished content blocks")
+                    );
                 }
-                let reason = required_str(&value["delta"]["stop_reason"], "message stop reason")?;
+                let reason =
+                    RAIL.required_str(&value["delta"]["stop_reason"], "message stop reason")?;
                 outcome = Some(map_stop_reason(reason)?);
                 let usage = value["usage"]
                     .as_object()
-                    .ok_or_else(|| protocol("message_delta missing usage"))?;
-                output_tokens = Some(required_u64(
+                    .ok_or_else(|| RAIL.protocol("message_delta missing usage"))?;
+                output_tokens = Some(RAIL.required_u64(
                     usage.get("output_tokens").unwrap_or(&Value::Null),
                     "output_tokens",
                 )?);
@@ -458,22 +448,22 @@ pub(super) async fn stream(
             }
             "message_stop" => {
                 if !started {
-                    return Err(protocol("message_stop arrived before message_start"));
+                    return Err(RAIL.protocol("message_stop arrived before message_start"));
                 }
                 if !open.is_empty() {
-                    return Err(protocol(
-                        "message_stop arrived with unfinished content blocks",
-                    ));
+                    return Err(
+                        RAIL.protocol("message_stop arrived with unfinished content blocks")
+                    );
                 }
                 let outcome = outcome
                     .take()
-                    .ok_or_else(|| protocol("message_stop arrived before message_delta"))?;
-                crate::validate_assistant_output("anthropic", &outcome, &completed)?;
+                    .ok_or_else(|| RAIL.protocol("message_stop arrived before message_delta"))?;
+                completed.validate_against("anthropic", &outcome)?;
                 let usage = Some(Usage {
                     input_tokens: input_tokens
-                        .ok_or_else(|| protocol("missing final input token usage"))?,
+                        .ok_or_else(|| RAIL.protocol("missing final input token usage"))?,
                     output_tokens: output_tokens
-                        .ok_or_else(|| protocol("missing final output token usage"))?,
+                        .ok_or_else(|| RAIL.protocol("missing final output token usage"))?,
                     cache_read_input_tokens: cache_read,
                     cache_creation_input_tokens: cache_creation,
                 });
@@ -488,7 +478,7 @@ pub(super) async fn stream(
                     cred.secret(),
                 ));
             }
-            _ => return Err(protocol("returned an unknown semantic event")),
+            _ => return Err(RAIL.protocol("returned an unknown semantic event")),
         }
         if completion.is_some() {
             frames.stop();

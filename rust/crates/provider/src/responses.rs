@@ -15,11 +15,11 @@ use std::collections::HashSet;
 use serde_json::Value;
 use serde_json::json;
 
+use super::CompletedToolCalls;
 use super::ProviderFailure;
 use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
-use super::sse::SseFrame;
 use super::tool_id::ToolIdRule;
 use super::tool_id::WireToolIds;
 use kloop_protocol::AssistantBlock;
@@ -37,10 +37,9 @@ use kloop_protocol::Usage;
 /// data-URL image_url with detail=auto. Used for both top-level user images and
 /// images embedded in a tool_result's function_call_output.
 fn input_image_item(source: &ImageSource) -> Value {
-    let ImageSource::Base64 { media_type, data } = source;
     json!({
         "type": "input_image",
-        "image_url": format!("data:{media_type};base64,{data}"),
+        "image_url": crate::image_data_url(source),
         "detail": "auto",
     })
 }
@@ -63,11 +62,7 @@ fn blocks_to_output_items(blocks: &[ContentBlock], is_error: bool) -> Vec<Value>
             _ => {}
         }
     }
-    let text = if is_error {
-        format!("[error] {text}")
-    } else {
-        text
-    };
+    let text = crate::error_prefixed(text, is_error);
     if !text.is_empty() {
         items.insert(0, json!({"type": "input_text", "text": text}));
     }
@@ -137,11 +132,7 @@ pub(super) fn to_input_items(messages: &[Message]) -> Result<Vec<Value>, Provide
                             // bare string to keep the common case unchanged.
                             let output = match content {
                                 ToolResultContent::Text(s) => {
-                                    if *is_error {
-                                        Value::String(format!("[error] {s}"))
-                                    } else {
-                                        Value::String(s.clone())
-                                    }
+                                    Value::String(crate::error_prefixed(s.clone(), *is_error))
                                 }
                                 ToolResultContent::Blocks(blocks) => {
                                     Value::Array(blocks_to_output_items(blocks, *is_error))
@@ -198,7 +189,7 @@ fn message_part_value<'a>(
     kind: MessagePartKind,
     field: &str,
 ) -> Result<&'a str, ProviderFailure> {
-    required_str(&value[message_part_field(kind)], field)
+    RAIL.required_str(&value[message_part_field(kind)], field)
 }
 
 /// The text a part opens with. `*_part.added` carries `""` on the reference
@@ -211,7 +202,7 @@ fn opening_part_text<'a>(value: &'a Value, field: &str) -> Result<&'a str, Provi
     if value.is_null() {
         return Ok("");
     }
-    required_str(value, field)
+    RAIL.required_str(value, field)
 }
 
 struct TextPart {
@@ -249,22 +240,24 @@ struct ItemState {
     kind: ItemKind,
 }
 
+impl ItemKind {
+    fn display_kind(&self) -> Option<super::DisplayKind> {
+        match self {
+            Self::Message { .. } => Some(super::DisplayKind::Text),
+            Self::Reasoning { .. } => Some(super::DisplayKind::Reasoning),
+            Self::FunctionCall { .. } => None,
+        }
+    }
+}
+
 type ItemKey = (u64, String);
 
-fn protocol(message: impl Into<String>) -> ProviderFailure {
-    ProviderFailure::protocol(format!("openai-responses {}", message.into()))
-}
-
-fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderFailure> {
-    value
-        .as_str()
-        .ok_or_else(|| protocol(format!("missing or invalid {field}")))
-}
+const RAIL: super::Rail = super::Rail::new("openai-responses");
 
 fn required_non_empty<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderFailure> {
-    let value = required_str(value, field)?;
+    let value = RAIL.required_str(value, field)?;
     if value.is_empty() {
-        return Err(protocol(format!("{field} was empty")));
+        return Err(RAIL.protocol(format!("{field} was empty")));
     }
     Ok(value)
 }
@@ -282,22 +275,6 @@ fn arguments_agree(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
-}
-
-fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
-    value
-        .as_u64()
-        .ok_or_else(|| protocol(format!("missing or invalid {field}")))
-}
-
-fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, ProviderFailure> {
-    let kind = required_str(&value["type"], "event type")?;
-    if let Some(wire) = frame.event.as_deref()
-        && wire != kind
-    {
-        return Err(protocol("SSE event name did not match payload type"));
-    }
-    Ok(kind)
 }
 
 /// Codex 式代理往 Responses 流里塞的厂商带外事件只携带遥测或心跳、
@@ -328,54 +305,16 @@ fn response_id_of(response: &Value) -> Result<&str, ProviderFailure> {
 
 fn event_item_key(value: &Value) -> Result<ItemKey, ProviderFailure> {
     Ok((
-        required_u64(&value["output_index"], "output_index")?,
+        RAIL.required_u64(&value["output_index"], "output_index")?,
         required_non_empty(&value["item_id"], "item_id")?.to_string(),
     ))
 }
 
 fn item_key(value: &Value) -> Result<ItemKey, ProviderFailure> {
     Ok((
-        required_u64(&value["output_index"], "output_index")?,
+        RAIL.required_u64(&value["output_index"], "output_index")?,
         required_non_empty(&value["item"]["id"], "output item id")?.to_string(),
     ))
-}
-
-fn lock_identity(
-    slot: &mut Option<String>,
-    value: &Value,
-    field: &str,
-) -> Result<(), ProviderFailure> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let value = required_non_empty(value, field)?;
-    match slot {
-        Some(current) if current != value => Err(protocol(format!("{field} changed"))),
-        Some(_) => Ok(()),
-        None => {
-            *slot = Some(value.to_string());
-            Ok(())
-        }
-    }
-}
-
-/// The cached part of the input count. See the Chat rail's copy: absent or null
-/// means "no hit reported", while a details block of another type is bad data
-/// that chained indexing would silently read as a cache miss.
-fn cached_tokens(usage: &Value) -> Result<u64, ProviderFailure> {
-    let details = &usage["input_tokens_details"];
-    if details.is_null() {
-        return Ok(0);
-    }
-    if !details.is_object() {
-        return Err(protocol("input_tokens_details was not an object"));
-    }
-    match &details["cached_tokens"] {
-        Value::Null => Ok(0),
-        other => other
-            .as_u64()
-            .ok_or_else(|| protocol("cached_tokens was not an integer")),
-    }
 }
 
 fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
@@ -384,20 +323,18 @@ fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
         return Ok(None);
     }
     if !usage.is_object() {
-        return Err(protocol("usage was not an object"));
+        return Err(RAIL.protocol("usage was not an object"));
     }
-    let input = required_u64(&usage["input_tokens"], "input_tokens")?;
-    let output = required_u64(&usage["output_tokens"], "output_tokens")?;
-    let cached = cached_tokens(usage)?;
-    if cached > input {
-        return Err(protocol("cached_tokens exceeded input_tokens"));
-    }
-    Ok(Some(Usage {
-        input_tokens: input - cached,
-        output_tokens: output,
-        cache_read_input_tokens: cached,
-        cache_creation_input_tokens: 0,
-    }))
+    crate::openai_usage(
+        RAIL,
+        usage,
+        crate::UsageFields {
+            prompt: "input_tokens",
+            output: "output_tokens",
+            details: "input_tokens_details",
+        },
+    )
+    .map(Some)
 }
 
 #[derive(Clone, Copy)]
@@ -429,15 +366,15 @@ fn item_status<'a>(
 ) -> Result<Option<&'a str>, ProviderFailure> {
     match item.get("status") {
         None => match policy {
-            ItemStatusPolicy::Required => required_str(&item["status"], field).map(Some),
+            ItemStatusPolicy::Required => RAIL.required_str(&item["status"], field).map(Some),
             ItemStatusPolicy::Optional => Ok(None),
         },
-        Some(status) => required_str(status, field).map(Some),
+        Some(status) => RAIL.required_str(status, field).map(Some),
     }
 }
 
 fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
-    let item_type = required_str(&item["type"], "output item type")?;
+    let item_type = RAIL.required_str(&item["type"], "output item type")?;
     let status_policy = if item_type == "reasoning" {
         ItemStatusPolicy::Optional
     } else {
@@ -446,15 +383,15 @@ fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
     match item_status(item, "output item status", status_policy)? {
         None | Some("in_progress") => {}
         Some(other) => {
-            return Err(protocol(format!(
+            return Err(RAIL.protocol(format!(
                 "added output {item_type} item status was {other:?}, not in_progress"
             )));
         }
     }
     let kind = match item_type {
         "message" => {
-            if required_str(&item["role"], "message role")? != "assistant" {
-                return Err(protocol("output message role was not assistant"));
+            if RAIL.required_str(&item["role"], "message role")? != "assistant" {
+                return Err(RAIL.protocol("output message role was not assistant"));
             }
             ItemKind::Message {
                 parts: BTreeMap::new(),
@@ -467,12 +404,24 @@ fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
         "function_call" => {
             let mut call_id = None;
             let mut name = None;
-            lock_identity(&mut call_id, &item["call_id"], "call_id")?;
-            lock_identity(&mut name, &item["name"], "function name")?;
+            crate::lock_identity(
+                RAIL,
+                &mut call_id,
+                &item["call_id"],
+                "call_id",
+                crate::EmptyIdentity::Rejected,
+            )?;
+            crate::lock_identity(
+                RAIL,
+                &mut name,
+                &item["name"],
+                "function name",
+                crate::EmptyIdentity::Rejected,
+            )?;
             let arguments = match item.get("arguments") {
                 None | Some(Value::Null) => String::new(),
                 Some(Value::String(value)) => value.clone(),
-                Some(_) => return Err(protocol("function arguments were not a string")),
+                Some(_) => return Err(RAIL.protocol("function arguments were not a string")),
             };
             ItemKind::FunctionCall {
                 call_id,
@@ -482,7 +431,7 @@ fn start_item(item: &Value) -> Result<ItemState, ProviderFailure> {
                 arguments_done: false,
             }
         }
-        _ => return Err(protocol("returned an unsupported output item type")),
+        _ => return Err(RAIL.protocol("returned an unsupported output item type")),
     };
     Ok(ItemState { kind })
 }
@@ -495,12 +444,12 @@ fn add_content_part(
     match &mut state.kind {
         ItemKind::Message { parts } => {
             if parts.values().any(|part| !part.part_closed) {
-                return Err(protocol("message content parts overlapped"));
+                return Err(RAIL.protocol("message content parts overlapped"));
             }
-            let kind = match required_str(&part["type"], "content part type")? {
+            let kind = match RAIL.required_str(&part["type"], "content part type")? {
                 "output_text" => MessagePartKind::OutputText,
                 "refusal" => MessagePartKind::Refusal,
-                _ => return Err(protocol("message contained an unsupported content part")),
+                _ => return Err(RAIL.protocol("message contained an unsupported content part")),
             };
             let text = opening_part_text(&part[message_part_field(kind)], "content part value")?
                 .to_string();
@@ -516,7 +465,7 @@ fn add_content_part(
                 )
                 .is_some()
             {
-                return Err(protocol("content_index was added more than once"));
+                return Err(RAIL.protocol("content_index was added more than once"));
             }
             Ok(kind == MessagePartKind::Refusal)
         }
@@ -527,8 +476,9 @@ fn add_content_part(
             // open. Reasoning parts are independent by index, and correctness
             // rides on the item boundary instead — `verify_reasoning_parts`
             // matches each accumulated part against the final array.
-            if required_str(&part["type"], "reasoning content part type")? != "reasoning_text" {
-                return Err(protocol("reasoning contained an unsupported content part"));
+            if RAIL.required_str(&part["type"], "reasoning content part type")? != "reasoning_text"
+            {
+                return Err(RAIL.protocol("reasoning contained an unsupported content part"));
             }
             let text = opening_part_text(&part["text"], "reasoning part text")?.to_string();
             if content
@@ -541,11 +491,13 @@ fn add_content_part(
                 )
                 .is_some()
             {
-                return Err(protocol("reasoning content_index was added more than once"));
+                return Err(RAIL.protocol("reasoning content_index was added more than once"));
             }
             Ok(false)
         }
-        ItemKind::FunctionCall { .. } => Err(protocol("function call received a content part")),
+        ItemKind::FunctionCall { .. } => {
+            Err(RAIL.protocol("function call received a content part"))
+        }
     }
 }
 
@@ -555,15 +507,13 @@ fn text_part_mut(
     expected: MessagePartKind,
 ) -> Result<&mut TextPart, ProviderFailure> {
     let ItemKind::Message { parts } = &mut state.kind else {
-        return Err(protocol("text event referenced a non-message item"));
+        return Err(RAIL.protocol("text event referenced a non-message item"));
     };
     let part = parts
         .get_mut(&index)
-        .ok_or_else(|| protocol("text event referenced an unknown content part"))?;
+        .ok_or_else(|| RAIL.protocol("text event referenced an unknown content part"))?;
     if part.kind != expected || part.part_closed || part.field_done {
-        return Err(protocol(
-            "text event referenced the wrong or closed content part",
-        ));
+        return Err(RAIL.protocol("text event referenced the wrong or closed content part"));
     }
     Ok(part)
 }
@@ -578,7 +528,7 @@ fn reasoning_part_mut(
         content,
     } = &mut state.kind
     else {
-        return Err(protocol("reasoning event referenced a non-reasoning item"));
+        return Err(RAIL.protocol("reasoning event referenced a non-reasoning item"));
     };
     // The first delta may be the part's only announcement: a gateway streams
     // raw reasoning with no `content_part.added` and no `.done`, closing the
@@ -591,7 +541,7 @@ fn reasoning_part_mut(
         .entry(index)
         .or_default();
     if part.part_closed || part.field_done {
-        return Err(protocol("reasoning event referenced a closed part"));
+        return Err(RAIL.protocol("reasoning event referenced a closed part"));
     }
     Ok(part)
 }
@@ -601,16 +551,16 @@ fn check_final_item_status(
     expected_type: &str,
     status_policy: ItemStatusPolicy,
 ) -> Result<ItemCompletion, ProviderFailure> {
-    let item_type = required_str(&item["type"], "final output item type")?;
+    let item_type = RAIL.required_str(&item["type"], "final output item type")?;
     if item_type != expected_type {
-        return Err(protocol(format!(
+        return Err(RAIL.protocol(format!(
             "final output item type changed from {expected_type} to {item_type}"
         )));
     }
     match item_status(item, "final output item status", status_policy)? {
         None | Some("completed") => Ok(ItemCompletion::Completed),
         Some("incomplete") => Ok(ItemCompletion::Truncated),
-        Some(other) => Err(protocol(format!(
+        Some(other) => Err(RAIL.protocol(format!(
             "final output {item_type} item status was {other:?}, neither completed nor incomplete"
         ))),
     }
@@ -622,29 +572,25 @@ fn finish_message(
     refusal_seen: &mut bool,
 ) -> Result<(Vec<AssistantBlock>, ItemCompletion), ProviderFailure> {
     let completion = check_final_item_status(item, "message", ItemStatusPolicy::Required)?;
-    if required_str(&item["role"], "final message role")? != "assistant" {
-        return Err(protocol("final output message role was not assistant"));
+    if RAIL.required_str(&item["role"], "final message role")? != "assistant" {
+        return Err(RAIL.protocol("final output message role was not assistant"));
     }
     let content = parts_array(&item["content"], "message content")?;
     let ItemKind::Message { parts } = state.kind else {
-        return Err(protocol("final message referenced the wrong item type"));
+        return Err(RAIL.protocol("final message referenced the wrong item type"));
     };
     let mut text = String::new();
     if parts.is_empty() {
         if !content.is_empty() {
-            return Err(protocol(
-                "final message introduced content without a part lifecycle",
-            ));
+            return Err(RAIL.protocol("final message introduced content without a part lifecycle"));
         }
     } else {
         if content.len() != parts.len() {
-            return Err(protocol(
-                "final message content count did not match streamed parts",
-            ));
+            return Err(RAIL.protocol("final message content count did not match streamed parts"));
         }
         for (position, (index, part)) in parts.into_iter().enumerate() {
             if index != position as u64 || !part.field_done || !part.part_closed {
-                return Err(protocol("message content parts were not fully closed"));
+                return Err(RAIL.protocol("message content parts were not fully closed"));
             }
             let final_part = &content[position];
             let expected = match part.kind {
@@ -654,13 +600,11 @@ fn finish_message(
                     "refusal"
                 }
             };
-            if required_str(&final_part["type"], "final content part type")? != expected
+            if RAIL.required_str(&final_part["type"], "final content part type")? != expected
                 || message_part_value(final_part, part.kind, "final content part value")?
                     != part.text
             {
-                return Err(protocol(
-                    "final message content did not match streamed text",
-                ));
+                return Err(RAIL.protocol("final message content did not match streamed text"));
             }
             text.push_str(&part.text);
         }
@@ -683,7 +627,7 @@ fn parts_array<'a>(value: &'a Value, what: &str) -> Result<&'a [Value], Provider
     match value {
         Value::Null => Ok(&[]),
         other => other.as_array().map(Vec::as_slice).ok_or_else(|| {
-            protocol(format!(
+            RAIL.protocol(format!(
                 "final {what} was not an array (got {})",
                 json_type(other)
             ))
@@ -712,14 +656,10 @@ fn verify_reasoning_parts(
         if final_parts.is_empty() {
             return Ok(Vec::new());
         }
-        return Err(protocol(
-            "final reasoning introduced content without a part lifecycle",
-        ));
+        return Err(RAIL.protocol("final reasoning introduced content without a part lifecycle"));
     }
     if final_parts.len() != parts.len() {
-        return Err(protocol(
-            "final reasoning part count did not match streaming",
-        ));
+        return Err(RAIL.protocol("final reasoning part count did not match streaming"));
     }
     let mut texts = Vec::with_capacity(parts.len());
     for (position, (index, part)) in parts.into_iter().enumerate() {
@@ -728,13 +668,13 @@ fn verify_reasoning_parts(
         // the stream is the text comparison below against the final array —
         // per-part `.done` was only ever a redundant, earlier check.
         if index != position as u64 {
-            return Err(protocol("reasoning part indices were not dense"));
+            return Err(RAIL.protocol("reasoning part indices were not dense"));
         }
         let final_part = &final_parts[position];
-        if required_str(&final_part["type"], "final reasoning part type")? != final_type
-            || required_str(&final_part["text"], "final reasoning text")? != part.text
+        if RAIL.required_str(&final_part["type"], "final reasoning part type")? != final_type
+            || RAIL.required_str(&final_part["text"], "final reasoning text")? != part.text
         {
-            return Err(protocol("final reasoning text did not match streamed text"));
+            return Err(RAIL.protocol("final reasoning text did not match streamed text"));
         }
         texts.push(part.text);
     }
@@ -747,7 +687,7 @@ fn finish_reasoning(
 ) -> Result<(Vec<AssistantBlock>, ItemCompletion), ProviderFailure> {
     let completion = check_final_item_status(item, "reasoning", ItemStatusPolicy::Optional)?;
     let ItemKind::Reasoning { summary, content } = state.kind else {
-        return Err(protocol("final reasoning referenced the wrong item type"));
+        return Err(RAIL.protocol("final reasoning referenced the wrong item type"));
     };
     let mut texts = verify_reasoning_parts(&item["summary"], summary, "summary_text")?;
     let mut raw = verify_reasoning_parts(&item["content"], content, "reasoning_text")?;
@@ -755,7 +695,7 @@ fn finish_reasoning(
     let signature = match item.get("encrypted_content") {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(value)) => value.clone(),
-        Some(_) => return Err(protocol("encrypted_content was not a string")),
+        Some(_) => return Err(RAIL.protocol("encrypted_content was not a string")),
     };
     let block = AssistantBlock::Thinking {
         thinking: texts.concat(),
@@ -784,9 +724,7 @@ fn finish_function_call(
         arguments_done,
     } = state.kind
     else {
-        return Err(protocol(
-            "final function call referenced the wrong item type",
-        ));
+        return Err(RAIL.protocol("final function call referenced the wrong item type"));
     };
     let final_call_id = required_non_empty(&item["call_id"], "final call_id")?;
     let final_name = required_non_empty(&item["name"], "final function name")?;
@@ -794,19 +732,17 @@ fn finish_function_call(
         .as_deref()
         .is_some_and(|value| value != final_call_id)
     {
-        return Err(protocol("call_id changed"));
+        return Err(RAIL.protocol("call_id changed"));
     }
     if name.as_deref().is_some_and(|value| value != final_name) {
-        return Err(protocol("function name changed"));
+        return Err(RAIL.protocol("function name changed"));
     }
-    let final_arguments = required_str(&item["arguments"], "final function arguments")?;
+    let final_arguments = RAIL.required_str(&item["arguments"], "final function arguments")?;
     if !arguments_started || !arguments_done {
-        return Err(protocol("function arguments were not fully closed"));
+        return Err(RAIL.protocol("function arguments were not fully closed"));
     }
     if !arguments_agree(&arguments, final_arguments) {
-        return Err(protocol(
-            "final function arguments did not match streamed arguments",
-        ));
+        return Err(RAIL.protocol("final function arguments did not match streamed arguments"));
     }
     let call_id = final_call_id.to_string();
     let name = final_name.to_string();
@@ -855,22 +791,22 @@ fn terminal_outcome(
     response: &Value,
     output: &OutputSummary,
 ) -> Result<AssistantOutcome, ProviderFailure> {
-    let status = required_str(&response["status"], "response status")?;
+    let status = RAIL.required_str(&response["status"], "response status")?;
     match event {
         "response.completed" => {
             if status != "completed" {
-                return Err(protocol("completed event carried a non-completed status"));
+                return Err(RAIL.protocol("completed event carried a non-completed status"));
             }
             // An item said the budget ran out and the response says it ran to
             // completion: the two describe different responses. Nothing below
             // could pick the right one, so fail closed.
             if output.truncated {
-                return Err(protocol(
-                    "an output item reported truncation but the response completed",
-                ));
+                return Err(
+                    RAIL.protocol("an output item reported truncation but the response completed")
+                );
             }
             match (output.has_tool, output.has_refusal) {
-                (true, true) => Err(protocol("response combined refusal with function calls")),
+                (true, true) => Err(RAIL.protocol("response combined refusal with function calls")),
                 (true, false) => Ok(AssistantOutcome::ToolUse),
                 (false, true) => Ok(AssistantOutcome::Refused),
                 (false, false) => Ok(AssistantOutcome::EndTurn),
@@ -878,10 +814,10 @@ fn terminal_outcome(
         }
         "response.incomplete" => {
             if status != "incomplete" {
-                return Err(protocol("incomplete event carried a non-incomplete status"));
+                return Err(RAIL.protocol("incomplete event carried a non-incomplete status"));
             }
             if output.has_tool && output.has_refusal {
-                return Err(protocol("response combined refusal with function calls"));
+                return Err(RAIL.protocol("response combined refusal with function calls"));
             }
             let reason = required_non_empty(
                 &response["incomplete_details"]["reason"],
@@ -944,16 +880,18 @@ fn stream_failure(event: &str, value: &Value, key: &str) -> ProviderFailure {
 }
 
 /// Everything one Responses stream accumulates: the response identity it
-/// adopted, the output items still open, the blocks already handed to the sink,
-/// and the terminal once one lands. One method per wire event family, so the
-/// grouping the event names already declare (`response.output_item.*`,
+/// adopted, the output items still open, the tool calls already handed to the
+/// sink, and the terminal once one lands. One method per wire event family, so
+/// the grouping the event names already declare (`response.output_item.*`,
 /// `response.function_call_arguments.*`, …) is the grouping of the code too.
 #[derive(Default)]
 struct ResponseStream {
     response_id: Option<String>,
     items: BTreeMap<ItemKey, ItemState>,
     seen_items: HashSet<ItemKey>,
-    completed_blocks: Vec<AssistantBlock>,
+    completed_calls: CompletedToolCalls,
+    /// Whether any semantic block has reached the sink.
+    landed_output: bool,
     output: OutputSummary,
     completion: Option<StreamCompletion>,
 }
@@ -965,7 +903,7 @@ impl ResponseStream {
         let key = event_item_key(value)?;
         self.items
             .get_mut(&key)
-            .ok_or_else(|| protocol(format!("{what} referenced an unknown item")))
+            .ok_or_else(|| RAIL.protocol(format!("{what} referenced an unknown item")))
     }
 
     /// `response.created` and `response.in_progress` are pure lifecycle
@@ -992,13 +930,13 @@ impl ResponseStream {
         let id = response_id_of(&value["response"])?;
         let adopt = match self.response_id.as_deref() {
             None if event == "response.in_progress" => {
-                return Err(protocol("response.in_progress arrived before created"));
+                return Err(RAIL.protocol("response.in_progress arrived before created"));
             }
             None => true,
             Some(seen) if seen == id => false,
             Some(seen) => {
-                if !self.seen_items.is_empty() || !self.completed_blocks.is_empty() {
-                    return Err(protocol(format!(
+                if !self.seen_items.is_empty() || self.landed_output {
+                    return Err(RAIL.protocol(format!(
                         "response identity changed from {seen} to {id} after output \
                              had landed"
                     )));
@@ -1015,10 +953,10 @@ impl ResponseStream {
     fn on_metadata(&self, value: &Value) -> Result<(), ProviderFailure> {
         let id = required_non_empty(&value["response_id"], "metadata response id")?;
         if self.response_id.as_deref() != Some(id) {
-            return Err(protocol("metadata referenced an unknown response"));
+            return Err(RAIL.protocol("metadata referenced an unknown response"));
         }
         if !value["metadata"].is_object() {
-            return Err(protocol("metadata was not an object"));
+            return Err(RAIL.protocol("metadata was not an object"));
         }
         Ok(())
     }
@@ -1026,24 +964,21 @@ impl ResponseStream {
     /// `response.output_item.added`: an item opens.
     fn on_item_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
         if self.response_id.is_none() {
-            return Err(protocol("output item arrived before response.created"));
+            return Err(RAIL.protocol("output item arrived before response.created"));
         }
         let key = item_key(value)?;
         if !self.seen_items.insert(key.clone()) {
-            return Err(protocol("output item identity was added more than once"));
+            return Err(RAIL.protocol("output item identity was added more than once"));
         }
         let state = start_item(&value["item"])?;
-        let display_kind_open = self.items.values().any(|current| {
-            matches!(
-                (&state.kind, &current.kind),
-                (ItemKind::Message { .. }, ItemKind::Message { .. })
-                    | (ItemKind::Reasoning { .. }, ItemKind::Reasoning { .. })
-            )
-        });
+        let display_kind_open = crate::display_conflict(
+            self.items
+                .values()
+                .map(|current| current.kind.display_kind()),
+            state.kind.display_kind(),
+        );
         if display_kind_open {
-            return Err(protocol(
-                "concurrent display items had no canonical identity",
-            ));
+            return Err(RAIL.protocol("concurrent display items had no canonical identity"));
         }
         self.items.insert(key, state);
         Ok(())
@@ -1059,7 +994,7 @@ impl ResponseStream {
         let state = self
             .items
             .remove(&key)
-            .ok_or_else(|| protocol("output item done referenced a non-open item"))?;
+            .ok_or_else(|| RAIL.protocol("output item done referenced a non-open item"))?;
         let (mut blocks, completion) =
             finish_item(state, &value["item"], &mut self.output.has_refusal)?;
         self.output.truncated |= completion == ItemCompletion::Truncated;
@@ -1074,7 +1009,8 @@ impl ResponseStream {
         }
         for block in blocks.drain(..) {
             if block.has_semantic_payload() {
-                self.completed_blocks.push(block.clone());
+                self.completed_calls.record(&block);
+                self.landed_output = true;
                 sink.block_done(block).await?;
             }
         }
@@ -1084,7 +1020,7 @@ impl ResponseStream {
     /// `response.content_part.added`: a message part opens.
     fn on_content_part_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
         let state = self.open_item(value, "content part")?;
-        let index = required_u64(&value["content_index"], "content_index")?;
+        let index = RAIL.required_u64(&value["content_index"], "content_index")?;
         let refusal = add_content_part(state, index, &value["part"])?;
         self.output.has_refusal |= refusal;
         Ok(())
@@ -1094,44 +1030,45 @@ impl ResponseStream {
     /// closes, and its final value has to be the one the deltas built.
     fn on_content_part_done(&mut self, value: &Value) -> Result<(), ProviderFailure> {
         let state = self.open_item(value, "content part done")?;
-        let index = required_u64(&value["content_index"], "content_index")?;
+        let index = RAIL.required_u64(&value["content_index"], "content_index")?;
         match &mut state.kind {
             ItemKind::Message { parts } => {
                 let part = parts
                     .get_mut(&index)
-                    .ok_or_else(|| protocol("content part done referenced an unknown part"))?;
+                    .ok_or_else(|| RAIL.protocol("content part done referenced an unknown part"))?;
                 if !part.field_done || part.part_closed {
-                    return Err(protocol("content part closed out of order"));
+                    return Err(RAIL.protocol("content part closed out of order"));
                 }
                 let expected = match part.kind {
                     MessagePartKind::OutputText => "output_text",
                     MessagePartKind::Refusal => "refusal",
                 };
-                if required_str(&value["part"]["type"], "content part type")? != expected
+                if RAIL.required_str(&value["part"]["type"], "content part type")? != expected
                     || message_part_value(&value["part"], part.kind, "content part value")?
                         != part.text
                 {
-                    return Err(protocol("content part final value changed"));
+                    return Err(RAIL.protocol("content part final value changed"));
                 }
                 part.part_closed = true;
             }
             ItemKind::Reasoning { content, .. } => {
-                let part = content
-                    .get_mut(&index)
-                    .ok_or_else(|| protocol("reasoning content done referenced an unknown part"))?;
+                let part = content.get_mut(&index).ok_or_else(|| {
+                    RAIL.protocol("reasoning content done referenced an unknown part")
+                })?;
                 if !part.field_done || part.part_closed {
-                    return Err(protocol("reasoning content part closed out of order"));
+                    return Err(RAIL.protocol("reasoning content part closed out of order"));
                 }
-                if required_str(&value["part"]["type"], "reasoning content part type")?
+                if RAIL.required_str(&value["part"]["type"], "reasoning content part type")?
                     != "reasoning_text"
-                    || required_str(&value["part"]["text"], "reasoning content text")? != part.text
+                    || RAIL.required_str(&value["part"]["text"], "reasoning content text")?
+                        != part.text
                 {
-                    return Err(protocol("reasoning content final value changed"));
+                    return Err(RAIL.protocol("reasoning content final value changed"));
                 }
                 part.part_closed = true;
             }
             ItemKind::FunctionCall { .. } => {
-                return Err(protocol("function call received content_part.done"));
+                return Err(RAIL.protocol("function call received content_part.done"));
             }
         }
         Ok(())
@@ -1148,9 +1085,9 @@ impl ResponseStream {
     ) -> Result<(), ProviderFailure> {
         let expected = self.message_part_kind(event, "response.output_text.delta");
         let state = self.open_item(value, "text delta")?;
-        let index = required_u64(&value["content_index"], "content_index")?;
+        let index = RAIL.required_u64(&value["content_index"], "content_index")?;
         let part = text_part_mut(state, index, expected)?;
-        let delta = required_str(&value["delta"], "text delta")?;
+        let delta = RAIL.required_str(&value["delta"], "text delta")?;
         part.text.push_str(delta);
         if !delta.is_empty() {
             sink.text_delta(delta.to_string()).await?;
@@ -1162,10 +1099,10 @@ impl ResponseStream {
     fn on_message_text_done(&mut self, event: &str, value: &Value) -> Result<(), ProviderFailure> {
         let expected = self.message_part_kind(event, "response.output_text.done");
         let state = self.open_item(value, "text done")?;
-        let index = required_u64(&value["content_index"], "content_index")?;
+        let index = RAIL.required_u64(&value["content_index"], "content_index")?;
         let part = text_part_mut(state, index, expected)?;
         if message_part_value(value, expected, "final text value")? != part.text {
-            return Err(protocol("text done did not match accumulated delta"));
+            return Err(RAIL.protocol("text done did not match accumulated delta"));
         }
         part.field_done = true;
         Ok(())
@@ -1186,18 +1123,18 @@ impl ResponseStream {
     /// `response.reasoning_summary_part.added`.
     fn on_reasoning_part_added(&mut self, value: &Value) -> Result<(), ProviderFailure> {
         let state = self.open_item(value, "reasoning part")?;
-        let index = required_u64(&value["summary_index"], "summary_index")?;
+        let index = RAIL.required_u64(&value["summary_index"], "summary_index")?;
         let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
-            return Err(protocol("reasoning part referenced the wrong item type"));
+            return Err(RAIL.protocol("reasoning part referenced the wrong item type"));
         };
         // Opening a part while earlier ones are still open is the
         // norm on this wire, not a violation — see `add_content_part`.
-        if required_str(&value["part"]["type"], "summary part type")? != "summary_text" {
-            return Err(protocol("reasoning summary part type was unsupported"));
+        if RAIL.required_str(&value["part"]["type"], "summary part type")? != "summary_text" {
+            return Err(RAIL.protocol("reasoning summary part type was unsupported"));
         }
         let text = opening_part_text(&value["part"]["text"], "summary part text")?;
         if summary.contains_key(&index) {
-            return Err(protocol("summary_index was added more than once"));
+            return Err(RAIL.protocol("summary_index was added more than once"));
         }
         summary.insert(
             index,
@@ -1212,22 +1149,20 @@ impl ResponseStream {
     /// `response.reasoning_summary_part.done`.
     fn on_reasoning_part_done(&mut self, value: &Value) -> Result<(), ProviderFailure> {
         let state = self.open_item(value, "reasoning part done")?;
-        let index = required_u64(&value["summary_index"], "summary_index")?;
+        let index = RAIL.required_u64(&value["summary_index"], "summary_index")?;
         let ItemKind::Reasoning { summary, .. } = &mut state.kind else {
-            return Err(protocol(
-                "reasoning part done referenced the wrong item type",
-            ));
+            return Err(RAIL.protocol("reasoning part done referenced the wrong item type"));
         };
         let part = summary
             .get_mut(&index)
-            .ok_or_else(|| protocol("reasoning part done referenced an unknown part"))?;
+            .ok_or_else(|| RAIL.protocol("reasoning part done referenced an unknown part"))?;
         if !part.field_done || part.part_closed {
-            return Err(protocol("reasoning summary part closed out of order"));
+            return Err(RAIL.protocol("reasoning summary part closed out of order"));
         }
-        if required_str(&value["part"]["type"], "summary part type")? != "summary_text"
-            || required_str(&value["part"]["text"], "summary part text")? != part.text
+        if RAIL.required_str(&value["part"]["type"], "summary part type")? != "summary_text"
+            || RAIL.required_str(&value["part"]["text"], "summary part text")? != part.text
         {
-            return Err(protocol("reasoning summary part final value changed"));
+            return Err(RAIL.protocol("reasoning summary part final value changed"));
         }
         part.part_closed = true;
         Ok(())
@@ -1245,7 +1180,7 @@ impl ResponseStream {
         let state = self.open_item(value, "reasoning delta")?;
         let index = reasoning_index(value, summary)?;
         let part = reasoning_part_mut(state, index, summary)?;
-        let delta = required_str(&value["delta"], "reasoning delta")?;
+        let delta = RAIL.required_str(&value["delta"], "reasoning delta")?;
         part.text.push_str(delta);
         if !delta.is_empty() {
             sink.thinking_delta(delta.to_string()).await?;
@@ -1263,8 +1198,8 @@ impl ResponseStream {
         let state = self.open_item(value, "reasoning done")?;
         let index = reasoning_index(value, summary)?;
         let part = reasoning_part_mut(state, index, summary)?;
-        if required_str(&value["text"], "final reasoning text")? != part.text {
-            return Err(protocol("reasoning done did not match accumulated delta"));
+        if RAIL.required_str(&value["text"], "final reasoning text")? != part.text {
+            return Err(RAIL.protocol("reasoning done did not match accumulated delta"));
         }
         part.field_done = true;
         Ok(())
@@ -1280,13 +1215,13 @@ impl ResponseStream {
             ..
         } = &mut state.kind
         else {
-            return Err(protocol("arguments delta referenced a non-function item"));
+            return Err(RAIL.protocol("arguments delta referenced a non-function item"));
         };
         if *arguments_done {
-            return Err(protocol("arguments delta arrived after arguments done"));
+            return Err(RAIL.protocol("arguments delta arrived after arguments done"));
         }
         *arguments_started = true;
-        arguments.push_str(required_str(&value["delta"], "arguments delta")?);
+        arguments.push_str(RAIL.required_str(&value["delta"], "arguments delta")?);
         Ok(())
     }
 
@@ -1300,13 +1235,13 @@ impl ResponseStream {
             ..
         } = &mut state.kind
         else {
-            return Err(protocol("arguments done referenced a non-function item"));
+            return Err(RAIL.protocol("arguments done referenced a non-function item"));
         };
         if *arguments_done {
-            return Err(protocol("received duplicate arguments done"));
+            return Err(RAIL.protocol("received duplicate arguments done"));
         }
         *arguments_started = true;
-        let final_arguments = required_str(&value["arguments"], "final arguments")?;
+        let final_arguments = RAIL.required_str(&value["arguments"], "final arguments")?;
         if arguments.is_empty() {
             // Nothing was streamed for the deltas to contradict: a relay may
             // deliver a whole call's arguments in this one frame, and whether it
@@ -1315,7 +1250,7 @@ impl ResponseStream {
             // still cross-checked below.
             *arguments = final_arguments.to_owned();
         } else if !arguments_agree(final_arguments, arguments.as_str()) {
-            return Err(protocol("arguments done did not match accumulated delta"));
+            return Err(RAIL.protocol("arguments done did not match accumulated delta"));
         }
         *arguments_done = true;
         Ok(())
@@ -1326,16 +1261,17 @@ impl ResponseStream {
         let expected = self
             .response_id
             .as_deref()
-            .ok_or_else(|| protocol("terminal arrived before response.created"))?;
+            .ok_or_else(|| RAIL.protocol("terminal arrived before response.created"))?;
         if !self.items.is_empty() {
-            return Err(protocol("terminal arrived with open output items"));
+            return Err(RAIL.protocol("terminal arrived with open output items"));
         }
         let id = response_id_of(&value["response"])?;
         if id != expected {
-            return Err(protocol("terminal response identity changed"));
+            return Err(RAIL.protocol("terminal response identity changed"));
         }
         let outcome = terminal_outcome(event, &value["response"], &self.output)?;
-        crate::validate_assistant_output("openai-responses", &outcome, &self.completed_blocks)?;
+        self.completed_calls
+            .validate_against("openai-responses", &outcome)?;
         self.completion = Some(StreamCompletion::new(
             outcome,
             usage_from(&value["response"])?,
@@ -1348,9 +1284,9 @@ impl ResponseStream {
 /// `content_index`.
 fn reasoning_index(value: &Value, summary: bool) -> Result<u64, ProviderFailure> {
     if summary {
-        required_u64(&value["summary_index"], "summary_index")
+        RAIL.required_u64(&value["summary_index"], "summary_index")
     } else {
-        required_u64(&value["content_index"], "content_index")
+        RAIL.required_u64(&value["content_index"], "content_index")
     }
 }
 
@@ -1371,12 +1307,12 @@ pub(super) async fn stream(
             if state.completion.is_some() {
                 continue;
             }
-            return Err(protocol("[DONE] arrived before a semantic terminal"));
+            return Err(RAIL.protocol("[DONE] arrived before a semantic terminal"));
         }
         let value = crate::parse_sse_json("openai-responses", &frame.data)?;
-        let event = event_type(&frame, &value)?;
+        let event = RAIL.event_type(&frame, &value)?;
         if state.completion.is_some() && !is_out_of_band(event) {
-            return Err(protocol("semantic event arrived after response terminal"));
+            return Err(RAIL.protocol("semantic event arrived after response terminal"));
         }
         match event {
             "response.created" | "response.in_progress" => state.on_lifecycle(event, &value)?,
@@ -1409,7 +1345,7 @@ pub(super) async fn stream(
             // Name the offender: without it a new vendor event costs an SSE
             // capture to identify (how `keepalive` was found).
             _ => {
-                return Err(protocol(format!(
+                return Err(RAIL.protocol(format!(
                     "returned an unknown semantic event: {}",
                     bounded_reason(event)
                 )));

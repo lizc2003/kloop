@@ -37,6 +37,7 @@ use sha2::Sha256;
 
 use kloop_protocol::AssistantBlock;
 use kloop_protocol::AssistantOutcome;
+use kloop_protocol::ImageSource;
 use kloop_protocol::Message;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAttemptIdentity;
@@ -285,45 +286,273 @@ pub(crate) fn error_detail(error: &Value, secret: &str) -> Option<String> {
 
 const MAX_ERROR_DETAIL_CHARS: usize = 300;
 
-fn validate_assistant_blocks(
-    rail: &str,
-    blocks: &[AssistantBlock],
-) -> Result<bool, ProviderFailure> {
-    let mut tool_ids = HashSet::new();
-    let mut has_tool = false;
-    for block in blocks {
+/// Per-rail failure prefix plus the field checks every adapter needs. The three
+/// rails differ in vocabulary, not in what "required" means, so the helpers
+/// live here once and each module carries its own [`Rail`].
+#[derive(Clone, Copy)]
+pub(crate) struct Rail(&'static str);
+
+impl Rail {
+    pub(crate) const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    pub(crate) fn protocol(self, message: impl Into<String>) -> ProviderFailure {
+        ProviderFailure::protocol(format!("{} {}", self.0, message.into()))
+    }
+
+    pub(crate) fn required_str<'a>(
+        self,
+        value: &'a Value,
+        field: &str,
+    ) -> Result<&'a str, ProviderFailure> {
+        value
+            .as_str()
+            .ok_or_else(|| self.protocol(format!("missing or invalid {field}")))
+    }
+
+    pub(crate) fn required_u64(self, value: &Value, field: &str) -> Result<u64, ProviderFailure> {
+        value
+            .as_u64()
+            .ok_or_else(|| self.protocol(format!("missing or invalid {field}")))
+    }
+
+    pub(crate) fn event_type<'a>(
+        self,
+        frame: &sse::SseFrame,
+        value: &'a Value,
+    ) -> Result<&'a str, ProviderFailure> {
+        let kind = self.required_str(&value["type"], "event type")?;
+        if let Some(wire) = frame.event.as_deref()
+            && wire != kind
+        {
+            return Err(self.protocol("SSE event name did not match payload type"));
+        }
+        Ok(kind)
+    }
+}
+
+/// The display families that share the sink's single text/reasoning channel.
+/// Anthropic and Responses both refuse a second open block of the same family:
+/// no canonical identity exists to attach its deltas to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayKind {
+    Text,
+    Reasoning,
+}
+
+/// Whether `opening` would be a second open display block of its family.
+pub(crate) fn display_conflict(
+    open: impl Iterator<Item = Option<DisplayKind>>,
+    opening: Option<DisplayKind>,
+) -> bool {
+    opening.is_some() && open.flatten().any(|kind| Some(kind) == opening)
+}
+
+/// How a rail treats an empty identity string while streaming.
+#[derive(Clone, Copy)]
+pub(crate) enum EmptyIdentity {
+    /// Chat streams open a call with an empty id/name and fill it in later.
+    Deferred,
+    /// Responses ids are required the first time they appear.
+    Rejected,
+}
+
+/// Lock a wire identity field: the first non-empty value wins, and a later
+/// different one is a protocol violation. `empty` selects what an empty string
+/// means on this rail.
+pub(crate) fn lock_identity(
+    rail: Rail,
+    slot: &mut Option<String>,
+    value: &Value,
+    field: &str,
+    empty: EmptyIdentity,
+) -> Result<(), ProviderFailure> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let value = match empty {
+        EmptyIdentity::Deferred => value
+            .as_str()
+            .ok_or_else(|| rail.protocol(format!("tool {field} was not a string")))?,
+        EmptyIdentity::Rejected => rail.required_str(value, field)?,
+    };
+    if value.is_empty() {
+        return match empty {
+            EmptyIdentity::Deferred => Ok(()),
+            EmptyIdentity::Rejected => Err(rail.protocol(format!("{field} was empty"))),
+        };
+    }
+    match slot {
+        Some(current) if current != value => Err(rail.protocol(format!("{field} changed"))),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(value.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// The usage report the two OpenAI-shaped rails send under different names.
+/// Both count cached tokens inside the prompt count; canonical usage keeps them
+/// separate, so subtract.
+pub(crate) struct UsageFields {
+    pub prompt: &'static str,
+    pub output: &'static str,
+    pub details: &'static str,
+}
+
+pub(crate) fn openai_usage(
+    rail: Rail,
+    usage: &Value,
+    fields: UsageFields,
+) -> Result<Usage, ProviderFailure> {
+    let prompt = rail.required_u64(&usage[fields.prompt], fields.prompt)?;
+    let output = rail.required_u64(&usage[fields.output], fields.output)?;
+    let cached = cached_tokens(rail, usage, fields.details)?;
+    if cached > prompt {
+        return Err(rail.protocol(format!("cached_tokens exceeded {}", fields.prompt)));
+    }
+    Ok(Usage {
+        input_tokens: prompt - cached,
+        output_tokens: output,
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+    })
+}
+
+/// The cached part of the prompt count. The details block absent or null means
+/// "no hit reported" and reads as 0; an object without the count says the same.
+/// A block or count of another type is bad data — chained indexing would turn a
+/// string or an array into `Null` and silently report a cache miss.
+fn cached_tokens(rail: Rail, usage: &Value, details_key: &str) -> Result<u64, ProviderFailure> {
+    let details = &usage[details_key];
+    if details.is_null() {
+        return Ok(0);
+    }
+    if !details.is_object() {
+        return Err(rail.protocol(format!("{details_key} was not an object")));
+    }
+    match &details["cached_tokens"] {
+        Value::Null => Ok(0),
+        other => other
+            .as_u64()
+            .ok_or_else(|| rail.protocol("cached_tokens was not an integer")),
+    }
+}
+
+/// A canonical base64 image as the `data:` URL both OpenAI-shaped rails put on
+/// the wire, wrapped as `image_url` (Chat) or `input_image` (Responses).
+pub(crate) fn image_data_url(source: &ImageSource) -> String {
+    let ImageSource::Base64 { media_type, data } = source;
+    format!("data:{media_type};base64,{data}")
+}
+
+/// The model-visible marker on a failed tool result.
+pub(crate) fn error_prefixed(text: String, is_error: bool) -> String {
+    if is_error {
+        format!("[error] {text}")
+    } else {
+        text
+    }
+}
+
+/// Name, description and schema — the part every tool definition shares. The
+/// rails differ only in how they wrap it: `function` on Chat, flat on
+/// Responses.
+pub(crate) fn tool_fields(tool: &ToolDef) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.schema,
+    })
+}
+
+/// Tool identity from completed blocks, kept without the blocks themselves.
+/// Only the checks below need it, and a completed `write_file` call can carry
+/// an entire file in its input.
+#[derive(Default)]
+pub(crate) struct CompletedToolCalls(Vec<CompletedCall>);
+
+struct CompletedCall {
+    id: String,
+    name: String,
+    object_input: bool,
+}
+
+impl CompletedToolCalls {
+    pub(crate) fn record(&mut self, block: &AssistantBlock) {
         // An unreadable call is still a call: it owns an id, it will be paired
         // with a tool_result, and the identity rules below are about the wire,
         // which the model's broken JSON says nothing about.
-        let identity = match block {
-            AssistantBlock::ToolUse { id, name, input } => {
-                if !input.is_object() {
-                    return Err(ProviderFailure::protocol(format!(
-                        "{rail} completed tool {name} with non-object input"
-                    )));
-                }
-                Some((id, name))
-            }
-            AssistantBlock::InvalidToolUse { id, name, .. } => Some((id, name)),
+        let (id, name, object_input) = match block {
+            AssistantBlock::ToolUse { id, name, input } => (id, name, input.is_object()),
+            AssistantBlock::InvalidToolUse { id, name, .. } => (id, name, true),
             AssistantBlock::Text { .. }
             | AssistantBlock::Thinking { .. }
-            | AssistantBlock::RedactedThinking { .. } => None,
+            | AssistantBlock::RedactedThinking { .. } => return,
         };
-        if let Some((id, name)) = identity {
-            has_tool = true;
-            if id.is_empty() || name.is_empty() {
+        self.0.push(CompletedCall {
+            id: id.clone(),
+            name: name.clone(),
+            object_input,
+        });
+    }
+
+    fn validate(&self, rail: &str) -> Result<(), ProviderFailure> {
+        let mut tool_ids = HashSet::new();
+        for call in &self.0 {
+            if !call.object_input {
+                return Err(ProviderFailure::protocol(format!(
+                    "{rail} completed tool {} with non-object input",
+                    call.name
+                )));
+            }
+            if call.id.is_empty() || call.name.is_empty() {
                 return Err(ProviderFailure::protocol(format!(
                     "{rail} completed a tool call with an empty identity"
                 )));
             }
-            if !tool_ids.insert(id) {
+            if !tool_ids.insert(&call.id) {
                 return Err(ProviderFailure::protocol(format!(
                     "{rail} completed duplicate tool call id"
                 )));
             }
         }
+        Ok(())
     }
-    Ok(has_tool)
+
+    pub(crate) fn validate_against(
+        &self,
+        rail: &str,
+        outcome: &AssistantOutcome,
+    ) -> Result<(), ProviderFailure> {
+        self.validate(rail)?;
+        match (
+            matches!(outcome, AssistantOutcome::ToolUse),
+            !self.0.is_empty(),
+        ) {
+            (true, false) => Err(ProviderFailure::protocol(format!(
+                "{rail} reported tool use without a completed tool call"
+            ))),
+            (false, true) => Err(ProviderFailure::protocol(format!(
+                "{rail} completed a tool call for a non-tool outcome"
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn validate_assistant_blocks(
+    rail: &str,
+    blocks: &[AssistantBlock],
+) -> Result<bool, ProviderFailure> {
+    let mut calls = CompletedToolCalls::default();
+    for block in blocks {
+        calls.record(block);
+    }
+    calls.validate(rail)?;
+    Ok(!calls.0.is_empty())
 }
 
 pub(crate) fn validate_assistant_output(
@@ -331,16 +560,11 @@ pub(crate) fn validate_assistant_output(
     outcome: &AssistantOutcome,
     blocks: &[AssistantBlock],
 ) -> Result<(), ProviderFailure> {
-    let has_tool = validate_assistant_blocks(rail, blocks)?;
-    match (matches!(outcome, AssistantOutcome::ToolUse), has_tool) {
-        (true, false) => Err(ProviderFailure::protocol(format!(
-            "{rail} reported tool use without a completed tool call"
-        ))),
-        (false, true) => Err(ProviderFailure::protocol(format!(
-            "{rail} completed a tool call for a non-tool outcome"
-        ))),
-        _ => Ok(()),
+    let mut calls = CompletedToolCalls::default();
+    for block in blocks {
+        calls.record(block);
     }
+    calls.validate_against(rail, outcome)
 }
 
 /// Bounded, char-boundary-safe view of what the model emitted. Long enough to
@@ -680,12 +904,11 @@ impl Provider {
                     body["tools"] = json!(
                         tools
                             .iter()
-                            .map(|t| json!({
-                                "type": "function",
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.schema,
-                            }))
+                            .map(|t| {
+                                let mut def = tool_fields(t);
+                                def["type"] = json!("function");
+                                def
+                            })
                             .collect::<Vec<_>>()
                     );
                 }
@@ -733,11 +956,7 @@ impl Provider {
                             .iter()
                             .map(|t| json!({
                                 "type": "function",
-                                "function": {
-                                    "name": t.name,
-                                    "description": t.description,
-                                    "parameters": t.schema,
-                                },
+                                "function": tool_fields(t),
                             }))
                             .collect::<Vec<_>>()
                     );
