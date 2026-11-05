@@ -21,52 +21,54 @@ pub struct SseFrame {
 impl SseParser {
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, crate::ProviderFailure> {
         self.buf.extend_from_slice(chunk);
+        // Frames are parsed in place and the consumed prefix is dropped once at
+        // the end: draining per frame memmoves the whole remainder, which goes
+        // quadratic when one chunk carries thousands of small frames.
         let mut frames = Vec::new();
+        let mut error = None;
+        let mut consumed = 0;
+        let mut scan_from = self.scan_from;
         loop {
-            while self.buf.first() == Some(&b'\n') || self.buf.starts_with(b"\r\n") {
-                let bytes = if self.buf[0] == b'\n' { 1 } else { 2 };
-                self.buf.drain(..bytes);
-                self.scan_from = 0;
+            // Blank lines separate frames, and a stream may open with them.
+            while consumed < self.buf.len() {
+                if self.buf[consumed] == b'\n' {
+                    consumed += 1;
+                } else if self.buf[consumed..].starts_with(b"\r\n") {
+                    consumed += 2;
+                } else {
+                    break;
+                }
             }
-            let Some(end) = frame_end(&self.buf, self.scan_from) else {
+            scan_from = scan_from.max(consumed);
+            let Some(end) = frame_end(&self.buf, scan_from) else {
                 break;
             };
-            if end > crate::stream::STREAM_MAX_FRAME_BYTES {
-                return Err(crate::ProviderFailure::response_too_large(format!(
+            if end - consumed > crate::stream::STREAM_MAX_FRAME_BYTES {
+                error = Some(crate::ProviderFailure::response_too_large(format!(
                     "SSE frame exceeded {} bytes",
                     crate::stream::STREAM_MAX_FRAME_BYTES
                 )));
+                break;
             }
-            let raw: Vec<u8> = self.buf.drain(..end).collect();
-            self.scan_from = 0;
-            let raw = String::from_utf8(raw).map_err(|error| {
-                crate::ProviderFailure::protocol(format!(
-                    "SSE frame was not valid UTF-8: {}",
-                    error.utf8_error()
-                ))
-            })?;
-            let mut event = None;
-            let mut data_lines = Vec::new();
-            for line in raw.lines() {
-                if let Some(rest) = line.strip_prefix("event:") {
-                    event = Some(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-                } else if let Some(rest) = line.strip_prefix("data:") {
-                    data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+            let raw = match std::str::from_utf8(&self.buf[consumed..end]) {
+                Ok(raw) => raw,
+                Err(invalid) => {
+                    consumed = end;
+                    error = Some(crate::ProviderFailure::protocol(format!(
+                        "SSE frame was not valid UTF-8: {invalid}"
+                    )));
+                    break;
                 }
-                // comments (":...") and other fields ignored
-            }
-            // A field of its own is not an event: `event: ping\n\n` carries no
-            // data, and the SSE dispatch algorithm drops a frame whose data
-            // buffer stayed empty. A present-but-empty `data:` line still
-            // dispatches (the buffer held a newline).
-            if !data_lines.is_empty() {
-                frames.push(SseFrame {
-                    event,
-                    data: data_lines.join("\n"),
-                });
-            }
+            };
+            frames.extend(parse_frame(raw));
+            consumed = end;
+            scan_from = end;
         }
+        self.buf.drain(..consumed);
         self.scan_from = self.buf.len().saturating_sub(2);
+        if let Some(error) = error {
+            return Err(error);
+        }
         if self.buf.len() > crate::stream::STREAM_MAX_FRAME_BYTES {
             return Err(crate::ProviderFailure::response_too_large(format!(
                 "unterminated SSE frame exceeded {} bytes",
@@ -92,6 +94,31 @@ impl SseParser {
     }
 }
 
+/// One complete frame's text, parsed in place. Returns `None` for a frame with
+/// no `data:` field: `event: ping\n\n` carries none, and the SSE dispatch
+/// algorithm drops a frame whose data buffer stayed empty. A present-but-empty
+/// `data:` line still dispatches (the buffer held a newline). Comments (":…")
+/// and other fields are ignored.
+fn parse_frame(raw: &str) -> Option<SseFrame> {
+    let mut event = None;
+    let mut data: Option<String> = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event = Some(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            match &mut data {
+                Some(data) => {
+                    data.push('\n');
+                    data.push_str(rest);
+                }
+                None => data = Some(rest.to_string()),
+            }
+        }
+    }
+    data.map(|data| SseFrame { event, data })
+}
+
 /// Byte index just past the first blank-line frame separator (`\n\n` or
 /// `\r\n\r\n`), or None if no complete frame is buffered yet. A blank line is
 /// an LF whose preceding line terminator is right in front of it.
@@ -114,6 +141,59 @@ fn frame_end(buf: &[u8], scan_from: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_thousands_of_frames_in_one_chunk() {
+        let mut parser = SseParser::default();
+        let mut chunk = String::new();
+        for index in 0..5_000 {
+            chunk.push_str(&format!("event: e{index}\ndata: {index}\n\n"));
+        }
+        let frames = parser.feed(chunk.as_bytes()).unwrap();
+        assert_eq!(frames.len(), 5_000);
+        assert_eq!(
+            frames.first().unwrap(),
+            &SseFrame {
+                event: Some("e0".into()),
+                data: "0".into(),
+            }
+        );
+        assert_eq!(
+            frames.last().unwrap(),
+            &SseFrame {
+                event: Some("e4999".into()),
+                data: "4999".into(),
+            }
+        );
+        parser.finish().unwrap();
+    }
+
+    #[test]
+    fn complete_frames_are_delivered_before_an_incomplete_tail() {
+        let mut parser = SseParser::default();
+        let frames = parser.feed(b"data: one\n\ndata: two\n\ndata: thr").unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                SseFrame {
+                    event: None,
+                    data: "one".into()
+                },
+                SseFrame {
+                    event: None,
+                    data: "two".into()
+                },
+            ]
+        );
+        let frames = parser.feed(b"ee\n\n").unwrap();
+        assert_eq!(
+            frames,
+            vec![SseFrame {
+                event: None,
+                data: "three".into()
+            }]
+        );
+    }
 
     #[test]
     fn parses_frames_split_across_chunks() {
