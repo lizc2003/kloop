@@ -72,17 +72,23 @@
    规则（`target/`、`secrets/`、`tmp/`）都视为构建产物，纯产物树随树删除并在 Note 列出目录。
    这条线看的是规则写法而不是用途，`secrets` 与 `secrets/` 结果不同；接受这个风险，不引入
    构建目录白名单。`/*`、裸名规则和 ignored **文件**都仍算内容；仅内容命中 `*.log` 时 git
-   逐文件列出，不会折叠成目录记录。目录规则的最后一段若没有字面字符（`/*/`、`**/`、`?*/`、
-   `[!.]*/`、`packages/*/`），它匹配该层所有目录，是白名单形状，也算内容；通配按 Git 语法认
-   `*`、`?` 与方括号表达式，转义字符算字面。`cmake-build-*/`、`[Dd]ebug/` 这类带名字的
-   通配仍算产物。`check-ignore` 失败则全部保留。另把 `worktree remove`
+   逐文件列出，不会折叠成目录记录。目录规则的最后一段若没有字面字符，就不指名任何目录，
+   一律算内容——不论它覆盖该层所有目录（`/*/`、`**/`、`?*/`、`packages/*/`，白名单形状），
+   还是只覆盖一类（`[!.]*/` 不含点目录、`[[:alpha:]]*/` 不含数字开头）。通配按 Git 的
+   wildmatch 认 `*`、`?` 与方括号表达式；`[:` 只在第一个 `]` 前以 `:` 收尾时才是字符类
+   （`[[:a]` 是 `[`、`:`、`a` 的集合），转义字符算字面。`cmake-build-*/`、`[Dd]ebug/` 这类
+   带名字的通配仍算产物。喂给 `check-ignore --stdin` 的目录统一加 `./` 前缀：输入按
+   pathspec 解析，开头的 `:` 会被当成 magic 改查另一个路径、却回显原字符串（`:x/` 曾套用
+   `x/` 的规则被删）；该命令拒绝 `--literal-pathspecs`，且只采纳问过的目录。`check-ignore`
+   失败则全部保留。另把 `worktree remove`
    的路径参数也过 `git_compatible_path`，与 add/rollback 对齐 Windows 格式。
    回归：`target/` 单独存在时整树删除并报告；`target/` 与 `/*` 吞掉的 `notes/` 同树时只丢
    `target`、`changed_files == 1`；`/*` + 裸 `secrets` + 裸 `node_modules` 的目录全部保留；
-   `/*/` + `src/?*/` 决定的 `notes/`、`src/gen/` 保留而同树 `target/` 仍丢；规则判定有单元表
-   （含 `?`、方括号、`[:class:]`、转义）；
+   `/*/` + `src/?*/` + `[[:a]/` 决定的 `notes/`、`src/gen/`、`a/` 保留而同树 `target/` 仍丢；
+   `:x/` 与真正的 `x/` 同树时只丢 `x`（Unix）；规则判定有单元表
+   （含 `?`、方括号、`[:class:]` 与非 class 的 `[:`、转义）；
    原 ignored 文件保留回归不变。
 
 验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug 全量测试，core
-1342 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
+1343 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
 worktree 两处生命周期、path 解析、注册表容错与删除判定已同步。Linux 与 Windows 未实测。

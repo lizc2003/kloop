@@ -924,9 +924,13 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
     }
     let mut input = String::new();
     for dir in dirs {
+        // `check-ignore` reads its input as pathspecs: a leading `:` would be
+        // parsed as magic and a different path checked, while the original
+        // string is echoed back with that other path's rule. `./` keeps the
+        // name literal; `--literal-pathspecs` is rejected by this command.
+        input.push_str("./");
         input.push_str(dir);
-        input.push('/');
-        input.push('\0');
+        input.push_str("/\0");
     }
     let output = match git_text_with_stdin(
         &worktree.path,
@@ -943,8 +947,18 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
     while let (Some(_source), Some(_line), Some(pattern), Some(path)) =
         (fields.next(), fields.next(), fields.next(), fields.next())
     {
-        if is_build_output_rule(pattern) {
-            build_dirs.push(path.trim_end_matches('/').to_string());
+        if !is_build_output_rule(pattern) {
+            continue;
+        }
+        let Some(dir) = path
+            .strip_prefix("./")
+            .and_then(|path| path.strip_suffix('/'))
+        else {
+            continue;
+        };
+        // Only a directory that was asked about can be discarded.
+        if dirs.iter().any(|asked| asked == dir) {
+            build_dirs.push(dir.to_string());
         }
     }
     build_dirs.sort();
@@ -955,10 +969,11 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
 
 /// Only a rule that names a directory marks build output: `target/`,
 /// `secrets/`, `cmake-build-*/`, `[Dd]ebug/`. `/*` and bare `node_modules` are
-/// not directory-scoped. A directory rule whose last segment has no literal
-/// character (`/*/`, `?*/`, `[!.]*/`, `packages/*/`) matches every directory
-/// at that level — the whitelist shape, where a new directory is hand-written
-/// work.
+/// not directory-scoped. A directory rule whose last segment is made only of
+/// wildcards names no directory and stays content, whether it covers every
+/// directory at that level (`/*/`, `?*/`, `packages/*/` — the whitelist shape,
+/// where a new directory is hand-written work) or only a class of them
+/// (`[!.]*/` skips dot directories, `[[:alpha:]]*/` digit-led ones).
 fn is_build_output_rule(pattern: &str) -> bool {
     if pattern.starts_with('!') {
         return false;
@@ -999,12 +1014,25 @@ fn skip_bracket(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
                 chars.next();
             }
             '[' if chars.peek() == Some(&':') => {
-                chars.next();
-                while let Some(ch) = chars.next() {
-                    if ch == ':' && chars.peek() == Some(&']') {
-                        chars.next();
+                // wildmatch reads `[:` as a class only when the first `]`
+                // after it ends a non-empty `...:`; otherwise `[` is an
+                // ordinary member and the `:` is read next (`[[:a]`).
+                let mut ahead = chars.clone();
+                ahead.next();
+                let mut last = None;
+                let mut closed = false;
+                for ch in ahead.by_ref() {
+                    if ch == ']' {
+                        closed = true;
                         break;
                     }
+                    last = Some(ch);
+                }
+                if !closed {
+                    return false;
+                }
+                if last == Some(':') {
+                    *chars = ahead;
                 }
             }
             _ => {}
@@ -1584,17 +1612,28 @@ mod tests {
     /// Whitelist repositories also write the catch-all as a directory rule:
     /// `/*/` and `src/?*/` decide `notes/` and `src/gen/`, which are new
     /// hand-written directories, while a named `target/` is still dropped.
+    /// `[[:a]` is a set of `[`, `:`, and `a`, not a broken class; as the last
+    /// matching rule it decides `a/`, which must stay content too.
     #[tokio::test]
     async fn wildcard_directory_rules_are_content() {
         let root = temp_repo("ignored-wildcard-dir").await;
-        std::fs::write(root.join(".gitignore"), "/*/\n!/src/\nsrc/?*/\ntarget/\n").unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "/*/\n!/src/\nsrc/?*/\n[[:a]/\ntarget/\n",
+        )
+        .unwrap();
         fixture_git(&root, &["add", ".gitignore"]).await;
         fixture_git(&root, &["commit", "-qm", "ignore"]).await;
         let worktree = create(&root, "agent-wildcard-dir", &cleanup_tasks())
             .await
             .unwrap();
         let path = worktree.path.clone();
-        for entry in ["target/debug/artifact", "notes/plan.md", "src/gen/notes.md"] {
+        for entry in [
+            "target/debug/artifact",
+            "notes/plan.md",
+            "src/gen/notes.md",
+            "a/notes.md",
+        ] {
             let file = path.join(entry);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, "content").unwrap();
@@ -1602,10 +1641,39 @@ mod tests {
 
         let changes = inspect_changes(&worktree).await.unwrap();
         assert_eq!(changes.ignored_dirs, vec!["target".to_string()]);
-        assert_eq!(changes.changed_files, 2, "{changes:?}");
+        assert_eq!(changes.changed_files, 3, "{changes:?}");
         assert!(finish(worktree).await.unwrap().is_some());
         assert!(path.join("notes/plan.md").exists());
         assert!(path.join("src/gen/notes.md").exists());
+        assert!(path.join("a/notes.md").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A leading `:` is pathspec magic to `check-ignore`: `:x/` used to be
+    /// checked as `x/` and inherit its `x/` rule. It is decided by `/*/`
+    /// and must stay content next to a real `x/` build directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn colon_led_directories_are_classified_by_their_own_rule() {
+        let root = temp_repo("ignored-colon-dir").await;
+        std::fs::write(root.join(".gitignore"), "/*/\nx/\n").unwrap();
+        fixture_git(&root, &["add", ".gitignore"]).await;
+        fixture_git(&root, &["commit", "-qm", "ignore"]).await;
+        let worktree = create(&root, "agent-colon-dir", &cleanup_tasks())
+            .await
+            .unwrap();
+        let path = worktree.path.clone();
+        for entry in ["x/artifact", ":x/notes.md"] {
+            let file = path.join(entry);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "content").unwrap();
+        }
+
+        let changes = inspect_changes(&worktree).await.unwrap();
+        assert_eq!(changes.ignored_dirs, vec!["x".to_string()]);
+        assert_eq!(changes.changed_files, 1, "{changes:?}");
+        assert!(finish(worktree).await.unwrap().is_some());
+        assert!(path.join(":x/notes.md").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1630,6 +1698,10 @@ mod tests {
             ("[!.]*/", false),
             ("[a-z]*/", false),
             ("[[:alpha:]]*/", false),
+            ("[:a]/", false),
+            ("[:a:]/", false),
+            ("[[:a]/", false),
+            ("[[:]/", false),
             ("[]a]*/", false),
             ("/", false),
             ("/*", false),

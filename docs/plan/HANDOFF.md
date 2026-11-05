@@ -11,16 +11,16 @@ create/enter/exit/finish 一起报“canonicalizing registered worktree”；仓
 进 `spawn_blocking`；`compute_overrides` 改 async 并复用 live permission policy 的父
 identity，只对 worktree 做一次探测且放在阻塞池。第 5 条按用户确认走细化版 (b)：只有
 决定性忽略规则本身指名一个目录（`target/`、`secrets/`、`tmp/`）时才算构建产物，纯产物树
-随树删除并在 Note 列出目录名；`/*`、裸名规则、最后一段没有字面字符的目录规则（`/*/`、
-`?*/`、`[!.]*/`、`packages/*/`，白名单形状）和 ignored 文件都仍算内容（一次 `git check-ignore -v -z --stdin`
-逐条判定，失败则全部保留）。接受“看写法不看用途”的边界：
+随树删除并在 Note 列出目录名；`/*`、裸名规则、最后一段没有字面字符的目录规则（不论覆盖
+全部目录如 `/*/`、`?*/`，还是只覆盖一类如 `[!.]*/`）和 ignored 文件都仍算内容（一次
+`git check-ignore -v -z --stdin` 逐条判定，输入加 `./` 防 pathspec magic，失败则全部保留）。接受“看写法不看用途”的边界：
 `secrets` 保留而 `secrets/` 丢弃，不引入构建目录白名单。顺带把 `worktree remove` 的参数
-也过 `git_compatible_path`，对齐 add/rollback 的 Windows 路径格式。新增 7 条回归
+也过 `git_compatible_path`，对齐 add/rollback 的 Windows 路径格式。新增 8 条回归
 （失效注册、相对 path、finish 单次校验、ignored 目录丢弃、宽忽略规则保留、逐条分类、
-通配目录规则保留）和一张规则判定单元表。外层执行沙箱之外
-`make check` 全绿（fmt、clippy、workspace debug 全量测试，core 1342 项，本机 parity
+通配目录规则保留、冒号开头目录）和一张规则判定单元表。外层执行沙箱之外
+`make check` 全绿（fmt、clippy、workspace debug 全量测试，core 1343 项，本机 parity
 baseline verified）。DESIGN 的 worktree 生命周期、path 解析、注册表容错与删除判定已同步。
-Linux 与 Windows 未实测。教训 333–338。
+Linux 与 Windows 未实测。教训 333–339。
 
 **`-c` 定位补两处（2026-11-04）**：复审指出上一条的两个问题。一是附着的 `-o`：
 `zsh -c -oshwordsplit 'cat .env' unused` 按字母 o 的个数吞掉了正文，返回“不在 -c 模式”，
@@ -4356,10 +4356,12 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    产生这种记录，目录里完全可能是手写内容；仅内容命中 `*.log` 时 git 反而逐文件列出，不会
    折叠。用一次 `git check-ignore -v -z --stdin` 取每条目录的决定性 pattern，指名目录的规则
    （`target/`、`secrets/`、`tmp/`、`cmake-build-*/`）算构建产物；`/*` 和裸名规则退回保留。
-   “以 `/` 结尾”还不够：白名单仓库同样会把兜底写成 `/*/`、`?*/` 或 `packages/*/`，最后一段
-   没有字面字符的目录规则匹配该层所有目录，新目录就是手写内容，也要退回保留。“通配”要按 Git
-   的完整语法认——`*`、`?`、方括号（含 `[:class:]`）都是，转义字符算字面；只认 `*` 会让
-   `?*/` 这种同义兜底漏过去。这条线看的是
+   “以 `/` 结尾”还不够：白名单仓库同样会把兜底写成 `/*/`、`?*/` 或 `packages/*/`。最后一段
+   没有字面字符的目录规则不指名任何目录，一律退回保留——它可能覆盖该层全部目录，也可能只覆盖
+   一类（`[!.]*/` 不含点目录），理由是“不指名”，不是“全覆盖”。“通配”要按 Git 的 wildmatch
+   认——`*`、`?`、方括号都是；`[:` 只在第一个 `]` 前以 `:` 收尾时才是字符类，`[[:a]` 是普通
+   集合；转义字符算字面。只认 `*` 会漏掉 `?*/`，把 `[:` 一律当字符类会把 `[[:a]` 误判成未闭合
+   的字面。这条线看的是
    规则写法而不是用途——`secrets` 保留、`secrets/` 丢弃——接受这个边界，不引入构建目录白名单。
    判据失败就保留全部，不能猜删。回源三家是分歧的（cc 全删、codex 拒绝、codewhale 保留），
    按本项目“别丢用户内容、也别让 target 堆满”的契约取中间线。
@@ -4367,3 +4369,8 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
 338. **异步路径里的阻塞 IO 要成组搬走，不是逐个 `.await` 化。** `info/exclude` 的 flock +
    读改写整体进 `spawn_blocking`，而不是在持异步锁时单独等一次 flock；identity 探测能复用
    live permission policy 的父 identity 就不要再起一个 Git 子进程，剩下的一次才值得放进阻塞池。
+
+339. **喂给 git 的路径是 pathspec，不是字面路径。** `check-ignore --stdin` 把开头的 `:` 当
+   magic：`:x/` 被改查成 `x/`，输出却回显原字符串配上 `x/` 的规则，看起来像 `:x/` 自己的判定。
+   `--literal-pathspecs` 在这个命令上直接报错，统一加 `./` 前缀才保持字面；读回时也只采纳
+   问过的路径，别让输出集合大于输入集合。

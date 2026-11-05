@@ -3411,11 +3411,13 @@ do not share ownership, an active slot, or deletion rights:
   reported. Any such rule counts, because pattern text cannot tell a build cache
   from a hand-written directory. Directories matched only by a non-directory
   rule (`/*`, a bare `node_modules`) or by a directory rule whose last segment
-  has no literal character (`/*/`, `?*/`, `[!.]*/`, `packages/*/` — the
-  whitelist shape; `*`, `?`, and bracket expressions are the wildcards, an
-  escaped character is literal) stay content; so do ignored *files*
-  (`.env.local`, local configs). Parallel agent worktree mutations are
-  serialized per Git common directory.
+  is made only of wildcards stay content, whether that rule covers every
+  directory at its level (`/*/`, `?*/`, `packages/*/` — the whitelist shape) or
+  only a class of them (`[!.]*/` skips dot directories, `[[:alpha:]]*/`
+  digit-led ones). `*`, `?`, and bracket expressions are the wildcards, read as
+  Git reads them; an escaped character is literal. Ignored *files*
+  (`.env.local`, local configs) stay content too. Parallel agent worktree
+  mutations are serialized per Git common directory.
 - **Session worktrees**: at depth zero, and only when the current frontend
   enables the worktree surface, the model may create or enter a worktree and
   move the whole session into it. `kloop --worktree[=<name>]` is the separate
