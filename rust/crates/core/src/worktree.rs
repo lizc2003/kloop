@@ -942,6 +942,9 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
         Ok(output) => output,
         Err(_) => return (Vec::new(), dirs.len()),
     };
+    // Only a directory that was asked about can be discarded. A monorepo can
+    // collapse thousands of `dist/` directories, so look them up in a set.
+    let asked: std::collections::HashSet<&str> = dirs.iter().map(String::as_str).collect();
     let mut fields = output.split('\0');
     let mut build_dirs = Vec::new();
     while let (Some(_source), Some(_line), Some(pattern), Some(path)) =
@@ -956,8 +959,7 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
         else {
             continue;
         };
-        // Only a directory that was asked about can be discarded.
-        if dirs.iter().any(|asked| asked == dir) {
+        if asked.contains(dir) {
             build_dirs.push(dir.to_string());
         }
     }
