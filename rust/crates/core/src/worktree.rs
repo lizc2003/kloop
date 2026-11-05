@@ -954,10 +954,11 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
 }
 
 /// Only a rule that names a directory marks build output: `target/`,
-/// `secrets/`, `cmake-build-*/`. `/*` and bare `node_modules` are not
-/// directory-scoped. A directory rule whose last segment is nothing but
-/// wildcards (`/*/`, `**/`, `packages/*/`) matches every directory at that
-/// level — the whitelist shape, where a new directory is hand-written work.
+/// `secrets/`, `cmake-build-*/`, `[Dd]ebug/`. `/*` and bare `node_modules` are
+/// not directory-scoped. A directory rule whose last segment has no literal
+/// character (`/*/`, `?*/`, `[!.]*/`, `packages/*/`) matches every directory
+/// at that level — the whitelist shape, where a new directory is hand-written
+/// work.
 fn is_build_output_rule(pattern: &str) -> bool {
     if pattern.starts_with('!') {
         return false;
@@ -965,8 +966,52 @@ fn is_build_output_rule(pattern: &str) -> bool {
     let Some(scope) = pattern.strip_suffix('/') else {
         return false;
     };
-    let last = scope.rsplit('/').next().unwrap_or_default();
-    last.chars().any(|ch| ch != '*')
+    has_literal(scope.rsplit('/').next().unwrap_or_default())
+}
+
+/// Whether a gitignore segment names something. `*`, `?`, and a complete
+/// bracket expression are wildcards; any other character, a backslash escape
+/// included, is a literal.
+fn has_literal(segment: &str) -> bool {
+    let mut chars = segment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' | '?' => {}
+            '[' if skip_bracket(&mut chars) => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Consume a bracket expression after its `[` as Git's wildmatch reads it: an
+/// optional `!`/`^`, a leading `]` taken as a member, `\` escapes, and
+/// `[:class:]`. False when it never closes.
+fn skip_bracket(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    if matches!(chars.peek(), Some('!' | '^')) {
+        chars.next();
+    }
+    let mut first = true;
+    while let Some(ch) = chars.next() {
+        match ch {
+            ']' if !first => return true,
+            '\\' => {
+                chars.next();
+            }
+            '[' if chars.peek() == Some(&':') => {
+                chars.next();
+                while let Some(ch) = chars.next() {
+                    if ch == ':' && chars.peek() == Some(&']') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        first = false;
+    }
+    false
 }
 
 async fn git_text_with_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
@@ -1537,12 +1582,12 @@ mod tests {
     }
 
     /// Whitelist repositories also write the catch-all as a directory rule:
-    /// `/*/` and `src/*/` decide `notes/` and `src/gen/`, which are new
+    /// `/*/` and `src/?*/` decide `notes/` and `src/gen/`, which are new
     /// hand-written directories, while a named `target/` is still dropped.
     #[tokio::test]
     async fn wildcard_directory_rules_are_content() {
         let root = temp_repo("ignored-wildcard-dir").await;
-        std::fs::write(root.join(".gitignore"), "/*/\n!/src/\nsrc/*/\ntarget/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/*/\n!/src/\nsrc/?*/\ntarget/\n").unwrap();
         fixture_git(&root, &["add", ".gitignore"]).await;
         fixture_git(&root, &["commit", "-qm", "ignore"]).await;
         let worktree = create(&root, "agent-wildcard-dir", &cleanup_tasks())
@@ -1574,11 +1619,18 @@ mod tests {
             ("cmake-build-*/", true),
             ("*.egg-info/", true),
             ("secrets/", true),
+            ("[Dd]ebug/", true),
+            ("\\*/", true),
             ("/*/", false),
             ("*/", false),
             ("**/", false),
             ("**/*/", false),
             ("packages/*/", false),
+            ("?*/", false),
+            ("[!.]*/", false),
+            ("[a-z]*/", false),
+            ("[[:alpha:]]*/", false),
+            ("[]a]*/", false),
             ("/", false),
             ("/*", false),
             ("node_modules", false),

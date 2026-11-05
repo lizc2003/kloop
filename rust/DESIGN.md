@@ -3411,9 +3411,11 @@ do not share ownership, an active slot, or deletion rights:
   reported. Any such rule counts, because pattern text cannot tell a build cache
   from a hand-written directory. Directories matched only by a non-directory
   rule (`/*`, a bare `node_modules`) or by a directory rule whose last segment
-  is all wildcards (`/*/`, `**/`, `packages/*/` — the whitelist shape) stay
-  content; so do ignored *files* (`.env.local`, local configs). Parallel agent
-  worktree mutations are serialized per Git common directory.
+  has no literal character (`/*/`, `?*/`, `[!.]*/`, `packages/*/` — the
+  whitelist shape; `*`, `?`, and bracket expressions are the wildcards, an
+  escaped character is literal) stay content; so do ignored *files*
+  (`.env.local`, local configs). Parallel agent worktree mutations are
+  serialized per Git common directory.
 - **Session worktrees**: at depth zero, and only when the current frontend
   enables the worktree surface, the model may create or enter a worktree and
   move the whole session into it. `kloop --worktree[=<name>]` is the separate
@@ -3479,7 +3481,7 @@ untracked, or ignored *files* and commits after the recorded base. Only a
 directory whose deciding ignore rule names a directory (`target/`, `secrets/`,
 `tmp/`) is discarded as build output; directories matched by a non-directory
 rule (`/*`, bare `node_modules`) or an all-wildcard directory rule (`/*/`,
-`packages/*/`) stay content and block removal.
+`?*/`, `packages/*/`) stay content and block removal.
 Discarded names are reported. `discard_changes:true` may override only those
 successfully observed content changes. It never overrides
 repository/path/registration/branch/base/owner provenance failures, and it

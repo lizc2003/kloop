@@ -11,8 +11,8 @@ create/enter/exit/finish 一起报“canonicalizing registered worktree”；仓
 进 `spawn_blocking`；`compute_overrides` 改 async 并复用 live permission policy 的父
 identity，只对 worktree 做一次探测且放在阻塞池。第 5 条按用户确认走细化版 (b)：只有
 决定性忽略规则本身指名一个目录（`target/`、`secrets/`、`tmp/`）时才算构建产物，纯产物树
-随树删除并在 Note 列出目录名；`/*`、裸名规则、最后一段全是通配的目录规则（`/*/`、
-`packages/*/`，白名单形状）和 ignored 文件都仍算内容（一次 `git check-ignore -v -z --stdin`
+随树删除并在 Note 列出目录名；`/*`、裸名规则、最后一段没有字面字符的目录规则（`/*/`、
+`?*/`、`[!.]*/`、`packages/*/`，白名单形状）和 ignored 文件都仍算内容（一次 `git check-ignore -v -z --stdin`
 逐条判定，失败则全部保留）。接受“看写法不看用途”的边界：
 `secrets` 保留而 `secrets/` 丢弃，不引入构建目录白名单。顺带把 `worktree remove` 的参数
 也过 `git_compatible_path`，对齐 add/rollback 的 Windows 路径格式。新增 7 条回归
@@ -4356,8 +4356,10 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    产生这种记录，目录里完全可能是手写内容；仅内容命中 `*.log` 时 git 反而逐文件列出，不会
    折叠。用一次 `git check-ignore -v -z --stdin` 取每条目录的决定性 pattern，指名目录的规则
    （`target/`、`secrets/`、`tmp/`、`cmake-build-*/`）算构建产物；`/*` 和裸名规则退回保留。
-   “以 `/` 结尾”还不够：白名单仓库同样会把兜底写成 `/*/` 或 `packages/*/`，最后一段全是通配
-   的目录规则匹配该层所有目录，新目录就是手写内容，也要退回保留。这条线看的是
+   “以 `/` 结尾”还不够：白名单仓库同样会把兜底写成 `/*/`、`?*/` 或 `packages/*/`，最后一段
+   没有字面字符的目录规则匹配该层所有目录，新目录就是手写内容，也要退回保留。“通配”要按 Git
+   的完整语法认——`*`、`?`、方括号（含 `[:class:]`）都是，转义字符算字面；只认 `*` 会让
+   `?*/` 这种同义兜底漏过去。这条线看的是
    规则写法而不是用途——`secrets` 保留、`secrets/` 丢弃——接受这个边界，不引入构建目录白名单。
    判据失败就保留全部，不能猜删。回源三家是分歧的（cc 全删、codex 拒绝、codewhale 保留），
    按本项目“别丢用户内容、也别让 target 堆满”的契约取中间线。
