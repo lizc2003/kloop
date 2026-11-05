@@ -359,6 +359,25 @@ fn lock_identity(
     }
 }
 
+/// The cached part of the input count. See the Chat rail's copy: absent or null
+/// means "no hit reported", while a details block of another type is bad data
+/// that chained indexing would silently read as a cache miss.
+fn cached_tokens(usage: &Value) -> Result<u64, ProviderFailure> {
+    let details = &usage["input_tokens_details"];
+    if details.is_null() {
+        return Ok(0);
+    }
+    if !details.is_object() {
+        return Err(protocol("input_tokens_details was not an object"));
+    }
+    match &details["cached_tokens"] {
+        Value::Null => Ok(0),
+        other => other
+            .as_u64()
+            .ok_or_else(|| protocol("cached_tokens was not an integer")),
+    }
+}
+
 fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
     let usage = &response["usage"];
     if usage.is_null() {
@@ -369,14 +388,7 @@ fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
     }
     let input = required_u64(&usage["input_tokens"], "input_tokens")?;
     let output = required_u64(&usage["output_tokens"], "output_tokens")?;
-    let cached = match &usage["input_tokens_details"]["cached_tokens"] {
-        // Absent and explicitly null both mean "no hit reported"; see the same
-        // rule on the Chat rail.
-        Value::Null => 0,
-        other => other
-            .as_u64()
-            .ok_or_else(|| protocol("cached_tokens was not an integer"))?,
-    };
+    let cached = cached_tokens(usage)?;
     if cached > input {
         return Err(protocol("cached_tokens exceeded input_tokens"));
     }

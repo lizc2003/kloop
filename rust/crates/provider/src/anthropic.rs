@@ -322,7 +322,10 @@ pub(super) async fn stream(
                 let usage = value["message"]["usage"]
                     .as_object()
                     .ok_or_else(|| protocol("message_start missing usage"))?;
-                input_tokens = Some(required_u64(&usage["input_tokens"], "input_tokens")?);
+                input_tokens = Some(required_u64(
+                    usage.get("input_tokens").unwrap_or(&Value::Null),
+                    "input_tokens",
+                )?);
                 cache_read = optional_u64(usage, "cache_read_input_tokens")?.unwrap_or(0);
                 cache_creation = optional_u64(usage, "cache_creation_input_tokens")?.unwrap_or(0);
                 started = true;
@@ -436,7 +439,10 @@ pub(super) async fn stream(
                 let usage = value["usage"]
                     .as_object()
                     .ok_or_else(|| protocol("message_delta missing usage"))?;
-                output_tokens = Some(required_u64(&usage["output_tokens"], "output_tokens")?);
+                output_tokens = Some(required_u64(
+                    usage.get("output_tokens").unwrap_or(&Value::Null),
+                    "output_tokens",
+                )?);
                 // A gateway may fill message_start with zeros and report the
                 // cumulative input/cache counts here instead. A later report
                 // wins, as with a repeated Chat usage frame.

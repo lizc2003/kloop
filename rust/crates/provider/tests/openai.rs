@@ -149,6 +149,68 @@ async fn chat_output_cap_field_is_configurable() {
     );
 }
 
+/// A details block that is present but not an object is bad data. Chained
+/// indexing would turn `"bad"` or `[]` into `Null` and silently report a cache
+/// miss; the type check keeps the old rejection.
+#[tokio::test]
+async fn non_object_cache_details_are_protocol_errors() {
+    for details in [json!("bad"), json!([])] {
+        let server = MockServer::start().await;
+        mount_sse(
+            &server,
+            sse_body(
+                &[
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                    json!({"choices": [], "usage": {
+                        "prompt_tokens": 9,
+                        "completion_tokens": 1,
+                        "prompt_tokens_details": details,
+                    }}),
+                ],
+                true,
+            ),
+        )
+        .await;
+
+        let events = collect(openai(&server)).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(!error.is_retryable());
+    }
+}
+
+/// A complete bad frame in the tail is not a cut connection: invalid UTF-8
+/// still fails closed, because that frame arrived in full and the parser
+/// rejected it.
+#[tokio::test]
+async fn invalid_utf8_tail_frame_after_finish_reason_still_fails() {
+    let server = ChunkedSse::start(vec![
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+        )
+        .into_bytes(),
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        )
+        .into_bytes(),
+        b"data: \xff\n\n".to_vec(),
+    ]);
+    let provider = Provider::OpenAiCompat {
+        cred: Credential::bearer("test-key"),
+        base: server.base().to_string(),
+        output_cap_field: ChatOutputCapField::MaxTokens,
+    };
+
+    let events = collect(provider).await;
+    let error = events.last().unwrap().as_ref().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(error.after_semantic_output());
+}
+
 /// Text deltas, tool_calls accumulated across chunks by index, usage arriving
 /// AFTER finish_reason (the include_usage contract), then [DONE].
 #[tokio::test]
@@ -283,7 +345,8 @@ async fn usage_flushed_after_finish_reason_is_not_lost() {
             "data: {}\n\ndata: {}\n\n",
             json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
             json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
-        ),
+        )
+        .into_bytes(),
         format!(
             "data: {}\n\ndata: [DONE]\n\n",
             json!({"choices": [], "usage": {
@@ -291,7 +354,8 @@ async fn usage_flushed_after_finish_reason_is_not_lost() {
                 "completion_tokens": 1,
                 "prompt_tokens_details": {"cached_tokens": 2},
             }}),
-        ),
+        )
+        .into_bytes(),
     ]);
     let provider = Provider::OpenAiCompat {
         cred: Credential::bearer("test-key"),

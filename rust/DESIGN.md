@@ -185,17 +185,20 @@ reports `usage` more than once — a gateway attaching its own copy to the
 `finish_reason` is the semantic terminal, not the end of the body: the rail keeps
 reading for the usage tail, bounded by a five-second post-terminal grace, because
 that frame often arrives on its own flush. A provider that closes without
-`[DONE]`, or whose tail read fails after the terminal, ends the stream with the
-outcome already in hand and only the usage missing; a malformed frame or a
-semantic delta that did arrive still fails closed. A frame carrying `event:` but
+`[DONE]`, or whose connection ends or idles mid-frame after the terminal, ends
+the stream with the outcome already in hand and only the usage missing. Bad data
+that did arrive still fails closed: a complete frame the parser rejects (invalid
+UTF-8, an oversized frame), a residual that is not valid UTF-8, a body over the
+response cap, a malformed frame, or a semantic delta after the terminal. A frame
+carrying `event:` but
 no `data:` is a heartbeat and is not dispatched on any rail. Requests with no
 tools omit the field rather than sending an empty array, which
 schema-validating endpoints refuse. An absent or null auxiliary cache count
 (`prompt_tokens_details.cached_tokens`, `input_tokens_details.cached_tokens`,
 `cache_read_input_tokens`, `cache_creation_input_tokens`) means "no hit" and
-counts as 0; a wrong type is still bad data. On Messages, an
-`input_tokens`/cache field reported again on `message_delta` is the cumulative
-report and overrides `message_start`. Core retains provider
+counts as 0; a details block or count of another type is still bad data. On
+Messages, an `input_tokens`/cache field reported again on `message_delta` is the
+cumulative report and overrides `message_start`. Core retains provider
 outcomes and failures inside typed turn errors;
 string rendering happens only at CLI/TUI/native protocol 1.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and

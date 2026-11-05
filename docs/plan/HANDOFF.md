@@ -9,9 +9,11 @@
 累计 input/cache 覆盖 `message_start`；配额措辞把裸 `billing` 换成五个短语，带
 `/account/billing` 链接的免费层 429 恢复重试；SSE 只有 `data:` 行才派发，`event: ping`
 不再解析。Chat 输出上限字段做成 profile 键 `output_cap_field`(默认 `max_tokens`，仅 chat
-轨，官方推理端点可切 `max_completion_tokens`)；错误体读取独立 30s 超时。外层执行沙箱之外
-`make check` 全绿(fmt、clippy、workspace debug 全量测试、本机 parity baseline verified)。
-真实 API 未实测。教训 340。
+轨，官方推理端点可切 `max_completion_tokens`)；错误体读取独立 30s 超时。审查跟进修了三处：
+`serde_json::Map` 缺键下标会 panic(required usage 改用 `get`)，尾帧宽限只忽略传输/超时/
+未成帧残片(完整坏帧、超限仍 fail-closed)，缓存明细父字段先验证类型再读 null。外层执行
+沙箱之外 `make check` 全绿(fmt、clippy、workspace debug 全量测试、本机 parity baseline
+verified)。真实 API 未实测。教训 340–343。
 
 **Plan 252 ✅：worktree 健壮性（2026-11-04）**：`git worktree list` 现在逐条容错，
 canonicalize 失败的条目（手工删掉的目录、未挂载的卷）在列表阶段跳过，不再让同仓的
@@ -4392,8 +4394,9 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    `finish_reason` 一到就停读，看起来只是省掉尾帧；但 `include_usage` 的权威 usage 在另一个
    flush 里，于是计费、`/cost` 与预测压缩悄悄退回估算，测试却全是绿的——`set_body_raw` 把整段
    body 一次交给客户端，尾帧本来就在同一个 chunk 里。把语义状态机和读循环分开之后，必须给
-   夹具补"分块 flush"的能力，"终端之后还有数据"这个真实形状才可测。同样的分界适用于超时：
-   终端之后只剩余额数据，尾帧读失败不该反过来否定已经完整的回答。
+   夹具补"分块 flush"的能力，"终端之后还有数据"这个真实形状才可测。同样的分界适用于超时，
+   但只对"没读到"成立：终端之后只剩余额数据，传输失败或未成帧的残片不该反过来否定已经完整
+   的回答；已经读到的完整坏帧仍然是坏数据。
 
 341. **"没有"和"空数组"在 wire 上不是一回事。** 压缩请求没有工具，发 `tools: []` 会被按
    schema 校验的端点 400；省略字段才是"没有"。同理，辅助计量字段的 null/缺失是"没上报/
@@ -4402,3 +4405,9 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
 342. **重试语义靠短语，不靠单词。** 裸 `billing` 命中免费层 429 文案里的 `/account/billing`
    链接，把一次限流转成永久失败；`billing_hard_limit`、`check your plan and billing` 才是
    欠费语境。一个词在目标语境和无关语境里都出现的匹配，等于没有匹配。
+
+343. **`serde_json::Map` 的下标会 panic，`Value` 的下标返回 Null。** 把
+   `value["usage"]` 收成 `as_object()` 之后继续写 `usage["input_tokens"]`，缺键就从"协议
+   错误"变成进程 panic，接收端只看到一次可重试的流中断；同一个表达式在 `Value` 上是安全的，
+   类型一变语义也变。连续下标还有第二个坑：父字段类型错误(`"details": "bad"`)会被吞成
+   Null，看起来像"没命中"。先验证父字段是对象或 null，再读子字段。

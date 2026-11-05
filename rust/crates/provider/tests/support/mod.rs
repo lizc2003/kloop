@@ -20,7 +20,7 @@ pub(crate) struct ChunkedSse {
 
 impl ChunkedSse {
     /// Serve exactly one request, writing `chunks` as separate flushes.
-    pub(crate) fn start(chunks: Vec<String>) -> Self {
+    pub(crate) fn start(chunks: Vec<Vec<u8>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind chunked sse fixture");
         let address = listener.local_addr().expect("chunked sse address");
         // Detached: the thread ends with the response, and a test that never
@@ -70,7 +70,7 @@ fn read_request(stream: &mut TcpStream) -> bool {
     }
 }
 
-fn write_chunks(stream: &mut TcpStream, chunks: &[String]) -> std::io::Result<()> {
+fn write_chunks(stream: &mut TcpStream, chunks: &[Vec<u8>]) -> std::io::Result<()> {
     stream.write_all(
         b"HTTP/1.1 200 OK\r\n\
           content-type: text/event-stream\r\n\
@@ -80,7 +80,7 @@ fn write_chunks(stream: &mut TcpStream, chunks: &[String]) -> std::io::Result<()
     stream.flush()?;
     for chunk in chunks {
         write!(stream, "{:x}\r\n", chunk.len())?;
-        stream.write_all(chunk.as_bytes())?;
+        stream.write_all(chunk)?;
         stream.write_all(b"\r\n")?;
         stream.flush()?;
         thread::sleep(CHUNK_GAP);

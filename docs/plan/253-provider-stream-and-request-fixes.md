@@ -92,10 +92,17 @@
 8. 错误体读取独立 30s 超时(`HTTP_ERROR_BODY_TIMEOUT`)，不再借用 300s 的打开超时；
    `stream.rs` 的过时注释、`responses.rs` 的「signature-less thinking dropped」注释已改正。
 
-新增 10 条测试(SSE 1、stream 1、openai 3、responses 2、anthropic 2、cli 配置 1)，另扩展
+新增 14 条测试(SSE 1、stream 1、openai 5、responses 3、anthropic 3、cli 配置 1)，另扩展
 4 条既有测试(三轨空 tools/缓存计数、429 分类表、请求体整对象断言)。外层执行沙箱之外
 `make check` 全绿(fmt、clippy、workspace debug 全量测试、本机 parity baseline verified)。
 真实 API 未实测：本机没有代理和 key，验收以夹具和单测为准。
+
+**审查跟进(2026-11-05)**：三条 P2 都成立。`serde_json::Map` 的下标在缺键时 panic，
+message_start/message_delta 的 required usage 改回 `get(...).unwrap_or(&Value::Null)`，
+`usage: {}` 现在是协议错误而不是进程 panic；尾帧宽限从"忽略一切读错误"收窄为只忽略
+Transport/Timeout/可重试的 EOF 残片，完整坏帧(非法 UTF-8)、超限帧与超限响应仍然 fail-closed；
+缓存明细先验证父字段是对象或 null，`"prompt_tokens_details": "bad"/[]` 恢复为协议错误而不是
+静默按 0。新增 4 条回归(missing required usage、非法 UTF-8 尾帧、两条非对象明细)。
 
 ## 另议(记一笔，不在本条做)
 

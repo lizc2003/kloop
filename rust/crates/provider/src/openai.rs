@@ -33,6 +33,21 @@ const IMAGE_RELOCATED_PLACEHOLDER: &str =
 /// is lost, and the next request starts from an estimate.
 const FINISH_TAIL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether a failure to read the next tail frame can be ignored once the
+/// outcome is in hand. A connection that ends or idles mid-frame — including
+/// the unterminated `[DONE]` residue — changes nothing about the answer. A
+/// complete frame the parser rejected (invalid UTF-8, an oversized frame) or a
+/// body over the response cap is bad data and still fails closed.
+fn tail_interruption(error: &ProviderFailure) -> bool {
+    match error.kind() {
+        crate::ProviderFailureKind::Transport | crate::ProviderFailureKind::Timeout { .. } => true,
+        // The retryable form of Protocol is `incomplete_protocol`, which the
+        // parser raises for an unterminated EOF residue.
+        crate::ProviderFailureKind::Protocol => error.is_retryable(),
+        _ => false,
+    }
+}
+
 /// One chat/completions `image_url` data-URL part from a canonical image source.
 fn image_url_part(source: &ImageSource) -> Value {
     let ImageSource::Base64 { media_type, data } = source;
@@ -258,14 +273,7 @@ fn parse_usage(value: &Value) -> Result<Usage, ProviderFailure> {
     let output = value["completion_tokens"]
         .as_u64()
         .ok_or_else(|| protocol("usage missing completion_tokens"))?;
-    let cached = match &value["prompt_tokens_details"]["cached_tokens"] {
-        // Absent and explicitly null both mean "no hit reported": a gateway
-        // that zeroes the block often sends null. Only a wrong type is bad data.
-        Value::Null => 0,
-        other => other
-            .as_u64()
-            .ok_or_else(|| protocol("usage cached_tokens was not an integer"))?,
-    };
+    let cached = cached_tokens(value)?;
     if cached > prompt {
         return Err(protocol("usage cached_tokens exceeded prompt_tokens"));
     }
@@ -275,6 +283,26 @@ fn parse_usage(value: &Value) -> Result<Usage, ProviderFailure> {
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: 0,
     })
+}
+
+/// The cached part of the prompt count. `prompt_tokens_details` absent or null
+/// means "no hit reported" and reads as 0; an object without the count says the
+/// same. A block or count of another type is bad data — chained indexing would
+/// turn a string or an array into `Null` and silently report a cache miss.
+fn cached_tokens(value: &Value) -> Result<u64, ProviderFailure> {
+    let details = &value["prompt_tokens_details"];
+    if details.is_null() {
+        return Ok(0);
+    }
+    if !details.is_object() {
+        return Err(protocol("usage prompt_tokens_details was not an object"));
+    }
+    match &details["cached_tokens"] {
+        Value::Null => Ok(0),
+        other => other
+            .as_u64()
+            .ok_or_else(|| protocol("usage cached_tokens was not an integer")),
+    }
 }
 
 fn semantic_string<'a>(
@@ -431,10 +459,9 @@ pub(super) async fn stream(
     loop {
         let frame = match frames.next().await {
             Ok(frame) => frame,
-            // The terminal is already in hand; whatever the tail does — a
-            // flush gap, a cut connection, an unterminated `[DONE]` — cannot
-            // change the answer, so only the usage is lost.
-            Err(_) if outcome.is_some() => break,
+            // The terminal is already in hand; a tail that ends or idles
+            // mid-frame cannot change the answer, so only the usage is lost.
+            Err(error) if outcome.is_some() && tail_interruption(&error) => break,
             Err(error) => return Err(error),
         };
         let Some(frame) = frame else { break };

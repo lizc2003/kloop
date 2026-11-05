@@ -213,6 +213,37 @@ async fn null_cached_tokens_counts_as_no_hit() {
     ));
 }
 
+/// A details block that is present but not an object is bad data; chained
+/// indexing would read it as a cache miss. See the Chat rail's copy.
+#[tokio::test]
+async fn non_object_cache_details_are_protocol_errors() {
+    for details in [json!("bad"), json!([])] {
+        let server = MockServer::start().await;
+        mount_sse(
+            &server,
+            sse_body(&[
+                json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+                json!({"type": "response.completed", "response": {
+                    "id": "r",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 9,
+                        "output_tokens": 2,
+                        "input_tokens_details": details,
+                    },
+                }}),
+            ]),
+        )
+        .await;
+
+        let events = collect(responses(&server)).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let error = events.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(!error.is_retryable());
+    }
+}
+
 /// The prompt-cache routing hint rides every request when the session is
 /// bound, and is absent otherwise — an empty key would herd every unbound run
 /// onto one bucket. It only steers routing, so the rest of the body is

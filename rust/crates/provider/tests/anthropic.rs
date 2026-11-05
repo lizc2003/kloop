@@ -483,6 +483,37 @@ async fn null_cache_fields_count_as_no_hit() {
     ));
 }
 
+/// A missing required count is a protocol error, not a process abort. The usage
+/// block is a map once validated, and indexing a map by a missing key panics —
+/// `get` keeps the failure typed and retryable-or-not by the same rules as any
+/// other bad count.
+#[tokio::test]
+async fn missing_required_usage_counts_are_protocol_errors() {
+    let cases = [
+        json!({"type": "message_start", "message": {"usage": {}}}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}}),
+    ];
+    for bad in cases {
+        let server = MockServer::start().await;
+        let mut events =
+            vec![json!({"type": "message_start", "message": {"usage": {"input_tokens": 3}}})];
+        // Drop the valid opening frame when the case is itself a bad opening;
+        // a message_delta still needs it.
+        if bad["type"] == "message_start" {
+            events.clear();
+        }
+        events.push(bad);
+        events.push(json!({"type": "message_stop"}));
+        mount_sse(&server, sse_body(&events)).await;
+
+        let out = collect(anthropic(&server)).await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        let error = out.into_iter().next().unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+        assert!(!error.is_retryable());
+    }
+}
+
 #[tokio::test]
 async fn stop_reasons_map_to_typed_outcomes() {
     let cases = [
