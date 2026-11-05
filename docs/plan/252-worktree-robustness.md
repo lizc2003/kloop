@@ -72,12 +72,15 @@
    规则（`target/`、`secrets/`、`tmp/`）都视为构建产物，纯产物树随树删除并在 Note 列出目录。
    这条线看的是规则写法而不是用途，`secrets` 与 `secrets/` 结果不同；接受这个风险，不引入
    构建目录白名单。`/*`、裸名规则和 ignored **文件**都仍算内容；仅内容命中 `*.log` 时 git
-   逐文件列出，不会折叠成目录记录。`check-ignore` 失败则全部保留。另把 `worktree remove`
+   逐文件列出，不会折叠成目录记录。目录规则的最后一段若全是通配（`/*/`、`**/`、
+   `packages/*/`），它匹配该层所有目录，是白名单形状，也算内容；`cmake-build-*/` 这类带名字的
+   通配仍算产物。`check-ignore` 失败则全部保留。另把 `worktree remove`
    的路径参数也过 `git_compatible_path`，与 add/rollback 对齐 Windows 格式。
    回归：`target/` 单独存在时整树删除并报告；`target/` 与 `/*` 吞掉的 `notes/` 同树时只丢
    `target`、`changed_files == 1`；`/*` + 裸 `secrets` + 裸 `node_modules` 的目录全部保留；
+   `/*/` + `src/*/` 决定的 `notes/`、`src/gen/` 保留而同树 `target/` 仍丢；规则判定有单元表；
    原 ignored 文件保留回归不变。
 
 验证：外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug 全量测试，core
-1340 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
+1342 项，本机 parity baseline verified）；复审收紧后重跑 worktree 定向测试。DESIGN 的
 worktree 两处生命周期、path 解析、注册表容错与删除判定已同步。Linux 与 Windows 未实测。

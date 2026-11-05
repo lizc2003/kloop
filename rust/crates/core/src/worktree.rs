@@ -913,13 +913,11 @@ async fn inspect_changes(worktree: &Worktree) -> Result<WorktreeChanges> {
     })
 }
 
-/// A directory is build output only when the ignore pattern that decides it is
-/// directory-scoped (`target/`, `secrets/`, `tmp/`). `/*` and bare `node_modules`
-/// also match directories but may contain hand-written files; those count as
-/// content. A directory whose contents merely match (`*.log`) is never
-/// collapsed, so it arrives as individual ignored files instead.
-/// `check-ignore` runs once, only when a tree has ignored directories, and any
-/// failure retains everything rather than delete by guess.
+/// A directory is build output only when the ignore pattern that decides it
+/// passes [`is_build_output_rule`]. A directory whose contents merely match
+/// (`*.log`) is never collapsed, so it arrives as individual ignored files
+/// instead. `check-ignore` runs once, only when a tree has ignored
+/// directories, and any failure retains everything rather than delete by guess.
 async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<String>, usize) {
     if dirs.is_empty() {
         return (Vec::new(), 0);
@@ -945,7 +943,7 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
     while let (Some(_source), Some(_line), Some(pattern), Some(path)) =
         (fields.next(), fields.next(), fields.next(), fields.next())
     {
-        if pattern.ends_with('/') && !pattern.starts_with('!') {
+        if is_build_output_rule(pattern) {
             build_dirs.push(path.trim_end_matches('/').to_string());
         }
     }
@@ -953,6 +951,22 @@ async fn classify_ignored_dirs(worktree: &Worktree, dirs: &[String]) -> (Vec<Str
     build_dirs.dedup();
     let retained = dirs.len().saturating_sub(build_dirs.len());
     (build_dirs, retained)
+}
+
+/// Only a rule that names a directory marks build output: `target/`,
+/// `secrets/`, `cmake-build-*/`. `/*` and bare `node_modules` are not
+/// directory-scoped. A directory rule whose last segment is nothing but
+/// wildcards (`/*/`, `**/`, `packages/*/`) matches every directory at that
+/// level — the whitelist shape, where a new directory is hand-written work.
+fn is_build_output_rule(pattern: &str) -> bool {
+    if pattern.starts_with('!') {
+        return false;
+    }
+    let Some(scope) = pattern.strip_suffix('/') else {
+        return false;
+    };
+    let last = scope.rsplit('/').next().unwrap_or_default();
+    last.chars().any(|ch| ch != '*')
 }
 
 async fn git_text_with_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
@@ -1520,6 +1534,61 @@ mod tests {
         assert!(finish(worktree).await.unwrap().is_some());
         assert!(path.join("notes/plan.md").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Whitelist repositories also write the catch-all as a directory rule:
+    /// `/*/` and `src/*/` decide `notes/` and `src/gen/`, which are new
+    /// hand-written directories, while a named `target/` is still dropped.
+    #[tokio::test]
+    async fn wildcard_directory_rules_are_content() {
+        let root = temp_repo("ignored-wildcard-dir").await;
+        std::fs::write(root.join(".gitignore"), "/*/\n!/src/\nsrc/*/\ntarget/\n").unwrap();
+        fixture_git(&root, &["add", ".gitignore"]).await;
+        fixture_git(&root, &["commit", "-qm", "ignore"]).await;
+        let worktree = create(&root, "agent-wildcard-dir", &cleanup_tasks())
+            .await
+            .unwrap();
+        let path = worktree.path.clone();
+        for entry in ["target/debug/artifact", "notes/plan.md", "src/gen/notes.md"] {
+            let file = path.join(entry);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "content").unwrap();
+        }
+
+        let changes = inspect_changes(&worktree).await.unwrap();
+        assert_eq!(changes.ignored_dirs, vec!["target".to_string()]);
+        assert_eq!(changes.changed_files, 2, "{changes:?}");
+        assert!(finish(worktree).await.unwrap().is_some());
+        assert!(path.join("notes/plan.md").exists());
+        assert!(path.join("src/gen/notes.md").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_named_directory_rules_mark_build_output() {
+        let expected = [
+            ("target/", true),
+            ("/build/", true),
+            ("src/gen/", true),
+            ("**/node_modules/", true),
+            ("cmake-build-*/", true),
+            ("*.egg-info/", true),
+            ("secrets/", true),
+            ("/*/", false),
+            ("*/", false),
+            ("**/", false),
+            ("**/*/", false),
+            ("packages/*/", false),
+            ("/", false),
+            ("/*", false),
+            ("node_modules", false),
+            ("!keep/", false),
+        ];
+        let actual: Vec<_> = expected
+            .iter()
+            .map(|(pattern, _)| (*pattern, is_build_output_rule(pattern)))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     /// `/*`, a bare `secrets`, and a bare `node_modules` match directories but
