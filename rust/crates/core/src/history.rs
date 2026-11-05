@@ -2044,6 +2044,7 @@ mod tests {
         let chat_provider = || Provider::OpenAiCompat {
             cred: kloop_provider::Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
+            output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
         };
         let chat_fingerprint = chat_provider().endpoint_fingerprint();
         let catalog = Arc::new(
@@ -2128,6 +2129,7 @@ mod tests {
         let chat = || Provider::OpenAiCompat {
             cred: kloop_provider::Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
+            output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
         };
         let anthropic = || Provider::Anthropic {
             cred: kloop_provider::Credential::api_key("unused"),
@@ -2203,6 +2205,7 @@ mod tests {
             Provider::OpenAiCompat {
                 cred: kloop_provider::Credential::bearer("unused"),
                 base: "https://chat.invalid".into(),
+                output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
             },
             "chat-model",
             vec!["chat-model".into()],
@@ -2268,6 +2271,7 @@ mod tests {
                     ProviderApiFamily::OpenAiChatCompletions => Provider::OpenAiCompat {
                         cred: Credential::bearer("synthetic"),
                         base: base.clone(),
+                        output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
                     },
                     ProviderApiFamily::Mock => unreachable!(),
                 };

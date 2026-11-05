@@ -163,8 +163,10 @@ Provider 采样有界且保留错误类型：每次尝试有一个终态，三�
 failure is retryable is decided in order (plan 206): a context overflow (see
 **Reactive** below) never is; `x-should-retry: false` forbids it; a body in the
 quota/billing wording (`insufficient_quota`, `quota exceeded`, `out of budget`,
-`billing`) forbids it too, whatever the status or the header says, since no
-wait refills a quota; `x-should-retry: true` admits any status, 409 included;
+`billing_hard_limit`, `check your plan and billing`) forbids it too, whatever the
+status or the header says, since no wait refills a quota; a free-tier throttle
+that merely links to `/account/billing` is not that wording and keeps retrying;
+`x-should-retry: true` admits any status, 409 included;
 otherwise the 408/429/5xx allowlist decides. The server's delay rides only a
 retryable failure — `retry-after-ms` first, then `Retry-After` — capped at 60s,
 and a longer one is capped and waited out, not refused. Stream-level errors on
@@ -179,7 +181,21 @@ ask one module (`provider/src/classify.rs`). A named Chat `event: error` frame i
 and read rather than rejected as an unknown event name. A Chat stream that
 reports `usage` more than once — a gateway attaching its own copy to the
 `finish_reason` frame on top of the trailing empty-choices frame
-`include_usage` promises — keeps the last report rather than failing. Core retains provider
+`include_usage` promises — keeps the last report rather than failing.
+`finish_reason` is the semantic terminal, not the end of the body: the rail keeps
+reading for the usage tail, bounded by a five-second post-terminal grace, because
+that frame often arrives on its own flush. A provider that closes without
+`[DONE]`, or whose tail read fails after the terminal, ends the stream with the
+outcome already in hand and only the usage missing; a malformed frame or a
+semantic delta that did arrive still fails closed. A frame carrying `event:` but
+no `data:` is a heartbeat and is not dispatched on any rail. Requests with no
+tools omit the field rather than sending an empty array, which
+schema-validating endpoints refuse. An absent or null auxiliary cache count
+(`prompt_tokens_details.cached_tokens`, `input_tokens_details.cached_tokens`,
+`cache_read_input_tokens`, `cache_creation_input_tokens`) means "no hit" and
+counts as 0; a wrong type is still bad data. On Messages, an
+`input_tokens`/cache field reported again on `message_delta` is the cumulative
+report and overrides `message_start`. Core retains provider
 outcomes and failures inside typed turn errors;
 string rendering happens only at CLI/TUI/native protocol 1.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and
@@ -5144,11 +5160,17 @@ cargo run -- --mock
 # wins, and either may raise the default, which is a guess and not a measurement.
 # A budget-dialect model asks for 8,192 of answer room plus its budget, never past
 # the cap, and startup refuses a budget that is not below the cap on any Messages
-# provider that lists the model.
+# provider that lists the model. The Chat rail writes the cap into `max_tokens` by
+# default; official OpenAI reasoning models accept only `max_completion_tokens`
+# and refuse the older name, while compat gateways usually know only `max_tokens`,
+# so a chat profile selects the field with
+# `output_cap_field = "max_completion_tokens"`. That key is refused on the other
+# two rails, where the body field is not a choice.
 #
 # Stream guards are fixed provider-internal safety defaults, not user config:
-# 45s response-header open, 15m per-chunk idle, 30m wall-clock, 10 MiB total
-# response, and 1 MiB per unfinished SSE frame. Anthropic requires message_stop;
+# 300s response-header open, 15m per-chunk idle, 30m wall-clock, 10 MiB total
+# response, 1 MiB per unfinished SSE frame, and 30s to read an error response
+# body (already failed; it must not wait out the model-start budget). Anthropic requires message_stop;
 # Responses requires response.completed/incomplete; Chat requires finish_reason
 # ([DONE] only ends the transport). Complete frames and EOF residuals are strict
 # UTF-8; malformed JSON, unknown semantic events, unclosed output items,

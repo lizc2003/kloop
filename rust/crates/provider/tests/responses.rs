@@ -152,6 +152,67 @@ async fn request_body_is_stateless_with_reasoning_include() {
     );
 }
 
+/// No tools means no field: compaction sends none, and a schema-validating
+/// endpoint refuses an empty `tools` array outright.
+#[tokio::test]
+async fn empty_tool_list_is_omitted() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[json!({"type": "response.completed", "response": {}})]),
+    )
+    .await;
+    let provider = Arc::new(responses(&server));
+    let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        body.get("tools").is_none(),
+        "an empty tool list must be omitted, not sent as []: {body}"
+    );
+}
+
+/// `cached_tokens: null` is a report of "no hit", not bad data; see the same
+/// rule on the Chat rail.
+#[tokio::test]
+async fn null_cached_tokens_counts_as_no_hit() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "response.created", "response": {"id": "r", "status": "in_progress"}}),
+            json!({"type": "response.completed", "response": {
+                "id": "r",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": 9,
+                    "output_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": null},
+                },
+            }}),
+        ]),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(responses(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Terminal { usage: Some(usage), .. })
+            if *usage == Usage {
+                input_tokens: 9,
+                output_tokens: 2,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }
+    ));
+}
+
 /// The prompt-cache routing hint rides every request when the session is
 /// bound, and is absent otherwise — an empty key would herd every unbound run
 /// onto one bucket. It only steers routing, so the rest of the body is

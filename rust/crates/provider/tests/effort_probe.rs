@@ -65,6 +65,7 @@ async fn probe_effort_levels() {
             ProviderApiFamily::OpenAiChatCompletions => Provider::OpenAiCompat {
                 cred: Credential::bearer(key.clone()),
                 base: base.clone(),
+                output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
             },
             _ => Provider::OpenAiResponses {
                 cred: Credential::bearer(key.clone()),

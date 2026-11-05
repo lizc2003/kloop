@@ -55,7 +55,11 @@ impl SseParser {
                 }
                 // comments (":...") and other fields ignored
             }
-            if event.is_some() || !data_lines.is_empty() {
+            // A field of its own is not an event: `event: ping\n\n` carries no
+            // data, and the SSE dispatch algorithm drops a frame whose data
+            // buffer stayed empty. A present-but-empty `data:` line still
+            // dispatches (the buffer held a newline).
+            if !data_lines.is_empty() {
                 frames.push(SseFrame {
                     event,
                     data: data_lines.join("\n"),
@@ -188,6 +192,30 @@ mod tests {
                 "message_stop ",
                 "\tmessage_stop",
             ]
+        );
+    }
+
+    #[test]
+    fn event_only_frames_are_not_dispatched() {
+        let mut parser = SseParser::default();
+        assert_eq!(
+            parser
+                .feed(b"event: ping\n\nevent: message_start\ndata: one\n\n")
+                .unwrap(),
+            vec![SseFrame {
+                event: Some("message_start".into()),
+                data: "one".into(),
+            }]
+        );
+
+        // A `data:` line is a field even when its value is empty; the frame
+        // still dispatches with an empty payload.
+        assert_eq!(
+            parser.feed(b"data:\n\n").unwrap(),
+            vec![SseFrame {
+                event: None,
+                data: String::new(),
+            }]
         );
     }
 

@@ -22,6 +22,7 @@ use kloop_protocol::ANTHROPIC_MIN_THINKING_BUDGET;
 use kloop_protocol::ProviderApiFamily;
 use kloop_protocol::ProviderAvailabilityCode;
 use kloop_protocol::ReasoningEffort;
+use kloop_provider::ChatOutputCapField;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
 
@@ -111,6 +112,8 @@ struct Profile {
     models: Vec<String>,
     prompt_cache: bool,
     effort: Option<ReasoningEffort>,
+    /// Chat rail only: the body field the output cap is written to.
+    output_cap_field: ChatOutputCapField,
     /// The model's real context window, when the provider knows it. Only the
     /// provider can: the global default has to be conservative enough for the
     /// smallest model anyone routes to, and a window set too low costs nothing
@@ -181,6 +184,7 @@ fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings
         let wire = profile.wire;
         let prompt_cache = profile.prompt_cache;
         let default_effort = profile.effort;
+        let output_cap_field = profile.output_cap_field;
         let factory = Arc::new(move || {
             let cred = credential
                 .clone()
@@ -194,6 +198,7 @@ fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings
                 Rail::OpenAiChat => Provider::OpenAiCompat {
                     cred,
                     base: base.clone(),
+                    output_cap_field,
                 },
                 Rail::OpenAiResponses => Provider::OpenAiResponses {
                     cred,
@@ -435,6 +440,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "effort"
                 | "context_window"
                 | "max_output_tokens"
+                | "output_cap_field"
         ) {
             bail!("providers.{id} has unknown key '{key}'");
         }
@@ -471,6 +477,26 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     if wire != Rail::Anthropic && spec.contains_key("prompt_cache") {
         bail!("providers.{id}.prompt_cache is only valid for messages wire_api");
     }
+    let output_cap_field = match optional_string(
+        spec,
+        "output_cap_field",
+        &format!("providers.{id}.output_cap_field"),
+    )? {
+        Some(raw) => {
+            if wire != Rail::OpenAiChat {
+                bail!("providers.{id}.output_cap_field is only valid for chat wire_api");
+            }
+            match raw.as_str() {
+                "max_tokens" => ChatOutputCapField::MaxTokens,
+                "max_completion_tokens" => ChatOutputCapField::MaxCompletionTokens,
+                other => bail!(
+                    "providers.{id}.output_cap_field must be \
+                     \"max_tokens\" or \"max_completion_tokens\", not \"{other}\""
+                ),
+            }
+        }
+        None => ChatOutputCapField::default(),
+    };
     let context_window = optional_integer(
         spec,
         "context_window",
@@ -490,6 +516,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         models,
         prompt_cache,
         effort,
+        output_cap_field,
         context_window,
         max_output_tokens,
     })
@@ -771,6 +798,40 @@ models = ["gpt-a"]
             descriptors[1].availability,
             ProviderAvailabilityCode::MissingCredential
         );
+    }
+
+    /// The Chat output cap field is a wire detail official OpenAI and compat
+    /// gateways disagree about, so the profile picks; it is meaningless on the
+    /// other rails and refused there rather than silently ignored.
+    #[test]
+    fn output_cap_field_is_chat_only_and_checked() {
+        let profile = |wire: &str, line: &str| {
+            let raw = format!(
+                "provider = \"x\"\n[providers.x]\nwire_api = \"{wire}\"\n\
+                 auth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
+            );
+            resolve(Some(&raw)).map(|_| ())
+        };
+
+        assert!(profile("chat", "").is_ok());
+        assert!(profile("chat", "output_cap_field = \"max_tokens\"").is_ok());
+        assert!(profile("chat", "output_cap_field = \"max_completion_tokens\"").is_ok());
+        assert_eq!(
+            profile("chat", "output_cap_field = \"max_new_tokens\"")
+                .unwrap_err()
+                .to_string(),
+            "providers.x.output_cap_field must be \"max_tokens\" or \
+             \"max_completion_tokens\", not \"max_new_tokens\""
+        );
+        for wire in ["messages", "responses"] {
+            assert_eq!(
+                profile(wire, "output_cap_field = \"max_completion_tokens\"")
+                    .unwrap_err()
+                    .to_string(),
+                "providers.x.output_cap_field is only valid for chat wire_api",
+                "{wire}"
+            );
+        }
     }
 
     /// The file names the initial route, and a model outside the profile's own

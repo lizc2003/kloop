@@ -369,10 +369,13 @@ fn usage_from(response: &Value) -> Result<Option<Usage>, ProviderFailure> {
     }
     let input = required_u64(&usage["input_tokens"], "input_tokens")?;
     let output = required_u64(&usage["output_tokens"], "output_tokens")?;
-    let cached = match usage["input_tokens_details"]["cached_tokens"].as_u64() {
-        Some(value) => value,
-        None if usage["input_tokens_details"].is_null() => 0,
-        None => return Err(protocol("cached_tokens was not an integer")),
+    let cached = match &usage["input_tokens_details"]["cached_tokens"] {
+        // Absent and explicitly null both mean "no hit reported"; see the same
+        // rule on the Chat rail.
+        Value::Null => 0,
+        other => other
+            .as_u64()
+            .ok_or_else(|| protocol("cached_tokens was not an integer"))?,
     };
     if cached > input {
         return Err(protocol("cached_tokens exceeded input_tokens"));
@@ -1419,7 +1422,9 @@ mod tests {
 
     /// Whole-object contract for the history translation: reasoning items
     /// replayed with their encrypted blob next to the calls they preceded,
-    /// signature-less thinking dropped, tool outputs before trailing text.
+    /// thinking from another rail replayed with an empty blob (its signature
+    /// is what fails closed elsewhere, not the text), tool outputs before
+    /// trailing text.
     #[test]
     fn translates_canonical_history_to_input_items() {
         let messages = vec![

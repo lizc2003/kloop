@@ -204,6 +204,27 @@ impl Reasoning {
     }
 }
 
+/// The Chat body field that carries the request's output cap. Official OpenAI
+/// reasoning models accept only `max_completion_tokens` and refuse
+/// `max_tokens`; compat gateways are usually the other way round. It is
+/// therefore per-provider configuration, and the compat spelling is the
+/// default so no existing profile changes meaning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatOutputCapField {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+impl ChatOutputCapField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
 pub enum Provider {
     Anthropic {
         cred: Credential,
@@ -217,14 +238,12 @@ pub enum Provider {
     OpenAiCompat {
         cred: Credential,
         base: String,
+        output_cap_field: ChatOutputCapField,
     },
     /// OpenAI Responses API (`/responses`), stateless: `store: false`, with
     /// reasoning carried across requests via encrypted_content blobs riding
     /// in `Thinking.signature`.
-    OpenAiResponses {
-        cred: Credential,
-        base: String,
-    },
+    OpenAiResponses { cred: Credential, base: String },
     /// Scripted turns for keyless end-to-end runs; each `stream()` call pops one turn.
     Mock {
         turns: Mutex<VecDeque<MockTurn>>,
@@ -601,9 +620,14 @@ impl Provider {
                     "max_tokens": max_output_tokens,
                     "system": anthropic::system_value(system, cache),
                     "messages": messages,
-                    "tools": anthropic::tools_value(tools, cache),
                     "stream": true,
                 });
+                // No tools is not the same as zero tools: a schema-validating
+                // endpoint refuses `"tools": []`, and compaction asks for none
+                // on every rail.
+                if !tools.is_empty() {
+                    body["tools"] = anthropic::tools_value(tools, cache);
+                }
                 // Effort is the only reasoning knob; `thinking` is what it
                 // rendered to for this model (resolved by the catalog, which is
                 // the only place that knows the model's dialect). A budget-
@@ -644,18 +668,27 @@ impl Provider {
                     "model": model,
                     "instructions": system,
                     "input": input,
-                    "tools": tools.iter().map(|t| json!({
-                        "type": "function",
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.schema,
-                    })).collect::<Vec<_>>(),
                     "max_output_tokens": max_output_tokens,
                     "parallel_tool_calls": true,
                     "store": false,
                     "include": ["reasoning.encrypted_content"],
                     "stream": true,
                 });
+                // See the Anthropic arm: an empty array is refused by
+                // schema-validating endpoints.
+                if !tools.is_empty() {
+                    body["tools"] = json!(
+                        tools
+                            .iter()
+                            .map(|t| json!({
+                                "type": "function",
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.schema,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 if let Some(effort) = effort {
                     body["reasoning"] = json!({"effort": effort.as_str(), "summary": "auto"});
                 }
@@ -668,9 +701,14 @@ impl Provider {
                     responses::stream(&url, &cred, &body, &sink).await
                 })
             }
-            Provider::OpenAiCompat { cred, base } => {
+            Provider::OpenAiCompat {
+                cred,
+                base,
+                output_cap_field,
+            } => {
                 let url = format!("{base}/chat/completions");
                 let cred = cred.clone();
+                let output_cap_field = *output_cap_field;
                 let messages = match openai::to_openai_messages(system, messages) {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -679,19 +717,31 @@ impl Provider {
                 };
                 let mut body = json!({
                     "model": model,
-                    "max_tokens": max_output_tokens,
                     "stream_options": {"include_usage": true},
                     "messages": messages,
-                    "tools": tools.iter().map(|t| json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.schema,
-                        },
-                    })).collect::<Vec<_>>(),
                     "stream": true,
                 });
+                // Official reasoning endpoints reject `max_tokens` outright and
+                // demand `max_completion_tokens`; compat gateways often know
+                // only the older name. The profile picks.
+                body[output_cap_field.as_str()] = json!(max_output_tokens);
+                // See the Anthropic arm: an empty array is refused by
+                // schema-validating endpoints.
+                if !tools.is_empty() {
+                    body["tools"] = json!(
+                        tools
+                            .iter()
+                            .map(|t| json!({
+                                "type": "function",
+                                "function": {
+                                    "name": t.name,
+                                    "description": t.description,
+                                    "parameters": t.schema,
+                                },
+                            }))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 // Only reasoning models accept this; a non-reasoning model
                 // rejects it, which is why the field is absent unless the
                 // session explicitly set an effort.
@@ -703,8 +753,8 @@ impl Provider {
                 // prompt sent three times reported `cached_tokens: 2816` on the
                 // third, with prompt cost dropping ~12x. `prompt_tokens_details`
                 // is absent on a miss rather than zeroed, so its absence means
-                // "no hit", not "not reported" — which is why `usage_from` in
-                // `openai.rs` reads a missing block as 0 instead of failing.
+                // "no hit", not "not reported" — which is why `parse_usage` in
+                // `openai.rs` reads a missing or null block as 0.
                 if let Some(cache_key) = cache_key.filter(|key| !key.is_empty()) {
                     body["prompt_cache_key"] = json!(cache_key);
                 }
@@ -949,6 +999,7 @@ mod tests {
         let chat = Provider::OpenAiCompat {
             cred: Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
+            output_cap_field: ChatOutputCapField::MaxTokens,
         };
         let chat_attempt = chat.attempt_identity("chat", 1, "chat-model");
         let chat_reasoning = Message::assistant_from_provider(
@@ -970,6 +1021,7 @@ mod tests {
         let chat = Provider::OpenAiCompat {
             cred: Credential::bearer("unused"),
             base: "https://chat.invalid".into(),
+            output_cap_field: ChatOutputCapField::MaxTokens,
         };
         let foreign = Message::assistant_from_provider(
             vec![kloop_protocol::ContentBlock::Thinking {

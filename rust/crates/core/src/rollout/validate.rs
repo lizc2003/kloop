@@ -610,6 +610,7 @@ mod tests {
         let provider = kloop_provider::Provider::OpenAiCompat {
             cred: kloop_provider::Credential::bearer("test-key"),
             base: "https://chat.invalid".into(),
+            output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
         };
         let (catalog, _) = crate::provider_route::ProviderCatalog::from_provider(
             "chat",
@@ -645,6 +646,7 @@ mod tests {
         let provider = kloop_provider::Provider::OpenAiCompat {
             cred: kloop_provider::Credential::bearer("test-key"),
             base: "https://chat.invalid".into(),
+            output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
         };
         let (catalog, _) = crate::provider_route::ProviderCatalog::from_provider(
             "chat",

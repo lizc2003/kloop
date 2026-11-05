@@ -2,6 +2,7 @@
 //! to chat messages and the tool_calls delta stream back into StreamEvents.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
@@ -24,6 +25,13 @@ use kloop_protocol::Usage;
 /// message (the `tool` role cannot carry images).
 const IMAGE_RELOCATED_PLACEHOLDER: &str =
     "[tool output contains image data attached in the following message]";
+
+/// How long the rail keeps reading after `finish_reason`. The `include_usage`
+/// report lands one flush later (and `[DONE]` after it), so this only covers a
+/// flush gap; a gateway that closes without `[DONE]` costs at most this much.
+/// Timing out is not an error — the outcome is already known, only the usage
+/// is lost, and the next request starts from an estimate.
+const FINISH_TAIL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One chat/completions `image_url` data-URL part from a canonical image source.
 fn image_url_part(source: &ImageSource) -> Value {
@@ -250,10 +258,13 @@ fn parse_usage(value: &Value) -> Result<Usage, ProviderFailure> {
     let output = value["completion_tokens"]
         .as_u64()
         .ok_or_else(|| protocol("usage missing completion_tokens"))?;
-    let cached = match value["prompt_tokens_details"]["cached_tokens"].as_u64() {
-        Some(value) => value,
-        None if value["prompt_tokens_details"].is_null() => 0,
-        None => return Err(protocol("usage cached_tokens was not an integer")),
+    let cached = match &value["prompt_tokens_details"]["cached_tokens"] {
+        // Absent and explicitly null both mean "no hit reported": a gateway
+        // that zeroes the block often sends null. Only a wrong type is bad data.
+        Value::Null => 0,
+        other => other
+            .as_u64()
+            .ok_or_else(|| protocol("usage cached_tokens was not an integer"))?,
     };
     if cached > prompt {
         return Err(protocol("usage cached_tokens exceeded prompt_tokens"));
@@ -417,7 +428,16 @@ pub(super) async fn stream(
     let mut usage = None;
     let mut transport_done = false;
 
-    while let Some(frame) = frames.next().await? {
+    loop {
+        let frame = match frames.next().await {
+            Ok(frame) => frame,
+            // The terminal is already in hand; whatever the tail does — a
+            // flush gap, a cut connection, an unterminated `[DONE]` — cannot
+            // change the answer, so only the usage is lost.
+            Err(_) if outcome.is_some() => break,
+            Err(error) => return Err(error),
+        };
+        let Some(frame) = frame else { break };
         if transport_done {
             return Err(protocol("SSE frame arrived after [DONE]"));
         }
@@ -518,7 +538,10 @@ pub(super) async fn stream(
         }
 
         if outcome.is_some() {
-            frames.stop();
+            // Keep reading: `include_usage` puts the authoritative report on a
+            // frame after `finish_reason`. The tail gets a short grace so a
+            // provider that never closes the body cannot hold the turn.
+            frames.finish_after(FINISH_TAIL_TIMEOUT);
         }
     }
 

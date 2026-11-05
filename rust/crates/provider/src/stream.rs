@@ -37,6 +37,9 @@ pub(crate) const STREAM_WALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub(crate) const STREAM_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const STREAM_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const HTTP_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// An error body is a short write-up, not a model that has yet to start: 300s
+/// (the header budget) would delay a failed request by minutes for no gain.
+const HTTP_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub type StreamResult = Result<StreamEvent, ProviderFailure>;
@@ -267,6 +270,9 @@ pub(crate) struct SseFrames<S> {
     /// Frames already parsed out of the chunk being drained.
     ready: VecDeque<SseFrame>,
     stopped: bool,
+    /// Absolute bound on further reads, set once the rail has its semantic
+    /// terminal; see [`SseFrames::finish_after`].
+    tail_deadline: Option<Instant>,
 }
 
 impl<S> SseFrames<S> {
@@ -276,6 +282,7 @@ impl<S> SseFrames<S> {
             body: GuardedBody::new(stream),
             ready: VecDeque::new(),
             stopped: false,
+            tail_deadline: None,
         }
     }
 
@@ -285,6 +292,17 @@ impl<S> SseFrames<S> {
     /// stops there.
     pub(crate) fn stop(&mut self) {
         self.stopped = true;
+    }
+
+    /// Keep reading past the terminal, but only for `wait`. A chat stream's
+    /// `finish_reason` frame is followed by the authoritative `include_usage`
+    /// report on a later flush and (usually) `[DONE]`; a provider is allowed to
+    /// omit `[DONE]` and hold the connection open, so the tail needs its own
+    /// bound instead of the 15-minute idle timeout. Frames already parsed are
+    /// still delivered; this only caps the wait for more bytes.
+    pub(crate) fn finish_after(&mut self, wait: Duration) {
+        self.tail_deadline
+            .get_or_insert_with(|| Instant::now() + wait);
     }
 
     /// The next complete frame, or `None` once the rail has stopped or the body
@@ -303,7 +321,19 @@ impl<S> SseFrames<S> {
             if self.stopped {
                 return Ok(None);
             }
-            let Some(chunk) = self.body.next().await? else {
+            let next = match self.tail_deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, self.body.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        return Err(ProviderFailure::timeout(
+                            TimeoutStage::Idle,
+                            "stream tail did not close within its post-terminal grace",
+                        ));
+                    }
+                },
+                None => self.body.next().await,
+            };
+            let Some(chunk) = next? else {
                 self.parser.finish()?;
                 return Ok(None);
             };
@@ -408,8 +438,8 @@ async fn bounded_http_error_body(mut response: reqwest::Response) -> String {
                     if chunk.len() >= remaining {
                         bytes.extend_from_slice(&chunk[..remaining]);
                         // Stop at the cap even when this chunk lands exactly on
-                        // it: waiting for another byte/EOF would let an error
-                        // response hold the request open for 45 more seconds.
+                        // it: waiting for another byte/EOF would hold the
+                        // request open until the error-body timeout.
                         truncated = true;
                         break;
                     }
@@ -427,7 +457,7 @@ async fn bounded_http_error_body(mut response: reqwest::Response) -> String {
         }
         text
     };
-    match tokio::time::timeout(STREAM_OPEN_TIMEOUT, read).await {
+    match tokio::time::timeout(HTTP_ERROR_BODY_TIMEOUT, read).await {
         Ok(text) => text,
         Err(_) => "[response body read timed out]".into(),
     }
@@ -508,12 +538,37 @@ mod tests {
         assert_eq!(STREAM_WALL_TIMEOUT, Duration::from_secs(30 * 60));
         assert_eq!(STREAM_MAX_RESPONSE_BYTES, 10 * 1024 * 1024);
         assert_eq!(STREAM_MAX_FRAME_BYTES, 1024 * 1024);
+        assert_eq!(HTTP_ERROR_BODY_TIMEOUT, Duration::from_secs(30));
+        assert!(
+            HTTP_ERROR_BODY_TIMEOUT < STREAM_OPEN_TIMEOUT,
+            "an error body must not wait out the model-start budget"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn open_wait_is_bounded() {
         let result = wait_for_open(pending::<()>(), Duration::from_secs(45)).await;
         assert_eq!(result, Err(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_terminal_tail_wait_is_bounded() {
+        let mut frames = SseFrames::new(stream::pending::<Result<Vec<u8>, Infallible>>());
+        frames.finish_after(Duration::from_secs(5));
+        let error = frames.next().await.unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &crate::ProviderFailureKind::Timeout {
+                stage: TimeoutStage::Idle
+            }
+        );
+        // The bound is absolute rather than refreshed per read, so a caller
+        // that ignores the first timeout does not get another grace period.
+        let error = frames.next().await.unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            crate::ProviderFailureKind::Timeout { .. }
+        ));
     }
 
     #[tokio::test(start_paused = true)]

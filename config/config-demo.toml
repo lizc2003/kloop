@@ -44,6 +44,8 @@ base_url    = "https://gateway.example.com/v1"
 auth_header = { Authorization = "Bearer REPLACE-ME" }
 model       = "grok-4.5"                           # no `models` = just this one
 effort      = "max"
+# output_cap_field = "max_completion_tokens"        # chat-only; official OpenAI
+                                                    # reasoning models reject max_tokens
 
 # responses → POST {base_url}/responses
 [providers.k-flash]

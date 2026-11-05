@@ -1546,6 +1546,7 @@ async fn real_three_rail_route_switch_contract() {
                     Ok(Provider::OpenAiCompat {
                         cred: Credential::bearer(chat_factory_key.clone()),
                         base: chat_factory_base.clone(),
+                        output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
                     })
                 }),
             },
@@ -4370,6 +4371,7 @@ async fn real_effort_sweep_contract() {
                             Provider::OpenAiCompat {
                                 cred: Credential::bearer(key),
                                 base,
+                                output_cap_field: kloop_provider::ChatOutputCapField::MaxTokens,
                             }
                         }
                         kloop_protocol::ProviderApiFamily::OpenAiResponses => {

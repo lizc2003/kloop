@@ -148,6 +148,17 @@ fn required_u64(value: &Value, field: &str) -> Result<u64, ProviderFailure> {
         .ok_or_else(|| protocol(format!("missing or invalid {field}")))
 }
 
+/// A usage field a gateway may omit or send as null; both mean "not reported".
+fn optional_u64(
+    usage: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, ProviderFailure> {
+    match usage.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => required_u64(value, field).map(Some),
+    }
+}
+
 fn event_type<'a>(frame: &SseFrame, value: &'a Value) -> Result<&'a str, ProviderFailure> {
     let kind = required_str(&value["type"], "event type")?;
     if let Some(wire) = frame.event.as_deref()
@@ -311,20 +322,9 @@ pub(super) async fn stream(
                 let usage = value["message"]["usage"]
                     .as_object()
                     .ok_or_else(|| protocol("message_start missing usage"))?;
-                input_tokens = Some(required_u64(
-                    &value["message"]["usage"]["input_tokens"],
-                    "input_tokens",
-                )?);
-                cache_read = usage
-                    .get("cache_read_input_tokens")
-                    .map(|value| required_u64(value, "cache_read_input_tokens"))
-                    .transpose()?
-                    .unwrap_or(0);
-                cache_creation = usage
-                    .get("cache_creation_input_tokens")
-                    .map(|value| required_u64(value, "cache_creation_input_tokens"))
-                    .transpose()?
-                    .unwrap_or(0);
+                input_tokens = Some(required_u64(&usage["input_tokens"], "input_tokens")?);
+                cache_read = optional_u64(usage, "cache_read_input_tokens")?.unwrap_or(0);
+                cache_creation = optional_u64(usage, "cache_creation_input_tokens")?.unwrap_or(0);
                 started = true;
             }
             "content_block_start" => {
@@ -433,10 +433,22 @@ pub(super) async fn stream(
                 }
                 let reason = required_str(&value["delta"]["stop_reason"], "message stop reason")?;
                 outcome = Some(map_stop_reason(reason)?);
-                output_tokens = Some(required_u64(
-                    &value["usage"]["output_tokens"],
-                    "output_tokens",
-                )?);
+                let usage = value["usage"]
+                    .as_object()
+                    .ok_or_else(|| protocol("message_delta missing usage"))?;
+                output_tokens = Some(required_u64(&usage["output_tokens"], "output_tokens")?);
+                // A gateway may fill message_start with zeros and report the
+                // cumulative input/cache counts here instead. A later report
+                // wins, as with a repeated Chat usage frame.
+                if let Some(value) = optional_u64(usage, "input_tokens")? {
+                    input_tokens = Some(value);
+                }
+                if let Some(value) = optional_u64(usage, "cache_read_input_tokens")? {
+                    cache_read = value;
+                }
+                if let Some(value) = optional_u64(usage, "cache_creation_input_tokens")? {
+                    cache_creation = value;
+                }
             }
             "message_stop" => {
                 if !started {

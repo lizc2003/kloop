@@ -1,8 +1,8 @@
 # Plan 253 — provider 流式读取与请求构造
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。三条轨的去重与解析性能另见 plan 254。
+> 状态：✅ 已完成(2026-11-05)。行号是 2026-10-28 的读数,开工先自己量;标「待复核」的条目
+> 开工第一步先读代码确认，不成立就在本文件划掉并写明原因。三条轨的去重与解析性能另见 plan 254。
 
 ## 问题
 
@@ -39,10 +39,11 @@
 ## 开工先问用户
 
 - 第 5 条怎么收窄：(a) `billing` 改成 `billing_hard_limit`、`check your plan and billing` 这类
-  短语;(b) status==429 时要求同时命中更强的配额标记。推荐 (a)。
+  短语;(b) status==429 时要求同时命中更强的配额标记。推荐 (a)。→ 用户选 (a)。
 - 第 7 条做不做、怎么做：(a) 发 `reasoning_effort` 时改用 `max_completion_tokens`;(b) 做成
-  provider 配置项。推荐 (b),默认保持 `max_tokens`(兼容网关是主要用户)。
-- 第 8 条错误体读取超时要不要单独设短(如 30s)?推荐要。
+  provider 配置项。推荐 (b),默认保持 `max_tokens`(兼容网关是主要用户)。→ 用户选 (b)，
+  键名定为 `output_cap_field`。
+- 第 8 条错误体读取超时要不要单独设短(如 30s)?推荐要。→ 用户同意，取 30s。
 
 ## 做法
 
@@ -64,6 +65,37 @@
 - provider 集成测试夹具补"分块下发"能力(夹具层改动，后续 plan 可复用)。
 - 外层执行沙箱之外 `make check`;真实 API 是否实测开工问用户(代理和 key 问用户要);DESIGN
   约 170–180 行先读再改;HANDOFF 记进展与教训。
+
+## 完成记录(2026-11-05)
+
+八条全部成立(含五条「疑似/待复核」)，无划掉项。
+
+1. Chat 轨收到 `finish_reason` 后不再 `stop()`：继续读到 `[DONE]`/EOF，
+   `SseFrames::finish_after` 给尾帧 5s **绝对**宽限(不是每次读重置)；终端之后尾帧读取失败
+   (超时、断连、未终止的 `[DONE]` 残片)都以已有结果收尾，只丢 usage；已经读到的坏帧或
+   语义帧仍然 fail-closed。provider 集成测试新增原块传输夹具 `tests/support/mod.rs`
+   (独立 flush + 50ms 间隔)，`usage_flushed_after_finish_reason_is_not_lost` 覆盖旧代码会丢
+   usage 的形状。
+2. `tools` 为空时整个字段省略。Anthropic 轨同样处理——压缩在三条轨上都不带工具，空数组
+   对按 schema 校验的端点一律是 400。
+3. 三条轨的辅助缓存计数(`cached_tokens`、`cache_read_input_tokens`、
+   `cache_creation_input_tokens`)缺失或 null 一律按 0；类型错误仍报协议错。
+4. Anthropic `message_delta` 的 usage 里出现 `input_tokens`/cache 字段即覆盖 `message_start`，
+   与 Chat「后到的 usage 覆盖先到的」同规则。
+5. 配额措辞收窄为 `insufficient_quota`、`out of budget`、`quota exceeded`、
+   `billing_hard_limit`、`check your plan and billing`；带 `/account/billing` 链接的免费层
+   429 恢复为按限流重试。DESIGN 的措辞清单同步。
+6. SSE 只在有 `data:` 行时派发；`event: ping\n\n` 不再进入 JSON 解析。空的 `data:` 行仍派发。
+7. Chat 轨输出上限字段改由 `Provider::OpenAiCompat.output_cap_field` 决定；profile 键
+   `output_cap_field = "max_tokens" | "max_completion_tokens"`，默认前者，仅 chat 轨合法，
+   写错值或写错轨在启动时报错。配置 demo 与 DESIGN 同步。
+8. 错误体读取独立 30s 超时(`HTTP_ERROR_BODY_TIMEOUT`)，不再借用 300s 的打开超时；
+   `stream.rs` 的过时注释、`responses.rs` 的「signature-less thinking dropped」注释已改正。
+
+新增 10 条测试(SSE 1、stream 1、openai 3、responses 2、anthropic 2、cli 配置 1)，另扩展
+4 条既有测试(三轨空 tools/缓存计数、429 分类表、请求体整对象断言)。外层执行沙箱之外
+`make check` 全绿(fmt、clippy、workspace debug 全量测试、本机 parity baseline verified)。
+真实 API 未实测：本机没有代理和 key，验收以夹具和单测为准。
 
 ## 另议(记一笔，不在本条做)
 

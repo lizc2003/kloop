@@ -75,11 +75,17 @@ const NOT_OVERFLOW: &[&str] = &[
 /// Quota or billing exhausted: the request is fine, the account is not, and a
 /// retry only waits to be refused again. The generic entries of pi's
 /// `packages/ai/src/utils/retry.ts`; its gateway-specific ones are not ported.
+///
+/// The bare word `billing` is deliberately absent: free-tier 429 text links to
+/// `/account/billing` without the account being out of quota, and matching it
+/// turned a throttle into a permanent failure. Only phrases that appear in an
+/// exhausted-account message are listed.
 const QUOTA: &[&str] = &[
     r"insufficient_quota",
     r"out of budget",
     r"quota exceeded",
-    r"billing",
+    r"billing_hard_limit",
+    r"check your plan and billing",
 ];
 
 static OVERFLOW_SET: LazyLock<RegexSet> = LazyLock::new(|| case_insensitive(OVERFLOW));
@@ -235,11 +241,14 @@ mod tests {
             r#"{"error":{"code":"insufficient_quota"}}"#,
             "You exceeded your current quota, please check your plan and billing details.",
             "Quota exceeded for this project",
+            r#"{"error":{"code":"billing_hard_limit_reached"}}"#,
+            // A free-tier throttle that merely links to the billing page.
+            "Rate limit reached for gpt-4o. Visit https://platform.openai.com/account/billing for limits.",
             "rate limit exceeded",
         ]
         .iter()
         .map(|text| is_quota_text(text))
         .collect();
-        assert_eq!(recognized, vec![true, true, true, false]);
+        assert_eq!(recognized, vec![true, true, true, true, false, false]);
     }
 }

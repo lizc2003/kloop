@@ -274,7 +274,9 @@ async fn session_id_rides_the_gateway_header_without_touching_the_body() {
 }
 
 /// With caching off the request is byte-identical to the pre-caching shape:
-/// plain string system, no cache_control anywhere.
+/// plain string system, no cache_control anywhere, and no `tools` field at all
+/// when the request has no tools (an empty array is refused by schema-validating
+/// endpoints; compaction sends this every time).
 #[tokio::test]
 async fn cache_off_sends_plain_request() {
     let server = MockServer::start().await;
@@ -298,7 +300,6 @@ async fn cache_off_sends_plain_request() {
             "messages": [
                 {"role": "user", "content": [{"type": "text", "text": "hi"}]},
             ],
-            "tools": [],
             "stream": true,
         })
     );
@@ -398,6 +399,86 @@ async fn cache_usage_fields_are_parsed() {
                 output_tokens: 5,
                 cache_read_input_tokens: 900,
                 cache_creation_input_tokens: 50,
+            }
+    ));
+}
+
+/// A gateway may zero message_start's cache fields and report the cumulative
+/// counts on message_delta; the later report wins, exactly as for a repeated
+/// Chat usage frame. Otherwise the input looks like 0 and compaction triggers
+/// far too late.
+#[tokio::test]
+async fn message_delta_cumulative_usage_overrides_message_start() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            }}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {
+                "output_tokens": 7,
+                "input_tokens": 1_234,
+                "cache_read_input_tokens": 1_000,
+                "cache_creation_input_tokens": 34,
+            }}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(
+        &ok[0],
+        StreamEvent::Terminal { usage: Some(u), .. }
+            if *u == Usage {
+                input_tokens: 1_234,
+                output_tokens: 7,
+                cache_read_input_tokens: 1_000,
+                cache_creation_input_tokens: 34,
+            }
+    ));
+}
+
+/// `cache_read_input_tokens: null` is a report of "no hit", not bad data. This
+/// one arrives in message_start, where a protocol error makes every request
+/// on that gateway fail before any output.
+#[tokio::test]
+async fn null_cache_fields_count_as_no_hit() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(&[
+            json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": null,
+                "cache_creation_input_tokens": null,
+            }}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )
+    .await;
+
+    let ok: Vec<StreamEvent> = collect(anthropic(&server))
+        .await
+        .into_iter()
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(matches!(
+        &ok[0],
+        StreamEvent::Terminal { usage: Some(u), .. }
+            if *u == Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
             }
     ));
 }

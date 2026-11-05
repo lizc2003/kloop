@@ -10,6 +10,7 @@ use kloop_protocol::Message;
 use kloop_protocol::ReasoningEffort;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::Usage;
+use kloop_provider::ChatOutputCapField;
 use kloop_provider::Credential;
 use kloop_provider::Provider;
 use kloop_provider::ProviderFailure;
@@ -23,6 +24,10 @@ use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+mod support;
+
+use support::ChunkedSse;
 
 fn sse_body(chunks: &[Value], done: bool) -> String {
     let mut body: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
@@ -76,6 +81,7 @@ fn openai(server: &MockServer) -> Provider {
     Provider::OpenAiCompat {
         cred: Credential::bearer("test-key"),
         base: server.uri(),
+        output_cap_field: ChatOutputCapField::MaxTokens,
     }
 }
 
@@ -106,6 +112,41 @@ async fn chat_requests_carry_the_openai_output_cap() {
     let requests = server.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["max_tokens"], json!(65_536));
+    assert!(
+        body.get("tools").is_none(),
+        "an empty tool list must be omitted, not sent as []: {body}"
+    );
+}
+
+/// Official reasoning endpoints accept only `max_completion_tokens` and refuse
+/// `max_tokens`; a profile can move the cap there. The compat field is then
+/// absent, not sent alongside.
+#[tokio::test]
+async fn chat_output_cap_field_is_configurable() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})],
+            true,
+        ),
+    )
+    .await;
+    let provider = Arc::new(Provider::OpenAiCompat {
+        cred: Credential::bearer("test-key"),
+        base: server.uri(),
+        output_cap_field: ChatOutputCapField::MaxCompletionTokens,
+    });
+    let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
+    while rx.recv().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["max_completion_tokens"], json!(65_536));
+    assert!(
+        body.get("max_tokens").is_none(),
+        "only one cap field may be sent: {body}"
+    );
 }
 
 /// Text deltas, tool_calls accumulated across chunks by index, usage arriving
@@ -229,6 +270,96 @@ async fn repeated_usage_keeps_the_last_report() {
             },
         ]
     );
+}
+
+/// The trailing `include_usage` frame lands on its own flush in the wild. A
+/// body that is split across two HTTP chunks (finish_reason first, usage and
+/// `[DONE]` second) must still report the authoritative usage: stopping at the
+/// terminal frame would keep only what the first chunk happened to contain.
+#[tokio::test]
+async fn usage_flushed_after_finish_reason_is_not_lost() {
+    let server = ChunkedSse::start(vec![
+        format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ),
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            }}),
+        ),
+    ]);
+    let provider = Provider::OpenAiCompat {
+        cred: Credential::bearer("test-key"),
+        base: server.base().to_string(),
+        output_cap_field: ChatOutputCapField::MaxTokens,
+    };
+
+    let events: Vec<StreamEvent> = collect(provider)
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::BlockDone(AssistantBlock::Text { text: "hi".into() }),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::EndTurn,
+                usage: Some(Usage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    cache_read_input_tokens: 2,
+                    cache_creation_input_tokens: 0,
+                }),
+            },
+        ]
+    );
+}
+
+/// `cached_tokens: null` is a report of "no hit", not bad data. The block is
+/// auxiliary to the authoritative input/output counts, and a gateway that
+/// zeroes it sends null rather than omitting it.
+#[tokio::test]
+async fn null_cached_tokens_counts_as_no_hit() {
+    let server = MockServer::start().await;
+    mount_sse(
+        &server,
+        sse_body(
+            &[
+                json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                json!({"choices": [], "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 1,
+                    "prompt_tokens_details": {"cached_tokens": null},
+                }}),
+            ],
+            true,
+        ),
+    )
+    .await;
+
+    let events: Vec<StreamEvent> = collect(openai(&server))
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Terminal { usage: Some(usage), .. })
+            if *usage == Usage {
+                input_tokens: 9,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            }
+    ));
 }
 
 /// reasoning_content deltas (deepseek-style; plain `reasoning` also accepted)
@@ -691,6 +822,12 @@ async fn http_errors_tell_overflow_throttle_and_quota_apart() {
         // Matches the overflow table's `too many tokens`; the 429 says throttle.
         ResponseTemplate::new(429)
             .set_body_string("Too many tokens, please wait before trying again."),
+        // A free-tier throttle that links to `/account/billing`: the link is
+        // not a quota report, so the 429 stays retryable.
+        ResponseTemplate::new(429).set_body_string(
+            "Rate limit reached for gpt-4o. \
+             Visit https://platform.openai.com/account/billing for limits.",
+        ),
         // 5xx is the server's fault even when the body mentions the window.
         ResponseTemplate::new(503)
             .set_body_string(r#"{"error":{"code":"context_length_exceeded"}}"#),
@@ -726,6 +863,7 @@ async fn http_errors_tell_overflow_throttle_and_quota_apart() {
         vec![
             (ProviderFailureKind::ContextOverflow, false, None),
             (http(429), false, None),
+            (http(429), true, None),
             (http(429), true, None),
             (http(503), true, None),
             (http(429), false, None),

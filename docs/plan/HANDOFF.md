@@ -1,5 +1,18 @@
 # HANDOFF — 当前状态与会话交接
 
+**Plan 253 ✅：provider 流式读取与请求构造（2026-11-05）**：八条审查项全部成立。Chat 轨
+收到 `finish_reason` 后改为继续读 usage 尾帧，`SseFrames::finish_after` 给 5s 绝对宽限；
+终端之后的尾帧读取失败(超时、断连、未终止的 `[DONE]`)以已有结果收尾，只有 usage 丢失，
+已读到的坏帧/语义帧仍 fail-closed。provider 测试新增原块传输夹具(独立 flush + 50ms 间隔)，
+旧行为下 usage 会丢。三条轨 `tools` 为空时省略字段(压缩原本发 `[]`，按 schema 校验的端点
+直接 400)；辅助缓存计数 null/缺失按 0，类型错误仍报协议错；Anthropic `message_delta` 的
+累计 input/cache 覆盖 `message_start`；配额措辞把裸 `billing` 换成五个短语，带
+`/account/billing` 链接的免费层 429 恢复重试；SSE 只有 `data:` 行才派发，`event: ping`
+不再解析。Chat 输出上限字段做成 profile 键 `output_cap_field`(默认 `max_tokens`，仅 chat
+轨，官方推理端点可切 `max_completion_tokens`)；错误体读取独立 30s 超时。外层执行沙箱之外
+`make check` 全绿(fmt、clippy、workspace debug 全量测试、本机 parity baseline verified)。
+真实 API 未实测。教训 340。
+
 **Plan 252 ✅：worktree 健壮性（2026-11-04）**：`git worktree list` 现在逐条容错，
 canonicalize 失败的条目（手工删掉的目录、未挂载的卷）在列表阶段跳过，不再让同仓的
 create/enter/exit/finish 一起报“canonicalizing registered worktree”；仓库根单独解析，
@@ -1283,7 +1296,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **250** agent 主循环与上下文估算 | hook 上下文残留吞掉用户输入;图片按 base64/4 估 token;主请求超长不记实测上限;`final_text` 拼接 | 中 | — |
 | **251** 会话持久化与恢复 | server 新会话文件不清理且读不出;rewind 回退错 route;digest 遇坏 UTF-8;resume 读两遍 | 中 | — |
 | **252** worktree 健壮性 | 一个失效的已登记 worktree 让所有操作失败;相对 path 按进程 cwd;阻塞 IO | 小 | 247 之后更顺 |
-| **253** provider 流式与请求构造 | Chat 轨 finish_reason 后停读丢 usage;空 `tools`;null 缓存字段判协议错;`billing` 太宽;无 data 帧 | 中 | — |
+| **253** ✅ provider 流式与请求构造 | Chat 轨 finish_reason 后停读丢 usage;空 `tools`;null 缓存字段判协议错;`billing` 太宽;无 data 帧 | 中 | — |
 | **254** provider 去重与解析性能 | SSE O(n²)、逐事件深拷贝;三条轨校验函数与 usage 解析成对复制 | 中 | 253 |
 | **255** bash 输出、超时与 hook IO | setsid 后代持管道让成功变错误;超时丢输出;`timeout_ms: 0`;stderr 被挤掉;hook 输出无上限 | 中 | — |
 | **256** 文件工具边界 | notebook 改类型、Unix 非覆盖 rename、长行永远不可写、二进制预览写成新文件、text_edit 内存放大 | 中 | — |
@@ -4374,3 +4387,18 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    magic：`:x/` 被改查成 `x/`，输出却回显原字符串配上 `x/` 的规则，看起来像 `:x/` 自己的判定。
    `--literal-pathspecs` 在这个命令上直接报错，统一加 `./` 前缀才保持字面；读回时也只采纳
    问过的路径，别让输出集合大于输入集合。
+
+340. **"语义终点"不是"传输终点"，而一次性下发的夹具永远看不出这个区别。** Chat 的
+   `finish_reason` 一到就停读，看起来只是省掉尾帧；但 `include_usage` 的权威 usage 在另一个
+   flush 里，于是计费、`/cost` 与预测压缩悄悄退回估算，测试却全是绿的——`set_body_raw` 把整段
+   body 一次交给客户端，尾帧本来就在同一个 chunk 里。把语义状态机和读循环分开之后，必须给
+   夹具补"分块 flush"的能力，"终端之后还有数据"这个真实形状才可测。同样的分界适用于超时：
+   终端之后只剩余额数据，尾帧读失败不该反过来否定已经完整的回答。
+
+341. **"没有"和"空数组"在 wire 上不是一回事。** 压缩请求没有工具，发 `tools: []` 会被按
+   schema 校验的端点 400；省略字段才是"没有"。同理，辅助计量字段的 null/缺失是"没上报/
+   没命中"，只有类型不对才是坏数据——把辅助字段当必需字段，会让一整轮输出在最后一步失败。
+
+342. **重试语义靠短语，不靠单词。** 裸 `billing` 命中免费层 429 文案里的 `/account/billing`
+   链接，把一次限流转成永久失败；`billing_hard_limit`、`check your plan and billing` 才是
+   欠费语境。一个词在目标语境和无关语境里都出现的匹配，等于没有匹配。
