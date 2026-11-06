@@ -82,6 +82,14 @@
   parity baseline verified），其中 provider 单元测试 61 项、Anthropic HTTP 契约测试 34 项。
 - 最初两次真实流式缓存采样在首次预热时被上游无签名 thinking 阻断；后续当前 provider
   已完整通过工具调用、结果回传和重复请求，包含有签名 thinking 回放及缓存读取。
-  最新重复请求仍有缓存读取为零的情况，未量化收益或保证稳定命中。
   原始 SSE 对照确认上游仍偶发整块缺签名，但该网关实测接受无签名回放。兼容由
   provider 显式配置开启，默认仍要求签名，详见 HANDOFF 的 thinking 小节。
+- 定向复核固定正文、请求头和会话标识，记录请求摘要并检查原始 SSE。开启/关闭
+  thinking、三/四断点都成功读到缓存；部分相同正文的请求仍出现总输入计数和响应
+  形状变化、重新建缓存。客户端请求与缓存读取路径已验证，额外断点收益仍无法可靠
+  量化，不以单次零读取判定客户端缓存功能损坏。
+- 按[官方缓存隔离与一致性要求](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-storage-and-sharing)
+  应进一步核对网关的会话粘性、上游账户/workspace、前缀改写及计量。响应未提供
+  workspace 标识，且[缓存诊断](https://platform.claude.com/docs/en/build-with-claude/cache-diagnostics)
+  的首响应未提供 diagnostics，不能从后续空值认定前缀一致或排除上游切换。
+  追加复核仅运行真实 API 对照，未编译或运行 `make check`，没有修改本机配置。
