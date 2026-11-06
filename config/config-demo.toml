@@ -26,6 +26,7 @@ models      = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
 effort      = "xhigh"
 # prompt_cache = true                                   # messages-only; false for a
                                                         # gateway rejecting cache_control
+# thinking_signature = "required"                       # 仅 messages；确认网关支持无签名回放后才改为 "optional"
 
 # responses → POST {base_url}/responses
 [providers.k-gpt]

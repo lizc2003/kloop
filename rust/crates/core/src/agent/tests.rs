@@ -28,6 +28,8 @@ use kloop_provider::Provider;
 use kloop_provider::ProviderFailure;
 use serde_json::json;
 
+mod anthropic_thinking;
+
 struct NullUi;
 impl Ui for NullUi {
     fn emit(&self, _: &Event) {}

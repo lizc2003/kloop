@@ -2135,6 +2135,7 @@ mod tests {
             cred: kloop_provider::Credential::api_key("unused"),
             base: "https://anthropic.invalid".into(),
             prompt_cache: true,
+            thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
         };
         let entry = |id: &str, factory: fn() -> Provider| ProviderCatalogEntry {
             id: id.into(),
@@ -2263,6 +2264,7 @@ mod tests {
                         cred: Credential::api_key("synthetic"),
                         base: base.clone(),
                         prompt_cache: true,
+                        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
                     },
                     ProviderApiFamily::OpenAiResponses => Provider::OpenAiResponses {
                         cred: Credential::bearer("synthetic"),

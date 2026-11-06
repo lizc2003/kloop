@@ -28,6 +28,7 @@ use kloop_protocol::Message;
 use kloop_protocol::StreamEvent;
 use kloop_protocol::ToolDef;
 use kloop_protocol::Usage;
+use kloop_provider::Provider;
 use kloop_provider::ProviderFailure;
 
 pub(super) struct SampleOk {
@@ -46,12 +47,8 @@ pub(super) enum Sampled {
     Overflow,
     Cancelled {
         partial: Vec<ContentBlock>,
-        /// Nothing at all came down the stream before the cancel — not a
-        /// token, not a reasoning delta, not a finished block. Distinct from
-        /// an empty `partial`, which also happens when plenty arrived and
-        /// none of it is replayable (unsigned reasoning, a complete but
-        /// undispatched tool call). Only the former means the turn can be
-        /// taken back as if it never ran.
+        /// 取消前未收到任何 token、推理增量或完成块，才可撤回整个回合。
+        /// partial 为空也可能已经显示了不可回放的推理增量，或收到尚未派发的工具调用。
         produced_nothing: bool,
     },
     /// A retryable failure exhausted the primary model's attempt budget and may
@@ -234,17 +231,12 @@ async fn sample_once(
                     &think_accum,
                     ItemStatus::Failed,
                 );
-                // Read before `blocks` is consumed. The three together are
-                // everything the stream has handed us this round; all empty
-                // means the cancel beat the first byte of the response, and
-                // only then can the turn be taken back whole. `partial` is
-                // not the test — it is empty for a round of unsigned
-                // reasoning too, and two minutes of visible thinking is not
-                // "nothing happened".
+                // 消费 blocks 前同时检查完成块和两类增量。只有三者全空才可撤回整个回合；
+                // 已显示但尚未完成的推理不能回放，partial 为空不能据此认定没有输出。
                 let produced_nothing =
                     blocks.is_empty() && text_accum.is_empty() && think_accum.is_empty();
                 return Err(SampleError::Cancelled {
-                    partial: replayable_partial(blocks, &text_accum),
+                    partial: replayable_partial(blocks, &text_accum, provider_attempt.provider()),
                     produced_nothing,
                 });
             },
@@ -261,18 +253,13 @@ async fn sample_once(
                         &think_accum,
                         ItemStatus::Failed,
                     );
-                    // Two different things make `replayable_partial` empty, and
-                    // only one of them is safe to re-request. A complete tool
-                    // call means the model already decided to act and the caller
-                    // has seen that decision; asking again can produce a
-                    // different one, so that stays an ending. Unsigned reasoning
-                    // is the other: nothing survives it, so there is nothing a
-                    // re-request could duplicate.
+                    // 已完成的工具调用虽不进 partial，也代表调用方已看到行动决定，不能重采样。
+                    // 不可回放的推理没有留下历史；若也没有工具决定，重试不会重复已记录的输出。
                     let decided_to_act = blocks
                         .iter()
                         .any(|block| matches!(block, AssistantBlock::ToolUse { .. }));
                     let partial = if error.after_semantic_output() {
-                        replayable_partial(blocks, &text_accum)
+                        replayable_partial(blocks, &text_accum, provider_attempt.provider())
                     } else {
                         Vec::new()
                     };
@@ -390,7 +377,7 @@ async fn sample_once(
                                 "provider terminal arrived before display output closed",
                             )
                             .with_semantic_output(true),
-                            partial: replayable_partial(blocks, &text_accum),
+                            partial: replayable_partial(blocks, &text_accum, provider_attempt.provider()),
                         });
                     }
                     let mut invalid_tool_inputs = Vec::new();
@@ -426,7 +413,11 @@ fn invalid_input_message(name: &str, raw: &str, error: &str) -> String {
     )
 }
 
-fn replayable_partial(blocks: Vec<AssistantBlock>, open_text: &str) -> Vec<ContentBlock> {
+fn replayable_partial(
+    blocks: Vec<AssistantBlock>,
+    open_text: &str,
+    provider: &Provider,
+) -> Vec<ContentBlock> {
     let mut replayable: Vec<ContentBlock> = blocks
         .into_iter()
         .filter_map(|block| match block {
@@ -437,10 +428,12 @@ fn replayable_partial(blocks: Vec<AssistantBlock>, open_text: &str) -> Vec<Conte
             AssistantBlock::Thinking {
                 thinking,
                 signature,
-            } if !signature.is_empty() => Some(ContentBlock::Thinking {
-                thinking,
-                signature,
-            }),
+            } if !signature.is_empty() || provider.allows_unsigned_thinking() => {
+                Some(ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                })
+            }
             AssistantBlock::Thinking { .. }
             | AssistantBlock::ToolUse { .. }
             | AssistantBlock::InvalidToolUse { .. } => None,

@@ -12,6 +12,7 @@ use super::ProviderFailure;
 use super::SseFrames;
 use super::StreamCompletion;
 use super::StreamSink;
+use super::ThinkingSignaturePolicy;
 use super::tool_id::ToolIdRule;
 use super::tool_id::WireToolIds;
 use kloop_protocol::AssistantBlock;
@@ -62,7 +63,11 @@ pub(super) fn system_value(system: &str, cache: bool) -> Value {
 /// 最近两条消息各占一个断点，补充服务端有限的缓存回看窗口；工具和 system 留用另两个。
 /// cache_control 只注入发送视图，不持久化到历史。其他协议产生的工具 id 在这里按
 /// `tool_id` 的规则转成可发送且仍能配对的 id。
-pub(super) fn messages_value(messages: &[Message], cache: bool) -> Result<Value, ProviderFailure> {
+pub(super) fn messages_value(
+    messages: &[Message],
+    cache: bool,
+    thinking_signature: ThinkingSignaturePolicy,
+) -> Result<Value, ProviderFailure> {
     let mut ids = WireToolIds::new(ToolIdRule::Anthropic);
     let mut rendered = Vec::with_capacity(messages.len());
     for message in messages {
@@ -74,8 +79,18 @@ pub(super) fn messages_value(messages: &[Message], cache: bool) -> Result<Value,
                 ContentBlock::ToolResult { tool_use_id, .. } => {
                     value["tool_use_id"] = json!(ids.wire(tool_use_id)?);
                 }
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => {
+                    if thinking_signature == ThinkingSignaturePolicy::Required
+                        && !thinking.is_empty()
+                        && signature.is_empty()
+                    {
+                        return Err(RAIL.protocol("cannot replay thinking without a signature"));
+                    }
+                }
                 ContentBlock::Text { .. }
-                | ContentBlock::Thinking { .. }
                 | ContentBlock::RedactedThinking { .. }
                 | ContentBlock::Image { .. } => {}
             }
@@ -211,7 +226,10 @@ fn start_block(content: &Value) -> Result<BlockAcc, ProviderFailure> {
     }
 }
 
-fn finish_block(acc: BlockAcc) -> Result<AssistantBlock, ProviderFailure> {
+fn finish_block(
+    acc: BlockAcc,
+    thinking_signature: ThinkingSignaturePolicy,
+) -> Result<AssistantBlock, ProviderFailure> {
     match acc {
         BlockAcc::Text { text } => Ok(AssistantBlock::Text { text }),
         BlockAcc::ToolUse {
@@ -239,7 +257,10 @@ fn finish_block(acc: BlockAcc) -> Result<AssistantBlock, ProviderFailure> {
             thinking,
             signature,
         } => {
-            if !thinking.is_empty() && signature.is_empty() {
+            if thinking_signature == ThinkingSignaturePolicy::Required
+                && !thinking.is_empty()
+                && signature.is_empty()
+            {
                 return Err(RAIL.protocol("thinking signature is empty at block completion"));
             }
             Ok(AssistantBlock::Thinking {
@@ -267,6 +288,7 @@ pub(super) async fn stream(
     session: Option<&str>,
     body: &Value,
     sink: &StreamSink,
+    thinking_signature: ThinkingSignaturePolicy,
 ) -> Result<StreamCompletion, ProviderFailure> {
     let mut req = cred
         .apply(crate::http_client().post(url))
@@ -406,7 +428,7 @@ pub(super) async fn stream(
                 let acc = open.remove(&index).ok_or_else(|| {
                     RAIL.protocol("content block stop referenced a non-open block")
                 })?;
-                let block = finish_block(acc)?;
+                let block = finish_block(acc, thinking_signature)?;
                 if block.has_semantic_payload() {
                     completed.record(&block);
                     sink.block_done(block).await?;
@@ -541,10 +563,16 @@ mod tests {
             Message::assistant(calls),
             Message::tool_results(results),
         ];
-        assert_eq!(messages_value(&messages, false).unwrap(), expected);
+        assert_eq!(
+            messages_value(&messages, false, ThinkingSignaturePolicy::Required).unwrap(),
+            expected
+        );
         expected[1]["content"][11]["cache_control"] = json!({"type": "ephemeral"});
         expected[2]["content"][35]["cache_control"] = json!({"type": "ephemeral"});
-        assert_eq!(messages_value(&messages, true).unwrap(), expected);
+        assert_eq!(
+            messages_value(&messages, true, ThinkingSignaturePolicy::Required).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -610,12 +638,18 @@ mod tests {
                 Message::tool_results(recent),
                 Message::assistant(tail),
             ];
-            assert_eq!(messages_value(&messages, false).unwrap(), expected);
+            assert_eq!(
+                messages_value(&messages, false, ThinkingSignaturePolicy::Required).unwrap(),
+                expected
+            );
             expected[2]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
             if let Some(index) = cache_index {
                 expected[3]["content"][index]["cache_control"] = json!({"type": "ephemeral"});
             }
-            assert_eq!(messages_value(&messages, true).unwrap(), expected);
+            assert_eq!(
+                messages_value(&messages, true, ThinkingSignaturePolicy::Required).unwrap(),
+                expected
+            );
         }
     }
 
@@ -647,7 +681,8 @@ mod tests {
             })
         };
         let rewritten = "functions_read_file_0_f9cc2c7822d54220";
-        let projected = messages_value(&messages, false).unwrap();
+        let projected =
+            messages_value(&messages, false, ThinkingSignaturePolicy::Required).unwrap();
         assert_eq!(
             projected,
             json!([
@@ -660,7 +695,10 @@ mod tests {
                 wire_result("toolu_01ABCdef"),
             ])
         );
-        assert_eq!(messages_value(&messages, false).unwrap(), projected);
+        assert_eq!(
+            messages_value(&messages, false, ThinkingSignaturePolicy::Required).unwrap(),
+            projected
+        );
     }
 
     /// Pairing a result with the wrong call is worse than not sending: the
@@ -674,7 +712,7 @@ mod tests {
             result("a_b_2e7336dc8eba87ef"),
         ];
         assert_eq!(
-            messages_value(&messages, false),
+            messages_value(&messages, false, ThinkingSignaturePolicy::Required),
             Err(ProviderFailure::protocol(
                 "anthropic tool call ids \"a.b\" and \"a_b_2e7336dc8eba87ef\" would both go out as \"a_b_2e7336dc8eba87ef\""
             ))
@@ -703,7 +741,7 @@ mod tests {
             injected: None,
         }];
         assert_eq!(
-            messages_value(&messages, true).unwrap(),
+            messages_value(&messages, true, ThinkingSignaturePolicy::Required).unwrap(),
             json!([{
                 "role": "user",
                 "content": [
@@ -734,7 +772,7 @@ mod tests {
             is_error: false,
         }])];
         assert_eq!(
-            messages_value(&messages, false).unwrap(),
+            messages_value(&messages, false, ThinkingSignaturePolicy::Required).unwrap(),
             json!([{
                 "role": "user",
                 "content": [{

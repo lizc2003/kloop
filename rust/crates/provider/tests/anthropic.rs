@@ -19,6 +19,7 @@ use kloop_provider::ProviderFailureKind;
 use kloop_provider::Reasoning;
 use kloop_provider::StreamResult;
 use kloop_provider::ThinkingMode;
+use kloop_provider::ThinkingSignaturePolicy;
 use serde_json::json;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -79,6 +80,7 @@ fn anthropic(server: &MockServer) -> Provider {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
         prompt_cache: true,
+        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
     }
 }
 
@@ -284,6 +286,7 @@ async fn cache_off_sends_plain_request() {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
         prompt_cache: false,
+        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
     });
     let mut rx = provider.stream("test-model", "be brief", &[Message::user_text("hi")], &[]);
     while rx.recv().await.is_some() {}
@@ -332,6 +335,7 @@ async fn tool_ids_from_another_rail_are_translated_before_the_wire() {
             cred: Credential::api_key("test-key"),
             base: server.uri(),
             prompt_cache: false,
+            thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
         });
         let mut rx = provider.stream("test-model", "s", &messages, &[]);
         let mut events = Vec::new();
@@ -856,6 +860,117 @@ async fn completed_thinking_without_signature_fails_before_tool_use() {
 }
 
 #[tokio::test]
+async fn optional_unsigned_thinking_survives_a_tool_round_and_replay() {
+    let server = MockServer::start().await;
+    mount_sse(&server, sse_body(&[
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "thought"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call-1", "name": "record_note", "input": {"body": "note"}}}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 8}}),
+        json!({"type": "message_stop"}),
+    ])).await;
+    let provider = Arc::new(Provider::Anthropic {
+        cred: Credential::api_key("test-key"),
+        base: server.uri(),
+        prompt_cache: false,
+        thinking_signature: ThinkingSignaturePolicy::Optional,
+    });
+    let mut stream = provider.stream("test-model", "system", &[Message::user_text("hi")], &[]);
+    let mut events = Vec::new();
+    while let Some(event) = stream.recv().await {
+        events.push(event.unwrap());
+    }
+    let blocks = vec![
+        AssistantBlock::Thinking {
+            thinking: "thought".into(),
+            signature: String::new(),
+        },
+        AssistantBlock::ToolUse {
+            id: "call-1".into(),
+            name: "record_note".into(),
+            input: json!({"body": "note"}),
+        },
+    ];
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::ThinkingDelta("thought".into()),
+            StreamEvent::BlockDone(blocks[0].clone()),
+            StreamEvent::BlockDone(blocks[1].clone()),
+            StreamEvent::Terminal {
+                outcome: AssistantOutcome::ToolUse,
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0
+                })
+            },
+        ]
+    );
+    server.reset().await;
+    mount_sse(&server, sse_body(&[
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 20}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "answer"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 8}}),
+        json!({"type": "message_stop"}),
+    ])).await;
+    let messages = vec![
+        Message::user_text("hi"),
+        Message::assistant_from_provider(
+            blocks
+                .into_iter()
+                .map(AssistantBlock::into_content_block)
+                .collect(),
+            provider.response_provenance("test-model"),
+        ),
+        Message::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: "recorded".into(),
+            is_error: false,
+        }]),
+    ];
+    let mut stream = provider.stream("test-model", "system", &messages, &[]);
+    while let Some(event) = stream.recv().await {
+        event.unwrap();
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = requests[0].body_json().unwrap();
+    assert_eq!(
+        body["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "thought"},
+                {"type": "tool_use", "id": "call-1", "name": "record_note", "input": {"body": "note"}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "recorded"}]},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn required_signature_rejects_unsigned_history_before_network_io() {
+    let server = MockServer::start().await;
+    let provider = Arc::new(anthropic(&server));
+    let messages = [Message::assistant(vec![ContentBlock::Thinking {
+        thinking: "thought".into(),
+        signature: String::new(),
+    }])];
+    let mut stream = provider.stream("test-model", "system", &messages, &[]);
+    let error = stream.recv().await.unwrap().unwrap_err();
+    assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(!error.after_semantic_output());
+    assert!(stream.recv().await.is_none());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn empty_thinking_is_dropped_but_signature_only_thinking_is_preserved() {
     let server = MockServer::start().await;
     for (content, signature) in [
@@ -921,32 +1036,43 @@ async fn empty_thinking_is_dropped_but_signature_only_thinking_is_preserved() {
 #[tokio::test]
 async fn malformed_thinking_signatures_fail_closed() {
     let server = MockServer::start().await;
-    for phase in ["start", "delta"] {
-        for invalid in [json!(null), json!(42), json!(true), json!([]), json!({})] {
-            server.reset().await;
-            let mut content = json!({"type": "thinking", "thinking": "", "signature": ""});
-            if phase == "start" {
-                content["signature"] = invalid.clone();
-            }
-            let mut events = vec![
-                json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
-                json!({"type": "content_block_start", "index": 0, "content_block": content}),
-            ];
-            if phase == "delta" {
-                events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": invalid}}));
-            }
-            events.extend([
+    for policy in [
+        ThinkingSignaturePolicy::Required,
+        ThinkingSignaturePolicy::Optional,
+    ] {
+        for phase in ["start", "delta"] {
+            for invalid in [json!(null), json!(42), json!(true), json!([]), json!({})] {
+                server.reset().await;
+                let mut content = json!({"type": "thinking", "thinking": "", "signature": ""});
+                if phase == "start" {
+                    content["signature"] = invalid.clone();
+                }
+                let mut events = vec![
+                    json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+                    json!({"type": "content_block_start", "index": 0, "content_block": content}),
+                ];
+                if phase == "delta" {
+                    events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": invalid}}));
+                }
+                events.extend([
                 json!({"type": "content_block_stop", "index": 0}),
                 json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 8}}),
                 json!({"type": "message_stop"}),
             ]);
-            mount_sse(&server, sse_body(&events)).await;
-            let events = collect(anthropic(&server)).await;
-            assert_eq!(events.len(), 1, "{phase}");
-            let error = events.into_iter().next().unwrap().unwrap_err();
-            assert_eq!(error.kind(), &ProviderFailureKind::Protocol, "{phase}");
-            assert!(!error.is_retryable(), "{phase}");
-            assert!(error.to_string().contains("thinking signature"), "{phase}");
+                mount_sse(&server, sse_body(&events)).await;
+                let events = collect(Provider::Anthropic {
+                    cred: Credential::api_key("test-key"),
+                    base: server.uri(),
+                    prompt_cache: true,
+                    thinking_signature: policy,
+                })
+                .await;
+                assert_eq!(events.len(), 1, "{phase}");
+                let error = events.into_iter().next().unwrap().unwrap_err();
+                assert_eq!(error.kind(), &ProviderFailureKind::Protocol, "{phase}");
+                assert!(!error.is_retryable(), "{phase}");
+                assert!(error.to_string().contains("thinking signature"), "{phase}");
+            }
         }
     }
 }
@@ -963,6 +1089,7 @@ async fn thinking_replay_and_request_modes() {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
         prompt_cache: true,
+        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
     });
     // Contrived: a trailing assistant message ending in thinking, to pin the
     // breakpoint-skips-thinking rule.
@@ -1034,6 +1161,7 @@ async fn thinking_mode_field_shapes() {
             cred: Credential::api_key("test-key"),
             base: server.uri(),
             prompt_cache: true,
+            thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
         });
         let attempt = provider.attempt_identity("test", 1, "test-model");
         let mut rx = provider.stream_attempt(
@@ -1340,6 +1468,7 @@ async fn a_disabled_mode_sends_no_effort_alongside_it() {
         cred: Credential::api_key("test-key"),
         base: server.uri(),
         prompt_cache: false,
+        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
     });
     let attempt = provider.attempt_identity("anthropic", 1, "test-model");
     let mut rx = provider.stream_attempt(
@@ -1391,6 +1520,7 @@ async fn the_credential_spelling_travels_with_the_credential() {
         cred: Credential::bearer("test-key"),
         base: server.uri(),
         prompt_cache: true,
+        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
     })
     .await;
     assert!(matches!(

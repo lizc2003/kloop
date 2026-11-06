@@ -61,6 +61,7 @@ async fn probe_effort_levels() {
                 cred: Credential::api_key(key.clone()),
                 base: base.clone(),
                 prompt_cache: false,
+                thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
             },
             ProviderApiFamily::OpenAiChatCompletions => Provider::OpenAiCompat {
                 cred: Credential::bearer(key.clone()),

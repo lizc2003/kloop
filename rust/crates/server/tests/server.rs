@@ -1526,6 +1526,7 @@ async fn real_three_rail_route_switch_contract() {
                         cred: Credential::api_key(anthropic_factory_key.clone()),
                         base: anthropic_factory_base.clone(),
                         prompt_cache: true,
+                        thinking_signature: kloop_provider::ThinkingSignaturePolicy::Required,
                     })
                 }),
             },
@@ -4365,6 +4366,8 @@ async fn real_effort_sweep_contract() {
                                 cred: Credential::api_key(key),
                                 base,
                                 prompt_cache: true,
+                                thinking_signature:
+                                    kloop_provider::ThinkingSignaturePolicy::Required,
                             }
                         }
                         kloop_protocol::ProviderApiFamily::OpenAiChatCompletions => {

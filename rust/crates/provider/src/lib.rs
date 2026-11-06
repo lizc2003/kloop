@@ -115,9 +115,8 @@ pub enum MockTurn {
     Failure(ProviderFailure),
 }
 
-/// The `thinking` request parameter on the Anthropic wire. Whatever the mode,
-/// thinking blocks the model sends are always accumulated and replayed — on
-/// current models thinking is on by default even with no field sent.
+/// Anthropic wire 的 thinking 请求参数；返回块的签名契约另由 ThinkingSignaturePolicy 决定。
+/// 当前模型即使不发 thinking 字段也可能默认开启推理。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ThinkingMode {
     /// Send no thinking field (current models then run adaptive).
@@ -132,6 +131,14 @@ pub enum ThinkingMode {
     /// route asks for answer room plus the budget rather than clamping the
     /// budget; the provider writes whatever number it was handed.
     Budget(u64),
+}
+
+/// Messages thinking 的签名契约；只有经验证支持无签名回放的网关才使用 Optional。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThinkingSignaturePolicy {
+    #[default]
+    Required,
+    Optional,
 }
 
 /// How a provider presents its credential on the wire. Both wires have a
@@ -233,6 +240,7 @@ pub enum Provider {
         /// 最后一个工具、system、最近两条消息各占一个缓存断点，消息内跳过不可缓存块。
         /// thinking 由每次请求的模型和会话 effort 解析，不由这个开关决定。
         prompt_cache: bool,
+        thinking_signature: ThinkingSignaturePolicy,
     },
     OpenAiCompat {
         cred: Credential,
@@ -633,6 +641,16 @@ impl Provider {
         }
     }
 
+    pub fn allows_unsigned_thinking(&self) -> bool {
+        matches!(
+            self,
+            Self::Anthropic {
+                thinking_signature: ThinkingSignaturePolicy::Optional,
+                ..
+            }
+        )
+    }
+
     pub fn endpoint_fingerprint_for(api_family: ProviderApiFamily, endpoint: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(format!("{api_family:?}\n{endpoint}"));
@@ -827,11 +845,14 @@ impl Provider {
                 cred,
                 base,
                 prompt_cache,
+                thinking_signature,
             } => {
                 let url = format!("{base}/v1/messages");
                 let cred = cred.clone();
                 let cache = *prompt_cache;
-                let messages = match anthropic::messages_value(messages, cache) {
+                let thinking_signature = *thinking_signature;
+                let messages = match anthropic::messages_value(messages, cache, thinking_signature)
+                {
                     Ok(messages) => messages,
                     Err(error) => {
                         return spawn_stream(move |_sink| async move { Err(error) });
@@ -874,7 +895,15 @@ impl Provider {
                 }
                 let session = cache_key.map(str::to_string);
                 spawn_stream(move |sink| async move {
-                    anthropic::stream(&url, &cred, session.as_deref(), &body, &sink).await
+                    anthropic::stream(
+                        &url,
+                        &cred,
+                        session.as_deref(),
+                        &body,
+                        &sink,
+                        thinking_signature,
+                    )
+                    .await
                 })
             }
             Provider::OpenAiResponses { cred, base } => {

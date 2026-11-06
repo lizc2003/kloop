@@ -205,10 +205,17 @@ Cancellation remains a distinct core terminal, aborts the producer task, and
 orphan patching still keeps history legal after interruption.
 
 Anthropic 的 `thinking` 开始块可以省略 `signature`，适配器先以空串累积，后续
-`signature_delta` 按到达顺序追加。块结束时，正文非空而签名仍为空是协议错误，不能
-发出 `BlockDone` 或进入历史；正文和签名都为空的块按无语义载荷丢弃。合法完成块
-原样保留和回放，包括仅含签名的块。开始块若显式携带签名，其值必须是字符串；
-delta 的签名同样必须存在且为字符串，null 和其他类型仍是协议错误。
+`signature_delta` 按到达顺序追加。Messages provider 的 `thinking_signature` 默认是
+`"required"`：块结束时有正文而最终无签名仍报协议错；发送历史中遇到同样的块，也在
+网络 IO 之前拒绝。确认网关支持无签名回放后，可仅为该 profile 显式设为 `"optional"`：
+完成块保留正文及空签名，以原 provenance 入库，并在同一路由上原样回传；缺席签名不
+伪造值，也不将推理改写为普通正文。这个配置不改变 thinking 模式、effort 或缓存开关。
+正文和签名都为空的块仍丢弃，仅含签名的块仍保留。显式携带的签名和 signature_delta
+必须是字符串，null、字段类型错误及其他流式结构错误在两种策略下都拒绝。
+
+取消或失败时，只有已完成的块能进入部分历史；无签名完成块仅在当前冻结 provider
+明确允许时保留，尚未完成的推理 delta 不能据此入库。该兼容项只证明客户端保留并
+发送了文本，HTTP 成功不能证明网关内部实际使用了它，也不保证推理质量或缓存命中。
 
 Every provider-produced assistant message also carries private replay
 provenance: provider endpoint identity, API family, and exact final wire model.
@@ -5149,6 +5156,10 @@ cargo run -- --mock
 # model and the effort, so nothing in a profile can contradict the effort asked
 # for. A gateway that cannot take the field would 400, loudly and with its
 # endpoint named; a key for that case will be added when one turns up, not before.
+#
+# thinking_signature 仅用于 Messages，默认 "required"。只有确认网关接受无签名 thinking
+# 回放时才设为 "optional"；该 profile 的无签名完成块将保留并原样回传，包括中断后的
+# 部分历史。其他 provider 不继承此策略，已有签名不改写；它不控制 thinking 请求字段。
 #
 # prompt_cache 仅用于 Messages，默认开启：最后一个工具、system 块、最近两条消息
 # 各占一个 cache_control 断点，总数不超过四个。每条消息只标最后一个可缓存的顶层块；

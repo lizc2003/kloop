@@ -111,6 +111,7 @@ struct Profile {
     model: String,
     models: Vec<String>,
     prompt_cache: bool,
+    thinking_signature: kloop_provider::ThinkingSignaturePolicy,
     effort: Option<ReasoningEffort>,
     /// Chat rail only: the body field the output cap is written to.
     output_cap_field: ChatOutputCapField,
@@ -183,6 +184,7 @@ fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings
         let endpoint_fingerprint = Provider::endpoint_fingerprint_for(api_family, &base);
         let wire = profile.wire;
         let prompt_cache = profile.prompt_cache;
+        let thinking_signature = profile.thinking_signature;
         let default_effort = profile.effort;
         let output_cap_field = profile.output_cap_field;
         let factory = Arc::new(move || {
@@ -194,6 +196,7 @@ fn resolve_table(table: Option<&toml::Table>) -> Result<ResolvedProviderSettings
                     cred,
                     base: base.clone(),
                     prompt_cache,
+                    thinking_signature,
                 },
                 Rail::OpenAiChat => Provider::OpenAiCompat {
                     cred,
@@ -437,6 +440,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
                 | "model"
                 | "models"
                 | "prompt_cache"
+                | "thinking_signature"
                 | "effort"
                 | "context_window"
                 | "max_output_tokens"
@@ -477,6 +481,23 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
     if wire != Rail::Anthropic && spec.contains_key("prompt_cache") {
         bail!("providers.{id}.prompt_cache is only valid for messages wire_api");
     }
+    let thinking_signature = match optional_string(
+        spec,
+        "thinking_signature",
+        &format!("providers.{id}.thinking_signature"),
+    )? {
+        Some(raw) => {
+            if wire != Rail::Anthropic {
+                bail!("providers.{id}.thinking_signature is only valid for messages wire_api");
+            }
+            match raw.as_str() {
+                "required" => kloop_provider::ThinkingSignaturePolicy::Required,
+                "optional" => kloop_provider::ThinkingSignaturePolicy::Optional,
+                _ => bail!("providers.{id}.thinking_signature must be required | optional"),
+            }
+        }
+        None => kloop_provider::ThinkingSignaturePolicy::Required,
+    };
     let output_cap_field = match optional_string(
         spec,
         "output_cap_field",
@@ -515,6 +536,7 @@ fn parse_profile(id: &str, spec: &toml::Table) -> Result<Profile> {
         model,
         models,
         prompt_cache,
+        thinking_signature,
         effort,
         output_cap_field,
         context_window,
@@ -831,6 +853,49 @@ models = ["gpt-a"]
                 "providers.x.output_cap_field is only valid for chat wire_api",
                 "{wire}"
             );
+        }
+    }
+
+    #[test]
+    fn thinking_signature_is_explicit_messages_only_and_defaults_to_required() {
+        for (line, allowed) in [
+            ("", false),
+            ("thinking_signature = \"required\"", false),
+            ("thinking_signature = \"optional\"", true),
+        ] {
+            let raw = format!(
+                "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\nauth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\n{line}\n"
+            );
+            let settings = resolve(Some(&raw)).unwrap();
+            assert_eq!(
+                settings
+                    .initial_route
+                    .primary_attempt()
+                    .provider()
+                    .allows_unsigned_thinking(),
+                allowed
+            );
+        }
+        for wire in ["chat", "responses"] {
+            let raw = format!(
+                "provider = \"x\"\n[providers.x]\nwire_api = \"{wire}\"\nauth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\nthinking_signature = \"optional\"\n"
+            );
+            assert_eq!(
+                resolve(Some(&raw)).err().unwrap().to_string(),
+                "providers.x.thinking_signature is only valid for messages wire_api"
+            );
+        }
+        for (value, expected) in [
+            (
+                "\"unknown\"",
+                "providers.x.thinking_signature must be required | optional",
+            ),
+            ("true", "providers.x.thinking_signature must be a string"),
+        ] {
+            let raw = format!(
+                "provider = \"x\"\n[providers.x]\nwire_api = \"messages\"\nauth_header = {{ x-api-key = \"k\" }}\nmodel = \"m\"\nthinking_signature = {value}\n"
+            );
+            assert_eq!(resolve(Some(&raw)).err().unwrap().to_string(), expected);
         }
     }
 
