@@ -5157,9 +5157,10 @@ cargo run -- --mock
 # for. A gateway that cannot take the field would 400, loudly and with its
 # endpoint named; a key for that case will be added when one turns up, not before.
 #
-# thinking_signature 仅用于 Messages，默认 "required"。只有确认网关接受无签名 thinking
-# 回放时才设为 "optional"；该 profile 的无签名完成块将保留并原样回传，包括中断后的
-# 部分历史。其他 provider 不继承此策略，已有签名不改写；它不控制 thinking 请求字段。
+# thinking_signature 仅用于 Messages，省略时为 "required"；config-demo 的 Messages
+# profile 显式设为 "optional"。该值用于支持无签名 thinking 回放的网关，完成块将保留
+# 并原样回传，包括中断后的部分历史。其他 provider 不继承此策略，已有签名不改写；
+# 它不控制 thinking 请求字段。
 #
 # prompt_cache 仅用于 Messages，默认开启：最后一个工具、system 块、最近两条消息
 # 各占一个 cache_control 断点，总数不超过四个。每条消息只标最后一个可缓存的顶层块；
