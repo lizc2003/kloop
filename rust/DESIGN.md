@@ -5168,6 +5168,9 @@ cargo run -- --mock
 # 回填到更早消息。断点只注入发送视图，不写入历史，仍使用默认五分钟 ephemeral TTL。
 # 两个消息断点随会话向前移动，为单个断点的有限回看窗口提供补充；实际命中由 usage
 # 的 cache_read/cache_creation 计数确认。仅在网关拒绝该字段时关闭此开关。
+# Cache reads are best-effort when a gateway changes upstream cache scopes.
+# A miss is a normal result and does not trigger an error or retry. Validation
+# covers requests, replay, and usage; consistent hits and savings are not guaranteed.
 #
 # Every call asks for an explicit output cap: predictive compaction needs a
 # number to reserve against (at most 20,000 of it), and the request, that reserve

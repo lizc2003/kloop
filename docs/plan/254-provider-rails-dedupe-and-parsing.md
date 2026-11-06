@@ -88,8 +88,10 @@
   thinking、三/四断点都成功读到缓存；部分相同正文的请求仍出现总输入计数和响应
   形状变化、重新建缓存。客户端请求与缓存读取路径已验证，额外断点收益仍无法可靠
   量化，不以单次零读取判定客户端缓存功能损坏。
-- 按[官方缓存隔离与一致性要求](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-storage-and-sharing)
-  应进一步核对网关的会话粘性、上游账户/workspace、前缀改写及计量。响应未提供
-  workspace 标识，且[缓存诊断](https://platform.claude.com/docs/en/build-with-claude/cache-diagnostics)
-  的首响应未提供 diagnostics，不能从后续空值认定前缀一致或排除上游切换。
-  追加复核仅运行真实 API 对照，未编译或运行 `make check`，没有修改本机配置。
+- 用户确认上游不能保证落到同一账号。按[官方缓存隔离规则](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#cache-storage-and-sharing)，
+  切换缓存作用域后可能重新预热，因此按尽力命中验收：请求、回放、缓存读取路径的
+  功能验证已完成；不要求账号粘性或连续命中，零读取不报错、不为命中重试。额外断点
+  收益仍未量化，计数和响应形状变化的具体来源也未确定。
+- 响应未提供 workspace 标识，且[缓存诊断](https://platform.claude.com/docs/en/build-with-claude/cache-diagnostics)
+  的首响应未提供 diagnostics，不能从后续空值认定前缀一致或排除上游切换。追加复核
+  仅运行真实 API 对照，未编译或运行 `make check`，没有修改本机配置。
