@@ -202,9 +202,11 @@ fn start_block(content: &Value) -> Result<BlockAcc, ProviderFailure> {
             thinking: RAIL
                 .required_str(&content["thinking"], "thinking text")?
                 .to_string(),
-            signature: RAIL
-                .required_str(&content["signature"], "thinking signature")?
-                .to_string(),
+            // 签名可在后续 signature_delta 才出现，开始块不必预填空串。
+            signature: match content.get("signature") {
+                None => String::new(),
+                Some(value) => RAIL.required_str(value, "thinking signature")?.to_string(),
+            },
         }),
         "redacted_thinking" => Ok(BlockAcc::RedactedThinking {
             data: RAIL

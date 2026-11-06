@@ -747,6 +747,95 @@ async fn thinking_blocks_stream_and_finalize_with_signature() {
     assert_eq!(ok.len(), 7);
 }
 
+#[tokio::test]
+async fn thinking_signature_can_arrive_after_block_start() {
+    let server = MockServer::start().await;
+    for (content, signature) in [
+        (json!({"type": "thinking", "thinking": ""}), "sig-abc"),
+        (
+            json!({"type": "thinking", "thinking": "", "signature": ""}),
+            "sig-abc",
+        ),
+        (
+            json!({"type": "thinking", "thinking": "", "signature": "seed-"}),
+            "seed-sig-abc",
+        ),
+    ] {
+        server.reset().await;
+        mount_sse(
+            &server,
+            sse_body(&[
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": content}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "思考"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-"}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "abc"}}),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 8}}),
+                json!({"type": "message_stop"}),
+            ]),
+        )
+        .await;
+        let events: Vec<_> = collect(anthropic(&server))
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ThinkingDelta("思考".into()),
+                StreamEvent::BlockDone(AssistantBlock::Thinking {
+                    thinking: "思考".into(),
+                    signature: signature.into(),
+                }),
+                StreamEvent::Terminal {
+                    outcome: AssistantOutcome::EndTurn,
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 8,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                },
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_thinking_signatures_fail_closed() {
+    let server = MockServer::start().await;
+    for phase in ["start", "delta"] {
+        for invalid in [json!(null), json!(42), json!(true), json!([]), json!({})] {
+            server.reset().await;
+            let mut content = json!({"type": "thinking", "thinking": "", "signature": ""});
+            if phase == "start" {
+                content["signature"] = invalid.clone();
+            }
+            let mut events = vec![
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": content}),
+            ];
+            if phase == "delta" {
+                events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": invalid}}));
+            }
+            events.extend([
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 8}}),
+                json!({"type": "message_stop"}),
+            ]);
+            mount_sse(&server, sse_body(&events)).await;
+            let events = collect(anthropic(&server)).await;
+            assert_eq!(events.len(), 1, "{phase}");
+            let error = events.into_iter().next().unwrap().unwrap_err();
+            assert_eq!(error.kind(), &ProviderFailureKind::Protocol, "{phase}");
+            assert!(!error.is_retryable(), "{phase}");
+            assert!(error.to_string().contains("thinking signature"), "{phase}");
+        }
+    }
+}
+
 /// History thinking blocks replay verbatim (signature included, empty text
 /// included) and the moving cache breakpoint skips them; the thinking request
 /// field follows the configured mode. `max_tokens` is the number the route

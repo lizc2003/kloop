@@ -204,6 +204,10 @@ string rendering happens only at CLI/TUI/native protocol 1.0 boundaries.
 Cancellation remains a distinct core terminal, aborts the producer task, and
 orphan patching still keeps history legal after interruption.
 
+Anthropic 的 `thinking` 开始块可以省略 `signature`，适配器先以空串累积，后续
+`signature_delta` 按到达顺序追加，随完成块原样保留和回放。开始块若显式携带签名，
+其值必须是字符串；delta 的签名同样必须存在且为字符串，null 和其他类型仍是协议错误。
+
 Every provider-produced assistant message also carries private replay
 provenance: provider endpoint identity, API family, and exact final wire model.
 Anthropic Messages and OpenAI Responses replay reasoning text plus
