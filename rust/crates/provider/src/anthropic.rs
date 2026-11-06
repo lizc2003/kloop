@@ -59,12 +59,9 @@ pub(super) fn system_value(system: &str, cache: bool) -> Value {
     }])
 }
 
-/// Serialize the history, marking the last content block of the last message
-/// as the moving cache breakpoint. Earlier requests' breakpoints remain valid
-/// read points server-side, so each round reuses the whole prior prefix.
-/// cache_control stays out of the protocol types: it is a transport detail
-/// injected here, never persisted. Tool-call ids another rail minted are
-/// translated here on the same terms (`tool_id`).
+/// 最近两条消息各占一个断点，补充服务端有限的缓存回看窗口；工具和 system 留用另两个。
+/// cache_control 只注入发送视图，不持久化到历史。其他协议产生的工具 id 在这里按
+/// `tool_id` 的规则转成可发送且仍能配对的 id。
 pub(super) fn messages_value(messages: &[Message], cache: bool) -> Result<Value, ProviderFailure> {
     let mut ids = WireToolIds::new(ToolIdRule::Anthropic);
     let mut rendered = Vec::with_capacity(messages.len());
@@ -89,27 +86,24 @@ pub(super) fn messages_value(messages: &[Message], cache: bool) -> Result<Value,
             "content": content,
         }));
     }
-    let mut value = Value::Array(rendered);
     if cache {
-        // The API rejects cache_control on thinking blocks, so the marker
-        // goes on the last cacheable block instead.
-        if let Some(block) = value
-            .as_array_mut()
-            .and_then(|msgs| msgs.last_mut())
-            .and_then(|msg| msg["content"].as_array_mut())
-            .and_then(|content| {
-                content.iter_mut().rev().find(|block| {
-                    !matches!(
-                        block["type"].as_str(),
-                        Some("thinking" | "redacted_thinking")
-                    )
-                })
-            })
-        {
-            block["cache_control"] = json!({"type": "ephemeral"});
+        for message in rendered.iter_mut().rev().take(2) {
+            // thinking 和空文本不能承载断点；无合适块时不向更早消息回填。
+            if let Some(block) = message["content"].as_array_mut().and_then(|content| {
+                content
+                    .iter_mut()
+                    .rev()
+                    .find(|block| match block["type"].as_str() {
+                        Some("thinking" | "redacted_thinking") => false,
+                        Some("text") => block["text"].as_str().is_some_and(|text| !text.is_empty()),
+                        _ => true,
+                    })
+            }) {
+                block["cache_control"] = json!({"type": "ephemeral"});
+            }
         }
     }
-    Ok(value)
+    Ok(Value::Array(rendered))
 }
 
 /// One in-flight content block, accumulated across its deltas.
@@ -520,6 +514,109 @@ mod tests {
             content: "ok".into(),
             is_error: false,
         }])
+    }
+
+    #[test]
+    fn recent_cache_breakpoints_cover_a_large_tool_round() {
+        let calls: Vec<_> = (0..12)
+            .map(|index| call(&format!("call_{index}")))
+            .collect();
+        let mut results: Vec<_> = (0..12)
+            .map(|index| ContentBlock::ToolResult {
+                tool_use_id: format!("call_{index}"),
+                content: "ok".into(),
+                is_error: false,
+            })
+            .collect();
+        results.extend((0..24).map(|index| ContentBlock::Text {
+            text: format!("context {index}"),
+        }));
+        let mut expected = json!([
+            {"role": "user", "content": [{"type": "text", "text": "stable prefix"}]},
+            {"role": "assistant", "content": calls},
+            {"role": "user", "content": results},
+        ]);
+        let messages = vec![
+            Message::user_text("stable prefix"),
+            Message::assistant(calls),
+            Message::tool_results(results),
+        ];
+        assert_eq!(messages_value(&messages, false).unwrap(), expected);
+        expected[1]["content"][11]["cache_control"] = json!({"type": "ephemeral"});
+        expected[2]["content"][35]["cache_control"] = json!({"type": "ephemeral"});
+        assert_eq!(messages_value(&messages, true).unwrap(), expected);
+    }
+
+    #[test]
+    fn recent_cache_breakpoints_skip_ineligible_blocks_without_backfilling() {
+        for (tail, cache_index) in [
+            (
+                vec![
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                    ContentBlock::Thinking {
+                        thinking: "thought".into(),
+                        signature: "sig".into(),
+                    },
+                    ContentBlock::RedactedThinking {
+                        data: "hidden".into(),
+                    },
+                    ContentBlock::Text {
+                        text: String::new(),
+                    },
+                ],
+                Some(0),
+            ),
+            (
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: "sig".into(),
+                    },
+                    ContentBlock::RedactedThinking {
+                        data: "hidden".into(),
+                    },
+                ],
+                None,
+            ),
+            (
+                vec![ContentBlock::Text {
+                    text: String::new(),
+                }],
+                None,
+            ),
+            (vec![], None),
+        ] {
+            let recent = vec![
+                ContentBlock::Text {
+                    text: "recent".into(),
+                },
+                ContentBlock::Text {
+                    text: String::new(),
+                },
+            ];
+            let mut expected = json!([
+                {"role": "user", "content": [{"type": "text", "text": "old"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "old answer"}]},
+                {"role": "user", "content": recent},
+                {"role": "assistant", "content": tail},
+            ]);
+            let messages = vec![
+                Message::user_text("old"),
+                Message::assistant(vec![ContentBlock::Text {
+                    text: "old answer".into(),
+                }]),
+                Message::tool_results(recent),
+                Message::assistant(tail),
+            ];
+            assert_eq!(messages_value(&messages, false).unwrap(), expected);
+            expected[2]["content"][0]["cache_control"] = json!({"type": "ephemeral"});
+            if let Some(index) = cache_index {
+                expected[3]["content"][index]["cache_control"] = json!({"type": "ephemeral"});
+            }
+            assert_eq!(messages_value(&messages, true).unwrap(), expected);
+        }
     }
 
     /// A chat service's ids arrive on this rail after a switch: each call and

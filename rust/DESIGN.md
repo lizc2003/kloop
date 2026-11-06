@@ -5150,11 +5150,12 @@ cargo run -- --mock
 # for. A gateway that cannot take the field would 400, loudly and with its
 # endpoint named; a key for that case will be added when one turns up, not before.
 #
-# prompt_cache (Messages only, on by default) marks cache_control breakpoints on
-# the last tool, the system block, and the last message block — tools and system
-# render before messages, so the breakpoints cache the whole stable prefix and the
-# last one moves forward each round. Turn it off only for a gateway that rejects
-# the field; usage reports cache_read/cache_creation so a real hit is visible.
+# prompt_cache 仅用于 Messages，默认开启：最后一个工具、system 块、最近两条消息
+# 各占一个 cache_control 断点，总数不超过四个。每条消息只标最后一个可缓存的顶层块；
+# thinking、redacted_thinking 和空文本不能承载断点，整条消息无合适块时不标记，也不
+# 回填到更早消息。断点只注入发送视图，不写入历史，仍使用默认五分钟 ephemeral TTL。
+# 两个消息断点随会话向前移动，为单个断点的有限回看窗口提供补充；实际命中由 usage
+# 的 cache_read/cache_creation 计数确认。仅在网关拒绝该字段时关闭此开关。
 #
 # Every call asks for an explicit output cap: predictive compaction needs a
 # number to reserve against (at most 20,000 of it), and the request, that reserve

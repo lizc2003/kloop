@@ -230,10 +230,8 @@ pub enum Provider {
     Anthropic {
         cred: Credential,
         base: String,
-        /// Prompt caching: mark cache_control breakpoints on the last tool,
-        /// the system block, and the last message block. The `thinking` field
-        /// is deliberately absent — it is resolved per request from the model
-        /// and the session effort, the way `effort` itself already is.
+        /// 最后一个工具、system、最近两条消息各占一个缓存断点，消息内跳过不可缓存块。
+        /// thinking 由每次请求的模型和会话 effort 解析，不由这个开关决定。
         prompt_cache: bool,
     },
     OpenAiCompat {

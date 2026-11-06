@@ -128,10 +128,8 @@ async fn streams_text_and_tool_use_with_usage() {
     assert_eq!(ok.len(), 5);
 }
 
-/// The caching request contract, asserted whole-object: one breakpoint on
-/// the LAST tool (the tool set outlives the volatile system prompt), one on
-/// the system block, and exactly one message breakpoint on the LAST content
-/// block of the LAST message.
+/// 工具、system 各占一个断点，最近两条消息各标记最后一个可缓存块；
+/// 完整请求断言同时约束四个断点上限和未被标记的历史前缀。
 #[tokio::test]
 async fn request_body_carries_cache_breakpoints() {
     let server = MockServer::start().await;
@@ -203,6 +201,7 @@ async fn request_body_carries_cache_breakpoints() {
                 {"role": "assistant", "content": [{
                     "type": "tool_use", "id": "t1", "name": "bash",
                     "input": {"command": "ls"},
+                    "cache_control": {"type": "ephemeral"},
                 }]},
                 {"role": "user", "content": [
                     {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},

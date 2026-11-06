@@ -13,9 +13,9 @@
 成功；结果回传后的响应有 thinking 正文却始终无签名，新校验在块结束时拒绝，未发出
 完成块。真实 Claude 工具循环尚未全部通过，需上游保留签名。教训 346–348。
 
-**Plan 254 ✅：provider 三条轨去重与流解析性能（2026-11-05）**：第 6 条（Anthropic 第 4 个
-缓存断点）按用户决定跳过，理由仍是它需要真实 API 量 `cache_read_input_tokens` 才能判断，
-手上没有代理和 key。其余五条分成两个提交：先性能，再去重，现有 `provider/tests/*` 一行未改。
+**Plan 254 ✅：provider 三条轨去重与流解析性能（2026-11-06 补齐缓存）**：第 1–5 条于
+2026-11-05 分成两个提交完成：先性能，再去重，当时现有 `provider/tests/*` 一行未改。
+第 6 条（Anthropic 第 4 个缓存断点）最初跳过，现已按用户授权补齐，验证说明见本节末。
 SSE 解析不再逐帧 `drain` 后 `collect` 成 `Vec<u8>` 再 `String`，也不再为多行 data 建
 `Vec<String>` 后 join：帧直接在缓冲上校验 UTF-8、就地解析，消费前缀在 `feed` 结束时一次
 dropped，每个 payload 只长一个 `String`。一个 chunk 含几千帧时旧实现是整体平方的 memmove，
@@ -29,9 +29,19 @@ required_str/required_u64/event_type）、`display_conflict` + `DisplayKind`、�
 `image_data_url`、`error_prefixed` 与 `tool_fields`，三个 adapter 只留调用点。可观察变化只有
 少数内部错误措辞统一（例如 `usage missing prompt_tokens` → `usage missing or invalid
 prompt_tokens`、Chat 的 `tool id changed during streaming` → `tool id changed`），测试均按
-错误类型断言，无需改动。外层执行沙箱之外 `make check` 全绿（fmt、clippy、workspace debug
-全量测试 2257 项通过、6 项 ignored，本机 parity baseline verified）。真实 provider 未实测。
-教训 344–345。
+错误类型断言，无需改动。第 1–5 条完成时在外层执行沙箱之外 `make check` 全绿（fmt、clippy、
+workspace debug 全量测试 2257 项通过、6 项 ignored，本机 parity baseline verified），
+当时未做真实 provider 验证。教训 344–345。
+
+第 6 条补做：tools、system 和最近两条消息各占一个断点，消息只标最后一个可缓存顶层块；
+thinking、redacted_thinking、空文本跳过，无合适块时不回填更早消息。标记只进发送视图，
+缓存关闭和五分钟 TTL 约定不变。更新完整 HTTP 请求期望，新增两条序列化回归，覆盖大批
+工具调用、多块尾部和不可标记块；HTTP 回归在实现前先红。DESIGN、plan、provider 注释同步。
+本次外层执行沙箱之外 `make check` 全绿（provider 单元 61 项、Anthropic HTTP 契约 34 项，
+本机 parity baseline verified）。使用现有配置的直接 API 对照确认四断点可读取缓存；总输入
+计数有波动，未量化收益。当前 provider 的流式复测两次在首轮预热时因上游无签名 thinking
+失败，关闭 thinking 的控制请求仍收到该形状，未进入新增第四断点的请求；不计为流式通过。
+缓存实验未改动本机配置或放宽签名保护。教训 349。
 
 **Plan 253 ✅：provider 流式读取与请求构造（2026-11-05）**：八条审查项全部成立。Chat 轨
 收到 `finish_reason` 后改为继续读 usage 尾帧，`SseFrames::finish_after` 给 5s 绝对宽限；
@@ -4473,3 +4483,9 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    不能先发 `BlockDone`。只校验类型和回放 provenance 会让坏块入库，工具结果回传时
    才重复触发上游拒绝。回归既要验证签名晚到，也要验证始终不到时完成块和后续工具
    调用都未发出；空块可丢弃，仅含签名的块仍需保留。
+
+349. **缓存回看按协议位置计数，命中量也要有可比的前缀。** 当前 Anthropic API 将连续
+   `tool_use` 和连续 `tool_result` 各视为一个回看位置，不能仅凭并行调用数量推断缓存
+   必然丢失；应另测包含更多独立块的消息尾部。真实对照先核对输入总量和稳定前缀，
+   网关改写或路由波动会混入缓存计数，不能只拿一次 `cache_read_input_tokens` 的涨跌
+   宣称优化比例。请求契约则独立验证断点位置、数量上限、禁用路径和不可标记的块。
