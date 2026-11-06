@@ -56,6 +56,7 @@ pub(super) fn fixture_route(route_boundary: u64) -> ProviderRouteReceipt {
             "mock",
         ),
         model: "mock".into(),
+        thinking_signature: None,
         effort: None,
         continuity: ReasoningContinuity::Preserved,
     }

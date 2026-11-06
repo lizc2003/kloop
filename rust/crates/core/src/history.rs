@@ -1002,6 +1002,8 @@ fn provider_request_view(
         || active.provider_id != attempt.identity().provider_id
         || active.api_family != attempt.identity().api_family
         || active.endpoint_fingerprint != attempt.identity().endpoint_fingerprint
+        || (active.thinking_signature.is_some()
+            && active.thinking_signature != attempt.provider().thinking_signature_policy())
     {
         return Err(kloop_provider::ProviderFailure::protocol(
             "frozen provider attempt does not match the active durable route",
@@ -1052,7 +1054,14 @@ fn provider_request_view(
         })?;
 
         let chat_target = attempt.identity().api_family == ProviderApiFamily::OpenAiChatCompletions;
-        if !chat_target && source.exact_replay_compatible(attempt.identity()) {
+        let signature_mismatch = attempt.provider().thinking_signature_policy()
+            == Some(kloop_protocol::ThinkingSignaturePolicy::Required)
+            && message
+                .content
+                .iter()
+                .any(ContentBlock::has_unsigned_thinking);
+        if !chat_target && !signature_mismatch && source.exact_replay_compatible(attempt.identity())
+        {
             projected.push(message.clone());
             continue;
         }
@@ -1074,6 +1083,7 @@ fn provider_request_view(
             ));
         }
         let mut message = message.clone();
+        // 一条消息的推理一起投影，避免把同一推理链中的已签名片段单独拼回请求。
         message.content = message
             .content
             .into_iter()
@@ -1204,6 +1214,203 @@ fn count_block_tokens(counter: &mut TokenCounter, block: &ContentBlock, images: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signature_route(
+        policy: kloop_provider::ThinkingSignaturePolicy,
+    ) -> (
+        std::sync::Arc<crate::provider_route::ProviderCatalog>,
+        FrozenProviderRoute,
+    ) {
+        crate::provider_route::ProviderCatalog::from_provider(
+            "messages",
+            kloop_provider::Provider::Anthropic {
+                cred: kloop_provider::Credential::api_key("test-key"),
+                base: "https://example.invalid".into(),
+                prompt_cache: false,
+                thinking_signature: policy,
+            },
+            "test-model",
+            vec!["test-model".into()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn thinking_signature_change_reopens_and_projects_without_rewriting_history() {
+        use kloop_provider::ThinkingSignaturePolicy::{Optional, Required};
+
+        let (_, optional) = signature_route(Optional);
+        let (required_catalog, required) = signature_route(Required);
+        let dir = temp_dir("signature-policy-reopen");
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.jsonl");
+        let mut history = History::new(dir.clone());
+        history
+            .attach_rollout(Rollout::new_with_initial_route(session.clone(), &optional).unwrap());
+        history.record(Message::user_text("question"));
+        history.record_provider_assistant(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "unsigned thought".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "record_note".into(),
+                    input: serde_json::json!({"body": "note"}),
+                },
+            ],
+            &optional.primary_attempt(),
+        );
+        history.record(tool_result("recorded".into()));
+        history.record_provider_assistant(
+            vec![ContentBlock::Thinking {
+                thinking: "reasoning only".into(),
+                signature: String::new(),
+            }],
+            &optional.primary_attempt(),
+        );
+        history.record_provider_assistant(
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "signed thought".into(),
+                    signature: "opaque".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+            &optional.primary_attempt(),
+        );
+        let canonical = history.messages().to_vec();
+        let mut projected = canonical.clone();
+        projected[1].content.remove(0);
+        projected[1].provider_provenance = None;
+        projected.remove(3);
+
+        assert!(!optional.same_route(&required));
+        assert!(
+            history
+                .provider_request_view(&required.primary_attempt())
+                .is_err()
+        );
+        let (adopted, reopened) = history.adopt_provider_route(&required).unwrap();
+        assert_eq!(adopted.revision(), 2);
+        assert_eq!(reopened.unwrap().continuity, ReasoningContinuity::Filtered);
+        assert_eq!(
+            history
+                .provider_request_view(&adopted.primary_attempt())
+                .unwrap(),
+            projected
+        );
+        assert_eq!(
+            history
+                .provider_request_view_for(&canonical, &adopted.primary_attempt())
+                .unwrap(),
+            projected,
+        );
+        assert_eq!(history.messages(), canonical);
+
+        drop(history);
+        let reread = crate::rollout::resume_session(&session).unwrap();
+        let timeline = reread.snapshot.provider_routes.clone();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[1].source, ProviderRouteSource::Reopened);
+        assert!(required_catalog.restore_route(&timeline[0]).is_err());
+        let restored = required_catalog.restore_route(&timeline[1]).unwrap();
+        assert_eq!(restored.revision(), 2);
+        let mut history = History::resume(dir.clone(), reread);
+        let (again, reopened) = history.adopt_provider_route(&required).unwrap();
+        assert_eq!(reopened, None);
+        assert_eq!(again.revision(), 2);
+        assert_eq!(
+            history
+                .provider_request_view(&again.primary_attempt())
+                .unwrap(),
+            projected
+        );
+        let (restored, reopened) = history.adopt_provider_route(&optional).unwrap();
+        assert_eq!(restored.revision(), 3);
+        assert_eq!(reopened.unwrap().continuity, ReasoningContinuity::Preserved);
+        assert_eq!(
+            history
+                .provider_request_view(&restored.primary_attempt())
+                .unwrap(),
+            canonical
+        );
+        assert_eq!(history.messages(), canonical);
+        drop(history);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn thinking_signature_legacy_receipts_adopt_the_configured_policy() {
+        use kloop_provider::ThinkingSignaturePolicy::{Optional, Required};
+
+        for (policy, signature, continuity) in [
+            (Required, "", ReasoningContinuity::Filtered),
+            (Optional, "", ReasoningContinuity::Preserved),
+            (Required, "opaque", ReasoningContinuity::Preserved),
+        ] {
+            let (_, old_route) = signature_route(Optional);
+            let (_, opening) = signature_route(policy);
+            let dir = temp_dir(&format!("signature-legacy-{policy:?}-{signature}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let session = dir.join("session.jsonl");
+            let mut history = History::new(dir.clone());
+            history.attach_rollout(
+                Rollout::new_with_initial_route(session.clone(), &old_route).unwrap(),
+            );
+            history.record_provider_assistant(
+                vec![
+                    ContentBlock::Thinking {
+                        thinking: "legacy thought".into(),
+                        signature: signature.into(),
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                    },
+                ],
+                &old_route.primary_attempt(),
+            );
+            let canonical = history.messages().to_vec();
+            drop(history);
+            // 旧格式没有策略字段，不能把缺席直接解释为 Required。
+            let legacy = std::fs::read_to_string(&session)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+                    value.as_object_mut().unwrap().remove("thinking_signature");
+                    format!("{value}\n")
+                })
+                .collect::<String>();
+            std::fs::write(&session, legacy).unwrap();
+            let resumed = crate::rollout::resume_session(&session).unwrap();
+            let mut history = History::resume(dir.clone(), resumed);
+            let (adopted, reopened) = history.adopt_provider_route(&opening).unwrap();
+            assert_eq!(adopted.revision(), 2);
+            assert_eq!(reopened.unwrap().continuity, continuity);
+            let expected = match continuity {
+                ReasoningContinuity::Preserved => canonical.clone(),
+                ReasoningContinuity::Filtered => {
+                    vec![Message::assistant(vec![ContentBlock::Text {
+                        text: "answer".into(),
+                    }])]
+                }
+            };
+            assert_eq!(
+                history
+                    .provider_request_view(&adopted.primary_attempt())
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(history.messages(), canonical);
+            assert_eq!(history.adopt_provider_route(&opening).unwrap().1, None);
+            drop(history);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn background_wait_memo_tracks_changed_and_cleared_reminders() {

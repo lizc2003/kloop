@@ -382,6 +382,7 @@ impl Rollout {
                 "mock",
             ),
             model: "mock".into(),
+            thinking_signature: None,
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         };

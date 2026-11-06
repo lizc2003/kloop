@@ -27,6 +27,9 @@ effort      = "xhigh"
 # prompt_cache = true                                   # messages-only; false for a
                                                         # gateway rejecting cache_control
 thinking_signature = "optional"                         # messages-only; preserve unsigned thinking
+# Switching to required (also the default when omitted) records a new route on reopen.
+# Requests omit reasoning from messages containing unsigned thinking; stored history
+# stays intact and can replay again under optional on the same endpoint and model.
 
 # responses → POST {base_url}/responses
 [providers.k-gpt]

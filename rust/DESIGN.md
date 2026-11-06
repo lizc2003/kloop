@@ -206,12 +206,21 @@ orphan patching still keeps history legal after interruption.
 
 Anthropic 的 `thinking` 开始块可以省略 `signature`，适配器先以空串累积，后续
 `signature_delta` 按到达顺序追加。Messages provider 的 `thinking_signature` 默认是
-`"required"`：块结束时有正文而最终无签名仍报协议错；发送历史中遇到同样的块，也在
-网络 IO 之前拒绝。确认网关支持无签名回放后，可仅为该 profile 显式设为 `"optional"`：
+`"required"`：块结束时有正文而最终无签名仍报协议错；provider 直接收到未投影的
+无签名历史，也在网络 IO 之前拒绝。确认网关支持无签名回放后，可仅为该 profile
+显式设为 `"optional"`：
 完成块保留正文及空签名，以原 provenance 入库，并在同一路由上原样回传；缺席签名不
 伪造值，也不将推理改写为普通正文。这个配置不改变 thinking 模式、effort 或缓存开关。
 正文和签名都为空的块仍丢弃，仅含签名的块仍保留。显式携带的签名和 signature_delta
 必须是字符串，null、字段类型错误及其他流式结构错误在两种策略下都拒绝。
+
+签名策略写入 Messages 路由 receipt。同一 profile 修改策略后，重开会话会新增
+`reopened` revision；旧 receipt 缺少此字段表示策略未知，首次重开同样记录当前策略，
+不直接推断为 `required`。切到 `required` 时，采样和压缩共用的请求投影会移除含
+无签名正文的消息中的全部推理，保留正文、工具调用及结果，并标记 `continuity: filtered`；
+过滤后为空的 assistant 消息不发送。仅含已签名推理的消息仍可原样回放，避免因策略
+变化而无谓损失上下文。原始历史不修改，切回 `optional` 后同一端点和模型上的推理可
+恢复回放。策略属于路由的回放契约，不改变端点 fingerprint 或原 provenance。
 
 取消或失败时，只有已完成的块能进入部分历史；无签名完成块仅在当前冻结 provider
 明确允许时保留，尚未完成的推理 delta 不能据此入库。该兼容项只证明客户端保留并
@@ -5160,7 +5169,8 @@ cargo run -- --mock
 # thinking_signature 仅用于 Messages，省略时为 "required"；config-demo 的 Messages
 # profile 显式设为 "optional"。该值用于支持无签名 thinking 回放的网关，完成块将保留
 # 并原样回传，包括中断后的部分历史。其他 provider 不继承此策略，已有签名不改写；
-# 它不控制 thinking 请求字段。
+# 它不控制 thinking 请求字段。改回 required 后，重开会话记录新路由 revision，
+# 请求视图过滤含无签名 thinking 消息的推理；原始历史保留，切回 optional 可恢复。
 #
 # prompt_cache 仅用于 Messages，默认开启：最后一个工具、system 块、最近两条消息
 # 各占一个 cache_control 断点，总数不超过四个。每条消息只标最后一个可缓存的顶层块；

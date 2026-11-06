@@ -311,6 +311,11 @@ impl ProviderCatalog {
         }
         self.validate_receipt(receipt)?;
         let resolved = self.resolve(&receipt.provider_id, &receipt.model)?;
+        if receipt.thinking_signature.is_some()
+            && receipt.thinking_signature != resolved.provider.thinking_signature_policy()
+        {
+            return Err(SwitchError::RouteDrift(receipt.provider_id.clone()));
+        }
         // Effort is session-local and absent from the durable timeline, so a
         // restored route re-seeds it from configuration (plan 102).
         Ok(FrozenProviderRoute::with_continuity(
@@ -1035,6 +1040,8 @@ impl FrozenProviderRoute {
             && self.route.model == other.route.model
             && self.route.api_family == other.route.api_family
             && self.route.endpoint_fingerprint == other.route.endpoint_fingerprint
+            && self.route.provider.thinking_signature_policy()
+                == other.route.provider.thinking_signature_policy()
     }
 
     pub fn revision(&self) -> u64 {
@@ -1156,6 +1163,7 @@ impl FrozenProviderRoute {
             api_family: self.route.api_family,
             endpoint_fingerprint: self.route.endpoint_fingerprint.clone(),
             model: self.route.model.clone(),
+            thinking_signature: self.route.provider.thinking_signature_policy(),
             effort: self.effort,
             continuity,
         }
@@ -1658,6 +1666,7 @@ mod tests {
             api_family: ProviderApiFamily::Mock,
             endpoint_fingerprint: format!("mock:{provider_id}"),
             model: model.into(),
+            thinking_signature: None,
             effort: None,
             continuity: ReasoningContinuity::Preserved,
         }

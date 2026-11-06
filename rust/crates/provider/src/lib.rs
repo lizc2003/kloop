@@ -23,6 +23,7 @@ use serde_json::json;
 pub use failure::ProviderFailure;
 pub use failure::ProviderFailureKind;
 pub use failure::TimeoutStage;
+pub use kloop_protocol::ThinkingSignaturePolicy;
 pub use stream::ProviderStream;
 pub use stream::StreamResult;
 
@@ -131,14 +132,6 @@ pub enum ThinkingMode {
     /// route asks for answer room plus the budget rather than clamping the
     /// budget; the provider writes whatever number it was handed.
     Budget(u64),
-}
-
-/// Messages thinking 的签名契约；只有经验证支持无签名回放的网关才使用 Optional。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ThinkingSignaturePolicy {
-    #[default]
-    Required,
-    Optional,
 }
 
 /// How a provider presents its credential on the wire. Both wires have a
@@ -642,13 +635,16 @@ impl Provider {
     }
 
     pub fn allows_unsigned_thinking(&self) -> bool {
-        matches!(
-            self,
+        self.thinking_signature_policy() == Some(ThinkingSignaturePolicy::Optional)
+    }
+
+    pub fn thinking_signature_policy(&self) -> Option<ThinkingSignaturePolicy> {
+        match self {
             Self::Anthropic {
-                thinking_signature: ThinkingSignaturePolicy::Optional,
-                ..
-            }
-        )
+                thinking_signature, ..
+            } => Some(*thinking_signature),
+            Self::OpenAiCompat { .. } | Self::OpenAiResponses { .. } | Self::Mock { .. } => None,
+        }
     }
 
     pub fn endpoint_fingerprint_for(api_family: ProviderApiFamily, endpoint: &str) -> String {

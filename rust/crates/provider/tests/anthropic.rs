@@ -958,13 +958,21 @@ async fn optional_unsigned_thinking_survives_a_tool_round_and_replay() {
 async fn required_signature_rejects_unsigned_history_before_network_io() {
     let server = MockServer::start().await;
     let provider = Arc::new(anthropic(&server));
-    let messages = [Message::assistant(vec![ContentBlock::Thinking {
-        thinking: "thought".into(),
-        signature: String::new(),
-    }])];
+    let messages = [Message::assistant_from_provider(
+        vec![ContentBlock::Thinking {
+            thinking: "thought".into(),
+            signature: String::new(),
+        }],
+        provider.response_provenance("test-model"),
+    )];
     let mut stream = provider.stream("test-model", "system", &messages, &[]);
     let error = stream.recv().await.unwrap().unwrap_err();
     assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+    assert!(
+        error
+            .to_string()
+            .contains("cannot replay thinking without a signature")
+    );
     assert!(!error.after_semantic_output());
     assert!(stream.recv().await.is_none());
     assert!(server.received_requests().await.unwrap().is_empty());

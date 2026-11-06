@@ -354,6 +354,27 @@ impl ContentBlock {
         }
     }
 
+    pub fn has_unsigned_thinking(&self) -> bool {
+        match self {
+            Self::Thinking {
+                thinking,
+                signature,
+            } => !thinking.is_empty() && signature.is_empty(),
+            Self::ToolResult {
+                content: ToolResultContent::Blocks(blocks),
+                ..
+            } => blocks.iter().any(Self::has_unsigned_thinking),
+            Self::Text { .. }
+            | Self::RedactedThinking { .. }
+            | Self::Image { .. }
+            | Self::ToolUse { .. }
+            | Self::ToolResult {
+                content: ToolResultContent::Text(_),
+                ..
+            } => false,
+        }
+    }
+
     pub fn into_without_reasoning(self) -> Option<Self> {
         match self {
             Self::Thinking { .. } | Self::RedactedThinking { .. } => None,
@@ -656,6 +677,15 @@ pub enum ReasoningContinuity {
     Filtered,
 }
 
+/// Messages thinking 的签名契约；只有经验证支持无签名回放的网关才使用 Optional。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingSignaturePolicy {
+    #[default]
+    Required,
+    Optional,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRouteReceipt {
     pub route_revision: u64,
@@ -665,6 +695,9 @@ pub struct ProviderRouteReceipt {
     pub api_family: ProviderApiFamily,
     pub endpoint_fingerprint: String,
     pub model: String,
+    /// 缺席表示旧 receipt 未记录策略；重开时补一条 revision，才能授权有损投影。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_signature: Option<ThinkingSignaturePolicy>,
     /// The reasoning effort this route samples at. Absent means no effort field
     /// is sent at all, which is a different state from any named level — and the
     /// one that makes a transcript readable months later, because effort decides
