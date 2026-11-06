@@ -244,10 +244,15 @@ fn finish_block(acc: BlockAcc) -> Result<AssistantBlock, ProviderFailure> {
         BlockAcc::Thinking {
             thinking,
             signature,
-        } => Ok(AssistantBlock::Thinking {
-            thinking,
-            signature,
-        }),
+        } => {
+            if !thinking.is_empty() && signature.is_empty() {
+                return Err(RAIL.protocol("thinking signature is empty at block completion"));
+            }
+            Ok(AssistantBlock::Thinking {
+                thinking,
+                signature,
+            })
+        }
         BlockAcc::RedactedThinking { data } => Ok(AssistantBlock::RedactedThinking { data }),
     }
 }

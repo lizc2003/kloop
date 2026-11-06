@@ -205,8 +205,10 @@ Cancellation remains a distinct core terminal, aborts the producer task, and
 orphan patching still keeps history legal after interruption.
 
 Anthropic 的 `thinking` 开始块可以省略 `signature`，适配器先以空串累积，后续
-`signature_delta` 按到达顺序追加，随完成块原样保留和回放。开始块若显式携带签名，
-其值必须是字符串；delta 的签名同样必须存在且为字符串，null 和其他类型仍是协议错误。
+`signature_delta` 按到达顺序追加。块结束时，正文非空而签名仍为空是协议错误，不能
+发出 `BlockDone` 或进入历史；正文和签名都为空的块按无语义载荷丢弃。合法完成块
+原样保留和回放，包括仅含签名的块。开始块若显式携带签名，其值必须是字符串；
+delta 的签名同样必须存在且为字符串，null 和其他类型仍是协议错误。
 
 Every provider-produced assistant message also carries private replay
 provenance: provider endpoint identity, API family, and exact final wire model.

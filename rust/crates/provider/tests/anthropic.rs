@@ -804,6 +804,122 @@ async fn thinking_signature_can_arrive_after_block_start() {
 }
 
 #[tokio::test]
+async fn completed_thinking_without_signature_fails_before_tool_use() {
+    let server = MockServer::start().await;
+    for (content, thinking_delta) in [
+        (json!({"type": "thinking", "thinking": ""}), Some("思考")),
+        (
+            json!({"type": "thinking", "thinking": "", "signature": ""}),
+            Some("思考"),
+        ),
+        (json!({"type": "thinking", "thinking": "思考"}), None),
+        (
+            json!({"type": "thinking", "thinking": "思考", "signature": ""}),
+            None,
+        ),
+        (json!({"type": "thinking", "thinking": ""}), Some(" ")),
+    ] {
+        for signature_delta in [None, Some("")] {
+            server.reset().await;
+            let mut wire = vec![
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": content}),
+            ];
+            if let Some(thinking) = thinking_delta {
+                wire.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}}));
+            }
+            if let Some(signature) = signature_delta {
+                wire.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": signature}}));
+            }
+            wire.extend([
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call-1", "name": "record_note", "input": {"body": "note"}}}),
+                json!({"type": "content_block_stop", "index": 1}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 8}}),
+                json!({"type": "message_stop"}),
+            ]);
+            mount_sse(&server, sse_body(&wire)).await;
+            let mut events = collect(anthropic(&server)).await.into_iter();
+            if let Some(thinking) = thinking_delta {
+                assert_eq!(
+                    events.next().unwrap().unwrap(),
+                    StreamEvent::ThinkingDelta(thinking.into())
+                );
+            }
+            let error = events.next().unwrap().unwrap_err();
+            assert_eq!(error.kind(), &ProviderFailureKind::Protocol);
+            assert!(!error.is_retryable());
+            assert_eq!(error.after_semantic_output(), thinking_delta.is_some());
+            assert!(error.to_string().contains("thinking signature"));
+            assert!(events.next().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn empty_thinking_is_dropped_but_signature_only_thinking_is_preserved() {
+    let server = MockServer::start().await;
+    for (content, signature) in [
+        (json!({"type": "thinking", "thinking": ""}), ""),
+        (
+            json!({"type": "thinking", "thinking": "", "signature": ""}),
+            "",
+        ),
+        (
+            json!({"type": "thinking", "thinking": "", "signature": "sig-start"}),
+            "sig-start",
+        ),
+    ] {
+        for signature_delta in [None, Some("sig-delta")] {
+            server.reset().await;
+            let mut wire = vec![
+                json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": content}),
+            ];
+            if let Some(signature) = signature_delta {
+                wire.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": signature}}));
+            }
+            wire.extend([
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": "answer"}}),
+                json!({"type": "content_block_stop", "index": 1}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 8}}),
+                json!({"type": "message_stop"}),
+            ]);
+            mount_sse(&server, sse_body(&wire)).await;
+            let events: Vec<_> = collect(anthropic(&server))
+                .await
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+            let signature = format!("{signature}{}", signature_delta.unwrap_or_default());
+            let mut expected = Vec::new();
+            if !signature.is_empty() {
+                expected.push(StreamEvent::BlockDone(AssistantBlock::Thinking {
+                    thinking: String::new(),
+                    signature,
+                }));
+            }
+            expected.extend([
+                StreamEvent::BlockDone(AssistantBlock::Text {
+                    text: "answer".into(),
+                }),
+                StreamEvent::Terminal {
+                    outcome: AssistantOutcome::EndTurn,
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 8,
+                        cache_read_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                    }),
+                },
+            ]);
+            assert_eq!(events, expected);
+        }
+    }
+}
+
+#[tokio::test]
 async fn malformed_thinking_signatures_fail_closed() {
     let server = MockServer::start().await;
     for phase in ["start", "delta"] {
