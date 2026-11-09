@@ -299,6 +299,15 @@
 临时 HOME 缺提示文件会启动失败，`--system-prompt` 又会追加重复键；现在相对路径的提示文件
 随配置复制，显式参数替换顶层键并用 tomllib 校验，三种配置形状用临时目录验证过。
 
+**第二轮复审（同日）**：一是放开 `-uS…` 之后，`env -iuSSH_AUTH_SOCK sh -c 'cat .env'` 仍因
+`-iu…` 不被认识而走不完整分支，`sh -c` 正文无人分析、bypass 下放行。探针显示这是一类问题：
+`env --debug`、`env -iv`、`sudo -X`、`nice --frob` 后接 `sh -c` 都放行，早于本计划。修法两层：
+`env` 短选项改按 getopt 读簇以定位被包命令；不完整的包装器后面若有可能进入 `-c` 模式的 shell，
+按未知执行体硬拒绝。`env --debug ls`、`xargs -r wc -l`、`sudo -l`、`env --debug sh script.sh`
+照常放行。plan 243 的一条测试原期望 `env --unsupported value bash -c …` 等三种写法在 manual
+下逐次确认，现在按新规则改为硬拒绝。二是基准脚本删除系统提示键时只删首行，多行 TOML 字符串
+会留下残行；现在按多行字符串整段删除，并用 tomllib 核对“只少这一个键”，五种写法验证过。
+
 验证：新增与改写的回归覆盖落盘文件全文与内联上限、不超限时不写文件、`/context` 的
 图片行与嵌套图片行、split-string 六种形状（manual/bypass）、两条循环包装危险命令的确认、
 包装器分析对 split-string 的标记；`kloop-core` 中 `tools::bash`、`commands::context`、

@@ -770,16 +770,49 @@ def snapshot(source: pathlib.Path, sha: str, root: pathlib.Path) -> None:
 
 
 def drop_top_level_key(text: str, key: str) -> str:
-    """去掉第一个表头之前的 `key = …` 行（TOML 不允许同一张表里重复的键）。"""
-    pattern = re.compile(rf"""^\s*["']?{re.escape(key)}["']?\s*=""")
-    out, top = [], True
-    for line in text.splitlines(keepends=True):
+    """去掉第一个表头之前的 `key = …`；值是多行字符串时连同后续行整段去掉。
+
+    结果再用 tomllib 核对：只少了这一个键、其余不变，否则直接报错，不悄悄写坏配置。
+    """
+    head = re.compile(rf"""\s*["']?{re.escape(key)}["']?\s*=\s*""")
+    lines = text.splitlines(keepends=True)
+    out, index, top = [], 0, True
+    while index < len(lines):
+        line = lines[index]
+        index += 1
         if re.match(r"\s*\[", line):
             top = False
-        if top and pattern.match(line):
+        match = head.match(line) if top else None
+        if not match:
+            out.append(line)
             continue
-        out.append(line)
-    return "".join(out)
+        value = line[match.end():]
+        delimiter = value[:3] if value[:3] in ('"""', "'''") else None
+        if delimiter:
+            body = value[3:]
+            while not closes_multiline(body, delimiter) and index < len(lines):
+                body += lines[index]
+                index += 1
+    result = "".join(out)
+    expected = tomllib.loads(text)
+    expected.pop(key, None)
+    if tomllib.loads(result) != expected:
+        sys.exit(f"could not remove {key} from the config cleanly; edit it by hand")
+    return result
+
+
+def closes_multiline(body: str, delimiter: str) -> bool:
+    """多行字符串在 body 里是否已闭合。基本字符串里奇数个反斜杠后的引号是转义；字面
+    字符串没有转义。"""
+    if delimiter == "'''":
+        return delimiter in body
+    start = 0
+    while (found := body.find(delimiter, start)) != -1:
+        backslashes = len(body[:found]) - len(body[:found].rstrip("\\"))
+        if backslashes % 2 == 0:
+            return True
+        start = found + 1
+    return False
 
 
 def prepare_config(real_state: pathlib.Path, state: pathlib.Path, system_prompt: str | None) -> str:

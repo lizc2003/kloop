@@ -272,7 +272,18 @@ fn analyze_depth(src: &str, depth: u8) -> BashFacts {
                             }
                             .into(),
                         );
+                        // 包装器没能定位被包命令时，完整路径会递归分析的 `sh -c` 正文在这里
+                        // 无人检查：`sudo -X sh -c 'cat .env'` 曾在 bypass 下放行。近似剥离后
+                        // 任一 shell 可能进入 -c 模式，就按未知执行体处理。
+                        let shell_script = wrappers.argv.iter().enumerate().any(|(index, word)| {
+                            matches!(executable_name(word), "sh" | "bash" | "zsh")
+                                && !matches!(
+                                    shell_command_string(&wrappers.argv[index + 1..]),
+                                    Ok(None)
+                                )
+                        });
                         if wrappers.arguments_unknown
+                            || shell_script
                             || (dynamic_argv && !wrappers.wrapper_commands.is_empty())
                         {
                             facts.commands.push(command.rewritten_execution());

@@ -17,9 +17,11 @@
 `estimate_block_tokens`）；`env -S`/`--split-string` 绕过敏感读取硬拒绝（字面写法早在 85d7a2b
 之前就存在），以及循环绑定后 `env "$w"` 包装的危险命令在 manual 下不经确认（危险判定改为
 同时看 syntax 视图）；复审跟进补了未知选项之后的 `-S`、长选项缩写，以及
-`-uSSH_AUTH_SOCK` 的误拒。速度与排除复核按用户“尽量快”的要求不改。验证：`kloop-core` 相关
+`-uSSH_AUTH_SOCK` 的误拒；第二轮复审又补了不完整包装器后接 `sh -c` 的整类绕过（env 选项簇按
+getopt 定位，其余不完整分支遇到可能进入 -c 模式的 shell 即未知执行体），kloop-core 库测试 1353 项
+通过。速度与排除复核按用户“尽量快”的要求不改。验证：`kloop-core` 相关
 349 项测试在外层执行沙箱之外通过，fmt 与 kloop-core clippy `-D warnings` 通过；未跑
-workspace 全量、parity 与真实 API。教训 354–356。
+workspace 全量、parity 与真实 API。教训 354–357。
 
 **Claude thinking 签名与网关兼容（2026-11-06）**：开始块可以不带签名，后续
 `signature_delta` 原样累积；默认 `thinking_signature = "required"` 在完成时检查最终
@@ -4577,3 +4579,10 @@ plan 244 第一轮为保住 `xargs -I` 的参数替换和 `time -o` 的写入，
    不能按“普通参数”近似剥离，只能当未知执行体。识别这类选项要按 getopt 的规则走：
    簇里带操作数的字母之后整簇是值（`-uSSH_AUTH_SOCK` 不是 `-S`），而一旦遇到未知选项，
    后面每个词的角色都不可知，只看当前词就会漏掉 `env --debug -S …`。
+
+357. **“无法定位”的分支不能比“定位成功”的分支检查得更少。** 包装器分析完整时会递归检查
+   `sh -c` 正文，不完整时直接跳过，于是写法越怪（`sudo -X`、`env --debug`、`env -iu…`）越能
+   绕过敏感读取硬拒绝。修这类洞先列出成功分支做了哪些检查，再让失败分支对齐它：这里是
+   “可能进入 -c 模式的 shell 即未知执行体”。一律拒绝所有不完整的包装器看似更安全，却会误伤
+   `xargs -r`、`sudo -l` 这类常见写法。缩小误判（`-uS…` 不是 split-string）之前，也要确认被
+   误判“拦住”的那些输入在放行之后由谁来检查。

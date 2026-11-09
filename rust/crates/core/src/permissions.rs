@@ -1418,6 +1418,56 @@ mod tests {
         }
     }
 
+    /// 包装器没能定位被包命令时，`sh -c` 正文曾无人检查：下面各条在修复前于 bypass、
+    /// 显式不走沙箱时放行。env 的选项簇现在按 getopt 定位；其余不完整的包装器后面若有
+    /// 可能进入 -c 模式的 shell，按未知执行体拒绝。
+    #[tokio::test]
+    async fn incomplete_wrappers_keep_nested_shell_scripts_checked() {
+        for command in [
+            "env -iuSSH_AUTH_SOCK sh -c 'cat .env'",
+            "env -iv sh -c 'cat .env'",
+            "env -P /bin sh -c 'cat .env'",
+            "env --debug sh -c 'cat .env'",
+            "env --debug bash -lc 'cat .env'",
+            "sudo -X sh -c 'cat .env'",
+            "nice --frob sh -c 'cat .env'",
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            let error = p
+                .check_call("bash", &bash(command), 0, false)
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("reading this sensitive path"),
+                "{command}: {error}"
+            );
+        }
+        // 不进入 -c 模式、或能定位到无害命令的写法照常放行。
+        for command in [
+            "env --debug ls",
+            "env --debug sh script.sh",
+            "env -iuSSH_AUTH_SOCK cargo test",
+            "env -iv ls",
+            "env -u FOO -i ls",
+            "env -C /tmp ls",
+            "sudo -l",
+            "find . -name '*.rs' | xargs -r wc -l",
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            p.check_call("bash", &bash(command), 0, false)
+                .await
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
     #[tokio::test]
     async fn shell_options_around_c_keep_the_script_checked() {
         // 正文位置不认识或曾被当普通参数的都要拒绝；常见写法不能误拦。

@@ -510,9 +510,14 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
     ]
     .into_iter()
     .map(|wrapper| (format!("{wrapper} {inner}"), Some("writing this sensitive path")))
+    // Plan 272：包装器无法定位时，后面的 `bash -c` 正文没人分析，按未知执行体硬拒绝，
+    // 不再落到写入规则的逐次确认。
     .chain(["env --unsupported value", "timeout --unsupported value 5 env HOME=/w/proj"]
-        .into_iter().map(|wrapper| (format!("{wrapper} {inner}"), None)))
-    .chain([("sudo -R /w/proj bash -c 'printf x > /locked.txt'".into(), None)])
+        .into_iter().map(|wrapper| (format!("{wrapper} {inner}"), Some("reading this sensitive path"))))
+    .chain([(
+        "sudo -R /w/proj bash -c 'printf x > /locked.txt'".into(),
+        Some("reading this sensitive path"),
+    )])
     {
         let p = gate(
             Mode::Bypass,

@@ -949,35 +949,42 @@ fn env_command<'a>(
             analysis.arguments_unknown = true;
             return None;
         }
-        match token {
+        let located = match token {
             "--" => {
                 rest = &rest[1..];
                 break;
             }
-            "-" | "-i" | "--ignore-environment" => analysis.environment_unknown = true,
-            "-u" | "--unset" | "-C" | "--chdir" => {
+            "-" | "--ignore-environment" => {
                 analysis.environment_unknown = true;
-                analysis.cwd_unknown |= matches!(token, "-C" | "--chdir");
-                rest = rest.get(1..)?;
-                rest.first()?;
+                Some(rest)
             }
-            _ if token.starts_with("--unset=") || (token.starts_with("-u") && token.len() > 2) => {
+            "--unset" | "--chdir" => {
                 analysis.environment_unknown = true;
+                analysis.cwd_unknown |= token == "--chdir";
+                rest.get(1..).filter(|value| !value.is_empty())
             }
-            _ if token.starts_with("--chdir=") || (token.starts_with("-C") && token.len() > 2) => {
+            _ if token.starts_with("--unset=") => {
+                analysis.environment_unknown = true;
+                Some(rest)
+            }
+            _ if token.starts_with("--chdir=") => {
                 analysis.environment_unknown = true;
                 analysis.cwd_unknown = true;
+                Some(rest)
             }
-            _ => {
-                // 未知选项可能带操作数，此后分不清哪个词是选项：`env --debug -S 'cat .env'`
-                // 里的 `-S` 仍会生效。后面任何位置像 split-string 都按未知执行体处理；
-                // 被包命令自己的 `-S`（`env --debug sort -S 1G`）也会被算进去，只多拒一次。
-                analysis.arguments_unknown |=
-                    rest[1..].iter().any(|token| env_splits_string(token));
-                return None;
-            }
-        }
-        rest = &rest[1..];
+            // 短选项按 getopt 读簇：`-iuNAME`、`-iu NAME`、`-iv` 都要能定位被包命令，
+            // 否则 `env -iuSSH_AUTH_SOCK sh -c 'cat .env'` 的正文不会被分析。
+            _ if !token.starts_with("--") => env_short_cluster(&token[1..], rest, analysis),
+            _ => None,
+        };
+        let Some(located) = located else {
+            // 未知选项可能带操作数，此后分不清哪个词是选项：`env --debug -S 'cat .env'`
+            // 里的 `-S` 仍会生效。后面任何位置像 split-string 都按未知执行体处理；
+            // 被包命令自己的 `-S`（`env --debug sort -S 1G`）也会被算进去，只多拒一次。
+            analysis.arguments_unknown |= rest[1..].iter().any(|token| env_splits_string(token));
+            return None;
+        };
+        rest = &located[1..];
     }
     while rest
         .first()
@@ -987,6 +994,33 @@ fn env_command<'a>(
         rest = &rest[1..];
     }
     Some(rest)
+}
+
+/// 按 getopt 读 `env` 的一个短选项簇（不含前导 `-`）。返回的切片以本选项的最后一个词
+/// 开头：簇本身，或带操作数字母的独立操作数；调用方再前进一个词。无参字母 `i`/`0`/`v`
+/// 可连写；带操作数的字母 `u`/`C`/`P`/`a` 取簇里余下的部分，余下为空时取下一个词。
+/// 认不出的字母返回 None，按未知选项处理。
+fn env_short_cluster<'a>(
+    cluster: &str,
+    rest: &'a [String],
+    analysis: &mut WrapperAnalysis<'_>,
+) -> Option<&'a [String]> {
+    for (index, flag) in cluster.char_indices() {
+        match flag {
+            'i' => analysis.environment_unknown = true,
+            '0' | 'v' => {}
+            'u' | 'C' | 'P' | 'a' => {
+                analysis.environment_unknown |= flag != 'a';
+                analysis.cwd_unknown |= flag == 'C';
+                if index + flag.len_utf8() < cluster.len() {
+                    return Some(rest);
+                }
+                return rest.get(1..).filter(|value| !value.is_empty());
+            }
+            _ => return None,
+        }
+    }
+    (!cluster.is_empty()).then_some(rest)
 }
 
 /// `env` 的这个词是否打开 split-string：`--split-string` 及其无歧义缩写（GNU 接受
@@ -1786,9 +1820,30 @@ mod tests {
         ] {
             assert_eq!(env_splits_string(token), splits, "{token}");
         }
-        let unset = argv(&["env", "-uSSH_AUTH_SOCK", "cargo", "test"]);
-        let analysis = analyze_wrappers(&unset);
-        assert!(analysis.complete);
-        assert_eq!(analysis.argv, ["cargo", "test"]);
+        // 短选项簇按 getopt 定位被包命令：带操作数的字母取簇余下部分或下一个词。
+        for (input, wrapped) in [
+            (
+                vec!["env", "-uSSH_AUTH_SOCK", "cargo", "test"],
+                vec!["cargo", "test"],
+            ),
+            (
+                vec!["env", "-iuSSH_AUTH_SOCK", "sh", "-c", "x"],
+                vec!["sh", "-c", "x"],
+            ),
+            (vec!["env", "-iu", "FOO", "ls"], vec!["ls"]),
+            (vec!["env", "-iv", "ls"], vec!["ls"]),
+            (vec!["env", "-P", "/usr/bin", "ls"], vec!["ls"]),
+            (vec!["env", "-C/tmp", "-i", "ls"], vec!["ls"]),
+        ] {
+            let input = argv(&input);
+            let analysis = analyze_wrappers(&input);
+            assert!(analysis.complete, "{input:?}");
+            assert_eq!(analysis.argv, wrapped, "{input:?}");
+            assert!(analysis.environment_unknown, "{input:?}");
+        }
+        // 带操作数的字母后面没有值：定位失败。
+        for input in [argv(&["env", "-iu"]), argv(&["env", "-x", "ls"])] {
+            assert!(!analyze_wrappers(&input).complete, "{input:?}");
+        }
     }
 }
