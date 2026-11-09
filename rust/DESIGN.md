@@ -4696,12 +4696,13 @@ touch no filesystem, so hermetic runs are unaffected.
 开发用 `scripts/review-bench.py` 另有独立候选复核实验（plan 273）：
 `recheck-prepare` 从固定父版本/目标版本取带行号的片段，冻结问题与证据；真值、来源与
 原裁决只留在本地评分材料中。`recheck` 对一组非空候选每次只发一个无工具的短上下文
-Responses 请求，由子进程提供整次请求的硬截止，失败不重试；输出区分 confirmed、
-excluded、unresolved，严重度仅用于已确认缺陷。代码引用可机械校验，裁决正确性仍须人工
-核对；`recheck-stats` 的标签匹配不代表端到端召回率。它是显式运行的开发实验，内置
-code-review skill 和共享 agent 循环不自动调用它。
-首次真实实验 12 次请求中 4 次耗尽输出预算而没有交付裁决，虽能纠正部分历史错误排除，
-仍保留为按需实验入口；不以有效 JSON、少量对照中的零误报或手工证据包推断生产收益。
+Responses 请求，由子进程提供整次请求的硬截止，失败不重试；`--max-output-tokens`
+可显式设置含推理的输出上限，默认 8,192，预算与截止时间记入每次试验元数据（plan 274）。
+输出区分 confirmed、excluded、unresolved，严重度仅用于已确认缺陷。代码引用可机械
+校验，裁决正确性仍须人工核对；`recheck-stats` 的标签匹配不代表端到端召回率。它是
+显式运行的开发实验，内置 code-review skill 和共享 agent 循环不自动调用它。
+真实实验能纠正部分历史错误排除，但扩大输出预算后仍有超时或推理耗尽上限而未交付裁决，
+因而保留为按需实验入口；不以有效 JSON、少量对照中的零误报或手工证据包推断生产收益。
 
 Two ways to trigger a skill, both expanding the **same** body:
 

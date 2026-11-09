@@ -9,6 +9,7 @@
     scripts/review-bench.py probe-reasoning [--provider <name>] [--trials 3]
     scripts/review-bench.py recheck-prepare <cases.json> <packet-dir> [--source <repo>]
     scripts/review-bench.py recheck <packet-dir> <out-dir> [--provider <name>] [--trials 3]
+                                   [--max-output-tokens 8192]
     scripts/review-bench.py recheck-stats <out-dir>...
 
 `make` 生成一个 Python 小项目：基础版本提交一次，审查对象是工作区里未提交的改动

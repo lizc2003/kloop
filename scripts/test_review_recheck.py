@@ -105,7 +105,7 @@ class RecheckTests(unittest.TestCase):
                           '[providers.fixture.auth_header]\nAuthorization = "SECRET_KEY"\n')
         return argparse.Namespace(packet=str(packet_dir), out=str(self.root / "out"),
                                   config=str(config), provider=None, model=None, effort="high",
-                                  trials=1, timeout=120)
+                                  trials=1, timeout=120, max_output_tokens=8192)
 
     def completed(self, answer):
         return {"event": "response.completed", "response": {
@@ -136,6 +136,7 @@ class RecheckTests(unittest.TestCase):
 
     def test_child_worker_reads_local_sse_and_sends_only_blinded_packet(self):
         args = self.args()
+        args.max_output_tokens = 16384
         response = self.completed(json.dumps({"verdicts": [self.verdict()]}))
         received = []
 
@@ -165,9 +166,34 @@ class RecheckTests(unittest.TestCase):
                 server.shutdown()
                 thread.join()
         self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["max_output_tokens"], 16384)
         self.assertNotIn("SECRET_ORIGINAL_VERDICT", json.dumps(received))
         self.assertNotIn('"expected"', json.dumps(received))
         self.assertEqual(recheck.score_run(args.out)["trials"][0]["status"], "valid")
+
+    def test_output_budget_changes_only_the_request_limit(self):
+        args = self.args()
+        response = self.completed(json.dumps({"verdicts": [self.verdict()]}))
+        with mock.patch.object(recheck, "one_request", return_value=response) as request:
+            self.run_recheck(args)
+            args.out = str(self.root / "larger-output-budget")
+            args.max_output_tokens = 16384
+            self.run_recheck(args)
+        self.assertEqual(request.call_count, 2)
+        first, second = [call.args[1] for call in request.call_args_list]
+        self.assertEqual(first["max_output_tokens"], 8192)
+        self.assertEqual(second, {**first, "max_output_tokens": 16384})
+        self.assertEqual([call.args[2] for call in request.call_args_list], [120, 120])
+        meta = recheck.load_json(pathlib.Path(args.out) / "trial-1/meta.json")
+        self.assertEqual(meta["max_output_tokens"], 16384)
+
+    def test_nonpositive_output_budget_stops_before_request(self):
+        args = self.args()
+        args.max_output_tokens = 0
+        with mock.patch.object(recheck, "one_request") as request:
+            with self.assertRaisesRegex(ValueError, "positive"):
+                self.run_recheck(args)
+        request.assert_not_called()
 
     def test_invalid_and_incomplete_responses_are_failed_without_retry(self):
         args = self.args()

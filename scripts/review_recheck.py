@@ -210,6 +210,8 @@ def recheck(args):
         raise ValueError("frozen packet checksum mismatch")
     if not 1 <= args.trials <= 3 or not 0 < args.timeout <= 120:
         raise ValueError("budget is 1..3 trials and at most 120 seconds per trial")
+    if args.max_output_tokens < 1:
+        raise ValueError("max_output_tokens must be positive")
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     save_json(out / "packet.json", packet)
@@ -226,14 +228,15 @@ def recheck(args):
         "model": args.model or provider["model"], "store": False, "stream": True,
         "input": [{"role": "user", "content": packet["prompt"]}],
         "reasoning": {"effort": args.effort, "summary": "auto"},
-        "include": ["reasoning.encrypted_content"], "max_output_tokens": 8192,
+        "include": ["reasoning.encrypted_content"], "max_output_tokens": args.max_output_tokens,
     }
     save_json(out / "request.json", body)
     for trial in range(1, args.trials + 1):
         trial_dir = out / f"trial-{trial}"
         trial_dir.mkdir()
         meta = {"trial": trial, "provider": name, "model": body["model"],
-                "effort": args.effort, "prompt_sha256": packet["prompt_sha256"], "status": "failed"}
+                "effort": args.effort, "max_output_tokens": args.max_output_tokens,
+                "timeout_s": args.timeout, "prompt_sha256": packet["prompt_sha256"], "status": "failed"}
         started = time.monotonic()
         try:
             result = one_request(provider, body, args.timeout)
@@ -302,6 +305,8 @@ def add_commands(sub, source):
     p.add_argument("--effort", default="high")
     p.add_argument("--trials", type=int, default=3)
     p.add_argument("--timeout", type=float, default=120)
+    p.add_argument("--max-output-tokens", type=int, default=8192,
+                   help="output budget including reasoning (default: 8192)")
     p.set_defaults(handler=recheck)
     p = sub.add_parser("recheck-stats", help="score decisions against local truth labels")
     p.add_argument("outs", nargs="+")
