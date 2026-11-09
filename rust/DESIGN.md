@@ -4693,6 +4693,14 @@ shipped one. A builtin has no directory (so its body cannot use
 an empty `path`. `--mock` skips disk discovery but keeps the builtins — they
 touch no filesystem, so hermetic runs are unaffected.
 
+开发用 `scripts/review-bench.py` 另有独立候选复核实验（plan 273）：
+`recheck-prepare` 从固定父版本/目标版本取带行号的片段，冻结问题与证据；真值、来源与
+原裁决只留在本地评分材料中。`recheck` 对一组非空候选每次只发一个无工具的短上下文
+Responses 请求，由子进程提供整次请求的硬截止，失败不重试；输出区分 confirmed、
+excluded、unresolved，严重度仅用于已确认缺陷。代码引用可机械校验，裁决正确性仍须人工
+核对；`recheck-stats` 的标签匹配不代表端到端召回率。它是显式运行的开发实验，内置
+code-review skill 和共享 agent 循环不自动调用它。
+
 Two ways to trigger a skill, both expanding the **same** body:
 
 - **模型按描述选择**。上下文只注入 `name` + `description`，正文到激活时才加载；

@@ -1,0 +1,44 @@
+{
+  "name": "plan272-R4-exclusions",
+  "split": "development",
+  "target": "6cc14b8",
+  "candidates": [
+    {
+      "id": "C1",
+      "question": "Does the accepted_structured EndTurn path preserve the late-work handling contract of the turn?",
+      "expected": "bug",
+      "provenance": "plan272 R4-A 已排除候选：accepted_structured 的 EndTurn 分支跳过 keep_going_for_late_work。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/core/src/agent.rs", "start": 862, "end": 916},
+        {"version": "after", "path": "rust/crates/core/src/agent.rs", "start": 892, "end": 968},
+        {"version": "after", "path": "rust/crates/core/src/agent.rs", "start": 1055, "end": 1072},
+        {"version": "after", "path": "rust/crates/server/src/worker.rs", "start": 154, "end": 181},
+        {"version": "after", "path": "rust/crates/core/src/inbox.rs", "start": 403, "end": 436}
+      ]
+    },
+    {
+      "id": "C2",
+      "question": "note_overflow_at receives an estimate computed before predictive compaction. Does that value serve the rejected-request ceiling correctly?",
+      "expected": "bug",
+      "provenance": "plan272 R4-A 已排除候选：note_overflow_at(estimated) 记录的是预测压缩之前的估算值。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/core/src/agent.rs", "start": 1105, "end": 1156},
+        {"version": "after", "path": "rust/crates/core/src/agent.rs", "start": 1163, "end": 1215},
+        {"version": "after", "path": "rust/crates/core/src/agent.rs", "start": 567, "end": 633},
+        {"version": "after", "path": "rust/crates/core/src/agent.rs", "start": 634, "end": 653},
+        {"version": "after", "path": "rust/crates/core/src/agent.rs", "start": 734, "end": 753},
+        {"version": "after", "path": "rust/crates/core/src/history.rs", "start": 646, "end": 665}
+      ]
+    },
+    {
+      "id": "C3",
+      "question": "Can a later, larger rejected estimate increase a ceiling already recorded by note_overflow_at? Is that behavior changed here?",
+      "expected": "not_bug",
+      "provenance": "人工负对照：沿 R4-A 的同一已调查消费者构造一个可由 min 规则排除的候选；不冒充历史漏报。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/core/src/history.rs", "start": 646, "end": 665},
+        {"version": "after", "path": "rust/crates/core/src/history.rs", "start": 646, "end": 665}
+      ]
+    }
+  ]
+}

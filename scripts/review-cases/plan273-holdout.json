@@ -1,0 +1,32 @@
+{
+  "name": "deferred-thinking-signatures",
+  "split": "holdout",
+  "target": "b00c9b6",
+  "candidates": [
+    {
+      "id": "C1",
+      "question": "After allowing a thinking start to omit its signature, what happens if no signature_delta arrives before block completion? Is there an actionable regression?",
+      "expected": "bug",
+      "provenance": "提示冻结后新增的留出提交；候选人工构造，真值由后续签名完成校验修复独立核对。不是 plan272 中的历史漏报。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/provider/src/anthropic.rs", "start": 198, "end": 251},
+        {"version": "after", "path": "rust/crates/provider/src/anthropic.rs", "start": 198, "end": 253},
+        {"version": "after", "path": "rust/crates/provider/src/anthropic.rs", "start": 378, "end": 418},
+        {"version": "after", "path": "rust/crates/provider/src/anthropic.rs", "start": 63, "end": 90},
+        {"version": "after", "path": "rust/crates/protocol/src/lib.rs", "start": 283, "end": 298},
+        {"version": "after", "path": "rust/crates/protocol/src/lib.rs", "start": 991, "end": 1018}
+      ]
+    },
+    {
+      "id": "C2",
+      "question": "Does appending signature_delta discard a nonempty signature prefix supplied in the thinking start?",
+      "expected": "not_bug",
+      "provenance": "人工负对照：同一留出提交的签名前缀保留路径，初始值与 push_str 可直接核对。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/provider/src/anthropic.rs", "start": 198, "end": 212},
+        {"version": "after", "path": "rust/crates/provider/src/anthropic.rs", "start": 198, "end": 214},
+        {"version": "after", "path": "rust/crates/provider/src/anthropic.rs", "start": 384, "end": 397}
+      ]
+    }
+  ]
+}

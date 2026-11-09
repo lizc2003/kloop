@@ -7,6 +7,9 @@
                                 [--commit <sha> [--source <repo>]]
     scripts/review-bench.py stats <out-dir>...
     scripts/review-bench.py probe-reasoning [--provider <name>] [--trials 3]
+    scripts/review-bench.py recheck-prepare <cases.json> <packet-dir> [--source <repo>]
+    scripts/review-bench.py recheck <packet-dir> <out-dir> [--provider <name>] [--trials 3]
+    scripts/review-bench.py recheck-stats <out-dir>...
 
 `make` 生成一个 Python 小项目：基础版本提交一次，审查对象是工作区里未提交的改动
 （含一个未跟踪的新文件）。缺陷 D1–D8 与诱饵见 `ANSWER_KEY`，判分规则见 plan 272。
@@ -37,6 +40,8 @@ import sys
 import time
 import tomllib
 import urllib.request
+
+import review_recheck
 
 ANSWER_KEY = {
     "D1": "report.paginate: end = start + size - 1 drops the last item of every page",
@@ -1068,8 +1073,11 @@ def main() -> None:
     p.add_argument("--model")
     p.add_argument("--effort", default="high")
     p.add_argument("--trials", type=int, default=3)
+    review_recheck.add_commands(sub, pathlib.Path(__file__).resolve().parent.parent)
     args = parser.parse_args()
-    if args.command == "make":
+    if hasattr(args, "handler"):
+        args.handler(args)
+    elif args.command == "make":
         make(pathlib.Path(args.dir).resolve())
     elif args.command == "run":
         run(args)

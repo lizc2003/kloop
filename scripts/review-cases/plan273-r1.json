@@ -1,0 +1,29 @@
+{
+  "name": "plan272-R1-exclusions",
+  "split": "development",
+  "target": "a41f6c7",
+  "candidates": [
+    {
+      "id": "C1",
+      "question": "How does changing parse_usage affect a prompt_tokens_details block whose entire value has the wrong type? Does the before/after difference create an actionable defect?",
+      "expected": "bug",
+      "provenance": "plan272 R1-A 已排除候选：prompt_tokens_details/input_tokens_details 整个块类型错误现在按 0。只取报告已指出的 Chat 分支，不补触发输入。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/provider/src/openai.rs", "start": 246, "end": 274},
+        {"version": "after", "path": "rust/crates/provider/src/openai.rs", "start": 254, "end": 283},
+        {"version": "before", "path": "rust/crates/provider/src/openai.rs", "start": 444, "end": 463},
+        {"version": "after", "path": "rust/crates/provider/src/openai.rs", "start": 465, "end": 484}
+      ]
+    },
+    {
+      "id": "C2",
+      "question": "SseParser::feed may lose frames it already parsed from a chunk when a later frame in the same chunk is invalid UTF-8. Is that an introduced or worsened defect in this commit?",
+      "expected": "not_bug",
+      "provenance": "plan272 R1-A 已排除候选：SseParser::feed 在坏帧时丢弃同 chunk 已解析帧。两版均先在局部 Vec 累积再因后帧返回 Err，行为未变。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/provider/src/sse.rs", "start": 21, "end": 81},
+        {"version": "after", "path": "rust/crates/provider/src/sse.rs", "start": 21, "end": 88}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "name": "plan272-R3-exclusions",
+  "split": "development",
+  "target": "85d7a2b",
+  "candidates": [
+    {
+      "id": "C1",
+      "question": "startup_unknown now treats options such as -e as affecting shell startup. Does that change path checking correctly?",
+      "expected": "bug",
+      "provenance": "plan272 R3-E 已排除候选：startup_unknown 把 -e 等非 -c 选项也标成读启动文件。不补写报告未给出的具体路径。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/core/src/shell/facts.rs", "start": 321, "end": 357},
+        {"version": "after", "path": "rust/crates/core/src/shell/facts.rs", "start": 322, "end": 371},
+        {"version": "after", "path": "rust/crates/core/src/shell/facts.rs", "start": 680, "end": 737},
+        {"version": "after", "path": "rust/crates/core/src/permissions/facts.rs", "start": 422, "end": 482},
+        {"version": "after", "path": "rust/crates/core/src/permissions/facts.rs", "start": 536, "end": 578},
+        {"version": "after", "path": "rust/crates/core/src/permissions/facts.rs", "start": 643, "end": 757}
+      ]
+    },
+    {
+      "id": "C2",
+      "question": "A literal bash -c with no command operand does not produce nested script analysis. Does this commit introduce or worsen that behavior?",
+      "expected": "not_bug",
+      "provenance": "plan272 R3-E 已排除候选：bash -c 无操作数时返回 Ok(None)。父版 get(..3) 同样不进入脚本分析。",
+      "evidence": [
+        {"version": "before", "path": "rust/crates/core/src/shell/facts.rs", "start": 321, "end": 338},
+        {"version": "before", "path": "rust/crates/core/src/shell.rs", "start": 127, "end": 138},
+        {"version": "after", "path": "rust/crates/core/src/shell/facts.rs", "start": 322, "end": 338},
+        {"version": "after", "path": "rust/crates/core/src/shell/facts.rs", "start": 680, "end": 737}
+      ]
+    }
+  ]
+}
