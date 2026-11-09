@@ -4700,6 +4700,8 @@ Responses 请求，由子进程提供整次请求的硬截止，失败不重试�
 excluded、unresolved，严重度仅用于已确认缺陷。代码引用可机械校验，裁决正确性仍须人工
 核对；`recheck-stats` 的标签匹配不代表端到端召回率。它是显式运行的开发实验，内置
 code-review skill 和共享 agent 循环不自动调用它。
+首次真实实验 12 次请求中 4 次耗尽输出预算而没有交付裁决，虽能纠正部分历史错误排除，
+仍保留为按需实验入口；不以有效 JSON、少量对照中的零误报或手工证据包推断生产收益。
 
 Two ways to trigger a skill, both expanding the **same** body:
 
