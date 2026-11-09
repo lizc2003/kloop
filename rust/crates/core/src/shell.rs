@@ -943,13 +943,9 @@ fn env_command<'a>(
 ) -> Option<&'a [String]> {
     while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
         let token = token.as_str();
-        // `-S`/`--split-string` 把一个词拆成整条命令行，被包命令不在任何单个参数里：
-        // `env -S 'cat .env'` 会读 `.env`。带 `S` 的短选项簇都算，`-uS`（取消名为 S
-        // 的变量）也会被误算，代价只是多一个未知执行体。
-        if token == "--split-string"
-            || token.starts_with("--split-string=")
-            || (!token.starts_with("--") && token[1..].contains('S'))
-        {
+        // split-string 把一个词拆成整条命令行，被包命令不在任何单个参数里：
+        // `env -S 'cat .env'` 会读 `.env`，只能当未知执行体。
+        if env_splits_string(token) {
             analysis.arguments_unknown = true;
             return None;
         }
@@ -972,7 +968,14 @@ fn env_command<'a>(
                 analysis.environment_unknown = true;
                 analysis.cwd_unknown = true;
             }
-            _ => return None,
+            _ => {
+                // 未知选项可能带操作数，此后分不清哪个词是选项：`env --debug -S 'cat .env'`
+                // 里的 `-S` 仍会生效。后面任何位置像 split-string 都按未知执行体处理；
+                // 被包命令自己的 `-S`（`env --debug sort -S 1G`）也会被算进去，只多拒一次。
+                analysis.arguments_unknown |=
+                    rest[1..].iter().any(|token| env_splits_string(token));
+                return None;
+            }
         }
         rest = &rest[1..];
     }
@@ -984,6 +987,27 @@ fn env_command<'a>(
         rest = &rest[1..];
     }
     Some(rest)
+}
+
+/// `env` 的这个词是否打开 split-string：`--split-string` 及其无歧义缩写（GNU 接受
+/// `--s=…`），或短选项簇里在带操作数的字母之前出现 `S`。带操作数的字母之后整簇都是
+/// 它的值：`-uSSH_AUTH_SOCK` 的 `S` 属于变量名，`-CS` 的属于目录名。
+fn env_splits_string(token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split_once('=').map_or(long, |(name, _)| name);
+        return !name.is_empty() && "split-string".starts_with(name);
+    }
+    let Some(cluster) = token.strip_prefix('-') else {
+        return false;
+    };
+    for flag in cluster.chars() {
+        match flag {
+            'S' => return true,
+            'u' | 'C' | 'P' | 'a' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn sudo_command<'a>(
@@ -1730,7 +1754,11 @@ mod tests {
             argv(&["env", "-iS", "cat .env"]),
             argv(&["env", "--split-string", "cat .env"]),
             argv(&["env", "--split-string=cat .env"]),
+            argv(&["env", "--s=cat .env"]),
             argv(&["env", "-C", "/tmp", "-S", "cat .env"]),
+            // 未知选项之后的 split-string 仍然生效。
+            argv(&["env", "--debug", "-S", "cat .env"]),
+            argv(&["env", "-P", "/usr/bin", "-S", "cat .env"]),
         ] {
             let analysis = analyze_wrappers(&input);
             assert!(!analysis.complete, "{input:?}");
@@ -1741,5 +1769,26 @@ mod tests {
         let analysis = analyze_wrappers(&debug);
         assert!(!analysis.complete);
         assert!(!analysis.arguments_unknown);
+        // 带操作数的字母之后整簇都是值，其中的 `S` 不是选项。
+        for (token, splits) in [
+            ("-S", true),
+            ("-iS", true),
+            ("-vS", true),
+            ("-Sx", true),
+            ("-uSSH_AUTH_SOCK", false),
+            ("-CS", false),
+            ("-iuSSH", false),
+            ("--split", true),
+            ("--s=x", true),
+            ("--unset=SSH_AUTH_SOCK", false),
+            ("--", false),
+            ("-", false),
+        ] {
+            assert_eq!(env_splits_string(token), splits, "{token}");
+        }
+        let unset = argv(&["env", "-uSSH_AUTH_SOCK", "cargo", "test"]);
+        let analysis = analyze_wrappers(&unset);
+        assert!(analysis.complete);
+        assert_eq!(analysis.argv, ["cargo", "test"]);
     }
 }

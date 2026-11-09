@@ -769,6 +769,40 @@ def snapshot(source: pathlib.Path, sha: str, root: pathlib.Path) -> None:
     git(root, "commit", "-qm", message)
 
 
+def drop_top_level_key(text: str, key: str) -> str:
+    """去掉第一个表头之前的 `key = …` 行（TOML 不允许同一张表里重复的键）。"""
+    pattern = re.compile(rf"""^\s*["']?{re.escape(key)}["']?\s*=""")
+    out, top = [], True
+    for line in text.splitlines(keepends=True):
+        if re.match(r"\s*\[", line):
+            top = False
+        if top and pattern.match(line):
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def prepare_config(real_state: pathlib.Path, state: pathlib.Path, system_prompt: str | None) -> str:
+    """临时 HOME 用的配置正文，以及它引用的系统提示文件。
+
+    显式 `--system-prompt` 替换原有的 `system_prompt_file`；没给时沿用原配置，相对路径
+    的提示文件跟着复制，否则临时 HOME 下启动就会因找不到文件失败。
+    """
+    text = (real_state / "config.toml").read_text()
+    current = tomllib.loads(text).get("system_prompt_file")
+    if system_prompt:
+        shutil.copyfile(system_prompt, state / "system-prompt.md")
+        text = 'system_prompt_file = "system-prompt.md"\n' + drop_top_level_key(
+            text, "system_prompt_file"
+        )
+    elif current and not pathlib.Path(current).is_absolute():
+        target = state / current
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(real_state / current, target)
+    tomllib.loads(text)
+    return text
+
+
 def run(args) -> None:
     out = pathlib.Path(args.out).resolve()
     if out.exists():
@@ -785,10 +819,7 @@ def run(args) -> None:
     state = home / ".kloop"
     state.mkdir(parents=True)
     os.chmod(state, 0o700)
-    config = (pathlib.Path.home() / ".kloop/config.toml").read_text()
-    if args.system_prompt:
-        shutil.copyfile(args.system_prompt, state / "system-prompt.md")
-        config = 'system_prompt_file = "system-prompt.md"\n' + config
+    config = prepare_config(pathlib.Path.home() / ".kloop", state, args.system_prompt)
     config_path = state / "config.toml"
     config_path.touch(mode=0o600)
     config_path.write_text(config)

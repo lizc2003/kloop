@@ -1362,6 +1362,9 @@ mod tests {
                 "env -iS 'cat .env'",
                 "env --split-string 'cat .env'",
                 "env --split-string='cat .env'",
+                "env --s='cat .env'",
+                "env --debug -S 'cat .env'",
+                "env -P /usr/bin -S 'cat .env'",
                 "for t in 'cat .env'; do env -S \"$t\"; done",
             ] {
                 let approver = ScriptedApprover::new(vec![]);
@@ -1377,6 +1380,19 @@ mod tests {
                 assert_eq!(approver.ask_count(), 0);
             }
         }
+    }
+
+    /// 簇里带操作数的字母之后都是值：`-uSSH_AUTH_SOCK` 取消一个变量，不是 split-string。
+    #[tokio::test]
+    async fn env_unset_operand_with_s_is_not_split_string() {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &[], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        p.check_call("bash", &bash("env -uSSH_AUTH_SOCK cargo test"), 0, true)
+            .await
+            .unwrap();
     }
 
     /// Plan 272：循环绑定只细化 syntax，包装器按 syntax 剥离后，被包的危险命令名在

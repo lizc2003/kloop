@@ -291,6 +291,14 @@
   - 危险判定在 `risk_argv()`（未知词视图）之外再看 `syntax` 求值后的视图，任一危险即确认；
     不改 `value` 保持 Unknown 的设计，所以不产生任何授权。
 
+**审查跟进（同日）**：复审指出三处。一是未知选项提前返回，`env --debug -S 'cat .env'` 的
+`-S` 没被检查；现在未知选项之后的任何词像 split-string 都按未知执行体处理，并补上 GNU
+长选项缩写 `--s=…`。二是“簇里含 `S`”的判断把 `-uSSH_AUTH_SOCK` 的变量名当成选项，正常
+命令被硬拒；改为逐字母解析，带操作数的字母（`u`、`C`、`P`、`a`）之后整簇是值。两条新回归
+在上一版 `shell.rs` 上先红后绿。三是基准脚本：本机配置里已有 `system_prompt_file` 时，
+临时 HOME 缺提示文件会启动失败，`--system-prompt` 又会追加重复键；现在相对路径的提示文件
+随配置复制，显式参数替换顶层键并用 tomllib 校验，三种配置形状用临时目录验证过。
+
 验证：新增与改写的回归覆盖落盘文件全文与内联上限、不超限时不写文件、`/context` 的
 图片行与嵌套图片行、split-string 六种形状（manual/bypass）、两条循环包装危险命令的确认、
 包装器分析对 split-string 的标记；`kloop-core` 中 `tools::bash`、`commands::context`、
