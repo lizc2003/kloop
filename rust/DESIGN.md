@@ -1283,6 +1283,9 @@ heredoc 调用仍 opaque：不只读、不并发，普通批准最多逐字记�
 包装器（`sudo`、`env`、`timeout`、`nice`、`xargs` 等）的统一分析同时返回剥离后的
 argv、每层已定位包装器、环境/cwd 不确定性、参数替换串及其作用的 argv、包装器自带
 未知写入与选项语法是否完整。完整只表示能定位被包命令，不保证没有未知效果。
+`env -S` / `--split-string`（含附着值与带 `S` 的短选项簇）把一个词拆成整条命令行，被包
+命令不在任何单个参数里，按未知执行体处理：`env -S 'cat .env'` 此前绕过敏感读取硬拒绝
+（plan 272）。代价是 `env -S 'ls -la'` 这类良性写法也被拒；其余未知 `env` 选项仍做近似剥离。
 `command` 的执行形式同样剥离，`-v`/`-V` 查询形式不当作执行。包装器参数按词事实求值，
 使用去除 shell 转义后的真实字节；单独的 `{}` 作为字面默认替换串处理。
 `env NAME="$VALUE"` 中名称固定、值保持单个参数的赋值仍可继续定位；双引号中的命令
@@ -1316,7 +1319,10 @@ shell 的参数或 `-c` 正文，或后续动态参数无法排除替换，则�
 printf 的变量输出、动态命令、嵌套循环与其它未建模语法都取消这项细化；未引用变量、
 拼接词、动态列表和可能生成选项的值仍未知。因此逐项 `cargo test -- "$t"` 不再把固定
 测试名误当未知路径，也不把测试程序的全部参数视为数据。严格分析仍为 opaque，原来的
-未知词身份继续用于 deny/ask 与危险判断，不产生只读、前缀或路径授权。
+未知词身份继续用于 deny/ask，不产生只读、前缀或路径授权。危险判断同时看展开后的字面
+视图：包装器按字面剥离后，被包命令名在未知词视图里看不出危险，
+`for w in shred; do env "$w" x; done` 曾因此在 manual 下不经确认放行；任一视图危险即确认
+（plan 272）。
 双引号单值赋值只证明参数边界，不证明值安全：`echo .env > list` 可作为数据写出，
 随后 `env FOO="$(cat list)" sh -c 'cat "$FOO"'` 的未知读取必须拒绝。
 单值赋值后只操作已知普通目标（如 touch notes.txt）仍允许。
@@ -2943,10 +2949,14 @@ substitutes PowerShell,
 `cmd.exe`, WSL, Cygwin, BusyBox, or an arbitrary PATH `sh.exe`. stdin is closed
 and stdout/stderr use separate pipes. Both pipes are drained concurrently to
 EOF, so a child filling one stream cannot deadlock behind an unread other
-stream. Each stream retains at most 150,000 bytes while continuing to drain
+stream. Each stream retains at most 1 MiB while continuing to drain
 discarded bytes; the merged model-facing result is UTF-8 lossy, capped at 30,000
 characters, and says how many captured characters and additional bytes were
-omitted. stdout precedes stderr in the canonical result, followed by
+omitted. When the cap cuts it, the whole captured text is first written to the
+offload store and the notice names that file and its line count, so the model
+reads the rest instead of re-running the command (plan 272: 6 of 11 measured
+reviews had a diff cut this way). The inline part keeps its size; bash and
+PowerShell share this. stdout precedes stderr in the canonical result, followed by
 `[exit status N]` or `[killed by signal]`; an empty successful run returns
 `(no output)`.
 
@@ -4014,7 +4024,9 @@ rest — and neither tells the user the command did not take them.
   reminders, compaction summaries, which can dwarf what the user typed —
   assistant text, reasoning, images, tool calls, tool results). Every row is the
   session's one text estimate (see **Predictive** compaction) so rows compare
-  with each other; the total is the sum of the top-level rows, and once a
+  with each other — image blocks too, top-level or inside a tool result, at the
+  same fixed per-image cost (plan 272: the breakdown used to serialize their
+  base64, putting a ~100k `images` row under a ~1.6k history total); the total is the sum of the top-level rows, and once a
   provider response exists its measured size is printed beside it rather than
   mixed in. History is sized **as sent**: a result carried as a stub (see
   **Request-time reduction**) counts as its stub, and a
@@ -4660,7 +4672,8 @@ does this code do with that input" and settled locally rather than by searching
 an upstream's docs — the few facts only the user has (what is deployed there,
 why the switch was added) end the report as a question carrying the verdict each
 answer would produce; and a review runs the affected package's tests, never the
-project's pre-merge gate. It runs **inline**, in the conversation that asked for
+project's pre-merge gate. With no target it covers the working tree plus untracked
+files, which `git diff HEAD` leaves out (plan 272). It runs **inline**, in the conversation that asked for
 it: a forked review keeps its evidence in the sub-agent, so the delegating agent
 — which must not take a sub-agent's report as fact — is left re-collecting it
 (measured: 42 minutes and 254 sub-agent tool calls, then 67 more in the parent

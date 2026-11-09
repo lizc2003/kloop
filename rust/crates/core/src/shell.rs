@@ -943,6 +943,16 @@ fn env_command<'a>(
 ) -> Option<&'a [String]> {
     while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
         let token = token.as_str();
+        // `-S`/`--split-string` 把一个词拆成整条命令行，被包命令不在任何单个参数里：
+        // `env -S 'cat .env'` 会读 `.env`。带 `S` 的短选项簇都算，`-uS`（取消名为 S
+        // 的变量）也会被误算，代价只是多一个未知执行体。
+        if token == "--split-string"
+            || token.starts_with("--split-string=")
+            || (!token.starts_with("--") && token[1..].contains('S'))
+        {
+            analysis.arguments_unknown = true;
+            return None;
+        }
         match token {
             "--" => {
                 rest = &rest[1..];
@@ -1713,5 +1723,23 @@ mod tests {
         ] {
             assert!(!analyze_wrappers(&input).complete, "{input:?}");
         }
+        // split-string 的被包命令不在任何单个参数里：只能当未知执行体。
+        for input in [
+            argv(&["env", "-S", "cat .env"]),
+            argv(&["env", "-Scat .env"]),
+            argv(&["env", "-iS", "cat .env"]),
+            argv(&["env", "--split-string", "cat .env"]),
+            argv(&["env", "--split-string=cat .env"]),
+            argv(&["env", "-C", "/tmp", "-S", "cat .env"]),
+        ] {
+            let analysis = analyze_wrappers(&input);
+            assert!(!analysis.complete, "{input:?}");
+            assert!(analysis.arguments_unknown, "{input:?}");
+        }
+        // 其他未知选项保留原来的近似剥离，不升级成未知执行体。
+        let debug = argv(&["env", "--debug", "ls"]);
+        let analysis = analyze_wrappers(&debug);
+        assert!(!analysis.complete);
+        assert!(!analysis.arguments_unknown);
     }
 }

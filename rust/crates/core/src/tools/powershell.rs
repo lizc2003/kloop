@@ -43,7 +43,7 @@ pub(super) async fn powershell_tool(
 
     let spec = powershell_spec(program, command, &workspace.cwd);
     let output = bash::run_process_foreground(spec, timeout_ms, &ctx.cancel, "powershell").await?;
-    Ok(bash::format_output(&output))
+    Ok(bash::format_output(&output, Some(&ctx.cfg.offload_dir)))
 }
 
 fn powershell_spec(program: &ShellProgram, command: &str, cwd: &Path) -> ProcessSpec {
@@ -313,7 +313,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let output =
                 bash::run_process_foreground(spec, timeout_ms, &cancel, "powershell").await?;
-            Ok(bash::format_output(&output))
+            Ok(bash::format_output(&output, None))
         }
 
         fn quoted_literal(path: &Path) -> String {

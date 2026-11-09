@@ -859,7 +859,7 @@ pub(crate) fn is_offload_pointer(text: &str) -> bool {
 /// Write `content` to a fresh `off-*.txt`. Every file the model is pointed
 /// at goes through here: the permission gate and the sandbox exempt offload
 /// files by that name, so a new name would mean a new hole in both.
-fn write_offload_file(dir: &Path, content: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn write_offload_file(dir: &Path, content: &str) -> std::io::Result<PathBuf> {
     use std::io::Write as _;
     let (_, path, mut file) = crate::resource_id::create_file(dir, "off-", ".txt")?;
     file.write_all(content.as_bytes())?;
@@ -1176,6 +1176,15 @@ pub fn estimate_message_tokens(message: &Message) -> u64 {
     for block in &message.content {
         count_block_tokens(&mut counter, block, &mut images);
     }
+    counter.tokens() + images * ESTIMATED_IMAGE_TOKENS
+}
+
+/// 按 [`estimate_message_tokens`] 的同一规则估一个块，给按块类型拆分该估算的调用方：
+/// 自己序列化图片 `data` 的拆分会让一张截图那一行比它所在消息高出两个数量级。
+pub fn estimate_block_tokens(block: &ContentBlock) -> u64 {
+    let mut counter = TokenCounter::default();
+    let mut images = 0u64;
+    count_block_tokens(&mut counter, block, &mut images);
     counter.tokens() + images * ESTIMATED_IMAGE_TOKENS
 }
 

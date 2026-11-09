@@ -1007,6 +1007,8 @@ mod tests {
             "including uncommitted edits",
             "Truncated output is not coverage",
             "Batch independent reads",
+            // Plan 272：`git diff HEAD` 不含未跟踪文件，工作区审查要自己列出并读它们。
+            "does not show untracked files",
         ] {
             assert!(
                 body.contains(clause),

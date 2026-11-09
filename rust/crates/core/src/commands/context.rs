@@ -13,7 +13,9 @@ use kloop_protocol::{ContentBlock, Role, ToolDef};
 
 use super::SlashResult;
 use crate::config::Config;
-use crate::history::{History, estimate_text_tokens, estimate_tool_def_tokens};
+use crate::history::{
+    History, estimate_block_tokens, estimate_text_tokens, estimate_tool_def_tokens,
+};
 
 pub const SUMMARY: &str = "show which parts of the prompt the context goes to";
 
@@ -167,7 +169,7 @@ fn history_rows(messages: &[kloop_protocol::Message]) -> Vec<Row> {
                 ContentBlock::ToolUse { .. } => 5,
                 ContentBlock::ToolResult { .. } => 6,
             };
-            tokens[kind] += block_tokens(block);
+            tokens[kind] += estimate_block_tokens(block);
         }
     }
     kinds
@@ -181,10 +183,6 @@ fn history_rows(messages: &[kloop_protocol::Message]) -> Vec<Row> {
             nested: true,
         })
         .collect()
-}
-
-fn block_tokens(block: &ContentBlock) -> u64 {
-    serde_json::to_string(block).map_or(0, |json| estimate_text_tokens(&json))
 }
 
 #[cfg(test)]
@@ -259,12 +257,58 @@ mod tests {
         assert_eq!(
             history_rows(&messages),
             vec![
-                nested("user text", block_tokens(&user)),
-                nested("injected text", block_tokens(&summary.content[0])),
-                nested("assistant text", block_tokens(&assistant)),
-                nested("tool calls", block_tokens(&call)),
-                nested("tool results", block_tokens(&result)),
+                nested("user text", estimate_block_tokens(&user)),
+                nested("injected text", estimate_block_tokens(&summary.content[0])),
+                nested("assistant text", estimate_block_tokens(&assistant)),
+                nested("tool calls", estimate_block_tokens(&call)),
+                nested("tool results", estimate_block_tokens(&result)),
             ]
+        );
+    }
+
+    /// Plan 272：history 行按固定值估图片，这里的明细却仍序列化 base64，于是一张
+    /// 400 KB 截图显示为 ~1.6k 的 history 下挂一个 ~100k 的 `images`。现在两者同一规则。
+    #[test]
+    fn image_rows_use_the_fixed_image_estimate_not_the_payload() {
+        let data = "iVBORw0KGgo".repeat(50_000);
+        let image = || ContentBlock::Image {
+            source: kloop_protocol::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: data.clone(),
+            },
+        };
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: ToolResultContent::Blocks(vec![image()]),
+            is_error: false,
+        };
+        let messages = [
+            Message::user_with_blocks("look", vec![image()]),
+            Message::tool_results(vec![result.clone()]),
+        ];
+        let rows = history_rows(&messages);
+        let images = rows
+            .iter()
+            .find(|row| row.label == "images")
+            .expect("images row");
+        assert_eq!(images.tokens, crate::history::ESTIMATED_IMAGE_TOKENS);
+        let results = rows
+            .iter()
+            .find(|row| row.label == "tool results")
+            .expect("tool results row");
+        assert!(
+            results.tokens < crate::history::ESTIMATED_IMAGE_TOKENS + 100,
+            "nested image counted by its payload: {}",
+            results.tokens
+        );
+        let total: u64 = messages
+            .iter()
+            .map(crate::history::estimate_message_tokens)
+            .sum();
+        let parts: u64 = rows.iter().map(|row| row.tokens).sum();
+        assert!(
+            parts <= total + 10,
+            "rows {parts} exceed the history estimate {total}"
         );
     }
 

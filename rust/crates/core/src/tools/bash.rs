@@ -42,7 +42,9 @@ use crate::shell_programs::ShellProgram;
 /// Each foreground fd is drained to EOF while retaining at most this many
 /// bytes. The final model-visible merge is tighter, matching CC's default
 /// inline Bash budget without inheriting its unbounded child-pipe buffering.
-const FOREGROUND_STREAM_CAP_BYTES: usize = 150_000;
+/// 截断时落盘给模型回读的也是这部分（plan 272），所以它同时是那个文件的上限：
+/// 大 diff 应当一次落全，而不是让模型分段重跑。
+const FOREGROUND_STREAM_CAP_BYTES: usize = 1 << 20;
 const FOREGROUND_OUTPUT_CAP_CHARS: usize = 30_000;
 const FOREGROUND_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -283,7 +285,7 @@ pub(crate) async fn run_foreground_bash(
         bail!(sandbox::PROTECTION_REQUIRED);
     }
     let output = run_foreground(command, &cwd, effective_sandbox, bash, timeout_ms, ctx).await?;
-    let mut text = format_output(&output);
+    let mut text = format_output(&output, Some(&ctx.cfg.offload_dir));
     let success = output.status.success();
     if remembered_escalation {
         return Ok(ForegroundRun {
@@ -336,7 +338,7 @@ pub(crate) async fn run_foreground_bash(
                         text: format!(
                             "{}{}",
                             sandbox::escalated_prefix(&denial, approval),
-                            format_output(&raw)
+                            format_output(&raw, Some(&ctx.cfg.offload_dir))
                         ),
                         success: raw.status.success(),
                     });
@@ -528,7 +530,7 @@ async fn finish_reader(
 }
 
 async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<BoundedStream> {
-    let mut bytes = Vec::with_capacity(FOREGROUND_STREAM_CAP_BYTES);
+    let mut bytes = Vec::new();
     let mut total_bytes = 0usize;
     let mut chunk = [0u8; 8192];
     loop {
@@ -546,13 +548,23 @@ async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<Bound
 /// stdout+stderr merged, a trailing `[exit …]` when the run failed, and a
 /// placeholder when empty — the model-facing text for one run (denial
 /// annotation is the caller's job, so an escalated re-run reuses this).
-pub(super) fn format_output(output: &ForegroundOutput) -> String {
+///
+/// 合并结果超出内联预算且给了 `spill_dir` 时，先把捕获到的全文写进去，截断说明里
+/// 给出文件路径：否则大 diff 被截掉的后半段只能重跑命令才拿得到（plan 272 实测
+/// 11 次审查里 6 次如此）。内联部分大小不变，路径不额外占上下文。
+pub(super) fn format_output(output: &ForegroundOutput, spill_dir: Option<&Path>) -> String {
     let mut merged = Vec::with_capacity(output.stdout.len() + output.stderr.len());
     merged.extend_from_slice(&output.stdout);
     merged.extend_from_slice(&output.stderr);
     let mut text = String::from_utf8_lossy(&merged).into_owned();
     let captured_chars = text.chars().count();
     let omitted_chars = captured_chars.saturating_sub(FOREGROUND_OUTPUT_CAP_CHARS);
+    let saved = match spill_dir {
+        Some(dir) if omitted_chars > 0 => Some(
+            crate::history::write_offload_file(dir, &text).map(|path| (path, text.lines().count())),
+        ),
+        _ => None,
+    };
     if omitted_chars > 0 {
         let boundary = text
             .char_indices()
@@ -561,9 +573,19 @@ pub(super) fn format_output(output: &ForegroundOutput) -> String {
         text.truncate(boundary);
     }
     if omitted_chars > 0 || output.omitted_bytes > 0 {
+        let omitted_bytes = output.omitted_bytes;
+        let saved = match saved {
+            Some(Ok((path, lines))) => format!(
+                "; all {captured_chars} captured characters ({lines} lines) are saved to {} \
+                 — read the rest from that file instead of re-running the command",
+                path.display()
+            ),
+            Some(Err(error)) => format!("; saving the captured output failed ({error})"),
+            None => String::new(),
+        };
         text.push_str(&format!(
-            "\n[output truncated: {omitted_chars} characters and {} additional bytes omitted]",
-            output.omitted_bytes
+            "\n[output truncated: {omitted_chars} characters and {omitted_bytes} additional \
+             bytes omitted{saved}]"
         ));
     }
     if !output.status.success() {
@@ -814,7 +836,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let text = super::format_output(&output);
+        let text = super::format_output(&output, None);
         assert!(text.contains("from-login|"), "{text}");
         assert!(
             !text.contains("from-login|set"),
@@ -1272,7 +1294,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let text = super::format_output(&output);
+        let text = super::format_output(&output, None);
         assert!(text.contains("stdout"), "{text}");
         assert!(text.contains("stderr"), "{text}");
         assert_eq!(
@@ -1418,11 +1440,44 @@ mod tests {
         assert!(!is_error, "{out}");
         assert!(out.starts_with("A\nA\n"), "{out}");
         assert!(out.contains("[output truncated:"), "{out}");
+        // 内联预算不变，只多一行路径。
         assert!(
-            out.chars().count() <= FOREGROUND_OUTPUT_CAP_CHARS + 100,
+            out.chars().count() <= FOREGROUND_OUTPUT_CAP_CHARS + 400,
             "bounded output grew to {} characters",
             out.chars().count()
         );
+        // 被截掉的内容都在说明里的文件中（stdout 在前、stderr 在后），模型可以接着读，
+        // 不必重跑命令。
+        let notice = out.rsplit_once("\n[output truncated: ").expect("notice").1;
+        assert!(
+            notice.starts_with("370000 characters and 0 additional bytes omitted; all 400000 captured characters (200000 lines) are saved to "),
+            "{notice}"
+        );
+        let path = notice
+            .split_once(" are saved to ")
+            .and_then(|(_, rest)| rest.split_once(" — "))
+            .map(|(path, _)| path)
+            .expect("saved path");
+        assert!(
+            path.starts_with(&ctx.cfg.offload_dir.display().to_string()),
+            "{path}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{}{}", "A\n".repeat(100_000), "B\n".repeat(100_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn output_within_the_inline_budget_saves_nothing() {
+        let ctx = test_ctx(0, "unspilled-output");
+        let (out, is_error) = run_tool("bash", bash_input("printf short"), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert_eq!(out, "short");
+        let saved = std::fs::read_dir(&ctx.cfg.offload_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(saved, 0, "a result that fits must not write a file");
     }
 
     #[cfg(windows)]

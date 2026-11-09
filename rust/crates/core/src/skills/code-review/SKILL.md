@@ -7,7 +7,10 @@ description: Review a PR, a commit, a diff, or working-tree changes for defects 
 
 Target: $ARGUMENTS
 
-With no target, review the working tree against HEAD. A bare revision means that
+With no target, review the working tree against HEAD **plus every untracked
+file**: `git diff HEAD` does not show untracked files, so list them with
+`git status --short` and count each new file as part of the change, read in
+full. A bare revision means that
 commit against its parent. A PR means its head against the merge-base with its
 actual target branch. Resolve that range before reading the diff.
 

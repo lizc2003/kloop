@@ -290,11 +290,22 @@ impl CallFacts {
                     return true;
                 }
             }
-            let argv = command.risk_argv();
-            argv_is_dangerous(&argv)
-                || risk_wrapper_views(&argv)
+            // 循环绑定只细化 syntax，value 保持 Unknown 以免产生授权。包装器按 syntax
+            // 剥离，于是 `for w in shred; do env "$w" x; done` 里被包命令名在那边是
+            // `shred`，在 risk_argv 里只是未知词。危险判定两个视图都看，任一危险就问。
+            let resolved = placeholder_argv(
+                &command
+                    .words
                     .iter()
-                    .any(|view| argv_is_dangerous(view))
+                    .map(|word| word.syntax.evaluate(None))
+                    .collect::<Vec<_>>(),
+            );
+            [command.risk_argv(), resolved].iter().any(|argv| {
+                argv_is_dangerous(argv)
+                    || risk_wrapper_views(argv)
+                        .iter()
+                        .any(|view| argv_is_dangerous(view))
+            })
         }) {
             return Some(Hazard { tag: "destructive" });
         }

@@ -3,7 +3,8 @@
 > 2026-11-09 立。来源：同事反馈同一个 DeepSeek 模型，opencode 审查代码比 kloop 更完备。
 > 本会话读了 `refs/opencode` 的审查链路（只读代码），结论见「调研」；改进项按实测
 > 结果决定取舍，实测设计与结果见后两节。
-> 状态：待实现。实测已完成（结果与取舍见末节）；P1、P4 待实现，其余不采纳或待用户定。
+> 状态：✅ 已完成（2026-11-09）。P1、P4 已实现，审查顺带发现的两个缺陷已修，见末节「实施」；
+> P2、P3、P6、P7 不采纳，P5 关闭；三个结构性方向按用户“尽量快”的要求暂不做。
 
 ## 约束
 
@@ -264,3 +265,35 @@
   `for t in 'cat .env'; do env -S "$t"; done`，R3-E 给出 `for w in shred; do env "$w" notes.txt; done`，
   两者都指向“父提交硬拒绝、现在放行”。当前 HEAD 的 `env -S` 仍走 unsupported wrapper
   分支且不补 `rewritten_execution()`（`shell/facts.rs:265-280`），需要实际跑权限检查确认。
+
+## 实施（2026-11-09）
+
+用户要求“按最合理的方案做，在保证好的前提下尽量快，并修复发现的 bug”。速度慢和排除
+那一步这次都不改：前者换来的是经过验证的结论，验证条款来自 gpt 上的实测问题，要按
+模型拆 skill 并在两边重测才能动；后者唯一可能有效的结构性修法会让每次审查多一轮，
+与“尽量快”冲突，而漏掉的条目本来就以带理由的形式留在 Excluded 里，读者可以推翻。
+
+- **P1 ✅**：`code-review` skill 无目标时写明包含未跟踪文件，先 `git status --short`
+  再全文读新文件；承重条款测试加 `does not show untracked files`。
+- **P4 ✅**：bash/PowerShell 输出超出 30,000 字符时，先把捕获到的全文写进 offload 存储
+  （与大结果落盘同一入口），截断说明里给出路径、字符数和行数；内联部分不变。每个流的
+  捕获上限从 150,000 字节提到 1 MiB，并不再按上限预分配，免得大 diff 落盘也是残缺的。
+- **修复 `/context` 图片估算**：history 新增 `estimate_block_tokens`，复用
+  `estimate_message_tokens` 的逐块规则；`/context` 的分行明细改用它，顶层图片和工具结果
+  内嵌图片都按固定 1,600 计，不再序列化 base64。
+- **修复 `env -S` 绕过与循环绑定的危险判定回归**：先用权限层探针确认（修复前
+  `env -S 'cat .env'`、`-S'…'`、`--split-string[=…]` 及循环写法在 manual/bypass 下都放行；
+  `for w in shred; do env "$w" notes.txt; done` 与 `for w in rm; do env "$w" -rf build; done`
+  在 manual 下不经确认放行，而字面写法会问）。
+  - `env` 遇到 split-string（含附着值、带 `S` 的短选项簇）标为 `arguments_unknown`，由事实层
+    生成未知执行体，按无法排除的敏感读取硬拒绝。`env -S 'ls -la'` 这类良性写法随之被拒，
+    其余未知 `env` 选项（`-P`、`--debug`、`-v`）探针确认原本就被近似剥离拦住，不改。
+  - 危险判定在 `risk_argv()`（未知词视图）之外再看 `syntax` 求值后的视图，任一危险即确认；
+    不改 `value` 保持 Unknown 的设计，所以不产生任何授权。
+
+验证：新增与改写的回归覆盖落盘文件全文与内联上限、不超限时不写文件、`/context` 的
+图片行与嵌套图片行、split-string 六种形状（manual/bypass）、两条循环包装危险命令的确认、
+包装器分析对 split-string 的标记；`kloop-core` 中 `tools::bash`、`commands::context`、
+`skills`、`permissions`、`shell`、`history` 相关 349 项在外层执行沙箱之外通过；
+`cargo fmt`、`kloop-core` 全目标 clippy `-D warnings` 通过。未跑 workspace 全量测试、
+parity 与真实 API；PowerShell 的 Windows 专用测试只按签名核对，未在 Windows 上运行。

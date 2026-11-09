@@ -1351,6 +1351,57 @@ mod tests {
         assert!(error.contains("deny permission rule"), "{error}");
     }
 
+    /// Plan 272：`env -S` 把一个词拆成整条命令行，被包命令不在任何单个参数里。
+    /// 字面写法在修复前直接放行（父提交亦然），循环写法则是 85d7a2b 绑定后跟着放行。
+    #[tokio::test]
+    async fn env_split_string_is_an_unknown_executable() {
+        for mode in [Mode::Manual, Mode::Bypass] {
+            for command in [
+                "env -S 'cat .env'",
+                "env -S'cat .env'",
+                "env -iS 'cat .env'",
+                "env --split-string 'cat .env'",
+                "env --split-string='cat .env'",
+                "for t in 'cat .env'; do env -S \"$t\"; done",
+            ] {
+                let approver = ScriptedApprover::new(vec![]);
+                let p = gate(mode, rules(&[], &[], &[]), approver.clone());
+                let error = p
+                    .check_call("bash", &bash(command), 0, true)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("reading this sensitive path"),
+                    "{mode:?} {command}: {error}"
+                );
+                assert_eq!(approver.ask_count(), 0);
+            }
+        }
+    }
+
+    /// Plan 272：循环绑定只细化 syntax，包装器按 syntax 剥离后，被包的危险命令名在
+    /// risk_argv 里只剩未知词。修复前下面两条在 manual 下不问就放行，字面写法会问。
+    #[tokio::test]
+    async fn literal_loop_wrapped_destructive_commands_still_ask() {
+        for command in [
+            "env shred notes.txt",
+            "for w in shred; do env \"$w\" notes.txt; done",
+            "for w in rm; do env \"$w\" -rf build; done",
+        ] {
+            let approver = ScriptedApprover::new(vec![Decision::Deny]);
+            let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+            assert!(
+                p.check_call("bash", &bash(command), 0, true).await.is_err(),
+                "{command}"
+            );
+            assert_eq!(approver.ask_count(), 1, "{command}");
+            assert!(
+                approver.asked()[0].description.contains("[destructive]"),
+                "{command}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shell_options_around_c_keep_the_script_checked() {
         // 正文位置不认识或曾被当普通参数的都要拒绝；常见写法不能误拦。
