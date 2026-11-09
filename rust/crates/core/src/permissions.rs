@@ -1480,6 +1480,11 @@ mod tests {
             // 只有登录、交互 shell 让回放的 HOME 不可信；普通选项不影响。
             ("bash -euo pipefail -c 'cat \"$HOME/public.txt\"'", false),
             ("bash -l -c 'cat \"$HOME/public.txt\"'", true),
+            // env -a 把 argv[0] 改成 `-bash` 同样是登录 shell（plan 272）。
+            ("env bash -c 'cat \"$HOME/public.txt\"'", false),
+            ("env -a -bash bash -c 'cat \"$HOME/public.txt\"'", true),
+            ("env --argv0=-bash bash -c 'cat \"$HOME/public.txt\"'", true),
+            ("env --argv0 -bash bash -c 'cat \"$HOME/public.txt\"'", true),
         ] {
             let p = gate(
                 Mode::Bypass,

@@ -958,16 +958,16 @@ fn env_command<'a>(
                 analysis.environment_unknown = true;
                 Some(rest)
             }
-            "--unset" | "--chdir" => {
+            "--unset" | "--chdir" | "--argv0" => {
                 analysis.environment_unknown = true;
-                analysis.cwd_unknown |= token == "--chdir";
+                analysis.cwd_unknown |= token != "--unset";
                 rest.get(1..).filter(|value| !value.is_empty())
             }
             _ if token.starts_with("--unset=") => {
                 analysis.environment_unknown = true;
                 Some(rest)
             }
-            _ if token.starts_with("--chdir=") => {
+            _ if token.starts_with("--chdir=") || token.starts_with("--argv0=") => {
                 analysis.environment_unknown = true;
                 analysis.cwd_unknown = true;
                 Some(rest)
@@ -999,6 +999,7 @@ fn env_command<'a>(
 /// 按 getopt 读 `env` 的一个短选项簇（不含前导 `-`）。返回的切片以本选项的最后一个词
 /// 开头：簇本身，或带操作数字母的独立操作数；调用方再前进一个词。无参字母 `i`/`0`/`v`
 /// 可连写；带操作数的字母 `u`/`C`/`P`/`a` 取簇里余下的部分，余下为空时取下一个词。
+/// 四者都让环境未知；`C`（换目录）与 `a`（改 argv[0]，可能变成登录 shell）还让 cwd 未知。
 /// 认不出的字母返回 None，按未知选项处理。
 fn env_short_cluster<'a>(
     cluster: &str,
@@ -1010,8 +1011,10 @@ fn env_short_cluster<'a>(
             'i' => analysis.environment_unknown = true,
             '0' | 'v' => {}
             'u' | 'C' | 'P' | 'a' => {
-                analysis.environment_unknown |= flag != 'a';
-                analysis.cwd_unknown |= flag == 'C';
+                analysis.environment_unknown = true;
+                // `-a` 改写 argv[0]：以 `-` 开头时 shell 按登录 shell 读启动文件，HOME 与
+                // cwd 都可能被改；其它值也会改变程序行为，一律当未知。
+                analysis.cwd_unknown |= matches!(flag, 'C' | 'a');
                 if index + flag.len_utf8() < cluster.len() {
                     return Some(rest);
                 }
@@ -1840,6 +1843,19 @@ mod tests {
             assert!(analysis.complete, "{input:?}");
             assert_eq!(analysis.argv, wrapped, "{input:?}");
             assert!(analysis.environment_unknown, "{input:?}");
+        }
+        // 改写 argv[0] 可能让 shell 变成登录 shell，嵌套分析要按 HOME、cwd 未知处理。
+        for input in [
+            argv(&["env", "-a", "-bash", "bash", "-c", "x"]),
+            argv(&["env", "-a-bash", "bash", "-c", "x"]),
+            argv(&["env", "--argv0", "-bash", "bash", "-c", "x"]),
+            argv(&["env", "--argv0=-bash", "bash", "-c", "x"]),
+        ] {
+            let analysis = analyze_wrappers(&input);
+            assert!(analysis.complete, "{input:?}");
+            assert_eq!(analysis.argv, ["bash", "-c", "x"], "{input:?}");
+            assert!(analysis.environment_unknown, "{input:?}");
+            assert!(analysis.cwd_unknown, "{input:?}");
         }
         // 带操作数的字母后面没有值：定位失败。
         for input in [argv(&["env", "-iu"]), argv(&["env", "-x", "ls"])] {

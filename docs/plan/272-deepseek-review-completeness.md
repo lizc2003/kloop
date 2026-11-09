@@ -308,6 +308,11 @@
 下逐次确认，现在按新规则改为硬拒绝。二是基准脚本删除系统提示键时只删首行，多行 TOML 字符串
 会留下残行；现在按多行字符串整段删除，并用 tomllib 核对“只少这一个键”，五种写法验证过。
 
+**第三轮复审（同日）**：新认识的 `env -a` 没有传播启动状态。`env -a -bash bash -c
+'cat "$HOME/public.txt"'` 让 bash 成为登录 shell、读启动文件，分析器却仍把回放的 HOME 和 cwd
+当作已知。`-a`、`--argv0`、`--argv0=` 现在与 `-C` 一样让嵌套分析的 HOME、cwd 未知；新用例在
+上一版 `shell.rs` 上先红后绿。
+
 验证：新增与改写的回归覆盖落盘文件全文与内联上限、不超限时不写文件、`/context` 的
 图片行与嵌套图片行、split-string 六种形状（manual/bypass）、两条循环包装危险命令的确认、
 包装器分析对 split-string 的标记；`kloop-core` 中 `tools::bash`、`commands::context`、
