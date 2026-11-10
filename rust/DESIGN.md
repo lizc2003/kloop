@@ -4698,11 +4698,14 @@ touch no filesystem, so hermetic runs are unaffected.
 原裁决只留在本地评分材料中。`recheck` 对一组非空候选每次只发一个无工具的短上下文
 Responses 请求，由子进程提供整次请求的硬截止，失败不重试；`--max-output-tokens`
 可显式设置含推理的输出上限，默认 8,192，预算与截止时间记入每次试验元数据（plan 274）。
+脚本默认 high、120 秒截止，这些均为实验预算；正常 agent 的上限与 effort 由 route
+解析，不能把脚本预算当作 kloop 默认配置。对齐实际请求参数的验证见 plan 275。
 输出区分 confirmed、excluded、unresolved，严重度仅用于已确认缺陷。代码引用可机械
 校验，裁决正确性仍须人工核对；`recheck-stats` 的标签匹配不代表端到端召回率。它是
 显式运行的开发实验，内置 code-review skill 和共享 agent 循环不自动调用它。
-真实实验能纠正部分历史错误排除，但扩大输出预算后仍有超时或推理耗尽上限而未交付裁决，
-因而保留为按需实验入口；不以有效 JSON、少量对照中的零误报或手工证据包推断生产收益。
+真实实验能纠正部分历史错误排除；对齐正常请求预算后能交付，也仍有正确候选配错误触发
+例子的情况。保留为按需实验入口，不以有效 JSON、少量对照中的零误报或手工证据包推断
+生产收益。
 
 Two ways to trigger a skill, both expanding the **same** body:
 
