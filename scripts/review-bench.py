@@ -16,6 +16,7 @@
     scripts/review-bench.py evidence-recheck <packet-dir> <out-dir> --sampling <protocol.json>
                                            [--with-tools] [--decision-contract [--decision-text] [--repair-decision]]
     scripts/review-bench.py stream-audit <response.sse>
+    scripts/review-bench.py rollout-recheck <pipeline-out> <out-dir>
 
 `make` 生成一个 Python 小项目：基础版本提交一次，审查对象是工作区里未提交的改动
 （含一个未跟踪的新文件）。缺陷 D1–D8 与诱饵见 `ANSWER_KEY`，判分规则见 plan 272。
@@ -51,6 +52,7 @@ import review_recheck
 import review_pipeline
 import review_evidence
 import review_stream
+import review_rollout
 
 ANSWER_KEY = {
     "D1": "report.paginate: end = start + size - 1 drops the last item of every page",
@@ -1090,6 +1092,7 @@ def main() -> None:
                                  sys.modules[__name__])
     review_evidence.add_commands(sub, pathlib.Path(__file__).resolve().parent.parent)
     review_stream.add_commands(sub)
+    review_rollout.add_commands(sub, pathlib.Path(__file__).resolve().parent.parent)
     args = parser.parse_args()
     if hasattr(args, "handler"):
         args.handler(args)

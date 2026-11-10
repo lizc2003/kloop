@@ -4772,6 +4772,13 @@ severity、reason、comparison、basis、evidence、missing；动态函数 schem
 发网络请求或改变裁决验收。各表示一致仍可能全部是非法参数；本地捕获只能定位到
 接口边界，不能据此区分上游模型生成和服务端转换。
 
+`rollout-recheck <pipeline-out> <out>`（plan 281）对同一份初审账本做配对复核，只把证据
+换成初审在 rollout 里实际读过的行：`read_file` 返回的行号、输出中补丁实际显示的行、
+`sed -n`/`nl`/`cat`/`git show REV:path` 片段、grep 命中行；只保留对应版本 Git blob 中存在
+的行，间隔不超过 3 行的合并成段。超预算时先取 excluded 锚点所在文件，再按首次读取顺序
+整段取舍，丢弃段记入包内。要求 A 组已有结果（发过请求、无候选，或账本保存后准备失败），
+发请求前以独占文件登记，不重试。实测无明确收益，仅作开发入口。
+
 原有 `recheck-prepare` / `recheck` 仍支持人工清单（plan 273–275）：前者冻结指定片段，
 真值、来源与原裁决只留在本地；后者默认 high、8,192 输出 token、120 秒整次截止，
 这些是该入口的实验预算，不是正常 agent 或 `pipeline` 的默认请求参数。
