@@ -11,6 +11,8 @@
     scripts/review-bench.py recheck <packet-dir> <out-dir> [--provider <name>] [--trials 3]
                                    [--max-output-tokens 8192]
     scripts/review-bench.py recheck-stats <out-dir>...
+    scripts/review-bench.py pipeline <out-dir> --commit <sha> [--kloop <binary>]
+    scripts/review-bench.py pipeline-recheck <initial-out> <out-dir>
 
 `make` 生成一个 Python 小项目：基础版本提交一次，审查对象是工作区里未提交的改动
 （含一个未跟踪的新文件）。缺陷 D1–D8 与诱饵见 `ANSWER_KEY`，判分规则见 plan 272。
@@ -43,6 +45,7 @@ import tomllib
 import urllib.request
 
 import review_recheck
+import review_pipeline
 
 ANSWER_KEY = {
     "D1": "report.paginate: end = start + size - 1 drops the last item of every page",
@@ -821,13 +824,14 @@ def closes_multiline(body: str, delimiter: str) -> bool:
     return False
 
 
-def prepare_config(real_state: pathlib.Path, state: pathlib.Path, system_prompt: str | None) -> str:
+def prepare_config(real_state: pathlib.Path, state: pathlib.Path, system_prompt: str | None,
+                   config_path: pathlib.Path | None = None) -> str:
     """临时 HOME 用的配置正文，以及它引用的系统提示文件。
 
     显式 `--system-prompt` 替换原有的 `system_prompt_file`；没给时沿用原配置，相对路径
     的提示文件跟着复制，否则临时 HOME 下启动就会因找不到文件失败。
     """
-    text = (real_state / "config.toml").read_text()
+    text = (config_path or real_state / "config.toml").read_text()
     current = tomllib.loads(text).get("system_prompt_file")
     if system_prompt:
         shutil.copyfile(system_prompt, state / "system-prompt.md")
@@ -858,7 +862,8 @@ def run(args) -> None:
     state = home / ".kloop"
     state.mkdir(parents=True)
     os.chmod(state, 0o700)
-    config = prepare_config(pathlib.Path.home() / ".kloop", state, args.system_prompt)
+    source_config = pathlib.Path(getattr(args, "config", "~/.kloop/config.toml")).expanduser().resolve()
+    config = prepare_config(source_config.parent, state, args.system_prompt, source_config)
     config_path = state / "config.toml"
     config_path.touch(mode=0o600)
     config_path.write_text(config)
@@ -916,7 +921,7 @@ def stats_one(out: pathlib.Path) -> dict:
     truncated_bash = offloaded = 0
     exposure = {key: False for key in EXPOSURE}
     final = ""
-    for line in rollouts[-1].open():
+    for line in rollouts[-1].read_text().splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -1062,6 +1067,7 @@ def main() -> None:
     p.add_argument("out")
     p.add_argument("--skill", required=True)
     p.add_argument("--system-prompt")
+    p.add_argument("--config", default="~/.kloop/config.toml")
     p.add_argument("--kloop", default="kloop")
     p.add_argument("--max-rounds", type=int, default=80)
     p.add_argument("--timeout", type=int, default=3600)
@@ -1075,6 +1081,8 @@ def main() -> None:
     p.add_argument("--effort", default="high")
     p.add_argument("--trials", type=int, default=3)
     review_recheck.add_commands(sub, pathlib.Path(__file__).resolve().parent.parent)
+    review_pipeline.add_commands(sub, pathlib.Path(__file__).resolve().parent.parent,
+                                 sys.modules[__name__])
     args = parser.parse_args()
     if hasattr(args, "handler"):
         args.handler(args)

@@ -4693,19 +4693,35 @@ shipped one. A builtin has no directory (so its body cannot use
 an empty `path`. `--mock` skips disk discovery but keeps the builtins — they
 touch no filesystem, so hermetic runs are unaffected.
 
-开发用 `scripts/review-bench.py` 另有独立候选复核实验（plan 273）：
-`recheck-prepare` 从固定父版本/目标版本取带行号的片段，冻结问题与证据；真值、来源与
-原裁决只留在本地评分材料中。`recheck` 对一组非空候选每次只发一个无工具的短上下文
-Responses 请求，由子进程提供整次请求的硬截止，失败不重试；`--max-output-tokens`
-可显式设置含推理的输出上限，默认 8,192，预算与截止时间记入每次试验元数据（plan 274）。
-脚本默认 high、120 秒截止，这些均为实验预算；正常 agent 的上限与 effort 由 route
-解析，不能把脚本预算当作 kloop 默认配置。对齐实际请求参数的验证见 plan 275。
-输出区分 confirmed、excluded、unresolved，严重度仅用于已确认缺陷。代码引用可机械
-校验，裁决正确性仍须人工核对；`recheck-stats` 的标签匹配不代表端到端召回率。它是
-显式运行的开发实验，内置 code-review skill 和共享 agent 循环不自动调用它。
-真实实验能纠正部分历史错误排除；对齐正常请求预算后能交付，也仍有正确候选配错误触发
-例子的情况。保留为按需实验入口，不以有效 JSON、少量对照中的零误报或手工证据包推断
-生产收益。
+开发用 `scripts/review-bench.py pipeline <out> --commit <rev>` 提供自动独立复核实验
+（plan 276）。外层先冻结目标 SHA 与第一父版本，再用临时 HOME 和只有两次快照提交的
+仓库执行一次真实初审，后来的修复不进对象库。实验只给审查正文增加结构化候选账本；
+A、B 共用这一份初审，不人工补候选、改问题或挑片段。仅把 excluded 的中性问题和源码
+锚点交给证据准备器：从固定 Git blob 取锚点前后各 80 行，并按行差异映射另一版本；
+同文件窗口跨候选合并并共享引用，缺文件/空文件明确标注，整包默认 160,000 字符。
+锚点必须是 Git blob 中的实际行；无效锚点或超预算明确
+失败，不静默裁剪；没有账本不等于空清单。空 excluded 清单跳过复核请求。
+
+`pipeline` 先让真实 kloop 向本机接收端发送一次请求，临时配置只替换所选端点，捕获
+解析后的模型、effort、输出预算及其他采样字段；复核复用这些字段，移除初审历史、
+系统指令和工具。它只发一次无工具 Responses 请求，不重试，隐藏原报告、原裁决和
+排除理由。传输预算为开流 300 秒、空闲 900 秒、收到响应头后的正文 1,800 秒硬截止；
+父进程另以开流 + 正文 + 5 秒兜底。该开发传输实现需要 Unix 的定时信号。
+保存两份报告、冻结证据、原始响应、各阶段用量及包含准备成本的总耗时；失败和缺失
+usage 均保留。`pipeline-recheck <initial-out> <new-out>` 可从交付成功、尚未请求复核的
+初审恢复材料准备，核对原报告与账本、沿用冻结窗口和预算；不重跑初审，不修改旧失败，
+已尝试复核的记录不能通过此入口重试。恢复记录的 `wall_s` 是两段累计执行时间，另记
+`resume_wall_s`，不包含中途人工修脚本的等待时间。窗口外的调用、公共依赖语义、
+重命名前路径或其他缺失事实仍可能导致 unresolved，
+源码锚点也受初审覆盖限制，不能找回完全没进入初审账本的缺陷。
+
+原有 `recheck-prepare` / `recheck` 仍支持人工清单（plan 273–275）：前者冻结指定片段，
+真值、来源与原裁决只留在本地；后者默认 high、8,192 输出 token、120 秒整次截止，
+这些是该入口的实验预算，不是正常 agent 或 `pipeline` 的默认请求参数。
+两个入口的裁决均区分 confirmed、excluded、unresolved，严重度仅用于已确认缺陷。
+引用可机械校验，具体触发条件和论证仍须人工核对；标签匹配、有效 JSON 和少量样本
+不能代表端到端召回收益。内置 code-review skill、共享 agent 循环和 `/code-review`
+均不自动调用这些实验入口。
 
 Two ways to trigger a skill, both expanding the **same** body:
 

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import pathlib
+import signal
 import subprocess
 import sys
 import time
@@ -165,7 +166,8 @@ def response_text(response):
                    if part.get("type") == "output_text")
 
 
-def request_worker(provider, body):
+def request_worker(provider, body, open_timeout=120, idle_timeout=120,
+                   body_wall_timeout=None, capture=None):
     """父进程提供整次请求的硬截止；这里的 socket timeout 只是第二道界限。"""
     request = urllib.request.Request(
         provider["base_url"].rstrip("/") + "/responses",
@@ -173,28 +175,50 @@ def request_worker(provider, body):
         headers={"Content-Type": "application/json", **provider.get("auth_header", {})},
     )
     total = 0
-    with urllib.request.urlopen(request, timeout=120) as response:
-        while raw := response.readline((1 << 21) + 1):
-            total += len(raw)
-            if len(raw) > 1 << 21 or total > 32 << 20:
-                raise ValueError("response stream exceeded capture budget")
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            event = json.loads(data)
-            if event.get("type") in ("response.completed", "response.incomplete", "response.failed"):
-                return {"event": event["type"], "response": event["response"]}
+    def expired(signum, frame):
+        raise TimeoutError("response body wall timeout")
+
+    with urllib.request.urlopen(request, timeout=open_timeout) as response:
+        response.fp.raw._sock.settimeout(idle_timeout)
+        previous = None
+        if body_wall_timeout is not None:
+            previous = signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, body_wall_timeout)
+        try:
+            data_lines = []
+            while raw := response.readline((1 << 21) + 1):
+                total += len(raw)
+                if len(raw) > 1 << 21 or total > 32 << 20:
+                    raise ValueError("response stream exceeded capture budget")
+                if capture:
+                    with pathlib.Path(capture).open("ab") as output:
+                        output.write(raw)
+                line = raw.decode("utf-8").rstrip("\r\n")
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+                elif not line and data_lines:
+                    data = "\n".join(data_lines)
+                    data_lines = []
+                    if data == "[DONE]":
+                        break
+                    event = json.loads(data)
+                    if event.get("type") in ("response.completed", "response.incomplete", "response.failed"):
+                        return {"event": event["type"], "response": event["response"]}
+        finally:
+            if body_wall_timeout is not None:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
     raise ValueError("stream ended without a terminal response")
 
 
-def one_request(provider, body, timeout):
+def one_request(provider, body, timeout, *, open_timeout=120, idle_timeout=120,
+                body_wall_timeout=None, capture=None):
     # key 只经 stdin 传给临时子进程，不进命令行、请求记录或异常正文。
     result = subprocess.run(
         [sys.executable, str(pathlib.Path(__file__).resolve()), "--request-worker"],
-        input=json.dumps({"provider": provider, "body": body}), text=True,
+        input=json.dumps({"provider": provider, "body": body, "open_timeout": open_timeout,
+                          "idle_timeout": idle_timeout, "body_wall_timeout": body_wall_timeout,
+                          "capture": str(capture) if capture else None}), text=True,
         capture_output=True, timeout=timeout, check=True,
     )
     return json.loads(result.stdout)
@@ -316,6 +340,10 @@ def add_commands(sub, source):
 if __name__ == "__main__" and sys.argv[1:] == ["--request-worker"]:
     try:
         payload = json.load(sys.stdin)
-        print(json.dumps(request_worker(payload["provider"], payload["body"])))
+        print(json.dumps(request_worker(**payload)))
     except Exception as error:
-        print(json.dumps({"error_type": type(error).__name__}))
+        reason = getattr(error, "reason", None)
+        print(json.dumps({"event": "request.error", "error_type": type(error).__name__,
+                          "http_status": getattr(error, "code", None),
+                          "reason_type": type(reason).__name__ if reason else None,
+                          "errno": getattr(reason, "errno", None)}))
