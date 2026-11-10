@@ -151,7 +151,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('Authorization="SECRET"', changed)
         self.assertNotIn("replace.invalid", changed)
 
-    def run_http_pipeline(self, ledger=None, malformed=False, preparation_failure=False, evidence_tools=False):
+    def run_http_pipeline(self, ledger=None, malformed=False, preparation_failure=False, evidence_tools=False,
+                          decision_contract=False):
         received = []
         initial_report = "no structured ledger" if malformed else self.report(ledger)
 
@@ -169,6 +170,13 @@ class PipelineTests(unittest.TestCase):
                 response = {"type": "response.completed", "response": {"status": "completed",
                     "output": [{"type": "message", "content": [{"type": "output_text", "text": answer}]}],
                     "usage": {"input_tokens": 31, "output_tokens": 7}}}
+                if decision_contract and len(received) > 1:
+                    row = json.loads(answer)["verdicts"][0]
+                    ident = row.pop("id")
+                    row.update(basis="introduced_or_worsened", comparison={"input": "unguarded call",
+                        "before": "guard stops the call", "after": "call runs without the guard"})
+                    response["response"]["output"] = [{"type": "function_call", "name": "submit_review",
+                        "call_id": "submit-1", "arguments": json.dumps({ident: row})}]
                 payload = ("data: " + json.dumps(response) + "\n\n").encode()
                 handler.send_response(200)
                 handler.send_header("Content-Type", "text/event-stream")
@@ -216,6 +224,7 @@ rows = [{'type':'provider_usage','usage':response['usage']},
                 skill=str(pathlib.Path(__file__).parents[1] / "rust/crates/core/src/skills/code-review/SKILL.md"),
                 config=str(config), kloop=str(fake), max_rounds=12, timeout=10, context=1, max_chars=20_000)
             args.evidence_tools = evidence_tools
+            args.decision_contract = decision_contract
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     try:
@@ -261,6 +270,13 @@ rows = [{'type':'provider_usage','usage':response['usage']},
         self.assertEqual(recheck.load_json(out / "meta.json")["status"], "complete")
         self.assertEqual(len(received[1]["tools"]), 3)
         self.assertTrue(recheck.load_json(out / "protocol.json")["evidence_tools"])
+
+    def test_pipeline_can_freeze_and_render_the_decision_contract(self):
+        out, received = self.run_http_pipeline(evidence_tools=True, decision_contract=True)
+        self.assertEqual(recheck.load_json(out / "meta.json")["status"], "complete")
+        self.assertTrue(recheck.load_json(out / "protocol.json")["decision_contract"])
+        self.assertEqual(received[1]["tools"][-1]["name"], "submit_review")
+        self.assertIn("Before: guard stops the call", (out / "report-b.md").read_text())
 
     def test_missing_ledger_records_failure_without_recheck(self):
         out, received = self.run_http_pipeline(malformed=True)

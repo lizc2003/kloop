@@ -14,7 +14,7 @@ import review_recheck as review
 from test_review_sources import SourceFixture
 
 
-class EvidenceTests(SourceFixture):
+class EvidenceFixture(SourceFixture):
     def sampling(self):
         return {"model": "fixture", "store": False, "stream": True, "max_output_tokens": 54321,
                 "reasoning": {"effort": "xhigh", "summary": "auto"}, "include": ["reasoning.encrypted_content"]}
@@ -38,6 +38,8 @@ class EvidenceTests(SourceFixture):
         return evidence.investigate(self.packet, {"base_url": "http://unused.invalid", "auth_header": {"Authorization": "SECRET_KEY"}},
                                     self.sampling(), self.repo, self.root / out, cargo_home=self.cargo, **kwargs)
 
+
+class EvidenceTests(EvidenceFixture):
     def test_control_uses_one_request_and_identical_prompt_without_tools(self):
         bodies = []
 

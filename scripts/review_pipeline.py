@@ -329,6 +329,10 @@ def report_b(report, rows, packet):
         text += f"- {row['id']} — {row['verdict']}{severity}: {row['reason']} ({citations})\n"
         if row["missing"]:
             text += f"  Missing evidence: {row['missing']}\n"
+        if "comparison" in row:
+            comparison = row["comparison"]
+            text += (f"  Input: {comparison['input']}\n  Before: {comparison['before']}\n"
+                     f"  After: {comparison['after']}\n  Basis: {row['basis']}\n")
     return text
 
 
@@ -352,10 +356,12 @@ def finish(args, out, protocol, report, ledger, meta):
             raise ValueError("configuration changed since initial review")
         provider = tomllib.loads(config_text)["providers"][protocol["provider"]]
         meta["recheck_requests"] = 1
-        if protocol.get("evidence_tools", False):
+        if protocol.get("evidence_tools", False) or protocol.get("decision_contract", False):
             result = review_evidence.investigate(packet, provider, protocol["sampling"], args.source,
-                out / "recheck", with_tools=True, max_requests=protocol["evidence_requests"],
-                max_calls=protocol["evidence_calls"], max_chars=protocol["evidence_chars"])
+                out / "recheck", with_tools=protocol["evidence_tools"], max_requests=protocol["evidence_requests"],
+                max_calls=protocol["evidence_calls"], max_chars=protocol["evidence_chars"],
+                decision_contract=protocol.get("decision_contract", False),
+                repair_decision=protocol.get("repair_decision", False))
             meta["recheck_requests"] = result["requests"]
         else:
             result = independent_request(packet, provider, protocol["sampling"], out / "recheck")
@@ -388,6 +394,8 @@ def run(args, bench):
                 getattr(args, "evidence_requests", 8) < 2 or getattr(args, "evidence_calls", 64) < 1
                 or getattr(args, "evidence_chars", 160_000) < 1):
             raise ValueError("invalid evidence follow-up budget")
+        if getattr(args, "repair_decision", False) and not getattr(args, "decision_contract", False):
+            raise ValueError("decision repair requires the decision contract")
         if not hasattr(recheck.signal, "setitimer"):
             raise ValueError("pipeline body deadline requires Unix interval timers")
         executable = shutil.which(args.kloop)
@@ -406,6 +414,8 @@ def run(args, bench):
                     "initial_max_rounds": args.max_rounds, "open_timeout_s": OPEN_S,
                     "idle_timeout_s": IDLE_S, "body_wall_timeout_s": BODY_WALL_S,
                     "evidence_tools": getattr(args, "evidence_tools", False),
+                    "decision_contract": getattr(args, "decision_contract", False),
+                    "repair_decision": getattr(args, "repair_decision", False),
                     "evidence_requests": getattr(args, "evidence_requests", 8),
                     "evidence_calls": getattr(args, "evidence_calls", 64),
                     "evidence_chars": getattr(args, "evidence_chars", 160_000),
@@ -485,6 +495,8 @@ def add_commands(sub, source, bench):
     parser.add_argument("--context", type=int, default=80)
     parser.add_argument("--max-chars", type=int, default=160_000)
     parser.add_argument("--evidence-tools", action="store_true", help="enable bounded frozen source follow-up")
+    parser.add_argument("--decision-contract", action="store_true", help="require typed decisions with before/after behavior")
+    parser.add_argument("--repair-decision", action="store_true", help="allow one extra validation-feedback submission")
     parser.add_argument("--evidence-requests", type=int, default=8)
     parser.add_argument("--evidence-calls", type=int, default=64)
     parser.add_argument("--evidence-chars", type=int, default=160_000)
