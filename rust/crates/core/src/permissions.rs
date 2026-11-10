@@ -1521,6 +1521,52 @@ mod tests {
         }
     }
 
+    /// Plan 282 审查发现：循环绑定的词在 value 视图里是未知词，包装器却按 syntax 剥离，
+    /// deny 只看 value 视图，`env "$w"` 的循环写法在 bypass 下绕过明确的 deny 规则。
+    #[tokio::test]
+    async fn loop_bound_wrapped_commands_still_hit_deny_rules() {
+        for (deny, command) in [
+            ("bash(rm *)", "for w in rm; do env \"$w\" -rf build; done"),
+            (
+                "bash(rm *)",
+                "for w in rm; do env FOO=1 \"$w\" -rf build; done",
+            ),
+            (
+                "bash(git push *)",
+                "for w in push; do env git \"$w\" origin main; done",
+            ),
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[deny], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            let error = p
+                .check_call("bash", &bash(command), 0, true)
+                .await
+                .unwrap_err();
+            assert!(error.contains("deny permission rule"), "{command}: {error}");
+        }
+        // ask 规则同样两个视图都看。
+        let approver = ScriptedApprover::new(vec![Decision::Deny]);
+        let p = gate(
+            Mode::Manual,
+            rules(&[], &[], &["bash(git push *)"]),
+            approver.clone(),
+        );
+        assert!(
+            p.check_call(
+                "bash",
+                &bash("for w in push; do env git \"$w\" origin main; done"),
+                0,
+                true
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(approver.ask_count(), 1);
+    }
+
     #[tokio::test]
     async fn shell_options_around_c_keep_the_script_checked() {
         // 正文位置不认识或曾被当普通参数的都要拒绝；常见写法不能误拦。

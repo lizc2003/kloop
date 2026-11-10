@@ -302,12 +302,16 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
         }
         let argv = command.risk_argv();
         let prefix = command.literal_prefix();
+        // 循环绑定的词在 value 视图里是未知词，包装器却按 syntax 剥离：
+        // `for w in rm; do env "$w" -rf x; done` 只在 syntax 视图里是 `rm`。deny/ask 两个视图都看。
+        let bound = command.bound_risk_argv();
         rules.iter().any(|rule| {
-            rule.matches_argv(&argv)
-                || risk_wrapper_views(&argv)
-                    .iter()
-                    .any(|view| rule.matches_argv(view))
-                || matches!(rule, Rule::BashPrefix { tokens, wildcard: true }
+            [&argv, &bound].into_iter().any(|argv| {
+                rule.matches_argv(argv)
+                    || risk_wrapper_views(argv)
+                        .iter()
+                        .any(|view| rule.matches_argv(view))
+            }) || matches!(rule, Rule::BashPrefix { tokens, wildcard: true }
                     if argv_has_prefix(tokens, true, &prefix)
                         || risk_wrapper_views(&prefix)
                             .iter()

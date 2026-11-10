@@ -121,6 +121,19 @@ impl CommandFact {
             })
             .collect()
     }
+
+    /// 与 [`Self::risk_argv`] 同样只供 blocklist，但按 syntax 求值：循环绑定只细化 syntax，
+    /// 包装器剥离也按 syntax 走，`for w in rm; do env "$w" -rf x; done` 的被包命令名在这里
+    /// 是 `rm`，在 `risk_argv` 里只是未知词。deny/ask 与危险判定两个视图都要看。
+    pub(crate) fn bound_risk_argv(&self) -> Vec<String> {
+        self.words
+            .iter()
+            .map(|word| match word.syntax.evaluate(None) {
+                WordEvaluation::Resolved(text) | WordEvaluation::Partial(text) => text,
+                WordEvaluation::Unknown => "\0unknown".into(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

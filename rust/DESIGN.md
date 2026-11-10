@@ -1330,10 +1330,11 @@ shell 的参数或 `-c` 正文，或后续动态参数无法排除替换，则�
 printf 的变量输出、动态命令、嵌套循环与其它未建模语法都取消这项细化；未引用变量、
 拼接词、动态列表和可能生成选项的值仍未知。因此逐项 `cargo test -- "$t"` 不再把固定
 测试名误当未知路径，也不把测试程序的全部参数视为数据。严格分析仍为 opaque，原来的
-未知词身份继续用于 deny/ask，不产生只读、前缀或路径授权。危险判断同时看展开后的字面
-视图：包装器按字面剥离后，被包命令名在未知词视图里看不出危险，
-`for w in shred; do env "$w" x; done` 曾因此在 manual 下不经确认放行；任一视图危险即确认
-（plan 272）。
+未知词身份不产生只读、前缀或路径授权。危险判断与 deny/ask 规则都同时看展开后的字面
+视图（`CommandFact::bound_risk_argv`）：包装器按字面剥离后，被包命令名或参数在未知词
+视图里只是占位，`for w in shred; do env "$w" x; done` 曾在 manual 下不经确认放行（plan 272），
+`for w in rm; do env "$w" -rf build; done` 曾在 bypass 下绕过 `bash(rm *)` deny（plan 282）；
+任一视图命中即生效。allow 不消费这个视图。
 双引号单值赋值只证明参数边界，不证明值安全：`echo .env > list` 可作为数据写出，
 随后 `env FOO="$(cat list)" sh -c 'cat "$FOO"'` 的未知读取必须拒绝。
 单值赋值后只操作已知普通目标（如 touch notes.txt）仍允许。
