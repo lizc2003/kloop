@@ -15,6 +15,7 @@ import time
 import tomllib
 
 import review_recheck as recheck
+import review_evidence
 
 
 LEDGER_INSTRUCTIONS = '''
@@ -40,7 +41,7 @@ and corresponding code in the other revision; you do not choose excerpt ranges.
 No gold labels or later fixes are available to you.
 '''
 
-OPEN_S, IDLE_S, BODY_WALL_S = 300, 900, 1800
+OPEN_S, IDLE_S, BODY_WALL_S = review_evidence.OPEN_S, review_evidence.IDLE_S, review_evidence.BODY_WALL_S
 
 
 def parse_ledger(report):
@@ -322,7 +323,7 @@ def report_b(report, rows, packet):
     text = report + "\n\nIndependent recheck (unscored; citations mechanically validated):\n\n"
     sources = {source["id"]: source for source in packet["evidence"]}
     for row in rows:
-        citations = ", ".join(f"{sources[c['source']]['version']} {sources[c['source']]['path']}:{c['line']}"
+        citations = ", ".join(f"{sources[c['source']]['version']} {sources[c['source']].get('package', '')} {sources[c['source']]['path']}:{c['line']}"
                               for c in row["evidence"])
         severity = f" / {row['severity']}" if row["severity"] else ""
         text += f"- {row['id']} — {row['verdict']}{severity}: {row['reason']} ({citations})\n"
@@ -351,12 +352,20 @@ def finish(args, out, protocol, report, ledger, meta):
             raise ValueError("configuration changed since initial review")
         provider = tomllib.loads(config_text)["providers"][protocol["provider"]]
         meta["recheck_requests"] = 1
-        result = independent_request(packet, provider, protocol["sampling"], out / "recheck")
+        if protocol.get("evidence_tools", False):
+            result = review_evidence.investigate(packet, provider, protocol["sampling"], args.source,
+                out / "recheck", with_tools=True, max_requests=protocol["evidence_requests"],
+                max_calls=protocol["evidence_calls"], max_chars=protocol["evidence_chars"])
+            meta["recheck_requests"] = result["requests"]
+        else:
+            result = independent_request(packet, provider, protocol["sampling"], out / "recheck")
         meta["recheck_status"] = result["status"]
         if result["status"] != "valid":
             raise ValueError("independent recheck did not deliver valid verdicts")
         rows = recheck.load_json(out / "recheck/verdicts.json")
-        (out / "report-b.md").write_text(report_b(report, rows, packet))
+        extended = out / "recheck/evidence-packet.json"
+        report_packet = recheck.load_json(extended) if extended.exists() else packet
+        (out / "report-b.md").write_text(report_b(report, rows, report_packet))
     else:
         meta["recheck_status"] = "skipped-empty"
         (out / "report-b.md").write_text(report)
@@ -375,6 +384,10 @@ def run(args, bench):
     try:
         if args.context < 0 or args.max_chars < 1 or args.max_rounds < 1 or args.timeout <= 0:
             raise ValueError("invalid pipeline budget")
+        if getattr(args, "evidence_tools", False) and (
+                getattr(args, "evidence_requests", 8) < 2 or getattr(args, "evidence_calls", 64) < 1
+                or getattr(args, "evidence_chars", 160_000) < 1):
+            raise ValueError("invalid evidence follow-up budget")
         if not hasattr(recheck.signal, "setitimer"):
             raise ValueError("pipeline body deadline requires Unix interval timers")
         executable = shutil.which(args.kloop)
@@ -392,6 +405,10 @@ def run(args, bench):
                     "recheck_trials": 1, "initial_timeout_s": args.timeout,
                     "initial_max_rounds": args.max_rounds, "open_timeout_s": OPEN_S,
                     "idle_timeout_s": IDLE_S, "body_wall_timeout_s": BODY_WALL_S,
+                    "evidence_tools": getattr(args, "evidence_tools", False),
+                    "evidence_requests": getattr(args, "evidence_requests", 8),
+                    "evidence_calls": getattr(args, "evidence_calls", 64),
+                    "evidence_chars": getattr(args, "evidence_chars", 160_000),
                     "skill_sha256": recheck.digest(skill), "config_sha256": config_digest}
         recheck.save_json(out / "protocol.json", protocol)
         if recheck.digest(config_path.read_text()) != config_digest:
@@ -467,6 +484,10 @@ def add_commands(sub, source, bench):
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--context", type=int, default=80)
     parser.add_argument("--max-chars", type=int, default=160_000)
+    parser.add_argument("--evidence-tools", action="store_true", help="enable bounded frozen source follow-up")
+    parser.add_argument("--evidence-requests", type=int, default=8)
+    parser.add_argument("--evidence-calls", type=int, default=64)
+    parser.add_argument("--evidence-chars", type=int, default=160_000)
     parser.set_defaults(handler=lambda args: run(args, bench))
     parser = sub.add_parser("pipeline-recheck", help="resume evidence preparation without repeating initial review")
     parser.add_argument("initial")

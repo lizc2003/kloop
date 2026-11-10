@@ -151,7 +151,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('Authorization="SECRET"', changed)
         self.assertNotIn("replace.invalid", changed)
 
-    def run_http_pipeline(self, ledger=None, malformed=False, preparation_failure=False):
+    def run_http_pipeline(self, ledger=None, malformed=False, preparation_failure=False, evidence_tools=False):
         received = []
         initial_report = "no structured ledger" if malformed else self.report(ledger)
 
@@ -162,7 +162,7 @@ class PipelineTests(unittest.TestCase):
                 if len(received) == 1:
                     answer = initial_report
                 else:
-                    evidence = json.loads(body["input"][0]["content"][len(recheck.PROMPT):])["evidence"][0]
+                    evidence = json.loads(body["input"][0]["content"].split(recheck.PROMPT, 1)[1])["evidence"][0]
                     answer = json.dumps({"verdicts": [{"id": "C1", "verdict": "confirmed",
                         "severity": "medium", "reason": "caller no longer checks the guard",
                         "evidence": [{"source": evidence["id"], "line": evidence["start"]}], "missing": ""}]})
@@ -215,6 +215,7 @@ rows = [{'type':'provider_usage','usage':response['usage']},
             args = argparse.Namespace(out=str(out), commit=self.revisions[1], source=str(self.repo),
                 skill=str(pathlib.Path(__file__).parents[1] / "rust/crates/core/src/skills/code-review/SKILL.md"),
                 config=str(config), kloop=str(fake), max_rounds=12, timeout=10, context=1, max_chars=20_000)
+            args.evidence_tools = evidence_tools
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     try:
@@ -253,6 +254,13 @@ rows = [{'type':'provider_usage','usage':response['usage']},
         self.assertEqual(len(received), 1)
         self.assertEqual(recheck.load_json(out / "meta.json")["recheck_status"], "skipped-empty")
         self.assertEqual((out / "report-a.md").read_text(), (out / "report-b.md").read_text())
+
+    def test_pipeline_can_explicitly_enable_frozen_evidence_followup(self):
+        out, received = self.run_http_pipeline(evidence_tools=True)
+        self.assertEqual(len(received), 2)
+        self.assertEqual(recheck.load_json(out / "meta.json")["status"], "complete")
+        self.assertEqual(len(received[1]["tools"]), 3)
+        self.assertTrue(recheck.load_json(out / "protocol.json")["evidence_tools"])
 
     def test_missing_ledger_records_failure_without_recheck(self):
         out, received = self.run_http_pipeline(malformed=True)
