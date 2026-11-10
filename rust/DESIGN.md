@@ -4782,6 +4782,11 @@ severity、reason、comparison、basis、evidence、missing；动态函数 schem
 整段取舍，丢弃段记入包内。要求 A 组已有结果（发过请求、无候选，或账本保存后准备失败），
 发请求前以独占文件登记，不重试。实测无明确收益，仅作开发入口。
 
+`run --commit <rev> --preload`（plan 282）把改动预先附在审查提示后：diff stat、代码文件按
+`git diff -W`（快照仓库写入内置 rust/python 函数识别，两组相同）带完整函数、其余文件 3 行
+上下文。`probe-batching` 直接请求 Responses，统计一次回复里的函数调用数与上游路由（路由名
+只留本机）。两者都是开发实验：预载实测更慢、召回更低，未接入 `/code-review`。
+
 原有 `recheck-prepare` / `recheck` 仍支持人工清单（plan 273–275）：前者冻结指定片段，
 真值、来源与原裁决只留在本地；后者默认 high、8,192 输出 token、120 秒整次截止，
 这些是该入口的实验预算，不是正常 agent 或 `pipeline` 的默认请求参数。

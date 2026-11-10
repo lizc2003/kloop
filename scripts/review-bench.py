@@ -853,6 +853,26 @@ def prepare_config(real_state: pathlib.Path, state: pathlib.Path, system_prompt:
     return text
 
 
+PRELOAD_NOTE = """
+
+## The change, preloaded
+
+The complete change is below: the changed-file statistics, every changed code file
+with each changed function in full, and other files with three lines of context.
+You do not need to fetch any of it again. Read further only for code outside it —
+callers, callees, tests, or definitions the change depends on.
+"""
+
+
+def preload(repo: pathlib.Path) -> str:
+    """Plan 282：审查开始前一次给出改动全文（代码带完整函数，其余 3 行上下文）。"""
+    code = ["*.rs", "*.py"]
+    stat = git(repo, "diff", "--stat", "HEAD^", "HEAD")
+    functions = git(repo, "diff", "-W", "HEAD^", "HEAD", "--", *code)
+    others = git(repo, "diff", "-U3", "HEAD^", "HEAD", "--", ".", *(f":(exclude){p}" for p in code))
+    return (PRELOAD_NOTE + "\n```text\n" + stat + "```\n\n```diff\n" + functions + others + "```\n")
+
+
 def run(args) -> None:
     out = pathlib.Path(args.out).resolve()
     if out.exists():
@@ -860,6 +880,9 @@ def run(args) -> None:
     repo, home = out / "repo", out / "home"
     if args.commit:
         snapshot(pathlib.Path(args.source).resolve(), args.commit, repo)
+        # 两组都用内置函数识别：`git diff -W` 与 hunk 标题按 Rust/Python 函数划分（plan 282）。
+        with open(repo / ".git/info/attributes", "a") as fh:
+            fh.write("*.rs diff=rust\n*.py diff=python\n")
     else:
         make(repo)
     skill = pathlib.Path(args.skill).read_text()
@@ -875,6 +898,10 @@ def run(args) -> None:
     config_path.touch(mode=0o600)
     config_path.write_text(config)
     prompt = skill_body(skill, "HEAD" if args.commit else "")
+    if getattr(args, "preload", False):
+        if not args.commit:
+            sys.exit("--preload needs --commit")
+        prompt += preload(repo)
     (out / "prompt.md").write_text(prompt)
     env = dict(os.environ, HOME=str(home))
     # 临时 HOME 下没有工具链；指回本机的 cargo/rustup，模型跑 cargo 时与平时一致。
@@ -984,12 +1011,14 @@ def stats(args) -> None:
 
 # ---- probe-reasoning -------------------------------------------------------
 
-def responses_call(provider: dict, input_items: list, effort: str, tools=None) -> dict:
+def responses_call(provider: dict, input_items: list, effort: str, tools=None,
+                   max_output_tokens: int = 4096, extra: dict | None = None) -> dict:
     """流式请求一次，返回 `response.completed` 里的 response 对象。"""
     body = {
         "model": provider["model"], "input": input_items, "store": False,
         "include": ["reasoning.encrypted_content"], "stream": True,
-        "reasoning": {"effort": effort, "summary": "auto"}, "max_output_tokens": 4096,
+        "reasoning": {"effort": effort, "summary": "auto"}, "max_output_tokens": max_output_tokens,
+        **(extra or {}),
     }
     if tools:
         body["tools"] = tools
@@ -1063,6 +1092,71 @@ def probe_reasoning(args) -> None:
         print(json.dumps(row, ensure_ascii=False))
 
 
+# ---- probe-batching (plan 282) ------------------------------------------------
+
+READ_TOOL = [{"type": "function", "name": "read_lines", "strict": True,
+              "description": "Read numbered lines from a repository file.",
+              "parameters": {"type": "object", "additionalProperties": False,
+                             "required": ["path", "start", "end"],
+                             "properties": {"path": {"type": "string"}, "start": {"type": "integer"},
+                                            "end": {"type": "integer"}}}}]
+BATCH_INSTRUCTIONS = ("You are a coding agent. Independent tool calls in one turn run in parallel; "
+                      "batch them.")
+
+
+def read_task(paths: list[str]) -> str:
+    return ("Before answering, read lines 1-20 of each of these files: " + ", ".join(paths)
+            + ". The reads do not depend on each other. Then say which file is longest.")
+
+
+def primed_history(mode: str) -> list:
+    """上一轮已完成的读取：`single` 逐个调用（交错），`multi` 一次发三个调用。"""
+    paths = ["src/p.rs", "src/q.rs", "src/r.rs"]
+    calls = [{"type": "function_call", "call_id": f"prime_{i}", "name": "read_lines",
+              "arguments": json.dumps({"path": path, "start": 1, "end": 20})} for i, path in enumerate(paths)]
+    outputs = [{"type": "function_call_output", "call_id": f"prime_{i}",
+                "output": "\n".join(f"{n}: // {path} line {n}" for n in range(1, 21))}
+               for i, path in enumerate(paths)]
+    items = [{"role": "user", "content": read_task(paths)}]
+    if mode == "single":
+        for call, output in zip(calls, outputs):
+            items += [call, output]
+    else:
+        items += calls + outputs
+    items.append({"type": "message", "role": "assistant",
+                  "content": [{"type": "output_text", "text": "They are the same length."}]})
+    return items
+
+
+def probe_batching(args) -> None:
+    config = tomllib.loads((pathlib.Path.home() / ".kloop/config.toml").read_text())
+    name = args.provider or config["provider"]
+    provider = config["providers"][name]
+    if provider.get("wire_api") != "responses":
+        sys.exit(f"{name} is not a responses provider")
+    routes, labels = {}, {}
+    task = read_task(["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"])
+    plan = ([("none", None)] * args.trials + [("primed-single", "single")] * args.primed
+            + [("primed-multi", "multi")] * args.primed)
+    extra = {"instructions": BATCH_INSTRUCTIONS, "parallel_tool_calls": True}
+    for index, (condition, mode) in enumerate(plan, 1):
+        items = (primed_history(mode) if mode else []) + [{"role": "user", "content": task}]
+        try:
+            response = responses_call(provider, items, args.effort, READ_TOOL, 16384, extra)
+        except Exception as error:  # noqa: BLE001 — 只记类别，不记可能含鉴权的异常正文
+            print(json.dumps({"trial": index, "condition": condition, "error": type(error).__name__}))
+            continue
+        calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
+        usage = response.get("usage") or {}
+        route = (usage.get("router_detail") or {}).get("router_name") or "unreported"
+        label = labels.setdefault(route, f"route-{len(labels) + 1}")
+        routes.setdefault(label, route)
+        print(json.dumps({"trial": index, "condition": condition, "calls": len(calls), "route": label,
+                          "output_tokens": usage.get("output_tokens")}), flush=True)
+    # 上游路由名只留本机，不进终端输出和仓库。
+    pathlib.Path(args.route_map).write_text(json.dumps(routes, indent=2))
+
+
 # ---- main ------------------------------------------------------------------
 
 def main() -> None:
@@ -1075,6 +1169,8 @@ def main() -> None:
     p.add_argument("--skill", required=True)
     p.add_argument("--system-prompt")
     p.add_argument("--config", default="~/.kloop/config.toml")
+    p.add_argument("--preload", action="store_true",
+                   help="append the complete change (code with whole functions) to the prompt (plan 282)")
     p.add_argument("--kloop", default="kloop")
     p.add_argument("--max-rounds", type=int, default=80)
     p.add_argument("--timeout", type=int, default=3600)
@@ -1082,6 +1178,13 @@ def main() -> None:
     p.add_argument("--source", default=str(pathlib.Path(__file__).resolve().parent.parent))
     p = sub.add_parser("stats")
     p.add_argument("outs", nargs="+")
+    p = sub.add_parser("probe-batching")
+    p.add_argument("--provider")
+    p.add_argument("--effort", default="xhigh")
+    p.add_argument("--trials", type=int, default=12)
+    p.add_argument("--primed", type=int, default=6)
+    p.add_argument("--route-map", default="/tmp/kloop-probe-batching-routes.json")
+    p.set_defaults(handler=probe_batching)
     p = sub.add_parser("probe-reasoning")
     p.add_argument("--provider")
     p.add_argument("--model")
