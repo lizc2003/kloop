@@ -338,6 +338,50 @@ rows = [{'type':'provider_usage','usage':response['usage']},
         with self.assertRaisesRegex(ValueError, "changed"):
             pipeline.resume(args)
 
+    def resume_args(self, base, name):
+        return argparse.Namespace(initial=str(base), out=str(self.root / name), source=str(self.repo),
+                                  config=str(self.root / "config.toml"))
+
+    def test_second_resume_from_the_same_initial_review_sends_nothing(self):
+        base, _ = self.run_http_pipeline(preparation_failure=True)
+        original = (base / "meta.json").read_text()
+
+        def fail(packet, provider, sampling, folder):
+            folder.mkdir()
+            return {"status": "failed"}
+
+        with mock.patch.object(pipeline, "independent_request", side_effect=fail) as request:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                pipeline.resume(self.resume_args(base, "first"))
+            # 第一次恢复的请求失败也算已尝试；第二次在任何请求和输出目录之前被拒。
+            with self.assertRaisesRegex(ValueError, "already attempted"):
+                pipeline.resume(self.resume_args(base, "second"))
+        request.assert_called_once()
+        self.assertEqual((base / "meta.json").read_text(), original)
+        self.assertEqual(recheck.load_json(base / "recheck-attempt.json"),
+                         {"out": str((self.root / "first").resolve())})
+        self.assertFalse((self.root / "second").exists())
+
+    def test_resume_that_fails_before_sending_can_resume_again(self):
+        base, _ = self.run_http_pipeline(preparation_failure=True)
+
+        def deliver(packet, provider, sampling, folder):
+            folder.mkdir()
+            row = {"id": "C1", "verdict": "unresolved", "severity": None, "reason": "caller missing",
+                   "evidence": [], "missing": "caller invocation"}
+            recheck.save_json(folder / "verdicts.json", [row])
+            return {"status": "valid"}
+
+        with mock.patch.object(pipeline, "independent_request", side_effect=deliver) as request:
+            with mock.patch.object(pipeline, "automatic_packet", side_effect=ValueError("budget")):
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                    pipeline.resume(self.resume_args(base, "first"))
+            self.assertFalse((base / "recheck-attempt.json").exists())
+            with contextlib.redirect_stdout(io.StringIO()):
+                pipeline.resume(self.resume_args(base, "second"))
+        request.assert_called_once()
+        self.assertEqual(recheck.load_json(self.root / "second/meta.json")["status"], "complete")
+
     def test_worker_enforces_body_deadline_even_when_idle_budget_is_larger(self):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(handler):

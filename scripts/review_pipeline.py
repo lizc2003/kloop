@@ -336,8 +336,11 @@ def report_b(report, rows, packet):
     return text
 
 
-def finish(args, out, protocol, report, ledger, meta):
-    """恢复入口复用相同规则和初审；不再发送一次初审或修改原失败记录。"""
+def finish(args, out, protocol, report, ledger, meta, claim=None):
+    """恢复入口复用相同规则和初审；不再发送一次初审或修改原失败记录。
+
+    `claim` 在本地检查都通过、即将发出复核请求时调用一次；它失败则不发请求。
+    """
     recheck.save_json(out / "ledger.json", ledger)
     meta["candidate_counts"] = {verdict: sum(c["verdict"] == verdict for c in ledger["candidates"])
                                 for verdict in ("confirmed", "excluded", "unresolved")}
@@ -355,6 +358,8 @@ def finish(args, out, protocol, report, ledger, meta):
         if recheck.digest(config_text) != protocol["config_sha256"]:
             raise ValueError("configuration changed since initial review")
         provider = tomllib.loads(config_text)["providers"][protocol["provider"]]
+        if claim is not None:
+            claim()
         meta["recheck_requests"] = 1
         if protocol.get("evidence_tools", False) or protocol.get("decision_contract", False):
             result = review_evidence.investigate(packet, provider, protocol["sampling"], args.source,
@@ -456,7 +461,10 @@ def run(args, bench):
 def resume(args):
     base, out = pathlib.Path(args.initial).resolve(), pathlib.Path(args.out).resolve()
     initial_meta = recheck.load_json(base / "meta.json")
-    if initial_meta.get("recheck_requests") != 0:
+    # 原 meta.json 保留初审的失败原样，所以恢复的尝试另记在初审目录的独占文件里：
+    # 只看 meta.json 时，同一份初审可以被反复恢复，每次都再发一次复核请求。
+    attempt = base / "recheck-attempt.json"
+    if initial_meta.get("recheck_requests") != 0 or attempt.exists():
         raise ValueError("a recheck was already attempted; resume does not retry requests")
     if recheck.load_json(base / "initial/meta.json")["exit"] != 0:
         raise ValueError("cannot resume an incomplete initial review")
@@ -471,8 +479,17 @@ def resume(args):
             "resumed_from": str(base), "initial_and_failed_preparation_wall_s": initial_meta["wall_s"]}
     recheck.save_json(out / "protocol.json", protocol)
     (out / "report-a.md").write_text(report)
+
+    def claim():
+        # 只在即将发请求时登记：准备阶段再次失败不占用这次尝试。
+        try:
+            with attempt.open("x") as marker:
+                json.dump({"out": str(out)}, marker)
+        except FileExistsError:
+            raise ValueError("a recheck was already attempted; resume does not retry requests") from None
+
     try:
-        finish(args, out, protocol, report, ledger, meta)
+        finish(args, out, protocol, report, ledger, meta, claim)
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         meta["error_type"] = type(error).__name__
         if isinstance(error, ValueError) and meta["stage"] in ("candidate-ledger", "evidence"):
