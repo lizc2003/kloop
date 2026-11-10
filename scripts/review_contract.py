@@ -6,12 +6,7 @@ import review_recheck as review
 
 
 NAME = "submit_review"
-INSTRUCTIONS = '''
-Final delivery uses submit_review, not a prose response or the legacy JSON
-example in the evidence packet. Its function schema is the final format.
-Call it exactly once, alone, when your decisions are ready. Every candidate key
-and every field is required; missing is an empty string for a settled decision.
-
+COMPARISON_INSTRUCTIONS = '''
 For both confirmed and excluded, give one concrete input/configuration/event
 sequence and trace that SAME input through before and after. State the observed
 result at the consumer, including valid inputs that may now be rejected. For an
@@ -23,6 +18,19 @@ that consumes an unknown/empty/default value. If its behavior is missing, use
 source tools or unresolved; do not invent it. For unresolved, state the precise
 gap in missing and keep any unknown comparison fields empty.
 '''
+INSTRUCTIONS = '''
+Final delivery uses submit_review, not a prose response or the legacy JSON
+example in the evidence packet. Its function schema is the final format.
+Call it exactly once, alone, when your decisions are ready. Every candidate key
+and every field is required; missing is an empty string for a settled decision.
+''' + COMPARISON_INSTRUCTIONS
+TEXT_INSTRUCTIONS = '''
+Final delivery is one JSON object as text matching the supplied text.format
+schema, replacing the legacy example in the evidence packet. Do not call
+submit_review. Every candidate key and field is required; missing is empty for
+a settled decision. When source tools are available, query them if needed before
+returning the complete JSON text. Do not use prose, code fences or internal markup.
+''' + COMPARISON_INSTRUCTIONS
 
 REPAIR_INSTRUCTIONS = '''
 The submission failed local validation. You have one repair request, with no
@@ -30,6 +38,13 @@ source tools. Call submit_review alone with the COMPLETE set of candidate keys
 and ALL required fields, including null severity and empty missing where needed.
 Return valid JSON arguments matching the schema. Do not use internal markup.
 Recheck the same-input comparison; use unresolved for facts still missing.
+'''
+TEXT_REPAIR_INSTRUCTIONS = '''
+The JSON text failed local validation. You have one repair request with no source
+tools. Return the COMPLETE JSON object matching text.format, with every candidate
+and field, including null severity and empty missing where needed. Do not call
+functions or use prose, code fences or internal markup. Recheck the same-input
+comparison; use unresolved for facts still missing.
 '''
 
 

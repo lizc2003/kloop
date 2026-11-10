@@ -29,6 +29,80 @@ class ContractTests(EvidenceFixture):
     def parse(self, value):
         return contract.parse_submission(json.dumps(value), self.packet)
 
+    def text_reply(self, value=None):
+        response = self.final()
+        response["response"]["output"][0]["content"][0]["text"] = json.dumps(self.values() if value is None else value)
+        return response
+
+    def test_text_decision_uses_the_same_schema_sampling_and_local_validator(self):
+        bodies = []
+
+        def request(provider, body, *args, **kwargs):
+            bodies.append(copy.deepcopy(body))
+            return self.text_reply()
+
+        with mock.patch.object(review, "one_request", side_effect=request):
+            meta = self.run_case(decision_contract=True, decision_text=True)
+        self.assertEqual((meta["status"], meta["requests"], meta["tool_calls"]), ("valid", 1, 0))
+        self.assertEqual(bodies[0]["text"]["format"], {"type": "json_schema", "name": "review_decisions",
+            "strict": True, "schema": contract.submission_tool(self.packet)["parameters"]})
+        self.assertNotIn("tools", bodies[0])
+        self.assertEqual({k: bodies[0][k] for k in self.sampling()}, self.sampling())
+        self.assertEqual(review.load_json(self.root / "case/verdicts.json"), self.parse(self.values()))
+
+    def test_text_decision_queries_sources_and_updates_final_schema(self):
+        bodies = []
+
+        def request(provider, body, *args, **kwargs):
+            bodies.append(copy.deepcopy(body))
+            return self.tool_reply() if len(bodies) == 1 else self.text_reply(self.values("S1"))
+
+        with mock.patch.object(review, "one_request", side_effect=request):
+            meta = self.run_case(decision_contract=True, decision_text=True, with_tools=True, max_requests=2)
+        self.assertEqual((meta["status"], meta["requests"], meta["tool_calls"]), ("valid", 2, 1))
+        self.assertEqual([t["name"] for t in bodies[0]["tools"]],
+                         ["source_packages", "source_search", "source_read"])
+        self.assertEqual(bodies[0]["tool_choice"], "auto")
+        self.assertNotIn("tools", bodies[-1])
+        citations = bodies[-1]["text"]["format"]["schema"]["properties"]["C1"]["properties"]["evidence"]["items"]["anyOf"]
+        self.assertEqual([c["properties"]["source"]["enum"][0] for c in citations], ["E1", "S1"])
+        self.assertEqual(bodies[-1]["input"][1:3], self.tool_reply()["response"]["output"])
+
+    def test_text_repair_keeps_failed_output_and_uses_one_complete_resubmission(self):
+        for name, invalid, second, status in (
+                ("missing", {"C1": self.values()["C1"]}, self.text_reply(), "valid"),
+                ("bad-json", "not a decision", self.text_reply(), "valid"),
+                ("twice-bad", {}, self.text_reply({}), "failed")):
+            first = self.text_reply(invalid)
+            if name == "bad-json":
+                first["response"]["output"][0]["content"][0]["text"] = "{broken>"
+            bodies = []
+
+            def request(provider, body, *args, **kwargs):
+                bodies.append(copy.deepcopy(body))
+                return first if len(bodies) == 1 else second
+
+            with mock.patch.object(review, "one_request", side_effect=request):
+                meta = self.run_case(name, decision_contract=True, decision_text=True, repair_decision=True)
+            self.assertEqual((meta["status"], meta["requests"], meta["repair_requests"], meta["max_requests"]),
+                             (status, 2, 1, 2))
+            self.assertNotIn("tools", bodies[-1])
+            self.assertEqual(bodies[-1]["input"][1], first["response"]["output"][0])
+            feedback = json.loads(bodies[-1]["input"][2]["content"])
+            self.assertEqual(feedback["required_candidates"], ["C1", "C2"])
+            self.assertTrue((self.root / name / "request-1/answer.txt").exists())
+
+    def test_text_contract_rejects_functions_and_invalid_text_without_implicit_retry(self):
+        for name, response, repair in (("function", self.submit(), True),
+                                       ("legacy", self.final(), False),
+                                       ("transport", {"event": "request.error"}, True)):
+            with mock.patch.object(review, "one_request", return_value=response) as request:
+                meta = self.run_case(name, decision_contract=True, decision_text=True, repair_decision=repair)
+            self.assertEqual((meta["status"], meta["requests"], meta["repair_requests"]), ("failed", 1, 0))
+            request.assert_called_once()
+        with self.assertRaisesRegex(ValueError, "requires"):
+            self.run_case("invalid-text-flag", decision_text=True)
+
     def test_valid_settled_and_unresolved_decisions_preserve_behavior(self):
         value = self.values()
         value["C1"].update(verdict="confirmed", severity="medium", basis="introduced_or_worsened")

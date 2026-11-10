@@ -361,7 +361,8 @@ def finish(args, out, protocol, report, ledger, meta):
                 out / "recheck", with_tools=protocol["evidence_tools"], max_requests=protocol["evidence_requests"],
                 max_calls=protocol["evidence_calls"], max_chars=protocol["evidence_chars"],
                 decision_contract=protocol.get("decision_contract", False),
-                repair_decision=protocol.get("repair_decision", False))
+                repair_decision=protocol.get("repair_decision", False),
+                decision_text=protocol.get("decision_text", False))
             meta["recheck_requests"] = result["requests"]
         else:
             result = independent_request(packet, provider, protocol["sampling"], out / "recheck")
@@ -396,6 +397,8 @@ def run(args, bench):
             raise ValueError("invalid evidence follow-up budget")
         if getattr(args, "repair_decision", False) and not getattr(args, "decision_contract", False):
             raise ValueError("decision repair requires the decision contract")
+        if getattr(args, "decision_text", False) and not getattr(args, "decision_contract", False):
+            raise ValueError("decision text requires the decision contract")
         if not hasattr(recheck.signal, "setitimer"):
             raise ValueError("pipeline body deadline requires Unix interval timers")
         executable = shutil.which(args.kloop)
@@ -415,6 +418,7 @@ def run(args, bench):
                     "idle_timeout_s": IDLE_S, "body_wall_timeout_s": BODY_WALL_S,
                     "evidence_tools": getattr(args, "evidence_tools", False),
                     "decision_contract": getattr(args, "decision_contract", False),
+                    "decision_text": getattr(args, "decision_text", False),
                     "repair_decision": getattr(args, "repair_decision", False),
                     "evidence_requests": getattr(args, "evidence_requests", 8),
                     "evidence_calls": getattr(args, "evidence_calls", 64),
@@ -496,6 +500,7 @@ def add_commands(sub, source, bench):
     parser.add_argument("--max-chars", type=int, default=160_000)
     parser.add_argument("--evidence-tools", action="store_true", help="enable bounded frozen source follow-up")
     parser.add_argument("--decision-contract", action="store_true", help="require typed decisions with before/after behavior")
+    parser.add_argument("--decision-text", action="store_true", help="use JSON text instead of a function; requires --decision-contract")
     parser.add_argument("--repair-decision", action="store_true", help="allow one extra validation-feedback submission")
     parser.add_argument("--evidence-requests", type=int, default=8)
     parser.add_argument("--evidence-calls", type=int, default=64)

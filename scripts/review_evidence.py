@@ -66,16 +66,20 @@ def citation_note(packet):
 
 
 def investigate(packet, provider, sampling, source, out, *, with_tools=False, cargo_home=None,
-                max_requests=8, max_calls=64, max_chars=160_000, decision_contract=False, repair_decision=False):
+                max_requests=8, max_calls=64, max_chars=160_000, decision_contract=False, repair_decision=False,
+                decision_text=False):
     verify_packet(packet)
     if (with_tools and max_requests < 2) or max_calls < 1 or max_chars < 1:
         raise ValueError("invalid evidence follow-up budget")
     if repair_decision and not decision_contract:
         raise ValueError("decision repair requires the decision contract")
+    if decision_text and not decision_contract:
+        raise ValueError("decision text requires the decision contract")
     out = pathlib.Path(out)
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
     started = time.monotonic()
     meta = {"status": "failed", "with_tools": with_tools, "decision_contract": decision_contract,
+            "decision_text": decision_text,
             "requests": 0, "tool_calls": 0, "repair_requests": 0,
             "max_requests": (max_requests if with_tools else 1) + int(repair_decision), "max_calls": max_calls,
             "repair_decision": repair_decision,
@@ -96,7 +100,8 @@ def investigate(packet, provider, sampling, source, out, *, with_tools=False, ca
             expected = "\n".join(f"{n}: {lines[n - 1]}" for n in range(evidence["start"], evidence["end"] + 1))
             if evidence["revision"] != sources.revisions[evidence["version"]] or evidence["text"] != expected:
                 raise ValueError("packet evidence does not match the frozen Git blob")
-        instructions = FOLLOWUP + (contract.INSTRUCTIONS if decision_contract else "")
+        instructions = FOLLOWUP + ((contract.TEXT_INSTRUCTIONS if decision_text else contract.INSTRUCTIONS)
+                                   if decision_contract else "")
         inputs = [{"role": "user", "content": instructions + citation_note(packet) + "\n" + packet["prompt"]}]
         (out / "prompt.txt").write_text(inputs[0]["content"])
         limit, seen_calls = (max_requests if with_tools else 1), set()
@@ -113,9 +118,15 @@ def investigate(packet, provider, sampling, source, out, *, with_tools=False, ca
                 body.update(tools=tools_schema(), parallel_tool_calls=True)
             if decision_contract:
                 extended = sources.validation_packet(packet)
-                body.update(tools=[*(tools_schema() if enabled else []), contract.submission_tool(extended)],
-                            parallel_tool_calls=False,
-                            tool_choice="required" if enabled else {"type": "function", "name": contract.NAME})
+                tool = contract.submission_tool(extended)
+                if decision_text:
+                    body["text"] = {"format": {"type": "json_schema", "name": "review_decisions",
+                                               "strict": True, "schema": tool["parameters"]}}
+                    if enabled:
+                        body.update(parallel_tool_calls=False, tool_choice="auto")
+                else:
+                    body.update(tools=[*(tools_schema() if enabled else []), tool], parallel_tool_calls=False,
+                                tool_choice="required" if enabled else {"type": "function", "name": contract.NAME})
             review.save_json(turn / "request.json", body)
             meta["requests"] += 1
             call_started = time.monotonic()
@@ -140,10 +151,12 @@ def investigate(packet, provider, sampling, source, out, *, with_tools=False, ca
                     raise ValueError("duplicate or invalid function call id")
                 seen_calls.add(ident)
             submissions = [call for call in calls if call["name"] == contract.NAME] if decision_contract else []
+            if decision_text and submissions:
+                raise ValueError("text decision returned an unavailable submit_review call")
             if submissions or not calls:
-                if decision_contract and (len(submissions) != 1 or len(calls) != 1):
+                if decision_contract and not decision_text and (len(submissions) != 1 or len(calls) != 1):
                     raise ValueError("decision requires one standalone submit_review call")
-                answer = submissions[0]["arguments"] if decision_contract else review.response_text(response)
+                answer = submissions[0]["arguments"] if submissions else review.response_text(response)
                 (out / "answer.txt").write_text(answer)
                 (turn / "answer.txt").write_text(answer)
                 extended = sources.validation_packet(packet)
@@ -157,9 +170,13 @@ def investigate(packet, provider, sampling, source, out, *, with_tools=False, ca
                     feedback = contract.validation_feedback(error, extended)
                     review.save_json(turn / "validation-error.json", feedback)
                     inputs.extend(output)
-                    inputs.append({"type": "function_call_output", "call_id": submissions[0]["call_id"],
-                                   "output": json.dumps(feedback)})
-                    inputs.append({"role": "user", "content": contract.REPAIR_INSTRUCTIONS + citation_note(extended)})
+                    if decision_text:
+                        inputs.append({"role": "user", "content": json.dumps(feedback)})
+                    else:
+                        inputs.append({"type": "function_call_output", "call_id": submissions[0]["call_id"],
+                                       "output": json.dumps(feedback)})
+                    repair = contract.TEXT_REPAIR_INSTRUCTIONS if decision_text else contract.REPAIR_INSTRUCTIONS
+                    inputs.append({"role": "user", "content": repair + citation_note(extended)})
                     repair_pending = True
                     continue
                 review.save_json(out / "verdicts.json", verdicts)
@@ -191,8 +208,11 @@ def investigate(packet, provider, sampling, source, out, *, with_tools=False, ca
                                "output": json.dumps(answer, ensure_ascii=False)})
             review.save_json(turn / "tools.json", records)
             if number == limit - 1 or meta["tool_calls"] >= max_calls:
-                final = ("Evidence budget is exhausted. Call submit_review alone now; all fields are required. Use unresolved where necessary facts remain missing."
-                         if decision_contract else "Evidence budget is exhausted. Return final verdict JSON now; unresolved where necessary facts remain missing.")
+                if decision_text:
+                    final = "Evidence budget is exhausted. Return the complete JSON text matching text.format now; unresolved where necessary facts remain missing."
+                else:
+                    final = ("Evidence budget is exhausted. Call submit_review alone now; all fields are required. Use unresolved where necessary facts remain missing."
+                             if decision_contract else "Evidence budget is exhausted. Return final verdict JSON now; unresolved where necessary facts remain missing.")
                 inputs.append({"role": "user", "content": final + citation_note(sources.validation_packet(packet))})
         if meta["status"] != "valid":
             raise ValueError("no final decision was delivered within the evidence budget")
@@ -214,7 +234,8 @@ def command(args):
     verify_packet(packet)
     if not packet["candidates"]:
         meta = investigate(packet, {}, {}, args.source, args.out, with_tools=args.with_tools,
-                           decision_contract=args.decision_contract, repair_decision=args.repair_decision)
+                           decision_contract=args.decision_contract, repair_decision=args.repair_decision,
+                           decision_text=args.decision_text)
     else:
         protocol = review.load_json(args.sampling)
         config_text = pathlib.Path(args.config).expanduser().read_text()
@@ -226,7 +247,8 @@ def command(args):
         meta = investigate(packet, provider, protocol["sampling"], args.source, args.out,
                            with_tools=args.with_tools, cargo_home=args.cargo_home,
                            max_requests=args.max_requests, max_calls=args.max_calls, max_chars=args.max_chars,
-                           decision_contract=args.decision_contract, repair_decision=args.repair_decision)
+                           decision_contract=args.decision_contract, repair_decision=args.repair_decision,
+                           decision_text=args.decision_text)
     # usage 的供应商扩展可能含内部路由信息，仅输出稳定的运行摘要。
     print(json.dumps({k: meta[k] for k in ("status", "requests", "tool_calls", "wall_s")}), flush=True)
     if meta["status"] not in ("valid", "skipped-empty"):
@@ -242,6 +264,7 @@ def add_commands(sub, source):
     parser.add_argument("--source", default=str(source))
     parser.add_argument("--with-tools", action="store_true")
     parser.add_argument("--decision-contract", action="store_true", help="submit typed decisions with before/after behavior")
+    parser.add_argument("--decision-text", action="store_true", help="use JSON text instead of a function; requires --decision-contract")
     parser.add_argument("--repair-decision", action="store_true", help="allow one extra validation-feedback submission")
     parser.add_argument("--cargo-home")
     parser.add_argument("--max-requests", type=int, default=8)
