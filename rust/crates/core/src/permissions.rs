@@ -1468,6 +1468,59 @@ mod tests {
         }
     }
 
+    /// Plan 281 实测：包装器分析不认识 `exec`/`builtin`，后面的 shell 正文无人分析，
+    /// `exec sh -c 'cat .env'` 在 bypass 与 manual 下都放行；危险命令也不再触发确认。
+    #[tokio::test]
+    async fn exec_and_builtin_keep_wrapped_commands_checked() {
+        for command in [
+            "exec sh -c 'cat .env'",
+            "builtin exec sh -c 'cat .env'",
+            "command exec sh -c 'cat .env'",
+            "exec env -S 'cat .env'",
+            "exec -l bash -c 'cat \"$HOME/public.txt\"'",
+            "exec -a -bash bash -c 'cat \"$HOME/public.txt\"'",
+        ] {
+            for mode in [Mode::Bypass, Mode::Manual] {
+                let p = gate(mode, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+                let error = p
+                    .check_call("bash", &bash(command), 0, true)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("reading this sensitive path"),
+                    "{mode:?} {command}: {error}"
+                );
+            }
+        }
+        for command in ["exec rm -rf build", "exec shred notes.txt"] {
+            let approver = ScriptedApprover::new(vec![Decision::Deny]);
+            let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+            assert!(
+                p.check_call("bash", &bash(command), 0, true).await.is_err(),
+                "{command}"
+            );
+            assert_eq!(approver.ask_count(), 1, "{command}");
+            assert!(
+                approver.asked()[0].description.contains("[destructive]"),
+                "{command}"
+            );
+        }
+        for command in [
+            "exec ls",
+            "exec bash -c 'cat notes.txt'",
+            "exec bash -c 'cat \"$HOME/public.txt\"'",
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            p.check_call("bash", &bash(command), 0, true)
+                .await
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+    }
+
     #[tokio::test]
     async fn shell_options_around_c_keep_the_script_checked() {
         // 正文位置不认识或曾被当普通参数的都要拒绝；常见写法不能误拦。

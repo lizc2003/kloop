@@ -692,6 +692,9 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
                 break;
             }
             "command" => command_command(&rest[1..]),
+            "exec" => exec_command(&rest[1..], &mut analysis),
+            // `builtin NAME …` 只调用 shell 内建；后面不是内建时 shell 直接报错，多剥一层无害。
+            "builtin" => Some(&rest[1..]),
             "nohup" | "nice" | "time" | "timeout" | "xargs" => {
                 transparent_wrapper_command(wrapper, &rest[1..], &mut analysis)
             }
@@ -709,6 +712,44 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
     }
     analysis.argv = rest;
     analysis
+}
+
+/// `exec [-cl] [-a name] [命令 …]`（bash、zsh）。`exec sh -c '…'` 与直接写 `sh -c '…'`
+/// 执行同一段正文，不剥掉它正文就无人分析（plan 281 实测放行 `cat .env`）。`-c` 清空
+/// 环境；`-l` 与 `-a` 改写 argv[0]，可能让 shell 按登录 shell 读启动文件，HOME 与 cwd 未知。
+fn exec_command<'a>(
+    mut rest: &'a [String],
+    analysis: &mut WrapperAnalysis<'_>,
+) -> Option<&'a [String]> {
+    while let Some(token) = rest.first().filter(|token| token.starts_with('-')) {
+        if token == "--" {
+            rest = &rest[1..];
+            break;
+        }
+        let cluster = &token[1..];
+        if cluster.is_empty() {
+            return None;
+        }
+        let mut last = rest;
+        for (index, flag) in cluster.char_indices() {
+            match flag {
+                'c' => analysis.environment_unknown = true,
+                'l' | 'a' => {
+                    analysis.environment_unknown = true;
+                    analysis.cwd_unknown = true;
+                    if flag == 'a' {
+                        if index + 1 == cluster.len() {
+                            last = rest.get(1..).filter(|value| !value.is_empty())?;
+                        }
+                        break;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        rest = &last[1..];
+    }
+    Some(rest)
 }
 
 fn command_command(mut rest: &[String]) -> Option<&[String]> {
@@ -1856,6 +1897,43 @@ mod tests {
             assert_eq!(analysis.argv, ["bash", "-c", "x"], "{input:?}");
             assert!(analysis.environment_unknown, "{input:?}");
             assert!(analysis.cwd_unknown, "{input:?}");
+        }
+        // exec / builtin 剥离后定位被包命令；改写 argv[0] 或清空环境的选项记为未知。
+        for (input, wrapped, cwd_unknown) in [
+            (vec!["exec", "sh", "-c", "x"], vec!["sh", "-c", "x"], false),
+            (
+                vec!["builtin", "exec", "sh", "-c", "x"],
+                vec!["sh", "-c", "x"],
+                false,
+            ),
+            (
+                vec!["command", "exec", "env", "-i", "ls"],
+                vec!["ls"],
+                false,
+            ),
+            (vec!["exec", "-c", "ls"], vec!["ls"], false),
+            (
+                vec!["exec", "-l", "bash", "-c", "x"],
+                vec!["bash", "-c", "x"],
+                true,
+            ),
+            (
+                vec!["exec", "-a", "-bash", "bash", "-c", "x"],
+                vec!["bash", "-c", "x"],
+                true,
+            ),
+            (vec!["exec", "-cla", "name", "ls"], vec!["ls"], true),
+            (vec!["exec", "-a-bash", "bash"], vec!["bash"], true),
+            (vec!["exec", "--", "ls"], vec!["ls"], false),
+        ] {
+            let input = argv(&input);
+            let analysis = analyze_wrappers(&input);
+            assert!(analysis.complete, "{input:?}");
+            assert_eq!(analysis.argv, wrapped, "{input:?}");
+            assert_eq!(analysis.cwd_unknown, cwd_unknown, "{input:?}");
+        }
+        for input in [argv(&["exec", "-a"]), argv(&["exec", "-x", "ls"])] {
+            assert!(!analyze_wrappers(&input).complete, "{input:?}");
         }
         // 带操作数的字母后面没有值：定位失败。
         for input in [argv(&["env", "-iu"]), argv(&["env", "-x", "ls"])] {

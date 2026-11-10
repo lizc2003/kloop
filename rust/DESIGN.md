@@ -1291,7 +1291,9 @@ GNU 接受的无歧义长选项缩写（`--s=…`）与短选项簇都算；簇�
 被包命令自己的 `-S` 也会被算进去。代价是 `env -S 'ls -la'` 这类良性写法也被拒。`env` 的
 短选项按 getopt 读簇（`-iuNAME`、`-iu NAME`、`-iv`、BSD 的 `-P altpath`），能定位被包命令；
 `-a` / `--argv0` 改写 argv[0]，`-bash` 这样的值让 shell 按登录 shell 读启动文件，所以与 `-C`
-一样让嵌套分析的 HOME 和 cwd 未知。其余未知选项仍做近似剥离。包装器无法定位时（未知选项、`sudo -R` 这类未建模的带值选项），
+一样让嵌套分析的 HOME 和 cwd 未知。`exec [-cl] [-a name]` 与 `builtin` 同样按包装器剥离：
+`exec sh -c 'cat .env'` 执行的正文与直接写 `sh -c` 相同，此前因 `exec` 未建模而无人分析，
+敏感读取与危险命令审批都会漏（plan 281）；`-l`、`-a` 让 HOME 与 cwd 未知，`-c` 让环境未知。其余未知选项仍做近似剥离。包装器无法定位时（未知选项、`sudo -R` 这类未建模的带值选项），
 近似剩余部分里只要有可能进入 `-c` 模式的 `sh`/`bash`/`zsh`，就按未知执行体处理：完整路径
 会递归分析的正文，不完整路径此前直接跳过，`sudo -X sh -c 'cat .env'` 因而在 bypass 下放行
 （plan 272）。不进入 `-c` 模式的写法（`env --debug ls`、`env --debug sh script.sh`）不受影响。
