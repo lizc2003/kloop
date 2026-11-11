@@ -73,7 +73,7 @@ class RolloutEvidenceTest(unittest.TestCase):
             ("bash", {"command": "cat h.py"}, lines(3)),
             # 以下都不应计入：仓库外文件、不存在的路径、越界行、不存在的版本文件、未知读法。
             ("read_file", {"path": "/etc/hosts"}, "1\tlocalhost"),
-            ("bash", {"command": "grep -rn x ."}, "nope.py:3:x\n"),
+            ("bash", {"command": f"grep -rn x {self.repo}"}, f"{self.repo}/nope.py:3:x\n"),
             ("bash", {"command": "sed -n '50,60p' f.py"}, ""),
             ("bash", {"command": "git show HEAD:missing.py"}, "fatal"),
             ("bash", {"command": "python3 -c 'print(1)'"}, "1\n"),
@@ -83,8 +83,8 @@ class RolloutEvidenceTest(unittest.TestCase):
         path = self.root / "rollout.jsonl"
         self.write_rollout(path, self.fixture_calls())
         reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
-        # 只有来源明确的读取计入：read_file、补丁、grep 工具与带路径的 grep 输出；
-        # sed、`git show | sed`、cat、无路径的 bash grep 不计。
+        # 只有来源明确的读取计入：read_file、补丁、grep 工具与绝对路径的 bash grep 输出；
+        # sed、`git show | sed`、cat、无路径或相对路径的 bash grep 不计。
         self.assertEqual(reads.lines, {
             ("after", "f.py"): {2, 3, 5, 9, 12},
             ("before", "f.py"): {5},
@@ -112,8 +112,14 @@ class RolloutEvidenceTest(unittest.TestCase):
             ("bash", {"command": "nl -ba g.py | sed -n '4,5p'"}, "     4\tline 4\n     5\tline 5\n"),
             ("bash", {"command": "cat h.py"}, "line 1\nline 2\nline 3\n"),
             ("bash", {"command": "grep -n x|head g.py"}, "50: marker\n"),
-            # grep 输出自带路径与行号：计入；截断说明之后的内容不算显示过。
-            ("bash", {"command": "grep -rn line ."}, "g.py:2:line 2\n" + notice + "\ng.py:5:line 5"),
+            # grep 输出带绝对路径与行号：计入；截断说明之后的内容不算显示过。
+            ("bash", {"command": f"grep -rn line {self.repo}"},
+             f"{self.repo}/g.py:2:line 2\n" + notice + f"\n{self.repo}/g.py:5:line 5"),
+            # 相对路径的基准取决于 cwd，无从确认：跳过，不按仓库根猜。
+            ("bash", {"command": "cd src && rg -n --with-filename needle f.py"}, "f.py:2:line 2\n"),
+            ("bash", {"command": "git grep -n line HEAD"}, "HEAD:g.py:3:line 3\n"),
+            # `--relative` 让补丁路径相对 cwd：跳过。
+            ("bash", {"command": "git diff --relative -U0 HEAD^ HEAD"}, diff),
             # 会话落盘预览：连补丁也不计。
             ("bash", {"command": "git diff -U0 HEAD^ HEAD"}, pointer),
             # 解析器假设之外的输入：这一条不计，不中断整次准备。
@@ -123,6 +129,7 @@ class RolloutEvidenceTest(unittest.TestCase):
         self.write_rollout(path, calls)
         reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
         self.assertEqual(reads.lines, {("after", "g.py"): {2}})
+        self.assertEqual(reads.counts["relative-skipped"], 2)
         self.assertEqual(reads.counts["offloaded-skipped"], 1)
         self.assertEqual(reads.counts["unparsed"], 1)
 

@@ -111,28 +111,35 @@ class Reads:
             elif not line.startswith("\\"):
                 before = None
 
-    def grep_output(self, output, base, single_file=None):
+    def grep_output(self, output, *, base, single_file=None):
+        """`base` 为 None 时相对路径的基准不明（bash 的 cwd 无从确认），只认绝对路径；
+        `git grep REV:路径` 默认也相对当前目录，同样跳过。"""
         for line in output.splitlines():
             match = GREP_LINE.match(line)
             if match:
-                version = self.version_of(match.group("rev")) if match.group("rev") else "after"
-                path = match.group("path")
-                path = path if match.group("rev") else self.relative(path, base)
+                path, rev = match.group("path"), match.group("rev")
+                if base is None and (rev or not os.path.isabs(path)):
+                    self.counts["relative-skipped"] = self.counts.get("relative-skipped", 0) + 1
+                    continue
+                version = self.version_of(rev) if rev else "after"
+                path = path if rev else self.relative(path, base or str(self.snapshot))
                 self.add(version, path, [int(match.group("line"))], "grep")
             elif single_file and (number := re.match(r"^(\d+):", line)):
                 self.add("after", single_file, [int(number.group(1))], "grep")
 
     def bash(self, command, output):
-        """只计输出里自带来源与行号的部分：git 补丁（文件头 + hunk 行号）与 grep 格式的
-        `路径:行号:`。`sed`/`cat`/`nl`/`git show` 等的来源要从命令推断，推断做不全（管道、
-        重定向、文件参数、条件分支），一律不计。"""
+        """只计输出里自带来源与行号的部分：git 补丁（文件头 + hunk 行号）与绝对路径的
+        grep 格式 `路径:行号:`。`sed`/`cat`/`nl`/`git show` 等的来源、相对路径的基准都要从命令
+        推断（cwd、管道、重定向、文件参数、条件分支），推断做不全，一律不计。"""
         # 整份结果被会话换成落盘预览时，模型只看到首尾片段，哪一行都无法确认读过。
         if output.rstrip().endswith(OFFLOAD_POINTER_END):
             self.counts["offloaded-skipped"] = self.counts.get("offloaded-skipped", 0) + 1
             return
         shown = output.partition(BASH_TRUNCATION)[0]
-        self.patch(shown)
-        self.grep_output(shown, str(self.snapshot))
+        # git 补丁的路径默认相对仓库根，与 cwd 无关；`--relative` 改成相对 cwd，基准不明，跳过。
+        if "--relative" not in command:
+            self.patch(shown)
+        self.grep_output(shown, base=None)
 
     def read_file(self, arguments, output):
         path = self.relative(arguments.get("path", ""), str(self.snapshot))
@@ -142,7 +149,8 @@ class Reads:
     def grep_tool(self, arguments, output):
         target = self.relative(arguments.get("path", "."), str(self.snapshot))
         single = target if target and self.file_lines("after", target) else None
-        self.grep_output(output, str(self.snapshot), single)
+        # grep 工具的相对路径按会话工作目录（快照仓库根）解析，这是工具自身的规则。
+        self.grep_output(output, base=str(self.snapshot), single_file=single)
 
 
 def text_of(content):
