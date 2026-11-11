@@ -2968,7 +2968,12 @@ omitted. When the cap cuts it, the whole captured text is first written to the
 offload store and the notice names that file and its line count, so the model
 reads the rest instead of re-running the command (plan 272: 6 of 11 measured
 reviews had a diff cut this way). The inline part keeps its size; bash and
-PowerShell share this. stdout precedes stderr in the canonical result, followed by
+PowerShell share this. A sandboxed bash run is formatted (and spilled) only when
+its own result is what the model gets: an approved escalation returns the
+unsandboxed re-run instead, so the first run's text is never saved. The
+sandbox-denial check reads the whole captured text, not the inline part —
+stdout comes first, so with more than the inline budget on stdout a denial
+line on stderr was cut away and neither the escalation nor the hint appeared. stdout precedes stderr in the canonical result, followed by
 `[exit status N]` or `[killed by signal]`; an empty successful run returns
 `(no output)`.
 

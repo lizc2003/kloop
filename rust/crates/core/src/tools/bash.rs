@@ -285,24 +285,35 @@ pub(crate) async fn run_foreground_bash(
         bail!(sandbox::PROTECTION_REQUIRED);
     }
     let output = run_foreground(command, &cwd, effective_sandbox, bash, timeout_ms, ctx).await?;
-    let mut text = format_output(&output, Some(&ctx.cfg.offload_dir));
     let success = output.status.success();
     if remembered_escalation {
         return Ok(ForegroundRun {
-            text: format!("{}{text}", sandbox::REMEMBERED_ESCALATION_PREFIX),
+            text: format!(
+                "{}{}",
+                sandbox::REMEMBERED_ESCALATION_PREFIX,
+                format_output(&output, Some(&ctx.cfg.offload_dir))
+            ),
             success,
         });
     }
 
+    // 沙箱内这次的结果确实要交给模型时才格式化并落盘：升级获批会换成重跑的结果，
+    // 先落盘的话第一次的全文就成了无人引用的文件。
+    let mut hint = None;
     // Sandbox denial handling applies only to an actually-sandboxed run;
     // disable_sandbox / no policy leaves `sandbox` None and skips it.
+    // 判定看完整捕获的输出而不是内联文本：合并顺序是先 stdout 后 stderr，stdout 超过
+    // 内联上限时，stderr 里的拒绝行会被截掉，升级和提示就都不会出现。
     if let Some(policy) = &sandbox
         && !output.status.success()
-        && let Some(denial) =
-            sandbox::classify_sandbox_denial(output.status.code(), &text, !policy.allow_network)
+        && let Some(denial) = sandbox::classify_sandbox_denial(
+            output.status.code(),
+            &captured_text(&output),
+            !policy.allow_network,
+        )
     {
         if requires_protection {
-            text.push_str(sandbox::PROTECTION_REQUIRED);
+            hint = Some(sandbox::PROTECTION_REQUIRED);
         } else if policy.escalate {
             // The code-level escalation loop (codex's retry-on-denial):
             // ask once, and on approval re-run the command unsandboxed —
@@ -343,16 +354,20 @@ pub(crate) async fn run_foreground_bash(
                         success: raw.status.success(),
                     });
                 }
-                EscalationOutcome::Declined => text.push_str(sandbox::ESCALATION_DECLINED),
+                EscalationOutcome::Declined => hint = Some(sandbox::ESCALATION_DECLINED),
                 EscalationOutcome::Stopped => {
                     ctx.stop.cancel();
-                    text.push_str(sandbox::ESCALATION_STOPPED);
+                    hint = Some(sandbox::ESCALATION_STOPPED);
                 }
-                EscalationOutcome::NotAttempted => text.push_str(sandbox::DENIAL_HINT),
+                EscalationOutcome::NotAttempted => hint = Some(sandbox::DENIAL_HINT),
             }
         } else {
-            text.push_str(sandbox::DENIAL_HINT);
+            hint = Some(sandbox::DENIAL_HINT);
         }
+    }
+    let mut text = format_output(&output, Some(&ctx.cfg.offload_dir));
+    if let Some(hint) = hint {
+        text.push_str(hint);
     }
     Ok(ForegroundRun { text, success })
 }
@@ -552,11 +567,16 @@ async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<Bound
 /// 合并结果超出内联预算且给了 `spill_dir` 时，先把捕获到的全文写进去，截断说明里
 /// 给出文件路径：否则大 diff 被截掉的后半段只能重跑命令才拿得到（plan 272 实测
 /// 11 次审查里 6 次如此）。内联部分大小不变，路径不额外占上下文。
-pub(super) fn format_output(output: &ForegroundOutput, spill_dir: Option<&Path>) -> String {
+/// 捕获到的 stdout 在前、stderr 在后，UTF-8 有损解码；内联截断之前的全文。
+fn captured_text(output: &ForegroundOutput) -> String {
     let mut merged = Vec::with_capacity(output.stdout.len() + output.stderr.len());
     merged.extend_from_slice(&output.stdout);
     merged.extend_from_slice(&output.stderr);
-    let mut text = String::from_utf8_lossy(&merged).into_owned();
+    String::from_utf8_lossy(&merged).into_owned()
+}
+
+pub(super) fn format_output(output: &ForegroundOutput, spill_dir: Option<&Path>) -> String {
+    let mut text = captured_text(output);
     let captured_chars = text.chars().count();
     let omitted_chars = captured_chars.saturating_sub(FOREGROUND_OUTPUT_CAP_CHARS);
     let saved = match spill_dir {
@@ -1890,6 +1910,59 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
             assert_eq!(asked.load(Ordering::SeqCst), 1, "asked exactly once: {out}");
+        }
+
+        /// 升级获批后返回的是重跑的结果：沙箱内那次的超长输出不能先落盘，否则就是
+        /// 无人引用的孤儿文件。这里重跑没有大输出，offload 目录应当保持为空。
+        #[tokio::test]
+        async fn approved_escalation_leaves_no_spill_of_the_sandboxed_run() {
+            let (ctx, asked) = escalating_ctx(
+                "esc-no-orphan",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let target = outside_dir("esc-no-orphan").join("climbed.txt");
+            let _ = std::fs::remove_file(&target);
+            let _ = std::fs::remove_dir_all(&ctx.cfg.offload_dir);
+            let command = format!(
+                "echo climbed > {} || {{ yes B | head -c 40000 >&2; exit 1; }}",
+                target.display()
+            );
+            let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+            assert!(!is_error, "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
+            let spilled = std::fs::read_dir(&ctx.cfg.offload_dir)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            assert_eq!(
+                spilled, 0,
+                "the sandboxed run's output must not be saved: {out}"
+            );
+        }
+
+        /// 拒绝行在 stderr，而 stdout 已超过内联上限：判定必须看完整捕获的输出，
+        /// 否则截断后的文本里没有拒绝行，既不问升级也不给沙箱提示。
+        #[tokio::test]
+        async fn denial_after_long_stdout_is_still_recognized() {
+            let (ctx, asked) = escalating_ctx(
+                "esc-long-stdout",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let target = outside_dir("esc-long-stdout").join("climbed.txt");
+            let _ = std::fs::remove_file(&target);
+            let command = format!("yes A | head -c 40000; echo climbed > {}", target.display());
+            let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
+            assert!(!is_error, "{out}");
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                1,
+                "denial was not recognized: {out}"
+            );
+            assert!(
+                out.contains("Re-ran without the sandbox after user approval"),
+                "{out}"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
         }
 
         #[tokio::test]
