@@ -4783,10 +4783,10 @@ severity、reason、comparison、basis、evidence、missing；动态函数 schem
 
 `rollout-recheck <pipeline-out> <out>`（plan 281）对同一份初审账本做配对复核，只把证据
 换成初审在 rollout 里实际读过的行：`read_file` 返回的行号、输出中补丁实际显示的行、
-`sed -n`/`nl`/`cat`/`git show REV:path` 片段、grep 命中行。命令推导的范围不直接采信：去掉 `cd`
-后整条命令只有一段、管道首段是已识别的读取、其余阶段都是同一条流上的过滤（`nl`、`sed -n`
-范围、`head`、`tail`）时，在输出里找对应冻结行从第一行起的最长连续前缀（有 `nl` 时先去掉
-行号），只计这一段；还有别的段或阶段可能产生输出时分不清输出归属，整条不计；反向范围按 sed 语义只算起始行；结果被会话换成落盘预览时一行不计；
+`sed -n`/`nl`/`cat`/`git show REV:path` 片段、grep 命中行。bash 读取只认几种写法完全固定、
+输出来源唯一的命令（`sed -n 'A,Bp' 文件`、`nl -ba 文件 | sed -n …`、`git show REV:路径 [| nl -ba]
+| sed -n …`、`cat 文件`、`git show REV:路径`，可带一个 `cd` 前缀和读标准输入的 `| head -n N`），
+整条匹配；再在输出里找对应冻结行从第一行起的最长连续前缀，只计这一段。其余写法一律不计；反向范围按 sed 语义只算起始行；结果被会话换成落盘预览时一行不计；
 超出解析假设的单条记录跳过并计数，不中断准备。
 交付方式与补查沿用 A 组冻结的设置（与 `pipeline` 共用 `dispatch_recheck`），两组只差证据；只保留对应版本 Git blob 中存在
 的行，间隔不超过 3 行的合并成段。超预算时先取 excluded 锚点所在文件，再按首次读取顺序
