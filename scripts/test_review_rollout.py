@@ -99,6 +99,35 @@ class RolloutEvidenceTest(unittest.TestCase):
         reads.patch(cut)
         self.assertEqual(reads.lines, {("before", "f.py"): {5}})
 
+    def test_truncated_or_offloaded_output_only_counts_lines_actually_shown(self):
+        notice = "\n[output truncated: 9000 characters and 0 additional bytes omitted]"
+        diff = self.git("diff", "-U0", "HEAD^", "HEAD", "--", "f.py")
+        pointer = ("[output truncated: 40000 chars, 900 lines; full output saved to /tmp/off-1.txt]\n"
+                   + diff + "\n[Query it in place instead of reading it back: bash with `python3 -c '...'` "
+                   "over that path, printing only the fields you need, so only what you extract enters the context]")
+        calls = [
+            # 单个读取被截断：只计显示出的前三行。
+            ("bash", {"command": "sed -n '1,12p' f.py"}, "line 1\nline 2\nline 3" + notice),
+            # 多段命令被截断：分不清每段显示了多少，命令范围不计。
+            ("bash", {"command": "sed -n '1,5p' g.py && sed -n '1,5p' h.py"}, "line 1" + notice),
+            # 未截断的多段命令按范围全计。
+            ("bash", {"command": "sed -n '1,2p' g.py && echo --- && sed -n '3,3p' g.py"}, "line 1\nline 2\n---\nline 3\n"),
+            # 整个文件被截断：只计前两行。
+            ("bash", {"command": "cat h.py"}, "line 1\nline 2" + notice),
+            # 会话落盘预览：连补丁也不计。
+            ("bash", {"command": "git diff -U0 HEAD^ HEAD"}, pointer),
+        ]
+        path = self.root / "truncated.jsonl"
+        self.write_rollout(path, calls)
+        reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
+        self.assertEqual(reads.lines, {
+            ("after", "f.py"): {1, 2, 3},
+            ("after", "g.py"): {1, 2, 3},
+            ("after", "h.py"): {1, 2},
+        })
+        self.assertEqual(reads.counts["truncated-skipped"], 1)
+        self.assertEqual(reads.counts["offloaded-skipped"], 1)
+
     def test_spans_merge_gaps_of_at_most_three_lines(self):
         self.assertEqual(rollout.spans_of({1, 2, 3, 7, 8, 20}), [(1, 8), (20, 20)])
         self.assertEqual(rollout.spans_of({1, 6}), [(1, 1), (6, 6)])
@@ -131,7 +160,7 @@ class RolloutEvidenceTest(unittest.TestCase):
         self.assertFalse(kept & dropped)
         self.assertEqual(len(kept) + len(dropped), full["preparation"]["spans_total"])
 
-    def pipeline_base(self, meta):
+    def pipeline_base(self, meta, protocol=None):
         base = self.root / "pipeline"
         self.write_rollout(base / "initial/home/.kloop/projects/a/b/sessions/x.jsonl", self.fixture_calls())
         (base / "initial").mkdir(parents=True, exist_ok=True)
@@ -145,7 +174,7 @@ class RolloutEvidenceTest(unittest.TestCase):
         recheck.save_json(base / "protocol.json", {
             "baseline": self.revisions[0], "target": self.revisions[1], "max_chars": 160_000,
             "provider": "fixture", "sampling": {"model": "fixture", "max_output_tokens": 54321},
-            "config_sha256": recheck.digest(config.read_text())})
+            "config_sha256": recheck.digest(config.read_text()), **(protocol or {})})
         (base / "report-a.md").write_text("Initial report\n")
         return base, config
 
@@ -176,6 +205,32 @@ class RolloutEvidenceTest(unittest.TestCase):
         (base / "rollout-recheck-attempt.json").unlink()
         with self.assertRaisesRegex(ValueError, "not been attempted"):
             rollout.command(self.args(base, config, "b2"))
+
+    def test_recheck_reuses_the_frozen_delivery_mode_of_the_fixed_window_arm(self):
+        # A 组用结构化文本交付时，B 组也必须走同一套交付与校验，两组只差证据。
+        base, config = self.pipeline_base(
+            {"status": "failed", "recheck_requests": 1, "recheck_status": "failed"},
+            {"decision_contract": True, "decision_text": True, "repair_decision": True,
+             "evidence_tools": False})
+        seen = {}
+
+        def investigate(packet, provider, sampling, source, folder, **options):
+            seen.update(options)
+            folder.mkdir()
+            evidence = packet["evidence"][0]
+            recheck.save_json(folder / "verdicts.json", [{"id": "C1", "verdict": "excluded", "severity": None,
+                "reason": "guard kept", "missing": "", "evidence": [{"source": evidence["id"], "line": evidence["start"]}]}])
+            return {"status": "valid", "requests": 2}
+
+        with mock.patch.object(pipeline.review_evidence, "investigate", side_effect=investigate), \
+                mock.patch.object(pipeline, "independent_request") as plain:
+            with contextlib.redirect_stdout(io.StringIO()):
+                rollout.command(self.args(base, config, "b1"))
+        plain.assert_not_called()
+        self.assertEqual((seen["decision_contract"], seen["decision_text"], seen["repair_decision"],
+                          seen["with_tools"]), (True, True, True, False))
+        meta = recheck.load_json(self.root / "b1/meta.json")
+        self.assertEqual((meta["status"], meta["recheck_requests"]), ("complete", 2))
 
     def test_recheck_pairs_with_an_attempted_fixed_window_arm_and_never_retries(self):
         base, config = self.pipeline_base({"status": "failed", "recheck_requests": 0})

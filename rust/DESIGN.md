@@ -4783,7 +4783,9 @@ severity、reason、comparison、basis、evidence、missing；动态函数 schem
 
 `rollout-recheck <pipeline-out> <out>`（plan 281）对同一份初审账本做配对复核，只把证据
 换成初审在 rollout 里实际读过的行：`read_file` 返回的行号、输出中补丁实际显示的行、
-`sed -n`/`nl`/`cat`/`git show REV:path` 片段、grep 命中行；只保留对应版本 Git blob 中存在
+`sed -n`/`nl`/`cat`/`git show REV:path` 片段、grep 命中行。命令推导的范围只在输出未截断时
+全计；被 bash 截断时只认单个读取命令显示出的前几行，结果被会话换成落盘预览时一行不计。
+交付方式与补查沿用 A 组冻结的设置（与 `pipeline` 共用 `dispatch_recheck`），两组只差证据；只保留对应版本 Git blob 中存在
 的行，间隔不超过 3 行的合并成段。超预算时先取 excluded 锚点所在文件，再按首次读取顺序
 整段取舍，丢弃段记入包内。要求 A 组已有结果（发过请求、无候选，或账本保存后准备失败），
 发请求前以独占文件登记，不重试。实测无明确收益，仅作开发入口。

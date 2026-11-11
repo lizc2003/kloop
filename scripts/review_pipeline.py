@@ -319,6 +319,21 @@ def independent_request(packet, provider, sampling, out):
     return meta
 
 
+def dispatch_recheck(protocol, packet, provider, source, folder):
+    """按冻结协议发出一次复核：交付方式（普通 JSON、结构化提交、结构化文本）与可选补查都
+    沿用初审时冻结的设置。配对的另一组（plan 281）也走这里，两组只差证据。"""
+    if protocol.get("evidence_tools", False) or protocol.get("decision_contract", False):
+        return review_evidence.investigate(
+            packet, provider, protocol["sampling"], source, folder,
+            with_tools=protocol.get("evidence_tools", False),
+            max_requests=protocol.get("evidence_requests", 8), max_calls=protocol.get("evidence_calls", 64),
+            max_chars=protocol.get("evidence_chars", 160_000),
+            decision_contract=protocol.get("decision_contract", False),
+            repair_decision=protocol.get("repair_decision", False),
+            decision_text=protocol.get("decision_text", False))
+    return independent_request(packet, provider, protocol["sampling"], folder)
+
+
 def report_b(report, rows, packet):
     text = report + "\n\nIndependent recheck (unscored; citations mechanically validated):\n\n"
     sources = {source["id"]: source for source in packet["evidence"]}
@@ -361,16 +376,8 @@ def finish(args, out, protocol, report, ledger, meta, claim=None):
         if claim is not None:
             claim()
         meta["recheck_requests"] = 1
-        if protocol.get("evidence_tools", False) or protocol.get("decision_contract", False):
-            result = review_evidence.investigate(packet, provider, protocol["sampling"], args.source,
-                out / "recheck", with_tools=protocol["evidence_tools"], max_requests=protocol["evidence_requests"],
-                max_calls=protocol["evidence_calls"], max_chars=protocol["evidence_chars"],
-                decision_contract=protocol.get("decision_contract", False),
-                repair_decision=protocol.get("repair_decision", False),
-                decision_text=protocol.get("decision_text", False))
-            meta["recheck_requests"] = result["requests"]
-        else:
-            result = independent_request(packet, provider, protocol["sampling"], out / "recheck")
+        result = dispatch_recheck(protocol, packet, provider, args.source, out / "recheck")
+        meta["recheck_requests"] = result.get("requests", 1)
         meta["recheck_status"] = result["status"]
         if result["status"] != "valid":
             raise ValueError("independent recheck did not deliver valid verdicts")

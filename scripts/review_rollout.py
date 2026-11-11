@@ -21,6 +21,9 @@ SED_RANGE = re.compile(r"""^sed\s+-n\s+['"]?(\d+)(?:,(\d+))?p['"]?(?:\s+(\S+))?$
 SHOW_BLOB = re.compile(r"^git\s+show\s+(\S+?):(\S+)$")
 GREP_LINE = re.compile(r"^(?:(?P<rev>[0-9a-fA-F]{7,40}|HEAD[\^~0-9]*):)?(?P<path>[^:\s][^:\n]*):(?P<line>\d+):")
 NUMBERED = re.compile(r"^(\d+)\t")
+# bash 内联截断说明（tools/bash.rs `format_output`）与会话落盘预览的结尾（history.rs `POINTER_END`）。
+BASH_TRUNCATION = "\n[output truncated: "
+OFFLOAD_POINTER_END = "so only what you extract enters the context]"
 
 
 def split_unquoted(text, separators):
@@ -158,8 +161,16 @@ class Reads:
                 self.add("after", single_file, [int(number.group(1))], "grep")
 
     def bash(self, command, output):
+        # 整份结果被会话换成落盘预览时，模型只看到首尾片段，哪一行都无法确认读过。
+        if output.rstrip().endswith(OFFLOAD_POINTER_END):
+            self.counts["offloaded-skipped"] = self.counts.get("offloaded-skipped", 0) + 1
+            return
+        shown, notice, _ = output.partition(BASH_TRUNCATION)
+        truncated = bool(notice)
         base = str(self.snapshot)
-        for segment in split_unquoted(command, ["&&", "||", ";", "\n"]):
+        segments = split_unquoted(command, ["&&", "||", ";", "\n"])
+        reads = []  # (version, path, start, end)；end 为 None 表示整个文件
+        for segment in segments:
             if segment.startswith("cd "):
                 target = unquote(segment[3:].strip())
                 base = os.path.realpath(target if os.path.isabs(target) else os.path.join(base, target))
@@ -170,29 +181,41 @@ class Reads:
             if match := SED_RANGE.match(first):
                 start, end, path = int(match.group(1)), int(match.group(2) or match.group(1)), match.group(3)
                 if path:
-                    self.add("after", self.relative(path, base), range(start, end + 1), "sed")
+                    reads.append(("after", self.relative(path, base), start, end, "sed"))
             elif match := SHOW_BLOB.match(first):
                 version, path = self.version_of(match.group(1)), unquote(match.group(2))
                 if sed:
-                    start, end = int(sed.group(1)), int(sed.group(2) or sed.group(1))
-                    self.add(version, path, range(start, end + 1), "show-blob")
+                    reads.append((version, path, int(sed.group(1)), int(sed.group(2) or sed.group(1)), "show-blob"))
                 elif len(stages) == 1:
-                    self.add_whole(version, path, "show-blob")
+                    reads.append((version, path, 1, None, "show-blob"))
             elif first.startswith("nl ") and sed:
-                path = first.split()[-1]
-                start, end = int(sed.group(1)), int(sed.group(2) or sed.group(1))
-                self.add("after", self.relative(path, base), range(start, end + 1), "nl")
+                reads.append(("after", self.relative(first.split()[-1], base),
+                              int(sed.group(1)), int(sed.group(2) or sed.group(1)), "nl"))
             elif first.startswith("cat ") and len(stages) == 1 and len(first.split()) == 2:
-                self.add_whole("after", self.relative(first.split()[1], base), "cat")
+                reads.append(("after", self.relative(first.split()[1], base), 1, None, "cat"))
+        commands = [segment for segment in segments if not segment.startswith("cd ")]
+        if not truncated:
+            for version, path, start, end, kind in reads:
+                if end is None:
+                    self.add_whole(version, path, kind)
+                else:
+                    self.add(version, path, range(start, end + 1), kind)
+        elif len(commands) == 1 and len(reads) == 1:
+            # 截断时只认单个读取命令显示出的前几行；多段命令分不清每段显示了多少，不计。
+            version, path, start, end, kind = reads[0]
+            shown_lines = len(shown.splitlines())
+            last = start + shown_lines - 1 if end is None else min(end, start + shown_lines - 1)
+            self.add(version, path, range(start, last + 1), kind)
+        elif reads:
+            self.counts["truncated-skipped"] = self.counts.get("truncated-skipped", 0) + 1
         single = None
-        segments = split_unquoted(command, ["&&", "||", ";", "\n"])
-        if len(segments) == 1 and len(split_unquoted(segments[0], ["|"])) == 1:
-            words = segments[0].split()
+        if len(commands) == 1 and len(split_unquoted(commands[0], ["|"])) == 1:
+            words = commands[0].split()
             if words and words[0] in ("grep", "rg") and any(w.startswith("-") and "n" in w for w in words[1:]):
                 path = self.relative(words[-1], base)
                 single = path if path and self.file_lines("after", path) else None
-        self.patch(output)
-        self.grep_output(output, base, single)
+        self.patch(shown)
+        self.grep_output(shown, base, single)
 
     def read_file(self, arguments, output):
         path = self.relative(arguments.get("path", ""), str(self.snapshot))
@@ -335,13 +358,17 @@ def command(args):
             with attempt.open("x") as marker:
                 json.dump({"out": str(out)}, marker)
             meta["recheck_requests"] = 1
-            result = pipeline.independent_request(packet, provider, protocol["sampling"], out / "recheck")
+            # 与 A 组同一套交付方式与补查设置，两组只差证据来源。
+            result = pipeline.dispatch_recheck(protocol, packet, provider, source, out / "recheck")
+            meta["recheck_requests"] = result.get("requests", 1)
             meta["recheck_status"] = result["status"]
             if result["status"] != "valid":
                 raise ValueError("rollout recheck did not deliver valid verdicts")
             rows = recheck.load_json(out / "recheck/verdicts.json")
+            extended = out / "recheck/evidence-packet.json"
+            report_packet = recheck.load_json(extended) if extended.exists() else packet
             report = (base / "report-a.md").read_text()
-            (out / "report-b.md").write_text(pipeline.report_b(report, rows, packet))
+            (out / "report-b.md").write_text(pipeline.report_b(report, rows, report_packet))
             meta["status"] = "complete"
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         meta["error_type"] = type(error).__name__
