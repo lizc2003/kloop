@@ -317,6 +317,10 @@ mod tests {
             let cancel = CancellationToken::new();
             let output =
                 bash::run_process_foreground(spec, timeout_ms, &cancel, "powershell").await?;
+            // The executor returns the capture with a timeout marker; the tool
+            // turns that into the error the model sees, and the native
+            // lifecycle tests assert on that error.
+            bash::fail_if_timed_out(&output, None)?;
             Ok(bash::format_output(&output, None))
         }
 

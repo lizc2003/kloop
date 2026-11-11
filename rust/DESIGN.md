@@ -2540,7 +2540,8 @@ stdin once its stdout pipe fills, and a `post_tool` payload carrying a large
 tool result is enough to deadlock a write-then-wait runner until the timeout.
 Both output streams are drained to EOF while retaining at most 64 KiB, and a
 capped stream says how many bytes were dropped, so one chatty hook cannot flood
-the history it is injected into.
+the history it is injected into. The cap is final: bytes freed by cutting a
+partial character are not refilled.
 
 **Sub-agents** (dispatched by the `run_agent` tool) fire `subagent_start` /
 `subagent_stop` **instead of** `pre_turn` / `post_turn` — the split both cc
@@ -2971,7 +2972,9 @@ EOF, so a child filling one stream cannot deadlock behind an unread other
 stream. Each stream retains at most 1 MiB while continuing to drain
 discarded bytes, and a cap that lands inside a multi-byte character is cut back
 to the boundary so the retained bytes never decode as U+FFFD (nor absorb the
-first bytes of the other stream when the two are merged). The readers write into
+first bytes of the other stream when the two are merged); that trims a byte or
+two, and the capture is final from then on — later chunks are counted but not
+kept, so the buffer stays a prefix of the stream rather than a splice. The readers write into
 shared buffers rather than owning them, which is what lets a drain that outlives
 the reap bound still contribute: a descendant that left the process group keeps
 its inherited pipes open after the tree is reaped, and that case now returns the

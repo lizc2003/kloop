@@ -551,21 +551,29 @@ impl ForegroundOutput {
 struct BoundedStream {
     bytes: Vec<u8>,
     total_bytes: usize,
+    /// The cap was reached. Trimming an incomplete character opens a couple of
+    /// bytes of room again; without this flag the next chunks would refill them
+    /// and the capture would no longer be the stream's prefix.
+    capped: bool,
 }
 
 impl BoundedStream {
     fn push(&mut self, chunk: &[u8]) {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
-        let retained = FOREGROUND_STREAM_CAP_BYTES.saturating_sub(self.bytes.len());
-        if chunk.len() <= retained {
-            self.bytes.extend_from_slice(chunk);
-        } else {
-            self.bytes.extend_from_slice(&chunk[..retained]);
-            // The cap can land inside a multi-byte character. Keeping that
-            // partial sequence would decode as U+FFFD and, worse, absorb the
-            // first bytes of the other stream when the two are merged.
-            truncate_incomplete_utf8(&mut self.bytes);
+        if self.capped {
+            return;
         }
+        let room = FOREGROUND_STREAM_CAP_BYTES.saturating_sub(self.bytes.len());
+        if chunk.len() < room {
+            self.bytes.extend_from_slice(chunk);
+            return;
+        }
+        self.bytes.extend_from_slice(&chunk[..room]);
+        // The cap can land inside a multi-byte character. Keeping that
+        // partial sequence would decode as U+FFFD and, worse, absorb the
+        // first bytes of the other stream when the two are merged.
+        truncate_incomplete_utf8(&mut self.bytes);
+        self.capped = true;
     }
 }
 
@@ -608,7 +616,16 @@ async fn finish_foreground_readers(
         finish_reader(stdout_task, tool),
         finish_reader(stderr_task, tool)
     );
-    Ok(stdout? || stderr?)
+    merge_drains(stdout, stderr)
+}
+
+/// Both drains are always observed. `stdout? || stderr?` short-circuits: a
+/// stalled stdout reports `true` and the stderr read error is never looked at.
+fn merge_drains(stdout: Result<bool>, stderr: Result<bool>) -> Result<bool> {
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => Ok(stdout || stderr),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 
 async fn finish_reader(
@@ -1622,6 +1639,33 @@ mod tests {
     /// The 1 MiB per-stream cap can land inside a character. If it does, the
     /// stream must end on a boundary: otherwise the spilled file's stdout tail
     /// decodes as U+FFFD, and the first bytes of stderr get absorbed into it.
+    /// Trimming the incomplete character at the cap frees a byte or two. Later
+    /// chunks must not refill that room: the capture is a prefix, and splicing
+    /// bytes from beyond the cap onto it would end it somewhere it never was.
+    #[test]
+    fn a_capped_stream_never_resumes_filling() {
+        let cap = super::FOREGROUND_STREAM_CAP_BYTES;
+        let mut stream = super::BoundedStream::default();
+        stream.push(&vec![b'a'; cap - 1]);
+        // Two bytes of 中, so the cap lands inside the character.
+        stream.push(&"中".as_bytes()[..2]);
+        assert_eq!(stream.bytes.len(), cap - 1);
+        stream.push(b"STRAY");
+        assert_eq!(stream.bytes, vec![b'a'; cap - 1]);
+        assert_eq!(stream.total_bytes, cap - 1 + 2 + 5);
+    }
+
+    #[test]
+    fn a_stalled_stream_does_not_hide_the_other_streams_read_error() {
+        fn failed() -> anyhow::Result<bool> {
+            Err(anyhow::anyhow!("reader failed"))
+        }
+        assert!(super::merge_drains(Ok(true), failed()).is_err());
+        assert!(super::merge_drains(failed(), Ok(true)).is_err());
+        assert!(super::merge_drains(Ok(false), Ok(true)).unwrap());
+        assert!(!super::merge_drains(Ok(false), Ok(false)).unwrap());
+    }
+
     #[tokio::test]
     async fn a_capped_stream_ends_on_a_character_boundary() {
         let ctx = test_ctx(0, "bash-utf8-seam");

@@ -458,18 +458,27 @@ async fn run_hook(def: &HookDef, payload: &Value) -> HookRun {
 async fn read_capped(mut reader: impl tokio::io::AsyncRead + Unpin) -> (Vec<u8>, usize) {
     let mut bytes = Vec::new();
     let mut total = 0usize;
+    // Once the cap is hit the retained prefix is final: trimming an incomplete
+    // character frees a byte or two, and refilling them would splice later
+    // bytes onto a prefix that no longer ends where the cap did.
+    let mut capped = false;
     let mut chunk = [0u8; 8192];
     while let Ok(count) = reader.read(&mut chunk).await {
         if count == 0 {
             break;
         }
         total = total.saturating_add(count);
-        let room = OUTPUT_CAP_BYTES.saturating_sub(bytes.len());
-        let retained = count.min(room);
-        bytes.extend_from_slice(&chunk[..retained]);
-        if retained < count {
-            crate::tools::truncate_incomplete_utf8(&mut bytes);
+        if capped {
+            continue;
         }
+        let room = OUTPUT_CAP_BYTES.saturating_sub(bytes.len());
+        if count < room {
+            bytes.extend_from_slice(&chunk[..count]);
+            continue;
+        }
+        bytes.extend_from_slice(&chunk[..room]);
+        crate::tools::truncate_incomplete_utf8(&mut bytes);
+        capped = true;
     }
     (bytes, total)
 }
@@ -566,6 +575,19 @@ mod tests {
             "history got {} bytes",
             context[0].len()
         );
+    }
+
+    /// The same cap rule as the foreground readers: trimming an incomplete
+    /// character frees room that a later chunk must not refill.
+    #[tokio::test]
+    async fn a_capped_hook_stream_never_resumes_filling() {
+        let cap = OUTPUT_CAP_BYTES;
+        let mut data = vec![b'a'; cap - 1];
+        data.extend_from_slice(&"中".as_bytes()[..2]);
+        data.extend_from_slice(b"STRAY");
+        let (bytes, total) = read_capped(&data[..]).await;
+        assert_eq!(bytes, vec![b'a'; cap - 1]);
+        assert_eq!(total, cap - 1 + 2 + 5);
     }
 
     /// Exit 2 blocks; the reason channel is stderr, with stdout and the bare
