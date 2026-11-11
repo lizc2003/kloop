@@ -25,6 +25,7 @@ NUMBERED = re.compile(r"^(\d+)\t")
 BASH_TRUNCATION = "\n[output truncated: "
 OFFLOAD_POINTER_END = "so only what you extract enters the context]"
 NL_PREFIX = re.compile(r"^\s*\d+\t")
+STREAM_FILTER = re.compile(r"^(nl|head|tail)(\s|$)")
 
 
 def split_unquoted(text, separators):
@@ -197,11 +198,15 @@ class Reads:
             elif first.startswith("cat ") and len(stages) == 1 and len(first.split()) == 2:
                 reads.append(("after", self.relative(first.split()[1], base), 1, None, "cat", False))
         commands = [segment for segment in segments if not segment.startswith("cd ")]
-        # 命令只说明想读哪里；是否真的显示要看输出。只有一个读取段时，在输出里找它对应
-        # 冻结行从第一行起的最长连续前缀，只计这一段：截断、`| head`、过滤、没执行的条件
-        # 分支都由此排除。多个读取段时分不清哪段输出属于哪个文件（没执行的段可能与执行
-        # 了的段开头相同），整条不计。
-        if len(reads) == 1:
+        # 命令只说明想读哪里；是否真的显示要看输出，而且输出只能有这一个来源。去掉 `cd`
+        # 后整条命令只有一段、管道首段是已识别的读取、其余阶段都是同一条流上的过滤
+        # （`nl`、`sed -n` 范围、`head`、`tail`）时，在输出里找对应冻结行从第一行起的最长
+        # 连续前缀，只计这一段：截断、`| head`、过滤由此排除。只要还有别的段或阶段可能
+        # 产生输出（`false && sed …; head h.py`），就分不清输出归属，整条不计。
+        single_source = (len(commands) == 1 and len(reads) == 1
+                         and all(STREAM_FILTER.match(stage) or SED_RANGE.match(stage)
+                                 for stage in split_unquoted(commands[0], ["|"])[1:]))
+        if single_source:
             version, path, start, end, kind, numbered = reads[0]
             content = self.file_lines(version, path) if version and path else None
             if content and start <= len(content):
@@ -214,7 +219,7 @@ class Reads:
                 if length < len(expected):
                     self.counts["unshown"] = self.counts.get("unshown", 0) + len(expected) - length
         elif reads:
-            self.counts["ambiguous-skipped"] = self.counts.get("ambiguous-skipped", 0) + len(reads)
+            self.counts["unattributed-skipped"] = self.counts.get("unattributed-skipped", 0) + len(reads)
         single = None
         if len(commands) == 1 and len(split_unquoted(commands[0], ["|"])) == 1:
             words = commands[0].split()

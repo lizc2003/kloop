@@ -119,6 +119,9 @@ class RolloutEvidenceTest(unittest.TestCase):
             ("bash", {"command": "false && sed -n '1,5p' g.py; cat h.py"}, "line 1\nline 2\nline 3\n"),
             ("bash", {"command": "sed -n '1,2p' g.py && echo --- && sed -n '3,3p' g.py"},
              "line 1\nline 2\n---\nline 3\n"),
+            # 只有一个已识别读取，但还有别的段或阶段能产生输出：归属不明，整条不计。
+            ("bash", {"command": "false && sed -n '1,5p' g.py; head -n 3 h.py"}, "line 1\nline 2\nline 3\n"),
+            ("bash", {"command": "sed -n '1,5p' g.py | paste - h.py"}, "line 1\tline 1\n"),
             # nl 的行号前缀去掉后比较，nl 在管道中间也一样。
             ("bash", {"command": "nl -ba g.py | sed -n '4,5p'"}, "     4\tline 4\n     5\tline 5\n"),
             ("bash", {"command": "git show HEAD^:f.py | nl -ba | sed -n '2,3p'"},
@@ -139,7 +142,7 @@ class RolloutEvidenceTest(unittest.TestCase):
             ("after", "g.py"): {4, 5},
             ("after", "h.py"): {1, 2},
         })
-        self.assertEqual(reads.counts["ambiguous-skipped"], 4)
+        self.assertEqual(reads.counts["unattributed-skipped"], 7)
         self.assertEqual(reads.counts["offloaded-skipped"], 1)
         self.assertEqual(reads.counts["unparsed"], 1)
 
