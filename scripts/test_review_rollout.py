@@ -110,11 +110,13 @@ class RolloutEvidenceTest(unittest.TestCase):
             ("bash", {"command": "sed -n '1,12p' f.py"}, "line 1\nline 2\nline 3" + notice),
             # 管道过滤：`| head -n 1` 只显示一行。
             ("bash", {"command": "sed -n '4,12p' f.py | head -n 1"}, "line 4\n"),
+            # 反向范围：sed 只打印起始行。
+            ("bash", {"command": "sed -n '5,3p' f.py"}, "line 5 changed\n"),
             # 条件分支没执行：没有输出，一行不计。
             ("bash", {"command": "false && sed -n '6,7p' f.py"}, ""),
-            # 多段命令按顺序匹配：g.py 显示了第一行，h.py 没有出现（同文本不串到 h.py）。
-            ("bash", {"command": "sed -n '1,5p' g.py && sed -n '1,5p' h.py"}, "line 1" + notice),
-            # 完整输出的多段命令：两段都计。
+            # 多个读取段分不清输出归属：g.py 与 h.py 开头相同、g.py 那段没执行，整条不计，
+            # 也不能把 h.py 的输出记到 g.py 上。
+            ("bash", {"command": "false && sed -n '1,5p' g.py; cat h.py"}, "line 1\nline 2\nline 3\n"),
             ("bash", {"command": "sed -n '1,2p' g.py && echo --- && sed -n '3,3p' g.py"},
              "line 1\nline 2\n---\nline 3\n"),
             # nl 的行号前缀去掉后比较，nl 在管道中间也一样。
@@ -125,23 +127,27 @@ class RolloutEvidenceTest(unittest.TestCase):
             ("bash", {"command": "cat h.py"}, "line 1\nline 2" + notice),
             # 会话落盘预览：连补丁也不计。
             ("bash", {"command": "git diff -U0 HEAD^ HEAD"}, pointer),
+            # 解析器假设之外的输入：这一条不计，不中断整次准备。
+            ("read_file", {"path": None}, "1\tline 1"),
         ]
         path = self.root / "shown.jsonl"
         self.write_rollout(path, calls)
         reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
         self.assertEqual(reads.lines, {
-            ("after", "f.py"): {1, 2, 3, 4},
+            ("after", "f.py"): {1, 2, 3, 4, 5},
             ("before", "f.py"): {2, 3},
-            ("after", "g.py"): {1, 2, 3, 4, 5},
+            ("after", "g.py"): {4, 5},
             ("after", "h.py"): {1, 2},
         })
+        self.assertEqual(reads.counts["ambiguous-skipped"], 4)
         self.assertEqual(reads.counts["offloaded-skipped"], 1)
+        self.assertEqual(reads.counts["unparsed"], 1)
 
     def test_longest_shown_prefix_starts_at_the_first_expected_line(self):
-        self.assertEqual(rollout.longest_shown_prefix(["a", "b", "c"], ["x", "a", "b", "y", "a", "b", "c"]), (4, 3))
-        self.assertEqual(rollout.longest_shown_prefix(["a", "b"], ["b", "a"]), (1, 1))
-        self.assertEqual(rollout.longest_shown_prefix(["a"], ["a", "a"], start=1), (1, 1))
-        self.assertEqual(rollout.longest_shown_prefix(["a"], ["b"]), (0, 0))
+        self.assertEqual(rollout.longest_shown_prefix(["a", "b", "c"], ["x", "a", "b", "y", "a", "b", "c"]), 3)
+        self.assertEqual(rollout.longest_shown_prefix(["a", "b"], ["b", "a"]), 1)
+        self.assertEqual(rollout.longest_shown_prefix(["a"], ["b"]), 0)
+        self.assertEqual(rollout.longest_shown_prefix([], ["a"]), 0)
 
     def test_spans_merge_gaps_of_at_most_three_lines(self):
         self.assertEqual(rollout.spans_of({1, 2, 3, 7, 8, 20}), [(1, 8), (20, 20)])

@@ -181,39 +181,40 @@ class Reads:
             # 管道里任何一段是 `nl` 时输出带行号前缀，比较前去掉。
             numbered = any(stage == "nl" or stage.startswith("nl ") for stage in stages)
             if match := SED_RANGE.match(first):
-                start, end, path = int(match.group(1)), int(match.group(2) or match.group(1)), match.group(3)
+                start, end, path = int(match.group(1)), max(int(match.group(1)), int(match.group(2) or match.group(1))), match.group(3)
                 if path:
                     reads.append(("after", self.relative(path, base), start, end, "sed", numbered))
             elif match := SHOW_BLOB.match(first):
                 version, path = self.version_of(match.group(1)), unquote(match.group(2))
                 if sed:
-                    reads.append((version, path, int(sed.group(1)), int(sed.group(2) or sed.group(1)),
+                    reads.append((version, path, int(sed.group(1)), max(int(sed.group(1)), int(sed.group(2) or sed.group(1))),
                                   "show-blob", numbered))
                 elif len(stages) == 1:
                     reads.append((version, path, 1, None, "show-blob", False))
             elif first.startswith("nl ") and sed:
                 reads.append(("after", self.relative(first.split()[-1], base),
-                              int(sed.group(1)), int(sed.group(2) or sed.group(1)), "nl", True))
+                              int(sed.group(1)), max(int(sed.group(1)), int(sed.group(2) or sed.group(1))), "nl", True))
             elif first.startswith("cat ") and len(stages) == 1 and len(first.split()) == 2:
                 reads.append(("after", self.relative(first.split()[1], base), 1, None, "cat", False))
         commands = [segment for segment in segments if not segment.startswith("cd ")]
-        # 命令只说明想读哪里；是否真的显示要看输出。按命令顺序在输出里找每个读取对应
-        # 冻结行从第一行起的最长连续前缀，只计这一段：截断、`| head`、`| grep`、没执行
-        # 的条件分支都由此排除。顺序匹配让两个文件里相同的一行不会被算到错误的文件上。
-        output_lines = shown.splitlines()
-        cursor = 0
-        for version, path, start, end, kind, numbered in reads:
+        # 命令只说明想读哪里；是否真的显示要看输出。只有一个读取段时，在输出里找它对应
+        # 冻结行从第一行起的最长连续前缀，只计这一段：截断、`| head`、过滤、没执行的条件
+        # 分支都由此排除。多个读取段时分不清哪段输出属于哪个文件（没执行的段可能与执行
+        # 了的段开头相同），整条不计。
+        if len(reads) == 1:
+            version, path, start, end, kind, numbered = reads[0]
             content = self.file_lines(version, path) if version and path else None
-            if not content or start > len(content):
-                continue
-            expected = content[start - 1:(len(content) if end is None else min(end, len(content)))]
-            lines = [NL_PREFIX.sub("", line, count=1) for line in output_lines] if numbered else output_lines
-            position, length = longest_shown_prefix(expected, lines, cursor)
-            if length:
-                self.add(version, path, range(start, start + length), kind)
-                cursor = position + length
-            if length < len(expected):
-                self.counts["unshown"] = self.counts.get("unshown", 0) + len(expected) - length
+            if content and start <= len(content):
+                expected = content[start - 1:(len(content) if end is None else min(end, len(content)))]
+                output_lines = shown.splitlines()
+                lines = [NL_PREFIX.sub("", line, count=1) for line in output_lines] if numbered else output_lines
+                length = longest_shown_prefix(expected, lines)
+                if length:
+                    self.add(version, path, range(start, start + length), kind)
+                if length < len(expected):
+                    self.counts["unshown"] = self.counts.get("unshown", 0) + len(expected) - length
+        elif reads:
+            self.counts["ambiguous-skipped"] = self.counts.get("ambiguous-skipped", 0) + len(reads)
         single = None
         if len(commands) == 1 and len(split_unquoted(commands[0], ["|"])) == 1:
             words = commands[0].split()
@@ -234,20 +235,19 @@ class Reads:
         self.grep_output(output, str(self.snapshot), single)
 
 
-def longest_shown_prefix(expected, lines, start=0):
-    """`expected` 从第一行起在 `lines[start:]` 里连续出现的最长前缀：返回（位置，长度）。"""
-    best = (start, 0)
-    for index in range(start, len(lines)):
-        if lines[index] != expected[0]:
+def longest_shown_prefix(expected, lines):
+    """`expected` 从第一行起在 `lines` 里连续出现的最长长度；空的 `expected` 为 0。"""
+    best = 0
+    for index, line in enumerate(lines):
+        if not expected or line != expected[0]:
             continue
         length = 0
         while (length < len(expected) and index + length < len(lines)
                and lines[index + length] == expected[length]):
             length += 1
-        if length > best[1]:
-            best = (index, length)
-            if length == len(expected):
-                break
+        best = max(best, length)
+        if best == len(expected):
+            break
     return best
 
 
@@ -275,12 +275,16 @@ def read_regions(rollout, snapshot, source, revisions):
             elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
                 call, output = calls[block["tool_use_id"]], text_of(block.get("content"))
                 arguments = call.get("input") or {}
-                if call.get("name") == "bash":
-                    reads.bash(arguments.get("command", ""), output)
-                elif call.get("name") == "read_file":
-                    reads.read_file(arguments, output)
-                elif call.get("name") == "grep":
-                    reads.grep_tool(arguments, output)
+                try:
+                    if call.get("name") == "bash":
+                        reads.bash(arguments.get("command", ""), output)
+                    elif call.get("name") == "read_file":
+                        reads.read_file(arguments, output)
+                    elif call.get("name") == "grep":
+                        reads.grep_tool(arguments, output)
+                except (ValueError, IndexError, KeyError, TypeError, AttributeError):
+                    # 读法超出解析器的假设时这一条不计（保守），不能让整次复核准备中断。
+                    reads.counts["unparsed"] = reads.counts.get("unparsed", 0) + 1
     return reads
 
 
