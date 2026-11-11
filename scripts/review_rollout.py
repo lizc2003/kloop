@@ -13,10 +13,6 @@ import review_pipeline as pipeline
 
 
 MERGE_GAP = 3
-PATCH_FILE = re.compile(r"^diff --git a/(\S+) b/(\S+)$")
-PATCH_NEW = re.compile(r"^\+\+\+ (?:b/(\S+)|/dev/null)$")
-PATCH_OLD = re.compile(r"^--- (?:a/(\S+)|/dev/null)$")
-HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 GREP_LINE = re.compile(r"^(?:(?P<rev>[0-9a-fA-F]{7,40}|HEAD[\^~0-9]*):)?(?P<path>[^:\s][^:\n]*):(?P<line>\d+):")
 NUMBERED = re.compile(r"^(\d+)\t")
 # bash 内联截断说明（tools/bash.rs `format_output`）与会话落盘预览的结尾（history.rs `POINTER_END`）。
@@ -80,37 +76,6 @@ class Reads:
         self.first_seen.setdefault((version, path), len(self.first_seen))
         self.counts[kind] = self.counts.get(kind, 0) + len(valid)
 
-    def patch(self, output):
-        old = new = None
-        before = after = None
-        for line in output.splitlines():
-            if match := PATCH_FILE.match(line):
-                old, new, before = match.group(1), match.group(2), None
-                continue
-            if match := PATCH_OLD.match(line):
-                old, before = match.group(1), None
-                continue
-            if match := PATCH_NEW.match(line):
-                new, before = match.group(1), None
-                continue
-            if match := HUNK.match(line):
-                before, after = int(match.group(1)), int(match.group(3))
-                continue
-            if before is None:
-                continue
-            if line.startswith(" "):
-                self.add("before", old, [before], "patch")
-                self.add("after", new, [after], "patch")
-                before, after = before + 1, after + 1
-            elif line.startswith("-"):
-                self.add("before", old, [before], "patch")
-                before += 1
-            elif line.startswith("+"):
-                self.add("after", new, [after], "patch")
-                after += 1
-            elif not line.startswith("\\"):
-                before = None
-
     def grep_output(self, output, *, base, single_file=None):
         """`base` 为 None 时相对路径的基准不明（bash 的 cwd 无从确认），只认绝对路径；
         `git grep REV:路径` 默认也相对当前目录，同样跳过。"""
@@ -127,19 +92,16 @@ class Reads:
             elif single_file and (number := re.match(r"^(\d+):", line)):
                 self.add("after", single_file, [int(number.group(1))], "grep")
 
-    def bash(self, command, output):
-        """只计输出里自带来源与行号的部分：git 补丁（文件头 + hunk 行号）与绝对路径的
-        grep 格式 `路径:行号:`。`sed`/`cat`/`nl`/`git show` 等的来源、相对路径的基准都要从命令
-        推断（cwd、管道、重定向、文件参数、条件分支），推断做不全，一律不计。"""
+    def bash(self, output):
+        """只计绝对路径的 grep 格式 `路径:行号:`。其余来源或路径基准都要从命令与环境推断，
+        推断做不全，一律不计：`sed`/`cat`/`nl`/`git show`（管道、重定向、文件参数、条件分支）、
+        相对路径（cwd），以及 git 补丁——补丁路径相对哪个仓库、哪一级目录取决于 cwd、`git -C`
+        和 `diff.relative` 等配置，输出本身看不出来。"""
         # 整份结果被会话换成落盘预览时，模型只看到首尾片段，哪一行都无法确认读过。
         if output.rstrip().endswith(OFFLOAD_POINTER_END):
             self.counts["offloaded-skipped"] = self.counts.get("offloaded-skipped", 0) + 1
             return
-        shown = output.partition(BASH_TRUNCATION)[0]
-        # git 补丁的路径默认相对仓库根，与 cwd 无关；`--relative` 改成相对 cwd，基准不明，跳过。
-        if "--relative" not in command:
-            self.patch(shown)
-        self.grep_output(shown, base=None)
+        self.grep_output(output.partition(BASH_TRUNCATION)[0], base=None)
 
     def read_file(self, arguments, output):
         path = self.relative(arguments.get("path", ""), str(self.snapshot))
@@ -179,7 +141,7 @@ def read_regions(rollout, snapshot, source, revisions):
                 arguments = call.get("input") or {}
                 try:
                     if call.get("name") == "bash":
-                        reads.bash(arguments.get("command", ""), output)
+                        reads.bash(output)
                     elif call.get("name") == "read_file":
                         reads.read_file(arguments, output)
                     elif call.get("name") == "grep":

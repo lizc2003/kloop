@@ -83,21 +83,10 @@ class RolloutEvidenceTest(unittest.TestCase):
         path = self.root / "rollout.jsonl"
         self.write_rollout(path, self.fixture_calls())
         reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
-        # 只有来源明确的读取计入：read_file、补丁、grep 工具与绝对路径的 bash grep 输出；
-        # sed、`git show | sed`、cat、无路径或相对路径的 bash grep 不计。
-        self.assertEqual(reads.lines, {
-            ("after", "f.py"): {2, 3, 5, 9, 12},
-            ("before", "f.py"): {5},
-            ("after", "g.py"): {3},
-        })
-        self.assertEqual(list(reads.first_seen), [("after", "f.py"), ("before", "f.py"), ("after", "g.py")])
-
-    def test_truncated_patch_only_counts_shown_lines(self):
-        diff = self.git("diff", "-U0", "HEAD^", "HEAD", "--", "f.py")
-        cut = diff[:diff.index("+line 5 changed")]
-        reads = rollout.Reads(self.repo, self.repo, self.versions)
-        reads.patch(cut)
-        self.assertEqual(reads.lines, {("before", "f.py"): {5}})
+        # 只有来源明确的读取计入：read_file、grep 工具与绝对路径的 bash grep 输出；
+        # sed、`git show | sed`、cat、bash 里的补丁、无路径或相对路径的 bash grep 不计。
+        self.assertEqual(reads.lines, {("after", "f.py"): {2, 3, 12}, ("after", "g.py"): {3}})
+        self.assertEqual(list(reads.first_seen), [("after", "f.py"), ("after", "g.py")])
 
     def test_bash_reads_count_only_with_an_explicit_source_and_line(self):
         notice = "\n[output truncated: 9000 characters and 0 additional bytes omitted]"
@@ -118,10 +107,11 @@ class RolloutEvidenceTest(unittest.TestCase):
             # 相对路径的基准取决于 cwd，无从确认：跳过，不按仓库根猜。
             ("bash", {"command": "cd src && rg -n --with-filename needle f.py"}, "f.py:2:line 2\n"),
             ("bash", {"command": "git grep -n line HEAD"}, "HEAD:g.py:3:line 3\n"),
-            # `--relative` 让补丁路径相对 cwd：跳过。
-            ("bash", {"command": "git diff --relative -U0 HEAD^ HEAD"}, diff),
-            # 会话落盘预览：连补丁也不计。
-            ("bash", {"command": "git diff -U0 HEAD^ HEAD"}, pointer),
+            # 补丁路径的基准取决于 cwd、`git -C` 与 diff.relative 配置，命令里看不全：不计。
+            ("bash", {"command": "git diff -U0 HEAD^ HEAD"}, diff),
+            ("bash", {"command": "cd src && git -c diff.relative=true diff -U0 HEAD^ HEAD"}, diff),
+            # 会话落盘预览：整条跳过。
+            ("bash", {"command": f"grep -rn line {self.repo}"}, pointer.replace(diff, f"{self.repo}/g.py:4:line 4\n")),
             # 解析器假设之外的输入：这一条不计，不中断整次准备。
             ("read_file", {"path": None}, "1\tline 1"),
         ]

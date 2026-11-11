@@ -4782,13 +4782,14 @@ severity、reason、comparison、basis、evidence、missing；动态函数 schem
 接口边界，不能据此区分上游模型生成和服务端转换。
 
 `rollout-recheck <pipeline-out> <out>`（plan 281）对同一份初审账本做配对复核，只把证据
-换成初审在 rollout 里实际读过、且来源与行号都明确的行：`read_file` 返回的行号、输出中
-补丁实际显示的行、grep 工具输出的 `路径:行号:`（相对路径按会话工作目录解析；指定单个文件时为
-`行号:`）、bash 输出里绝对路径的 `路径:行号:`。`sed`、`cat`、`nl`、`git show REV:path` 等的来源
-要从命令推断，推断做不全（管道、重定向、文件参数、条件分支），一律不计；bash 输出里的相对
-路径与 `git grep` 的 `REV:路径` 相对 cwd，带 `--relative` 的补丁同样相对 cwd，基准都无从确认，
-跳过并计数，不按仓库根猜——DeepSeek 初审多用 `sed` 读代码、grep 用相对路径，这一入口能拿到
-的证据因此很少；结果被会话换成落盘预览时一行不计；
+换成初审在 rollout 里实际读过、且来源与行号都明确的行：`read_file` 返回的行号、grep 工具
+输出的 `路径:行号:`（相对路径按会话工作目录解析；指定单个文件时为 `行号:`）、bash 输出里绝对
+路径的 `路径:行号:`。`sed`、`cat`、`nl`、`git show REV:path` 等的来源要从命令推断，推断做不全
+（管道、重定向、文件参数、条件分支），一律不计；bash 输出里的相对路径、`git grep` 的 `REV:路径`
+相对 cwd，跳过并计数，不按仓库根猜；bash 输出里的 git 补丁同样不计——路径相对哪个仓库、哪一级
+目录取决于 cwd、`git -C` 与 `diff.relative` 配置，输出看不出来。DeepSeek 初审只用 bash 读代码
+（`sed`、相对路径 grep、`git diff`），plan 281 的两份 rollout 按此规则一行证据都取不到；结果被
+会话换成落盘预览时一行不计；
 超出解析假设的单条记录跳过并计数，不中断准备。
 交付方式与补查沿用 A 组冻结的设置（与 `pipeline` 共用 `dispatch_recheck`），两组只差证据；只保留对应版本 Git blob 中存在
 的行，间隔不超过 3 行的合并成段。超预算时先取 excluded 锚点所在文件，再按首次读取顺序
