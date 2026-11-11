@@ -1,7 +1,7 @@
 # Plan 255 — bash 前台输出、超时语义与 hook 子进程 IO
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
+> 状态：✅ 已完成(2026-11-11)。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
 > 先读代码确认，不成立就在本文件划掉并写明原因。
 
 ## 问题
@@ -28,8 +28,8 @@
    5 秒仍是 Stopping 也返回 `Stopped {id}`;`:633-638` `killer.terminate()` 出错后
    `signal_sent = true`,此后不再重试。
 7. **轮询与预分配**(优化)。`background.rs:83-92`、`122-128` 的 `bash_output`/`stop_bash` 每 100ms
-   查一次 registry,而 `BackgroundShells.activity` watch 已存在;`bash.rs:501` 每次前台调用给两个流
-   各 `with_capacity(150KB)`。
+   查一次 registry,而 `BackgroundShells.activity` watch 已存在;~~`bash.rs:501` 每次前台调用给两个流
+   各 `with_capacity(150KB)`~~(开工复核不成立：读取缓冲早已从 `Vec::new()` 起按需增长)。
 8. **hook 输出无上限，大 payload 下可能互锁**(上限已确认，互锁疑似)。`core/src/hooks.rs:405-422`:
    注释"The payload is tiny, so write-then-wait cannot deadlock",但 post_tool payload 带完整
    tool_result、pre_tool 带 Write 全文，超过管道缓冲时一个回显输入的 hook(`tee -a log`)会与
@@ -41,8 +41,9 @@
 ## 开工先问用户
 
 - 第 3 条上限取多少?推荐 600000(10 分钟),超过时报错并提示用后台执行。
+  **定：600000**(2026-11-11，按推荐)。
 - 第 4 条：(a) 两个流分别给预算(如 stderr 至少保留尾部 8KB);(b) 对合并结果按"头 + 尾"截断。
-  推荐 (a),保留 DESIGN"stdout 在前"的主体取舍。
+  推荐 (a),保留 DESIGN"stdout 在前"的主体取舍。**定：(a)**，stderr 尾部 8KB。
 
 ## 做法
 
@@ -67,3 +68,33 @@
   被拒，PowerShell 同;大 stdout + stderr 失败原因仍可见;中文输出 tail 首字符不是 U+FFFD;
   stop 超时后的文案;回显 stdin 的 hook 收到 200KB payload 不超时、输出被截断。
 - DESIGN 改写约 2612–2619 行与 hooks 一节;外层执行沙箱之外 `make check`;HANDOFF 记进展与教训。
+
+## 完成记录 ✅(2026-11-11)
+
+- **第 1/2 条**：读取任务只负责 `read`，字节写进共享的 `Arc<Mutex<BoundedStream>>`。排空窗口
+  到期只中止任务并保留已采字节，结果加一行说明"输出管道仍被脱离进程组的后代持有"，不再把
+  成功的命令变成错误；超时分支同样拿回已采输出，`bash`/`PowerShell` 把它连同
+  `[timed out after Nms]` 作为错误文本返回。转向中断仍严格返回 `interrupted` 并丢弃部分输出
+  ——dispatcher 与历史契约都按这段原文判定。
+- **第 3/9 条**：共用 `bounded_timeout_ms`（`1..=600000`）；`parse_bash_input` 只在非 background
+  时校验（该字段在后台被忽略），PowerShell 改调同一函数。schema 写 `minimum`/`maximum`。
+  外层 deadline 用例改为越界时回落到默认值。PowerShell 仍保留手写字段白名单而非 serde
+  `deny_unknown_fields`：后者会丢掉"foreground-only ... 不支持 background"的定向提示。
+- **第 4 条**：内联摘录改为 stdout 头 + stderr 尾（至少 8,000 字符，剩余预算继续给 stderr），
+  两段都被保留且有截断时加 `[... output omitted ...]` 接缝标记；落盘的仍是有损解码后的全文。
+- **第 5 条**：每流 1MiB 截断后用 `truncate_incomplete_utf8` 裁掉不完整序列（两个流也改为
+  分别解码，接缝不再互相吞字节）；`read_tail` 跳过开头的续字节，裁掉的字节计入 omitted。
+- **第 6 条**：`stop_bash` 用 `stop_report`：窗口内没停下来就报
+  `stop requested for <id> (<command>); it is still <state>`；terminate 失败由 watchdog 每 tick
+  重试，错误文本保留到最终状态。
+- **第 7 条**：两个 waiter 改为 `activity.subscribe()` + `timeout_at(deadline, changed())`，
+  醒来重读一次表；预分配一条已过期（见上）。
+- **第 8 条**：payload 写入与 stdout/stderr 读取 `join!` 并发；两个流都排空到 EOF、各保留
+  64KiB，超出部分附 `[hook output truncated: N bytes omitted]`。
+- **回归**（修复前先红）：setsid 后代持管道仍返回 `ok` + 说明 + 退出码；超时结果带已打印内容；
+  `timeout_ms` 0/越界被拒且未 spawn；大 stdout 时 stderr 失败原因可见；1MiB 截断处不出现
+  U+FFFD（手工禁用裁切验证过先红）；后台尾部首字符不是 U+FFFD；stop 未完成的文案；回显
+  stdin 的 hook 收 200KB payload 不超时且输出被截断。
+- **验证**：外层执行沙箱之外 `cargo test -p kloop-core --lib` 全绿（1366 项）；
+  `cargo clippy -p kloop-core --tests -- -D warnings` 与 `cargo fmt --all` 通过。未跑
+  `make check`，Windows 与 PowerShell 原生用例未实测（无本机环境）。

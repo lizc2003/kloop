@@ -570,22 +570,32 @@ fn bash_keeps_the_timeout_the_model_asked_for() {
     let budget = |input| super::Builtin::Bash.timeout(&input);
     let grace = super::BASH_TIMEOUT_GRACE;
 
-    // The model's value wins, whatever it is — high or low.
+    // The model's value wins, high or low, as long as the executor accepts it.
     assert_eq!(
         budget(json!({"command": "sleep 1", "timeout_ms": 5_000})),
         Some(Duration::from_secs(5) + grace)
     );
     assert_eq!(
-        budget(json!({"command": "sleep 1", "timeout_ms": 900_000})),
-        Some(Duration::from_secs(900) + grace)
+        budget(json!({"command": "sleep 1", "timeout_ms": 600_000})),
+        Some(Duration::from_secs(600) + grace)
     );
     // No value: bash's own default, not some new number.
     assert_eq!(
         budget(json!({"command": "sleep 1"})),
         Some(Duration::from_secs(60) + grace)
     );
+    // Out of range: the executor refuses the call before it spawns, so there is
+    // no inner bound for the outer one to sit above.
+    assert_eq!(
+        budget(json!({"command": "sleep 1", "timeout_ms": 900_000})),
+        Some(Duration::from_secs(60) + grace)
+    );
+    assert_eq!(
+        budget(json!({"command": "sleep 1", "timeout_ms": 0})),
+        Some(Duration::from_secs(60) + grace)
+    );
     // Strictly above the inner bound in every case, so the killing one wins.
-    for timeout_ms in [1_u64, 1_000, 60_000, 900_000] {
+    for timeout_ms in [1_u64, 1_000, 60_000, 600_000] {
         let outer = budget(json!({"command": "x", "timeout_ms": timeout_ms})).unwrap();
         assert!(outer > Duration::from_millis(timeout_ms), "{timeout_ms}");
     }

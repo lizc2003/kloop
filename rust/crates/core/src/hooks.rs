@@ -16,11 +16,16 @@ use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::agent::Ui;
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+/// Whatever a hook prints becomes context or a block reason, so one chatty
+/// hook must not be able to put an arbitrary payload into history.
+const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 
 /// The `agent_type` a sub-agent reports when it was started without one
 /// (`run_agent` omitted `agent_type`, or a `fork` skill spawned it). Codex
@@ -402,32 +407,82 @@ async fn run_hook(def: &HookDef, payload: &Value) -> HookRun {
             .kill_on_drop(true);
         let mut child = kloop_process_spawn::spawn(&mut command)
             .map_err(|e| format!("failed to spawn: {e}"))?;
-        // The payload is tiny, so write-then-wait cannot deadlock on a full
-        // stdout pipe. A hook that closed stdin early is not an error.
-        if let Some(mut stdin) = child.stdin.take() {
-            let mut line = payload.to_string();
-            line.push('\n');
-            let _ = stdin.write_all(line.as_bytes()).await;
-        }
-        child
-            .wait_with_output()
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "stdout pipe missing".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "stderr pipe missing".to_string())?;
+        // Writing the payload and reading the output must overlap. A hook that
+        // echoes its input (`tee`, `cat`) stops reading stdin once its stdout
+        // pipe fills, so write-then-wait deadlocks both sides until the timeout —
+        // and a `post_tool` payload carrying a large tool_result is big enough
+        // to fill it. A hook that closed stdin early is not an error.
+        let stdin = child.stdin.take();
+        let write = async {
+            if let Some(mut stdin) = stdin {
+                let mut line = payload.to_string();
+                line.push('\n');
+                let _ = stdin.write_all(line.as_bytes()).await;
+            }
+        };
+        let ((), stdout, stderr) = tokio::join!(write, read_capped(stdout), read_capped(stderr));
+        let status = child
+            .wait()
             .await
-            .map_err(|e| format!("failed to run: {e}"))
+            .map_err(|e| format!("failed to run: {e}"))?;
+        Ok::<_, String>((status, stdout, stderr))
     };
-    let output = match tokio::time::timeout(Duration::from_millis(def.timeout_ms), run).await {
-        Err(_) => return HookRun::Failed(format!("timed out after {}ms", def.timeout_ms)),
-        Ok(Err(why)) => return HookRun::Failed(why),
-        Ok(Ok(output)) => output,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    if output.status.success() {
+    let (status, stdout, stderr) =
+        match tokio::time::timeout(Duration::from_millis(def.timeout_ms), run).await {
+            Err(_) => return HookRun::Failed(format!("timed out after {}ms", def.timeout_ms)),
+            Ok(Err(why)) => return HookRun::Failed(why),
+            Ok(Ok(output)) => output,
+        };
+    let stdout = capped_text(stdout);
+    if status.success() {
         return HookRun::Allow { stdout };
     }
     HookRun::NonZero {
-        code: output.status.code().unwrap_or(-1),
+        code: status.code().unwrap_or(-1),
         stdout,
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stderr: capped_text(stderr),
     }
+}
+
+/// Drain one hook pipe to EOF — a short read would leave the writer blocked on
+/// a full pipe — while retaining at most [`OUTPUT_CAP_BYTES`]. Returns the
+/// retained bytes and the total that passed through.
+async fn read_capped(mut reader: impl tokio::io::AsyncRead + Unpin) -> (Vec<u8>, usize) {
+    let mut bytes = Vec::new();
+    let mut total = 0usize;
+    let mut chunk = [0u8; 8192];
+    while let Ok(count) = reader.read(&mut chunk).await {
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count);
+        let room = OUTPUT_CAP_BYTES.saturating_sub(bytes.len());
+        let retained = count.min(room);
+        bytes.extend_from_slice(&chunk[..retained]);
+        if retained < count {
+            crate::tools::truncate_incomplete_utf8(&mut bytes);
+        }
+    }
+    (bytes, total)
+}
+
+fn capped_text((bytes, total): (Vec<u8>, usize)) -> String {
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    let omitted = total.saturating_sub(bytes.len());
+    if omitted > 0 {
+        text.push_str(&format!(
+            "\n[hook output truncated: {omitted} bytes omitted]"
+        ));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -471,6 +526,45 @@ mod tests {
             HookDecision::Allow {
                 context: vec!["[pre_turn hook]\nremember the style guide".into()],
             }
+        );
+    }
+
+    /// A hook that echoes its input stops reading stdin once its stdout pipe
+    /// fills. Writing the payload first and only then reading used to deadlock
+    /// both sides until the timeout; the large payload a `post_tool` carries
+    /// made that common, not hypothetical.
+    #[tokio::test]
+    async fn a_hook_that_echoes_a_large_payload_neither_deadlocks_nor_floods_history() {
+        let hooks = Hooks {
+            defs: vec![HookDef {
+                event: HookEvent::PostTool,
+                command: test_shell_command("cat"),
+                matcher: None,
+                timeout_ms: 5_000,
+            }],
+        };
+        let ui = note_ui();
+        let context = hooks
+            .post_tool(
+                "s-1",
+                "",
+                "bash",
+                &json!({"command": "true"}),
+                &"x".repeat(200_000),
+                false,
+                &ui,
+            )
+            .await;
+        assert_eq!(context.len(), 1, "hook failed: {:?}", ui.0.lock().unwrap());
+        assert!(
+            context[0].contains("[hook output truncated:"),
+            "{}",
+            context[0]
+        );
+        assert!(
+            context[0].len() < 70_000,
+            "history got {} bytes",
+            context[0].len()
         );
     }
 

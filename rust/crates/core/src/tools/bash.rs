@@ -11,6 +11,7 @@ pub(super) use background::stop_bash_tool;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -46,6 +47,10 @@ use crate::shell_programs::ShellProgram;
 /// 大 diff 应当一次落全，而不是让模型分段重跑。
 const FOREGROUND_STREAM_CAP_BYTES: usize = 1 << 20;
 const FOREGROUND_OUTPUT_CAP_CHARS: usize = 30_000;
+/// When the merged capture exceeds the inline budget, at least this much of
+/// stderr's tail is kept. stdout fills the budget first, so without a reserve a
+/// failure reason written to stderr never reached the model at all.
+const FOREGROUND_STDERR_TAIL_CHARS: usize = 8_000;
 const FOREGROUND_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
@@ -84,9 +89,34 @@ pub(super) fn foreground_timeout(input: &Value) -> Duration {
 
 const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 60_000;
 
+/// The longest foreground budget any tool accepts. Ten minutes is long enough
+/// for a slow build and short enough that a stuck command still gives the model
+/// an answer; anything longer belongs in `background`.
+pub(super) const MAX_TIMEOUT_MS: u64 = 600_000;
+
+/// The one bound both `bash` and `powershell` apply to `timeout_ms`. A zero
+/// budget kills the command before its first poll, and an unbounded one lets a
+/// single call outlive the turn it belongs to.
+pub(super) fn bounded_timeout_ms(timeout_ms: u64, tool: &str) -> Result<u64> {
+    if (1..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        Ok(timeout_ms)
+    } else {
+        bail!("{tool}: timeout_ms must be between 1 and {MAX_TIMEOUT_MS}")
+    }
+}
+
 fn parse_bash_input(input: &Value) -> Result<BashInput> {
     super::optional_display_description(input, "bash")?;
-    serde_json::from_value(input.clone()).context("bash: invalid input")
+    let mut parsed: BashInput =
+        serde_json::from_value(input.clone()).context("bash: invalid input")?;
+    // A background call ignores the field, so its value cannot mislead anyone;
+    // a foreground call is the one the number actually kills.
+    if !parsed.background
+        && let Some(timeout_ms) = parsed.timeout_ms
+    {
+        parsed.timeout_ms = Some(bounded_timeout_ms(timeout_ms, "bash")?);
+    }
+    Ok(parsed)
 }
 
 pub(super) fn scrub_model_shell_env(spec: &mut ProcessSpec) {
@@ -285,6 +315,7 @@ pub(crate) async fn run_foreground_bash(
         bail!(sandbox::PROTECTION_REQUIRED);
     }
     let output = run_foreground(command, &cwd, effective_sandbox, bash, timeout_ms, ctx).await?;
+    fail_if_timed_out(&output, Some(&ctx.cfg.offload_dir))?;
     let success = output.status.success();
     if remembered_escalation {
         return Ok(ForegroundRun {
@@ -341,6 +372,7 @@ pub(crate) async fn run_foreground_bash(
             match escalation.outcome {
                 EscalationOutcome::Approved(approval) => {
                     let raw = run_foreground(command, &cwd, None, bash, timeout_ms, ctx).await?;
+                    fail_if_timed_out(&raw, Some(&ctx.cfg.offload_dir))?;
                     // What the sandbox refused is the only record of why this
                     // ran uncontained, and the sandboxed output is about to be
                     // dropped for the unsandboxed one. Carrying the line keeps
@@ -421,8 +453,14 @@ pub(super) async fn run_process_foreground(
     let stderr = child
         .take_stderr()
         .with_context(|| format!("{tool}: stderr pipe missing"))?;
-    let stdout_task = tokio::spawn(read_bounded_stream(stdout));
-    let stderr_task = tokio::spawn(read_bounded_stream(stderr));
+    // The readers own only the read; the bytes land in shared buffers. A pipe
+    // that outlives the process tree therefore still leaves everything that had
+    // arrived available to the caller instead of being lost with the aborted
+    // task.
+    let stdout_capture = Arc::new(Mutex::new(BoundedStream::default()));
+    let stderr_capture = Arc::new(Mutex::new(BoundedStream::default()));
+    let stdout_task = tokio::spawn(read_bounded_stream(stdout, Arc::clone(&stdout_capture)));
+    let stderr_task = tokio::spawn(read_bounded_stream(stderr, Arc::clone(&stderr_capture)));
 
     enum Completion {
         Finished(std::io::Result<ProcessExit>),
@@ -449,26 +487,42 @@ pub(super) async fn run_process_foreground(
                 .cleanup_after_exit(FOREGROUND_REAP_TIMEOUT)
                 .await
                 .with_context(|| format!("{tool}: failed to clean residual process tree"))?;
-            collect_foreground_output(status, stdout_task, stderr_task, tool).await
+            let pipe_stalled = finish_foreground_readers(stdout_task, stderr_task, tool).await?;
+            Ok(assemble_output(
+                status,
+                None,
+                &stdout_capture,
+                &stderr_capture,
+                pipe_stalled,
+            ))
         }
         Completion::TimedOut => {
             let cleanup = child
                 .terminate_and_wait(FOREGROUND_REAP_TIMEOUT)
                 .await
                 .with_context(|| format!("{tool}: failed to terminate timed-out process tree"));
-            let drain = drain_foreground_readers(stdout_task, stderr_task, tool).await;
-            cleanup?;
-            drain?;
-            bail!("{tool}: command timed out after {timeout_ms}ms")
+            let drained = finish_foreground_readers(stdout_task, stderr_task, tool).await;
+            let status = cleanup?;
+            // What the command printed before it was killed is the only clue to
+            // where it got stuck; the caller renders it next to the timeout.
+            Ok(assemble_output(
+                status,
+                Some(timeout_ms),
+                &stdout_capture,
+                &stderr_capture,
+                drained?,
+            ))
         }
         Completion::Cancelled => {
             let cleanup = child
                 .terminate_and_wait(FOREGROUND_REAP_TIMEOUT)
                 .await
                 .with_context(|| format!("{tool}: failed to terminate interrupted process tree"));
-            let drain = drain_foreground_readers(stdout_task, stderr_task, tool).await;
+            let drained = finish_foreground_readers(stdout_task, stderr_task, tool).await;
             cleanup?;
-            drain?;
+            drained?;
+            // Deliberately drops the partial output: an interrupted call's
+            // contract with the dispatcher is exactly this text.
             bail!("interrupted")
         }
     }
@@ -480,84 +534,136 @@ pub(super) struct ForegroundOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     omitted_bytes: usize,
+    /// The command was killed at its budget; `status` is the kill, not an exit.
+    timed_out: Option<u64>,
+    /// The tree was cleaned up but a pipe writer outside it kept the readers
+    /// from reaching EOF inside the reap bound.
+    pipe_stalled: bool,
 }
 
+impl ForegroundOutput {
+    pub(super) fn timed_out(&self) -> bool {
+        self.timed_out.is_some()
+    }
+}
+
+#[derive(Default)]
 struct BoundedStream {
     bytes: Vec<u8>,
     total_bytes: usize,
 }
 
-async fn collect_foreground_output(
+impl BoundedStream {
+    fn push(&mut self, chunk: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        let retained = FOREGROUND_STREAM_CAP_BYTES.saturating_sub(self.bytes.len());
+        if chunk.len() <= retained {
+            self.bytes.extend_from_slice(chunk);
+        } else {
+            self.bytes.extend_from_slice(&chunk[..retained]);
+            // The cap can land inside a multi-byte character. Keeping that
+            // partial sequence would decode as U+FFFD and, worse, absorb the
+            // first bytes of the other stream when the two are merged.
+            truncate_incomplete_utf8(&mut self.bytes);
+        }
+    }
+}
+
+fn take_capture(capture: &Arc<Mutex<BoundedStream>>) -> BoundedStream {
+    std::mem::take(&mut *capture.lock().unwrap())
+}
+
+fn assemble_output(
     status: ProcessExit,
-    stdout_task: tokio::task::JoinHandle<Result<BoundedStream>>,
-    stderr_task: tokio::task::JoinHandle<Result<BoundedStream>>,
-    tool: &'static str,
-) -> Result<ForegroundOutput> {
-    let (stdout, stderr) = finish_foreground_readers(stdout_task, stderr_task, tool).await?;
+    timed_out: Option<u64>,
+    stdout: &Arc<Mutex<BoundedStream>>,
+    stderr: &Arc<Mutex<BoundedStream>>,
+    pipe_stalled: bool,
+) -> ForegroundOutput {
+    let stdout = take_capture(stdout);
+    let stderr = take_capture(stderr);
     let omitted_bytes = stdout
         .total_bytes
         .saturating_sub(stdout.bytes.len())
         .saturating_add(stderr.total_bytes.saturating_sub(stderr.bytes.len()));
-    Ok(ForegroundOutput {
+    ForegroundOutput {
         status,
         stdout: stdout.bytes,
         stderr: stderr.bytes,
         omitted_bytes,
-    })
+        timed_out,
+        pipe_stalled,
+    }
 }
 
+/// Join both readers under one short bound. False = both reached EOF; true =
+/// the bound expired, the readers were aborted, and whatever they had captured
+/// is all there is.
 async fn finish_foreground_readers(
-    stdout_task: tokio::task::JoinHandle<Result<BoundedStream>>,
-    stderr_task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    stdout_task: tokio::task::JoinHandle<Result<()>>,
+    stderr_task: tokio::task::JoinHandle<Result<()>>,
     tool: &'static str,
-) -> Result<(BoundedStream, BoundedStream)> {
+) -> Result<bool> {
     let (stdout, stderr) = tokio::join!(
         finish_reader(stdout_task, tool),
         finish_reader(stderr_task, tool)
     );
-    Ok((stdout?, stderr?))
-}
-
-async fn drain_foreground_readers(
-    stdout_task: tokio::task::JoinHandle<Result<BoundedStream>>,
-    stderr_task: tokio::task::JoinHandle<Result<BoundedStream>>,
-    tool: &'static str,
-) -> Result<()> {
-    finish_foreground_readers(stdout_task, stderr_task, tool)
-        .await
-        .map(|_| ())
+    Ok(stdout? || stderr?)
 }
 
 async fn finish_reader(
-    mut task: tokio::task::JoinHandle<Result<BoundedStream>>,
+    mut task: tokio::task::JoinHandle<Result<()>>,
     tool: &'static str,
-) -> Result<BoundedStream> {
+) -> Result<bool> {
     match tokio::time::timeout(FOREGROUND_REAP_TIMEOUT, &mut task).await {
-        Ok(result) => result
-            .with_context(|| format!("{tool}: output reader task failed"))?
-            .with_context(|| format!("{tool}: failed to drain output pipe")),
+        Ok(result) => {
+            result
+                .with_context(|| format!("{tool}: output reader task failed"))?
+                .with_context(|| format!("{tool}: failed to drain output pipe"))?;
+            Ok(false)
+        }
         Err(_) => {
             task.abort();
             let _ = task.await;
-            bail!("{tool}: timed out draining output pipe after process-tree cleanup")
+            Ok(true)
         }
     }
 }
 
-async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<BoundedStream> {
-    let mut bytes = Vec::new();
-    let mut total_bytes = 0usize;
+async fn read_bounded_stream(
+    mut reader: impl AsyncRead + Unpin,
+    capture: Arc<Mutex<BoundedStream>>,
+) -> Result<()> {
     let mut chunk = [0u8; 8192];
     loop {
         let count = reader.read(&mut chunk).await?;
         if count == 0 {
-            break;
+            return Ok(());
         }
-        total_bytes = total_bytes.saturating_add(count);
-        let retained = FOREGROUND_STREAM_CAP_BYTES.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&chunk[..count.min(retained)]);
+        capture.lock().unwrap().push(&chunk[..count]);
     }
-    Ok(BoundedStream { bytes, total_bytes })
+}
+
+/// Cut a byte buffer whose end fell inside a multi-byte UTF-8 character.
+/// A sequence is at most four bytes, so only the last three can hide a lead.
+pub(crate) fn truncate_incomplete_utf8(bytes: &mut Vec<u8>) {
+    let len = bytes.len();
+    let start = len.saturating_sub(3);
+    let Some(lead) = (start..len)
+        .rev()
+        .find(|&index| bytes[index] & 0xC0 != 0x80)
+    else {
+        return;
+    };
+    let width = match bytes[lead] {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    };
+    if len - lead < width {
+        bytes.truncate(lead);
+    }
 }
 
 /// stdout+stderr merged, a trailing `[exit …]` when the run failed, and a
@@ -567,31 +673,71 @@ async fn read_bounded_stream(mut reader: impl AsyncRead + Unpin) -> Result<Bound
 /// 合并结果超出内联预算且给了 `spill_dir` 时，先把捕获到的全文写进去，截断说明里
 /// 给出文件路径：否则大 diff 被截掉的后半段只能重跑命令才拿得到（plan 272 实测
 /// 11 次审查里 6 次如此）。内联部分大小不变，路径不额外占上下文。
-/// 捕获到的 stdout 在前、stderr 在后，UTF-8 有损解码；内联截断之前的全文。
+/// 捕获到的 stdout 在前、stderr 在后，两个流各自做 UTF-8 有损解码；内联截断之前的全文。
 fn captured_text(output: &ForegroundOutput) -> String {
-    let mut merged = Vec::with_capacity(output.stdout.len() + output.stderr.len());
-    merged.extend_from_slice(&output.stdout);
-    merged.extend_from_slice(&output.stderr);
-    String::from_utf8_lossy(&merged).into_owned()
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
 }
 
+/// Inline excerpt of an over-budget capture: stdout's head, then stderr's tail.
+/// stdout filling the whole budget used to push a failure reason on stderr out
+/// of the result entirely; the head of stdout is still what explains most
+/// successful output, so it keeps the larger share.
+fn inline_excerpt(stdout: &str, stderr: &str) -> String {
+    let stdout_chars = stdout.chars().count();
+    let stderr_chars = stderr.chars().count();
+    let stderr_reserved = stderr_chars.min(FOREGROUND_STDERR_TAIL_CHARS);
+    let stdout_keep = stdout_chars.min(FOREGROUND_OUTPUT_CAP_CHARS.saturating_sub(stderr_reserved));
+    let stderr_keep = (FOREGROUND_OUTPUT_CAP_CHARS - stdout_keep).min(stderr_chars);
+    let mut text = take_head(stdout, stdout_keep).to_string();
+    if stderr_keep > 0 {
+        if stdout_keep < stdout_chars {
+            text.push_str("\n[... output omitted ...]\n");
+        }
+        text.push_str(take_tail(stderr, stderr_keep));
+    }
+    text
+}
+
+fn take_head(text: &str, chars: usize) -> &str {
+    match text.char_indices().nth(chars) {
+        Some((index, _)) => &text[..index],
+        None => text,
+    }
+}
+
+fn take_tail(text: &str, chars: usize) -> &str {
+    let skip = text.chars().count().saturating_sub(chars);
+    match text.char_indices().nth(skip) {
+        Some((index, _)) => &text[index..],
+        None => text,
+    }
+}
+
+/// Render a finished run. A timeout is the caller's to turn into an error; this
+/// only makes sure the text the model sees includes what the command printed
+/// before it was killed, and says why the output may be short.
 pub(super) fn format_output(output: &ForegroundOutput, spill_dir: Option<&Path>) -> String {
-    let mut text = captured_text(output);
-    let captured_chars = text.chars().count();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let captured_chars = stdout.chars().count() + stderr.chars().count();
     let omitted_chars = captured_chars.saturating_sub(FOREGROUND_OUTPUT_CAP_CHARS);
     let saved = match spill_dir {
-        Some(dir) if omitted_chars > 0 => Some(
-            crate::history::write_offload_file(dir, &text).map(|path| (path, text.lines().count())),
-        ),
+        Some(dir) if omitted_chars > 0 => {
+            let full = format!("{stdout}{stderr}");
+            Some(
+                crate::history::write_offload_file(dir, &full)
+                    .map(|path| (path, full.lines().count())),
+            )
+        }
         _ => None,
     };
-    if omitted_chars > 0 {
-        let boundary = text
-            .char_indices()
-            .nth(FOREGROUND_OUTPUT_CAP_CHARS)
-            .map_or(text.len(), |(index, _)| index);
-        text.truncate(boundary);
-    }
+    let mut text = if omitted_chars > 0 {
+        inline_excerpt(&stdout, &stderr)
+    } else {
+        format!("{stdout}{stderr}")
+    };
     if omitted_chars > 0 || output.omitted_bytes > 0 {
         let omitted_bytes = output.omitted_bytes;
         let saved = match saved {
@@ -608,7 +754,15 @@ pub(super) fn format_output(output: &ForegroundOutput, spill_dir: Option<&Path>)
              bytes omitted{saved}]"
         ));
     }
-    if !output.status.success() {
+    if output.pipe_stalled {
+        text.push_str(
+            "\n[the output pipe stayed open after the command exited: a descendant that left \
+             the process group still holds it, so the output above is what had arrived]",
+        );
+    }
+    if let Some(timeout_ms) = output.timed_out {
+        text.push_str(&format!("\n[timed out after {timeout_ms}ms]"));
+    } else if !output.status.success() {
         let code = output
             .status
             .code()
@@ -619,6 +773,16 @@ pub(super) fn format_output(output: &ForegroundOutput, spill_dir: Option<&Path>)
         text = "(no output)".into();
     }
     text
+}
+
+/// A timed-out run is still a failed tool call — the caller reports the
+/// rendered text as the error, so the model sees both why it stopped and what
+/// it printed first.
+pub(super) fn fail_if_timed_out(output: &ForegroundOutput, spill_dir: Option<&Path>) -> Result<()> {
+    if output.timed_out() {
+        bail!("{}", format_output(output, spill_dir));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1351,6 +1515,138 @@ mod tests {
         assert!(is_error);
         assert!(out.contains("timed out"));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// What the command printed before the timeout is the only clue to where it
+    /// got stuck; the error keeps it instead of discarding the capture.
+    #[tokio::test]
+    async fn foreground_timeout_keeps_what_the_command_printed() {
+        let ctx = test_ctx(0, "bash-timeout-output");
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": "echo stuck-here; sleep 30", "timeout_ms": 500}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("stuck-here"), "{out}");
+        assert!(out.contains("timed out after 500ms"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_bounds_are_rejected_before_spawning() {
+        let ctx = test_ctx(0, "bash-timeout-bounds");
+        for value in [0, 600_001] {
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({"command": "echo spawned-anyway", "timeout_ms": value}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{out}");
+            assert!(
+                out.contains("timeout_ms must be between 1 and 600000"),
+                "{out}"
+            );
+            assert!(!out.contains("spawned-anyway"), "{out}");
+        }
+        // Background execution ignores the field, so an out-of-range value is
+        // not a reason to refuse a call that can never use it.
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({"command": "true", "background": true, "timeout_ms": 0}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+    }
+
+    /// A descendant that leaves the process group keeps its inherited stdio
+    /// after the tree is reaped. That must not turn a successful command into
+    /// an error: the already-read output and the exit status are the result.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_detached_descendant_holding_the_pipe_keeps_the_result() {
+        let ctx = test_ctx(0, "bash-setsid-pipe");
+        // macOS ships no `setsid` command; python3 is the portable way to put
+        // the descendant in a session of its own while it keeps our stdout.
+        let command =
+            "python3 -c 'import os, time; os.setsid(); time.sleep(5)' & sleep 0.2; echo ok; exit 3";
+        let started = std::time::Instant::now();
+        let (out, is_error) = run_tool("bash", bash_input(command), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("ok"), "{out}");
+        assert!(out.contains("output pipe stayed open"), "{out}");
+        assert!(out.contains("[exit status 3]"), "{out}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "waited for the detached descendant to close the pipe"
+        );
+    }
+
+    /// A failure reason on stderr must survive a stdout that alone fills the
+    /// inline budget — the merged result used to keep only the head.
+    #[tokio::test]
+    async fn stderr_failure_reason_survives_a_budget_filling_stdout() {
+        let ctx = test_ctx(0, "bash-stderr-tail");
+        let (out, is_error) = run_tool(
+            "bash",
+            bash_input("yes A | head -c 200000; echo 'BUILD FAILED: reason' >&2; exit 1"),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("BUILD FAILED: reason"), "{out}");
+        assert!(out.contains("output truncated"), "{out}");
+        assert!(out.contains("[exit status 1]"), "{out}");
+    }
+
+    #[test]
+    fn a_cut_inside_a_character_is_trimmed_to_a_boundary() {
+        let mut three_byte = "中".as_bytes().to_vec();
+        three_byte.truncate(2);
+        super::truncate_incomplete_utf8(&mut three_byte);
+        assert!(three_byte.is_empty(), "{three_byte:?}");
+
+        let mut four_byte = "😀".as_bytes().to_vec();
+        let keep = four_byte.len() - 2;
+        four_byte.truncate(keep);
+        super::truncate_incomplete_utf8(&mut four_byte);
+        assert!(four_byte.is_empty(), "{four_byte:?}");
+
+        let mut complete = "ok中".as_bytes().to_vec();
+        super::truncate_incomplete_utf8(&mut complete);
+        assert_eq!(complete, "ok中".as_bytes());
+    }
+
+    /// The 1 MiB per-stream cap can land inside a character. If it does, the
+    /// stream must end on a boundary: otherwise the spilled file's stdout tail
+    /// decodes as U+FFFD, and the first bytes of stderr get absorbed into it.
+    #[tokio::test]
+    async fn a_capped_stream_ends_on_a_character_boundary() {
+        let ctx = test_ctx(0, "bash-utf8-seam");
+        // 1 MiB lands two bytes into a 3-byte character after the `xy` prefix.
+        let (out, is_error) = run_tool(
+            "bash",
+            bash_input("printf xy; yes 中 | head -c 1200000; printf 'ERROR-TAIL' >&2; exit 1"),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("ERROR-TAIL"), "{out}");
+        let notice = out.rsplit_once("\n[output truncated: ").expect("notice").1;
+        let path = notice
+            .split_once(" are saved to ")
+            .and_then(|(_, rest)| rest.split_once(" — "))
+            .map(|(path, _)| path)
+            .expect("saved path");
+        let spilled = std::fs::read_to_string(path).unwrap();
+        assert!(
+            spilled.ends_with("ERROR-TAIL"),
+            "{:?}",
+            &spilled[spilled.len() - 40..]
+        );
+        assert!(!spilled.contains('\u{FFFD}'), "seam decoded as U+FFFD");
     }
 
     /// A foreground timeout must reap the whole process group, not just the

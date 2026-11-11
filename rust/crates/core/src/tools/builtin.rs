@@ -665,7 +665,7 @@ fn bash_def() -> ToolDef {
             "properties": {
                 "command": {"type": "string", "description": "The command to run"},
                 "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "What this command does, in a few words on one line (e.g. \"Run the core tests\", \"Show the last five commits\"). It heads this call's row in the user's transcript, above the command, so they can tell what a long command is for without parsing it; give one on every call. It never reaches the shell and never changes the result."},
-                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000); ignored when background=true"},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "description": "Timeout in milliseconds (default 60000, min 1, max 600000); ignored when background=true"},
                 "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-* id and output file path (default false)"},
                 "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively. The retry still passes the permission gate; bypass mode does not ask for user approval."}
             },
@@ -729,7 +729,7 @@ fn powershell_def() -> ToolDef {
             "properties": {
                 "command": {"type": "string", "description": "The original PowerShell script to run"},
                 "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "What this script does, in a few words on one line (e.g. \"Check the resolved version\", \"List changed files\"). It heads this call's row in the user's transcript, above the script, so they can tell what a long one-liner is for without parsing it; give one on every call. It never reaches PowerShell and never changes the result."},
-                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000)"}
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "description": "Timeout in milliseconds (default 60000, min 1, max 600000)"}
             },
             "required": ["command"],
             "additionalProperties": false

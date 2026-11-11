@@ -49,6 +49,7 @@ mod worktree_tool;
 pub use background_executions::BackgroundExecutions;
 pub use background_executions::ExecutionStatus;
 pub use bash::BackgroundShells;
+pub(crate) use bash::truncate_incomplete_utf8;
 pub(crate) use builtin::Builtin;
 pub use builtin::builtin_tool_names;
 pub(crate) use codemode::ProgramToolManifest;

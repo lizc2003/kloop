@@ -69,7 +69,10 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// bash_output blocking defaults, straight from cc's TaskOutput.
 const BLOCK_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 const BLOCK_TIMEOUT_MAX_MS: u64 = 600_000;
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long `stop_bash` waits for the monitor to confirm the kill before it
+/// reports the truth — that the stop was requested but the shell is still
+/// stopping — instead of claiming a state it has not observed.
+const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     let id = str_arg(input, "bash_id", "bash_output")?;
@@ -79,16 +82,24 @@ pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> 
         .unwrap_or(BLOCK_TIMEOUT_DEFAULT_MS)
         .min(BLOCK_TIMEOUT_MAX_MS);
     let shells = &ctx.cfg.background_shells;
-    let started = std::time::Instant::now();
+    // The registry bumps `activity` on every terminal transition, so the wait
+    // wakes on the one change that matters instead of polling the table.
+    let mut activity = shells.activity();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let (status, path, sandboxed) = loop {
         let Some((status, path, sandboxed)) = shells.snapshot(id) else {
             bail!("bash_output: no background command with id {id}");
         };
-        let done = !status.is_active();
-        if done || !block || started.elapsed() >= Duration::from_millis(timeout_ms) {
+        if !status.is_active() || !block || tokio::time::Instant::now() >= deadline {
             break (status, path, sandboxed);
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        match tokio::time::timeout_at(deadline, activity.changed()).await {
+            // Any wake re-reads the table: the change may belong to another
+            // shell, and every read is cheap next to a 100ms poll cycle.
+            Ok(Ok(())) | Err(_) => {}
+            // The registry is gone; the session is tearing down.
+            Ok(Err(_)) => break (status, path, sandboxed),
+        }
     };
     let status_line = wait_status_line(id, &status, block, timeout_ms);
     let mut tail = read_tail(&path).await;
@@ -118,15 +129,41 @@ pub(in crate::tools) async fn stop_bash_tool(input: &Value, ctx: &ToolCtx) -> Re
         .request_kill(id)
         .map_err(|e| anyhow!("stop_bash: {e}"))?;
     // The monitor task does the killing; wait for it to confirm so the
-    // reported status is final rather than racy.
-    let started = std::time::Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
+    // reported status is final rather than racy. A shell that has not stopped
+    // within the window is reported as still stopping — claiming "Stopped" for
+    // a tree that is still dying is how a later call gets a surprise.
+    let mut activity = shells.activity();
+    let deadline = tokio::time::Instant::now() + STOP_CONFIRM_TIMEOUT;
+    let status = loop {
         match shells.snapshot(id) {
-            Some((status, _, _)) if status.is_active() => tokio::time::sleep(POLL_INTERVAL).await,
-            _ => break,
+            Some((status, _, _)) if status.is_active() => {
+                if tokio::time::Instant::now() >= deadline {
+                    break status;
+                }
+                match tokio::time::timeout_at(deadline, activity.changed()).await {
+                    Ok(Ok(())) | Err(_) => {}
+                    Ok(Err(_)) => break status,
+                }
+            }
+            Some((status, _, _)) => break status,
+            None => break BgStatus::Stopping,
         }
+    };
+    Ok(stop_report(id, &command, &status))
+}
+
+/// What `stop_bash` says once its confirmation window closed. Reporting the
+/// state actually observed matters: a later `bash_output` on a shell that was
+/// announced as stopped, but was still dying, is otherwise a surprise.
+fn stop_report(id: &str, command: &str, status: &BgStatus) -> String {
+    if status.is_active() {
+        format!(
+            "stop requested for {id} ({command}); it is still {}",
+            status_text(status)
+        )
+    } else {
+        format!("Stopped {id} ({command})")
     }
-    Ok(format!("Stopped {id} ({command})"))
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +438,13 @@ impl BackgroundShells {
         ))
     }
 
+    /// Wake on the next terminal transition of any shell. Subscribing before
+    /// the snapshot read is what makes the pair race-free: a change either is
+    /// already visible in the read or wakes the receiver.
+    fn activity(&self) -> watch::Receiver<u64> {
+        self.activity.subscribe()
+    }
+
     fn snapshot(&self, id: &str) -> Option<(BgStatus, PathBuf, Option<BgSandbox>)> {
         let registry = self.state.lock().unwrap();
         let shell = registry.shells.get(id)?;
@@ -614,6 +658,14 @@ struct BackgroundMonitor {
     inbox: Arc<Inbox>,
 }
 
+/// Ask the tree to die; the failure text comes back so the watchdog can retry.
+fn kill_tree(killer: &ProcessTreeKiller) -> Option<String> {
+    killer
+        .terminate()
+        .err()
+        .map(|error| format!("failed to terminate process tree: {error}"))
+}
+
 /// Owns the child: waits for exit, executes kill requests, and enforces the
 /// output-file cap. Deliberately not tied to any turn's cancel token — that
 /// is what makes the shell "background".
@@ -634,32 +686,42 @@ async fn monitor(monitor: BackgroundMonitor) {
     let mut watchdog = tokio::time::interval(WATCHDOG_INTERVAL);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failure_reason: Option<String> = None;
-    let mut signal_sent = false;
+    let mut stop_requested = false;
+    let mut output_cap_hit = false;
+    // Kept as text so a failed kill is visible even after a later retry.
+    let mut terminate_error: Option<String> = None;
     let exit = loop {
         tokio::select! {
             status = child.wait() => break status,
-            _ = kill.cancelled(), if !signal_sent => {
-                if let Err(error) = killer.terminate() {
-                    failure_reason = Some(format!("failed to terminate process tree: {error}"));
-                }
-                signal_sent = true;
+            _ = kill.cancelled(), if !stop_requested => {
+                stop_requested = true;
+                terminate_error = kill_tree(&killer);
             }
             _ = watchdog.tick() => {
-                let size = std::fs::metadata(&output_path).map_or(0, |metadata| metadata.len());
-                if size > OUTPUT_FILE_CAP && !signal_sent {
-                    let reason = format!("output file exceeded {OUTPUT_FILE_CAP} bytes");
-                    if let Err(error) = killer.terminate() {
-                        failure_reason = Some(format!("{reason}; failed to terminate process tree: {error}"));
-                    } else {
-                        failure_reason = Some(reason);
+                // Termination is retried on every tick. The first attempt can
+                // lose to a transient OS error (a debugger still attaching, a
+                // racing exit); giving up would leave the tree running for the
+                // rest of the session while the registry says it is dying.
+                if terminate_error.is_some() {
+                    terminate_error = kill_tree(&killer);
+                }
+                if !output_cap_hit {
+                    let size = std::fs::metadata(&output_path).map_or(0, |metadata| metadata.len());
+                    if size > OUTPUT_FILE_CAP {
+                        output_cap_hit = true;
+                        failure_reason = Some(format!("output file exceeded {OUTPUT_FILE_CAP} bytes"));
+                        terminate_error = kill_tree(&killer);
                     }
-                    signal_sent = true;
                 }
             }
         }
     };
     let cleanup = child.cleanup_after_exit(FOREGROUND_REAP_TIMEOUT).await;
     let observed = if let Some(reason) = failure_reason {
+        let reason = match terminate_error {
+            Some(error) => format!("{reason}; {error}"),
+            None => reason,
+        };
         BgStatus::Failed(reason)
     } else if let Err(error) = cleanup {
         BgStatus::Failed(format!("process-tree cleanup failed: {error}"))
@@ -750,9 +812,18 @@ async fn read_tail(path: &Path) -> String {
         file.seek(std::io::SeekFrom::Start(skip)).await?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).await?;
-        let mut text = String::from_utf8_lossy(&buf).into_owned();
-        if skip > 0 {
-            text = format!("[{skip} bytes of earlier output omitted]\n{text}");
+        // The tail starts at a byte offset that can fall inside a multi-byte
+        // character; keeping the leading continuation bytes would open the
+        // text with U+FFFD.
+        let cut = buf
+            .iter()
+            .take(3)
+            .position(|byte| byte & 0xC0 != 0x80)
+            .unwrap_or(buf.len().min(3));
+        let omitted = skip.saturating_add(cut as u64);
+        let mut text = String::from_utf8_lossy(&buf[cut..]).into_owned();
+        if omitted > 0 {
+            text = format!("[{omitted} bytes of earlier output omitted]\n{text}");
         }
         Ok::<String, std::io::Error>(text)
     }
@@ -770,6 +841,7 @@ mod tests {
     use super::BLOCK_TIMEOUT_MAX_MS;
     use super::BgStatus;
     use super::status_text;
+    use super::stop_report;
     use super::wait_status_line;
     use crate::event::BackgroundTaskStatus;
     use crate::event::Event;
@@ -1268,6 +1340,40 @@ mod tests {
             out.len() < 40_000,
             "inline output stays bounded: {}",
             out.len()
+        );
+    }
+
+    /// The tail starts at a byte offset; landing inside a multi-byte character
+    /// must not open the inline text with U+FFFD.
+    #[tokio::test]
+    async fn bash_output_tail_starts_on_a_character_boundary() {
+        let ctx = test_ctx(0, "bg-utf8-tail");
+        let (out, _) = run_tool(
+            "bash",
+            // The omitted prefix leaves 30015 bytes: 2 (`xy`) + 60000 of 中
+            // plus a 13-byte marker, so the tail offset lands one byte into a
+            // 4-byte "中\n" record.
+            json!({"command": "printf xy; yes 中 | head -c 60000; echo TAIL-MARKERS", "background": true}),
+            &ctx,
+        )
+        .await;
+        let id = bg_id(&out);
+        let (out, is_error) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("TAIL-MARKERS"), "{out}");
+        assert!(out.contains("bytes of earlier output omitted"), "{out}");
+        assert!(!out.contains('\u{FFFD}'), "{out}");
+    }
+
+    #[test]
+    fn a_stop_that_has_not_finished_reports_the_observed_state() {
+        assert_eq!(
+            stop_report("bg-1", "sleep 30", &BgStatus::Stopping),
+            "stop requested for bg-1 (sleep 30); it is still stopping"
+        );
+        assert_eq!(
+            stop_report("bg-1", "sleep 30", &BgStatus::Killed("stopped".into())),
+            "Stopped bg-1 (sleep 30)"
         );
     }
 

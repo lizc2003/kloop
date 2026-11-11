@@ -43,6 +43,7 @@ pub(super) async fn powershell_tool(
 
     let spec = powershell_spec(program, command, &workspace.cwd);
     let output = bash::run_process_foreground(spec, timeout_ms, &ctx.cancel, "powershell").await?;
+    bash::fail_if_timed_out(&output, Some(&ctx.cfg.offload_dir))?;
     Ok(bash::format_output(&output, Some(&ctx.cfg.offload_dir)))
 }
 
@@ -67,10 +68,12 @@ fn powershell_spec(program: &ShellProgram, command: &str, cwd: &Path) -> Process
 fn timeout_ms(input: &Value) -> Result<u64> {
     match input.get("timeout_ms") {
         None => Ok(DEFAULT_TIMEOUT_MS),
-        Some(value) => value
-            .as_u64()
-            .filter(|timeout| *timeout > 0)
-            .context("powershell: timeout_ms must be a positive integer"),
+        Some(value) => {
+            let timeout_ms = value
+                .as_u64()
+                .context("powershell: timeout_ms must be a non-negative integer")?;
+            bash::bounded_timeout_ms(timeout_ms, "powershell")
+        }
     }
 }
 
@@ -249,19 +252,20 @@ mod tests {
     }
 
     #[test]
-    fn timeout_must_be_positive_integer() {
+    fn timeout_is_bounded_like_bash() {
         assert_eq!(
             timeout_ms(&serde_json::json!({"command": "Get-Location"})).unwrap(),
             60_000
         );
-        for value in [
-            serde_json::json!(0),
-            serde_json::json!(-1),
-            serde_json::json!("10"),
-        ] {
+        for value in [serde_json::json!(0), serde_json::json!(600_001)] {
             let input = serde_json::json!({"command": "Get-Location", "timeout_ms": value});
             let error = timeout_ms(&input).unwrap_err().to_string();
-            assert!(error.contains("positive integer"), "{error}");
+            assert!(error.contains("between 1 and 600000"), "{error}");
+        }
+        for value in [serde_json::json!(-1), serde_json::json!("10")] {
+            let input = serde_json::json!({"command": "Get-Location", "timeout_ms": value});
+            let error = timeout_ms(&input).unwrap_err().to_string();
+            assert!(error.contains("non-negative integer"), "{error}");
         }
     }
 

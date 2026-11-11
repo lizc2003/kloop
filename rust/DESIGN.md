@@ -2534,7 +2534,13 @@ fails **open** with a warning: any other exit code, exit 2 on a stop/post
 event, a spawn failure, a timeout — a broken hook script is a malfunction,
 not a policy decision (the permission gate is the enforcement layer).
 Whatever an allowing hook prints on stdout is injected into history as a
-`[{event} hook]`-prefixed user message the model sees.
+`[{event} hook]`-prefixed user message the model sees. The payload write and the
+stdout/stderr reads run concurrently: a hook that echoes its input stops reading
+stdin once its stdout pipe fills, and a `post_tool` payload carrying a large
+tool result is enough to deadlock a write-then-wait runner until the timeout.
+Both output streams are drained to EOF while retaining at most 64 KiB, and a
+capped stream says how many bytes were dropped, so one chatty hook cannot flood
+the history it is injected into.
 
 **Sub-agents** (dispatched by the `run_agent` tool) fire `subagent_start` /
 `subagent_stop` **instead of** `pre_turn` / `post_turn` — the split both cc
@@ -2963,20 +2969,40 @@ substitutes PowerShell,
 and stdout/stderr use separate pipes. Both pipes are drained concurrently to
 EOF, so a child filling one stream cannot deadlock behind an unread other
 stream. Each stream retains at most 1 MiB while continuing to drain
-discarded bytes; the merged model-facing result is UTF-8 lossy, capped at 30,000
-characters, and says how many captured characters and additional bytes were
-omitted. When the cap cuts it, the whole captured text is first written to the
-offload store and the notice names that file and its line count, so the model
-reads the rest instead of re-running the command (plan 272: 6 of 11 measured
-reviews had a diff cut this way). The inline part keeps its size; bash and
-PowerShell share this. A sandboxed bash run is formatted (and spilled) only when
-its own result is what the model gets: an approved escalation returns the
-unsandboxed re-run instead, so the first run's text is never saved. The
-sandbox-denial check reads the whole captured text, not the inline part —
-stdout comes first, so with more than the inline budget on stdout a denial
-line on stderr was cut away and neither the escalation nor the hint appeared. stdout precedes stderr in the canonical result, followed by
-`[exit status N]` or `[killed by signal]`; an empty successful run returns
-`(no output)`.
+discarded bytes, and a cap that lands inside a multi-byte character is cut back
+to the boundary so the retained bytes never decode as U+FFFD (nor absorb the
+first bytes of the other stream when the two are merged). The readers write into
+shared buffers rather than owning them, which is what lets a drain that outlives
+the reap bound still contribute: a descendant that left the process group keeps
+its inherited pipes open after the tree is reaped, and that case now returns the
+command's output and exit status plus one line saying the pipe stayed open,
+instead of failing a command that succeeded. The merged model-facing result is
+UTF-8 lossy, capped at 30,000 characters, and says how many captured characters
+and additional bytes were omitted. When the cap cuts it, the whole captured text
+is first written to the offload store and the notice names that file and its
+line count, so the model reads the rest instead of re-running the command (plan
+272: 6 of 11 measured reviews had a diff cut this way). The inline excerpt keeps
+stdout's head and reserves up to 8,000 characters at the tail of stderr, so a
+failure reason written there survives a stdout that alone fills the budget; a
+seam marker separates the two parts when both the cut and stderr are present. A
+sandboxed bash run is formatted (and spilled) only when its own result is what
+the model gets: an approved escalation returns the unsandboxed re-run instead,
+so the first run's text is never saved. The sandbox-denial check reads the whole
+captured text, not the inline part — stdout comes first, so with more than the
+inline budget on stdout a denial line on stderr was cut away and neither the
+escalation nor the hint appeared. stdout precedes stderr in the canonical result,
+followed by `[exit status N]` or `[killed by signal]`; an empty successful run
+returns `(no output)`.
+
+`timeout_ms` is bounded to 1..=600,000 on both `bash` and `powershell` through
+one shared check, and a value outside it is rejected before anything is spawned;
+`bash`'s background form ignores the field, so it is not validated there. A
+timeout that fires is still an error result, but it now carries what the command
+had printed (formatted exactly as a normal result, including the spilling rule)
+followed by `[timed out after N ms]`, so the model can see which test or build
+step hung. Turn interruption keeps its exact `interrupted` text — the dispatcher
+and the transcript contract key on it — and deliberately drops the partial
+capture.
 
 `bash` also takes an optional `description` (Plan 156) under the same display-only
 contract as `run_agent`/`run_program`: at most 200 Unicode characters, nonblank,
@@ -3055,8 +3081,10 @@ returns immediately with the ID and the output path. Companions:
   for every active state including `Finishing` — while a peek or a finish
   reports `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`,
   plus the last 30k bytes of output (read the file with `read_file` for more).
-  Read-only: skips the gate, joins concurrent batches. These are instructions to
-  the model; unit tests of the text and early return do not establish that the
+  That tail starts on a UTF-8 character boundary even when the byte offset would
+  land inside a character. Read-only: skips the gate, joins concurrent batches.
+  These are instructions to the model; unit tests of the text and early return
+  do not establish that the
   wording changes its tool choices. In plan 220's incident-context replay,
   fixed sleeps occurred in 30/30 old-wording and 27/30 new-wording samples;
   only 3/30 new-wording samples chose blocking `bash_output`. This wording
@@ -3066,8 +3094,15 @@ returns immediately with the ID and the output path. Companions:
   nonblocking `bash_output` calls, and one upstream failure in 30 samples;
   none of its completed replies used a fixed sleep.
 - **stop_bash** `{bash_id}` — terminates the whole owned process tree and waits
-  for the registry to confirm. Auto-allowed: it can only signal processes this
-  agent itself started.
+  up to 5 s for the registry to confirm. If the shell is still active when that
+  window closes, it says `stop requested for <id> (<command>); it is still
+  <state>` instead of claiming the stop completed. Auto-allowed: it can only
+  signal processes this agent itself started. A failed terminate is retried on
+  every watchdog tick rather than abandoned after the first error.
+
+Both waiters subscribe to the registry's activity watch instead of polling the
+table every 100 ms: any terminal transition wakes them, and every wake re-reads
+the current state (a change may belong to another shell).
 
 Semantics: permission checks are identical to foreground bash (the command
 string is what's judged, not where it runs); `timeout_ms` is ignored in
