@@ -4782,11 +4782,10 @@ severity、reason、comparison、basis、evidence、missing；动态函数 schem
 接口边界，不能据此区分上游模型生成和服务端转换。
 
 `rollout-recheck <pipeline-out> <out>`（plan 281）对同一份初审账本做配对复核，只把证据
-换成初审在 rollout 里实际读过的行：`read_file` 返回的行号、输出中补丁实际显示的行、
-`sed -n`/`nl`/`cat`/`git show REV:path` 片段、grep 命中行。bash 读取只认几种写法完全固定、
-输出来源唯一的命令（`sed -n 'A,Bp' 文件`、`nl -ba 文件 | sed -n …`、`git show REV:路径 [| nl -ba]
-| sed -n …`、`cat 文件`、`git show REV:路径`，可带一个 `cd` 前缀和读标准输入的 `| head -n N`），
-整条匹配；再在输出里找对应冻结行从第一行起的最长连续前缀，只计这一段。其余写法一律不计；反向范围按 sed 语义只算起始行；结果被会话换成落盘预览时一行不计；
+换成初审在 rollout 里实际读过、且来源与行号都明确的行：`read_file` 返回的行号、输出中
+补丁实际显示的行、grep 格式的 `路径:行号:`（grep 工具指定单个文件时为 `行号:`）。`sed`、`cat`、
+`nl`、`git show REV:path` 等的来源要从命令推断，推断做不全（管道、重定向、文件参数、条件
+分支），一律不计——DeepSeek 初审多用 `sed` 读代码，这一入口能拿到的证据因此很少；反向范围按 sed 语义只算起始行；结果被会话换成落盘预览时一行不计；
 超出解析假设的单条记录跳过并计数，不中断准备。
 交付方式与补查沿用 A 组冻结的设置（与 `pipeline` 共用 `dispatch_recheck`），两组只差证据；只保留对应版本 Git blob 中存在
 的行，间隔不超过 3 行的合并成段。超预算时先取 excluded 锚点所在文件，再按首次读取顺序

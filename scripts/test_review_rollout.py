@@ -83,14 +83,14 @@ class RolloutEvidenceTest(unittest.TestCase):
         path = self.root / "rollout.jsonl"
         self.write_rollout(path, self.fixture_calls())
         reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
+        # 只有来源明确的读取计入：read_file、补丁、grep 工具与带路径的 grep 输出；
+        # sed、`git show | sed`、cat、无路径的 bash grep 不计。
         self.assertEqual(reads.lines, {
-            ("after", "f.py"): {2, 3, 6, 7, 5, 9, 12},
-            ("before", "f.py"): {10, 11, 5},
-            ("after", "g.py"): {3, 4},
-            ("after", "h.py"): {1, 2, 3},
+            ("after", "f.py"): {2, 3, 5, 9, 12},
+            ("before", "f.py"): {5},
+            ("after", "g.py"): {3},
         })
-        self.assertEqual(list(reads.first_seen), [("after", "f.py"), ("before", "f.py"),
-                                                  ("after", "g.py"), ("after", "h.py")])
+        self.assertEqual(list(reads.first_seen), [("after", "f.py"), ("before", "f.py"), ("after", "g.py")])
 
     def test_truncated_patch_only_counts_shown_lines(self):
         diff = self.git("diff", "-U0", "HEAD^", "HEAD", "--", "f.py")
@@ -99,64 +99,32 @@ class RolloutEvidenceTest(unittest.TestCase):
         reads.patch(cut)
         self.assertEqual(reads.lines, {("before", "f.py"): {5}})
 
-    def test_only_lines_actually_shown_in_the_output_are_counted(self):
+    def test_bash_reads_count_only_with_an_explicit_source_and_line(self):
         notice = "\n[output truncated: 9000 characters and 0 additional bytes omitted]"
         diff = self.git("diff", "-U0", "HEAD^", "HEAD", "--", "f.py")
         pointer = ("[output truncated: 40000 chars, 900 lines; full output saved to /tmp/off-1.txt]\n"
                    + diff + "\n[Query it in place instead of reading it back: bash with `python3 -c '...'` "
                    "over that path, printing only the fields you need, so only what you extract enters the context]")
         calls = [
-            # 截断：只计显示出的前三行。
-            ("bash", {"command": "sed -n '1,12p' f.py"}, "line 1\nline 2\nline 3" + notice),
-            # 管道过滤：`| head -n 1` 只显示一行。
-            ("bash", {"command": "sed -n '4,12p' f.py | head -n 1"}, "line 4\n"),
-            # 反向范围：sed 只打印起始行。
-            ("bash", {"command": "sed -n '5,3p' f.py"}, "line 5 changed\n"),
-            # 条件分支没执行：没有输出，一行不计。
-            ("bash", {"command": "false && sed -n '6,7p' f.py"}, ""),
-            # 多个读取段分不清输出归属：g.py 与 h.py 开头相同、g.py 那段没执行，整条不计，
-            # 也不能把 h.py 的输出记到 g.py 上。
-            ("bash", {"command": "false && sed -n '1,5p' g.py; cat h.py"}, "line 1\nline 2\nline 3\n"),
-            ("bash", {"command": "sed -n '1,2p' g.py && echo --- && sed -n '3,3p' g.py"},
-             "line 1\nline 2\n---\nline 3\n"),
-            # 只有一个已识别读取，但还有别的段或阶段能产生输出：归属不明，整条不计。
-            ("bash", {"command": "false && sed -n '1,5p' g.py; head -n 3 h.py"}, "line 1\nline 2\nline 3\n"),
-            ("bash", {"command": "sed -n '1,5p' g.py | paste - h.py"}, "line 1\tline 1\n"),
-            # 过滤器或重定向换了输入源：只认固定形状，这些都匹配不上，不计。
-            ("bash", {"command": "sed -n '1,5p' g.py | head -n 3 h.py"}, "line 1\nline 2\nline 3\n"),
-            ("bash", {"command": "sed -n '1,5p' g.py < h.py"}, "line 1\nline 2\nline 3\n"),
-            ("bash", {"command": "sed -n '1,5p' g.py | sed -n '1,2p' h.py"}, "line 1\nline 2\n"),
-            ("bash", {"command": "nl -ba g.py | sed -n '1,2p' h.py"}, "line 1\nline 2\n"),
-            ("bash", {"command": "git show HEAD:g.py | tail -n 2 h.py"}, "line 2\nline 3\n"),
-            # nl 的行号前缀去掉后比较，nl 在管道中间也一样。
+            # 来源要从命令推断的读取一律不计，不论写法多简单。
+            ("bash", {"command": "sed -n '1,3p' f.py"}, "line 1\nline 2\nline 3\n"),
+            ("bash", {"command": "sed -n '1,5p' g.py | head 3"}, "line 1\nline 2\nline 3\n"),
             ("bash", {"command": "nl -ba g.py | sed -n '4,5p'"}, "     4\tline 4\n     5\tline 5\n"),
-            ("bash", {"command": "git show HEAD^:f.py | nl -ba | sed -n '2,3p'"},
-             "     2\tline 2\n     3\tline 3\n"),
-            # 整个文件被截断：只计前两行。
-            ("bash", {"command": "cat h.py"}, "line 1\nline 2" + notice),
+            ("bash", {"command": "cat h.py"}, "line 1\nline 2\nline 3\n"),
+            ("bash", {"command": "grep -n x|head g.py"}, "50: marker\n"),
+            # grep 输出自带路径与行号：计入；截断说明之后的内容不算显示过。
+            ("bash", {"command": "grep -rn line ."}, "g.py:2:line 2\n" + notice + "\ng.py:5:line 5"),
             # 会话落盘预览：连补丁也不计。
             ("bash", {"command": "git diff -U0 HEAD^ HEAD"}, pointer),
             # 解析器假设之外的输入：这一条不计，不中断整次准备。
             ("read_file", {"path": None}, "1\tline 1"),
         ]
-        path = self.root / "shown.jsonl"
+        path = self.root / "explicit.jsonl"
         self.write_rollout(path, calls)
         reads = rollout.read_regions(path, self.repo, self.repo, self.versions)
-        self.assertEqual(reads.lines, {
-            ("after", "f.py"): {1, 2, 3, 4, 5},
-            ("before", "f.py"): {2, 3},
-            ("after", "g.py"): {4, 5},
-            ("after", "h.py"): {1, 2},
-        })
-        self.assertEqual(reads.counts["unrecognized-skipped"], 10)
+        self.assertEqual(reads.lines, {("after", "g.py"): {2}})
         self.assertEqual(reads.counts["offloaded-skipped"], 1)
         self.assertEqual(reads.counts["unparsed"], 1)
-
-    def test_longest_shown_prefix_starts_at_the_first_expected_line(self):
-        self.assertEqual(rollout.longest_shown_prefix(["a", "b", "c"], ["x", "a", "b", "y", "a", "b", "c"]), 3)
-        self.assertEqual(rollout.longest_shown_prefix(["a", "b"], ["b", "a"]), 1)
-        self.assertEqual(rollout.longest_shown_prefix(["a"], ["b"]), 0)
-        self.assertEqual(rollout.longest_shown_prefix([], ["a"]), 0)
 
     def test_spans_merge_gaps_of_at_most_three_lines(self):
         self.assertEqual(rollout.spans_of({1, 2, 3, 7, 8, 20}), [(1, 8), (20, 20)])

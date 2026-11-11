@@ -22,33 +22,6 @@ NUMBERED = re.compile(r"^(\d+)\t")
 # bash 内联截断说明（tools/bash.rs `format_output`）与会话落盘预览的结尾（history.rs `POINTER_END`）。
 BASH_TRUNCATION = "\n[output truncated: "
 OFFLOAD_POINTER_END = "so only what you extract enters the context]"
-NL_PREFIX = re.compile(r"^\s*\d+\t")
-# 只认几种写法完全固定的读取命令（可带一个 `cd 目录 &&` 前缀、末尾一个读标准输入的
-# `| head -n N`）。整条匹配，所以带文件参数的过滤器、输入重定向、多文件、额外的命令段都
-# 匹配不上，输出来源唯一；其余写法一律不计。
-_CD = r"""(?:cd\s+(?P<cd>[^\s;&|<>]+)\s*(?:&&|;)\s*)?"""
-_FILE = r"""(?P<path>'[^']+'|"[^"]+"|[^\s;&|<>'"]+)"""
-_RANGE = r"""sed\s+-n\s+(?P<q>['"]?)(?P<a>\d+)(?:,(?P<b>\d+))?p(?P=q)"""
-_REV = r"""git\s+show\s+(?P<rev>[^\s:;&|<>'"]+):(?P<path>[^\s;&|<>'"]+)"""
-_HEAD = r"""(?:\s*\|\s*head\s+(?:-n\s*)?-?\d+)?"""
-READ_SHAPES = [
-    ("sed", re.compile(rf"^{_CD}{_RANGE}\s+{_FILE}{_HEAD}$")),
-    ("nl", re.compile(rf"^{_CD}(?P<nl>nl\s+-ba)\s+{_FILE}\s*\|\s*{_RANGE}{_HEAD}$")),
-    ("show-blob", re.compile(rf"^{_CD}{_REV}\s*\|\s*(?:(?P<nl>nl\s+-ba)\s*\|\s*)?{_RANGE}{_HEAD}$")),
-    ("cat", re.compile(rf"^{_CD}cat\s+{_FILE}{_HEAD}$")),
-    ("show-blob", re.compile(rf"^{_CD}{_REV}{_HEAD}$")),
-]
-READ_VERB = re.compile(r"\b(sed\s+-n|cat|nl|head|tail|git\s+show)\b")
-GREP_ONE_FILE = re.compile(rf"""^{_CD}(?:grep|rg)\s+(?:-\S*n\S*\s+)(?:-\S+\s+)*(?:'[^']*'|"[^"]*"|\S+)\s+{_FILE}$""")
-
-
-def exact_read(command):
-    """命令完整匹配某个固定读取形状时返回各字段，否则 None。"""
-    text = command.strip()
-    for kind, shape in READ_SHAPES:
-        if match := shape.match(text):
-            return {**match.groupdict(), "kind": kind}
-    return None
 
 
 def unquote(word):
@@ -107,11 +80,6 @@ class Reads:
         self.first_seen.setdefault((version, path), len(self.first_seen))
         self.counts[kind] = self.counts.get(kind, 0) + len(valid)
 
-    def add_whole(self, version, path, kind):
-        content = self.file_lines(version, path) if version and path else None
-        if content:
-            self.add(version, path, range(1, len(content) + 1), kind)
-
     def patch(self, output):
         old = new = None
         before = after = None
@@ -155,48 +123,16 @@ class Reads:
                 self.add("after", single_file, [int(number.group(1))], "grep")
 
     def bash(self, command, output):
+        """只计输出里自带来源与行号的部分：git 补丁（文件头 + hunk 行号）与 grep 格式的
+        `路径:行号:`。`sed`/`cat`/`nl`/`git show` 等的来源要从命令推断，推断做不全（管道、
+        重定向、文件参数、条件分支），一律不计。"""
         # 整份结果被会话换成落盘预览时，模型只看到首尾片段，哪一行都无法确认读过。
         if output.rstrip().endswith(OFFLOAD_POINTER_END):
             self.counts["offloaded-skipped"] = self.counts.get("offloaded-skipped", 0) + 1
             return
         shown = output.partition(BASH_TRUNCATION)[0]
-        base = str(self.snapshot)
-        if cd := re.match(_CD, command.strip()).group("cd"):
-            target = unquote(cd)
-            base = os.path.realpath(target if os.path.isabs(target) else os.path.join(base, target))
-        if read := exact_read(command):
-            self.credit_read(read, shown, base)
-        elif READ_VERB.search(command):
-            # 读取写法不在固定形状里：输出可能另有来源（多段、文件参数、重定向），不计。
-            self.counts["unrecognized-skipped"] = self.counts.get("unrecognized-skipped", 0) + 1
-        single = None
-        if match := GREP_ONE_FILE.match(command.strip()):
-            path = self.relative(match.group("path"), base)
-            single = path if path and self.file_lines("after", path) else None
         self.patch(shown)
-        self.grep_output(shown, base, single)
-
-    def credit_read(self, read, shown, base):
-        """固定形状的单个读取：在输出里找对应冻结行从第一行起的最长连续前缀，只计这一段
-        （截断与 `| head` 由此排除）。"""
-        rev = read.get("rev")
-        version = self.version_of(rev) if rev else "after"
-        path = unquote(read["path"]) if rev else self.relative(read["path"], base)
-        content = self.file_lines(version, path) if version and path else None
-        start = int(read["a"]) if read.get("a") else 1
-        if not content or start > len(content):
-            return
-        # 反向范围按 sed 语义只打印起始行。
-        end = len(content) if not read.get("a") else max(start, int(read["b"] or start))
-        expected = content[start - 1:min(end, len(content))]
-        lines = shown.splitlines()
-        if read.get("nl"):
-            lines = [NL_PREFIX.sub("", line, count=1) for line in lines]
-        length = longest_shown_prefix(expected, lines)
-        if length:
-            self.add(version, path, range(start, start + length), read["kind"])
-        if length < len(expected):
-            self.counts["unshown"] = self.counts.get("unshown", 0) + len(expected) - length
+        self.grep_output(shown, str(self.snapshot))
 
     def read_file(self, arguments, output):
         path = self.relative(arguments.get("path", ""), str(self.snapshot))
@@ -207,22 +143,6 @@ class Reads:
         target = self.relative(arguments.get("path", "."), str(self.snapshot))
         single = target if target and self.file_lines("after", target) else None
         self.grep_output(output, str(self.snapshot), single)
-
-
-def longest_shown_prefix(expected, lines):
-    """`expected` 从第一行起在 `lines` 里连续出现的最长长度；空的 `expected` 为 0。"""
-    best = 0
-    for index, line in enumerate(lines):
-        if not expected or line != expected[0]:
-            continue
-        length = 0
-        while (length < len(expected) and index + length < len(lines)
-               and lines[index + length] == expected[length]):
-            length += 1
-        best = max(best, length)
-        if best == len(expected):
-            break
-    return best
 
 
 def text_of(content):
