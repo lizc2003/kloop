@@ -24,6 +24,7 @@ NUMBERED = re.compile(r"^(\d+)\t")
 # bash 内联截断说明（tools/bash.rs `format_output`）与会话落盘预览的结尾（history.rs `POINTER_END`）。
 BASH_TRUNCATION = "\n[output truncated: "
 OFFLOAD_POINTER_END = "so only what you extract enters the context]"
+NL_PREFIX = re.compile(r"^\s*\d+\t")
 
 
 def split_unquoted(text, separators):
@@ -165,11 +166,10 @@ class Reads:
         if output.rstrip().endswith(OFFLOAD_POINTER_END):
             self.counts["offloaded-skipped"] = self.counts.get("offloaded-skipped", 0) + 1
             return
-        shown, notice, _ = output.partition(BASH_TRUNCATION)
-        truncated = bool(notice)
+        shown = output.partition(BASH_TRUNCATION)[0]
         base = str(self.snapshot)
         segments = split_unquoted(command, ["&&", "||", ";", "\n"])
-        reads = []  # (version, path, start, end)；end 为 None 表示整个文件
+        reads = []  # (version, path, start, end, kind, numbered)；end 为 None 表示整个文件
         for segment in segments:
             if segment.startswith("cd "):
                 target = unquote(segment[3:].strip())
@@ -178,36 +178,42 @@ class Reads:
             stages = split_unquoted(segment, ["|"])
             first = stages[0]
             sed = next((SED_RANGE.match(stage) for stage in stages[1:] if SED_RANGE.match(stage)), None)
+            # 管道里任何一段是 `nl` 时输出带行号前缀，比较前去掉。
+            numbered = any(stage == "nl" or stage.startswith("nl ") for stage in stages)
             if match := SED_RANGE.match(first):
                 start, end, path = int(match.group(1)), int(match.group(2) or match.group(1)), match.group(3)
                 if path:
-                    reads.append(("after", self.relative(path, base), start, end, "sed"))
+                    reads.append(("after", self.relative(path, base), start, end, "sed", numbered))
             elif match := SHOW_BLOB.match(first):
                 version, path = self.version_of(match.group(1)), unquote(match.group(2))
                 if sed:
-                    reads.append((version, path, int(sed.group(1)), int(sed.group(2) or sed.group(1)), "show-blob"))
+                    reads.append((version, path, int(sed.group(1)), int(sed.group(2) or sed.group(1)),
+                                  "show-blob", numbered))
                 elif len(stages) == 1:
-                    reads.append((version, path, 1, None, "show-blob"))
+                    reads.append((version, path, 1, None, "show-blob", False))
             elif first.startswith("nl ") and sed:
                 reads.append(("after", self.relative(first.split()[-1], base),
-                              int(sed.group(1)), int(sed.group(2) or sed.group(1)), "nl"))
+                              int(sed.group(1)), int(sed.group(2) or sed.group(1)), "nl", True))
             elif first.startswith("cat ") and len(stages) == 1 and len(first.split()) == 2:
-                reads.append(("after", self.relative(first.split()[1], base), 1, None, "cat"))
+                reads.append(("after", self.relative(first.split()[1], base), 1, None, "cat", False))
         commands = [segment for segment in segments if not segment.startswith("cd ")]
-        if not truncated:
-            for version, path, start, end, kind in reads:
-                if end is None:
-                    self.add_whole(version, path, kind)
-                else:
-                    self.add(version, path, range(start, end + 1), kind)
-        elif len(commands) == 1 and len(reads) == 1:
-            # 截断时只认单个读取命令显示出的前几行；多段命令分不清每段显示了多少，不计。
-            version, path, start, end, kind = reads[0]
-            shown_lines = len(shown.splitlines())
-            last = start + shown_lines - 1 if end is None else min(end, start + shown_lines - 1)
-            self.add(version, path, range(start, last + 1), kind)
-        elif reads:
-            self.counts["truncated-skipped"] = self.counts.get("truncated-skipped", 0) + 1
+        # 命令只说明想读哪里；是否真的显示要看输出。按命令顺序在输出里找每个读取对应
+        # 冻结行从第一行起的最长连续前缀，只计这一段：截断、`| head`、`| grep`、没执行
+        # 的条件分支都由此排除。顺序匹配让两个文件里相同的一行不会被算到错误的文件上。
+        output_lines = shown.splitlines()
+        cursor = 0
+        for version, path, start, end, kind, numbered in reads:
+            content = self.file_lines(version, path) if version and path else None
+            if not content or start > len(content):
+                continue
+            expected = content[start - 1:(len(content) if end is None else min(end, len(content)))]
+            lines = [NL_PREFIX.sub("", line, count=1) for line in output_lines] if numbered else output_lines
+            position, length = longest_shown_prefix(expected, lines, cursor)
+            if length:
+                self.add(version, path, range(start, start + length), kind)
+                cursor = position + length
+            if length < len(expected):
+                self.counts["unshown"] = self.counts.get("unshown", 0) + len(expected) - length
         single = None
         if len(commands) == 1 and len(split_unquoted(commands[0], ["|"])) == 1:
             words = commands[0].split()
@@ -226,6 +232,23 @@ class Reads:
         target = self.relative(arguments.get("path", "."), str(self.snapshot))
         single = target if target and self.file_lines("after", target) else None
         self.grep_output(output, str(self.snapshot), single)
+
+
+def longest_shown_prefix(expected, lines, start=0):
+    """`expected` 从第一行起在 `lines[start:]` 里连续出现的最长前缀：返回（位置，长度）。"""
+    best = (start, 0)
+    for index in range(start, len(lines)):
+        if lines[index] != expected[0]:
+            continue
+        length = 0
+        while (length < len(expected) and index + length < len(lines)
+               and lines[index + length] == expected[length]):
+            length += 1
+        if length > best[1]:
+            best = (index, length)
+            if length == len(expected):
+                break
+    return best
 
 
 def text_of(content):
