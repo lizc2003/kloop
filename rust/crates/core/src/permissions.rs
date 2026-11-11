@@ -1475,7 +1475,9 @@ mod tests {
         for command in [
             "exec sh -c 'cat .env'",
             "builtin exec sh -c 'cat .env'",
+            "builtin -- exec sh -c 'cat .env'",
             "command exec sh -c 'cat .env'",
+            "command -- exec sh -c 'cat .env'",
             "exec env -S 'cat .env'",
             "exec -l bash -c 'cat \"$HOME/public.txt\"'",
             "exec -a -bash bash -c 'cat \"$HOME/public.txt\"'",

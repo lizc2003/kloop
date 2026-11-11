@@ -694,7 +694,14 @@ pub(crate) fn analyze_wrappers(argv: &[String]) -> WrapperAnalysis<'_> {
             "command" => command_command(&rest[1..]),
             "exec" => exec_command(&rest[1..], &mut analysis),
             // `builtin NAME …` 只调用 shell 内建；后面不是内建时 shell 直接报错，多剥一层无害。
-            "builtin" => Some(&rest[1..]),
+            // bash 接受一个 `--` 结束选项（`builtin -- exec sh -c …` 照常执行），一并剥掉。
+            "builtin" => {
+                let after = &rest[1..];
+                Some(match after.first() {
+                    Some(word) if word == "--" => &after[1..],
+                    _ => after,
+                })
+            }
             "nohup" | "nice" | "time" | "timeout" | "xargs" => {
                 transparent_wrapper_command(wrapper, &rest[1..], &mut analysis)
             }
@@ -1903,6 +1910,11 @@ mod tests {
             (vec!["exec", "sh", "-c", "x"], vec!["sh", "-c", "x"], false),
             (
                 vec!["builtin", "exec", "sh", "-c", "x"],
+                vec!["sh", "-c", "x"],
+                false,
+            ),
+            (
+                vec!["builtin", "--", "exec", "sh", "-c", "x"],
                 vec!["sh", "-c", "x"],
                 false,
             ),
