@@ -67,8 +67,10 @@ struct BashInput {
     timeout_ms: Option<u64>,
     #[serde(default)]
     background: bool,
-    #[serde(default)]
-    disable_sandbox: bool,
+    /// Declared only so `deny_unknown_fields` accepts the field; containment
+    /// is decided by the permission gate, not by the executor.
+    #[serde(default, rename = "disable_sandbox")]
+    _disable_sandbox: bool,
 }
 
 /// The foreground budget this call runs under: the model's `timeout_ms` when it
@@ -225,6 +227,8 @@ pub(super) async fn bash_tool(
     input: &Value,
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
+    verdict: &crate::permissions::Verdict,
+    facts: Option<&crate::shell::BashFacts>,
 ) -> Result<String> {
     #[cfg(windows)]
     if input.get("disable_sandbox").is_some() {
@@ -240,11 +244,9 @@ pub(super) async fn bash_tool(
         .bash
         .as_ref()
         .context("bash: Git for Windows Bash is unavailable in this session")?;
-    let sandbox = if parsed.disable_sandbox {
-        None
-    } else {
-        workspace.sandbox.clone()
-    };
+    // The gate already decided containment from the same facts; execution
+    // takes it as written. `Escalated` is remembered consent to stay uncontained.
+    let sandbox = sandbox_for(verdict, workspace);
     let cwd = workspace.cwd.clone();
     if parsed.background {
         // No timeout in background mode; the watchdog and stop_bash are the
@@ -256,11 +258,32 @@ pub(super) async fn bash_tool(
             bash,
             ctx,
             workspace,
+            verdict,
+            facts,
         );
     }
-    run_foreground_bash(command, parsed.timeout_ms, sandbox, ctx, workspace)
-        .await
-        .map(|run| run.text)
+    run_foreground_bash(
+        command,
+        parsed.timeout_ms,
+        sandbox,
+        ctx,
+        workspace,
+        verdict,
+        facts,
+    )
+    .await
+    .map(|run| run.text)
+}
+
+/// The executor's whole sandbox decision: the gate's plan, read verbatim.
+fn sandbox_for(
+    verdict: &crate::permissions::Verdict,
+    workspace: &EffectiveWorkspace,
+) -> Option<Arc<SandboxPolicy>> {
+    match verdict.sandbox {
+        crate::permissions::SandboxPlan::Contained => workspace.sandbox.clone(),
+        crate::permissions::SandboxPlan::None | crate::permissions::SandboxPlan::Escalated => None,
+    }
 }
 
 /// What one foreground run left behind: the model-facing text, and whether the
@@ -279,6 +302,8 @@ pub(crate) async fn run_foreground_bash(
     sandbox: Option<Arc<SandboxPolicy>>,
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
+    verdict: &crate::permissions::Verdict,
+    facts: Option<&crate::shell::BashFacts>,
 ) -> Result<ForegroundRun> {
     let cwd = workspace.cwd.clone();
     let bash = ctx
@@ -292,29 +317,24 @@ pub(crate) async fn run_foreground_bash(
     }
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_FOREGROUND_TIMEOUT_MS);
     // A remembered escalation is consent to run this command uncontained, so
-    // the contained attempt is skipped rather than run and thrown away. It is
-    // the expensive half — the run that compiles the test binary, binds the
-    // port, and only then discovers it may not — and re-running it every time
-    // is what made "remember this" feel like it had not been remembered.
-    let requires_protection = crate::permissions::bash_protection_requirement(
-        command,
-        &cwd,
-        sandbox::ExecutionContext::sandboxed(sandbox.as_deref())
-            .with_shell_home(replayed_home(&ctx.cfg.shell_login_env)),
-    )
-    .map_err(anyhow::Error::msg)?;
-    let remembered_escalation = sandbox.as_ref().is_some_and(|policy| policy.escalate)
-        && workspace.permissions.sandbox_escalation_remembered(command);
-    let effective_sandbox = if remembered_escalation {
-        None
-    } else {
-        sandbox.as_deref()
-    };
-    // 已有通配升级不能覆盖这次调用新引入的保护要求；在第一次执行前拒绝。
-    if requires_protection && remembered_escalation {
+    // the contained attempt is skipped rather than run and thrown away. The
+    // gate decided that once; the contained run is the expensive half — the
+    // run that compiles the test binary, binds the port, and only then
+    // discovers it may not.
+    let remembered_escalation = verdict.sandbox == crate::permissions::SandboxPlan::Escalated;
+    if verdict.protection == crate::permissions::Protection::Required && sandbox.is_none() {
         bail!(sandbox::PROTECTION_REQUIRED);
     }
-    let output = run_foreground(command, &cwd, effective_sandbox, bash, timeout_ms, ctx).await?;
+    let output = run_foreground(
+        command,
+        &cwd,
+        sandbox.as_deref(),
+        bash,
+        timeout_ms,
+        ctx,
+        verdict.protection,
+    )
+    .await?;
     fail_if_timed_out(&output, Some(&ctx.cfg.offload_dir))?;
     let success = output.status.success();
     if remembered_escalation {
@@ -343,15 +363,18 @@ pub(crate) async fn run_foreground_bash(
             !policy.allow_network,
         )
     {
-        if requires_protection {
+        if verdict.protection == crate::permissions::Protection::Required {
             hint = Some(sandbox::PROTECTION_REQUIRED);
         } else if policy.escalate {
             // The code-level escalation loop (codex's retry-on-denial):
             // ask once, and on approval re-run the command unsandboxed —
             // one fewer model round-trip than the disable_sandbox hint.
-            let asking = workspace
-                .permissions
-                .escalate_sandbox(command, Some(&denial), ctx.depth);
+            let asking = workspace.permissions.escalate_sandbox_with_facts(
+                command,
+                Some(&denial),
+                ctx.depth,
+                facts,
+            );
             // A prompt withdrawn by another call's stop leaves the sandboxed
             // failure standing, exactly as a decline would; the turn is ending.
             // Cancelling the turn itself withdraws it too, but must end the
@@ -371,7 +394,16 @@ pub(crate) async fn run_foreground_bash(
             }
             match escalation.outcome {
                 EscalationOutcome::Approved(approval) => {
-                    let raw = run_foreground(command, &cwd, None, bash, timeout_ms, ctx).await?;
+                    let raw = run_foreground(
+                        command,
+                        &cwd,
+                        None,
+                        bash,
+                        timeout_ms,
+                        ctx,
+                        verdict.protection,
+                    )
+                    .await?;
                     fail_if_timed_out(&raw, Some(&ctx.cfg.offload_dir))?;
                     // What the sandbox refused is the only record of why this
                     // ran uncontained, and the sandboxed output is about to be
@@ -413,14 +445,13 @@ async fn run_foreground(
     bash: &ShellProgram,
     timeout_ms: u64,
     ctx: &ToolCtx,
+    protection: crate::permissions::Protection,
 ) -> Result<ForegroundOutput> {
-    crate::permissions::bash_protection_requirement(
-        command,
-        cwd,
-        sandbox::ExecutionContext::sandboxed(sandbox)
-            .with_shell_home(replayed_home(&ctx.cfg.shell_login_env)),
-    )
-    .map_err(anyhow::Error::msg)?;
+    // Per-launch invariant: the one protection judgment came from the gate, and
+    // an uncontained launch may not be the way around it.
+    if protection == crate::permissions::Protection::Required && sandbox.is_none() {
+        bail!(sandbox::PROTECTION_REQUIRED);
+    }
     let spec = shell_spec(
         command,
         cwd,
@@ -817,6 +848,49 @@ mod tests {
     use std::path::Path;
     #[cfg(unix)]
     use std::sync::Arc;
+
+    /// Plan 266: the executor's sandbox is the gate's plan, read verbatim. A
+    /// `Contained` verdict always means the workspace policy; every other plan
+    /// means no containment.
+    #[test]
+    fn plan266_execution_follows_the_verdicts_containment() {
+        use crate::config::EffectiveWorkspace;
+        use crate::permissions::Permissions;
+        use crate::permissions::SandboxPlan;
+        use crate::permissions::Verdict;
+        use crate::sandbox::SandboxPolicy;
+
+        let policy = std::sync::Arc::new(SandboxPolicy::workspace(
+            std::path::Path::new("/w"),
+            &[],
+            false,
+        ));
+        let workspace = EffectiveWorkspace {
+            identity: crate::project::WorkspaceIdentity::ephemeral("/w".into()),
+            workspace_epoch: 0,
+            cwd: "/w".into(),
+            permissions: std::sync::Arc::new(Permissions::allow_all()),
+            file_state: Default::default(),
+            sandbox: Some(policy.clone()),
+            system: String::new(),
+            branch: None,
+        };
+        let plan = |sandbox| Verdict {
+            sandbox,
+            ..Default::default()
+        };
+        let contained = super::sandbox_for(&plan(SandboxPlan::Contained), &workspace)
+            .expect("contained means the workspace policy");
+        assert!(std::sync::Arc::ptr_eq(&contained, &policy));
+        assert!(super::sandbox_for(&plan(SandboxPlan::None), &workspace).is_none());
+        assert!(super::sandbox_for(&plan(SandboxPlan::Escalated), &workspace).is_none());
+
+        let no_policy = EffectiveWorkspace {
+            sandbox: None,
+            ..workspace
+        };
+        assert!(super::sandbox_for(&plan(SandboxPlan::Contained), &no_policy).is_none());
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1492,6 +1566,7 @@ mod tests {
             &bash,
             10_000,
             &ctx,
+            crate::permissions::Protection::Unchecked,
         )
         .await
         .unwrap();

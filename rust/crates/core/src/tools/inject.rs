@@ -45,7 +45,6 @@ use super::bash;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
 use crate::event::Event;
-use crate::permissions::PermissionNotice;
 use crate::permissions::Refusal;
 use crate::permissions::user_stop;
 use crate::skills::expand_body;
@@ -253,27 +252,34 @@ async fn run_gated_bash(
             .await
             .map_err(|e| anyhow!("!`{command}`: {e:#}"))?;
     }
+    let facts = super::analyze_shell_call("bash", &input);
     let sandbox_auto = bash::execution_context("bash", &input, workspace, &ctx.cfg.shell_login_env);
-    match trigger {
+    let verdict = match trigger {
         // The slash path runs outside a turn and keeps its original gate and
         // error text. The skill path runs inside one, so it must distinguish
         // a Stop (end the turn) from a denial and surface a notice.
-        Trigger::Slash => {
-            workspace
-                .permissions
-                .check_call_with_execution("bash", &input, ctx.depth, sandbox_auto)
-                .await
-                .map_err(|reason| anyhow!("!`{command}`: {reason}"))?;
-        }
+        Trigger::Slash => workspace
+            .permissions
+            .check_call_with_execution("bash", &input, ctx.depth, sandbox_auto, facts.as_deref())
+            .await
+            .map_err(|reason| anyhow!("!`{command}`: {reason}"))?,
         Trigger::Skill => {
             let verdict = workspace
                 .permissions
-                .check_call_with_resolved_path("bash", &input, None, None, ctx.depth, sandbox_auto)
+                .check_call_with_resolved_path(
+                    "bash",
+                    &input,
+                    None,
+                    None,
+                    ctx.depth,
+                    sandbox_auto,
+                    facts.as_deref(),
+                )
                 .await;
-            accept_permission(verdict, command, ctx)?;
+            accept_permission(verdict, command, ctx)?
         }
-    }
-    bash::bash_tool(&input, ctx, workspace).await
+    };
+    bash::bash_tool(&input, ctx, workspace, &verdict, facts.as_deref()).await
 }
 
 /// Apply the permission gate's verdict. `Stopped` must end the turn just as it
@@ -281,20 +287,23 @@ async fn run_gated_bash(
 /// No into an ordinary denial the model is free to route around — and a
 /// `notice` (e.g. "project rule not saved") is surfaced, not dropped.
 fn accept_permission(
-    verdict: std::result::Result<Option<PermissionNotice>, Refusal>,
+    verdict: std::result::Result<crate::permissions::Verdict, Refusal>,
     command: &str,
     ctx: &ToolCtx,
-) -> Result<()> {
+) -> Result<crate::permissions::Verdict> {
     match verdict {
-        Ok(Some(notice)) => ctx.ui.emit(&Event::Note(notice.message)),
-        Ok(None) => {}
+        Ok(verdict) => {
+            if let Some(notice) = &verdict.notice {
+                ctx.ui.emit(&Event::Note(notice.message.clone()));
+            }
+            Ok(verdict)
+        }
         Err(Refusal::Denied(reason)) => bail!("!`{command}`: {reason}"),
         Err(Refusal::Stopped) => {
             ctx.stop.cancel();
             bail!("!`{command}`: {}", user_stop("bash"));
         }
     }
-    Ok(())
 }
 
 /// Append the contents of each `@file` mention that resolves to a readable file.
@@ -501,9 +510,12 @@ mod tests {
         let recording = std::sync::Arc::new(Recording(Default::default()));
         ctx.ui = recording.clone();
         accept_permission(
-            Ok(Some(PermissionNotice {
-                message: "rule not saved".into(),
-            })),
+            Ok(crate::permissions::Verdict {
+                notice: Some(crate::permissions::PermissionNotice {
+                    message: "rule not saved".into(),
+                }),
+                ..Default::default()
+            }),
             "echo x",
             &ctx,
         )

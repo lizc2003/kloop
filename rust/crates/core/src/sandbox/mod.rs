@@ -351,6 +351,12 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// The policy this call would run under, when there is one and the
+    /// platform implements it. The gate reads it to decide containment.
+    pub(crate) fn policy(self) -> Option<&'a SandboxPolicy> {
+        self.sandbox
+    }
+
     pub(crate) fn with_shell_home(mut self, home: Option<&'a str>) -> Self {
         self.home = ShellHome::Replayed(home);
         self

@@ -19,6 +19,8 @@ mod facts;
 mod word;
 pub(crate) use facts::analyze as analyze_bash_facts;
 pub(crate) use facts::{BashFacts, CommandFact, Context, Direction, WordValue};
+#[cfg(test)]
+pub(crate) use facts::{analyses as bash_analyses, reset_analyses as reset_bash_analyses};
 pub(crate) use word::{ShellWord, WordEvaluation};
 
 use tree_sitter::Node;
@@ -479,10 +481,68 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
     }
 }
 
-/// `tree` writes when `-o` (output file) or `-R` (re-runs with -H and writes
-/// 00Tree.html at each depth boundary) is an option letter. Operand-taking
-/// options consume following argv tokens, so `-I -old*` is a pattern, not an
-/// output file, and `--` ends option parsing.
+/// How one `tree` option is spelled. The read-only classifier and the
+/// path-role table (`permissions/argv_roles.rs`) both consult this one table;
+/// they had grown separate lists that already disagreed about `--json`,
+/// `--ignore`, `--matchdirs` and `--info`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeOption {
+    /// Takes no operand.
+    Flag,
+    /// Consumes one token that is not a path (`-L`, `-I`, `--sort`…).
+    Value,
+    /// Consumes one token that is opened (`--infofile`, `--hintro`…).
+    Path,
+    /// Consumes one token it writes (`-o`, `--outfile`).
+    Write,
+    /// Writes without an operand (`-R`).
+    WriteFlag,
+}
+
+impl TreeOption {
+    pub(crate) fn takes_value(self) -> bool {
+        matches!(self, Self::Value | Self::Path | Self::Write)
+    }
+
+    pub(crate) fn writes(self) -> bool {
+        matches!(self, Self::Write | Self::WriteFlag)
+    }
+}
+
+pub(crate) fn tree_short_option(ch: char) -> Option<TreeOption> {
+    match ch {
+        'o' => Some(TreeOption::Write),
+        'R' => Some(TreeOption::WriteFlag),
+        'H' | 'I' | 'L' | 'P' | 'T' => Some(TreeOption::Value),
+        'A' | 'C' | 'D' | 'F' | 'J' | 'N' | 'Q' | 'S' | 'U' | 'X' | 'a' | 'c' | 'd' | 'f' | 'g'
+        | 'h' | 'i' | 'l' | 'n' | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' => {
+            Some(TreeOption::Flag)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn tree_long_option(name: &str) -> Option<TreeOption> {
+    match name {
+        "outfile" => Some(TreeOption::Write),
+        // Files the command opens for input.
+        "gitfile" | "infofile" | "hintro" | "houtro" => Some(TreeOption::Path),
+        // Values that are text, not paths.
+        "charset" | "timefmt" | "filelimit" | "sort" | "scheme" | "authority" | "ignore"
+        | "match" | "level" | "title" | "baseHREF" => Some(TreeOption::Value),
+        "all" | "ansi" | "color" | "device" | "dirs-only" | "dirsfirst" | "du" | "fflinks"
+        | "filesfirst" | "fromfile" | "fromtabfile" | "full-path" | "gitignore" | "help"
+        | "hyperlink" | "ignore-case" | "inodes" | "info" | "json" | "matchdirs" | "metafirst"
+        | "no-indent" | "nocolor" | "nolinks" | "noreport" | "opt-toggle" | "prune" | "quote"
+        | "si" | "version" | "xml" => Some(TreeOption::Flag),
+        _ => None,
+    }
+}
+
+/// `tree` writes when `-o`/`--outfile` (an output file) or `-R` (re-runs with
+/// -H and writes 00Tree.html at each depth boundary) appears as an option.
+/// Operand-taking options consume following argv tokens, so `-I -old*` is a
+/// pattern, not an output file, and `--` ends option parsing.
 fn tree_writes(argv: &[String]) -> bool {
     let mut pending_operands = 0_usize;
     let mut options_done = false;
@@ -508,78 +568,48 @@ fn tree_writes(argv: &[String]) -> bool {
                 Some((name, value)) => (name, Some(value)),
                 None => (long, None),
             };
-            if name == "outfile" {
-                return true;
-            }
-            let takes_operand = matches!(
-                name,
-                "charset"
-                    | "timefmt"
-                    | "filelimit"
-                    | "sort"
-                    | "gitfile"
-                    | "infofile"
-                    | "hintro"
-                    | "houtro"
-                    | "scheme"
-                    | "authority"
-            );
             // 未识别的长选项可能带操作数，把后面的 `--` 或 `-o` 吞进去；
             // 无法担保时按非只读处理。
-            if !takes_operand
-                && !matches!(
-                    name,
-                    "gitignore"
-                        | "ignore-case"
-                        | "matchdirs"
-                        | "metafirst"
-                        | "prune"
-                        | "info"
-                        | "noreport"
-                        | "si"
-                        | "du"
-                        | "inodes"
-                        | "device"
-                        | "dirsfirst"
-                        | "filesfirst"
-                        | "nolinks"
-                        | "hyperlink"
-                        | "fromfile"
-                        | "fromtabfile"
-                        | "fflinks"
-                        | "opt-toggle"
-                        | "help"
-                        | "version"
-                )
-            {
+            let Some(option) = tree_long_option(name) else {
+                return true;
+            };
+            if option.writes() {
                 return true;
             }
-            if takes_operand && attached.is_none() {
+            if option.takes_value() && attached.is_none() {
                 pending_operands += 1;
             }
             index += 1;
             continue;
         }
         let body = &arg[1..];
-        for (offset, ch) in body.char_indices() {
-            match ch {
-                'o' | 'R' => return true,
-                'I' | 'P' | 'T' | 'H' => pending_operands += 1,
-                'L' => {
-                    // `-L<digits>` carries its operand; bare `-L` takes the
-                    // next token.
-                    let rest = &body[offset + ch.len_utf8()..];
-                    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
-                        pending_operands += 1;
-                    }
+        let mut cursor = 0;
+        while cursor < body.len() {
+            let ch = body[cursor..].chars().next().expect("cursor is on a char");
+            let next = cursor + ch.len_utf8();
+            // 未知短选项也可能吞掉后面的 token。
+            let Some(option) = tree_short_option(ch) else {
+                return true;
+            };
+            if option.writes() {
+                return true;
+            }
+            if ch == 'L' {
+                // `-L<digits>` carries its operand; bare `-L` takes the next token.
+                let digits = body[next..].bytes().take_while(u8::is_ascii_digit).count();
+                if digits == 0 {
+                    pending_operands += 1;
                 }
-                // 已知无参开关。其余字母保守按非只读处理：未知短选项也可能
-                // 吞掉后面的 token。
-                'a' | 'c' | 'd' | 'f' | 'g' | 'h' | 'i' | 'l' | 'n' | 'p' | 'q' | 'r' | 's'
-                | 't' | 'u' | 'v' | 'x' | 'A' | 'C' | 'D' | 'F' | 'J' | 'N' | 'Q' | 'S' | 'U'
-                | 'X' => {}
-                '0'..='9' => {}
-                _ => return true,
+                cursor = next + digits;
+            } else if option.takes_value() {
+                // The rest of the cluster is the value (`-Ifoo`); without one,
+                // the next token is.
+                if body[next..].is_empty() {
+                    pending_operands += 1;
+                }
+                break;
+            } else {
+                cursor = next;
             }
         }
         index += 1;

@@ -54,8 +54,12 @@ pub(super) const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this 
 /// `sandbox_escalate(...)` rule, because "may run" and "may run uncontained"
 /// are different permissions. 已定位但带未知效果的包装器只记原文，不让未知效果
 /// 进入持久规则匹配；其它 opaque 脚本或无法表示的前缀返回 `None`。
-pub(super) fn escalation_remember_payload(command: &str, cwd: &Path) -> Option<Remember> {
-    escalation_memory(command, cwd).remember
+pub(super) fn escalation_remember_payload(
+    command: &str,
+    cwd: &Path,
+    facts: Option<&BashFacts>,
+) -> Option<Remember> {
+    escalation_memory(command, cwd, facts).remember
 }
 
 /// 升级记忆的形状：可复用的载荷，以及脚本是否根本没法按键值描述。
@@ -65,10 +69,21 @@ pub(super) struct EscalationMemory {
     pub(super) opaque: bool,
 }
 
-pub(super) fn escalation_memory(command: &str, cwd: &Path) -> EscalationMemory {
-    let facts = analyze_bash_facts(command);
+pub(super) fn escalation_memory(
+    command: &str,
+    cwd: &Path,
+    shared_facts: Option<&BashFacts>,
+) -> EscalationMemory {
+    let computed;
+    let facts: &BashFacts = match shared_facts {
+        Some(facts) => facts,
+        None => {
+            computed = analyze_bash_facts(command);
+            &computed
+        }
+    };
     let opaque = matches!(facts.analysis, BashAnalysis::Opaque);
-    let remember = escalation_payload_from_facts(facts, command, cwd);
+    let remember = escalation_payload_from_facts(facts.clone(), command, cwd);
     EscalationMemory { remember, opaque }
 }
 
@@ -503,8 +518,9 @@ mod tests {
 
         // The sandbox denied the whole line, `pwd` included, so the escalation
         // remembers both — under its own rule name.
-        let escalation = escalation_remember_payload(command, &super::super::testutil::test_cwd())
-            .expect("same command, other door");
+        let escalation =
+            escalation_remember_payload(command, &super::super::testutil::test_cwd(), None)
+                .expect("same command, other door");
         assert_eq!(
             escalation.rules,
             vec!["sandbox_escalate(pwd *)", "sandbox_escalate(git commit *)"]
@@ -525,7 +541,7 @@ mod tests {
         );
         assert!(remember_payload("bash", &read_only).is_none());
         assert_eq!(
-            escalation_remember_payload("ls && pwd", &super::super::testutil::test_cwd())
+            escalation_remember_payload("ls && pwd", &super::super::testutil::test_cwd(), None)
                 .unwrap()
                 .rules,
             vec!["sandbox_escalate(ls *)", "sandbox_escalate(pwd *)"]
@@ -543,7 +559,8 @@ mod tests {
         ));
         assert!(remember_payload("bash", &corrupt_call).is_none());
         assert!(
-            escalation_remember_payload(corrupt, &super::super::testutil::test_cwd()).is_none()
+            escalation_remember_payload(corrupt, &super::super::testutil::test_cwd(), None)
+                .is_none()
         );
     }
 }

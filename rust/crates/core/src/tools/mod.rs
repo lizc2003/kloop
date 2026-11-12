@@ -266,6 +266,10 @@ struct PreparedExecution<'a> {
     read: Option<&'a fs::PreparedRead>,
     mutation: Option<&'a fs::PreparedMutation>,
     source: Option<SourceCallBinding>,
+    /// The gate's execution-side decision; tools read it and never re-judge.
+    verdict: &'a crate::permissions::Verdict,
+    /// The one parse of this call's bash command, when it has one.
+    facts: Option<&'a crate::shell::BashFacts>,
     local_send_committed: &'a AtomicBool,
 }
 
@@ -822,10 +826,34 @@ pub fn tool_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
 /// they do in dispatch — a source cannot claim a reserved name in the first
 /// place.
 pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
+    is_concurrency_safe_with(name, input, sources, None)
+}
+
+/// The batching decision over a parse dispatch already made for bash. Passing
+/// the same facts here is what keeps one call's command analysed once: the
+/// batch loop, the gate and execution all read this one value.
+fn is_concurrency_safe_with(
+    name: &str,
+    input: &Value,
+    sources: &[Arc<dyn ToolSource>],
+    facts: Option<&crate::shell::BashFacts>,
+) -> bool {
     match Builtin::from_name(name) {
-        Some(builtin) => builtin.concurrency_safe(input),
+        Some(builtin) => builtin.concurrency_safe_with(input, facts),
         None => find_source(sources, name).is_some_and(|source| source.is_readonly(name)),
     }
+}
+
+/// Parse a bash call's command for the whole call. Every other tool has no
+/// shell analysis to share, and a bash call without a string command is
+/// rejected by its own parser later.
+fn analyze_shell_call(name: &str, input: &Value) -> Option<Arc<crate::shell::BashFacts>> {
+    if name != "bash" {
+        return None;
+    }
+    input["command"]
+        .as_str()
+        .map(|command| Arc::new(crate::shell::analyze_bash_facts(command)))
 }
 
 /// Whether a call may change something outside the conversation, so that a
@@ -833,8 +861,13 @@ pub fn is_concurrency_safe(name: &str, input: &Value, sources: &[Arc<dyn ToolSou
 /// Concurrency safety is almost that question, except for the orchestrators:
 /// they are batched as safe because their children re-enter the gate, but
 /// those children write and run things all the same.
-fn may_have_effects(name: &str, input: &Value, sources: &[Arc<dyn ToolSource>]) -> bool {
-    !is_concurrency_safe(name, input, sources)
+fn may_have_effects(
+    name: &str,
+    input: &Value,
+    sources: &[Arc<dyn ToolSource>],
+    facts: Option<&crate::shell::BashFacts>,
+) -> bool {
+    !is_concurrency_safe_with(name, input, sources, facts)
         || matches!(
             Builtin::from_name(name),
             Some(Builtin::RunAgent | Builtin::Workflow | Builtin::RunProgram)
@@ -952,12 +985,28 @@ pub async fn dispatch_tools(
             .flatten()
     };
     let mut results = Vec::with_capacity(tool_uses.len());
+    // One parse per bash call, before anything asks a question about it. The
+    // batch decision, the gate and execution all consume these exact facts.
+    let analyses: Vec<Option<Arc<crate::shell::BashFacts>>> = tool_uses
+        .iter()
+        .map(|(_, name, input)| analyze_shell_call(name, input))
+        .collect();
     let mut i = 0;
     while i < tool_uses.len() {
-        let safe = is_concurrency_safe(&tool_uses[i].1, &tool_uses[i].2, sources);
+        let safe = is_concurrency_safe_with(
+            &tool_uses[i].1,
+            &tool_uses[i].2,
+            sources,
+            analyses[i].as_deref(),
+        );
         let mut j = i + 1;
         while j < tool_uses.len()
-            && is_concurrency_safe(&tool_uses[j].1, &tool_uses[j].2, sources) == safe
+            && is_concurrency_safe_with(
+                &tool_uses[j].1,
+                &tool_uses[j].2,
+                sources,
+                analyses[j].as_deref(),
+            ) == safe
         {
             j += 1;
         }
@@ -973,13 +1022,14 @@ pub async fn dispatch_tools(
             // `run_one` observes the cancelled token first and settles as
             // interrupted.
             let limiter = tokio::sync::Semaphore::new(MAX_CONCURRENT_TOOL_CALLS);
-            let futs = batch.iter().map(|(id, name, input)| {
+            let futs = batch.iter().enumerate().map(|(offset, (id, name, input))| {
                 let call = run_one(
                     id.clone(),
                     name.clone(),
                     input.clone(),
                     ctx.clone(),
                     expected_program_source(name),
+                    analyses[i + offset].clone(),
                 );
                 let limiter = &limiter;
                 async move {
@@ -992,7 +1042,7 @@ pub async fn dispatch_tools(
             });
             results.extend(futures::future::join_all(futs).await);
         } else {
-            for (id, name, input) in batch {
+            for (offset, (id, name, input)) in batch.iter().enumerate() {
                 if ctx.cancel.is_cancelled() {
                     results.push(interrupted(id));
                 } else {
@@ -1003,6 +1053,7 @@ pub async fn dispatch_tools(
                             input.clone(),
                             ctx.clone(),
                             expected_program_source(name),
+                            analyses[i + offset].clone(),
                         )
                         .await,
                     );
@@ -1266,7 +1317,8 @@ impl PreparedCall {
         input: &Value,
         ctx: &ToolCtx,
         workspace: &EffectiveWorkspace,
-    ) -> Result<()> {
+        facts: Option<&crate::shell::BashFacts>,
+    ) -> Result<crate::permissions::Verdict> {
         let preview_context = self
             .mutation
             .as_ref()
@@ -1285,20 +1337,24 @@ impl PreparedCall {
                 preview_context.as_ref(),
                 ctx.depth,
                 sandbox_auto_allow,
+                facts,
             ),
         )
         .await;
         match permission {
             None => bail!(NOT_RUN_STOPPED),
-            Some(Ok(Some(notice))) => ctx.ui.emit(&Event::Note(notice.message)),
-            Some(Ok(None)) => {}
+            Some(Ok(verdict)) => {
+                if let Some(notice) = &verdict.notice {
+                    ctx.ui.emit(&Event::Note(notice.message.clone()));
+                }
+                Ok(verdict)
+            }
             Some(Err(Refusal::Denied(reason))) => bail!(reason),
             Some(Err(Refusal::Stopped)) => {
                 ctx.stop.cancel();
                 bail!(user_stop(name));
             }
         }
-        Ok(())
     }
 }
 
@@ -1336,6 +1392,7 @@ async fn run_gated(
     input: &Value,
     ctx: &ToolCtx,
     expected_program_source: Option<SourceCallBinding>,
+    facts: Option<&crate::shell::BashFacts>,
     foreground_shell_started: &AtomicBool,
     local_send_committed: &AtomicBool,
     deadline: &CallDeadline,
@@ -1352,7 +1409,9 @@ async fn run_gated(
     recheck_source_after_hook(&gate, name, ctx, &workspace)?;
     preflight_source(&gate, name, input, ctx)?;
     let prepared = PreparedCall::resolve(name, input, &workspace).await?;
-    prepared.authorize(name, input, ctx, &workspace).await?;
+    let verdict = prepared
+        .authorize(name, input, ctx, &workspace, facts)
+        .await?;
     let powershell_guard = if name == "powershell" {
         Some(ctx.cfg.powershell_execution_gate.lock().await)
     } else {
@@ -1366,7 +1425,7 @@ async fn run_gated(
     // Every gate is behind us and nothing below can refuse the call, so this is
     // the one point where "started" is true and not yet stale.
     if let Some(sink) = &ctx.tool_started
-        && may_have_effects(name, input, &ctx.cfg.tool_sources)
+        && may_have_effects(name, input, &ctx.cfg.tool_sources, facts)
     {
         sink.note(id).await;
     }
@@ -1385,6 +1444,8 @@ async fn run_gated(
                     read: prepared.read.as_ref(),
                     mutation: prepared.mutation.as_ref(),
                     source: gate.expected,
+                    verdict: &verdict,
+                    facts,
                     local_send_committed,
                 },
                 ctx,
@@ -1569,6 +1630,7 @@ async fn run_one(
     input: Value,
     ctx: ToolCtx,
     expected_program_source: Option<SourceCallBinding>,
+    facts: Option<Arc<crate::shell::BashFacts>>,
 ) -> ContentBlock {
     // Checked here rather than in the batch loop so it also reaches a call that
     // sat behind the concurrency limiter, and a program's calls, which arrive
@@ -1614,6 +1676,7 @@ async fn run_one(
         &input,
         &ctx,
         expected_program_source,
+        facts.as_deref(),
         &foreground_shell_started,
         &local_send_committed,
         &deadline,
@@ -1774,7 +1837,9 @@ fn execute_tool<'a>(
                     Err(error) => ToolExecution::from_result(Err(error)),
                 };
             }
-            Builtin::Bash => bash::bash_tool(input, ctx, workspace).await,
+            Builtin::Bash => {
+                bash::bash_tool(input, ctx, workspace, prepared.verdict, prepared.facts).await
+            }
             Builtin::PowerShell => powershell::powershell_tool(input, ctx, workspace).await,
             Builtin::BashOutput => bash::bash_output_tool(input, ctx).await,
             Builtin::StopBash => bash::stop_bash_tool(input, ctx).await,
@@ -4337,12 +4402,65 @@ mod tests {
         assert_eq!(ids, vec!["t1", "t2", "t3"]);
     }
 
+    /// Plan 266: one foreground bash call parses its command exactly once.
+    /// Batching, the gate and execution read the dispatch's facts; before
+    /// this, the same text went through tree-sitter five to seven times.
+    #[tokio::test]
+    async fn one_foreground_bash_call_parses_its_command_once() {
+        let cfg = (*TestConfig::new("plan266-one-parse").build()).clone();
+        let cfg = Config {
+            permissions: Arc::new(
+                crate::permissions::Permissions::new(
+                    crate::permissions::Mode::Manual,
+                    &crate::permissions::PermissionRules::default(),
+                    cfg.cwd.clone(),
+                    None,
+                )
+                .expect("empty rules parse"),
+            ),
+            ..cfg
+        };
+        let ctx = test_ctx_with_cfg(0, Arc::new(cfg));
+        crate::shell::reset_bash_analyses();
+        let results = dispatch_tools(
+            vec![("t".into(), "bash".into(), bash_input("echo kloop-plan266"))],
+            &ctx,
+        )
+        .await;
+        assert!(
+            results.iter().all(|block| matches!(
+                block,
+                ContentBlock::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            )),
+            "{results:?}"
+        );
+        assert_eq!(crate::shell::bash_analyses(), 1);
+    }
+
+    /// The batching verdict must not change when it reads the parse dispatch
+    /// already made instead of paying for its own.
+    #[test]
+    fn plan266_batching_decides_from_the_shared_parse() {
+        for command in ["echo hi", "cargo build", "cat x > out.txt"] {
+            let input = bash_input(command);
+            let facts = analyze_shell_call("bash", &input).expect("bash has a command");
+            assert_eq!(
+                is_concurrency_safe("bash", &input, &[]),
+                is_concurrency_safe_with("bash", &input, &[], Some(&facts)),
+                "{command}"
+            );
+        }
+    }
+
     /// Plan 204: the orchestrators are batched as concurrency-safe, but what
     /// they spawn acts on the world, so a crash inside one is not "nothing
     /// happened".
     #[test]
     fn orchestrators_may_have_effects_though_batched_as_safe() {
-        let effects = |name: &str, input: Value| super::may_have_effects(name, &input, &[]);
+        let effects = |name: &str, input: Value| super::may_have_effects(name, &input, &[], None);
         assert_eq!(
             [
                 effects("read_file", json!({"path": "x"})),
@@ -4366,7 +4484,7 @@ mod tests {
     fn skill_activation_is_effectful() {
         let input = json!({"name": "x"});
         assert!(!super::is_concurrency_safe("skill", &input, &[]));
-        assert!(super::may_have_effects("skill", &input, &[]));
+        assert!(super::may_have_effects("skill", &input, &[], None));
     }
 
     #[test]

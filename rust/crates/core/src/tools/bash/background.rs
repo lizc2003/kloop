@@ -266,6 +266,7 @@ impl BackgroundShells {
     /// The output file lives outside the sandbox's writable roots, but the
     /// child writes it through an inherited fd — seatbelt checks at open
     /// time, not per write (verified against the real sandbox-exec).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_background(
         self: &Arc<Self>,
         input: &BashInput,
@@ -274,15 +275,14 @@ impl BackgroundShells {
         bash: &ShellProgram,
         ctx: &ToolCtx,
         workspace: &EffectiveWorkspace,
+        verdict: &crate::permissions::Verdict,
+        facts: Option<&crate::shell::BashFacts>,
     ) -> Result<String> {
         let command = input.command.as_str();
-        let requires_protection = crate::permissions::bash_protection_requirement(
-            command,
-            cwd,
-            sandbox::ExecutionContext::sandboxed(sandbox)
-                .with_shell_home(super::replayed_home(&ctx.cfg.shell_login_env)),
-        )
-        .map_err(anyhow::Error::msg)?;
+        if verdict.protection == crate::permissions::Protection::Required && sandbox.is_none() {
+            bail!(sandbox::PROTECTION_REQUIRED);
+        }
+        let _ = facts;
         let description = input.description.as_deref().unwrap_or("");
         let offload_dir = &ctx.cfg.offload_dir;
         std::fs::create_dir_all(offload_dir)
@@ -351,7 +351,8 @@ impl BackgroundShells {
                     killer: Some(killer.clone()),
                     sandbox: sandbox.map(|policy| BgSandbox {
                         network_disabled: !policy.allow_network,
-                        requires_protection,
+                        requires_protection: verdict.protection
+                            == crate::permissions::Protection::Required,
                     }),
                 },
             );

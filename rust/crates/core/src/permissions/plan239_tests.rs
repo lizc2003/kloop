@@ -102,7 +102,8 @@ async fn plan239_protected_literal_gate_keeps_opaque_consent() {
                     &bash(command),
                     0,
                     ExecutionContext::sandboxed(Some(&policy)),
-                )
+                     None
+                 )
                 .await;
             assert_eq!(
                 result.is_ok(),
@@ -129,7 +130,8 @@ async fn plan239_protected_literal_gate_keeps_opaque_consent() {
             &bash(command),
             0,
             ExecutionContext::sandboxed(Some(&policy)),
-        )
+              None
+          )
         .await
         .unwrap();
     }
@@ -144,8 +146,9 @@ async fn plan239_protected_literal_gate_keeps_opaque_consent() {
             "bash",
             &bash(&command.replace("id_rsa", "other")),
             0,
-            ExecutionContext::sandboxed(Some(&policy))
-        )
+            ExecutionContext::sandboxed(Some(&policy)),
+              None
+          )
         .await
         .is_err()
     );
@@ -157,7 +160,7 @@ async fn plan239_protected_literal_gate_keeps_opaque_consent() {
             .contains("sensitive path")
     );
     assert!(
-        p.check_call_with_execution("bash", &bash(command), 0, ExecutionContext::default())
+        p.check_call_with_execution("bash", &bash(command), 0, ExecutionContext::default(), None)
             .await
             .is_err()
     );
@@ -183,7 +186,8 @@ async fn plan239_literal_exemption_checks_every_needle_and_actual_policy() {
             &check(body),
             0,
             ExecutionContext::sandboxed(Some(&policy)),
-        )
+              None
+          )
         .await
         .unwrap();
     }
@@ -199,8 +203,9 @@ async fn plan239_literal_exemption_checks_every_needle_and_actual_policy() {
                 "bash",
                 &check(body),
                 0,
-                ExecutionContext::sandboxed(Some(&policy))
-            )
+                ExecutionContext::sandboxed(Some(&policy)),
+                  None
+              )
             .await
             .is_err(),
             "{body}"
@@ -220,8 +225,9 @@ async fn plan239_literal_exemption_checks_every_needle_and_actual_policy() {
                 "bash",
                 &bash(command),
                 0,
-                ExecutionContext::sandboxed(Some(&policy))
-            )
+                ExecutionContext::sandboxed(Some(&policy)),
+                  None
+              )
             .await
             .is_err(),
             "{command}"
@@ -247,8 +253,9 @@ async fn plan239_literal_exemption_checks_every_needle_and_actual_policy() {
                 "bash",
                 &input,
                 0,
-                ExecutionContext::sandboxed(Some(&policy))
-            )
+                ExecutionContext::sandboxed(Some(&policy)),
+                  None
+              )
             .await
             .is_err()
         );
@@ -267,8 +274,9 @@ async fn plan239_literal_exemption_checks_every_needle_and_actual_policy() {
                 "bash",
                 &input,
                 0,
-                ExecutionContext::sandboxed(Some(&policy))
-            )
+                ExecutionContext::sandboxed(Some(&policy)),
+                  None
+              )
             .await
             .is_err(),
             "{suffix}"
@@ -291,8 +299,9 @@ async fn plan239_literal_exemption_checks_every_needle_and_actual_policy() {
                 "bash",
                 &input,
                 0,
-                ExecutionContext::sandboxed(Some(&policy))
-            )
+                ExecutionContext::sandboxed(Some(&policy)),
+                  None
+              )
             .await
             .is_err()
         );

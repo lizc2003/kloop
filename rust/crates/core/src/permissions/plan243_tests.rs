@@ -530,7 +530,8 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
                 &bash(&command),
                 0,
                 ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
-            )
+                 None
+             )
             .await
             .expect_err(&command);
         assert!(error.contains("deny permission rule"), "{command}: {error}");
@@ -546,7 +547,8 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
             &bash(&command),
             0,
             ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
-        )
+                           None
+                       )
         .await;
         if let Some(expected_error) = expected_error {
             let error = result.expect_err(&command);
@@ -574,7 +576,8 @@ async fn plan243_wrapper_environment_changes_keep_narrow_write_rules_effective()
             &bash(&command),
             0,
             ExecutionContext::approval_only(true).with_shell_home(Some("/snapshot/user")),
-        )
+              None
+          )
         .await
         .unwrap_or_else(|error| panic!("{command}: {error}"));
     }
@@ -686,7 +689,8 @@ async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
             &bash(&command),
             0,
             ExecutionContext::sandboxed(Some(&policy)),
-        )
+              None
+          )
         .await
         .unwrap_or_else(|error| panic!("{command}: {error}"));
     }
@@ -708,7 +712,8 @@ async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
                 &bash(&command),
                 0,
                 ExecutionContext::sandboxed(Some(&policy)),
-            )
+                 None
+             )
             .await
             .expect_err(&command);
         assert!(error.contains("sensitive path"), "{command}: {error}");

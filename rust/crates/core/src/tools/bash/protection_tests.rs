@@ -221,6 +221,11 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
         None,
         &probe.ctx,
         &workspace,
+        &crate::permissions::Verdict {
+            protection: crate::permissions::Protection::Required,
+            ..Default::default()
+        },
+        None,
     )
     .await
     .err()

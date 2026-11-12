@@ -1,8 +1,8 @@
 # Plan 266 — 权限判定一次产出，执行照单执行
 
 > 2026-10-28 立。来源：全仓只读审查与随后的架构讨论(HANDOFF「〇⁵」节)。
-> 状态：待实现，**先做 243、244、245**——它们修的是这里要统一的那几处分歧，先修后统一，
-> 每一步都有测试兜底。行号是 2026-10-28 的读数，开工先自己量。
+> 状态：✅ 已完成（2026-11-11）。243、244、245 均已实现。行号是 2026-10-28 的读数，
+> 开工时已按函数重新定位。
 
 ## 问题
 
@@ -47,3 +47,25 @@
 - 第 3 步补"判定说进沙箱 → 执行一定进沙箱"的性质测试(遍历现有用例表);
 - DESIGN 权限管线一节改写为"判定一次、执行照单";外层执行沙箱之外 `make check`;HANDOFF 记进展与
   教训。
+
+## 完成记录（2026-11-11）
+
+- **第 1 步**：`BashFacts` 在 `dispatch_tools` 解析一次（code-mode / `!cmd` / scheduler 各自在
+  入口解析一次），`is_concurrency_safe`、`CallFacts`、保护判定、升级载荷都读同一份；新增
+  `bash_protection_requirement` 的 `raw_mentions_sensitive_path` 快路径。线程内解析计数钩子
+  锁住“一次前台 bash 只解析一次”，并补了共用事实与重新解析等价、分批判定等价两条断言。
+- **第 2 步**：`CallFacts` 只 canonicalize 一次 cwd，`PathRoot` 传进路径判定；`PathFacts::gather`
+  保留给单点调用与测试。
+- **第 3 步**：新增 `permissions/verdict.rs`（`Verdict { sandbox, protection, notice }`）。门决定
+  `Contained`/`Escalated`/`None` 与 `Protection::Required`；执行层删掉
+  `sandbox_escalation_remembered` 的独立判断，`escalate_sandbox` 复用同一份解析。后台 bash
+  的判定固定为 `Contained`（它没有拒绝后重跑的循环）；`disable_sandbox` 由门判为 `None`。
+  “已记住的升级 + 需要沙箱保护的字面正文”在门内直接拒绝，询问之前生效。
+- **第 4 步**：`rule.rs` 的两套路径 glob 合成一个 `matches_path(tool, facts, direction)`：
+  `Allows` 只认规范目标，`Blocks` 兼顾别名；`bash_write` 与文件工具 allow 都走前者。
+- **第 5 步**：`shell.rs` 的 `TreeOption` 一张表，`tree_writes` 与 `argv_roles` 的
+  `tree_short`/`tree_long` 共查；顺带补上两边各自漏的 `--ignore`/`--json`/`--matchdirs`/
+  `--info`/`--gitfile` 等。
+- **验证**：`cargo fmt --all`；`cargo clippy -p kloop-core --all-targets -- -D warnings`；
+  `cargo check --workspace --all-targets`；外层执行沙箱之外跑 `cargo test -p kloop-core --lib`
+  （1375 passed，含 26 个真实 seatbelt 用例）。未跑 parity（本机无新语料）与 Windows 检查。

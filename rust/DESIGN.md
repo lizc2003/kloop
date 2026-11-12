@@ -1109,9 +1109,17 @@ cache → ask the user
 模式切换的顺序集中在同一处。`permissions/rule.rs` 负责规则语法与 allow/deny/ask
 的匹配，`policy.rs` 持有全局约束、项目策略与工作区会话状态，`facts.rs` 采集调用的
 shell、路径和危险特征，`argv_roles.rs` 持有各命令的参数角色表，`describe.rs`
-构造审批记忆载荷与展示文案。规则匹配读取
+构造审批记忆载荷与展示文案，`verdict.rs` 定义门交出的执行约定。规则匹配读取
 调用事实，项目策略复用规则匹配；事实模块不依赖 `Permissions`。所有原有公开路径
 由父模块保留，内部状态与帮助项仅向实际调用者开放。
+
+**门判定一次，执行照单执行**（plan 266）。分发入口把一条 bash 命令解析一次
+（`BashFacts`，随调用下传），并发分批、权限门和执行读同一份事实；门对每一次放行
+同时产出一份 `Verdict`：进不进沙箱（`Contained`/`Escalated`/`None`）、是否依赖沙箱
+保护字面正文（`Required`/`Clear`/`Unchecked`），以及审批带回的提示。执行层不再自己
+判断升级记忆或保护要求：`Escalated` 就是跳过沙箱内的尝试，`Contained` 就是用
+workspace 策略，`Protection::Required` 在第一次不带沙箱的启动前拒绝。后台 bash 没有
+拒绝后重跑的循环，门的 `Verdict` 对它是 `Contained`。
 
 **deny 始终优先于 allow 与 bypass**。`bypass` 是用户显式选择的免审批模式：
 危险命令、仓库内部写入的确认、显式 ask 规则、复杂 shell 脚本和主动脱沙箱都不再弹权限审批。
@@ -3725,6 +3733,9 @@ rule. 可解析但两词前缀不描述命令本身的调用（`timeout 600 carg
 A remembered **per-command** rule is consulted **before** the sandboxed attempt,
 not after it fails: the command runs uncontained from the start and the result
 says so (`[Ran without the sandbox: a remembered sandbox_escalate rule …]`).
+The gate makes that decision once, in its `Verdict`; execution reads `Escalated`
+and skips the sandbox, so it cannot disagree with the layer that auto-allowed
+the call.
 Consulting it only at the denial would save the question but still pay for the
 contained run — which is the expensive half, the one that compiles the test
 binary and binds the port before finding out it may not. It is deliberately not
@@ -3749,12 +3760,14 @@ one measured review spent 20 minutes of its 63 on escalation round-trips,
 against 1 minute for the same review without them.
 
 字面正文例外使用独立的执行上下文，不能用 `trust_sandboxed` 或免审批 bool 代替实际保护。
-关闭自动放行但保留沙箱时仍可通过敏感门，随后按 opaque 规则审批。前景、背景和直接前景执行器
-（包括 scheduler）在启动前重新核对传入的同一份策略。已有逐命令升级记忆若会跳过
-沙箱，须在第一次执行前硬拒绝；会话通配不再跳过首次沙箱尝试，保护要求改由拒绝后的
-分支优先处理。沙箱失败也不询问或自动脱沙箱重跑，不提示 `disable_sandbox`。
-主动脱沙箱、无策略、平台不支持或缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。
-未依赖这次正文例外的调用保持现有升级行为。
+关闭自动放行但保留沙箱时仍可通过敏感门，随后按 opaque 规则审批。保护要求由权限门在
+产出 `Verdict` 时算一次；前景、背景和直接前景执行器（包括 scheduler）只读
+`Protection::Required`，在第一次不带沙箱的启动前拒绝，拒绝后的分支只提示保护要求、
+不提供升级。已有逐命令升级记忆若会把这条调用带出沙箱，门在判定 `Escalated` 时就直接
+硬拒绝；会话通配不再跳过首次沙箱尝试，保护要求改由拒绝后的分支优先处理。沙箱失败也
+不询问或自动脱沙箱重跑，不提示 `disable_sandbox`。主动脱沙箱、无策略、平台不支持或
+缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。未依赖这次正文例外的调用保持
+现有升级行为。
 
 Otherwise escalation is per call — the next command is sandboxed again —
 and the command already cleared the permission gate (deny rules and safety

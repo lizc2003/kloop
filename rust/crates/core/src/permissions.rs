@@ -63,13 +63,18 @@ mod argv_roles;
 mod describe;
 mod facts;
 pub(crate) use facts::bash_protection_requirement;
+pub use verdict::Protection;
+pub use verdict::SandboxPlan;
+pub use verdict::Verdict;
 mod policy;
 mod rule;
 pub(crate) mod sensitive;
 #[cfg(test)]
 mod testutil;
+mod verdict;
 
 use crate::shell::BashAnalysis;
+use crate::shell::BashFacts;
 use describe::BLANKET_ESCALATION_RULE;
 use describe::BLANKET_ESCALATION_SIGNATURE;
 use describe::Remember;
@@ -601,12 +606,7 @@ impl Permissions {
     /// durable persistence failed).
     /// The sandbox-blind form (no auto-allow layer); dispatch uses
     /// [`Permissions::check_call`] with the per-call sandbox verdict.
-    pub async fn check(
-        &self,
-        name: &str,
-        input: &Value,
-        depth: u8,
-    ) -> Result<Option<PermissionNotice>, String> {
+    pub async fn check(&self, name: &str, input: &Value, depth: u8) -> Result<Verdict, String> {
         self.check_call(name, input, depth, /*sandbox_auto_allow*/ false)
             .await
     }
@@ -624,7 +624,7 @@ impl Permissions {
         input: &Value,
         depth: u8,
         sandbox_auto_allow: bool,
-    ) -> Result<Option<PermissionNotice>, String> {
+    ) -> Result<Verdict, String> {
         self.check_call_with_resolved_path(
             name,
             input,
@@ -632,6 +632,7 @@ impl Permissions {
             None,
             depth,
             crate::sandbox::ExecutionContext::approval_only(sandbox_auto_allow),
+            None,
         )
         .await
         .map_err(|refusal| match refusal {
@@ -646,8 +647,9 @@ impl Permissions {
         input: &Value,
         depth: u8,
         execution: crate::sandbox::ExecutionContext<'_>,
-    ) -> Result<Option<PermissionNotice>, String> {
-        self.check_call_with_resolved_path(name, input, None, None, depth, execution)
+        facts: Option<&BashFacts>,
+    ) -> Result<Verdict, String> {
+        self.check_call_with_resolved_path(name, input, None, None, depth, execution, facts)
             .await
             .map_err(|refusal| match refusal {
                 Refusal::Denied(reason) => reason,
@@ -658,6 +660,7 @@ impl Permissions {
     /// Mutation dispatch resolves and opens the target parent before permission.
     /// Supplying that effective path keeps safety/containment on the frozen
     /// target while path rules still see the model's original alias spelling.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn check_call_with_resolved_path(
         &self,
         name: &str,
@@ -666,9 +669,17 @@ impl Permissions {
         preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
         execution: crate::sandbox::ExecutionContext<'_>,
-    ) -> Result<Option<PermissionNotice>, Refusal> {
+        facts: Option<&BashFacts>,
+    ) -> Result<Verdict, Refusal> {
         if self.allow_everything {
-            return Ok(None);
+            return Ok(Verdict {
+                sandbox: if execution.policy().is_some() {
+                    SandboxPlan::Contained
+                } else {
+                    SandboxPlan::None
+                },
+                ..Verdict::default()
+            });
         }
         let call = CallFacts::gather_with_execution(
             name,
@@ -676,6 +687,7 @@ impl Permissions {
             self.identity.cwd(),
             resolved_path,
             execution,
+            facts,
         );
         let resolved_input = call
             .path
@@ -687,7 +699,6 @@ impl Permissions {
                 resolved
             });
         let approval_input = resolved_input.as_ref().unwrap_or(input);
-
         // 1. Deny rules — before everything, immune to every mode.
         if self.matches_deny(name, &call) {
             return Err(Refusal::Denied(format!(
@@ -726,9 +737,22 @@ impl Permissions {
             )));
         }
 
+        let (sandbox, protection) = self.execution_plan(input, &call, execution, facts);
+        let allow = |notice| Verdict {
+            sandbox,
+            protection,
+            notice,
+        };
+        // 需要实际沙箱保护的字面正文（heredoc 里的凭据探针）不能被审批或
+        // 已记住的升级带出沙箱；bypass 也不算。第 2 层已经拦了直接读取，
+        // 这里只剩“沙箱本身是保护”的那一类。
+        if protection == Protection::Required && sandbox != SandboxPlan::Contained {
+            return Err(Refusal::Denied(crate::sandbox::PROTECTION_REQUIRED.into()));
+        }
+
         // 4. Bypass — 用户显式选择工具免审批，前面的硬限制仍优先。
         if self.mode() == Mode::Bypass {
-            return Ok(None);
+            return Ok(allow(None));
         }
 
         // 5. Safety checks — manual 下直接询问用户。
@@ -742,14 +766,16 @@ impl Permissions {
                     Some(hazard.tag),
                     None,
                 )
-                .await;
+                .await
+                .map(allow);
         }
 
         // 6. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
             return self
                 .ask_user(name, approval_input, preview_context, depth, None, None)
-                .await;
+                .await
+                .map(allow);
         }
 
         // 7. Safe session scheduler controls mutate only kloop's owner-scoped
@@ -757,7 +783,7 @@ impl Permissions {
         // rules above retain priority; ordinary manual/accept/bypass modes do
         // not prompt for these controls.
         if matches!(name, "cron_create" | "cron_delete" | "schedule_wakeup") {
-            return Ok(None);
+            return Ok(allow(None));
         }
 
         // 8. Sandbox auto-allow — the OS sandbox will contain this call, so
@@ -766,17 +792,20 @@ impl Permissions {
         // that opted out of the sandbox is not contained no matter what the
         // dispatcher says, so it never takes this layer. 解析不可信时同样不
         // 自动放行：局部命令事实可能整体缺失，而 bash 仍会逐条执行。
+        // Contained, or uncontained under a consent the user already gave for
+        // this command: either way the sandbox layer is not news to the human.
+        // Deny, hazards and explicit ask rules above keep their say.
         if execution.auto_allow
             && call.shell_facts_complete
-            && !call.no_sandbox
+            && matches!(sandbox, SandboxPlan::Contained | SandboxPlan::Escalated)
             && matches!(call.shell, Some(ShellFacts::Bash(_)))
         {
-            return Ok(None);
+            return Ok(allow(None));
         }
 
         // 9. Read-only self-verdict.
         if call.is_readonly(name) {
-            return Ok(None);
+            return Ok(allow(None));
         }
 
         // 10. Contained writes: a structured file write whose target lands
@@ -790,12 +819,12 @@ impl Permissions {
         if matches!(name, "write_file" | "edit_file" | "notebook_edit")
             && call.path.as_ref().is_some_and(|p| p.inside_cwd)
         {
-            return Ok(None);
+            return Ok(allow(None));
         }
 
         // 11. Allow rules.
         if self.matches_allow(name, &call) {
-            return Ok(None);
+            return Ok(allow(None));
         }
 
         // 12. Session cache. A `disable_sandbox` call asks about a different
@@ -807,9 +836,9 @@ impl Permissions {
         let opaque_bash = matches!(call.shell, Some(ShellFacts::Bash(BashAnalysis::Opaque)));
         let escalation_memory = call.no_sandbox && (!opaque_bash || call.verbatim_escalation);
         let remember = if escalation_memory {
-            call.command
-                .as_deref()
-                .and_then(|command| escalation_remember_payload(command, self.identity.cwd()))
+            call.command.as_deref().and_then(|command| {
+                escalation_remember_payload(command, self.identity.cwd(), facts)
+            })
         } else {
             remember_payload(name, &call)
         };
@@ -818,7 +847,7 @@ impl Permissions {
                 .as_ref()
                 .is_some_and(|remember| self.escalation_remembered(remember))
             {
-                return Ok(None);
+                return Ok(allow(None));
             }
         } else if let Some(remember) = &remember {
             let caches = self.session.cache.lock().unwrap();
@@ -831,13 +860,70 @@ impl Permissions {
                         .all(|signature| cache.signatures.contains(signature))
                 })
             {
-                return Ok(None);
+                return Ok(allow(None));
             }
         }
 
         // 13. Ask.
         self.ask_user(name, approval_input, preview_context, depth, None, remember)
             .await
+            .map(allow)
+    }
+
+    /// What this call will execute inside, decided once from the same facts
+    /// the permission decision used. `Escalated` is a remembered per-command
+    /// consent to run uncontained: the contained attempt is skipped, so the
+    /// gate must not credit the sandbox with containing this call.
+    fn execution_plan(
+        &self,
+        input: &Value,
+        call: &CallFacts,
+        execution: crate::sandbox::ExecutionContext<'_>,
+        facts: Option<&BashFacts>,
+    ) -> (SandboxPlan, Protection) {
+        if !matches!(call.shell, Some(ShellFacts::Bash(_))) {
+            return (SandboxPlan::None, Protection::Unchecked);
+        }
+        let Some(policy) = execution.policy() else {
+            // 沙箱盲的入口只有调用方的一句“会被包含”；照它的断言作答，
+            // 但没有策略就没有可评估的保护要求。
+            let claimed = execution.auto_allow && !call.no_sandbox;
+            return (
+                if claimed {
+                    SandboxPlan::Contained
+                } else {
+                    SandboxPlan::None
+                },
+                Protection::Unchecked,
+            );
+        };
+        let command = call.command.as_deref().unwrap_or_default();
+        let protection =
+            match bash_protection_requirement(command, self.identity.cwd(), execution, facts) {
+                Ok(true) => Protection::Required,
+                Ok(false) => Protection::Clear,
+                // 第 2 层用同一判定硬拒绝过；走到这里说明两个判定不一致，
+                // 取安全的一侧。
+                Err(_) => Protection::Required,
+            };
+        if call.no_sandbox {
+            return (SandboxPlan::None, protection);
+        }
+        // 后台 bash 没有拒绝后重跑的循环，升级只对前台有意义。
+        let foreground = input["background"].as_bool() != Some(true);
+        let escalated = !call.no_sandbox
+            && foreground
+            && policy.escalate
+            && escalation_remember_payload(command, self.identity.cwd(), facts)
+                .is_some_and(|remember| self.escalation_remembered(&remember));
+        (
+            if escalated {
+                SandboxPlan::Escalated
+            } else {
+                SandboxPlan::Contained
+            },
+            protection,
+        )
     }
 
     fn matches_deny(&self, name: &str, call: &CallFacts) -> bool {
@@ -971,7 +1057,7 @@ impl Permissions {
                 .global
                 .deny
                 .iter()
-                .any(|r| r.matches_path("read_file", &facts))
+                .any(|r| r.matches_path("read_file", &facts, rule::PathDirection::Blocks))
     }
 
     /// The escalation loop's consent step (codex's retry-on-denial): a
@@ -986,6 +1072,19 @@ impl Permissions {
         denial: Option<&crate::sandbox::SandboxDenial>,
         depth: u8,
     ) -> Escalation {
+        self.escalate_sandbox_with_facts(command, denial, depth, None)
+            .await
+    }
+
+    /// 调用方已经为这条命令解析过一次时走这里：升级记忆的载荷从同一份
+    /// 事实派生，不再重解析。
+    pub(crate) async fn escalate_sandbox_with_facts(
+        &self,
+        command: &str,
+        denial: Option<&crate::sandbox::SandboxDenial>,
+        depth: u8,
+        facts: Option<&BashFacts>,
+    ) -> Escalation {
         // Tests / `--mock`: nobody is watching (and the sandbox is off in
         // `--mock` anyway). Don't silently escalate.
         if self.allow_everything {
@@ -998,7 +1097,7 @@ impl Permissions {
         // A remembered escalation answers before the ask, exactly as a durable
         // allow rule does for the ordinary gate. 固定输出还需写入范围；已定位但
         // 带未知效果的包装器只记原文，其余 opaque 仍用本工作区会话的通配同意。
-        let memory = escalation_memory(command, self.identity.cwd());
+        let memory = escalation_memory(command, self.identity.cwd(), facts);
         let remember = memory.remember;
         if self.blanket_escalation_granted()
             || remember
@@ -1101,7 +1200,7 @@ impl Permissions {
         if self.allow_everything {
             return false;
         }
-        escalation_remember_payload(command, self.identity.cwd())
+        escalation_remember_payload(command, self.identity.cwd(), None)
             .is_some_and(|remember| self.escalation_remembered(&remember))
     }
 
@@ -1164,6 +1263,7 @@ mod tests {
     include!("permissions/plan243_tests.rs");
     include!("permissions/plan244_tests.rs");
     include!("permissions/plan245_tests.rs");
+    include!("permissions/plan266_tests.rs");
     include!("permissions/plan271_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
@@ -1247,6 +1347,19 @@ mod tests {
 
     async fn ok(p: &Permissions, name: &str, input: Value) -> bool {
         p.check(name, &input, 0).await.is_ok()
+    }
+
+    /// What a call the gate allows without asking answers: containment only
+    /// when the caller claims an OS sandbox (`sandbox_auto_allow`).
+    fn allowed_verdict(sandbox_auto_allow: bool) -> Result<Verdict, String> {
+        Ok(Verdict {
+            sandbox: if sandbox_auto_allow {
+                SandboxPlan::Contained
+            } else {
+                SandboxPlan::None
+            },
+            ..Verdict::default()
+        })
     }
 
     fn bash(cmd: &str) -> Value {
@@ -2041,7 +2154,7 @@ mod tests {
                 assert_eq!(
                     p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                         .await,
-                    Ok(None)
+                    allowed_verdict(sandbox_auto_allow)
                 );
                 assert_eq!(
                     approver.ask_count(),
@@ -2077,7 +2190,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        Ok(None),
+                        allowed_verdict(sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2148,7 +2261,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        Ok(None),
+                        allowed_verdict(sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2173,7 +2286,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        Ok(None),
+                        allowed_verdict(sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2268,7 +2381,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        Ok(None),
+                        allowed_verdict(sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2472,11 +2585,16 @@ mod tests {
                 .unwrap();
                 for (name, input) in &cases {
                     for sandbox_auto_allow in [false, true] {
+                        // A call that opts out of the sandbox is never contained,
+                        // whatever the dispatcher claims.
+                        let contained = *name == "bash"
+                            && sandbox_auto_allow
+                            && !input["disable_sandbox"].as_bool().unwrap_or(false);
                         assert_eq!(
                             permissions
                                 .check_call(name, input, 1, sandbox_auto_allow)
                                 .await,
-                            Ok(None),
+                            allowed_verdict(contained),
                             "{name}: {input}, ask={ask_rules:?}, approver={approver_available}, sandbox={sandbox_auto_allow}"
                         );
                     }
@@ -2782,6 +2900,7 @@ mod tests {
             .check("bash", &bash("cargo build"), 0)
             .await
             .unwrap()
+            .notice
             .expect("persistence failure must be visible");
         assert!(notice.message.contains("not saved"));
         assert_eq!(
@@ -3006,7 +3125,7 @@ mod tests {
         for target in [".", "./", "logs/..", cwd.to_str().unwrap()] {
             let command = format!("make check > '{target}'");
             assert!(
-                escalation_remember_payload(&command, &test_cwd()).is_none(),
+                escalation_remember_payload(&command, &test_cwd(), None).is_none(),
                 "{target}"
             );
             let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
@@ -3146,7 +3265,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            escalation_remember_payload("make check > check.log", &test_cwd())
+            escalation_remember_payload("make check > check.log", &test_cwd(), None)
                 .unwrap()
                 .signatures,
             vec![
@@ -3188,7 +3307,7 @@ mod tests {
             let remember = if tool == "bash" {
                 remember_payload(tool, &call)
             } else {
-                escalation_remember_payload("make check > /check.log", Path::new("/"))
+                escalation_remember_payload("make check > /check.log", Path::new("/"), None)
             };
             assert!(
                 remember.is_none(),
@@ -3682,7 +3801,8 @@ mod tests {
                 None,
                 None,
                 0,
-                Default::default()
+                Default::default(),
+                None
             )
             .await,
             Err(Refusal::Stopped)
@@ -3698,7 +3818,8 @@ mod tests {
                 None,
                 None,
                 0,
-                Default::default()
+                Default::default(),
+                None
             )
             .await,
             Err(Refusal::Denied(user_denial("write_file")))

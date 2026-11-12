@@ -505,7 +505,19 @@ impl Builtin {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn concurrency_safe(self, input: &Value) -> bool {
+        self.concurrency_safe_with(input, None)
+    }
+
+    /// Batching over a parse dispatch already made. The batch decision and the
+    /// permission gate ask the same question of the same facts, so one call
+    /// must not parse its command twice to get them.
+    pub(crate) fn concurrency_safe_with(
+        self,
+        input: &Value,
+        facts: Option<&crate::shell::BashFacts>,
+    ) -> bool {
         match self {
             Self::ReadFile | Self::Grep | Self::Glob => true,
             // These inspect or signal resources already created by a gated call.
@@ -527,9 +539,12 @@ impl Builtin {
             // a crash after an injected command ran is not "nothing happened"
             // (plan 204).
             Self::Skill => false,
-            Self::Bash => input["command"]
-                .as_str()
-                .is_some_and(|cmd| crate::shell::analyze_bash(cmd).is_readonly()),
+            Self::Bash => match facts {
+                Some(facts) => facts.analysis.is_readonly(),
+                None => input["command"]
+                    .as_str()
+                    .is_some_and(|cmd| crate::shell::analyze_bash(cmd).is_readonly()),
+            },
             Self::AskUserQuestion | Self::CronList | Self::ListAgents => true,
             Self::SendMessage
             | Self::CronCreate

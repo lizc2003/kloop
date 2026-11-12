@@ -38,14 +38,14 @@ async fn plan271_project_kloop_reads_pass() {
             assert_eq!(
                 p.check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
                     .await,
-                Ok(None),
+                allowed_verdict(/*sandbox_auto_allow*/ true),
                 "{mode:?}: {command}"
             );
         }
         assert_eq!(
             p.check("read_file", &json!({"path": ".kloop/notes.md"}), 0)
                 .await,
-            Ok(None),
+            Ok(Verdict::default()),
             "{mode:?}"
         );
         assert!(!p.read_path_blocked(&root.join(".kloop/rules/style.md")));
@@ -57,7 +57,7 @@ async fn plan271_project_kloop_reads_pass() {
     assert_eq!(
         p.check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
             .await,
-        Ok(None),
+        allowed_verdict(/*sandbox_auto_allow*/ true),
         "{command}"
     );
     let _ = std::fs::remove_dir_all(&root);

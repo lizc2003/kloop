@@ -108,6 +108,13 @@ impl WriteTarget {
     }
 }
 
+/// The cwd every path in one call is judged against, canonicalised once.
+#[derive(Clone, Copy)]
+pub(super) struct PathRoot<'a> {
+    pub(super) cwd: &'a Path,
+    pub(super) canonical: &'a Path,
+}
+
 #[derive(Clone)]
 pub(super) struct PathFacts {
     /// Canonical existing ancestor plus any not-yet-created suffix.
@@ -135,7 +142,14 @@ impl CallFacts {
         cwd: &Path,
         resolved_path: Option<&Path>,
     ) -> Self {
-        Self::gather_with_execution(name, input, cwd, resolved_path, ExecutionContext::default())
+        Self::gather_with_execution(
+            name,
+            input,
+            cwd,
+            resolved_path,
+            ExecutionContext::default(),
+            None,
+        )
     }
 
     pub(super) fn gather_with_execution(
@@ -144,13 +158,29 @@ impl CallFacts {
         cwd: &Path,
         resolved_path: Option<&Path>,
         execution: ExecutionContext<'_>,
+        shared_facts: Option<&BashFacts>,
     ) -> Self {
+        let canonical = canonical_cwd(cwd);
+        let root = PathRoot {
+            cwd,
+            canonical: &canonical,
+        };
         let shell_command = matches!(name, "bash" | "powershell")
             .then(|| input["command"].as_str())
             .flatten();
-        let bash_facts = (name == "bash")
-            .then(|| shell_command.map(analyze_bash_facts))
-            .flatten();
+        // Dispatch parsed this command once and handed it down; a caller
+        // without one (a blind gate check, a test) gets the same facts here.
+        let computed;
+        let bash_facts: Option<&BashFacts> = match (name, shell_command) {
+            ("bash", Some(command)) => Some(match shared_facts {
+                Some(facts) => facts,
+                None => {
+                    computed = analyze_bash_facts(command);
+                    &computed
+                }
+            }),
+            _ => None,
+        };
         let shell = match (name, shell_command) {
             ("bash", Some(_)) => {
                 let analysis = bash_facts.as_ref().unwrap().analysis.clone();
@@ -173,7 +203,7 @@ impl CallFacts {
             })
             .unwrap_or_default()
             .iter()
-            .map(|path| PathFacts::gather(Path::new(path), cwd))
+            .map(|path| PathFacts::gather_in(Path::new(path), root, None))
             .collect();
         let path_key = match name {
             "write_file" | "edit_file" | "read_file" => Some("path"),
@@ -182,7 +212,7 @@ impl CallFacts {
         };
         let path = path_key
             .and_then(|key| input[key].as_str())
-            .map(|raw| PathFacts::gather_with_resolved(Path::new(raw), cwd, resolved_path));
+            .map(|raw| PathFacts::gather_in(Path::new(raw), root, resolved_path));
         let sensitive_read = (name == "read_file"
             && path
                 .as_ref()
@@ -197,7 +227,7 @@ impl CallFacts {
                         bash_reads_sensitive_path(
                             command,
                             bash_facts.as_ref().unwrap(),
-                            cwd,
+                            root,
                             execution,
                         )
                         .blocked()
@@ -216,7 +246,7 @@ impl CallFacts {
         };
         let risk_writes = bash_facts
             .as_ref()
-            .map_or_else(Vec::new, |facts| write_targets(facts, cwd, execution));
+            .map_or_else(Vec::new, |facts| write_targets(facts, root, execution));
         let sensitive_write = risk_writes.iter().any(WriteTarget::blocks_sensitive_write)
             || (matches!(name, "write_file" | "edit_file" | "notebook_edit")
                 && path.as_ref().is_some_and(|path| {
@@ -431,7 +461,7 @@ fn placeholder_argv(words: &[WordEvaluation]) -> Vec<String> {
         .collect()
 }
 
-fn argv_sensitive_access(argv: &[String], cwd: &Path, placement: Placement) -> ReadVerdict {
+fn argv_sensitive_access(argv: &[String], root: PathRoot<'_>, placement: Placement) -> ReadVerdict {
     let wrappers = analyze_wrappers(argv);
     let (prefix, argv) = if wrappers.complete {
         (&argv[..argv.len() - wrappers.argv.len()], wrappers.argv)
@@ -442,7 +472,7 @@ fn argv_sensitive_access(argv: &[String], cwd: &Path, placement: Placement) -> R
     if prefix
         .iter()
         .skip(1)
-        .any(|arg| path_argument_is_sensitive(arg, cwd, false, placement.access(arg)))
+        .any(|arg| path_argument_is_sensitive_in(arg, root, false, placement.access(arg)))
     {
         return ReadVerdict::Sensitive;
     }
@@ -458,7 +488,7 @@ fn argv_sensitive_access(argv: &[String], cwd: &Path, placement: Placement) -> R
                 } else {
                     WordEvaluation::Resolved(path.value.into())
                 };
-                evaluation_is_sensitive(&word, cwd, path.access.is_metadata(), |value| {
+                evaluation_is_sensitive(&word, root, path.access.is_metadata(), |value| {
                     placement.access(value)
                 })
             }),
@@ -472,10 +502,10 @@ fn argv_sensitive_access(argv: &[String], cwd: &Path, placement: Placement) -> R
             } else {
                 WordEvaluation::Resolved(arg.clone())
             };
-            evaluation_is_sensitive(&word, cwd, false, |value| placement.access(value))
+            evaluation_is_sensitive(&word, root, false, |value| placement.access(value))
         }),
     };
-    if sensitive || recursive_search_covers_sensitive_path(argv, cwd) {
+    if sensitive || recursive_search_covers_sensitive_path(argv, root.cwd) {
         ReadVerdict::Sensitive
     } else if argv_roles::unknown_effects(argv).unresolved_access {
         // 单值边界只证明 argv 位置；变量、命令替换和 xargs 的未知目标使用同一硬限制。
@@ -491,7 +521,7 @@ fn argv_sensitive_access(argv: &[String], cwd: &Path, placement: Placement) -> R
 fn mask_project_kloop_words(
     masked: &mut String,
     facts: &BashFacts,
-    cwd: &Path,
+    root: PathRoot<'_>,
     home: Option<&Path>,
 ) {
     let mut mask = |range: &std::ops::Range<usize>, word: &WordEvaluation, placement: Placement| {
@@ -502,7 +532,7 @@ fn mask_project_kloop_words(
             return;
         }
         let access = placement.access(spelling);
-        if access == Access::Read && !path_argument_is_sensitive(spelling, cwd, false, access) {
+        if access == Access::Read && !path_argument_is_sensitive_in(spelling, root, false, access) {
             masked.replace_range(range.clone(), &" ".repeat(range.len()));
         }
     };
@@ -537,13 +567,13 @@ fn mask_project_kloop_words(
 fn bash_reads_sensitive_path(
     command: &str,
     facts: &BashFacts,
-    cwd: &Path,
+    root: PathRoot<'_>,
     execution: ExecutionContext<'_>,
 ) -> ReadVerdict {
     let home = execution.shell_home();
     let mut masked = command.to_string();
     if facts.reliable {
-        mask_project_kloop_words(&mut masked, facts, cwd, home.as_deref());
+        mask_project_kloop_words(&mut masked, facts, root, home.as_deref());
     }
     let raw_sensitive = raw_mentions_sensitive_path(&masked);
     let mut requires_protection = false;
@@ -572,7 +602,7 @@ fn bash_reads_sensitive_path(
                 .map(|word| word.syntax.evaluate(home))
                 .collect();
             let placement = Placement::of_command(&placeholder_argv(&words), &command.context);
-            match argv_sensitive_access(&placeholder_argv(&words), cwd, placement) {
+            match argv_sensitive_access(&placeholder_argv(&words), root, placement) {
                 ReadVerdict::Clear => {}
                 verdict => return verdict,
             }
@@ -584,7 +614,8 @@ fn bash_reads_sensitive_path(
             let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
             let target = redirect.syntax.evaluate(home);
             let placement = Placement::of_shell(&redirect.context);
-            if evaluation_is_sensitive(&target, cwd, false, |spelling| placement.access(spelling)) {
+            if evaluation_is_sensitive(&target, root, false, |spelling| placement.access(spelling))
+            {
                 return ReadVerdict::Sensitive;
             }
             if matches!(&target, WordEvaluation::Unknown)
@@ -625,8 +656,20 @@ pub(crate) fn bash_protection_requirement(
     command: &str,
     cwd: &Path,
     execution: ExecutionContext<'_>,
+    shared_facts: Option<&BashFacts>,
 ) -> Result<bool, String> {
-    let facts = analyze_bash_facts(command);
+    // Most commands never name a credential; they cannot protect one either.
+    if !raw_mentions_sensitive_path(command) {
+        return Ok(false);
+    }
+    let computed;
+    let facts = match shared_facts {
+        Some(facts) => facts,
+        None => {
+            computed = analyze_bash_facts(command);
+            &computed
+        }
+    };
     if !facts
         .literal_inputs
         .iter()
@@ -634,7 +677,16 @@ pub(crate) fn bash_protection_requirement(
     {
         return Ok(false);
     }
-    match bash_reads_sensitive_path(command, &facts, cwd, execution) {
+    let canonical = canonical_cwd(cwd);
+    match bash_reads_sensitive_path(
+        command,
+        facts,
+        PathRoot {
+            cwd,
+            canonical: &canonical,
+        },
+        execution,
+    ) {
         ReadVerdict::RequiresProtection => Ok(true),
         ReadVerdict::Clear => Ok(false),
         ReadVerdict::Sensitive | ReadVerdict::Unresolved => {
@@ -643,28 +695,47 @@ pub(crate) fn bash_protection_requirement(
     }
 }
 
+#[cfg(test)]
 fn path_argument_is_sensitive(raw: &str, cwd: &Path, metadata: bool, access: Access) -> bool {
+    let canonical = canonical_cwd(cwd);
+    path_argument_is_sensitive_in(
+        raw,
+        PathRoot {
+            cwd,
+            canonical: &canonical,
+        },
+        metadata,
+        access,
+    )
+}
+
+fn path_argument_is_sensitive_in(
+    raw: &str,
+    root: PathRoot<'_>,
+    metadata: bool,
+    access: Access,
+) -> bool {
     sensitivity_blocks_read(
-        path_argument_sensitivity(raw, cwd, metadata, access),
+        path_argument_sensitivity(raw, root, metadata, access),
         metadata,
     )
 }
 
 fn path_argument_sensitivity(
     raw: &str,
-    cwd: &Path,
+    root: PathRoot<'_>,
     metadata: bool,
     access: Access,
 ) -> Option<Sensitivity> {
-    let path = crate::paths::lexically_normalize(cwd, Path::new(raw));
+    let path = crate::paths::lexically_normalize(root.cwd, Path::new(raw));
     // 词法归一化先消掉 `..`，可能跨过了符号链接；再按物理落点判一次，只会多拦。
     let physical = Path::new(raw)
         .components()
         .any(|component| matches!(component, Component::ParentDir))
-        .then(|| resolve_nearest_existing(&cwd.join(raw)))
+        .then(|| resolve_nearest_existing(&root.cwd.join(raw)))
         .flatten();
     [
-        PathFacts::gather(&path, cwd).sensitivity(access),
+        PathFacts::gather_in(&path, root, None).sensitivity(access),
         glob_spelling_sensitivity(&path, metadata, access),
         physical.and_then(|physical| path_sensitivity(&physical, access)),
     ]
@@ -685,28 +756,28 @@ fn sensitivity_blocks_read(sensitivity: Option<Sensitivity>, metadata: bool) -> 
 /// `access_of` 按拼写给出访问口径：读取看它所在命令能否定位，写入不分。
 fn evaluation_is_sensitive(
     word: &WordEvaluation,
-    cwd: &Path,
+    root: PathRoot<'_>,
     metadata: bool,
     access_of: impl Fn(&str) -> Access,
 ) -> bool {
     sensitivity_blocks_read(
-        evaluation_sensitivity(word, cwd, metadata, access_of),
+        evaluation_sensitivity(word, root, metadata, access_of),
         metadata,
     )
 }
 
 fn evaluation_sensitivity(
     word: &WordEvaluation,
-    cwd: &Path,
+    root: PathRoot<'_>,
     metadata: bool,
     access_of: impl Fn(&str) -> Access,
 ) -> Option<Sensitivity> {
     match word {
         WordEvaluation::Resolved(path) => {
-            path_argument_sensitivity(path, cwd, metadata, access_of(path))
+            path_argument_sensitivity(path, root, metadata, access_of(path))
         }
         WordEvaluation::Partial(spelling) if !spelling.contains('\0') => {
-            path_argument_sensitivity(spelling, cwd, metadata, access_of(spelling))
+            path_argument_sensitivity(spelling, root, metadata, access_of(spelling))
         }
         WordEvaluation::Partial(spelling) => {
             // 未知片段不能假装成文件系统落点，但已知的敏感分量仍然成立。
@@ -976,23 +1047,26 @@ fn recursive_root_is_sensitive(root: &Path) -> bool {
 /// argv 与重定向共用求值器；不确定的写效果必须保留给 deny/ask。
 fn write_targets(
     facts: &BashFacts,
-    cwd: &Path,
+    root: PathRoot<'_>,
     execution: ExecutionContext<'_>,
 ) -> Vec<WriteTarget> {
     let home = execution.shell_home();
     let write_target = |target: WordEvaluation, cwd_unknown: bool| match target {
         WordEvaluation::Resolved(path) if path == "/dev/null" => None,
         WordEvaluation::Resolved(path) if !cwd_unknown || Path::new(&path).is_absolute() => Some(
-            WriteTarget::Resolved(PathFacts::gather(Path::new(&path), cwd)),
+            WriteTarget::Resolved(PathFacts::gather_in(Path::new(&path), root, None)),
         ),
         WordEvaluation::Resolved(path) => Some(WriteTarget::Partial {
-            sensitivity: evaluation_sensitivity(&WordEvaluation::Partial(path), cwd, false, |_| {
-                Access::Write
-            }),
+            sensitivity: evaluation_sensitivity(
+                &WordEvaluation::Partial(path),
+                root,
+                false,
+                |_| Access::Write,
+            ),
             value_unknown: false,
         }),
         WordEvaluation::Partial(_) => Some(WriteTarget::Partial {
-            sensitivity: evaluation_sensitivity(&target, cwd, false, |_| Access::Write),
+            sensitivity: evaluation_sensitivity(&target, root, false, |_| Access::Write),
             value_unknown: true,
         }),
         WordEvaluation::Unknown => Some(WriteTarget::Partial {
@@ -1062,7 +1136,15 @@ fn is_stream_device(path: &Path) -> bool {
     )
 }
 
+/// Canonical spelling of a working directory, with the lexical fallback every
+/// path judgment already used when the directory cannot be resolved.
+pub(super) fn canonical_cwd(cwd: &Path) -> PathBuf {
+    std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| crate::paths::lexically_normalize(Path::new("/"), cwd))
+}
+
 impl PathFacts {
+    #[cfg(test)]
     pub(super) fn gather(raw: &Path, cwd: &Path) -> Self {
         Self::gather_with_resolved(raw, cwd, None)
     }
@@ -1072,9 +1154,23 @@ impl PathFacts {
         cwd: &Path,
         resolved_path: Option<&Path>,
     ) -> Self {
+        let canonical = canonical_cwd(cwd);
+        Self::gather_in(
+            raw,
+            PathRoot {
+                cwd,
+                canonical: &canonical,
+            },
+            resolved_path,
+        )
+    }
+
+    /// The form every caller inside one call uses: the cwd was canonicalised
+    /// once by [`CallFacts`], not once per argument.
+    pub(super) fn gather_in(raw: &Path, root: PathRoot<'_>, resolved_path: Option<&Path>) -> Self {
+        let cwd = root.cwd;
         let original = crate::paths::lexically_normalize(cwd, raw);
-        let canonical_cwd = std::fs::canonicalize(cwd)
-            .unwrap_or_else(|_| crate::paths::lexically_normalize(Path::new("/"), cwd));
+        let canonical_cwd = root.canonical;
         let target = if raw.is_absolute() {
             raw.to_path_buf()
         } else {
@@ -1086,7 +1182,7 @@ impl PathFacts {
         let normalized = resolved.clone().unwrap_or_else(|| original.clone());
         let relative = resolved
             .as_ref()
-            .and_then(|path| path.strip_prefix(&canonical_cwd).ok())
+            .and_then(|path| path.strip_prefix(canonical_cwd).ok())
             .map(Path::to_path_buf);
         let original_relative = original.strip_prefix(cwd).ok().map(Path::to_path_buf);
         let deny_alias = resolved
@@ -1095,7 +1191,7 @@ impl PathFacts {
             .flatten();
         let deny_alias_relative = deny_alias
             .as_ref()
-            .and_then(|path| path.strip_prefix(&canonical_cwd).ok())
+            .and_then(|path| path.strip_prefix(canonical_cwd).ok())
             .map(Path::to_path_buf);
         let inside_cwd = relative.is_some();
         PathFacts {
@@ -1337,8 +1433,53 @@ mod tests {
             Path::new("/workspace"),
             None,
             ExecutionContext::sandboxed(Some(&policy)),
+            None,
         );
         assert_eq!(call.sensitive_read, !cfg!(target_os = "macos"));
+    }
+
+    /// Plan 266: the facts dispatch parsed once must answer exactly like a
+    /// fresh parse, and a command with no credential needle cannot need
+    /// protection at all (the fast path).
+    #[test]
+    fn plan266_shared_facts_answer_like_a_fresh_parse() {
+        let home = std::env::temp_dir().join("kloop-plan266-facts-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let policy = crate::sandbox::SandboxPolicy::workspace(&home, &[], false)
+            .with_credential_roots(&home);
+        let execution = ExecutionContext::sandboxed(Some(&policy));
+        for command in [
+            "echo hi",
+            "grep -rn KEY .",
+            "cat /tmp/x",
+            "cat > /tmp/probe.rs <<'EOF'\nlet path = \"~/.ssh/id_rsa\";\nEOF\ncargo run",
+            "cat ~/.ssh/id_rsa",
+        ] {
+            let facts = analyze_bash_facts(command);
+            assert_eq!(
+                bash_protection_requirement(
+                    command,
+                    Path::new("/workspace"),
+                    execution,
+                    Some(&facts)
+                ),
+                bash_protection_requirement(command, Path::new("/workspace"), execution, None),
+                "{command}"
+            );
+            if !raw_mentions_sensitive_path(command) {
+                assert_eq!(
+                    bash_protection_requirement(
+                        command,
+                        Path::new("/workspace"),
+                        execution,
+                        Some(&facts)
+                    ),
+                    Ok(false),
+                    "{command}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// The string layer is the only screen left for a command too opaque to

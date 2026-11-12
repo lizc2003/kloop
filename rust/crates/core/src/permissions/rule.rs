@@ -40,6 +40,15 @@ pub(super) enum Rule {
     },
 }
 
+/// The two directions of one path-glob rule. Allow only trusts the canonical
+/// target (`**` crosses `/`, so a relative glob cannot be aimed at absolute
+/// spellings either); deny/ask also match every alias the call could mean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PathDirection {
+    Allows,
+    Blocks,
+}
+
 /// Allow 方向的路径判定只有一条：绝对 glob 对规范绝对目标，相对 glob 只对 cwd 内的
 /// 规范相对目标。`**` 能跨 `/`，所以相对 glob 不能顺手拿去匹配绝对路径。
 fn glob_allows_path(glob: &GlobMatcher, facts: &PathFacts) -> bool {
@@ -83,59 +92,65 @@ impl Rule {
         }
     }
 
-    /// 相对 glob 只看 cwd 内的规范相对目标；`**` 能匹配 `/`，不能拿它直接匹配绝对路径。
-    pub(super) fn matches_shell_write(&self, tool: &str, facts: &PathFacts) -> bool {
+    /// The one path-glob matcher. `bash_write`, `write_file` allow and the
+    /// deny/ask layers used to be separate implementations of the same
+    /// question, which is how their spellings drifted apart.
+    pub(super) fn matches_path(
+        &self,
+        tool: &str,
+        facts: &PathFacts,
+        direction: PathDirection,
+    ) -> bool {
         let Rule::PathGlob {
             tool: rule_tool,
             glob,
         } = self
         else {
-            return false;
+            // deny/ask 的整工具规则也拦这类路径（`read_path_blocked` 依赖它）；
+            // allow 方向的整工具规则由调用方单独处理，因为 bash_write 没有这种写法。
+            return direction == PathDirection::Blocks
+                && matches!(self, Rule::Tool(t) if t == tool);
         };
-        rule_tool == tool && glob_allows_path(glob, facts)
-    }
-
-    /// allow 方向与 `bash_write` 同一条口径：只认规范目标。原文别名可能与符号
-    /// 链接父目录的落点不同，不能凭它把外面的写入带进这条授权。
-    pub(super) fn matches_allow_path(&self, tool: &str, facts: &PathFacts) -> bool {
-        match self {
-            Rule::Tool(t) => t == tool,
-            Rule::PathGlob {
-                tool: rule_tool,
-                glob,
-            } => rule_tool == tool && glob_allows_path(glob, facts),
-            Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+        if rule_tool != tool {
+            return false;
+        }
+        match direction {
+            PathDirection::Allows => glob_allows_path(glob, facts),
+            PathDirection::Blocks => {
+                facts
+                    .relative
+                    .as_ref()
+                    .is_some_and(|rel| glob.is_match(rel))
+                    || facts
+                        .original_relative
+                        .as_ref()
+                        .is_some_and(|rel| glob.is_match(rel))
+                    || facts
+                        .deny_alias_relative
+                        .as_ref()
+                        .is_some_and(|rel| glob.is_match(rel))
+                    || glob.is_match(&facts.normalized)
+                    || glob.is_match(&facts.original)
+                    || facts
+                        .deny_alias
+                        .as_ref()
+                        .is_some_and(|path| glob.is_match(path))
+            }
         }
     }
 
-    /// deny/ask 方向反过来兼顾别名：原文或规范目标任一命中都算。
-    pub(super) fn matches_path(&self, tool: &str, facts: &PathFacts) -> bool {
+    /// `bash_write` has no whole-tool form: the rule names files, and a
+    /// `bash_write` rule is the only spelling that reaches this call.
+    pub(super) fn matches_shell_write(&self, tool: &str, facts: &PathFacts) -> bool {
+        self.matches_path(tool, facts, PathDirection::Allows)
+    }
+
+    /// allow 只认规范目标：原文别名可能与符号链接父目录的落点不同，不能凭它把
+    /// 外面的写入带进这条授权。
+    pub(super) fn matches_allow_path(&self, tool: &str, facts: &PathFacts) -> bool {
         match self {
             Rule::Tool(t) => t == tool,
-            Rule::PathGlob {
-                tool: rule_tool,
-                glob,
-            } => {
-                rule_tool == tool
-                    && (facts
-                        .relative
-                        .as_ref()
-                        .is_some_and(|rel| glob.is_match(rel))
-                        || facts
-                            .original_relative
-                            .as_ref()
-                            .is_some_and(|rel| glob.is_match(rel))
-                        || facts
-                            .deny_alias_relative
-                            .as_ref()
-                            .is_some_and(|rel| glob.is_match(rel))
-                        || glob.is_match(&facts.normalized)
-                        || glob.is_match(&facts.original)
-                        || facts
-                            .deny_alias
-                            .as_ref()
-                            .is_some_and(|path| glob.is_match(path)))
-            }
+            Rule::PathGlob { .. } => self.matches_path(tool, facts, PathDirection::Allows),
             Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
         }
     }
@@ -263,7 +278,9 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
     if rules.iter().any(|r| r.matches_tool(name))
         || call.risk_writes.iter().any(|target| {
             rules.iter().any(|rule| match target {
-                WriteTarget::Resolved(path) => rule.matches_path("bash_write", path),
+                WriteTarget::Resolved(path) => {
+                    rule.matches_path("bash_write", path, PathDirection::Blocks)
+                }
                 // 未知目标无法证明与显式规则不相交；allow 不消费这类事实。
                 WriteTarget::Partial { .. } | WriteTarget::Unknown => matches!(rule,
                     Rule::Tool(tool) | Rule::PathGlob { tool, .. } if tool == "bash_write"),
@@ -338,7 +355,9 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
         // rules never decide here. Whole-tool rules were handled above.
         (Some(ShellFacts::Bash(BashAnalysis::Opaque)), _) => false,
         (Some(ShellFacts::PowerShellOpaque), _) => false,
-        (None, Some(path)) => rules.iter().any(|r| r.matches_path(name, path)),
+        (None, Some(path)) => rules
+            .iter()
+            .any(|r| r.matches_path(name, path, PathDirection::Blocks)),
         (None, None) => false,
     }
 }
@@ -416,7 +435,7 @@ mod tests {
         assert!(!facts.resolved);
         let allow = parse_rule(&format!("write_file({}/**)", base.display())).unwrap();
         assert!(!allow.matches_allow_path("write_file", &facts));
-        assert!(allow.matches_path("write_file", &facts));
+        assert!(allow.matches_path("write_file", &facts, PathDirection::Blocks));
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

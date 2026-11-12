@@ -286,21 +286,35 @@ impl CheckRunner for GatedCheck {
             let ctx = ToolCtx::harness(Arc::clone(&self.cfg), self.cancel.clone());
             let workspace = self.cfg.effective_workspace();
             let input = json!({ "command": command });
+            let facts = super::analyze_shell_call("bash", &input);
             let sandbox_auto = super::bash::execution_context(
                 "bash",
                 &input,
                 &workspace,
                 &self.cfg.shell_login_env,
             );
-            if let Err(reason) = workspace
+            let verdict = match workspace
                 .permissions
-                .check_call_with_execution("bash", &input, 0, sandbox_auto)
+                .check_call_with_execution("bash", &input, 0, sandbox_auto, facts.as_deref())
                 .await
             {
-                return CheckOutcome::Unavailable(format!("blocked: {reason}"));
-            }
-            let sandbox = workspace.sandbox.clone();
-            match super::bash::run_foreground_bash(command, None, sandbox, &ctx, &workspace).await {
+                Ok(verdict) => verdict,
+                Err(reason) => return CheckOutcome::Unavailable(format!("blocked: {reason}")),
+            };
+            let sandbox = (verdict.sandbox == crate::permissions::SandboxPlan::Contained)
+                .then(|| workspace.sandbox.clone())
+                .flatten();
+            match super::bash::run_foreground_bash(
+                command,
+                None,
+                sandbox,
+                &ctx,
+                &workspace,
+                &verdict,
+                facts.as_deref(),
+            )
+            .await
+            {
                 Ok(run) if run.success => CheckOutcome::Passed,
                 Ok(run) => CheckOutcome::Failed(run.text),
                 Err(error) => CheckOutcome::Unavailable(format!("{error:#}")),

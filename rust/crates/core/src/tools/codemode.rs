@@ -612,9 +612,10 @@ impl HostBridge for CoreBridge {
                 Err("program bash calls must stay foreground; background resources are controlled by the parent session".into())
             });
         }
+        let facts = super::analyze_shell_call(&name, &args);
         let safe = match tool.source {
             Some(_) => tool.readonly,
-            None => super::is_concurrency_safe(&name, &args, &[]),
+            None => super::is_concurrency_safe_with(&name, &args, &[], facts.as_deref()),
         };
         let expected_source = tool.source;
         let id = format!("run_program-{}", self.seq.fetch_add(1, Ordering::Relaxed));
@@ -631,7 +632,7 @@ impl HostBridge for CoreBridge {
             } else {
                 Box::new(gate.write_owned().await)
             };
-            let block = super::run_one(id, name, args, ctx, expected_source).await;
+            let block = super::run_one(id, name, args, ctx, expected_source, facts).await;
             let ContentBlock::ToolResult {
                 content, is_error, ..
             } = block

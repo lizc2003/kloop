@@ -42,7 +42,7 @@ async fn plan245_unrepresentable_escalation_offers_only_once() {
     let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
     // 输出目标是根目录下的文件：可解析，但父目录 `/` 不能生成写入范围。
     let command = "make check > /kloop-plan245-root.log";
-    assert!(escalation_remember_payload(command, &test_cwd()).is_none());
+    assert!(escalation_remember_payload(command, &test_cwd(), None).is_none());
 
     assert_eq!(
         p.escalate_sandbox(command, None, 0).await.outcome,

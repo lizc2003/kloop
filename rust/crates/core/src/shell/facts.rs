@@ -179,7 +179,26 @@ pub(crate) struct BashFacts {
     pub verbatim_escalation: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts entry-point parses so a test can pin "one analysis per call".
+    /// Thread-local keeps concurrent tests from seeing each other's calls.
+    static ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn analyses() -> usize {
+    ANALYSES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_analyses() {
+    ANALYSES.with(|count| count.set(0));
+}
+
 pub(crate) fn analyze(script: &str) -> BashFacts {
+    #[cfg(test)]
+    ANALYSES.with(|count| count.set(count.get() + 1));
     analyze_depth(script, 0)
 }
 

@@ -1083,26 +1083,23 @@ fn tree_depth_operand(rest: &str) -> Option<&str> {
     .then_some(depth)
 }
 
-fn tree_short(ch: char) -> Option<Operand> {
-    match ch {
-        'H' | 'I' | 'L' | 'P' | 'T' => Some(Operand::Literal),
-        'o' => Some(Operand::WritePath),
-        'A' | 'C' | 'F' | 'J' | 'N' | 'Q' | 'R' | 'S' | 'U' | 'X' | 'a' | 'd' | 'f' | 'h' | 'i'
-        | 'l' | 'n' | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'x' => Some(Operand::None),
-        _ => None,
+/// `tree` 的选项角色只此一份，读 `shell` 里同一张表；`-R` 无操作数但会写，
+/// 这里仍返回 `None`，由 `path_arguments` 对 `-R` 整体退回逐参数检查。
+fn tree_operand(option: crate::shell::TreeOption) -> Operand {
+    match option {
+        crate::shell::TreeOption::Flag | crate::shell::TreeOption::WriteFlag => Operand::None,
+        crate::shell::TreeOption::Value => Operand::Literal,
+        crate::shell::TreeOption::Path => Operand::Path,
+        crate::shell::TreeOption::Write => Operand::WritePath,
     }
 }
 
+fn tree_short(ch: char) -> Option<Operand> {
+    crate::shell::tree_short_option(ch).map(tree_operand)
+}
+
 fn tree_long(name: &str) -> Option<Operand> {
-    match name {
-        "ignore" | "match" | "level" | "title" | "baseHREF" | "charset" | "filelimit"
-        | "timefmt" | "sort" => Some(Operand::Literal),
-        "outfile" => Some(Operand::WritePath),
-        "all" | "ansi" | "color" | "device" | "dirs-only" | "dirsfirst" | "du" | "full-path"
-        | "fromfile" | "gitignore" | "help" | "inodes" | "json" | "no-indent" | "nocolor"
-        | "noreport" | "prune" | "quote" | "version" | "xml" => Some(Operand::None),
-        _ => None,
-    }
+    crate::shell::tree_long_option(name).map(tree_operand)
 }
 
 #[cfg(test)]
