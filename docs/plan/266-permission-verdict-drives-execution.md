@@ -66,6 +66,9 @@
 - **第 5 步**：`shell.rs` 的 `TreeOption` 一张表，`tree_writes` 与 `argv_roles` 的
   `tree_short`/`tree_long` 共查；顺带补上两边各自漏的 `--ignore`/`--json`/`--matchdirs`/
   `--info`/`--gitfile` 等。
+- **复审补丁**：`tree` 的短选项簇按上游语义继续扫描（`-Io out.txt` 是 `-I` 取下一个
+  token 加 `-o`，仍判为写）；`--fromtabfile` 与 `--fromfile` 一样按内容读取；
+  plan 266 的沙箱判定测试限 macOS（非 macOS 的 `sandboxed` 上下文没有策略）。
 - **验证**：`cargo fmt --all`；`cargo clippy -p kloop-core --all-targets -- -D warnings`；
   `cargo check --workspace --all-targets`；外层执行沙箱之外跑 `cargo test -p kloop-core --lib`
   （1375 passed，含 26 个真实 seatbelt 用例）。未跑 parity（本机无新语料）与 Windows 检查。

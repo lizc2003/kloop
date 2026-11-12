@@ -602,12 +602,12 @@ fn tree_writes(argv: &[String]) -> bool {
                 }
                 cursor = next + digits;
             } else if option.takes_value() {
-                // The rest of the cluster is the value (`-Ifoo`); without one,
-                // the next token is.
-                if body[next..].is_empty() {
-                    pending_operands += 1;
-                }
-                break;
+                // `tree` takes these operands from the next argv token, never
+                // from the rest of the cluster: `-Io out.txt` is `-I out.txt`
+                // plus `-o` (which then takes the next token), not a pattern
+                // spelled `o`. Keep scanning the cluster so the `o` is seen.
+                pending_operands += 1;
+                cursor = next;
             } else {
                 cursor = next;
             }
@@ -1591,6 +1591,11 @@ mod tests {
             "."
         ])));
         assert!(!argv_is_readonly(&argv(&["tree", "--future-flag", "."])));
+        // `tree` reads value-taking operands from the next token, not from the
+        // rest of a short cluster: the `o` here is still the output option.
+        assert!(!argv_is_readonly(&argv(&["tree", "-Io", "out.txt", "."])));
+        assert!(!argv_is_readonly(&argv(&["tree", "-Pfoo", "."])));
+        assert!(!argv_is_readonly(&argv(&["tree", "-L2o", "out.txt", "."])));
         assert!(!argv_is_readonly(&argv(&["tree", "-Z", "."])));
         assert!(!argv_is_readonly(&argv(&["sed", "-i", "s/a/b/", "f"])));
         assert!(!argv_is_readonly(&argv(&["rm", "-rf", "x"])));

@@ -97,7 +97,7 @@ pub(super) fn path_arguments(argv: &[String]) -> Option<Vec<PathArgument<'_>>> {
             if walked
                 .long_flags
                 .iter()
-                .any(|flag| matches!(*flag, "fromfile" | "gitignore"))
+                .any(|flag| matches!(*flag, "fromfile" | "fromtabfile" | "gitignore"))
             {
                 for path in &mut walked.paths {
                     if path.access == PathAccess::Metadata {
@@ -1301,6 +1301,7 @@ mod tests {
         assert!(!metadata(&["du", "-sX", ".git/config", "."]));
         assert!(!metadata(&["du", "-hX", "./.git/config"]));
         assert!(!metadata(&["tree", "--fromfile", ".git/config"]));
+        assert!(!metadata(&["tree", "--fromtabfile", ".git/config"]));
         assert!(!metadata(&["tree", "--gitignore", ".git"]));
         assert!(!metadata(&["tree", "-R", "-L", "1", ".git"]));
         assert!(!metadata(&["tree", "-aR", ".git"]));

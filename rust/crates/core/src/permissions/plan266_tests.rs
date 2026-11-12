@@ -5,6 +5,7 @@ use crate::sandbox::SandboxPolicy;
 
 /// 沙箱进不进由门决定：普通调用在内，主动脱沙箱与已记住的升级在外，后台
 /// 永远在内（它没有拒绝后重跑的循环）。
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn plan266_containment_is_decided_once() {
     let policy = SandboxPolicy::workspace(&test_cwd(), &[], false);
