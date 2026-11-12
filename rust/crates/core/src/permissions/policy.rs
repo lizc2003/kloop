@@ -19,6 +19,7 @@ use super::facts::PathFacts;
 use super::rule::Rule;
 use super::rule::allow_rules_match;
 use super::rule::parse_rules;
+use crate::shell::argv_is_readonly;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ModeState {
@@ -107,14 +108,21 @@ impl ProjectPermissionPolicy {
 
     /// Whether durable rules consent to re-running every one of these argvs
     /// outside the sandbox. Strict like `matches_allow`: one uncovered segment
-    /// means the whole command still has to be asked about.
+    /// means the whole command still has to be asked about. Read-only
+    /// segments (`cd`, `| tail -20`) are not part of what is consented to, the
+    /// same as on the remembering side (plan 283), so a command left with only
+    /// its writes is covered by its write rules alone.
     pub(super) fn matches_escalation(&self, argvs: &[Vec<String>], writes: &[PathFacts]) -> bool {
-        if argvs.is_empty() {
+        let effective: Vec<&Vec<String>> = argvs
+            .iter()
+            .filter(|argv| !argv_is_readonly(argv))
+            .collect();
+        if effective.is_empty() && writes.is_empty() {
             return false;
         }
         let state = self.state.read().unwrap();
         let rules = state.snapshot.allow.parsed();
-        argvs
+        effective
             .iter()
             .all(|argv| rules.iter().any(|rule| rule.matches_escalation_argv(argv)))
             && writes.iter().all(|path| {

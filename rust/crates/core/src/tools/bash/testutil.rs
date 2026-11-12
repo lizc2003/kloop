@@ -348,10 +348,6 @@ pub(super) mod seatbelt {
             denied_write_paths: Vec::new(),
             allow_network: false,
             auto_allow: true,
-            // No approver in test_ctx (allow_all), so escalation always
-            // resolves NotAttempted → the model-driven hint; the tests
-            // below that need a real escalation build their own ctx.
-            escalate: true,
         };
         (with_sandbox(test_ctx(0, tag), policy), root)
     }

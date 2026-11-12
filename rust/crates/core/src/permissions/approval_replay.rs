@@ -12,6 +12,8 @@
 //! - `KLOOP_REPLAY_DIR`：语料根，下面一层是项目分区目录。
 //! - `KLOOP_REPLAY_SESSIONS`：取最近多少个根会话（子 agent 的文件并进它的根），默认 40。
 //! - `KLOOP_REPLAY_OUT`：另把汇总写成 JSON，供下一阶段对比。
+//! - `KLOOP_REPLAY_ASSUME_DENIED`：原来脱沙箱跑、现在会进沙箱的调用，结果里没有拒绝痕迹，
+//!   离线不知道会不会被拒；设了它就按“全部被拒”替它们问升级，得到这部分询问的上界。
 //!
 //! 简化：每个项目的持久规则从窗口开头的空集开始累积；全局 deny/ask 规则、权限模式
 //! 都不回放（一律 manual）；fork 出来的会话按 tool_use id 去重。
@@ -363,6 +365,7 @@ async fn approval_replay() {
         println!("skipped: no session corpus (set KLOOP_REPLAY_DIR)");
         return;
     };
+    let assume_denied = std::env::var_os("KLOOP_REPLAY_ASSUME_DENIED").is_some();
     let window: usize = std::env::var("KLOOP_REPLAY_SESSIONS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -467,12 +470,18 @@ async fn approval_replay() {
                 tally.bash += 1;
                 tally.no_sandbox += usize::from(no_sandbox);
             }
+            // `disable_sandbox` is gone from the schema (plan 283): a model
+            // sends the same call without it, and it runs contained.
+            let mut input = call.input.clone();
+            if let Some(fields) = input.as_object_mut() {
+                fields.remove("disable_sandbox");
+            }
             // The executor's choice of sandbox context, as dispatch makes it.
-            let sandbox = (call.name == "bash" && !no_sandbox).then_some(&policy);
+            let sandbox = (call.name == "bash").then_some(&policy);
             let outcome = gate
                 .gate_call(
                     &call.name,
-                    &call.input,
+                    &input,
                     None,
                     None,
                     call.depth,
@@ -484,18 +493,23 @@ async fn approval_replay() {
             let Ok(verdict) = outcome.result else {
                 continue;
             };
-            if call.name != "bash" || call.input["background"].as_bool() == Some(true) {
+            if call.name != "bash" || input["background"].as_bool() == Some(true) {
                 continue;
             }
             match verdict.sandbox {
                 SandboxPlan::Escalated => tally.escalated_up_front += 1,
                 SandboxPlan::Contained => {
-                    let command = call.input["command"].as_str().unwrap_or_default();
+                    let command = input["command"].as_str().unwrap_or_default();
                     match call.result.as_deref().and_then(recorded_denial) {
                         Some(denial) => {
                             let escalation = gate
                                 .escalate_sandbox(command, denial.as_ref(), call.depth)
                                 .await;
+                            tally_record(&mut tally, &mut detail, escalation.approval);
+                        }
+                        None if no_sandbox && assume_denied => {
+                            tally.unknown_outcome += 1;
+                            let escalation = gate.escalate_sandbox(command, None, call.depth).await;
                             tally_record(&mut tally, &mut detail, escalation.approval);
                         }
                         None if no_sandbox => tally.unknown_outcome += 1,

@@ -21,17 +21,6 @@ async fn plan245_blanket_escalation_never_skips_the_contained_attempt() {
         EscalationOutcome::Approved(EscalationApproval::Remembered)
     );
     assert_eq!(approver.ask_count(), 1, "通配仍免去第二次升级询问");
-
-    // 模型主动 disable_sandbox 是另一个动作，通配不能预先批准它。
-    assert!(
-        !ok(
-            &p,
-            "bash",
-            json!({"command": "go test ./pkg", "disable_sandbox": true})
-        )
-        .await
-    );
-    assert_eq!(approver.ask_count(), 2);
 }
 
 /// 可解析但没有任何安全复用范围的命令只提供 Once，不能升级成整个会话的通配。

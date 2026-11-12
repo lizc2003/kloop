@@ -177,3 +177,78 @@ fn plan283_a_record_round_trips_through_its_file_shape() {
         record
     );
 }
+
+/// 阶段 1：只读段与 `cd` 既不进升级的键，也不参与匹配。已存的
+/// `sandbox_escalate(make check *)` 覆盖带 `cd` 前缀、`| tail -N` 尾巴的同一个意图；
+/// 新的询问提议的就是这条规则，而不是逐字记忆或 `sandbox_escalate(cd … *)`。
+#[tokio::test]
+async fn plan283_read_only_segments_and_cd_are_not_part_of_the_escalation_key() {
+    let p = gate(
+        Mode::Manual,
+        rules(&["sandbox_escalate(make check *)"], &[], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    for command in [
+        "make check",
+        "make check 2>&1 | tail -20",
+        "cd /Users/someone/repo && make check 2>&1 | tail -80",
+        "pwd; make check | grep -E 'test result|FAILED' | head -40",
+    ] {
+        assert!(p.sandbox_escalation_remembered(command), "{command}");
+    }
+    // 有效果的段仍要逐个被覆盖。
+    assert!(!p.sandbox_escalation_remembered("make check && cargo install --path ."));
+    assert!(!p.sandbox_escalation_remembered("cd /Users/someone/repo && make install"));
+
+    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+    let writer = ScriptedWriter::succeeding();
+    let p = gate_with_writer(Mode::Manual, approver.clone(), writer);
+    let escalation = p
+        .escalate_sandbox(
+            "cd /Users/someone/repo && cargo test -p kloop-core 2>&1 | tail -20",
+            None,
+            0,
+        )
+        .await;
+    assert_eq!(
+        escalation.outcome,
+        EscalationOutcome::Approved(EscalationApproval::User)
+    );
+    let asked = approver.asked();
+    assert_eq!(
+        asked[0].approval_scopes,
+        vec![
+            ApprovalScope::Once,
+            ApprovalScope::WorkspaceSession,
+            ApprovalScope::Project
+        ]
+    );
+    assert_eq!(
+        asked[0].remember_rules,
+        Some(vec!["sandbox_escalate(cargo test *)".to_string()])
+    );
+}
+
+/// 只剩写入的命令（`echo`/`cat` 是只读段）由写入规则单独覆盖：键里没有命令段，
+/// 匹配也不因此判成“什么都没同意”。
+#[cfg(unix)]
+#[tokio::test]
+async fn plan283_a_write_only_escalation_is_covered_by_its_write_rule() {
+    let outside = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join("kloop-plan283-outside");
+    let command = format!("echo done > {}/marker.txt", outside.display());
+    let remember = escalation_remember_payload(&command, &test_cwd(), None).unwrap();
+    assert_eq!(
+        remember.rules,
+        vec![format!("sandbox_escalate_write({}/**)", outside.display())]
+    );
+    assert!(remember.argvs.is_empty());
+
+    let rule = format!("sandbox_escalate_write({}/**)", outside.display());
+    let p = gate(Mode::Manual, rules(&[&rule], &[], &[]), ScriptedApprover::new(vec![]));
+    assert!(p.sandbox_escalation_remembered(&command));
+    assert!(!p.sandbox_escalation_remembered(&format!("{command} && make install")));
+    // 没有命令段也没有写入：没有可同意的东西，不算记住。
+    assert!(!p.sandbox_escalation_remembered("ls && pwd"));
+}

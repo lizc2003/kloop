@@ -110,7 +110,7 @@ pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> 
         tail.push_str(if sb.requires_protection {
             sandbox::PROTECTION_REQUIRED
         } else {
-            sandbox::DENIAL_HINT
+            sandbox::BACKGROUND_DENIAL_HINT
         });
     }
     Ok(format!(
@@ -1388,6 +1388,9 @@ mod tests {
         /// happen at open time). This test is the regression lock on that.
         #[tokio::test]
         async fn background_shell_runs_sandboxed_and_reports_denials() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, _) = sandbox_ctx("bg");
             let (out, is_error) = run_tool(
                 "bash",
@@ -1414,7 +1417,10 @@ mod tests {
             let id = bg_id(&out);
             let (out, _) = run_tool("bash_output", json!({"bash_id": id}), &ctx).await;
             assert!(out.contains("failed"), "{out}");
-            assert!(out.contains("disable_sandbox: true"), "{out}");
+            assert!(
+                out.ends_with(crate::sandbox::BACKGROUND_DENIAL_HINT),
+                "{out}"
+            );
         }
     }
 

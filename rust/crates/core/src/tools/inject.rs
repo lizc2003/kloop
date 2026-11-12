@@ -253,7 +253,7 @@ async fn run_gated_bash(
             .map_err(|e| anyhow!("!`{command}`: {e:#}"))?;
     }
     let facts = super::analyze_shell_call("bash", &input);
-    let sandbox_auto = bash::execution_context("bash", &input, workspace, &ctx.cfg.shell_login_env);
+    let sandbox_auto = bash::execution_context("bash", workspace, &ctx.cfg.shell_login_env);
     let verdict = match trigger {
         // The slash path runs outside a turn and keeps its original gate and
         // error text. The skill path runs inside one, so it must distinguish

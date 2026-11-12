@@ -15,7 +15,7 @@ pub struct Verdict {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SandboxPlan {
-    /// No OS sandbox is in play: `disable_sandbox`, no policy, or not bash.
+    /// No OS sandbox is in play: no policy, or not bash.
     #[default]
     None,
     /// Run inside the workspace sandbox.

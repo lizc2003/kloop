@@ -50,10 +50,10 @@ const VERBATIM_REMEMBER_RULE: &str = "only this exact command text";
 pub(super) const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this session";
 
 /// Escalation consent is remembered at the same granularity the ordinary gate
-/// uses for bash — a two-word command prefix per segment — but under its own
-/// `sandbox_escalate(...)` rule, because "may run" and "may run uncontained"
-/// are different permissions. 已定位但带未知效果的包装器只记原文，不让未知效果
-/// 进入持久规则匹配；其它 opaque 脚本或无法表示的前缀返回 `None`。
+/// uses for bash — a two-word command prefix per segment with an effect — but
+/// under its own `sandbox_escalate(...)` rule, because "may run" and "may run
+/// uncontained" are different permissions. 已定位但带未知效果的包装器只记原文，
+/// 不让未知效果进入持久规则匹配；其它 opaque 脚本或无法表示的前缀返回 `None`。
 pub(super) fn escalation_remember_payload(
     command: &str,
     cwd: &Path,
@@ -92,7 +92,6 @@ fn escalation_payload_from_facts(facts: BashFacts, command: &str, cwd: &Path) ->
         return Some(verbatim_remember(
             "sandbox_escalate",
             command.trim(),
-            /*no_sandbox*/ false,
             Vec::new(),
             Vec::new(),
         ));
@@ -107,14 +106,7 @@ fn escalation_payload_from_facts(facts: BashFacts, command: &str, cwd: &Path) ->
         .iter()
         .map(|path| PathFacts::gather_with_resolved(Path::new(path), cwd, None))
         .collect();
-    bash_prefix_memory(
-        cmds,
-        &writes,
-        "sandbox_escalate",
-        ReadOnlySegments::Remember,
-        Some(command.trim()),
-        /*no_sandbox*/ false,
-    )
+    bash_prefix_memory(cmds, &writes, "sandbox_escalate", Some(command.trim()))
 }
 
 pub(super) fn user_denial(name: &str) -> String {
@@ -141,10 +133,10 @@ pub(super) struct Remember {
     pub(super) echo: Vec<String>,
     /// Session-cache keys, one per non-covered segment / path scope.
     pub(super) signatures: Vec<String>,
-    /// The parsed argv of each remembered segment. Only the sandbox-escalation
-    /// path reads this — it has to test the command against durable rules
-    /// itself, where the ordinary gate has already done that upstream. Empty
-    /// for the ordinary gate's payloads.
+    /// The parsed argv of each segment with an effect (read-only segments,
+    /// `cd` included, are neither keyed nor matched — plan 283). Only the
+    /// sandbox-escalation path reads this: it has to test the command against
+    /// durable rules itself, where the ordinary gate did that upstream.
     pub(super) argvs: Vec<Vec<String>>,
     /// 升级记忆匹配还需复核同一组规范输出目标。
     pub(super) writes: Vec<PathFacts>,
@@ -170,22 +162,17 @@ impl Remember {
     }
 }
 
-/// Whether a read-only segment needs remembering. The ordinary gate skips them
-/// — a read-only command was never going to be asked about, so there is nothing
-/// to remember. The escalation does not skip: a read-only command still had to
-/// be *denied inside the sandbox* to reach that prompt, so it is part of what
-/// the yes was given for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadOnlySegments {
-    Skip,
-    Remember,
-}
-
 /// One rule per distinct two-word command prefix, in `tool`'s own vocabulary:
 /// `bash(git commit *)` for the ordinary gate, `sandbox_escalate(git commit *)`
 /// for the escalation. The two consents are different permissions written at
-/// the same granularity, so only the vocabulary and [`ReadOnlySegments`] differ
-/// — everything else used to be a second copy of these twenty lines.
+/// the same granularity, so only the vocabulary differs.
+///
+/// Read-only segments are skipped on both doors (plan 283): the sandbox limits
+/// writes and the network, sensitive reads are hard-blocked from the parse, and
+/// `cd` has no effect of its own — relative write targets are already resolved
+/// into [`PathFacts`]. Keying on them is what turned `… | tail -20` into an
+/// exact-text memory and wrote `sandbox_escalate(cd <dir> *)` to disk. The
+/// matching side skips them too ([`super::policy::ProjectPermissionPolicy::matches_escalation`]).
 ///
 /// `None` = a token that would corrupt a rule string (a paren, a comma, or
 /// embedded whitespace), so nothing can be written down at all. An empty argv
@@ -198,32 +185,25 @@ fn bash_prefix_memory(
     cmds: &[Vec<String>],
     writes: &[PathFacts],
     tool: &str,
-    segments: ReadOnlySegments,
     verbatim: Option<&str>,
-    no_sandbox: bool,
 ) -> Option<Remember> {
+    let effective: Vec<Vec<String>> = cmds
+        .iter()
+        .filter(|argv| !argv_is_readonly(argv))
+        .cloned()
+        .collect();
     let mut rules = Vec::new();
     let mut signatures = Vec::new();
-    let mut argvs = Vec::new();
-    for argv in cmds {
-        if segments == ReadOnlySegments::Skip && argv_is_readonly(argv) {
-            continue;
-        }
+    for argv in &effective {
         if argv_prefix_is_unstable(argv) {
             let command = verbatim.filter(|command| !command.is_empty())?;
             // The exact text keys the *new* memory, but the argv and write
             // facts still have to answer rules that already exist: a durable
             // `sandbox_escalate(timeout 600 cargo test)` must cover this run.
-            let argvs = if segments == ReadOnlySegments::Remember {
-                cmds.to_vec()
-            } else {
-                Vec::new()
-            };
             return Some(verbatim_remember(
                 tool,
                 command,
-                no_sandbox,
-                argvs,
+                effective.clone(),
                 writes.to_vec(),
             ));
         }
@@ -241,11 +221,6 @@ fn bash_prefix_memory(
             rules.push(rule);
             signatures.push(format!("{tool}:{head}"));
         }
-        // Only a payload that remembered *every* segment may later stand in for
-        // the whole command; the skipping form hands back none on purpose.
-        if segments == ReadOnlySegments::Remember {
-            argvs.push(argv.clone());
-        }
     }
     for path in writes {
         let scope = path_memory_scope(path)?;
@@ -259,30 +234,23 @@ fn bash_prefix_memory(
     if rules.is_empty() {
         return None;
     }
-    let mut remember = Remember::echoing_rules(rules, signatures, argvs);
+    let mut remember = Remember::echoing_rules(rules, signatures, effective);
     remember.writes = writes.to_vec();
     Some(remember)
 }
 
-/// 逐字会话记忆：只认这条命令的原文，不落成规则、不提供 Project。脱沙箱是另一种
-/// 同意，因此普通门的键里带上它；升级门本身就是在记脱沙箱，不再重复。`argvs` /
+/// 逐字会话记忆：只认这条命令的原文，不落成规则、不提供 Project。`argvs` /
 /// `writes` 不参与新规则，只让已有的精确升级规则还能认领这条命令。
 fn verbatim_remember(
     tool: &str,
     command: &str,
-    no_sandbox: bool,
     argvs: Vec<Vec<String>>,
     writes: Vec<PathFacts>,
 ) -> Remember {
-    let escape = if tool == "bash" && no_sandbox {
-        "!no-sandbox"
-    } else {
-        ""
-    };
     Remember {
         rules: Vec::new(),
         echo: vec![VERBATIM_REMEMBER_RULE.to_string()],
-        signatures: vec![format!("{tool}-script{escape}:{command}")],
+        signatures: vec![format!("{tool}-script:{command}")],
         argvs,
         writes,
     }
@@ -330,14 +298,7 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
                 BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
             )),
             _,
-        ) => bash_prefix_memory(
-            cmds,
-            &call.writes,
-            "bash",
-            ReadOnlySegments::Skip,
-            call.command.as_deref(),
-            call.no_sandbox,
-        ),
+        ) => bash_prefix_memory(cmds, &call.writes, "bash", call.command.as_deref()),
         // PowerShell stays unremember-able: bash at least gets parsed and only
         // then gives up, while PowerShell has no analysis at all — so "every
         // call asks" is the only safety net it has left.
@@ -355,7 +316,6 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
             Some(verbatim_remember(
                 "bash",
                 &script.command,
-                script.no_sandbox,
                 Vec::new(),
                 Vec::new(),
             ))
@@ -400,20 +360,13 @@ pub(super) fn clipped_detail(name: &str, input: &Value) -> String {
 pub(super) fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     let hazard = hazard_tag.map_or(String::new(), |t| format!("[{t}] "));
-    // The escape hatch from the OS sandbox is worth flagging to the human:
-    // this run gets full filesystem and network access if approved.
-    let no_sandbox = if name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false) {
-        "[no sandbox] "
-    } else {
-        ""
-    };
     let detail = clip(&call_detail(name, input));
     let shell_class = if name == "powershell" {
         "[unclassified PowerShell] "
     } else {
         ""
     };
-    format!("{agent}{hazard}{no_sandbox}{shell_class}{name}: {detail}")
+    format!("{agent}{hazard}{shell_class}{name}: {detail}")
 }
 
 /// [`describe`] pulled apart for a multi-line frontend: the kind of action, the
@@ -431,9 +384,6 @@ pub(super) fn describe_parts(
     }
     if let Some(tag) = hazard_tag {
         notices.push(tag.to_string());
-    }
-    if name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false) {
-        notices.push("no OS sandbox — full filesystem and network access".to_string());
     }
     if name == "powershell" {
         notices.push("unclassified PowerShell".to_string());
@@ -502,42 +452,33 @@ mod tests {
     use serde_json::json;
 
     /// The two bash memories are the same granularity in two vocabularies, and
-    /// they disagree about exactly one thing: whether a read-only segment is
-    /// part of what was approved. Writing them through one helper is only
-    /// correct while that disagreement survives — so it is asserted from both
-    /// ends of the same command.
+    /// both key only on the segments with an effect: `cd`, `pwd` and a
+    /// trailing `| tail -20` are in neither, so the escalation no longer falls
+    /// back to the exact text or writes `sandbox_escalate(cd <dir> *)` (plan 283).
     #[test]
-    fn the_two_bash_memories_differ_only_in_vocabulary_and_read_only_segments() {
-        let command = "pwd && git commit -m x";
+    fn the_two_bash_memories_differ_only_in_vocabulary() {
+        let command = "cd /tmp && pwd && git commit -m x 2>&1 | tail -20";
         let call = CallFacts::gather("bash", &json!({"command": command}), Path::new("/"), None);
+        let commit = vec![vec![
+            "git".to_string(),
+            "commit".into(),
+            "-m".into(),
+            "x".into(),
+        ]];
 
-        // The ordinary gate never had to ask about `pwd`, so it remembers only
-        // the segment that would have been asked about.
         let ordinary = remember_payload("bash", &call).expect("a parsed command is remember-able");
         assert_eq!(ordinary.rules, vec!["bash(git commit *)"]);
         assert_eq!(ordinary.signatures, vec!["bash:git commit"]);
-        assert!(
-            ordinary.argvs.is_empty(),
-            "a payload that skipped a segment must not stand in for the whole command"
-        );
+        assert_eq!(ordinary.argvs, commit);
 
-        // The sandbox denied the whole line, `pwd` included, so the escalation
-        // remembers both — under its own rule name.
         let escalation =
             escalation_remember_payload(command, &super::super::testutil::test_cwd(), None)
                 .expect("same command, other door");
-        assert_eq!(
-            escalation.rules,
-            vec!["sandbox_escalate(pwd *)", "sandbox_escalate(git commit *)"]
-        );
-        assert_eq!(
-            escalation.signatures,
-            vec!["sandbox_escalate:pwd", "sandbox_escalate:git commit"]
-        );
-        assert_eq!(escalation.argvs.len(), 2);
+        assert_eq!(escalation.rules, vec!["sandbox_escalate(git commit *)"]);
+        assert_eq!(escalation.signatures, vec!["sandbox_escalate:git commit"]);
+        assert_eq!(escalation.argvs, commit);
 
-        // Read-only throughout: nothing the ordinary gate could write down,
-        // while the escalation still has two denied commands to consent to.
+        // Read-only throughout: nothing either door could write down.
         let read_only = CallFacts::gather(
             "bash",
             &json!({"command": "ls && pwd"}),
@@ -545,11 +486,9 @@ mod tests {
             None,
         );
         assert!(remember_payload("bash", &read_only).is_none());
-        assert_eq!(
+        assert!(
             escalation_remember_payload("ls && pwd", &super::super::testutil::test_cwd(), None)
-                .unwrap()
-                .rules,
-            vec!["sandbox_escalate(ls *)", "sandbox_escalate(pwd *)"]
+                .is_none()
         );
 
         // A prefix token that would corrupt a rule string stops both. The

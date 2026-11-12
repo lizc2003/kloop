@@ -908,7 +908,6 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                 enabled: true,
                 allow_network: false,
                 auto_allow: true,
-                escalate: true,
             },
             worktree_enabled: true,
         })
@@ -994,7 +993,6 @@ async fn read_surfaces_are_scoped_safe_and_read_only() {
                     "enabled": true,
                     "allow_network": false,
                     "auto_allow": true,
-                    "escalate": true,
                 },
                 "worktree_enabled": true,
             }},

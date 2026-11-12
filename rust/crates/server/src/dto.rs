@@ -65,7 +65,6 @@ pub struct SandboxConfigInfo {
     pub enabled: bool,
     pub allow_network: bool,
     pub auto_allow: bool,
-    pub escalate: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -181,7 +180,6 @@ impl ServerConfig {
                         enabled: false,
                         allow_network: false,
                         auto_allow: false,
-                        escalate: false,
                     },
                     worktree_enabled: false,
                 })

@@ -20,8 +20,11 @@
 //! read-only here (it only shows the plan and flips the mode), so it passes.
 //!
 //! Bypass mode ([`Mode::Bypass`]) 不改变 OS 沙箱配置：普通调用仍在配置的沙箱内执行，
-//! 主动 `disable_sandbox` 与失败后自动升级都免审批。选择该模式即接受执行代价；
+//! 沙箱拒绝后的脱沙箱重跑免审批。选择该模式即接受执行代价；
 //! 权限免审批本身不提供命令内容或文件系统隔离保证。
+//!
+//! 离开沙箱只由 kloop 决定（plan 283）：模型没有自己脱沙箱的参数，越界只发生在
+//! 沙箱拒绝之后的升级，或已记住的逐命令升级跳过沙箱内的尝试。
 //!
 //! The contained-writes layer is the file-tool counterpart of sandbox
 //! auto-allow, and the reason kloop has no `acceptEdits` mode. `write_file` /
@@ -81,7 +84,6 @@ pub(crate) mod sensitive;
 mod testutil;
 mod verdict;
 
-use crate::shell::BashAnalysis;
 use crate::shell::BashFacts;
 use describe::BLANKET_ESCALATION_RULE;
 use describe::BLANKET_ESCALATION_SIGNATURE;
@@ -204,8 +206,8 @@ pub enum EscalationApproval {
 pub enum EscalationOutcome {
     /// 已获准裸跑；结果必须标明实际授权来源。
     Approved(EscalationApproval),
-    /// The user was asked and declined: keep the sandboxed failure and do
-    /// not invite a disable_sandbox retry.
+    /// The user was asked and declined: keep the sandboxed failure and tell
+    /// the model not to retry it.
     Declined,
     /// Declined with [`Decision::Stop`]: as `Declined`, and the turn ends.
     Stopped,
@@ -865,10 +867,8 @@ impl Permissions {
 
         // 8. Sandbox auto-allow — the OS sandbox will contain this call, so
         // nothing below (parse-level vetting, rules, the human) needs to be
-        // consulted. Sits under deny/safety/ask: those keep their say. A call
-        // that opted out of the sandbox is not contained no matter what the
-        // dispatcher says, so it never takes this layer. 解析不可信时同样不
-        // 自动放行：局部命令事实可能整体缺失，而 bash 仍会逐条执行。
+        // consulted. Sits under deny/safety/ask: those keep their say. 解析不可信时
+        // 不自动放行：局部命令事实可能整体缺失，而 bash 仍会逐条执行。
         // Contained, or uncontained under a consent the user already gave for
         // this command: either way the sandbox layer is not news to the human.
         // Deny, hazards and explicit ask rules above keep their say.
@@ -915,31 +915,13 @@ impl Permissions {
             return Ok(allow(None));
         }
 
-        // 12. Session cache. A `disable_sandbox` call asks about a different
-        // permission — running uncontained — so neither a contained run's
-        // `bash(...)` rules nor its session key may answer it; only per-command
-        // escalation consent can. 通配同意只免去“沙箱拒绝之后”的询问，不能
-        // 预先批准模型主动脱沙箱。已定位但带未知效果的包装器复用升级的逐字键；其它 opaque
-        // 脚本仍用按 containment 分开的普通逐字键（[`remember_payload`]）。
-        let opaque_bash = matches!(call.shell, Some(ShellFacts::Bash(BashAnalysis::Opaque)));
-        let escalation_memory = call.no_sandbox && (!opaque_bash || call.verbatim_escalation);
-        let remember = if escalation_memory {
-            call.command.as_deref().and_then(|command| {
-                escalation_remember_payload(command, self.identity.cwd(), facts)
-            })
-        } else {
-            remember_payload(name, &call)
-        };
-        let remembered = if escalation_memory {
-            remember
-                .as_ref()
-                .and_then(|remember| self.escalation_memory_source(remember))
-        } else {
-            remember.as_ref().and_then(|remember| {
-                self.session_remembers(remember)
-                    .then_some(MemorySource::Session)
-            })
-        };
+        // 12. Session cache. Opaque 脚本按原文记，其余按两词前缀与写入目录记
+        // （[`remember_payload`]）。
+        let remember = remember_payload(name, &call);
+        let remembered = remember.as_ref().and_then(|remember| {
+            self.session_remembers(remember)
+                .then_some(MemorySource::Session)
+        });
         if let Some(by) = remembered {
             *approval = Some(remembered_record(
                 name,
@@ -979,19 +961,18 @@ impl Permissions {
         if !matches!(call.shell, Some(ShellFacts::Bash(_))) {
             return (SandboxPlan::None, Protection::Unchecked);
         }
-        let Some(policy) = execution.policy() else {
+        if execution.policy().is_none() {
             // 沙箱盲的入口只有调用方的一句“会被包含”；照它的断言作答，
             // 但没有策略就没有可评估的保护要求。
-            let claimed = execution.auto_allow && !call.no_sandbox;
             return (
-                if claimed {
+                if execution.auto_allow {
                     SandboxPlan::Contained
                 } else {
                     SandboxPlan::None
                 },
                 Protection::Unchecked,
             );
-        };
+        }
         let command = call.command.as_deref().unwrap_or_default();
         let protection =
             match bash_protection_requirement(command, self.identity.cwd(), execution, facts) {
@@ -1001,14 +982,9 @@ impl Permissions {
                 // 取安全的一侧。
                 Err(_) => Protection::Required,
             };
-        if call.no_sandbox {
-            return (SandboxPlan::None, protection);
-        }
         // 后台 bash 没有拒绝后重跑的循环，升级只对前台有意义。
         let foreground = input["background"].as_bool() != Some(true);
-        let escalated = !call.no_sandbox
-            && foreground
-            && policy.escalate
+        let escalated = foreground
             && escalation_remember_payload(command, self.identity.cwd(), facts)
                 .is_some_and(|remember| self.escalation_remembered(&remember));
         (
@@ -1031,18 +1007,8 @@ impl Permissions {
 
     /// Allow is the strict direction: every bash argv must be read-only or
     /// rule-matched (un-stripped — wrappers must be spelled out), and opaque
-    /// bash never matches. A call carrying `disable_sandbox` is a different
-    /// permission: only a `sandbox_escalate(...)` rule may vouch for it, never
-    /// `bash(...)` or the whole-tool `bash` rule.
+    /// bash never matches.
     fn matches_allow(&self, name: &str, call: &CallFacts) -> bool {
-        if call.no_sandbox {
-            return match call.shell.as_ref() {
-                Some(ShellFacts::Bash(
-                    BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
-                )) => self.project.matches_escalation(cmds, &call.writes),
-                _ => false,
-            };
-        }
         self.project.matches_allow(name, call)
     }
 
@@ -1226,7 +1192,7 @@ impl Permissions {
         if self.allow_everything {
             return Escalation::new(EscalationOutcome::NotAttempted);
         }
-        // Bypass 的程序升级与模型主动 disable_sandbox 都免审批。
+        // Bypass 下沙箱拒绝后的升级免审批。
         if self.mode() == Mode::Bypass {
             return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Bypass));
         }
@@ -1472,9 +1438,7 @@ fn ask_reason(
 ) -> AskReason {
     match name {
         "bash" | "powershell" => {
-            if call.no_sandbox {
-                AskReason::NoSandbox
-            } else if execution.auto_allow
+            if execution.auto_allow
                 && matches!(sandbox, SandboxPlan::Contained | SandboxPlan::Escalated)
                 && !call.shell_facts_complete
             {
@@ -2776,14 +2740,7 @@ mod tests {
             ("bash", bash("make install")),
             (
                 "bash",
-                json!({"command": "make install", "disable_sandbox": true}),
-            ),
-            (
-                "bash",
-                json!({
-                    "command": "export QUERY=tools/query\n\"tools/query\" rename",
-                    "disable_sandbox": true
-                }),
+                bash("export QUERY=tools/query\n\"tools/query\" rename"),
             ),
             ("bash", bash("echo result > output.txt")),
             ("bash", bash("rm -rf build")),
@@ -2836,11 +2793,7 @@ mod tests {
                 .unwrap();
                 for (name, input) in &cases {
                     for sandbox_auto_allow in [false, true] {
-                        // A call that opts out of the sandbox is never contained,
-                        // whatever the dispatcher claims.
-                        let contained = *name == "bash"
-                            && sandbox_auto_allow
-                            && !input["disable_sandbox"].as_bool().unwrap_or(false);
+                        let contained = *name == "bash" && sandbox_auto_allow;
                         assert_eq!(
                             permissions
                                 .check_call(name, input, 1, sandbox_auto_allow)
@@ -2868,10 +2821,7 @@ mod tests {
             approver.clone(),
         );
         for (name, input) in [
-            (
-                "bash",
-                json!({"command": "echo ${VALUE:-default} > output.txt", "disable_sandbox": true}),
-            ),
+            ("bash", bash("echo ${VALUE:-default} > output.txt")),
             ("powershell", json!({"command": "Set-Content x y"})),
         ] {
             let error = permissions.check(name, &input, 0).await.unwrap_err();
@@ -2881,29 +2831,6 @@ mod tests {
             );
         }
         assert_eq!(approver.asked(), vec![]);
-    }
-
-    #[tokio::test]
-    async fn manual_sandbox_escape_still_asks_and_describes_the_risk() {
-        let escaping = json!({"command": "make install", "disable_sandbox": true});
-        let approver = ScriptedApprover::new(vec![Decision::Deny]);
-        let asked = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(!ok(&asked, "bash", escaping).await);
-        assert_eq!(approver.ask_count(), 1);
-        let notice = approver.asked()[0]
-            .notice
-            .clone()
-            .expect("an escaping call carries a notice");
-        assert!(notice.contains("no OS sandbox"), "{notice}");
-        assert!(
-            ok(
-                &asked,
-                "bash",
-                json!({"command": "ls -la", "disable_sandbox": true})
-            )
-            .await
-        );
-        assert_eq!(approver.ask_count(), 1);
     }
 
     // ── layer 6: ask rules ──────────────────────────────────────────────
@@ -3332,18 +3259,7 @@ mod tests {
             let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
             let writer = ScriptedWriter::succeeding();
             let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
-            assert!(
-                ok(
-                    &p,
-                    "bash",
-                    json!({
-                        "command": command,
-                        "disable_sandbox": true
-                    })
-                )
-                .await,
-                "{target}"
-            );
+            assert!(ok(&p, "bash", bash(&command)).await, "{target}");
             assert!(!ok(&p, "bash", bash(&command)).await, "{target}");
             assert!(
                 !ok(
@@ -3594,18 +3510,7 @@ mod tests {
                 assert!(ok(&p, "bash", bash(&inside)).await, "{pattern}");
                 assert!(p.sandbox_escalation_remembered(&inside), "{pattern}");
             }
-            assert!(
-                !ok(
-                    &p,
-                    "bash",
-                    json!({
-                        "command": command,
-                        "disable_sandbox": true
-                    })
-                )
-                .await,
-                "{pattern}"
-            );
+            assert!(!ok(&p, "bash", bash(&command)).await, "{pattern}");
             assert!(!p.sandbox_escalation_remembered(&command), "{pattern}");
             assert_eq!(approver.ask_count(), 1);
             for tool in ["bash_write", "sandbox_escalate_write"] {
@@ -3978,21 +3883,10 @@ mod tests {
         assert!(ok(&p, "bash", bash(script)).await);
         assert_eq!(approver.ask_count(), 1, "same text, not asked again");
 
-        // Escaping the sandbox is a different consent: the contained run's yes
-        // does not cover it, so it is asked (and granted Once here).
-        assert!(
-            ok(
-                &p,
-                "bash",
-                json!({"command": script, "disable_sandbox": true})
-            )
-            .await
-        );
-        assert_eq!(approver.ask_count(), 2);
-
-        // A different opaque script still asks — the approver is exhausted, so
-        // the prompt denies, which is what proves it asked.
-        assert!(!ok(&p, "bash", bash("cd sub && go test ./other > out.log")).await);
+        // A different opaque script still asks — the scripted Once is spent on
+        // it, then the exhausted approver denies, which proves it asked.
+        assert!(ok(&p, "bash", bash("cd sub && go test ./other > out.log")).await);
+        assert!(!ok(&p, "bash", bash("cd sub && go test ./third > out.log")).await);
         assert_eq!(approver.ask_count(), 3);
 
         assert!(
@@ -4441,18 +4335,6 @@ mod tests {
         assert!(
             notice.contains("listen tcp6 [::1]:0: bind: operation not permitted"),
             "{notice}"
-        );
-    }
-
-    #[tokio::test]
-    async fn description_flags_sandbox_escape() {
-        let approver = ScriptedApprover::new(vec![Decision::Deny]);
-        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        let input = serde_json::json!({"command": "git push", "disable_sandbox": true});
-        let _ = p.check("bash", &input, 0).await;
-        assert_eq!(
-            approver.asked()[0].description,
-            "[no sandbox] bash: git push"
         );
     }
 

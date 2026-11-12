@@ -2,7 +2,7 @@
 
 > 2026-11-11 立。来源：用户截图（`cd …/rust && cargo test … | tail -20`，带 "no OS sandbox"
 > 通告，每次都问），以及「询问这块，反复修改了很多次，能有一个彻底的方案吗」。
-> 状态：阶段 0 ✅（2026-11-12，结果见第八节）；阶段 1 起待实现。方向已于 2026-11-11 确认（见第七节）。
+> 状态：阶段 0、1 ✅（2026-11-12，结果见第八、九节）；阶段 2 起待实现。方向已于 2026-11-11 确认（见第七节）。
 
 ## 一、这次为什么一直问
 
@@ -182,7 +182,7 @@
    - 列出越界以外的询问来源及频次：危险命令、解析不完整（`shell_facts_complete` 为 false 时
      不走沙箱自动放行）、文件工具写工作区外、MCP 与 web 工具。现在会话里没有询问记录，这几类的
      频次是未知数，阶段 0 之后才知道还剩多少打扰。
-1. **止血**：删除 `disable_sandbox`（原则 2，主因，放在最前）；改写 `AGENTS.md`；沙箱测试嵌套
+1. ✅（2026-11-12，结果见第九节）**止血**：删除 `disable_sandbox`（原则 2，主因，放在最前）；改写 `AGENTS.md`；沙箱测试嵌套
    时自跳过；键排除只读段与 `cd`（两侧）；`cd` 不再生成规则。验收：kloop-core 库测试能在 kloop 沙箱内跑通（沙箱测试跳过）；已有的
    `sandbox_escalate(make check *)` 能匹配 `make check 2>&1 | tail -20`；用 kloop 真跑一次
    "改代码、跑相关测试"的任务，没有一次脱沙箱询问。
@@ -215,6 +215,10 @@
 5. ~~阶段 2 与 plan 266 合并做，还是先做 266~~ 已不必问：plan 266 已于 2026-11-11 完成
    （`Verdict { sandbox, protection, notice }`），阶段 2 在它上面扩展。
 6. ~~参数名与兼容~~ 已定（2026-11-11）：删除 `disable_sandbox`，放进阶段 1。
+7. ~~模型再带 `disable_sandbox` 怎么办~~ 已定（2026-11-12）：当成不认识的参数，和其它未知字段一样报错。
+8. ~~Makefile 变量名~~ 已定（2026-11-12）：`KLOOP_REQUIRE_SEATBELT_TESTS`。
+9. ~~`[sandbox] escalate` 还要不要~~ 已定（2026-11-12）：删掉。它原来的含义是“改由模型带
+   `disable_sandbox` 越界”，参数删掉后只剩“沙箱是连询问都打不开的绝对边界”，没人用过。
 
 ## 八、阶段 0 结果（2026-11-12）
 
@@ -293,3 +297,43 @@
 
 见上面"按原因"：危险命令 36（全部"只能一次"）、外部工具 2、文件工具写工作区外 1、解析不完整 0。
 回放只覆盖模型发起的调用；`!cmd` 与定时 check 的询问不在会话里，频次仍未知。
+
+## 九、阶段 1 结果（2026-11-12）
+
+### 改了什么
+
+- **删除 `disable_sandbox`**：schema、描述、输入结构、权限门里所有相关分支（第 8 层注释、第 11 层
+  `matches_allow` 的脱沙箱分支、第 12 层的升级记忆分支、`execution_plan`、`!no-sandbox` 会话键、
+  `[no sandbox]` 标记与通告）都删了。模型再带上它就是未知字段；为了不先问人再报错，分发入口在权限门
+  之前就解析 bash 输入（和 `notebook_edit` 的预校验同一处），格式不对的调用在任何询问之前失败。
+  `AskReason::NoSandbox` 保留，只为读得动阶段 0 写下的会话文件。
+- **删除 `[sandbox] escalate`**：配置里再写它就是未知键；server `config/read` 的 `sandbox` 里少了
+  `escalate` 字段。沙箱拒绝后要么升级询问，要么（没有人可问：无界面、测试）以提示结束。
+- **提示改写**：`DENIAL_HINT` 只用于“没有人可问”，说明边界、让模型换法或告诉用户需要什么权限，
+  不再教它重试；后台命令另有 `BACKGROUND_DENIAL_HINT`（去前台跑，kloop 会在那里问）；拒绝/叫停升级
+  的提示不再提参数。bash 描述写明“你关不掉沙箱；被拦时 kloop 会自己问用户；看着像沙箱拒绝却没有
+  这类说明，就是没认出来，告诉用户”。
+- **键只看有效果的段**：升级的键和匹配都跳过只读段（`argv_is_readonly`，`cd` 本来就在里面），和
+  普通门一致，`ReadOnlySegments` 这个区分随之删除。只剩写入的命令由写入规则单独覆盖（匹配里
+  “没有命令段”不再等于“什么都没同意”）。
+- **测试**：26 个真实 seatbelt 用例开头加 `skip_nested_seatbelt_test()`：`KLOOP_SANDBOX=seatbelt`
+  且没设 `KLOOP_REQUIRE_SEATBELT_TESTS` 时跳过。`make test`/`make check`（及 release 版）先试嵌套
+  一次 `sandbox-exec`，不行就带着真实的 `sandbox_apply: Operation not permitted` 立即失败并说明要在
+  沙箱外运行，再带上 `KLOOP_REQUIRE_SEATBELT_TESTS=1` 跑。顺带修了一个用例：它的“工作区内写入”
+  文件留在固定临时目录里，嵌套时没写成也能读到旧文件而通过。
+- **`AGENTS.md`**「测试运行环境」分成“在 kloop 里开发”和“在外部 agent 执行器里”两条。
+
+### 验收
+
+- kloop-core 库测试在 kloop 的沙箱 profile 内（`KLOOP_SANDBOX=seatbelt`）1378 项全过（与沙箱外同数）；设上
+  `KLOOP_REQUIRE_SEATBELT_TESTS=1` 时真实 seatbelt 用例不跳过、如实失败。
+- 在 kloop 的 profile 内跑 `make test`：第一行就是 `sandbox-exec: sandbox_apply: Operation not
+  permitted`，随后是说明，退出码非零，没有开始编译。现有关键字分类会把它认成拒绝并询问升级。
+- 已有的 `sandbox_escalate(make check *)` 覆盖 `make check 2>&1 | tail -20`、
+  `cd <dir> && make check 2>&1 | tail -80`；对 `cd <dir> && cargo test -p … | tail -20` 的升级询问
+  提议 `sandbox_escalate(cargo test *)`，并提供“本项目”（回归测试锁住）。
+- 回放（同一窗口，40 个根会话）：询问从 108 次降到 41 次；其中危险命令 36 次不变。原来脱沙箱、现在
+  进沙箱的调用有 53 次，离线不知道会不会被拒；按“全部被拒”估上界是 54 次（升级询问 13 次，记忆答掉
+  20 次，已记住的规则让 31 次直接跳过沙箱）。分项目：kloop 74 → 33（上界 39），网络诊断 29 → 3
+  （上界 10），另一个业务仓库 5 → 5。kloop 剩下的几乎都是 `/tmp` 探针里的 `rm -rf`。
+- **未做**：用 kloop 接真实 API 跑一次“改代码、跑相关测试”的任务（需要用户的代理与 key）。

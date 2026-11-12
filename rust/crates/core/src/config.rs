@@ -372,8 +372,8 @@ pub struct Config {
     /// OS sandbox policy for bash execution; None runs commands bare
     /// (sandbox disabled, platform unsupported, --mock). The permission gate
     /// is independent — approved commands still run inside this sandbox, and
-    /// the model escapes per call with disable_sandbox (which faces the same
-    /// gate). Sub-agents inherit it with the Config.
+    /// only kloop takes a command out of it, after a denial and with consent
+    /// (plan 283). Sub-agents inherit it with the Config.
     pub sandbox: Option<Arc<crate::sandbox::SandboxPolicy>>,
     /// Named custom agent types run_agent can dispatch to (plan 17
     /// slice 2). Empty when none are configured. Shared into sub-agent

@@ -1368,6 +1368,12 @@ impl PreparedCall {
         if name == "notebook_edit" {
             notebook::request_from_input(input)?;
         }
+        // A malformed call (an unknown field such as the removed
+        // `disable_sandbox`, plan 283) fails here, before anyone is asked
+        // about a call that could never run.
+        if name == "bash" {
+            bash::validate_input(input)?;
+        }
         let mutation = if matches!(name, "write_file" | "edit_file" | "notebook_edit") {
             Some(if name == "notebook_edit" {
                 fs::prepare_notebook_mutation_input(input, workspace).await?
@@ -1398,8 +1404,7 @@ impl PreparedCall {
             .mutation
             .as_ref()
             .and_then(fs::PreparedMutation::preview_context);
-        let sandbox_auto_allow =
-            bash::execution_context(name, input, workspace, &ctx.cfg.shell_login_env);
+        let sandbox_auto_allow = bash::execution_context(name, workspace, &ctx.cfg.shell_login_env);
         let gated = unless_stopped(
             &ctx.stop,
             workspace.permissions.gate_call(

@@ -67,10 +67,6 @@ struct BashInput {
     timeout_ms: Option<u64>,
     #[serde(default)]
     background: bool,
-    /// Declared only so `deny_unknown_fields` accepts the field; containment
-    /// is decided by the permission gate, not by the executor.
-    #[serde(default, rename = "disable_sandbox")]
-    _disable_sandbox: bool,
 }
 
 /// The foreground budget this call runs under: the model's `timeout_ms` when it
@@ -105,6 +101,11 @@ pub(super) fn bounded_timeout_ms(timeout_ms: u64, tool: &str) -> Result<u64> {
     } else {
         bail!("{tool}: timeout_ms must be between 1 and {MAX_TIMEOUT_MS}")
     }
+}
+
+/// Reject a malformed call before it reaches the permission gate.
+pub(super) fn validate_input(input: &Value) -> Result<()> {
+    parse_bash_input(input).map(drop)
 }
 
 fn parse_bash_input(input: &Value) -> Result<BashInput> {
@@ -203,11 +204,10 @@ fn shell_args(
 
 pub(super) fn execution_context<'a>(
     name: &str,
-    input: &Value,
     workspace: &'a EffectiveWorkspace,
     login_env: &'a ShellLoginEnv,
 ) -> sandbox::ExecutionContext<'a> {
-    let policy = (name == "bash" && !input["disable_sandbox"].as_bool().unwrap_or(false))
+    let policy = (name == "bash")
         .then_some(workspace.sandbox.as_deref())
         .flatten();
     sandbox::ExecutionContext::sandboxed(policy)
@@ -230,12 +230,6 @@ pub(super) async fn bash_tool(
     verdict: &crate::permissions::Verdict,
     facts: Option<&crate::shell::BashFacts>,
 ) -> Result<String> {
-    #[cfg(windows)]
-    if input.get("disable_sandbox").is_some() {
-        bail!(
-            "bash: disable_sandbox is unavailable on Windows because Windows shell sandboxing is not implemented"
-        );
-    }
     let parsed = parse_bash_input(input)?;
     let command = parsed.command.as_str();
     let bash = ctx
@@ -351,8 +345,8 @@ pub(crate) async fn run_foreground_bash(
     // 沙箱内这次的结果确实要交给模型时才格式化并落盘：升级获批会换成重跑的结果，
     // 先落盘的话第一次的全文就成了无人引用的文件。
     let mut hint = None;
-    // Sandbox denial handling applies only to an actually-sandboxed run;
-    // disable_sandbox / no policy leaves `sandbox` None and skips it.
+    // Sandbox denial handling applies only to an actually-sandboxed run; no
+    // policy, or a remembered escalation, leaves `sandbox` None and skips it.
     // 判定看完整捕获的输出而不是内联文本：合并顺序是先 stdout 后 stderr，stdout 超过
     // 内联上限时，stderr 里的拒绝行会被截掉，升级和提示就都不会出现。
     if let Some(policy) = &sandbox
@@ -365,10 +359,10 @@ pub(crate) async fn run_foreground_bash(
     {
         if verdict.protection == crate::permissions::Protection::Required {
             hint = Some(sandbox::PROTECTION_REQUIRED);
-        } else if policy.escalate {
+        } else {
             // The code-level escalation loop (codex's retry-on-denial):
-            // ask once, and on approval re-run the command unsandboxed —
-            // one fewer model round-trip than the disable_sandbox hint.
+            // ask once, and on approval re-run the command unsandboxed. The
+            // model has no way out of the sandbox of its own (plan 283).
             let asking = workspace.permissions.escalate_sandbox_with_facts(
                 command,
                 Some(&denial),
@@ -427,8 +421,6 @@ pub(crate) async fn run_foreground_bash(
                 }
                 EscalationOutcome::NotAttempted => hint = Some(sandbox::DENIAL_HINT),
             }
-        } else {
-            hint = Some(sandbox::DENIAL_HINT);
         }
     }
     let mut text = format_output(&output, Some(&ctx.cfg.offload_dir));
@@ -1582,18 +1574,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(cwd);
     }
 
-    #[cfg(windows)]
+    /// Plan 283 removed `disable_sandbox`: it is an unknown field like any
+    /// other, on every platform and whatever its value.
     #[tokio::test]
-    async fn windows_bash_rejects_disable_sandbox_even_when_false() {
-        let ctx = test_ctx(0, "windows-disable-sandbox");
-        let (output, is_error) = run_tool(
-            "bash",
-            json!({"command": "true", "disable_sandbox": false}),
-            &ctx,
-        )
-        .await;
-        assert!(is_error);
-        assert!(output.contains("unavailable on Windows"), "{output}");
+    async fn disable_sandbox_is_an_unknown_field() {
+        let ctx = test_ctx(0, "removed-disable-sandbox");
+        for value in [true, false] {
+            let (output, is_error) = run_tool(
+                "bash",
+                json!({"command": "true", "disable_sandbox": value}),
+                &ctx,
+            )
+            .await;
+            assert!(is_error, "{output}");
+            assert!(
+                output.contains("unknown field `disable_sandbox`"),
+                "{output}"
+            );
+        }
+        let definition = crate::tools::tool_defs(ctx.depth, &ctx.cfg.shell_programs)
+            .into_iter()
+            .find(|definition| definition.name == "bash")
+            .unwrap();
+        assert_eq!(definition.schema["properties"].get("disable_sandbox"), None);
+        #[cfg(not(windows))]
+        assert!(
+            definition
+                .description
+                .contains("You cannot turn the sandbox off"),
+            "{}",
+            definition.description
+        );
     }
 
     #[tokio::test]
@@ -2068,7 +2079,6 @@ mod tests {
                 denied_write_paths: Vec::new(),
                 allow_network: false,
                 auto_allow: true,
-                escalate: true,
             };
             let base = test_ctx(0, tag);
             let mut cfg = base.cfg.test_clone();
@@ -2083,6 +2093,9 @@ mod tests {
 
         #[tokio::test]
         async fn denied_read_path_cannot_be_read_through_a_symlink() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, root) = sandbox_ctx("secret-read");
             let secret_dir = root.join(".kloop");
             std::fs::create_dir_all(&secret_dir).unwrap();
@@ -2118,8 +2131,14 @@ mod tests {
 
         #[tokio::test]
         async fn write_inside_root_succeeds_outside_gets_denial_hint() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, root) = sandbox_ctx("inout");
             let inside = root.join("ok.txt");
+            // The root is a fixed temp path; a file left by an earlier run would
+            // let the read below pass without this run's write.
+            let _ = std::fs::remove_file(&inside);
             let (out, is_error) = run_tool(
                 "bash",
                 bash_input(&format!("echo hi > {}", inside.display())),
@@ -2139,14 +2158,18 @@ mod tests {
             assert!(!is_error, "a denied write is content, not a tool error");
             assert!(out.contains("Operation not permitted"), "{out}");
             assert!(
-                out.contains("disable_sandbox: true"),
-                "hint teaches the escape: {out}"
+                out.ends_with(crate::sandbox::DENIAL_HINT),
+                "nobody to ask: the hint points at the user, not a retry: {out}"
             );
+            assert!(!out.contains("disable_sandbox"), "{out}");
             assert!(!blocked.exists());
         }
 
         #[tokio::test]
         async fn private_state_stays_unwritable_when_it_is_the_workspace_root() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, root) = sandbox_ctx("private-state-overlap");
             let mut cfg = ctx.cfg.test_clone();
             let policy = cfg.sandbox.take().unwrap();
@@ -2170,6 +2193,9 @@ mod tests {
 
         #[tokio::test]
         async fn worktree_policy_cannot_write_the_previous_workspace() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, previous) = sandbox_ctx("workspace-replace");
             let worktree = outside_dir("workspace-replace-tree");
             let mut cfg = ctx.cfg.test_clone();
@@ -2206,6 +2232,9 @@ mod tests {
 
         #[tokio::test]
         async fn read_only_subpath_stays_protected_inside_writable_root() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, root) = sandbox_ctx("rosub");
             let (out, _) = run_tool(
                 "bash",
@@ -2216,58 +2245,6 @@ mod tests {
             assert!(out.contains("Operation not permitted"), "{out}");
         }
 
-        #[tokio::test]
-        async fn disable_sandbox_escapes_per_call() {
-            let (mut ctx, _) = sandbox_ctx("escape");
-            let mut cfg = ctx.cfg.test_clone();
-            Arc::make_mut(cfg.sandbox.as_mut().unwrap()).escalate = false;
-            cfg.permissions = Arc::new(
-                crate::permissions::Permissions::new(
-                    crate::permissions::Mode::Bypass,
-                    &Default::default(),
-                    cfg.cwd.clone(),
-                    None,
-                )
-                .unwrap(),
-            );
-            ctx.cfg = Arc::new(cfg);
-            let target = outside_dir("escape").join("escaped.txt");
-            let _ = std::fs::remove_file(&target);
-            let command = format!("echo freed > {}", target.display());
-            let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
-            assert!(!is_error, "{out}");
-            assert!(out.contains("Operation not permitted"), "{out}");
-            assert!(
-                out.contains("bypass mode does not ask for user approval"),
-                "{out}"
-            );
-            assert!(!out.contains("requires user approval"), "{out}");
-            assert!(!target.exists());
-
-            let definition = crate::tools::tool_defs(ctx.depth, &ctx.cfg.shell_programs)
-                .into_iter()
-                .find(|definition| definition.name == "bash")
-                .unwrap();
-            let description = definition.schema["properties"]["disable_sandbox"]["description"]
-                .as_str()
-                .unwrap();
-            assert!(description.contains("bypass mode does not ask for user approval"));
-            assert!(!description.contains("requires user approval"));
-
-            let (out, is_error) = run_tool(
-                "bash",
-                json!({
-                    "command": command,
-                    "disable_sandbox": true
-                }),
-                &ctx,
-            )
-            .await;
-            assert!(!is_error, "{out}");
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "freed\n");
-            let _ = std::fs::remove_file(target);
-        }
-
         /// The denied network is a boundary around the machine, not around the
         /// socket API: a command must still reach a listener of its own (plan
         /// 170 — Go's httptest is this shape, and denying it is what drove a
@@ -2275,6 +2252,9 @@ mod tests {
         /// refused.
         #[tokio::test]
         async fn loopback_stays_reachable_while_the_machine_boundary_holds() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             // A real local listener makes the first half discriminating: the
             // connect can only succeed if something is actually listening.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2295,7 +2275,7 @@ mod tests {
             let (out, _) =
                 run_tool("bash", bash_input("exec 3<>/dev/tcp/192.0.2.1/80"), &ctx).await;
             assert!(out.contains("Operation not permitted"), "{out}");
-            assert!(out.contains("disable_sandbox: true"), "{out}");
+            assert!(out.ends_with(crate::sandbox::DENIAL_HINT), "{out}");
         }
 
         /// Escalation loop, approved: a contained write outside the writable
@@ -2304,6 +2284,9 @@ mod tests {
         /// is flagged as escalated, with no denial hint left dangling.
         #[tokio::test]
         async fn escalation_reruns_unsandboxed_on_approval() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx(
                 "esc-yes",
                 crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
@@ -2333,6 +2316,9 @@ mod tests {
         /// 无人引用的孤儿文件。这里重跑没有大输出，offload 目录应当保持为空。
         #[tokio::test]
         async fn approved_escalation_leaves_no_spill_of_the_sandboxed_run() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx(
                 "esc-no-orphan",
                 crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
@@ -2361,6 +2347,9 @@ mod tests {
         /// 否则截断后的文本里没有拒绝行，既不问升级也不给沙箱提示。
         #[tokio::test]
         async fn denial_after_long_stdout_is_still_recognized() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx(
                 "esc-long-stdout",
                 crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
@@ -2384,9 +2373,11 @@ mod tests {
 
         #[tokio::test]
         async fn escalation_in_bypass_attributes_the_retry_without_an_approver() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (mut ctx, _) = sandbox_ctx("esc-bypass");
             let mut cfg = ctx.cfg.test_clone();
-            Arc::make_mut(cfg.sandbox.as_mut().unwrap()).escalate = true;
             cfg.permissions = Arc::new(
                 crate::permissions::Permissions::new(
                     crate::permissions::Mode::Bypass,
@@ -2421,6 +2412,9 @@ mod tests {
         /// thrown away.
         #[tokio::test]
         async fn a_remembered_escalation_skips_the_sandboxed_attempt() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx(
                 "esc-remembered",
                 crate::permissions::Decision::Allow(
@@ -2481,6 +2475,9 @@ mod tests {
 
         #[tokio::test]
         async fn remembered_log_writes_skip_the_sandboxed_attempt() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx(
                 "log-remembered",
                 crate::permissions::Decision::Allow(
@@ -2529,10 +2526,13 @@ mod tests {
         }
 
         /// Escalation loop, declined: the sandboxed failure is kept and the
-        /// result steers the model away from a disable_sandbox retry (not the
-        /// hint, which would invite exactly that).
+        /// result tells the model not to retry it (not the hint, which is for
+        /// a denial nobody could be asked about).
         #[tokio::test]
         async fn escalation_declined_keeps_denial_and_warns_off_retry() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx("esc-no", crate::permissions::Decision::Deny);
             let target = outside_dir("esc-no").join("nope.txt");
             let _ = std::fs::remove_file(&target);
@@ -2558,6 +2558,9 @@ mod tests {
         /// wait for the user rather than find another way.
         #[tokio::test]
         async fn escalation_no_keeps_denial_and_stops_the_turn() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, asked) = escalating_ctx("esc-stop", crate::permissions::Decision::Stop);
             let target = outside_dir("esc-stop").join("nope.txt");
             let _ = std::fs::remove_file(&target);
@@ -2577,10 +2580,14 @@ mod tests {
 
         /// End-to-end through the real dispatch gate: with auto_allow, a
         /// contained bash call (opaque redirect, previously always asked)
-        /// runs with NOBODY available to approve; the escaped form and the
-        /// auto_allow=false policy both still reach the ask layer and fail.
+        /// runs with NOBODY available to approve; the auto_allow=false policy
+        /// still reaches the ask layer and fails. A call carrying the removed
+        /// `disable_sandbox` fails as malformed before the gate is consulted.
         #[tokio::test]
         async fn auto_allow_runs_contained_bash_without_an_approver() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
             let (ctx, root) = sandbox_ctx("autoallow");
             let no_approver = || {
                 Arc::new(
@@ -2610,16 +2617,6 @@ mod tests {
             assert!(!is_error, "{out}");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi\n");
 
-            // Escaping the sandbox forfeits the auto-allow.
-            let (out, is_error) = run_tool(
-                "bash",
-                json!({"command": "touch escaped.txt", "disable_sandbox": true}),
-                &ctx,
-            )
-            .await;
-            assert!(is_error);
-            assert!(out.contains("approval required"), "{out}");
-
             // auto_allow = false reverts to slice-1: contained or not, the
             // call asks.
             let mut cfg = ctx.cfg.test_clone();
@@ -2639,6 +2636,20 @@ mod tests {
             .await;
             assert!(is_error);
             assert!(out.contains("approval required"), "{out}");
+
+            // The same call with the removed field never reaches that layer.
+            let (out, is_error) = run_tool(
+                "bash",
+                json!({
+                    "command": format!("echo hi > {}", root.join("c.txt").display()),
+                    "disable_sandbox": true
+                }),
+                &ctx,
+            )
+            .await;
+            assert!(is_error);
+            assert!(out.contains("unknown field `disable_sandbox`"), "{out}");
+            assert!(!out.contains("approval required"), "{out}");
         }
     }
 

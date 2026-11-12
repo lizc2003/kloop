@@ -478,8 +478,9 @@ fn build_permissions(
 /// `[sandbox]` in the global user config: `enabled` (default true),
 /// `allow_network` (default false), `writable_roots` (extra writable
 /// directories, default none), `trust_sandboxed` (default true: sandboxed bash
-/// skips the asking layers of the permission gate), `escalate` (default
-/// true: a sandbox-denied command is offered for an unsandboxed re-run).
+/// skips the asking layers of the permission gate). A sandbox-denied command is
+/// always offered for an unsandboxed re-run; there is no switch for it (plan 283
+/// removed `escalate`).
 struct SandboxSettings {
     enabled: bool,
     allow_network: bool,
@@ -488,7 +489,6 @@ struct SandboxSettings {
     /// keeps its own word for the mechanism; what the user writes says what it
     /// means — a command that already ran inside the sandbox is trusted.
     trust_sandboxed: bool,
-    escalate: bool,
 }
 
 impl Default for SandboxSettings {
@@ -498,7 +498,6 @@ impl Default for SandboxSettings {
             allow_network: false,
             writable_roots: Vec::new(),
             trust_sandboxed: true,
-            escalate: true,
         }
     }
 }
@@ -789,13 +788,8 @@ fn load_sandbox_settings(root: &toml::Table) -> Result<SandboxSettings> {
                     .as_bool()
                     .context("sandbox.trust_sandboxed must be a boolean")?;
             }
-            "escalate" => {
-                settings.escalate = value
-                    .as_bool()
-                    .context("sandbox.escalate must be a boolean")?;
-            }
             other => bail!(
-                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots | trust_sandboxed | escalate)"
+                "[sandbox] has unknown key '{other}' (enabled | allow_network | writable_roots | trust_sandboxed)"
             ),
         }
     }
@@ -905,7 +899,6 @@ fn build_sandbox_for_home(
                 policy = policy.with_credential_roots(home);
             }
             policy.auto_allow = settings.trust_sandboxed;
-            policy.escalate = settings.escalate;
             Ok(Some(Arc::new(policy)))
         }
         Err(reason) => {
@@ -950,7 +943,6 @@ pub(crate) fn server_config_snapshot(
             enabled: sandbox_enabled,
             allow_network: !args.mock && settings.allow_network,
             auto_allow: !args.mock && settings.trust_sandboxed,
-            escalate: !args.mock && settings.escalate,
         },
         worktree_enabled: !args.mock,
     })
@@ -1419,7 +1411,6 @@ command = ["SENTINEL-HOOK"]
 [sandbox]
 allow_network = true
 trust_sandboxed = false
-escalate = false
 [mcp.servers.remote]
 url = "https://mcp.example.test"
 http_headers = { Authorization = "SENTINEL-MCP" }
@@ -1438,7 +1429,6 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         assert_eq!(normalized_a, snapshot_b);
         assert!(snapshot_a.sandbox.allow_network);
         assert!(!snapshot_a.sandbox.auto_allow);
-        assert!(!snapshot_a.sandbox.escalate);
         let wire = serde_json::to_string(&snapshot_a).unwrap();
         for secret in [
             "secret-model",
@@ -1854,7 +1844,6 @@ http_headers = { Authorization = "SENTINEL-MCP" }
         assert!(!settings.allow_network);
         assert!(settings.writable_roots.is_empty());
         assert!(settings.trust_sandboxed);
-        assert!(settings.escalate);
         assert!(
             load_sandbox_settings(&config("[permissions]\nallow = []\n"))
                 .unwrap()
@@ -1879,11 +1868,6 @@ http_headers = { Authorization = "SENTINEL-MCP" }
                 .unwrap()
                 .trust_sandboxed
         );
-        assert!(
-            !load_sandbox_settings(&config("[sandbox]\nescalate = false\n"))
-                .unwrap()
-                .escalate
-        );
 
         for bad in [
             "[sandbox]\nenabled = \"yes\"\n",
@@ -1891,7 +1875,8 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             "[sandbox]\nwritable_roots = \"/opt\"\n",
             "[sandbox]\nwritable_roots = [1]\n",
             "[sandbox]\ntrust_sandboxed = \"on\"\n",
-            "[sandbox]\nescalate = 1\n",
+            // Removed by plan 283: an unknown key like any other.
+            "[sandbox]\nescalate = false\n",
             "[sandbox]\nnetwork = true\n",
             "sandbox = true\n",
         ] {

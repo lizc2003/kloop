@@ -23,7 +23,7 @@ CONFIG := $(KLOOP_DIR)/config.toml
 CONFIG_DEMO := config/config-demo.toml
 
 .DEFAULT_GOAL := all
-.PHONY: all build debug test test-release fmt fmt-check clippy clippy-release check check-release check-windows parity mock install install-config uninstall clean help
+.PHONY: all build debug test test-release seatbelt-nesting fmt fmt-check clippy clippy-release check check-release check-windows parity mock install install-config uninstall clean help
 
 all: build
 
@@ -33,11 +33,21 @@ build:
 debug:
 	cd $(RUST_DIR) && $(CARGO) build --locked
 
-test:
-	cd $(RUST_DIR) && $(CARGO) test --locked --workspace
+# 全量测试包含真实 seatbelt 用例，而 macOS 的沙箱不能嵌套：外层 profile 只要有一条限制，
+# 内层 sandbox_apply 就报 Operation not permitted。全量测试不跳过它们（plan 283）：先试一次
+# 嵌套，不行就直接失败并说明要在沙箱外运行；cargo test 带上 KLOOP_REQUIRE_SEATBELT_TESTS=1，
+# 关掉测试里“在 kloop 沙箱内就跳过”的那一支。没有 sandbox-exec 的平台不检查。
+seatbelt-nesting:
+	@if [ -x /usr/bin/sandbox-exec ] && ! /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true; then \
+	  echo "error: the full test suite runs the real OS sandbox, which cannot nest inside another sandbox; run make test / make check outside the sandbox" >&2; \
+	  exit 1; \
+	fi
 
-test-release:
-	cd $(RUST_DIR) && $(CARGO) test --locked --release --workspace
+test: seatbelt-nesting
+	cd $(RUST_DIR) && KLOOP_REQUIRE_SEATBELT_TESTS=1 $(CARGO) test --locked --workspace
+
+test-release: seatbelt-nesting
+	cd $(RUST_DIR) && KLOOP_REQUIRE_SEATBELT_TESTS=1 $(CARGO) test --locked --release --workspace
 
 fmt:
 	cd $(RUST_DIR) && $(CARGO) fmt --all
@@ -53,9 +63,9 @@ clippy-release:
 
 # parity 在 check 里:它断言 kloop 自己原生报告里的行为,改了行为只跑 test 是绿的,
 # 只有它会红(教训 156)。没有语料的机器上它跳过,不拖累别处。
-check: fmt-check clippy test parity
+check: seatbelt-nesting fmt-check clippy test parity
 
-check-release: fmt-check clippy-release test-release parity
+check-release: seatbelt-nesting fmt-check clippy-release test-release parity
 
 # Windows 目标的交叉检查(msvc)。按需手动运行,不属于 make check:本项目唯一的提交门禁
 # 是 check,Windows 日常不校验(2026-11-04 用户定)。需要 cargo-xwin 与

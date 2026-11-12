@@ -66,23 +66,9 @@ async fn plan266_containment_is_decided_once() {
         .await
         .unwrap();
     assert_eq!(verdict.sandbox, SandboxPlan::Contained);
-
-    // 主动脱沙箱仍是显式选择，无论记住了什么。
-    let verdict = p
-        .check_call_with_execution(
-            "bash",
-            &json!({"command": "go test ./pkg", "disable_sandbox": true}),
-            0,
-            execution(),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(verdict.sandbox, SandboxPlan::None);
 }
 
-/// 需要沙箱本身保护的字面正文不能被“已记住的升级”带出沙箱：门判出
-/// `Required` 后直接拒绝，而不是留给执行层在启动前才发现。
+/// 需要沙箱本身保护的字面正文由门判出 `Required`，并在沙箱内运行。
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn plan266_required_protection_never_leaves_the_sandbox() {
@@ -102,21 +88,10 @@ async fn plan266_required_protection_never_leaves_the_sandbox() {
     assert_eq!(verdict.protection, Protection::Required);
     assert_eq!(verdict.sandbox, SandboxPlan::Contained);
 
-    // 模型主动脱沙箱也不能带走受保护的字面正文；这条在询问之前就拒绝。
-    let error = p
-        .check_call_with_execution(
-            "bash",
-            &json!({"command": command, "disable_sandbox": true}),
-            0,
-            execution(),
-            None,
-        )
-        .await
-        .expect_err("required protection cannot leave the sandbox");
-    assert!(
-        error.contains("requires credential read/write protection"),
-        "{error}"
-    );
+    // 这类正文都是 heredoc，解析为 opaque：只有会话通配能记住它的升级，而通配
+    // 从不在运行前跳过沙箱（plan 245），所以没有记忆能把它判成 Escalated。
+    // 门里 Required 且不在沙箱内就拒绝的那一支仍保留，作为防御。
+    assert!(!p.sandbox_escalation_remembered(command));
 
     let _ = std::fs::remove_dir_all(home);
 }

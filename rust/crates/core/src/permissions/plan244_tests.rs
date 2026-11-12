@@ -80,58 +80,15 @@ async fn plan244_stable_two_word_prefixes_still_persist() {
     }
 }
 
-/// 脱沙箱是另一种权限：普通 `bash(...)`、whole-tool `bash` 和普通会话键都不能
-/// 替代 `sandbox_escalate(...)`，而升级同意可以覆盖同一条命令。
+/// 升级时选择 Project 写下的是升级规则，不是“可以运行”的普通规则。
 #[tokio::test]
-async fn plan244_disable_sandbox_needs_escalation_consent() {
-    let escaping = json!({"command": "make check", "disable_sandbox": true});
-    for allow in [vec!["bash(make check *)"], vec!["bash"]] {
-        let approver = ScriptedApprover::new(vec![]);
-        let p = gate(Mode::Manual, rules(&allow, &[], &[]), approver.clone());
-        assert!(!ok(&p, "bash", escaping.clone()).await, "{allow:?}");
-        assert_eq!(approver.ask_count(), 1, "{allow:?}");
-    }
-
-    let approver = ScriptedApprover::new(vec![]);
-    let p = gate(
-        Mode::Manual,
-        rules(&["sandbox_escalate(make check *)"], &[], &[]),
-        approver.clone(),
-    );
-    assert!(ok(&p, "bash", escaping.clone()).await);
-    assert_eq!(approver.ask_count(), 0, "escalation consent covers it");
-
-    // A contained run's session grant is a different key.
-    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-    let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-    assert!(ok(&p, "bash", bash("make check")).await);
-    assert!(!ok(&p, "bash", escaping.clone()).await);
-    assert_eq!(approver.ask_count(), 2);
-
-    // Remembering an escalation answers the model's own escape too.
-    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-    let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-    assert_eq!(
-        p.escalate_sandbox("make check", None, 0).await.outcome,
-        EscalationOutcome::Approved(EscalationApproval::User)
-    );
-    assert!(ok(&p, "bash", escaping.clone()).await);
-    assert_eq!(approver.ask_count(), 1);
-}
-
-/// 脱沙箱调用选择 Project 时写下的是升级规则，不是“可以运行”的普通规则。
-#[tokio::test]
-async fn plan244_disable_sandbox_project_memory_is_escalation_vocabulary() {
+async fn plan244_escalation_project_memory_is_escalation_vocabulary() {
     let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
     let writer = ScriptedWriter::succeeding();
     let p = gate_with_writer(Mode::Manual, approver, writer.clone());
-    assert!(
-        ok(
-            &p,
-            "bash",
-            json!({"command": "make check", "disable_sandbox": true})
-        )
-        .await
+    assert_eq!(
+        p.escalate_sandbox("make check", None, 0).await.outcome,
+        EscalationOutcome::Approved(EscalationApproval::User)
     );
     assert_eq!(
         writer.calls.lock().unwrap().as_slice(),
@@ -412,19 +369,13 @@ async fn plan244_effectful_wrappers_never_remember_blanket_escalation() {
         assert!(p.sandbox_escalation_remembered(&command), "{command}");
         assert!(!p.sandbox_escalation_remembered(&different), "{command}");
         assert!(!p.sandbox_escalation_remembered("make install"), "{command}");
-        assert!(ok(&p, "bash", json!({"command": command, "disable_sandbox": true})).await);
+        assert_eq!(p.escalate_sandbox(&command, None, 0).await.outcome,
+            EscalationOutcome::Approved(EscalationApproval::Remembered));
         assert_eq!(approver.ask_count(), 1, "{command}");
-        assert!(!ok(&p, "bash", json!({"command": different, "disable_sandbox": true})).await);
+        assert_eq!(p.escalate_sandbox(&different, None, 0).await.outcome,
+            EscalationOutcome::Declined);
         assert_eq!(approver.ask_count(), 2, "{command}");
         assert!(writer.calls.lock().unwrap().is_empty());
-
-        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert!(ok(&p, "bash", json!({"command": command, "disable_sandbox": true})).await);
-        assert!(p.sandbox_escalation_remembered(&command), "{command}");
-        assert!(!p.sandbox_escalation_remembered(&different), "{command}");
-        assert!(!p.sandbox_escalation_remembered("make install"), "{command}");
-        assert_eq!(approver.ask_count(), 1, "{command}");
     }
 }
 
@@ -437,7 +388,8 @@ async fn plan244_effectful_wrappers_keep_containment_consents_separate() {
         assert!(ok(&p, "bash", bash(&command)).await);
         assert_eq!(approver.ask_count(), 1, "{command}: whole-tool allow cannot cover unknown effects");
         assert!(!p.sandbox_escalation_remembered(&command), "{command}");
-        assert!(!ok(&p, "bash", json!({"command": command, "disable_sandbox": true})).await);
+        assert_eq!(p.escalate_sandbox(&command, None, 0).await.outcome,
+            EscalationOutcome::Declined);
         assert_eq!(approver.ask_count(), 2, "{command}");
     }
 }

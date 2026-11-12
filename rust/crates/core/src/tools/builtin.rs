@@ -669,20 +669,19 @@ impl Builtin {
 }
 
 /// The POSIX definition, patched on Windows: there the shell is Git for
-/// Windows' `bash.exe` and there is no filesystem/network sandbox to opt out of.
+/// Windows' `bash.exe` and there is no filesystem/network sandbox.
 fn bash_def() -> ToolDef {
     let def =
     ToolDef {
         name: "bash".into(),
-        description: "Run a shell command in the user's shell (`sh`, `bash`, or `zsh`). Prefer the dedicated tools over shell equivalents: grep (not grep/rg), glob (not find), read_file (not cat/head/tail), edit_file (not sed); reserve bash for real shell work like builds, tests, installs, and git. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-* id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network beyond this machine — a loopback listener (a test server) works, so do not disable the sandbox for one; a failure that looks sandbox-caused is annotated in the result.".into(),
+        description: "Run a shell command in the user's shell (`sh`, `bash`, or `zsh`). Prefer the dedicated tools over shell equivalents: grep (not grep/rg), glob (not find), read_file (not cat/head/tail), edit_file (not sed); reserve bash for real shell work like builds, tests, installs, and git. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands (dev servers, watches, slow builds) set background=true instead of appending '&'. A background call returns a bg-* id and output file; inspect it with bash_output and stop it with stop_bash. When OS sandboxing is active, commands run with file writes limited to the workspace and temp directories and no network beyond this machine — a loopback listener (a test server) works. You cannot turn the sandbox off: when it blocks a command, kloop itself asks the user whether to re-run it outside, and the result says what happened. A failure that looks sandbox-caused without such a note was not recognized as a denial; tell the user what access the command needs instead of working around it.".into(),
         schema: json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The command to run"},
                 "description": {"type": ["string", "null"], "minLength": 1, "maxLength": MAX_DISPLAY_DESCRIPTION_CHARS, "pattern": ".*\\S.*", "description": "What this command does, in a few words on one line (e.g. \"Run the core tests\", \"Show the last five commits\"). It heads this call's row in the user's transcript, above the command, so they can tell what a long command is for without parsing it; give one on every call. It never reaches the shell and never changes the result."},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "description": "Timeout in milliseconds (default 60000, min 1, max 600000); ignored when background=true"},
-                "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-* id and output file path (default false)"},
-                "disable_sandbox": {"type": "boolean", "description": "Run without the OS sandbox. Only set this after a command failed from sandbox restrictions (writes outside the workspace, network access) and that access is genuinely needed — never preemptively. The retry still passes the permission gate; bypass mode does not ask for user approval."}
+                "background": {"type": "boolean", "description": "Run in the background: return immediately with a bg-* id and output file path (default false)"}
             },
             "required": ["command"],
             "additionalProperties": false
@@ -692,10 +691,6 @@ fn bash_def() -> ToolDef {
     let def = {
         let mut def = def;
         def.description = "Run a command with the validated Git for Windows `bash.exe -lc`. stdout and stderr are merged; a non-zero exit status is appended. Default timeout 60s. For long-running commands set background=true. Windows Job Object containment owns the full process tree; filesystem/network sandboxing is not implemented. Prefer forward slashes inside Bash commands.".into();
-        def.schema["properties"]
-            .as_object_mut()
-            .expect("bash properties are an object")
-            .remove("disable_sandbox");
         def
     };
     let mut def = def;

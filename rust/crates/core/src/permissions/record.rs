@@ -45,7 +45,9 @@ pub enum AskReason {
     Hazard { tag: String },
     /// An explicit `ask` rule matched.
     AskRule,
-    /// The model asked to run bash without the OS sandbox.
+    /// The model asked to run bash without the OS sandbox. Only in files
+    /// written before plan 283 stage 1 removed `disable_sandbox`; kept so
+    /// those files still read.
     NoSandbox,
     /// The sandbox would contain this bash call, but the parse could not vouch
     /// for all of it, so the sandbox auto-allow did not apply.

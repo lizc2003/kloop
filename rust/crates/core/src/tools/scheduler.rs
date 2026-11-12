@@ -287,12 +287,8 @@ impl CheckRunner for GatedCheck {
             let workspace = self.cfg.effective_workspace();
             let input = json!({ "command": command });
             let facts = super::analyze_shell_call("bash", &input);
-            let sandbox_auto = super::bash::execution_context(
-                "bash",
-                &input,
-                &workspace,
-                &self.cfg.shell_login_env,
-            );
+            let sandbox_auto =
+                super::bash::execution_context("bash", &workspace, &self.cfg.shell_login_env);
             let verdict = match workspace
                 .permissions
                 .check_call_with_execution("bash", &input, 0, sandbox_auto, facts.as_deref())
@@ -384,6 +380,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn plan239_scheduled_check_keeps_literal_input_protection() {
+        if crate::sandbox::skip_nested_seatbelt_test() {
+            return;
+        }
         let root = std::env::temp_dir().join(crate::resource_id::fresh("plan239-check-").unwrap());
         std::fs::create_dir_all(root.join("home/.ssh")).unwrap();
         let root = std::fs::canonicalize(root).unwrap();

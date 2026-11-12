@@ -51,9 +51,6 @@ pub(crate) struct CallFacts {
     pub(super) risk_writes: Vec<WriteTarget>,
     /// 可解析 Bash 的原文，供逐字会话记忆与升级授权使用；其它工具为空。
     pub(super) command: Option<String>,
-    /// `disable_sandbox`：脱沙箱运行是另一种权限，普通 `bash(...)` 授权不能覆盖。
-    pub(super) no_sandbox: bool,
-    pub(super) verbatim_escalation: bool,
     powershell_sensitive: bool,
     entering_existing_worktree: bool,
     pub(crate) removing_worktree: bool,
@@ -62,12 +59,9 @@ pub(crate) struct CallFacts {
     pub(super) opaque_script: Option<OpaqueScript>,
 }
 
-/// An unparseable bash script kept whole. `no_sandbox` is the call's
-/// `disable_sandbox` flag, carried alongside the text because "may run" and
-/// "may run outside the sandbox" are different consents about the same words.
+/// An unparseable bash script kept whole.
 pub(super) struct OpaqueScript {
     pub(super) command: String,
-    pub(super) no_sandbox: bool,
 }
 
 /// 未知效果不能从规则输入中消失；只有 Resolved 可按确切路径排除 deny/ask。
@@ -239,7 +233,6 @@ impl CallFacts {
                 let command = command.trim();
                 (!command.is_empty()).then(|| OpaqueScript {
                     command: command.to_string(),
-                    no_sandbox: input["disable_sandbox"].as_bool().unwrap_or(false),
                 })
             }
             _ => None,
@@ -252,7 +245,6 @@ impl CallFacts {
                 && path.as_ref().is_some_and(|path| {
                     path.sensitivity(Access::Write) == Some(Sensitivity::Secret)
                 }));
-        let no_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
         CallFacts {
             shell,
             shell_facts_complete: bash_facts
@@ -271,10 +263,6 @@ impl CallFacts {
                 .then_some(shell_command)
                 .flatten()
                 .map(str::to_string),
-            no_sandbox,
-            verbatim_escalation: bash_facts
-                .as_ref()
-                .is_some_and(|facts| facts.verbatim_escalation),
             powershell_sensitive,
             entering_existing_worktree: name == "enter_worktree"
                 && input.get("path").is_some_and(Value::is_string),

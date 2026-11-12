@@ -33,14 +33,23 @@ const SEATBELT_LOOPBACK_POLICY: &str = include_str!("seatbelt_loopback.sbpl");
 pub const PROTECTION_REQUIRED: &str = "\n[This literal-input command requires credential read/write protection. Running it without that protection is blocked; sandbox escalation is unavailable.]";
 
 /// Appended to a failed sandboxed bash result when the failure looks like a
-/// sandbox denial — this is what teaches the model the escalation move (cc
-/// keeps the equivalent guidance in its system prompt; a hint at failure time
-/// needs no prompt budget until it is actually relevant).
+/// sandbox denial and nobody could be asked about running it outside (no
+/// approver: headless runs, tests). The model has no way out of the sandbox of
+/// its own (plan 283), so the hint says what the boundary is and points it at
+/// the user, not at a retry.
 pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file writes limited \
     to the workspace and temp directories; no network beyond this machine, though loopback — a test \
-    server of your own — still works) and the failure looks like a sandbox denial. If the command \
-    legitimately needs the blocked access, retry with disable_sandbox: true. The retry still passes \
-    the permission gate; bypass mode does not ask for user approval.]";
+    server of your own — still works) and the failure looks like a sandbox denial. Running it outside \
+    the sandbox needs the user's approval, which cannot be asked for here. Do not try to work around \
+    the sandbox; take a different approach, or tell the user what access the command needs.]";
+
+/// [`DENIAL_HINT`] for a background command: it has no escalation loop, but
+/// the same command in the foreground does.
+pub const BACKGROUND_DENIAL_HINT: &str = "\n[This background command ran inside kloop's \
+    sandbox (file writes limited to the workspace and temp directories; no network beyond this \
+    machine) and the failure looks like a sandbox denial. A background command cannot ask the user \
+    to run it outside the sandbox; run it in the foreground, where kloop asks, or tell the user what \
+    access it needs.]";
 
 /// Prepended when a remembered `sandbox_escalate(...)` rule let the command run
 /// uncontained from the start. Distinct from [`escalated_prefix`]: nothing was
@@ -65,18 +74,17 @@ pub fn escalated_prefix(denial: &SandboxDenial, approval: EscalationApproval) ->
     )
 }
 
-/// Appended when the user was asked to escalate and declined. Unlike
-/// [`DENIAL_HINT`] it must NOT invite a disable_sandbox retry — the user
-/// already said no.
+/// Appended when the user was asked to escalate and declined: the user
+/// already said no, so the hint must not invite another try.
 pub const ESCALATION_DECLINED: &str = "\n[The user declined to run this outside kloop's sandbox. \
-    Do not retry with disable_sandbox; take a different approach — write within the workspace or a \
-    temp directory, or ask the user how to proceed.]";
+    Do not retry it; take a different approach — write within the workspace or a temp directory, \
+    or ask the user how to proceed.]";
 
 /// Appended when the user answered the escalation No (plan 216): the turn ends
 /// after this batch, so there is no "different approach" to take yet.
 pub const ESCALATION_STOPPED: &str = "\n[The user declined to run this outside kloop's sandbox \
     and stopped the turn to tell you what to do instead. Their next message says what they want; \
-    do not retry with disable_sandbox unless they ask for it.]";
+    do not retry this command unless they ask for it.]";
 
 /// Why one root remains writable when the active workspace changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,12 +142,6 @@ pub struct SandboxPolicy {
     /// reverts to slice-1 behavior (sandbox as pure containment, asking
     /// unchanged).
     pub auto_allow: bool,
-    /// The code-level escalation loop (codex's retry-on-denial, default
-    /// on): when a contained bash command fails in a denial-shaped way, ask
-    /// once and — on approval — re-run it without the sandbox, one fewer
-    /// model round-trip than the disable_sandbox hint. `[sandbox] escalate =
-    /// false` keeps the model-driven hint instead.
-    pub escalate: bool,
 }
 
 impl SandboxPolicy {
@@ -189,7 +191,6 @@ impl SandboxPolicy {
             denied_write_paths: Vec::new(),
             allow_network,
             auto_allow: true,
-            escalate: true,
         }
     }
 
@@ -580,6 +581,24 @@ pub fn seatbelt_command(
     (PathBuf::from(SEATBELT_EXE), args)
 }
 
+/// Whether a test that runs the real `sandbox-exec` should skip itself: it is
+/// already inside kloop's sandbox, and seatbelt cannot nest (`sandbox_apply:
+/// Operation not permitted` as soon as the outer profile restricts anything —
+/// plan 283). `KLOOP_REQUIRE_SEATBELT_TESTS` turns the skip off; `make test`
+/// and `make check` set it, so a full check fails for real rather than pass
+/// without its sandbox coverage.
+#[cfg(test)]
+pub(crate) fn skip_nested_seatbelt_test() -> bool {
+    if std::env::var_os("KLOOP_SANDBOX").is_none_or(|value| value != "seatbelt") {
+        return false;
+    }
+    if std::env::var_os("KLOOP_REQUIRE_SEATBELT_TESTS").is_some_and(|value| !value.is_empty()) {
+        return false;
+    }
+    eprintln!("skipped: needs the real OS sandbox, which cannot nest inside kloop's sandbox");
+    true
+}
+
 /// Err(reason) when bash cannot be sandboxed on this machine; the CLI turns
 /// that into a startup warning and runs unsandboxed (fail-open like hooks:
 /// the permission gate stays the enforcement layer).
@@ -754,7 +773,6 @@ mod tests {
             denied_write_paths: Vec::new(),
             allow_network,
             auto_allow: true,
-            escalate: true,
         }
     }
 
@@ -1173,7 +1191,6 @@ mod tests {
         assert!(roots(&next_policy).contains(&extra));
         assert_eq!(next_policy.allow_network, base.allow_network);
         assert_eq!(next_policy.auto_allow, base.auto_allow);
-        assert_eq!(next_policy.escalate, base.escalate);
     }
 
     #[test]

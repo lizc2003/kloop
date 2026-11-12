@@ -723,8 +723,9 @@ program's own call is the one the session has to judge — and a sub-agent's
 turn records into its own file.
 An `approval` line (plan 283) records one permission question about a call, or
 a memory that answered one: which door asked (`gate`, or `escalation` after a
-sandbox denial), why (`hazard`, `ask_rule`, `no_sandbox`, `incomplete_parse`,
-`uncontained`, `outside_workspace`, `tool`, `sandbox_denied`), the clipped
+sandbox denial), why (`hazard`, `ask_rule`, `incomplete_parse`, `uncontained`,
+`outside_workspace`, `tool`, `sandbox_denied`; `no_sandbox` only in files
+written before `disable_sandbox` was removed), the clipped
 detail, the session keys and durable rules a remembering answer would write,
 the scopes offered, and the answer (`allowed` with its scope, `denied`,
 `stopped`, `no_approver`, or `remembered` by a project rule or the session
@@ -1270,8 +1271,9 @@ The sandbox auto-allow layer is the sandbox/approval coupling — see OS sandbox
 below: a bash call the OS sandbox will contain skips everything beneath this
 layer, while deny rules, sensitive reads, safety checks and explicit ask rules
 keep their say (the ask-rule half is deliberately stricter than cc's
-autoAllowBashIfSandboxed). A call carrying `disable_sandbox` is not contained,
-so it never takes this layer.
+autoAllowBashIfSandboxed). The model has no way to opt a call out of the sandbox
+(plan 283 removed `disable_sandbox`); only a remembered escalation runs a call
+uncontained, and the layer credits it the same way.
 
 **Bash 严格授权与局部风险共用真实语法树**（`crates/core/src/shell.rs`、`shell/facts.rs`、`shell/word.rs`，
 tree-sitter-bash）。一次解析保留命令的严格字面/未知参数、词结构与位置、重定向方向/fd/词目标、
@@ -1470,13 +1472,12 @@ is the usual shape) has no prefix to key on and is instead remembered
 only ever match a byte-identical re-run, and a real command carries this run's
 own test filter and package list (measured on one project: 38 such rules on
 disk, 0 hits between them). The prompt echoes `only this exact command text`
-rather than reprinting the command already on screen. Which run was consented to
-is part of the key: a call carrying `disable_sandbox` is a separate consent, so
-a contained grant never covers the escape — for a parseable command that escape
-needs a `sandbox_escalate(...)` rule or a remembered escalation, and neither
-`bash(...)` nor the whole-tool `bash` rule covers it; and a whole-tool `bash`
-allow vouches for no opaque script at all, since it was written without anyone
-having read this one. Bash 的原文或规范路径
+rather than reprinting the command already on screen. Running a command and
+running it outside the sandbox are separate consents: neither `bash(...)` nor
+the whole-tool `bash` rule covers an escalation, which needs a
+`sandbox_escalate(...)` rule or a remembered escalation (OS sandbox below); and
+a whole-tool `bash` allow vouches for no opaque script at all, since it was
+written without anyone having read this one. Bash 的原文或规范路径
 命中敏感读取时直接硬拦截，bypass 与会话批准都不能覆盖。Opaque *PowerShell* 不进入会话记忆：
 manual 下每次询问或匹配 whole-tool allow；bypass 下直接放行。`p`
 allows for the current `ProjectId` across sessions and linked
@@ -3703,9 +3704,8 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   without a prompt — protected `.git` internals aside, git history is the
   recovery path. `trust_sandboxed = false` reverts to pure containment (approve
   first, then run sandboxed). `--permission-mode bypass` 跳过全部工具权限审批，
-  包括复杂脚本、危险命令和带 `disable_sandbox: true` 的主动脱沙箱调用。
-  它不关闭已配置的 OS 沙箱；普通调用仍先在沙箱内执行，模型主动脱沙箱和程序失败后
-  自动升级通常也免审批。依赖字面正文例外的调用必须保留凭据隔离，任何模式都不能升级移除它。
+  包括复杂脚本和危险命令。它不关闭已配置的 OS 沙箱；普通调用仍先在沙箱内执行，
+  沙箱拒绝后的升级免审批。依赖字面正文例外的调用必须保留凭据隔离，任何模式都不能升级移除它。
   用户选择该模式即接受这些调用的执行代价；deny 与敏感读写
   硬拦截仍优先，权限模式本身不提供命令内容或文件系统隔离保证。
 
@@ -3716,20 +3716,29 @@ Objects contain process lifetime, not filesystem access.
 
 When a sandboxed command fails and the failure looks like a sandbox denial
 (keyword match ported from codex, plus DNS-failure shapes when the sandbox
-disables network), there are two escalation paths:
+disables network), **kloop decides whether it leaves the sandbox; the model
+cannot** (plan 283). The bash tool has no `disable_sandbox` parameter any more —
+a call still carrying it fails as an unknown field, and dispatch checks bash
+input before the gate so nobody is asked about a call that could never run —
+and there is no `[sandbox] escalate` switch. The parameter was the model's own
+way out, and project instructions written for an outer executor ("run tests
+outside the sandbox") pushed it onto every `cargo test`; measured, it was 67 of
+108 replayed questions.
 
-- **Code-level loop** (`escalate`, default on — codex's retry-on-denial):
-  沙箱拒绝后，在同一次工具调用内决定是否脱沙箱重跑，省去一次模型往返。
-  非 bypass 模式下先查已有升级授权，再询问用户；用户拒绝则保留失败并引导换法，
-  没有 approver 则回退模型驱动指引。`--permission-mode bypass` 自动放行。
-  升级结果携带实际放行来源；前缀区分用户批准、bypass 自动放行与已有升级授权，
-  同时保留拒绝类型和证据。无人被询问时不写成“用户批准后重跑”。
-- **Model-driven** (fallback when `escalate = false`, or when there is no
-  approver): the result is annotated with guidance and the model retries
-  that one call with `disable_sandbox: true`。重试仍先过权限门；bypass 直接放行，
-  不弹审批。其他模式沿用权限判定，实际需要弹出审批时才显示 `[no sandbox]` 标记。
-  可解析命令的这次重试只认 `sandbox_escalate(...)` 或升级会话记忆，普通
-  `bash(...)` 与 whole-tool `bash` 都不能替它放行。
+- **Escalation** (codex's retry-on-denial): 沙箱拒绝后，在同一次工具调用内决定是否
+  脱沙箱重跑。非 bypass 模式下先查已有升级授权，再询问用户；用户拒绝则保留失败并告诉
+  模型不要重试；`--permission-mode bypass` 自动放行。升级结果携带实际放行来源；前缀区分
+  用户批准、bypass 自动放行与已有升级授权，同时保留拒绝类型和证据。无人被询问时不写成
+  “用户批准后重跑”。
+- **Nobody to ask** (headless, tests): the failure stands, and the result ends
+  with a hint that names the boundary and points the model at the user — take a
+  different approach, or say what access the command needs — never at a retry.
+  A background command has no escalation loop, so its hint says to run the
+  command in the foreground, where kloop asks.
+
+The tool description says the same from the other side: the model cannot turn
+the sandbox off, and a sandbox-looking failure that carries no such note was not
+recognized as a denial — report it to the user rather than work around it.
 
 The escalation ask says **what** was refused — `file write`, `network`, or
 `unclassified`, plus the failure line that proves it. A blocked socket and a
@@ -3743,11 +3752,14 @@ use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *
 rule. 可解析但两词前缀不描述命令本身的调用（`timeout 600 cargo test`、
 `git -C ../lib status`）改记逐字会话记忆，不提供 `p`。字面命令形状完整、但因为
 `xargs -I` 或 `time -o` 的未知效果成为 opaque 的调用（含嵌套形式）同样只记整条原文，
-不退成通配升级，不参与持久前缀规则匹配；主动 `disable_sandbox` 与失败后的升级共用
-这份逐字升级键，普通沙箱内批准仍是另一种同意。固定文件输出还必须逐个匹配
-`sandbox_escalate_write(<glob>)`，会话缓存也包含相同写入范围。升级继续记住每个命令
-（包括只读段），与普通审批跳过只读段的粒度区别保留；普通 `bash_write` 与升级写入规则
-不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
+不退成通配升级，不参与持久前缀规则匹配；普通沙箱内批准是另一种同意。固定文件输出还
+必须逐个匹配 `sandbox_escalate_write(<glob>)`，会话缓存也包含相同写入范围。升级与普通
+审批一样只记有效果的段：只读段（含 `cd`、`| tail -20`、`| grep`）既不进键也不参与匹配
+（plan 283）——沙箱限制的是写和网络，敏感读取由解析结果硬拦截，`cd` 本身没有效果、
+相对写入目标另行解析。于是 `cd <dir> && make check 2>&1 | tail -80` 由
+`sandbox_escalate(make check *)` 覆盖，询问提议的也是这条，不再退成逐字记忆或写下
+`sandbox_escalate(cd <dir> *)`；只剩写入的命令（`echo x > /elsewhere/f`）由写入规则单独
+覆盖。普通 `bash_write` 与升级写入规则不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
 A remembered **per-command** rule is consulted **before** the sandboxed attempt,
 not after it fails: the command runs uncontained from the start and the result
 says so (`[Ran without the sandbox: a remembered sandbox_escalate rule …]`).
@@ -3765,9 +3777,7 @@ here, so their `a` is blanket — *every* sandbox escalation for the rest of thi
 workspace session, said in as many words on the prompt, session-only and never
 persisted. The blanket is consulted **only inside the denial handler**: every
 new command still runs contained first, and only a command the sandbox actually
-refused is re-run uncontained without another ask. It therefore cannot
-pre-approve a model-chosen `disable_sandbox` call, which remains a separate
-consent. That is still wider than the ordinary gate's verbatim memory on purpose:
+refused is re-run uncontained without another ask. That is still wider than the ordinary gate's verbatim memory on purpose:
 it waives only the escalation question, never the first contained attempt, so a
 review's probes do not re-ask after the first refusal. A parseable command whose
 memory cannot be expressed safely — a write whose parent scope is `/`, glob
@@ -3782,9 +3792,9 @@ against 1 minute for the same review without them.
 产出 `Verdict` 时算一次；前景、背景和直接前景执行器（包括 scheduler）只读
 `Protection::Required`，在第一次不带沙箱的启动前拒绝，拒绝后的分支只提示保护要求、
 不提供升级。已有逐命令升级记忆若会把这条调用带出沙箱，门在判定 `Escalated` 时就直接
-硬拒绝；会话通配不再跳过首次沙箱尝试，保护要求改由拒绝后的分支优先处理。沙箱失败也
-不询问或自动脱沙箱重跑，不提示 `disable_sandbox`。主动脱沙箱、无策略、平台不支持或
-缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。未依赖这次正文例外的调用保持
+硬拒绝（这类正文都是 heredoc，解析为 opaque，实际只有会话通配能记住，而通配不在运行前
+跳过沙箱，所以这一支是防御）；保护要求由拒绝后的分支优先处理。沙箱失败也不询问或自动
+脱沙箱重跑。无策略、平台不支持或缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。未依赖这次正文例外的调用保持
 现有升级行为。
 
 Otherwise escalation is per call — the next command is sandboxed again —
@@ -3798,7 +3808,6 @@ enabled = true            # default; false turns the sandbox off
 allow_network = false     # default; true appends the network allow rules
 writable_roots = []       # extra writable directories
 trust_sandboxed = true    # default; false = ask first, then run sandboxed
-escalate = true           # default; false = model-driven disable_sandbox instead
 ```
 
 `enabled = false` is the whole off switch; no environment variable overrides
@@ -3807,11 +3816,17 @@ that containment, while the permission gate and Unix process-group ownership
 remain active. Native Windows also has no restricted-token/AppContainer
 filesystem/network sandbox, but every model-controlled Bash or PowerShell
 process is still assigned to a mandatory Job Object before user code runs;
-neither `[sandbox]` nor `disable_sandbox` ever disables process-tree
-ownership. A missing
+`[sandbox]` never disables process-tree ownership. A missing
 `sandbox-run_program` on macOS warns and falls back to the permission gate plus
 process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
-`KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. `--mock` never
+`KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. kloop's own tests use it:
+seatbelt cannot nest (an outer profile with any restriction makes the inner
+`sandbox_apply` fail), so the 26 real-seatbelt tests skip themselves inside
+kloop's sandbox and everything else runs there as usual. A full run must not
+skip them: `make test`/`make check` first try to nest `sandbox-exec` and fail at
+once with the real denial line if they cannot — which is what the escalation
+classifier needs to see — and set `KLOOP_REQUIRE_SEATBELT_TESTS=1`, which turns
+the skip off (plan 283). `--mock` never
 sandboxes.
 
 ## Root-owned session todo list (Plans 71–74, 187, 188, 190)
@@ -5717,7 +5732,9 @@ control / treatment：两臂版本与唯一被测差异。
   outrank the sandbox; escalation-consent decision/mode mapping) plus
   macOS-only integration against the real `sandbox-run_program` (write
   inside/outside a writable root with the denial hint, protected subpath,
-  per-call disable_sandbox escape, network denied where a bare run
+  no way out of the sandbox but the escalation (the removed
+  `disable_sandbox` is an unknown field, rejected before the gate), real-seatbelt
+  tests skipping themselves when nested, network denied where a bare run
   connects, background shell sandboxed with inherited-fd output, contained
   bash running with no approver present, the escalation loop re-running a
   denied command unsandboxed on approval and warning off retry when

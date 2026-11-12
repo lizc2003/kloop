@@ -77,6 +77,9 @@ impl Drop for LiteralProbe {
 
 #[tokio::test]
 async fn plan239_original_rust_probe_builds_and_runs_under_protection() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     let probe = LiteralProbe::new(crate::permissions::Mode::Manual);
     let root = probe.root.display();
     let command = format!(
@@ -128,6 +131,9 @@ CARGO_HOME={root}/cargo-home cargo run --offline --quiet --manifest-path {root}/
 
 #[tokio::test]
 async fn plan239_real_foreground_literal_program_keeps_credential_isolation() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     use crate::permissions::Mode;
     for mode in [Mode::Manual, Mode::Bypass] {
         let probe = LiteralProbe::new(mode);
@@ -154,7 +160,7 @@ async fn plan239_real_foreground_literal_program_keeps_credential_isolation() {
                 out.contains("requires credential read/write protection"),
                 "{out}"
             );
-            assert!(!out.contains("disable_sandbox: true"), "{out}");
+            assert!(!out.contains("disable_sandbox"), "{out}");
             assert!(!out.contains("Re-ran without"), "{out}");
             assert!(!probe.root.join("moved").exists());
             assert!(!probe.root.join("moved-home").exists());
@@ -169,6 +175,9 @@ async fn plan239_real_foreground_literal_program_keeps_credential_isolation() {
 
 #[tokio::test]
 async fn plan239_real_background_preserves_protection_and_suppresses_escape_hint() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     let probe = LiteralProbe::new(crate::permissions::Mode::Manual);
     for action in ["compare", "read"] {
         let (out, error) = run_tool(
@@ -194,7 +203,7 @@ async fn plan239_real_background_preserves_protection_and_suppresses_escape_hint
                 out.contains("requires credential read/write protection"),
                 "{out}"
             );
-            assert!(!out.contains("disable_sandbox: true"), "{out}");
+            assert!(!out.contains("disable_sandbox"), "{out}");
         }
     }
     assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
@@ -207,13 +216,11 @@ async fn plan239_real_background_preserves_protection_and_suppresses_escape_hint
 
 #[tokio::test]
 async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protection() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     use crate::permissions::{ApprovalScope, Decision, EscalationOutcome, Mode, Permissions};
     let mut probe = LiteralProbe::new(Mode::Manual);
-    for background in [false, true] {
-        let (out, error) = run_tool("bash", json!({"command": probe.command("compare"), "disable_sandbox": true, "background": background}), &probe.ctx).await;
-        assert!(error, "{out}");
-        assert!(out.contains("sensitive path"), "{out}");
-    }
     let workspace = probe.ctx.cfg.effective_workspace();
     let error = super::super::run_foreground_bash(
         &probe.command("compare"),
@@ -303,6 +310,9 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
 /// 必须在第一步就被 seatbelt 拒绝。
 #[tokio::test]
 async fn plan245_git_hooks_survive_renaming_the_git_directory() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     let root = std::env::temp_dir().join(format!("kloop-plan245-git-{}", std::process::id()));
     let root = std::fs::canonicalize({
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
@@ -331,6 +341,9 @@ async fn plan245_git_hooks_survive_renaming_the_git_directory() {
 /// 通配升级只能省掉“被拒之后的询问”，不能省掉沙箱内的第一次尝试。
 #[tokio::test]
 async fn plan245_blanket_escalation_still_runs_the_sandboxed_attempt_first() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     use crate::permissions::{Decision, EscalationOutcome};
 
     let (ctx, asked) = escalating_ctx(
@@ -379,6 +392,9 @@ async fn plan245_blanket_escalation_still_runs_the_sandboxed_attempt_first() {
 
 #[tokio::test]
 async fn plan239_sandbox_start_failure_does_not_retry_without_protection() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     let mut probe = LiteralProbe::new(crate::permissions::Mode::Bypass);
     let mut cfg = probe.ctx.cfg.test_clone();
     let mut shells = (*cfg.shell_programs).clone();
@@ -387,7 +403,7 @@ async fn plan239_sandbox_start_failure_does_not_retry_without_protection() {
     probe.ctx.cfg = Arc::new(cfg);
     let (out, error) = run_tool("bash", bash_input(&probe.command("compare")), &probe.ctx).await;
     assert!(!out.contains("Re-ran without"), "{out}");
-    assert!(!out.contains("disable_sandbox: true"), "{out}");
+    assert!(!out.contains("disable_sandbox"), "{out}");
     assert!(
         error || out.contains("requires credential read/write protection"),
         "{out}"
@@ -397,6 +413,9 @@ async fn plan239_sandbox_start_failure_does_not_retry_without_protection() {
 
 #[tokio::test]
 async fn plan239_symlinked_credential_root_is_denied_under_both_names() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
     let mut probe = LiteralProbe::new(crate::permissions::Mode::Bypass);
     let home = probe.root.join("home");
     let keys = probe.root.join("keys");
