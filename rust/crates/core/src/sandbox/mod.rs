@@ -729,7 +729,7 @@ pub fn classify_sandbox_denial(
     if exit_code == Some(0) {
         return None;
     }
-    classify_lines(output, network_disabled, &DENIED_KEYWORDS)
+    classify_lines(output, network_disabled, &DENIED_KEYWORDS, &DNS_KEYWORDS)
 }
 
 /// The OS's own refusal texts — EPERM, EACCES, EROFS — without the mechanism
@@ -740,20 +740,41 @@ const STRONG_DENIED_KEYWORDS: [&str; 3] = [
     "read-only file system",
 ];
 
+/// Resolver failures as the resolvers themselves word them — curl/git, the
+/// macOS and glibc `gai_strerror` texts, Node's `getaddrinfo <code>`, Go's
+/// lookup error — never a bare function name: `getaddrinfo` or `name
+/// resolution` alone is as likely a test's name as a failure.
+const STRONG_DNS_KEYWORDS: [&str; 7] = [
+    "could not resolve host",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "getaddrinfo enotfound",
+    "getaddrinfo eai_again",
+    "no such host",
+];
+
 /// Denial evidence that has to stand without a failing exit status: a zero
 /// that a pipe or `;` may have masked (`make test 2>&1 | tail -20`). Only the
-/// OS's own refusal text counts, or a DNS failure while the network is denied;
-/// `sandbox`, `seccomp` and `landlock` alone do not — they are words a passing
-/// test run prints in its own test names, and taking them as a denial would
-/// re-run a suite that just passed outside the sandbox.
+/// OS's own refusal text counts, or a resolver's own failure text while the
+/// network is denied; `sandbox`, `seccomp`, `landlock` or `getaddrinfo` alone
+/// do not — they are words a passing test run prints in its own test names,
+/// and taking them as a denial would re-run a suite that just passed outside
+/// the sandbox.
 pub fn classify_masked_denial(output: &str, network_disabled: bool) -> Option<SandboxDenial> {
-    classify_lines(output, network_disabled, &STRONG_DENIED_KEYWORDS)
+    classify_lines(
+        output,
+        network_disabled,
+        &STRONG_DENIED_KEYWORDS,
+        &STRONG_DNS_KEYWORDS,
+    )
 }
 
 fn classify_lines(
     output: &str,
     network_disabled: bool,
     denied_keywords: &[&str],
+    dns_keywords: &[&str],
 ) -> Option<SandboxDenial> {
     // Per line, so the evidence handed back is the sentence that matched rather
     // than the whole (possibly enormous) output, and so the network/write hints
@@ -763,7 +784,7 @@ fn classify_lines(
     for line in output.lines() {
         let lower = line.to_lowercase();
         let denied = denied_keywords.iter().any(|k| lower.contains(k));
-        let dns = network_disabled && DNS_KEYWORDS.iter().any(|k| lower.contains(k));
+        let dns = network_disabled && dns_keywords.iter().any(|k| lower.contains(k));
         if !denied && !dns {
             continue;
         }
@@ -815,6 +836,27 @@ mod tests {
             classify_masked_denial("curl: (6) Could not resolve host: example.com", false),
             None
         );
+        // A resolver function's name in a passing test is not a DNS failure;
+        // the resolvers' own failure texts are.
+        let passing = "test net::getaddrinfo_fallback ... ok\n\
+                       test dns::name resolution order ... ok\n\
+                       test result: ok. 2 passed; 0 failed";
+        assert_eq!(classify_masked_denial(passing, true), None);
+        for failure in [
+            "Error: getaddrinfo ENOTFOUND registry.npmjs.org",
+            "Error: getaddrinfo EAI_AGAIN registry.npmjs.org",
+            "ssh: Could not resolve hostname github.com: nodename nor servname provided, or not known",
+            "curl: (6) Could not resolve host: example.com",
+            "socket.gaierror: [Errno -3] Temporary failure in name resolution",
+            "socket.gaierror: [Errno -2] Name or service not known",
+            "dial tcp: lookup proxy.golang.org: no such host",
+        ] {
+            assert_eq!(
+                classify_masked_denial(failure, true).map(|denial| denial.kind),
+                Some(DenialKind::Network),
+                "{failure}"
+            );
+        }
     }
 
     fn policy_with(roots: Vec<WritableRoot>, allow_network: bool) -> SandboxPolicy {

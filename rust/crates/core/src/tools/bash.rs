@@ -2459,6 +2459,22 @@ mod tests {
             .await;
             assert!(!out.contains("Re-ran without the sandbox"), "{out}");
             assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            // Nor does a resolver function's name, behind a `-c` wrapper too.
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!(
+                    "sh -c \"touch {} && echo 'test net::getaddrinfo_fallback ... ok' | tail -1\"",
+                    std::fs::canonicalize(std::env::temp_dir().join("kloop-sbx-esc-pipe"))
+                        .unwrap()
+                        .join("inside-wrapped.txt")
+                        .display()
+                )),
+                &ctx,
+            )
+            .await;
+            assert!(!out.contains("Re-ran without the sandbox"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
             let _ = std::fs::remove_file(target);
         }
 

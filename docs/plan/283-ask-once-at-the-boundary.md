@@ -376,3 +376,11 @@
    队列；旧 journal 之后才送来的记录不再落进新分支。
 
 kloop-core 库测试沙箱内外都是 1385 过。
+
+### 第三轮复审修正（2026-11-12）
+
+**零退出仍会因测试名里的 `getaddrinfo` 误判**（P2），核实成立：零退出的判定沿用了含裸 `getaddrinfo` 和
+`name resolution` 的 DNS 关键字，禁网时全部通过的 `sh -c 'cargo test getaddrinfo 2>&1 | tail -20'` 会被认成
+DNS 失败。零退出现在只认解析器自己的报错文本：curl/git 的 `could not resolve host`、macOS 与 glibc 的
+`gai_strerror` 文本、Node 的 `getaddrinfo ENOTFOUND`/`EAI_AGAIN`、Go 的 `no such host`；单独的函数名不算。
+非零退出的分类器不变。kloop-core 库测试沙箱内外都是 1385 过。

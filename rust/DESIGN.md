@@ -3728,10 +3728,11 @@ bash reports only the last command's status, so `make test 2>&1 | tail -20` or
 `make install; echo done` exits 0 even when the part that did the work was
 denied. When the command that sets the status is read-only and something else
 had an effect or a redirect writes, a zero is judged on strong evidence only:
-the OS's own refusal text (EPERM, EACCES, EROFS) or a DNS failure with the
-network denied, never the mechanism's name alone — a passing test run prints
-`sandbox` in its own test names, and taking that as a denial would re-run the
-suite outside. The command that sets the status is not simply the last one the
+the OS's own refusal text (EPERM, EACCES, EROFS) or, with the network denied, a
+resolver's own failure text (`could not resolve host`, `nodename nor servname`,
+`getaddrinfo ENOTFOUND`, Go's `no such host`…) — never a bare name such as
+`sandbox` or `getaddrinfo`, which a passing test run prints in its own test
+names; taking that as a denial would re-run the suite outside. The command that sets the status is not simply the last one the
 analysis lists: a `-c` wrapper's script is listed before the wrapper, one level
 deeper, and the wrapper's status is its script's — **kloop decides whether it leaves the sandbox; the model
 cannot** (plan 283). The bash tool has no `disable_sandbox` parameter any more —
