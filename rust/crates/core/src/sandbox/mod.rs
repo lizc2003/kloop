@@ -20,6 +20,12 @@ use std::path::PathBuf;
 use crate::path_resolve::resolve_nearest_existing;
 use crate::permissions::EscalationApproval;
 
+mod denials;
+pub(crate) use denials::DenialWatch;
+pub(crate) use denials::LoggedDenial;
+pub(crate) use denials::classify_logged;
+pub(crate) use denials::fresh_tag;
+
 /// Hardcoded absolute path (codex does the same): resolving `sandbox-exec`
 /// through PATH would let an attacker-controlled directory supply the
 /// "sandbox".
@@ -42,6 +48,13 @@ pub const DENIAL_HINT: &str = "\n[This command ran inside kloop's sandbox (file 
     server of your own — still works) and the failure looks like a sandbox denial. Running it outside \
     the sandbox needs the user's approval, which cannot be asked for here. Do not try to work around \
     the sandbox; take a different approach, or tell the user what access the command needs.]";
+
+/// Appended when the sandbox refused a read of a protected path (a credential
+/// or kloop's own state). Unlike a write or the network this is never offered
+/// for an escalation: the deny exists so the command cannot read it.
+pub const PROTECTED_READ_DENIED: &str = "\n[kloop's sandbox kept this command from reading a \
+    protected path (credentials or kloop's own state). That protection is not lifted for a command; \
+    do not try to read it another way — tell the user if the task really needs it.]";
 
 /// [`DENIAL_HINT`] for a background command: it has no escalation loop, but
 /// the same command in the foreground does.
@@ -437,6 +450,39 @@ fn protected_subpaths(root: &Path) -> Vec<PathBuf> {
 /// `(param "KEY")` definitions, never inlined into the profile — codex's
 /// defense against paths that would otherwise need SBPL escaping.
 pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) {
+    seatbelt_profile_tagged(policy, None)
+}
+
+/// [`seatbelt_profile`] with every deny rule carrying `tag` as its message, so
+/// the kernel's log of each refusal names the call it came from (plan 283
+/// stage 2a). Every deny is a single-line form, the base policy's included.
+pub(crate) fn seatbelt_profile_tagged(
+    policy: &SandboxPolicy,
+    tag: Option<&str>,
+) -> (String, Vec<(String, PathBuf)>) {
+    let (profile, params) = untagged_profile(policy);
+    let Some(tag) = tag else {
+        return (profile, params);
+    };
+    let tagged = profile
+        .split_inclusive('\n')
+        .map(|chunk| {
+            let (line, newline) = match chunk.strip_suffix('\n') {
+                Some(line) => (line, "\n"),
+                None => (chunk, ""),
+            };
+            match line.strip_suffix(')') {
+                Some(open) if line.trim_start().starts_with("(deny ") => {
+                    format!("{open} (with message \"{tag}\")){newline}")
+                }
+                _ => chunk.to_string(),
+            }
+        })
+        .collect();
+    (tagged, params)
+}
+
+fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) {
     let mut params: Vec<(String, PathBuf)> = Vec::new();
     let mut write_parts: Vec<String> = Vec::new();
     for (i, wr) in policy.writable_roots.iter().enumerate() {
@@ -565,10 +611,11 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf
 /// adds the sandbox-exec prefix.
 pub fn seatbelt_command(
     policy: &SandboxPolicy,
+    tag: Option<&str>,
     program: &std::ffi::OsStr,
     command_args: &[std::ffi::OsString],
 ) -> (PathBuf, Vec<std::ffi::OsString>) {
-    let (profile, params) = seatbelt_profile(policy);
+    let (profile, params) = seatbelt_profile_tagged(policy, tag);
     let mut args = vec!["-p".into(), profile.into()];
     args.extend(
         params
@@ -644,6 +691,13 @@ pub fn is_likely_sandbox_denied(
 pub enum DenialKind {
     Write,
     Network,
+    /// A read of a path the profile denies — a credential or kloop's own
+    /// state. That protection is the point of the deny, so it is never
+    /// offered for an escalation.
+    Read,
+    /// The command started its own `sandbox-exec`, which cannot nest inside
+    /// this one (`sandbox_apply: Operation not permitted`).
+    Nested,
     /// Denial-shaped, but the line does not say which resource. Reported as
     /// such rather than guessed at — a wrong label sends the reader after the
     /// wrong knob.
@@ -655,6 +709,8 @@ impl DenialKind {
         match self {
             DenialKind::Write => "file write",
             DenialKind::Network => "network",
+            DenialKind::Read => "protected read",
+            DenialKind::Nested => "nested sandbox",
             DenialKind::Unclassified => "unclassified",
         }
     }
@@ -667,6 +723,23 @@ impl DenialKind {
 pub struct SandboxDenial {
     pub kind: DenialKind,
     pub evidence: String,
+    /// The paths a write was refused on, when the system log says (plan 283
+    /// stage 2a); empty for a denial read off the output.
+    pub paths: Vec<PathBuf>,
+}
+
+/// The command tried to start a sandbox of its own. That refusal is a built-in
+/// one the profile's markers do not reach, so it is read off the output, where
+/// `sandbox-exec` names it.
+pub fn nested_sandbox_denial(output: &str) -> Option<SandboxDenial> {
+    output
+        .lines()
+        .find(|line| line.contains("sandbox_apply: Operation not permitted"))
+        .map(|line| SandboxDenial {
+            kind: DenialKind::Nested,
+            evidence: clip_evidence(line.trim()),
+            paths: Vec::new(),
+        })
 }
 
 const MAX_DENIAL_EVIDENCE_CHARS: usize = 200;
@@ -798,6 +871,7 @@ fn classify_lines(
         return Some(SandboxDenial {
             kind,
             evidence: clip_evidence(line.trim()),
+            paths: Vec::new(),
         });
     }
     None
@@ -810,6 +884,53 @@ fn clip_evidence(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every deny rule — the base policy's `(deny default)` and the generated
+    /// credential, write and rename denies — carries the call's marker, so each
+    /// refusal the kernel logs names its call; the untagged profile is the
+    /// same text without it (plan 283 stage 2a).
+    #[test]
+    fn a_tagged_profile_marks_every_deny_rule() {
+        let policy = SandboxPolicy {
+            denied_read_paths: vec![PathBuf::from("/home/u/.ssh")],
+            denied_write_paths: vec![PathBuf::from("/home/u/.kloop")],
+            ..policy_with(
+                vec![WritableRoot {
+                    root: PathBuf::from("/work/proj"),
+                    origins: vec![WritableRootOrigin::Workspace],
+                    read_only_subpaths: vec![PathBuf::from("/work/proj/.git/hooks")],
+                }],
+                false,
+            )
+        };
+        let (plain, plain_params) = seatbelt_profile(&policy);
+        let (tagged, tagged_params) = seatbelt_profile_tagged(&policy, Some("kloop-deny-T3st"));
+        assert_eq!(plain_params, tagged_params);
+        let denies = |profile: &str| {
+            profile
+                .lines()
+                .filter(|line| line.trim_start().starts_with("(deny "))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let plain_denies = denies(&plain);
+        assert!(plain_denies.len() >= 4, "{plain_denies:?}");
+        assert_eq!(
+            denies(&tagged),
+            plain_denies
+                .iter()
+                .map(|line| format!(
+                    "{} (with message \"kloop-deny-T3st\"))",
+                    line.strip_suffix(')').unwrap()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(tagged.contains("(deny default (with message \"kloop-deny-T3st\"))"));
+        assert_eq!(
+            tagged.replace(" (with message \"kloop-deny-T3st\")", ""),
+            plain
+        );
+    }
 
     /// A zero exit that a pipe may have masked stands on the OS's own refusal
     /// text, or a DNS failure with the network denied; the mechanism's name in
@@ -825,6 +946,7 @@ mod tests {
             Some(SandboxDenial {
                 kind: DenialKind::Write,
                 evidence: "mkdir: /x/y: Operation not permitted".into(),
+                paths: Vec::new(),
             })
         );
         assert_eq!(
@@ -1022,7 +1144,8 @@ mod tests {
             false,
         );
         let command_args = ["-lc".into(), "echo hi".into()];
-        let (program, args) = seatbelt_command(&policy, std::ffi::OsStr::new("sh"), &command_args);
+        let (program, args) =
+            seatbelt_command(&policy, None, std::ffi::OsStr::new("sh"), &command_args);
         assert_eq!(program, PathBuf::from("/usr/bin/sandbox-exec"));
         assert_eq!(args[0], "-p");
         assert_eq!(args[1].to_string_lossy(), seatbelt_profile(&policy).0);
@@ -1142,6 +1265,7 @@ mod tests {
         let denial = SandboxDenial {
             kind: DenialKind::Network,
             evidence: "bind: operation not permitted".to_string(),
+            paths: Vec::new(),
         };
         for (approval, source) in [
             (EscalationApproval::User, "after user approval"),

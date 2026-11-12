@@ -2,7 +2,7 @@
 
 > 2026-11-11 立。来源：用户截图（`cd …/rust && cargo test … | tail -20`，带 "no OS sandbox"
 > 通告，每次都问），以及「询问这块，反复修改了很多次，能有一个彻底的方案吗」。
-> 状态：阶段 0、1 ✅（2026-11-12，结果见第八、九节）；阶段 2 起待实现。方向已于 2026-11-11 确认（见第七节）。
+> 状态：阶段 0、1、2a ✅（2026-11-12，结果见第八、九、十节）；阶段 2b 起待实现。方向已于 2026-11-11 确认（见第七节）。
 
 ## 一、这次为什么一直问
 
@@ -186,7 +186,7 @@
    时自跳过；键排除只读段与 `cd`（两侧）；`cd` 不再生成规则。验收：kloop-core 库测试能在 kloop 沙箱内跑通（沙箱测试跳过）；已有的
    `sandbox_escalate(make check *)` 能匹配 `make check 2>&1 | tail -20`；用 kloop 真跑一次
    "改代码、跑相关测试"的任务，没有一次脱沙箱询问。
-2. **能力同意 + Verdict**（与 266 合并或先做 266，见第七节）。验收：网络诊断会话回放，
+2. **能力同意 + Verdict**（拆成两步：2a ✅ 拒绝取证改用系统日志，见第十节；2b 待实现）（与 266 合并或先做 266，见第七节）。验收：网络诊断会话回放，
    询问 ≤ 1 次（联网一次）；写目录类拒绝走沙箱内放宽，不脱沙箱。
 3. **收掉无用记忆**：删掉越界询问的逐字记忆和会话通配；完全脱沙箱只提供"允许一次"和
    "本项目以后都允许"；文案同步。
@@ -384,3 +384,33 @@ kloop-core 库测试沙箱内外都是 1385 过。
 DNS 失败。零退出现在只认解析器自己的报错文本：curl/git 的 `could not resolve host`、macOS 与 glibc 的
 `gai_strerror` 文本、Node 的 `getaddrinfo ENOTFOUND`/`EAI_AGAIN`、Go 的 `no such host`；单独的函数名不算。
 非零退出的分类器不变。kloop-core 库测试沙箱内外都是 1385 过。
+
+## 十、阶段 2a 结果：拒绝取证改用系统日志（2026-11-12）
+
+**先补测了一项**：`log show` 查不到沙箱拒绝事件（加 `--info --debug` 也一样），这类内核事件不落盘，
+只能在命令运行时用 `log stream` 接。`log stream` 启动后 5–7 ms 输出第一行（“Filtering the log data…”），
+可作就绪信号；常驻时 CPU 0.2%、内存 5 MB。按标记过滤（`eventMessage CONTAINS "<标记>"`）实测只收到
+本次调用的事件。据此选了“每次沙箱内的前台 bash 临时起一个 `log stream`”，不做常驻进程和跨调用分发。
+
+**做法**：
+
+- profile 里每条 deny（基础的 `(deny default)` 和生成的凭据读、受保护写、改名 deny）都带
+  `(with message "kloop-deny-<随机>")`。
+- 前台沙箱运行前起 `log stream`，等第一行再启动命令；只有失败或退出码可能被盖住时才读事件
+  （等 50 ms 送达），成功就直接结束这个进程。
+- 分类：忽略每个进程启动时的无害拒绝（`sysctl-read`、`mach-lookup`、`/dev/dtracehelper`、
+  `/dev/tty`）；`/dev` 外的写是 `file write`，带上全部被拒路径（给 2b 用）；`network-*` 是
+  `network`；`file-read*` 是新的 `protected read`，不提供升级，结果附 `PROTECTED_READ_DENIED`。
+- 有日志时，日志里没有相关事件就不算沙箱拒绝，输出里写了什么都不算；只从输出里补两样日志看不到
+  的：嵌套 `sandbox-exec`（`sandbox_apply: Operation not permitted`，新类别 `nested sandbox`）和
+  系统自己的拒绝文本（以防日志丢事件）。
+- 没有日志时（其它平台、`log` 500 ms 内没就绪、后台命令）退回原来的输出判定。
+
+**效果**：阶段 0 回放里那次误判（`sed …; echo ===` 失败、输出里有测试名含 `sandbox`）现在不会再问；
+写入被拒的证据从 `zsh: operation not permitted: <路径>` 变成内核记录的 `file-write-create <路径>`。
+两条旧测试随之改了断言：bypass 升级的证据改看 `file-write-create`；shell 可执行文件不存在
+（`sandbox-exec: execvp() … failed`）不再被当成拒绝，原断言里的保护提示也就不再出现。
+
+**验证**：kloop-core 库测试沙箱外 1390 过（含三条新的真实 seatbelt 用例：日志给出写入路径并询问、
+失败输出只有 `sandbox` 字样不问、嵌套沙箱认成 `nested sandbox` 并询问；受保护读不问、附提示），
+kloop 沙箱内同样 1390 过（真实 seatbelt 用例跳过）。

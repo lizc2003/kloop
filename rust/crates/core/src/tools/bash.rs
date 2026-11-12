@@ -141,9 +141,25 @@ fn shell_spec(
     login_env: &ShellLoginEnv,
     ui: &dyn Ui,
 ) -> ProcessSpec {
+    shell_spec_tagged(command, cwd, sandbox, None, bash, login_env, ui)
+}
+
+/// [`shell_spec`] whose profile marks every refusal with `tag`, for a run whose
+/// denials are read back from the system log (plan 283 stage 2a).
+fn shell_spec_tagged(
+    command: &str,
+    cwd: &Path,
+    sandbox: Option<&SandboxPolicy>,
+    tag: Option<&str>,
+    bash: &ShellProgram,
+    login_env: &ShellLoginEnv,
+    ui: &dyn Ui,
+) -> ProcessSpec {
     let shell_args = shell_args(bash, command, login_env, ui);
     let (program, args) = match sandbox {
-        Some(policy) => sandbox::seatbelt_command(policy, bash.executable.as_os_str(), &shell_args),
+        Some(policy) => {
+            sandbox::seatbelt_command(policy, tag, bash.executable.as_os_str(), &shell_args)
+        }
         None => (bash.executable.clone(), shell_args),
     };
     let mut spec = ProcessSpec::new(program, cwd);
@@ -337,6 +353,33 @@ fn status_command(commands: &[crate::shell::CommandFact]) -> Option<(usize, Vec<
     }
 }
 
+/// What the sandbox refused in a run that failed (or whose zero may be
+/// masked), if anything. When the system log was watched it is the witness:
+/// its events name the operation and the path, and a failure that logged
+/// nothing relevant was not the sandbox's doing, whatever words the output
+/// happens to contain — a test named `sandbox_…`, a resolver named in a log.
+/// Two things the log does not show are read off the output instead: a nested
+/// `sandbox-exec`, a built-in refusal the per-call marker does not reach, and —
+/// in case the log dropped an event — the OS's own refusal text. Without a
+/// watch the output is all there is: a failure gets the keyword classifier, a
+/// masked zero only the strong evidence.
+fn judge_denial(
+    output: &ForegroundOutput,
+    logged: Option<&[sandbox::LoggedDenial]>,
+    network_disabled: bool,
+) -> Option<sandbox::SandboxDenial> {
+    let text = captured_text(output);
+    if let Some(nested) = sandbox::nested_sandbox_denial(&text) {
+        return Some(nested);
+    }
+    match logged {
+        Some(events) => sandbox::classify_logged(events)
+            .or_else(|| sandbox::classify_masked_denial(&text, network_disabled)),
+        None if output.status.success() => sandbox::classify_masked_denial(&text, network_disabled),
+        None => sandbox::classify_sandbox_denial(output.status.code(), &text, network_disabled),
+    }
+}
+
 /// What one foreground run left behind: the model-facing text, and whether the
 /// command that produced it (the escalated re-run, when there was one)
 /// succeeded. A scheduled check needs the second without parsing the first.
@@ -376,10 +419,19 @@ pub(crate) async fn run_foreground_bash(
     if verdict.protection == crate::permissions::Protection::Required && sandbox.is_none() {
         bail!(sandbox::PROTECTION_REQUIRED);
     }
+    // A contained run marks its refusals and the system log is watched for
+    // them while it runs: what was refused, and on which path, is read from
+    // the kernel instead of guessed from the output (plan 283 stage 2a).
+    let tag = sandbox.as_ref().and_then(|_| sandbox::fresh_tag());
+    let watch = match &tag {
+        Some(tag) => sandbox::DenialWatch::start(tag).await,
+        None => None,
+    };
     let output = run_foreground(
         command,
         &cwd,
         sandbox.as_deref(),
+        tag.as_deref(),
         bash,
         timeout_ms,
         ctx,
@@ -406,22 +458,25 @@ pub(crate) async fn run_foreground_bash(
     // policy, or a remembered escalation, leaves `sandbox` None and skips it.
     // 判定看完整捕获的输出而不是内联文本：合并顺序是先 stdout 后 stderr，stdout 超过
     // 内联上限时，stderr 里的拒绝行会被截掉，升级和提示就都不会出现。
-    // A zero a pipe or `;` may have masked is judged on strong evidence only.
-    if let Some(policy) = &sandbox
-        && let Some(denial) = if !output.status.success() {
-            sandbox::classify_sandbox_denial(
-                output.status.code(),
-                &captured_text(&output),
-                !policy.allow_network,
-            )
-        } else if status_may_be_masked(command, facts) {
-            sandbox::classify_masked_denial(&captured_text(&output), !policy.allow_network)
-        } else {
-            None
+    // Only a failure — or a zero a pipe or `;` may have masked — is judged; a
+    // success that logged a refusal coped with it on its own.
+    let candidate =
+        !output.status.success() || (sandbox.is_some() && status_may_be_masked(command, facts));
+    let logged = match watch {
+        Some(watch) if candidate => Some(watch.finish().await),
+        _ => None,
+    };
+    let denial = match &sandbox {
+        Some(policy) if candidate => {
+            judge_denial(&output, logged.as_deref(), !policy.allow_network)
         }
-    {
+        _ => None,
+    };
+    if let Some(denial) = denial {
         if verdict.protection == crate::permissions::Protection::Required {
             hint = Some(sandbox::PROTECTION_REQUIRED);
+        } else if denial.kind == sandbox::DenialKind::Read {
+            hint = Some(sandbox::PROTECTED_READ_DENIED);
         } else {
             // The code-level escalation loop (codex's retry-on-denial):
             // ask once, and on approval re-run the command unsandboxed. The
@@ -456,6 +511,7 @@ pub(crate) async fn run_foreground_bash(
                     let raw = run_foreground(
                         command,
                         &cwd,
+                        None,
                         None,
                         bash,
                         timeout_ms,
@@ -495,10 +551,12 @@ pub(crate) async fn run_foreground_bash(
 
 /// One foreground shell run. The root is awaited independently from pipe EOF:
 /// once it exits, residual tree members are killed before readers are joined.
+#[allow(clippy::too_many_arguments)]
 async fn run_foreground(
     command: &str,
     cwd: &Path,
     sandbox: Option<&SandboxPolicy>,
+    tag: Option<&str>,
     bash: &ShellProgram,
     timeout_ms: u64,
     ctx: &ToolCtx,
@@ -509,10 +567,11 @@ async fn run_foreground(
     if protection == crate::permissions::Protection::Required && sandbox.is_none() {
         bail!(sandbox::PROTECTION_REQUIRED);
     }
-    let spec = shell_spec(
+    let spec = shell_spec_tagged(
         command,
         cwd,
         sandbox,
+        tag,
         bash,
         &ctx.cfg.shell_login_env,
         ctx.ui.as_ref(),
@@ -1620,6 +1679,7 @@ mod tests {
             "printf '你好' > marker.txt; printf stdout; printf stderr >&2",
             &cwd,
             None,
+            None,
             &bash,
             10_000,
             &ctx,
@@ -2478,6 +2538,93 @@ mod tests {
             let _ = std::fs::remove_file(target);
         }
 
+        /// Plan 283 stage 2a: the system log is the witness. A refused write
+        /// names its operation and path; a failure whose output merely says
+        /// "sandbox" was not a denial and asks nothing; a nested
+        /// `sandbox-exec` is told apart from other refusals.
+        #[tokio::test]
+        async fn the_system_log_says_what_the_sandbox_refused() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, asked) = escalating_ctx(
+                "esc-log",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let target = outside_dir("esc-log").join("logged.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!("touch {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(
+                out.contains(&format!(
+                    "denied (file write): file-write-create {}",
+                    target.display()
+                )),
+                "{out}"
+            );
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            let (out, _) = run_tool(
+                "bash",
+                bash_input("echo 'test tools::sandbox::denial ... FAILED'; exit 1"),
+                &ctx,
+            )
+            .await;
+            assert!(out.contains("exit status 1"), "{out}");
+            assert!(!out.contains("Re-ran without the sandbox"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "not a denial: {out}");
+
+            let (out, _) = run_tool(
+                "bash",
+                bash_input("/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true"),
+                &ctx,
+            )
+            .await;
+            assert!(out.contains("denied (nested sandbox)"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 2, "{out}");
+            let _ = std::fs::remove_file(target);
+        }
+
+        /// A refused read is a protected path by construction — the profile
+        /// reads the whole disk otherwise — so it is never offered for an
+        /// escalation, whatever the approver would say.
+        #[tokio::test]
+        async fn a_protected_read_is_not_offered_for_escalation() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, asked) = escalating_ctx(
+                "esc-read",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let protected = outside_dir("esc-read-protected");
+            std::fs::write(protected.join("notes.txt"), "secret").unwrap();
+            let mut cfg = ctx.cfg.test_clone();
+            let policy = cfg.sandbox.take().unwrap();
+            cfg.sandbox = Some(Arc::new(policy.with_denied_read_path(&protected)));
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!("cat {}/notes.txt", protected.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!out.contains("secret"), "{out}");
+            assert!(
+                out.ends_with(crate::sandbox::PROTECTED_READ_DENIED),
+                "{out}"
+            );
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "{out}");
+            let _ = std::fs::remove_dir_all(protected);
+        }
+
         /// 升级获批后返回的是重跑的结果：沙箱内那次的超长输出不能先落盘，否则就是
         /// 无人引用的孤儿文件。这里重跑没有大输出，offload 目录应当保持为空。
         #[tokio::test]
@@ -2564,9 +2711,13 @@ mod tests {
             .await;
             assert!(!is_error, "{out}");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
-            let _ = std::fs::remove_file(target);
+            let _ = std::fs::remove_file(&target);
             assert!(out.contains("automatically in bypass mode"), "{out}");
-            assert!(out.contains("Operation not permitted"), "{out}");
+            // The evidence is the kernel's own record of the refusal (stage 2a).
+            assert!(
+                out.contains(&format!("file-write-create {}", target.display())),
+                "{out}"
+            );
             assert!(!out.contains("after user approval"), "{out}");
             assert!(!out.contains("looks like a sandbox"), "{out}");
         }

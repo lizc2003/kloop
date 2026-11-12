@@ -87,6 +87,7 @@ async fn plan283_the_escalation_records_questions_and_the_memories_that_answer_t
     let denial = crate::sandbox::SandboxDenial {
         kind: crate::sandbox::DenialKind::Network,
         evidence: "curl: (6) Could not resolve host: example.com".into(),
+    paths: Vec::new(),
     };
     let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
     let p = gate(Mode::Manual, rules(&[], &[], &[]), approver);

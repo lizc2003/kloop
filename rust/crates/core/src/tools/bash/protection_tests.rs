@@ -404,10 +404,10 @@ async fn plan239_sandbox_start_failure_does_not_retry_without_protection() {
     let (out, error) = run_tool("bash", bash_input(&probe.command("compare")), &probe.ctx).await;
     assert!(!out.contains("Re-ran without"), "{out}");
     assert!(!out.contains("disable_sandbox"), "{out}");
-    assert!(
-        error || out.contains("requires credential read/write protection"),
-        "{out}"
-    );
+    // A shell that never started is not a sandbox denial (plan 283 stage 2a:
+    // the log shows no refusal), so nothing is offered either way; the failure
+    // itself is what the model sees.
+    assert!(error || out.contains("execvp()"), "{out}");
     assert!(!probe.root.join("attempts").exists());
 }
 

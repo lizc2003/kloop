@@ -3721,20 +3721,40 @@ ordinary relative paths and parallel edits, but it cannot contain a model that
 deliberately writes the old checkout by absolute path. Windows process Job
 Objects contain process lifetime, not filesystem access.
 
-When a sandboxed command fails and the failure looks like a sandbox denial
-(keyword match ported from codex, plus DNS-failure shapes when the sandbox
-disables network) — "fails" including a zero exit that may hide the failure:
-bash reports only the last command's status, so `make test 2>&1 | tail -20` or
-`make install; echo done` exits 0 even when the part that did the work was
-denied. When the command that sets the status is read-only and something else
-had an effect or a redirect writes, a zero is judged on strong evidence only:
-the OS's own refusal text (EPERM, EACCES, EROFS) or, with the network denied, a
-resolver's own failure text (`could not resolve host`, `nodename nor servname`,
-`getaddrinfo ENOTFOUND`, Go's `no such host`…) — never a bare name such as
-`sandbox` or `getaddrinfo`, which a passing test run prints in its own test
-names; taking that as a denial would re-run the suite outside. The command that sets the status is not simply the last one the
-analysis lists: a `-c` wrapper's script is listed before the wrapper, one level
-deeper, and the wrapper's status is its script's — **kloop decides whether it leaves the sandbox; the model
+When a sandboxed command fails — including a zero exit that may hide the
+failure: bash reports only the last command's status, so `make test 2>&1 | tail
+-20` or `make install; echo done` exits 0 even when the part that did the work
+was denied; the zero counts when the command that sets the status is read-only
+and something else had an effect or a redirect writes, and that command is not
+simply the last one the analysis lists, since a `-c` wrapper's script is listed
+before the wrapper, one level deeper, and the wrapper's status is its script's —
+kloop asks what the sandbox refused, and **the system log is the witness**
+(plan 283 stage 2a). Every deny rule in the profile carries a per-call marker
+(`(with message "kloop-deny-…")`), and a `log stream` filtered on it runs
+alongside the command (ready in about 6 ms; the command starts only once it
+is), so the kernel's own record of each refusal — `file-write-create <path>`,
+`network-outbound …`, `file-read-data <path>` — is collected for this call
+alone, concurrent calls notwithstanding. The events are not persisted (`log
+show` finds none, `--info --debug` included), so they can only be caught live.
+Startup noise every process logs (`sysctl-read`, `mach-lookup` of the log
+daemon, writes to `/dev/dtracehelper` and `/dev/tty`) is ignored; a write
+outside `/dev` is a `file write` denial carrying its paths, a network operation
+a `network` one, and a read a `protected read` — the profile reads the whole
+disk otherwise, so that is a credential or kloop's own state, never offered for
+an escalation. A failure the log shows nothing relevant for was not the
+sandbox's doing, whatever its output says (a test named `sandbox_…`, a failed
+`echo ===`). Two things the log does not show are read off the output: a nested
+`sandbox-exec` (`sandbox_apply: Operation not permitted`, a built-in refusal the
+marker does not reach — `nested sandbox`) and, should an event have been
+dropped, the OS's own refusal text. Without a watch — another platform, a `log`
+that does not answer within 500 ms, a background command — the output is all
+there is: the keyword classifier ported from codex (plus DNS-failure shapes when
+the network is denied) for a failure, and for a masked zero only strong
+evidence, the OS's own refusal text (EPERM, EACCES, EROFS) or a resolver's own
+failure text (`could not resolve host`, `nodename nor servname`, `getaddrinfo
+ENOTFOUND`, Go's `no such host`…), never a bare name such as `sandbox` or
+`getaddrinfo` that a passing test run prints in its own test names. Either way
+**kloop decides whether it leaves the sandbox; the model
 cannot** (plan 283). The bash tool has no `disable_sandbox` parameter any more —
 a call still carrying it fails as an unknown field, and dispatch checks bash
 input before the gate so nobody is asked about a call that could never run —
@@ -3758,8 +3778,9 @@ The tool description says the same from the other side: the model cannot turn
 the sandbox off, and a sandbox-looking failure that carries no such note was not
 recognized as a denial — report it to the user rather than work around it.
 
-The escalation ask says **what** was refused — `file write`, `network`, or
-`unclassified`, plus the failure line that proves it. A blocked socket and a
+The escalation ask says **what** was refused — `file write`, `network`,
+`nested sandbox` or `unclassified` — plus the kernel's record of it (the
+failure line when there was no log to watch). A blocked socket and a
 blocked write both read as `operation not permitted` on macOS and are answered
 with completely different knobs, so the class is the actionable half; the same
 line is carried into the escalated result, which is otherwise the only record of

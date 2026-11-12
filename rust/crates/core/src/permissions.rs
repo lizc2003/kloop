@@ -4359,6 +4359,7 @@ mod tests {
         let denial = crate::sandbox::SandboxDenial {
             kind: crate::sandbox::DenialKind::Network,
             evidence: "listen tcp6 [::1]:0: bind: operation not permitted".to_string(),
+            paths: Vec::new(),
         };
         p.escalate_sandbox("go test ./pkg", Some(&denial), 0).await;
         let notice = approver.asked()[0]

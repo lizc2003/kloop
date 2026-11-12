@@ -196,12 +196,15 @@ fn recorded_denial(result: &str) -> Option<Option<SandboxDenial>> {
         let kind = match label {
             "file write" => DenialKind::Write,
             "network" => DenialKind::Network,
+            "protected read" => DenialKind::Read,
+            "nested sandbox" => DenialKind::Nested,
             _ => DenialKind::Unclassified,
         };
         let evidence = evidence.lines().next().unwrap_or_default();
         return Some(Some(SandboxDenial {
             kind,
             evidence: evidence.trim_end_matches(']').to_string(),
+            paths: Vec::new(),
         }));
     }
     if result.starts_with("[Ran without the sandbox: a remembered") {
