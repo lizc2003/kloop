@@ -12,7 +12,8 @@
 `KLOOP_SANDBOX=seatbelt` 下自己跳过；`make test`/`make check` 先试嵌套、不行就带真实拒绝行立即失败，
 并设 `KLOOP_REQUIRE_SEATBELT_TESTS=1`（用户定的名字）关掉跳过。`AGENTS.md`「测试运行环境」分成
 kloop 内与外部执行器两条。回放：询问 108 → 41（危险命令 36 不变），原脱沙箱调用全部被拒的上界 54；
-kloop 74 → 33。kloop-core 库测试沙箱内外都是 1378 过。未用真实 API 实跑。
+kloop 74 → 33。kloop-core 库测试沙箱内外都是 1378 过。真实 API 无界面实跑一次（worktree 里
+改代码、在沙箱内跑 `cargo test`）：会话文件零 `approval` 记录。
 教训 374。下一步阶段 2（能力同意 + `Verdict` 沙箱档位、日志事件分类）。
 
 **Plan 283 阶段 0 ✅（2026-11-12）：询问落盘 + 离线回放基线**：会话文件新增 `approval` 行，权限门的
