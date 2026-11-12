@@ -369,6 +369,16 @@ pub(super) enum RolloutLine {
         meta: LineMeta,
         tool_use_id: String,
     },
+    /// A permission question about one call, or a memory that answered one
+    /// (plan 283). Not part of the conversation; nothing on the resume path
+    /// reads it — it exists to count questions offline.
+    Approval {
+        #[serde(flatten)]
+        meta: LineMeta,
+        tool_use_id: String,
+        #[serde(flatten)]
+        record: crate::permissions::ApprovalRecord,
+    },
 }
 
 impl RolloutLine {
@@ -400,7 +410,8 @@ impl RolloutLine {
             | RolloutLine::Compacted { .. }
             | RolloutLine::TurnTerminal { .. }
             | RolloutLine::Repaired { .. }
-            | RolloutLine::RequestStub { .. } => false,
+            | RolloutLine::RequestStub { .. }
+            | RolloutLine::Approval { .. } => false,
         }
     }
 
@@ -416,7 +427,8 @@ impl RolloutLine {
             | RolloutLine::TurnTerminal { meta, .. }
             | RolloutLine::Repaired { meta, .. }
             | RolloutLine::RequestStub { meta, .. }
-            | RolloutLine::ToolStarted { meta, .. } => meta,
+            | RolloutLine::ToolStarted { meta, .. }
+            | RolloutLine::Approval { meta, .. } => meta,
         }
     }
 
@@ -432,7 +444,8 @@ impl RolloutLine {
             | RolloutLine::TurnTerminal { meta, .. }
             | RolloutLine::Repaired { meta, .. }
             | RolloutLine::RequestStub { meta, .. }
-            | RolloutLine::ToolStarted { meta, .. } => meta,
+            | RolloutLine::ToolStarted { meta, .. }
+            | RolloutLine::Approval { meta, .. } => meta,
         }
     }
 }

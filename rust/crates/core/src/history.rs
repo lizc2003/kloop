@@ -617,6 +617,16 @@ impl History {
         self.persist(|rollout| rollout.append_tool_started(tool_use_id));
     }
 
+    /// Record a permission question about one call (plan 283). Like
+    /// `ToolStarted` it never enters `items`; only offline counting reads it.
+    pub(crate) fn note_approval(
+        &mut self,
+        tool_use_id: &str,
+        record: &crate::permissions::ApprovalRecord,
+    ) {
+        self.persist(|rollout| rollout.append_approval(tool_use_id, record));
+    }
+
     /// Persistence must never take down the live session: a failed write
     /// drops the rollout and the session continues in memory only.
     fn persist(&mut self, write: impl FnOnce(&mut Rollout) -> std::io::Result<()>) {

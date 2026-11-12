@@ -3757,6 +3757,9 @@ async fn only_gated_side_effecting_calls_are_recorded_as_started() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .map(|line| (line["type"].as_str().unwrap().to_string(), line))
+        // The denied call's permission question (plan 283) is journaled too;
+        // this test is about where "started" sits among the conversation.
+        .filter(|(kind, _)| kind != "approval")
         .collect();
     let started: Vec<(usize, &Value)> = lines
         .iter()
@@ -3779,6 +3782,112 @@ async fn only_gated_side_effecting_calls_are_recorded_as_started() {
     assert!(is_message_with(at + 1, "tool_result"), "{lines:?}");
 
     // Replay leaves it out of the conversation, so no request can carry it.
+    assert_eq!(
+        crate::rollout::load_session_snapshot(&session)
+            .unwrap()
+            .messages,
+        history.messages()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Plan 283: a permission question lands in the session file as an `approval`
+/// line naming the call it was about — and so does a session memory answering
+/// the same question later — written before the call's `tool_started`, never
+/// as a message.
+#[tokio::test]
+async fn permission_questions_are_recorded_against_their_call() {
+    use crate::permissions::{
+        ApprovalScope, Approver, ConfirmRequest, Decision, Mode, PermissionRules, Permissions,
+    };
+    use std::pin::Pin;
+
+    struct RememberForSession;
+    impl Approver for RememberForSession {
+        fn confirm(
+            &self,
+            _request: ConfirmRequest,
+        ) -> Pin<Box<dyn std::future::Future<Output = Decision> + Send + '_>> {
+            Box::pin(async { Decision::Allow(ApprovalScope::WorkspaceSession) })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("kloop-plan283-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(dir).unwrap();
+    let script = vec![
+        vec![tool_use("b1", "printf done > a.txt")],
+        vec![tool_use("b2", "printf done > b.txt")],
+        vec![AssistantBlock::Text {
+            text: "done".into(),
+        }],
+    ];
+    let mut cfg = crate::tools::testutil::TestConfig::new("agent-approval")
+        .provider(Provider::mock(script))
+        .max_rounds(Some(4))
+        .build()
+        .test_clone();
+    cfg.cwd = dir.clone();
+    cfg.permissions = Arc::new(
+        Permissions::new(
+            Mode::Manual,
+            &PermissionRules::default(),
+            dir.clone(),
+            Some(Arc::new(RememberForSession)),
+        )
+        .unwrap(),
+    );
+    let cfg = Arc::new(cfg);
+    let session = dir.join("session.jsonl");
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let mut history = History::new(cfg.offload_dir.clone());
+    history.attach_rollout(
+        crate::rollout::Rollout::new_with_initial_route(session.clone(), &cfg.provider_route)
+            .unwrap(),
+    );
+    history.record(Message::user_text("write twice"));
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert!(dir.join("b.txt").exists());
+
+    let lines: Vec<Value> = std::fs::read_to_string(&session)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| matches!(line["type"].as_str(), Some("approval" | "tool_started")))
+        .map(|line| {
+            json!({
+                "type": line["type"],
+                "tool_use_id": line["tool_use_id"],
+                "door": line["door"],
+                "reason": line["reason"],
+                "answer": line["answer"],
+            })
+        })
+        .collect();
+    let started = |id: &str| json!({"type": "tool_started", "tool_use_id": id, "door": null, "reason": null, "answer": null});
+    assert_eq!(
+        lines,
+        vec![
+            json!({
+                "type": "approval",
+                "tool_use_id": "b1",
+                "door": "gate",
+                "reason": {"kind": "uncontained"},
+                "answer": {"kind": "allowed", "scope": "workspace_session"},
+            }),
+            started("b1"),
+            json!({
+                "type": "approval",
+                "tool_use_id": "b2",
+                "door": "gate",
+                "reason": {"kind": "uncontained"},
+                "answer": {"kind": "remembered", "by": "session"},
+            }),
+            started("b2"),
+        ]
+    );
     assert_eq!(
         crate::rollout::load_session_snapshot(&session)
             .unwrap()

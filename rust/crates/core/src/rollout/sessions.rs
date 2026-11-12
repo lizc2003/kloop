@@ -365,6 +365,15 @@ fn fork_lines(lines: Vec<RolloutLine>, cut: u64, src: &Path, path: &Path) -> io:
                 meta: remeta(meta),
                 tool_use_id,
             },
+            RolloutLine::Approval {
+                meta,
+                tool_use_id,
+                record,
+            } => RolloutLine::Approval {
+                meta: remeta(meta),
+                tool_use_id,
+                record,
+            },
         };
         out.push_str(&serde_json::to_string(&line).map_err(io::Error::other)?);
         out.push('\n');
@@ -398,7 +407,8 @@ fn opens_user_turn(line: &RolloutLine) -> bool {
         | RolloutLine::TurnTerminal { .. }
         | RolloutLine::Repaired { .. }
         | RolloutLine::RequestStub { .. }
-        | RolloutLine::ToolStarted { .. } => false,
+        | RolloutLine::ToolStarted { .. }
+        | RolloutLine::Approval { .. } => false,
     }
 }
 

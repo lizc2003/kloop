@@ -12,9 +12,10 @@ use crate::execution_provenance::ExecutionRef;
 use crate::history::History;
 use crate::inbox::Inbox;
 use crate::provider_route::FrozenProviderAttempt;
+use crate::tools::JournalNote;
 use crate::tools::ToolCtx;
-use crate::tools::ToolStartedReceiver;
-use crate::tools::ToolStartedSink;
+use crate::tools::ToolJournal;
+use crate::tools::ToolJournalReceiver;
 use crate::tools::dispatch_tools;
 use crate::usage::{ProviderUsageRecord, UsageOperation};
 use kloop_protocol::AssistantOutcome;
@@ -1053,7 +1054,7 @@ impl Turn<'_> {
                 | ContentBlock::ToolResult { .. } => None,
             })
             .collect();
-        let (tool_started, started_notes) = ToolStartedSink::channel();
+        let (journal, journal_notes) = ToolJournal::channel();
         let ctx = ToolCtx {
             cfg: self.cfg.clone(),
             ui: self.ui.clone(),
@@ -1069,7 +1070,7 @@ impl Turn<'_> {
             // from.
             parent_rollout_id: self.history.rollout_last_id().map(str::to_string),
             program_result: None,
-            tool_started: Some(tool_started),
+            journal: Some(journal),
         };
         let schema = &self.options.structured_schema;
         let dispatch = async {
@@ -1079,7 +1080,7 @@ impl Turn<'_> {
             }
         };
         let (results, structured_output) =
-            journal_tool_starts(self.history, started_notes, dispatch).await;
+            journal_tool_calls(self.history, journal_notes, dispatch).await;
         let results = merge_invalid_results(blocks, invalid, results);
         // Record results BEFORE checking cancellation so every tool_use has a
         // paired tool_result and history stays legal for the next request.
@@ -1286,22 +1287,27 @@ async fn turn_rounds(
 /// Put the failed results for unreadable calls back where their calls were.
 /// Pairing is by id, but order is what a person reads in the transcript, so a
 /// result sits next to the call it answers.
-/// Run a round's dispatch while writing each "about to run" note it sends
-/// into the session file, acknowledging only once the line is written. The
-/// dispatch holds a sender for as long as it runs, so the notes stop exactly
-/// when it finishes; `biased` drains a waiting note before looking at the
-/// dispatch again.
-async fn journal_tool_starts<T>(
+/// Run a round's dispatch while writing each note its calls send ("about to
+/// run", a permission question) into the session file, acknowledging only once
+/// the line is written. The dispatch holds a sender for as long as it runs, so
+/// the notes stop exactly when it finishes; `biased` drains a waiting note
+/// before looking at the dispatch again.
+async fn journal_tool_calls<T>(
     history: &mut History,
-    mut notes: ToolStartedReceiver,
+    mut notes: ToolJournalReceiver,
     dispatch: impl Future<Output = T>,
 ) -> T {
     let mut dispatch = std::pin::pin!(dispatch);
     loop {
         tokio::select! {
             biased;
-            Some((tool_use_id, written)) = notes.recv() => {
-                history.note_tool_started(&tool_use_id);
+            Some((note, written)) = notes.recv() => {
+                match note {
+                    JournalNote::Started { tool_use_id } => history.note_tool_started(&tool_use_id),
+                    JournalNote::Approval { tool_use_id, record } => {
+                        history.note_approval(&tool_use_id, &record);
+                    }
+                }
                 let _ = written.send(());
             }
             done = &mut dispatch => return done,

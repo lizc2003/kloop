@@ -582,7 +582,7 @@ impl CoreBridge {
         // object. All other gates (deny, permission, sandbox, hooks) still apply.
         let ctx = ToolCtx {
             from_program: true,
-            tool_started: None,
+            journal: ctx.journal.map(super::ToolJournal::without_starts),
             ..ctx
         };
         Self {

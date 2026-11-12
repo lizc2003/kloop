@@ -2,7 +2,7 @@
 
 > 2026-11-11 立。来源：用户截图（`cd …/rust && cargo test … | tail -20`，带 "no OS sandbox"
 > 通告，每次都问），以及「询问这块，反复修改了很多次，能有一个彻底的方案吗」。
-> 状态：待实现。方向待用户确认（见第七节），确认前不动代码。
+> 状态：阶段 0 ✅（2026-11-12，结果见第八节）；阶段 1 起待实现。方向已于 2026-11-11 确认（见第七节）。
 
 ## 一、这次为什么一直问
 
@@ -172,7 +172,7 @@
 
 ## 五、阶段（每个阶段一次提交，各自可验收）
 
-0. **先度量，不改行为**。
+0. ✅ **先度量，不改行为**（2026-11-12，结果见第八节）。
    - 询问事件落盘：rollout 新增 `approval` 记录，包括门/升级、原因种类、键、提供了哪些作用域、
      用户选了什么、是否命中记忆。
    - 离线回放工具：读本机会话里的 bash 调用，送进权限门，用脚本化的批准者（总选最宽的作用域），
@@ -212,5 +212,84 @@
    写只能按具体目录放。
 3. ~~完全脱沙箱怎么记~~ 已定（2026-11-11，防君子不防小人）：第一次问，可按项目记住，不提供会话级。
 4. ~~已存的 `sandbox_escalate(...)` 规则~~ 随第 3 条：继续生效。
-5. 阶段 2 与 plan 266 合并做，还是先做 266？
+5. ~~阶段 2 与 plan 266 合并做，还是先做 266~~ 已不必问：plan 266 已于 2026-11-11 完成
+   （`Verdict { sandbox, protection, notice }`），阶段 2 在它上面扩展。
 6. ~~参数名与兼容~~ 已定（2026-11-11）：删除 `disable_sandbox`，放进阶段 1。
+
+## 八、阶段 0 结果（2026-11-12）
+
+### 做了什么
+
+- **询问记录**：会话文件新增 `approval` 行。权限门（第 5、6、13 层的询问，第 11、12 层的记忆命中）
+  和被拒后升级各产出一条 `ApprovalRecord`：哪扇门、原因（`hazard`/`ask_rule`/`no_sandbox`/
+  `incomplete_parse`/`uncontained`/`outside_workspace`/`tool`/`sandbox_denied`）、截断后的命令、
+  会话键、持久规则、提供的作用域、答案（含"被规则/会话记忆答掉"）。走 `tool_started` 那条按调用
+  绑定 id 的通道写入；程序发起的调用也记；`!cmd` 与定时 check 没有会话通道，不记。旧二进制读到
+  新行类型会拒绝整个文件，和当初加 `tool_started` 一样。
+- **离线回放**：`permissions/approval_replay.rs`，一个 `#[ignore]` 测试。读本机会话里的工具调用，
+  按时间顺序送进真实的权限门（真实的 workspace 沙箱策略），批准者总选最宽的作用域；被拒后升级
+  按原结果里的痕迹（拒绝提示在末行、升级重跑前缀、已记住升级的前缀、拒绝升级的说明）替它问一次。
+  子 agent 的文件并进根会话，fork 按 tool_use id 去重，CLI 会话没有 runtime 行，cwd 取项目分区的
+  `project.json` 锚点。项目持久规则从窗口开头的空集累积；全局 deny/ask、权限模式不回放。语料只在
+  本机：`cargo test -p kloop-core --lib approval_replay -- --ignored --nocapture`，
+  `KLOOP_REPLAY_SESSIONS`/`KLOOP_REPLAY_DIR`/`KLOOP_REPLAY_OUT` 可调。
+
+### 基线（最近 40 个根会话，当前权限层，最宽作用域批准者）
+
+6789 次调用（bash 4704 次，其中 95 次带 `disable_sandbox`），**询问 108 次**，中位 0 次/会话，最多 29 次。
+
+| 项目 | 会话 | 询问 | 带 `disable_sandbox` 的 bash |
+|---|---|---|---|
+| kloop | 9 | 74 | 64 |
+| 网络诊断项目 | 1 | 29 | 31 |
+| 另一个业务仓库 | 30 | 5 | 0 |
+
+按原因：
+
+- `gate/no_sandbox` **67**：最宽只能给到"本会话、逐字"的 44 次，会话级 16 次，项目级 7 次；
+  另有 24 次被已记住的规则/会话答掉。典型是 `cargo xwin …`、`make check 2>&1 | tail -80`、
+  多行网络诊断脚本、`brew install`/`cargo install`。`make check | tail -80` 在三个会话里各问一次
+  （逐字记忆只活一个会话）。
+- `gate/hazard:destructive` **36**：全部只能"允许一次"。几乎都是 `cd /tmp && rm -rf <探针目录> && …`
+  这类临时目录探针，其中 26 次来自同一个 kloop 会话。这一类与越界无关，本计划不改（危险命令照问），
+  留给阶段 4 复盘决定。
+- `escalation/sandbox_denied` **1**：一条只读的 `sed -n …; echo ===; sed -n …`。沙箱内那次因为
+  `echo ===` 在 zsh 里报错而退出非零，输出里恰好有个测试函数名含 `sandbox`，关键字分类把它判成
+  拒绝，用户真的被问了一次。这是"拒绝分得准"（原则 3）的实例。
+- `gate/tool` 2（web 搜索/抓取）、`gate/outside_workspace` 1、`gate/uncontained` 1、
+  `gate/incomplete_parse` 0。
+
+结论与计划一致：越界询问几乎全部来自模型主动脱沙箱；其余来源里只有危险命令量大，且集中在一类
+临时目录探针。
+
+### kloop-core 测试在 kloop 沙箱内跑
+
+按 CLI 启动时的同一份策略（workspace、`/tmp`、`$TMPDIR`、用户缓存目录可写，私有状态根读写都拒绝，
+凭据根拒绝）拼出 profile，在它里面跑 `cargo test -p kloop-core --lib`：1369 过、10 败。失败的全是
+真实 seatbelt 用例：`tools::bash::tests::seatbelt` 8 个、`tools::bash::background::tests::seatbelt`
+1 个，以及 `tools::scheduler` 的 `plan239_scheduled_check_keeps_literal_input_protection`（限 macOS，
+不在 `seatbelt` 模块里），9 个直接报 `sandbox_apply: Operation not permitted`。构建本身没碰网络、
+没写工作区外。阶段 1 要跳过的就是这两个 `seatbelt` 模块加这一个用例；其余真实 seatbelt 用例在嵌套
+下"恰好通过"也不可信，跳过范围按"需要真实 seatbelt"划，不按"会失败"划。
+
+### 系统日志取沙箱拒绝事件
+
+在 kloop 的 profile 下用 `log stream --style ndjson`（谓词同 codex 的调试命令）实测：
+
+- **不需要额外权限**，普通用户即可；启动后立即开始捕获（不等待也没丢事件），送达延迟在 1 ms 以内。
+- 事件信息足够分类：写工作区外是 `deny(1) file-write-create <完整路径>`；联网是
+  `deny(1) network-outbound /private/var/run/mDNSResponder`（DNS 先被拒）；嵌套沙箱是
+  `deny(1) forbidden-sandbox-reinit`，操作名独一无二。
+- **噪声**：每个进程启动都会有一批无害拒绝（`sysctl-read …`、`file-write-data /dev/dtracehelper`、
+  `/dev/tty`、`mach-lookup …logd/notification_center/configd`），分类前要滤掉。
+- **归属**：事件只带被拒进程自己的 pid（子进程的 pid），不是调用的根进程。不用跟踪进程树也能归属：
+  SBPL 的 `(deny default (with message "<标记>"))` 会把标记附在事件正文第二行，实测 profile 产生的
+  拒绝（写、联网）都带上了；`forbidden-sandbox-reinit` 是系统内建拒绝、不带标记，但它本身可辨认，
+  按调用的时间窗口归属即可。profile 里其它显式 deny 规则也可以各带同一个标记。
+
+所以原则 3 第一条成立，可以在阶段 2 用日志事件代替关键字分类。
+
+### 越界以外的询问来源
+
+见上面"按原因"：危险命令 36（全部"只能一次"）、外部工具 2、文件工具写工作区外 1、解析不完整 0。
+回放只覆盖模型发起的调用；`!cmd` 与定时 check 的询问不在会话里，频次仍未知。

@@ -392,6 +392,11 @@ fn call_detail(name: &str, input: &Value) -> String {
     }
 }
 
+/// [`call_detail`] clipped the way the prompt shows it, for a question record.
+pub(super) fn clipped_detail(name: &str, input: &Value) -> String {
+    clip(&call_detail(name, input))
+}
+
 pub(super) fn describe(name: &str, input: &Value, depth: u8, hazard_tag: Option<&str>) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     let hazard = hazard_tag.map_or(String::new(), |t| format!("[{t}] "));

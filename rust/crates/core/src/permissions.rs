@@ -59,6 +59,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
+#[cfg(test)]
+mod approval_replay;
 mod argv_roles;
 mod describe;
 mod facts;
@@ -67,6 +69,12 @@ pub use verdict::Protection;
 pub use verdict::SandboxPlan;
 pub use verdict::Verdict;
 mod policy;
+mod record;
+pub use record::ApprovalAnswer;
+pub use record::ApprovalDoor;
+pub use record::ApprovalRecord;
+pub use record::AskReason;
+pub use record::MemorySource;
 mod rule;
 pub(crate) mod sensitive;
 #[cfg(test)]
@@ -106,7 +114,8 @@ use rule::parse_rules;
 use rule::rules_hit;
 
 /// The scope a human may grant to one approval request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalScope {
     Once,
     WorkspaceSession,
@@ -211,6 +220,9 @@ pub enum EscalationOutcome {
 pub struct Escalation {
     pub outcome: EscalationOutcome,
     pub notice: Option<PermissionNotice>,
+    /// What to write into the session file about this question (plan 283);
+    /// `None` when nobody would have been asked (bypass, tests).
+    pub approval: Option<ApprovalRecord>,
 }
 
 impl Escalation {
@@ -218,16 +230,22 @@ impl Escalation {
         Self {
             outcome,
             notice: None,
+            approval: None,
         }
     }
 
     fn with_notice(outcome: EscalationOutcome, message: &str) -> Self {
         Self {
-            outcome,
             notice: Some(PermissionNotice {
                 message: message.to_string(),
             }),
+            ..Self::new(outcome)
         }
+    }
+
+    fn recorded(mut self, record: ApprovalRecord) -> Self {
+        self.approval = Some(record);
+        self
     }
 }
 
@@ -671,6 +689,60 @@ impl Permissions {
         execution: crate::sandbox::ExecutionContext<'_>,
         facts: Option<&BashFacts>,
     ) -> Result<Verdict, Refusal> {
+        self.gate_call(
+            name,
+            input,
+            resolved_path,
+            preview_context,
+            depth,
+            execution,
+            facts,
+        )
+        .await
+        .result
+    }
+
+    /// [`Self::check_call_with_resolved_path`] plus what to record about the
+    /// question, for a caller that writes to a session file.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gate_call(
+        &self,
+        name: &str,
+        input: &Value,
+        resolved_path: Option<&Path>,
+        preview_context: Option<&crate::diff::MutationPreviewContext>,
+        depth: u8,
+        execution: crate::sandbox::ExecutionContext<'_>,
+        facts: Option<&BashFacts>,
+    ) -> GateOutcome {
+        let mut approval = None;
+        let result = self
+            .decide(
+                name,
+                input,
+                resolved_path,
+                preview_context,
+                depth,
+                execution,
+                facts,
+                &mut approval,
+            )
+            .await;
+        GateOutcome { result, approval }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide(
+        &self,
+        name: &str,
+        input: &Value,
+        resolved_path: Option<&Path>,
+        preview_context: Option<&crate::diff::MutationPreviewContext>,
+        depth: u8,
+        execution: crate::sandbox::ExecutionContext<'_>,
+        facts: Option<&BashFacts>,
+        approval: &mut Option<ApprovalRecord>,
+    ) -> Result<Verdict, Refusal> {
         if self.allow_everything {
             return Ok(Verdict {
                 sandbox: if execution.policy().is_some() {
@@ -757,24 +829,29 @@ impl Permissions {
 
         // 5. Safety checks — manual 下直接询问用户。
         if let Some(hazard) = call.hazard(name) {
+            let reason = AskReason::Hazard {
+                tag: hazard.tag.to_string(),
+            };
             return self
-                .ask_user(
-                    name,
-                    approval_input,
-                    preview_context,
-                    depth,
-                    Some(hazard.tag),
-                    None,
-                )
+                .ask_user(name, approval_input, preview_context, depth, reason, None)
                 .await
+                .settle(approval)
                 .map(allow);
         }
 
         // 6. Explicit ask rules — "always confirm this"; never remembered.
         if self.matches_ask(name, &call) {
             return self
-                .ask_user(name, approval_input, preview_context, depth, None, None)
+                .ask_user(
+                    name,
+                    approval_input,
+                    preview_context,
+                    depth,
+                    AskReason::AskRule,
+                    None,
+                )
                 .await
+                .settle(approval)
                 .map(allow);
         }
 
@@ -822,8 +899,19 @@ impl Permissions {
             return Ok(allow(None));
         }
 
+        // Everything below either answers from a memory or asks, so this is
+        // also what a record of the question says it was about.
+        let reason = ask_reason(name, &call, execution, sandbox);
+
         // 11. Allow rules.
         if self.matches_allow(name, &call) {
+            *approval = Some(remembered_record(
+                name,
+                approval_input,
+                reason,
+                remember_payload(name, &call).as_ref(),
+                MemorySource::Rule,
+            ));
             return Ok(allow(None));
         }
 
@@ -842,32 +930,39 @@ impl Permissions {
         } else {
             remember_payload(name, &call)
         };
-        if escalation_memory {
-            if remember
+        let remembered = if escalation_memory {
+            remember
                 .as_ref()
-                .is_some_and(|remember| self.escalation_remembered(remember))
-            {
-                return Ok(allow(None));
-            }
-        } else if let Some(remember) = &remember {
-            let caches = self.session.cache.lock().unwrap();
-            if caches
-                .get(self.identity.workspace_id())
-                .is_some_and(|cache| {
-                    remember
-                        .signatures
-                        .iter()
-                        .all(|signature| cache.signatures.contains(signature))
-                })
-            {
-                return Ok(allow(None));
-            }
+                .and_then(|remember| self.escalation_memory_source(remember))
+        } else {
+            remember.as_ref().and_then(|remember| {
+                self.session_remembers(remember)
+                    .then_some(MemorySource::Session)
+            })
+        };
+        if let Some(by) = remembered {
+            *approval = Some(remembered_record(
+                name,
+                approval_input,
+                reason,
+                remember.as_ref(),
+                by,
+            ));
+            return Ok(allow(None));
         }
 
         // 13. Ask.
-        self.ask_user(name, approval_input, preview_context, depth, None, remember)
-            .await
-            .map(allow)
+        self.ask_user(
+            name,
+            approval_input,
+            preview_context,
+            depth,
+            reason,
+            remember,
+        )
+        .await
+        .settle(approval)
+        .map(allow)
     }
 
     /// What this call will execute inside, decided once from the same facts
@@ -957,14 +1052,49 @@ impl Permissions {
         input: &Value,
         preview_context: Option<&crate::diff::MutationPreviewContext>,
         depth: u8,
-        hazard_tag: Option<&str>,
+        reason: AskReason,
         remember: Option<Remember>,
+    ) -> Asked {
+        let mut record = ApprovalRecord {
+            door: ApprovalDoor::Gate,
+            tool: name.to_string(),
+            reason,
+            detail: describe::clipped_detail(name, input),
+            keys: remember
+                .as_ref()
+                .map(|remember| remember.signatures.clone())
+                .unwrap_or_default(),
+            rules: remember
+                .as_ref()
+                .map(|remember| remember.rules.clone())
+                .unwrap_or_default(),
+            offered: Vec::new(),
+            answer: ApprovalAnswer::NoApprover,
+        };
+        let result = self
+            .ask_user_answer(name, input, preview_context, depth, remember, &mut record)
+            .await;
+        Asked { result, record }
+    }
+
+    async fn ask_user_answer(
+        &self,
+        name: &str,
+        input: &Value,
+        preview_context: Option<&crate::diff::MutationPreviewContext>,
+        depth: u8,
+        remember: Option<Remember>,
+        record: &mut ApprovalRecord,
     ) -> Result<Option<PermissionNotice>, Refusal> {
         let denied = || Refusal::Denied(user_denial(name));
         let Some(approver) = &self.session.approver else {
             return Err(Refusal::Denied(format!(
                 "{name}: approval required but no approver is available in this mode; denied."
             )));
+        };
+        let hazard_tag = match &record.reason {
+            AskReason::Hazard { tag } => Some(tag.as_str()),
+            _ => None,
         };
         let mut approval_scopes = vec![ApprovalScope::Once];
         if let Some(remember) = &remember {
@@ -990,14 +1120,20 @@ impl Permissions {
                 .await
                 .map(ConfirmPreview::FileChange),
         };
+        record.offered = approval_scopes.clone();
+        record.answer = ApprovalAnswer::Denied;
         let scope = match approver.confirm(req).await {
             Decision::Allow(scope) => scope,
             Decision::Deny => return Err(denied()),
-            Decision::Stop => return Err(Refusal::Stopped),
+            Decision::Stop => {
+                record.answer = ApprovalAnswer::Stopped;
+                return Err(Refusal::Stopped);
+            }
         };
         if !approval_scopes.contains(&scope) {
             return Err(denied());
         }
+        record.answer = ApprovalAnswer::Allowed { scope };
         match scope {
             ApprovalScope::Once => Ok(None),
             ApprovalScope::WorkspaceSession => {
@@ -1099,15 +1235,41 @@ impl Permissions {
         // 带未知效果的包装器只记原文，其余 opaque 仍用本工作区会话的通配同意。
         let memory = escalation_memory(command, self.identity.cwd(), facts);
         let remember = memory.remember;
-        if self.blanket_escalation_granted()
-            || remember
+        let mut record = ApprovalRecord {
+            door: ApprovalDoor::Escalation,
+            tool: "bash".to_string(),
+            reason: AskReason::SandboxDenied {
+                denial: denial
+                    .map_or("unknown", |denial| denial.kind.label())
+                    .to_string(),
+            },
+            detail: clip(command),
+            keys: match &remember {
+                Some(remember) => remember.signatures.clone(),
+                None if memory.opaque => vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
+                None => Vec::new(),
+            },
+            rules: remember
                 .as_ref()
-                .is_some_and(|remember| self.escalation_remembered(remember))
-        {
-            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Remembered));
+                .map(|remember| remember.rules.clone())
+                .unwrap_or_default(),
+            offered: Vec::new(),
+            answer: ApprovalAnswer::NoApprover,
+        };
+        let remembered = if self.blanket_escalation_granted() {
+            Some(MemorySource::Session)
+        } else {
+            remember
+                .as_ref()
+                .and_then(|remember| self.escalation_memory_source(remember))
+        };
+        if let Some(by) = remembered {
+            record.answer = ApprovalAnswer::Remembered { by };
+            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Remembered))
+                .recorded(record);
         }
         let Some(approver) = &self.session.approver else {
-            return Escalation::new(EscalationOutcome::NotAttempted);
+            return Escalation::new(EscalationOutcome::NotAttempted).recorded(record);
         };
         // Opaque 脚本只能按整条会话通配记住；有载荷的按载荷粒度记住。可解析但
         // 载荷为 `None` 的形状（父目录是根、目标含元字符等）没有任何安全的复用
@@ -1136,15 +1298,21 @@ impl Permissions {
             remember_rules,
             preview: None,
         };
+        record.offered = approval_scopes.clone();
+        record.answer = ApprovalAnswer::Denied;
         let scope = match approver.confirm(req).await {
             Decision::Allow(scope) => scope,
-            Decision::Deny => return Escalation::new(EscalationOutcome::Declined),
-            Decision::Stop => return Escalation::new(EscalationOutcome::Stopped),
+            Decision::Deny => return Escalation::new(EscalationOutcome::Declined).recorded(record),
+            Decision::Stop => {
+                record.answer = ApprovalAnswer::Stopped;
+                return Escalation::new(EscalationOutcome::Stopped).recorded(record);
+            }
         };
         if !approval_scopes.contains(&scope) {
-            return Escalation::new(EscalationOutcome::Declined);
+            return Escalation::new(EscalationOutcome::Declined).recorded(record);
         }
-        match scope {
+        record.answer = ApprovalAnswer::Allowed { scope };
+        let escalation = match scope {
             ApprovalScope::Once => {
                 Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
             }
@@ -1183,7 +1351,12 @@ impl Permissions {
                     ),
                 }
             }
+        };
+        if escalation.outcome == EscalationOutcome::Declined {
+            // 会话作用域却没有可记的键：按拒绝处理，记录也照实写。
+            record.answer = ApprovalAnswer::Denied;
         }
+        escalation.recorded(record)
     }
 
     /// Whether a *per-command* consent to run this command uncontained is
@@ -1239,12 +1412,23 @@ impl Permissions {
     /// Whether a durable project rule or this workspace's session cache already
     /// consented to running these commands uncontained.
     fn escalation_remembered(&self, remember: &Remember) -> bool {
+        self.escalation_memory_source(remember).is_some()
+    }
+
+    /// [`Self::escalation_remembered`], saying which memory answered.
+    fn escalation_memory_source(&self, remember: &Remember) -> Option<MemorySource> {
         if self
             .project
             .matches_escalation(&remember.argvs, &remember.writes)
         {
-            return true;
+            return Some(MemorySource::Rule);
         }
+        self.session_remembers(remember)
+            .then_some(MemorySource::Session)
+    }
+
+    /// Whether this workspace's session cache holds every key of `remember`.
+    fn session_remembers(&self, remember: &Remember) -> bool {
         let caches = self.session.cache.lock().unwrap();
         caches
             .get(self.identity.workspace_id())
@@ -1257,6 +1441,72 @@ impl Permissions {
     }
 }
 
+/// The gate's answer plus what to record about the question it asked, if any.
+pub(crate) struct GateOutcome {
+    pub(crate) result: Result<Verdict, Refusal>,
+    pub(crate) approval: Option<ApprovalRecord>,
+}
+
+/// One question put to the approver, and the record of it.
+struct Asked {
+    result: Result<Option<PermissionNotice>, Refusal>,
+    record: ApprovalRecord,
+}
+
+impl Asked {
+    fn settle(
+        self,
+        slot: &mut Option<ApprovalRecord>,
+    ) -> Result<Option<PermissionNotice>, Refusal> {
+        *slot = Some(self.record);
+        self.result
+    }
+}
+
+/// Why a call that reached the remembering layers would be asked about.
+fn ask_reason(
+    name: &str,
+    call: &CallFacts,
+    execution: crate::sandbox::ExecutionContext<'_>,
+    sandbox: SandboxPlan,
+) -> AskReason {
+    match name {
+        "bash" | "powershell" => {
+            if call.no_sandbox {
+                AskReason::NoSandbox
+            } else if execution.auto_allow
+                && matches!(sandbox, SandboxPlan::Contained | SandboxPlan::Escalated)
+                && !call.shell_facts_complete
+            {
+                AskReason::IncompleteParse
+            } else {
+                AskReason::Uncontained
+            }
+        }
+        "write_file" | "edit_file" | "notebook_edit" | "read_file" => AskReason::OutsideWorkspace,
+        _ => AskReason::Tool,
+    }
+}
+
+fn remembered_record(
+    name: &str,
+    input: &Value,
+    reason: AskReason,
+    remember: Option<&Remember>,
+    by: MemorySource,
+) -> ApprovalRecord {
+    ApprovalRecord {
+        door: ApprovalDoor::Gate,
+        tool: name.to_string(),
+        reason,
+        detail: describe::clipped_detail(name, input),
+        keys: remember.map_or_else(Vec::new, |remember| remember.signatures.clone()),
+        rules: remember.map_or_else(Vec::new, |remember| remember.rules.clone()),
+        offered: Vec::new(),
+        answer: ApprovalAnswer::Remembered { by },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     include!("permissions/plan239_tests.rs");
@@ -1265,6 +1515,7 @@ mod tests {
     include!("permissions/plan245_tests.rs");
     include!("permissions/plan266_tests.rs");
     include!("permissions/plan271_tests.rs");
+    include!("permissions/plan283_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;

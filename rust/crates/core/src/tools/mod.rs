@@ -412,30 +412,92 @@ pub trait ToolSource: Send + Sync {
 /// `run_one` returns. One slot per call, so concurrent program calls never race.
 pub type ProgramResultSink = Arc<std::sync::Mutex<Option<Value>>>;
 
-/// Where a call that may have side effects reports "about to run" (plan 204).
-/// The session file belongs to the turn's `History`, which `run_one` cannot
-/// reach, so the report travels to the turn and the call waits until the line
-/// is on disk: the rollout says "started" only before the effect can begin.
+/// What one call reports to its turn for the session file. The file belongs to
+/// the turn's `History`, which `run_one` cannot reach, so the report travels to
+/// the turn and the call waits until the line is written.
+pub(crate) enum JournalNote {
+    /// A call that may have side effects is about to run (plan 204): the
+    /// rollout says "started" only before the effect can begin.
+    Started { tool_use_id: String },
+    /// A permission question about this call, or a memory that answered one
+    /// (plan 283). Only read back offline, to count questions.
+    Approval {
+        tool_use_id: String,
+        record: crate::permissions::ApprovalRecord,
+    },
+}
+
+/// The turn's end of a [`ToolJournal`].
+pub(crate) type ToolJournalReceiver =
+    tokio::sync::mpsc::UnboundedReceiver<(JournalNote, tokio::sync::oneshot::Sender<()>)>;
+
+/// A call's way to the turn's session file. `run_one` binds it to the call's
+/// id, so a note sent from anywhere below (the gate, the bash escalation) says
+/// which call it is about.
 #[derive(Clone)]
-pub(crate) struct ToolStartedSink(
-    tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>,
-);
+pub(crate) struct ToolJournal {
+    tx: tokio::sync::mpsc::UnboundedSender<(JournalNote, tokio::sync::oneshot::Sender<()>)>,
+    /// False for calls a program fires: the program's own call is the one the
+    /// session's pairing repair has to judge, so theirs are not journaled as
+    /// started. Their questions still are.
+    starts: bool,
+    call_id: Option<Arc<str>>,
+}
 
-/// The turn's end of a [`ToolStartedSink`].
-pub(crate) type ToolStartedReceiver =
-    tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)>;
-
-impl ToolStartedSink {
-    pub(crate) fn channel() -> (Self, ToolStartedReceiver) {
+impl ToolJournal {
+    pub(crate) fn channel() -> (Self, ToolJournalReceiver) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self(tx), rx)
+        (
+            Self {
+                tx,
+                starts: true,
+                call_id: None,
+            },
+            rx,
+        )
+    }
+
+    pub(crate) fn without_starts(self) -> Self {
+        Self {
+            starts: false,
+            ..self
+        }
+    }
+
+    fn for_call(self, id: &str) -> Self {
+        Self {
+            call_id: Some(Arc::from(id)),
+            ..self
+        }
+    }
+
+    async fn started(&self) {
+        if !self.starts {
+            return;
+        }
+        if let Some(id) = &self.call_id {
+            self.send(JournalNote::Started {
+                tool_use_id: id.to_string(),
+            })
+            .await;
+        }
+    }
+
+    pub(crate) async fn approval(&self, record: crate::permissions::ApprovalRecord) {
+        if let Some(id) = &self.call_id {
+            self.send(JournalNote::Approval {
+                tool_use_id: id.to_string(),
+                record,
+            })
+            .await;
+        }
     }
 
     /// Returns once the turn has written the line, or at once if the turn is
     /// no longer listening — a note nobody can write must not block the call.
-    async fn note(&self, tool_use_id: &str) {
+    async fn send(&self, note: JournalNote) {
         let (ack, written) = tokio::sync::oneshot::channel();
-        if self.0.send((tool_use_id.to_string(), ack)).is_ok() {
+        if self.tx.send((note, ack)).is_ok() {
             let _ = written.await;
         }
     }
@@ -481,10 +543,23 @@ pub struct ToolCtx {
     /// program instead of the flattened text `run_one` returns. `execute_tool`
     /// fills it on the relevant tools; the bridge reads it after `run_one`.
     pub program_result: Option<ProgramResultSink>,
-    /// Set only by a turn whose calls answer to a session file. None for
-    /// harness commands, and for calls a program fires: the program's own
-    /// call is the one the session's pairing repair has to judge.
-    pub(crate) tool_started: Option<ToolStartedSink>,
+    /// Set only by a turn whose calls answer to a session file; None for
+    /// harness commands. Calls a program fires carry it without "started"
+    /// notes ([`ToolJournal::without_starts`]).
+    pub(crate) journal: Option<ToolJournal>,
+}
+
+impl ToolCtx {
+    /// Write a permission question into the session file, when this call
+    /// answers to one.
+    pub(crate) async fn journal_approval(
+        &self,
+        record: Option<crate::permissions::ApprovalRecord>,
+    ) {
+        if let (Some(journal), Some(record)) = (&self.journal, record) {
+            journal.approval(record).await;
+        }
+    }
 }
 
 impl ToolCtx {
@@ -505,7 +580,7 @@ impl ToolCtx {
             program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
-            tool_started: None,
+            journal: None,
         }
     }
 }
@@ -1325,9 +1400,9 @@ impl PreparedCall {
             .and_then(fs::PreparedMutation::preview_context);
         let sandbox_auto_allow =
             bash::execution_context(name, input, workspace, &ctx.cfg.shell_login_env);
-        let permission = unless_stopped(
+        let gated = unless_stopped(
             &ctx.stop,
-            workspace.permissions.check_call_with_resolved_path(
+            workspace.permissions.gate_call(
                 name,
                 input,
                 self.mutation
@@ -1341,6 +1416,13 @@ impl PreparedCall {
             ),
         )
         .await;
+        let permission = match gated {
+            Some(outcome) => {
+                ctx.journal_approval(outcome.approval).await;
+                Some(outcome.result)
+            }
+            None => None,
+        };
         match permission {
             None => bail!(NOT_RUN_STOPPED),
             Some(Ok(verdict)) => {
@@ -1387,7 +1469,6 @@ async fn run_post_tool_hook(name: &str, input: &Value, execution: &ToolExecution
 /// under way, in which case [`run_one`] lets it finish.
 #[allow(clippy::too_many_arguments)]
 async fn run_gated(
-    id: &str,
     name: &str,
     input: &Value,
     ctx: &ToolCtx,
@@ -1424,10 +1505,10 @@ async fn run_gated(
     };
     // Every gate is behind us and nothing below can refuse the call, so this is
     // the one point where "started" is true and not yet stale.
-    if let Some(sink) = &ctx.tool_started
+    if let Some(journal) = &ctx.journal
         && may_have_effects(name, input, &ctx.cfg.tool_sources, facts)
     {
-        sink.note(id).await;
+        journal.started().await;
     }
     let foreground_shell =
         name == "powershell" || (name == "bash" && !input["background"].as_bool().unwrap_or(false));
@@ -1647,6 +1728,7 @@ async fn run_one(
     let call_cancel = ctx.cancel.child_token();
     let ctx = ToolCtx {
         cancel: call_cancel.clone(),
+        journal: ctx.journal.map(|journal| journal.for_call(&id)),
         ..ctx
     };
     let event_input = agent_message::event_input(&name, &input);
@@ -1671,7 +1753,6 @@ async fn run_one(
     let local_send_committed = AtomicBool::new(false);
     let deadline = CallDeadline::new(&name, &input, &ctx);
     let mut gated = Box::pin(run_gated(
-        &id,
         &name,
         &input,
         &ctx,
@@ -2223,7 +2304,7 @@ pub(crate) mod testutil {
             program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
-            tool_started: None,
+            journal: None,
         }
     }
 
@@ -4579,7 +4660,7 @@ mod tests {
             program_tool_manifest: None,
             parent_rollout_id: None,
             program_result: None,
-            tool_started: None,
+            journal: None,
         };
         let results = dispatch_tools(
             vec![

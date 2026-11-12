@@ -249,6 +249,23 @@ impl WorkspaceIdentity {
         }
     }
 
+    /// An identity for replaying a recorded session offline (plan 283): the
+    /// recorded cwd may be a worktree that no longer exists, and a Git probe
+    /// would then disable the project layer the replay is measuring. The
+    /// project is the session store's partition the file was found in.
+    #[cfg(test)]
+    pub(crate) fn for_replay(cwd: PathBuf, partition: &str) -> Self {
+        Self {
+            project_id: Some(ProjectId(partition.to_string())),
+            workspace_id: WorkspaceId(hash_id("w1_", WORKSPACE_DIRECTORY_DOMAIN, cwd.as_os_str())),
+            workspace_root: cwd.clone(),
+            project_anchor: Some(cwd.clone()),
+            cwd,
+            git: false,
+            status: ProjectIdentityStatus::Available,
+        }
+    }
+
     fn unavailable(cwd: PathBuf, reason: IdentityUnavailableReason) -> Self {
         Self {
             project_id: None,

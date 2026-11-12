@@ -718,16 +718,34 @@ every other line is written but left in the page cache, which survives a
 process kill and loses only a power cut's worth of tail, whereas a lost
 `tool_started` would err toward danger — it would tell the model that a call
 that may have acted never ran. Replay never puts it in the conversation; only
-pairing repair reads it. Calls a program fires carry no sink — the program's
-own call is the one the session has to judge — and a sub-agent's turn records
-into its own file.
+pairing repair reads it. Calls a program fires write no `tool_started` — the
+program's own call is the one the session has to judge — and a sub-agent's
+turn records into its own file.
+An `approval` line (plan 283) records one permission question about a call, or
+a memory that answered one: which door asked (`gate`, or `escalation` after a
+sandbox denial), why (`hazard`, `ask_rule`, `no_sandbox`, `incomplete_parse`,
+`uncontained`, `outside_workspace`, `tool`, `sandbox_denied`), the clipped
+detail, the session keys and durable rules a remembering answer would write,
+the scopes offered, and the answer (`allowed` with its scope, `denied`,
+`stopped`, `no_approver`, or `remembered` by a project rule or the session
+cache). Memory-answered lines exist so the counts can say what memory saved,
+not only what it failed to. It travels over the same per-call channel as
+`tool_started` — which is why `run_one` binds that channel to the call's id,
+so the gate and the bash escalation below it need not know the id — and is
+written whether or not the call is from a program. Nothing on the resume path
+reads it: it is for offline counting (`permissions/approval_replay.rs`, an
+ignored test that replays the local corpus through the real gate). Prompts
+withdrawn by a stop or cancel leave no line, and harness commands (`!cmd`, a
+scheduled check) have no session channel and record nothing.
 
 Every line carries an envelope — `id` (`{session}#{seq}`, no rand
 dependency), `parent` (previous line's id, linked across resumed runs), `ts`
 (unix ms). Within one file the chain is purely sequential; a forked file's
 first line carries a cross-file parent (see Fork below). Unknown fields are
 ignored on read (locked by test), so the format grows additively without a
-version bump.
+version bump. A new line *type* is not additive in that sense: a binary older
+than it refuses the whole file (`intact_lines` treats an unknown `type` as a
+corrupt complete line), as happened with `tool_started` and `approval`.
 
 The case additive growth cannot cover is a change that makes an older file parse
 into the *wrong* meaning, so a file's first line also carries `format_version`

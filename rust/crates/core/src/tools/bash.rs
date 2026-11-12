@@ -385,10 +385,12 @@ pub(crate) async fn run_foreground_bash(
                 _ = ctx.stop.cancelled() => Escalation {
                     outcome: EscalationOutcome::Declined,
                     notice: None,
+                    approval: None,
                 },
                 _ = ctx.cancel.cancelled() => bail!("interrupted"),
                 escalation = asking => escalation,
             };
+            ctx.journal_approval(escalation.approval.clone()).await;
             if let Some(notice) = &escalation.notice {
                 ctx.ui.emit(&Event::Note(notice.message.clone()));
             }

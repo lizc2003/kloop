@@ -496,6 +496,18 @@ impl Rollout {
         })
     }
 
+    pub(crate) fn append_approval(
+        &mut self,
+        tool_use_id: &str,
+        record: &crate::permissions::ApprovalRecord,
+    ) -> io::Result<()> {
+        self.append_line(RolloutLine::Approval {
+            meta: self.next_meta(),
+            tool_use_id: tool_use_id.to_string(),
+            record: record.clone(),
+        })
+    }
+
     fn append_repaired(
         &mut self,
         snapshot: &SessionSnapshot,

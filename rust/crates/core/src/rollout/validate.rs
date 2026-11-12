@@ -362,6 +362,7 @@ pub(super) fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
                 parsed.started.insert(tool_use_id);
                 meta
             }
+            RolloutLine::Approval { meta, .. } => meta,
             RolloutLine::TurnTerminal { meta, terminal } => {
                 parsed.terminals.push(SnapshotTerminal {
                     after_message: parsed.items.len(),
