@@ -256,6 +256,34 @@ fn verbatim_remember(
     }
 }
 
+/// The programs a parsed command runs that a network grant has to cover: the
+/// program of every segment with an effect, known wrappers (`timeout`, `env`…)
+/// stripped (plan 283). `None` when one cannot be named — an incomplete
+/// wrapper, a token no rule could spell — so only the session-wide grant can
+/// cover the command.
+pub(crate) fn network_programs(cmds: &[Vec<String>]) -> Option<Vec<String>> {
+    let mut programs: Vec<String> = Vec::new();
+    for argv in cmds.iter().filter(|argv| !argv_is_readonly(argv)) {
+        let wrappers = crate::shell::analyze_wrappers(argv);
+        if !wrappers.complete {
+            return None;
+        }
+        let first = wrappers.argv.first()?;
+        let program = first.rsplit('/').next().unwrap_or(first);
+        if program.is_empty()
+            || program
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '*' | '?' | '['))
+        {
+            return None;
+        }
+        if !programs.iter().any(|known| known == program) {
+            programs.push(program.to_string());
+        }
+    }
+    Some(programs)
+}
+
 /// 文件工具的记忆粒度是父目录。与 Bash 写入记忆同一套边界：cwd 本身没有可授权的
 /// 父目录，根部文件锚回规范 cwd；目录含 glob 元字符或位于文件系统根时不生成模式。
 fn path_memory_scope(path: &PathFacts) -> Option<String> {

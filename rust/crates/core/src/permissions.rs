@@ -65,10 +65,15 @@ use serde_json::Value;
 #[cfg(test)]
 mod approval_replay;
 mod argv_roles;
+mod capability;
+pub(crate) use capability::CapabilityRequest;
+pub(crate) use capability::grantable_write_dir;
+pub(crate) use describe::network_programs;
 mod describe;
 mod facts;
 pub(crate) use facts::bash_protection_requirement;
 pub use verdict::Protection;
+pub use verdict::SandboxGrants;
 pub use verdict::SandboxPlan;
 pub use verdict::Verdict;
 mod policy;
@@ -225,6 +230,9 @@ pub struct Escalation {
     /// What to write into the session file about this question (plan 283);
     /// `None` when nobody would have been asked (bypass, tests).
     pub approval: Option<ApprovalRecord>,
+    /// For a capability escalation, what the approval granted: the re-run
+    /// stays contained, widened by these. Empty for a full escalation.
+    pub grants: SandboxGrants,
 }
 
 impl Escalation {
@@ -233,7 +241,13 @@ impl Escalation {
             outcome,
             notice: None,
             approval: None,
+            grants: SandboxGrants::default(),
         }
+    }
+
+    fn granting(mut self, grants: SandboxGrants) -> Self {
+        self.grants = grants;
+        self
     }
 
     fn with_notice(outcome: EscalationOutcome, message: &str) -> Self {
@@ -250,6 +264,11 @@ impl Escalation {
         self
     }
 }
+
+/// The session-cache key for "every bash command may reach the network this
+/// workspace session" (plan 283). Session-only: a project remembers the
+/// network per program.
+const SESSION_NETWORK_SIGNATURE: &str = "sandbox_network:*";
 
 const PROJECT_RULE_NOT_SAVED: &str =
     "project approval applied to this call only; the durable project rule was not saved";
@@ -844,10 +863,16 @@ impl Permissions {
         }
 
         let (sandbox, protection) = self.execution_plan(input, &call, execution, facts);
+        let grants = if sandbox == SandboxPlan::Contained && execution.policy().is_some() {
+            self.sandbox_grants(&call)
+        } else {
+            SandboxGrants::default()
+        };
         let allow = |notice| Verdict {
             sandbox,
             protection,
             notice,
+            grants: grants.clone(),
         };
         // 需要实际沙箱保护的字面正文（heredoc 里的凭据探针）不能被审批或
         // 已记住的升级带出沙箱；bypass 也不算。第 2 层已经拦了直接读取，
@@ -1027,6 +1052,35 @@ impl Permissions {
             },
             protection,
         )
+    }
+
+    /// What consents already given add to this contained call's sandbox: the
+    /// network when this workspace session granted it to every command or the
+    /// project's `sandbox_network(...)` rules cover every program with an
+    /// effect, and the project's `sandbox_write(...)` directories.
+    fn sandbox_grants(&self, call: &CallFacts) -> SandboxGrants {
+        let network = self.session_network_granted()
+            || call
+                .shell
+                .as_ref()
+                .and_then(|shell| match shell {
+                    ShellFacts::Bash(analysis) => analysis.commands(),
+                    ShellFacts::PowerShellOpaque => None,
+                })
+                .and_then(describe::network_programs)
+                .is_some_and(|programs| self.project.network_programs_covered(&programs));
+        SandboxGrants {
+            network,
+            writable: self.project.sandbox_write_dirs(),
+        }
+    }
+
+    /// Whether this workspace session let every bash command reach the network.
+    fn session_network_granted(&self) -> bool {
+        let caches = self.session.cache.lock().unwrap();
+        caches
+            .get(self.identity.workspace_id())
+            .is_some_and(|cache| cache.signatures.contains(SESSION_NETWORK_SIGNATURE))
     }
 
     fn matches_deny(&self, name: &str, call: &CallFacts) -> bool {

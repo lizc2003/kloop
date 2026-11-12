@@ -352,6 +352,23 @@ pub(super) mod seatbelt {
         (with_sandbox(test_ctx(0, tag), policy), root)
     }
 
+    /// `ctx` with `dir` denied for writes. A refusal there is not offered as
+    /// a writable directory (plan 283 stage 2b), so it goes to the full
+    /// escalation — which is what the tests of that path need, now that other
+    /// writes outside the root are answered by widening the sandbox instead.
+    pub(in crate::tools::bash) fn deny_writes_to(
+        ctx: crate::tools::ToolCtx,
+        dir: &std::path::Path,
+    ) -> crate::tools::ToolCtx {
+        let mut cfg = ctx.cfg.test_clone();
+        let policy = cfg.sandbox.take().unwrap();
+        cfg.sandbox = Some(std::sync::Arc::new(policy.with_denied_write_path(dir)));
+        crate::tools::ToolCtx {
+            cfg: std::sync::Arc::new(cfg),
+            ..ctx
+        }
+    }
+
     /// A directory outside every writable root of `sandbox_ctx`.
     pub(in crate::tools::bash) fn outside_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("kloop-sbx-out-{tag}"));

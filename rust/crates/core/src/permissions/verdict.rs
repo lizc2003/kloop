@@ -11,6 +11,24 @@ pub struct Verdict {
     pub(crate) protection: Protection,
     /// A safe, user-visible note that came with the approval.
     pub(crate) notice: Option<PermissionNotice>,
+    /// What a contained run gets beyond the workspace policy, from consents
+    /// already given (plan 283). Empty unless `sandbox` is `Contained`.
+    pub(crate) grants: SandboxGrants,
+}
+
+/// Capabilities added to the sandbox rather than removing it (plan 283): the
+/// network, and directories to write. The two things the sandbox refuses that
+/// can be granted without lifting the rest of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandboxGrants {
+    pub(crate) network: bool,
+    pub(crate) writable: Vec<std::path::PathBuf>,
+}
+
+impl SandboxGrants {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.network && self.writable.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

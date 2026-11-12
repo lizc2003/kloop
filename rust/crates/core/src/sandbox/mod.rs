@@ -93,6 +93,51 @@ pub const ESCALATION_DECLINED: &str = "\n[The user declined to run this outside 
     Do not retry it; take a different approach — write within the workspace or a temp directory, \
     or ask the user how to proceed.]";
 
+/// Appended when the user was asked to widen the sandbox (the network, a
+/// directory) and declined (plan 283).
+pub const CAPABILITY_DECLINED: &str = "\n[The user declined to widen kloop's sandbox for this \
+    command. Do not retry it; take a different approach, or ask the user how to proceed.]";
+
+/// [`CAPABILITY_DECLINED`] answered No: the turn ends after this batch.
+pub const CAPABILITY_STOPPED: &str = "\n[The user declined to widen kloop's sandbox for this \
+    command and stopped the turn to tell you what to do instead. Their next message says what \
+    they want; do not retry this command unless they ask for it.]";
+
+/// Prepended to a result re-run inside a sandbox widened by a consent (plan 283):
+/// what was refused, what was granted, and on whose authority.
+pub fn widened_prefix(
+    denial: &SandboxDenial,
+    approval: EscalationApproval,
+    grants: &crate::permissions::SandboxGrants,
+) -> String {
+    let source = match approval {
+        EscalationApproval::User => "after user approval",
+        EscalationApproval::Bypass => "automatically in bypass mode",
+        EscalationApproval::Remembered => "under a remembered rule",
+    };
+    let mut granted = Vec::new();
+    if grants.network {
+        granted.push("network access".to_string());
+    }
+    if !grants.writable.is_empty() {
+        granted.push(format!(
+            "write access to {}",
+            grants
+                .writable
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    format!(
+        "[Re-ran inside the sandbox with {} {source}; it had been denied ({}): {}]\n",
+        granted.join(" and "),
+        denial.kind.label(),
+        denial.evidence
+    )
+}
+
 /// Appended when the user answered the escalation No (plan 216): the turn ends
 /// after this batch, so there is no "different approach" to take yet.
 pub const ESCALATION_STOPPED: &str = "\n[The user declined to run this outside kloop's sandbox \
@@ -109,6 +154,8 @@ pub enum WritableRootOrigin {
     /// root outside the workspace that exists for a toolchain, not for the model.
     ToolchainCache,
     Extra,
+    /// A directory the user let bash write (plan 283), added per call.
+    Granted,
 }
 
 /// One directory the sandboxed command may write, minus its protected
@@ -225,6 +272,31 @@ impl SandboxPolicy {
             WritableRootOrigin::Workspace,
         );
         policy
+    }
+
+    /// This policy widened by consents (plan 283): the network, and extra
+    /// writable roots — each with the usual protected subpaths, and still under
+    /// every write deny, which is emitted after the allows and wins.
+    pub(crate) fn with_grants(&self, grants: &crate::permissions::SandboxGrants) -> Self {
+        let mut policy = self.clone();
+        policy.allow_network |= grants.network;
+        for dir in &grants.writable {
+            push_root_aliases(&mut policy.writable_roots, dir, WritableRootOrigin::Granted);
+        }
+        policy
+    }
+
+    /// Whether this policy already settles writes under `dir`: it lies inside
+    /// a writable root (so a refusal there came from a protected subpath or a
+    /// deny, which a grant would not change) or inside a denied write path.
+    pub(crate) fn already_decides_writes(&self, dir: &Path) -> bool {
+        self.writable_roots
+            .iter()
+            .any(|root| dir.starts_with(&root.root))
+            || self
+                .denied_write_paths
+                .iter()
+                .any(|deny| dir.starts_with(deny))
     }
 
     /// Re-allow reads under `path` even though a denied ancestor covers it.

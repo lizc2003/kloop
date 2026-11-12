@@ -132,6 +132,37 @@ impl ProjectPermissionPolicy {
             })
     }
 
+    /// Whether project rules let every one of these programs reach the
+    /// network from inside the sandbox. Nothing to cover is not covered.
+    pub(super) fn network_programs_covered(&self, programs: &[String]) -> bool {
+        if programs.is_empty() {
+            return false;
+        }
+        let state = self.state.read().unwrap();
+        let rules = state.snapshot.allow.parsed();
+        programs.iter().all(|program| {
+            rules
+                .iter()
+                .any(|rule| matches!(rule, Rule::SandboxNetwork { program: p } if p == program))
+        })
+    }
+
+    /// Directories project rules add to every contained bash call's writable
+    /// roots.
+    pub(super) fn sandbox_write_dirs(&self) -> Vec<std::path::PathBuf> {
+        let state = self.state.read().unwrap();
+        state
+            .snapshot
+            .allow
+            .parsed()
+            .iter()
+            .filter_map(|rule| match rule {
+                Rule::SandboxWrite { dir } => Some(dir.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn can_persist(&self) -> bool {
         self.project_id.is_some() && self.writer.is_some()
     }

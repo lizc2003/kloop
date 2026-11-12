@@ -315,3 +315,226 @@ async fn plan283_a_remembered_escalation_that_skips_the_sandbox_is_recorded() {
         vec![(AskReason::AskRule, ApprovalAnswer::Denied)]
     );
 }
+
+/// 阶段 2b 的两种规则：程序名、绝对目录；拼不成规则的形状在解析时就拒绝。
+#[test]
+fn plan283_capability_rules_parse_programs_and_absolute_dirs() {
+    assert!(matches!(
+        parse_rule("sandbox_network(curl)"),
+        Ok(rule::Rule::SandboxNetwork { program }) if program == "curl"
+    ));
+    assert!(matches!(
+        parse_rule("sandbox_write(/opt/out)"),
+        Ok(rule::Rule::SandboxWrite { dir }) if dir == Path::new("/opt/out")
+    ));
+    for bad in [
+        "sandbox_network()",
+        "sandbox_network(curl wget)",
+        "sandbox_network(/usr/bin/curl)",
+        "sandbox_network(*)",
+        "sandbox_write(out)",
+        "sandbox_write(/)",
+        "sandbox_write(/opt/*)",
+    ] {
+        assert!(parse_rule(bad).is_err(), "{bad}");
+    }
+}
+
+/// 只提议能写成规则、又不碰敏感目录的目录：不是根、不是家目录本身、没有 glob 字符、
+/// 不含 `.git`/`.kloop`/凭据目录。
+#[test]
+fn plan283_only_plain_directories_are_offered_for_writes() {
+    let home = Path::new("/Users/someone");
+    for (dir, offered) in [
+        ("/Users/someone/.cargo/bin", true),
+        ("/opt/out", true),
+        ("/", false),
+        ("/Users/someone", false),
+        ("/opt/out[1]", false),
+        ("/Users/someone/repo/.git", false),
+        ("/Users/someone/repo/.kloop", false),
+        ("/Users/someone/.ssh", false),
+        ("relative/dir", false),
+    ] {
+        assert_eq!(grantable_write_dir(Path::new(dir), Some(home)), offered, "{dir}");
+    }
+}
+
+/// 门在调用进沙箱时把已有的同意算进 `Verdict`：项目的 `sandbox_write` 目录全部加上；
+/// 联网要每个有效果的程序都被 `sandbox_network` 覆盖，或者本会话已经整体放开。
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn plan283_the_gate_carries_remembered_capabilities_into_the_verdict() {
+    let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false);
+    let execution = || crate::sandbox::ExecutionContext::sandboxed(Some(&policy));
+    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+    let p = gate(
+        Mode::Manual,
+        rules(&["sandbox_network(curl)", "sandbox_write(/opt/out)"], &[], &[]),
+        approver,
+    );
+    let grants = |command: &str| {
+        let input = bash(command);
+        let p = &p;
+        let execution = execution();
+        async move {
+            p.check_call_with_execution("bash", &input, 0, execution, None)
+                .await
+                .unwrap()
+                .grants
+        }
+    };
+    let opt_out = vec![std::path::PathBuf::from("/opt/out")];
+    assert_eq!(
+        grants("timeout 30 curl -sS https://example.com | head -5").await,
+        SandboxGrants {
+            network: true,
+            writable: opt_out.clone(),
+        }
+    );
+    assert_eq!(
+        grants("curl -sS https://example.com | jq .").await,
+        SandboxGrants {
+            network: false,
+            writable: opt_out.clone(),
+        },
+        "jq is not covered, and the grant is for the whole command"
+    );
+
+    let denial = crate::sandbox::SandboxDenial {
+        kind: crate::sandbox::DenialKind::Network,
+        evidence: "network-outbound /private/var/run/mDNSResponder".into(),
+        paths: Vec::new(),
+    };
+    let request = CapabilityRequest::Network { programs: None };
+    let escalation = p.escalate_capability("wget -q x", &denial, &request, 0).await;
+    assert_eq!(
+        escalation.outcome,
+        EscalationOutcome::Approved(EscalationApproval::User)
+    );
+    assert_eq!(
+        grants("wget -q https://example.com").await,
+        SandboxGrants {
+            network: true,
+            writable: opt_out,
+        },
+        "the session-wide consent covers every command"
+    );
+}
+
+/// 联网的询问提供本次、本会话、本项目（按程序），选本项目写下 `sandbox_network(<程序>)`；
+/// 写目录只提供本次与本项目，写下 `sandbox_write(<目录>)`。记录与问的内容一致；
+/// bypass 直接放行同样的放宽，不留记录。
+#[tokio::test]
+async fn plan283_capability_questions_offer_their_scopes_and_write_their_rules() {
+    let denial = |kind| crate::sandbox::SandboxDenial {
+        kind,
+        evidence: "evidence".into(),
+        paths: Vec::new(),
+    };
+    let approver = ScriptedApprover::new(vec![
+        Decision::Allow(ApprovalScope::Project),
+        Decision::Allow(ApprovalScope::Project),
+    ]);
+    let writer = ScriptedWriter::succeeding();
+    let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
+
+    let network = CapabilityRequest::Network {
+        programs: Some(vec!["curl".into()]),
+    };
+    let escalation = p
+        .escalate_capability(
+            "curl -sS x",
+            &denial(crate::sandbox::DenialKind::Network),
+            &network,
+            0,
+        )
+        .await;
+    assert_eq!(
+        escalation.grants,
+        SandboxGrants {
+            network: true,
+            writable: Vec::new(),
+        }
+    );
+    let write = CapabilityRequest::Write {
+        dirs: vec![std::path::PathBuf::from("/opt/out")],
+    };
+    let escalation = p
+        .escalate_capability(
+            "cp a /opt/out/a",
+            &denial(crate::sandbox::DenialKind::Write),
+            &write,
+            0,
+        )
+        .await;
+    assert_eq!(
+        escalation.approval,
+        Some(ApprovalRecord {
+            door: ApprovalDoor::Escalation,
+            tool: "bash".into(),
+            reason: AskReason::SandboxDenied {
+                denial: "file write".into(),
+            },
+            detail: "cp a /opt/out/a".into(),
+            keys: Vec::new(),
+            rules: vec!["sandbox_write(/opt/out)".into()],
+            offered: vec![ApprovalScope::Once, ApprovalScope::Project],
+            answer: ApprovalAnswer::Allowed {
+                scope: ApprovalScope::Project,
+            },
+        })
+    );
+    let asked = approver.asked();
+    assert_eq!(
+        asked
+            .iter()
+            .map(|request| (request.approval_scopes.clone(), request.remember_rules.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                vec![
+                    ApprovalScope::Once,
+                    ApprovalScope::WorkspaceSession,
+                    ApprovalScope::Project
+                ],
+                Some(vec![
+                    "this session: every bash command may reach the network".to_string(),
+                    "this project: sandbox_network(curl)".to_string(),
+                ])
+            ),
+            (
+                vec![ApprovalScope::Once, ApprovalScope::Project],
+                Some(vec!["this project: sandbox_write(/opt/out)".to_string()])
+            ),
+        ]
+    );
+    assert_eq!(
+        writer.calls.lock().unwrap().as_slice(),
+        &[
+            vec!["sandbox_network(curl)".to_string()],
+            vec!["sandbox_write(/opt/out)".to_string()]
+        ]
+    );
+
+    let bypass = gate(Mode::Bypass, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
+    let escalation = bypass
+        .escalate_capability(
+            "cp a /opt/out/a",
+            &denial(crate::sandbox::DenialKind::Write),
+            &write,
+            0,
+        )
+        .await;
+    assert_eq!(
+        (escalation.outcome, escalation.grants, escalation.approval),
+        (
+            EscalationOutcome::Approved(EscalationApproval::Bypass),
+            SandboxGrants {
+                network: false,
+                writable: vec![std::path::PathBuf::from("/opt/out")],
+            },
+            None
+        )
+    );
+}

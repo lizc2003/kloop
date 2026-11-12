@@ -54,19 +54,35 @@ use crate::sandbox::SandboxDenial;
 use crate::sandbox::SandboxPolicy;
 
 /// Says yes with the widest scope offered, so every memory that could spare a
-/// later question gets the chance to.
+/// later question gets the chance to. For the network that is the session:
+/// every command for the rest of it, where the project scope covers only the
+/// programs it names (plan 283 stage 2b).
 struct WidestScope;
 
 impl Approver for WidestScope {
     fn confirm(&self, req: ConfirmRequest) -> Pin<Box<dyn Future<Output = Decision> + Send + '_>> {
-        let scope = [
-            ApprovalScope::Project,
-            ApprovalScope::WorkspaceSession,
-            ApprovalScope::Once,
-        ]
-        .into_iter()
-        .find(|scope| req.approval_scopes.contains(scope))
-        .unwrap_or(ApprovalScope::Once);
+        let network = req
+            .remember_rules
+            .iter()
+            .flatten()
+            .any(|line| line.contains("every bash command may reach the network"));
+        let order = if network {
+            [
+                ApprovalScope::WorkspaceSession,
+                ApprovalScope::Project,
+                ApprovalScope::Once,
+            ]
+        } else {
+            [
+                ApprovalScope::Project,
+                ApprovalScope::WorkspaceSession,
+                ApprovalScope::Once,
+            ]
+        };
+        let scope = order
+            .into_iter()
+            .find(|scope| req.approval_scopes.contains(scope))
+            .unwrap_or(ApprovalScope::Once);
         Box::pin(async move { Decision::Allow(scope) })
     }
 }
@@ -367,6 +383,44 @@ fn tally_one(tally: &mut Tally, detail: &mut Detail, record: ApprovalRecord) {
     }
 }
 
+/// The questions a recorded denial leads to now (plan 283 stage 2b): a refused
+/// network is asked as a capability — and not at all when a remembered consent
+/// already gave the call the network — and anything else as the full
+/// escalation. Recorded writes carry no paths, so they cannot be offered as a
+/// directory and go to the full escalation as before.
+async fn replay_escalation(
+    gate: &Permissions,
+    command: &str,
+    denial: Option<SandboxDenial>,
+    network_granted: bool,
+    depth: u8,
+) -> Option<ApprovalRecord> {
+    match denial {
+        Some(denial) if denial.kind == DenialKind::Network => {
+            if network_granted {
+                return None;
+            }
+            let programs = crate::shell::analyze_bash(command)
+                .commands()
+                .and_then(super::network_programs)
+                .filter(|programs| !programs.is_empty());
+            gate.escalate_capability(
+                command,
+                &denial,
+                &super::CapabilityRequest::Network { programs },
+                depth,
+            )
+            .await
+            .approval
+        }
+        denial => {
+            gate.escalate_sandbox(command, denial.as_ref(), depth)
+                .await
+                .approval
+        }
+    }
+}
+
 fn corpus_root() -> Option<PathBuf> {
     std::env::var_os("KLOOP_REPLAY_DIR")
         .map(PathBuf::from)
@@ -390,7 +444,11 @@ async fn approval_replay() {
         println!("skipped: no session corpus (set KLOOP_REPLAY_DIR)");
         return;
     };
-    let assume_denied = std::env::var_os("KLOOP_REPLAY_ASSUME_DENIED").is_some();
+    // `network` assumes those calls were refused the network; any other value,
+    // an unclassified refusal.
+    let assume_denied = std::env::var("KLOOP_REPLAY_ASSUME_DENIED")
+        .ok()
+        .map(|kind| (kind == "network").then_some(DenialKind::Network));
     let window: usize = std::env::var("KLOOP_REPLAY_SESSIONS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -513,6 +571,7 @@ async fn approval_replay() {
             let Ok(verdict) = outcome.result else {
                 continue;
             };
+            let network_granted = verdict.grants.network;
             if name != "bash" || input["background"].as_bool() == Some(true) {
                 continue;
             }
@@ -521,20 +580,26 @@ async fn approval_replay() {
                 SandboxPlan::Escalated => {}
                 SandboxPlan::Contained => {
                     let command = input["command"].as_str().unwrap_or_default();
-                    match call.result.as_deref().and_then(recorded_denial) {
-                        Some(denial) => {
-                            let escalation = gate
-                                .escalate_sandbox(command, denial.as_ref(), call.depth)
-                                .await;
-                            tally_record(&mut tally, &mut detail, escalation.approval);
-                        }
-                        None if no_sandbox && assume_denied => {
+                    let assumed = |kind: Option<DenialKind>| {
+                        kind.map(|kind| SandboxDenial {
+                            kind,
+                            evidence: "assumed".into(),
+                            paths: Vec::new(),
+                        })
+                    };
+                    let denial = match call.result.as_deref().and_then(recorded_denial) {
+                        Some(denial) => Some(denial),
+                        None if no_sandbox => {
                             tally.unknown_outcome += 1;
-                            let escalation = gate.escalate_sandbox(command, None, call.depth).await;
-                            tally_record(&mut tally, &mut detail, escalation.approval);
+                            assume_denied.map(assumed)
                         }
-                        None if no_sandbox => tally.unknown_outcome += 1,
-                        None => {}
+                        None => None,
+                    };
+                    if let Some(denial) = denial {
+                        let records =
+                            replay_escalation(&gate, command, denial, network_granted, call.depth)
+                                .await;
+                        tally_record(&mut tally, &mut detail, records);
                     }
                 }
                 SandboxPlan::None => {}

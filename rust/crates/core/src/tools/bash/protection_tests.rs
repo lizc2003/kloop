@@ -350,6 +350,8 @@ async fn plan245_blanket_escalation_still_runs_the_sandboxed_attempt_first() {
         "plan245-blanket",
         Decision::Allow(crate::permissions::ApprovalScope::WorkspaceSession),
     );
+
+    let ctx = deny_writes_to(ctx, &outside_dir("plan245-blanket"));
     let root = ctx.cfg.sandbox.as_ref().unwrap().writable_roots[0]
         .root
         .clone();

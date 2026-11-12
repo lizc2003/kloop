@@ -3763,12 +3763,16 @@ way out, and project instructions written for an outer executor ("run tests
 outside the sandbox") pushed it onto every `cargo test`; measured, it was 67 of
 108 replayed questions.
 
+- **Widening** (plan 283 stage 2b): a refused network or a refused write
+  outside the writable roots is answered by widening the sandbox by exactly that
+  and re-running inside it — see **Capabilities** below. Only what cannot be
+  widened goes on to the escalation.
 - **Escalation** (codex's retry-on-denial): 沙箱拒绝后，在同一次工具调用内决定是否
   脱沙箱重跑。非 bypass 模式下先查已有升级授权，再询问用户；用户拒绝则保留失败并告诉
   模型不要重试；`--permission-mode bypass` 自动放行。升级结果携带实际放行来源；前缀区分
   用户批准、bypass 自动放行与已有升级授权，同时保留拒绝类型和证据。无人被询问时不写成
   “用户批准后重跑”。
-- **Nobody to ask** (headless, tests): the failure stands, and the result ends
+- **Nobody to ask** (headless, tests): neither is offered; the failure stands, and the result ends
   with a hint that names the boundary and points the model at the user — take a
   different approach, or say what access the command needs — never at a retry.
   A background command has no escalation loop, so its hint says to run the
@@ -3785,6 +3789,41 @@ blocked write both read as `operation not permitted` on macOS and are answered
 with completely different knobs, so the class is the actionable half; the same
 line is carried into the escalated result, which is otherwise the only record of
 why containment was removed.
+
+**Capabilities** (plan 283 stage 2b). The sandbox refuses only a few things,
+and two of them can be granted without lifting the rest: the network, and
+writes to a directory. Asking about those, not about "running without the
+sandbox", is what makes a yes reusable: the consent is to a capability, so the
+next command that needs it is covered whatever its text.
+
+- **Network**: once, for every bash command this workspace session (the
+  session-cache key `sandbox_network:*`), or for this project by program —
+  `sandbox_network(curl)`, one rule per program with an effect, known wrappers
+  stripped; a command is covered when every such program is. The program, not
+  a two-word prefix: reaching the network is what `curl` or `dig` is for, and
+  the second word is an option or a host. An opaque script names no programs
+  and gets the session scope only. Writes stay limited — the sandbox stays on.
+- **Write**: the parent directories of the refused paths the system log
+  reported, once or for this project — `sandbox_write(<dir>)`, a writable root
+  added to every contained bash call in the project. Only a plain directory is
+  offered: absolute, not `/` or the home directory itself, no glob characters,
+  nothing the permission layer treats as sensitive (`.git`, `.kloop`,
+  credential directories), and not one the policy already decides (inside a
+  writable root, where the refusal came from a protected subpath, or inside a
+  denied path). The added root gets the usual protected subpaths, and every
+  write deny still wins over it. No session scope: a directory is about the
+  project, and nothing is gained by asking again next session.
+
+The gate puts remembered capabilities into the `Verdict` (`grants`), and the
+executor widens the contained policy by them before the run, so a covered
+command is neither asked nor re-run. After a consent the command re-runs inside
+the widened sandbox (`[Re-ran inside the sandbox with network access after user
+approval; it had been denied (network): …]`); if that run is refused the other
+capability, it is asked again, at most three widenings per call, after which a
+refusal goes to the escalation. A declined or stopped widening keeps the
+refusal and says the sandbox was not widened. Bypass widens without asking.
+Nested sandboxes, unclassified refusals, writes that cannot be offered and
+anything left after the widenings still go to the full escalation below.
 
 Escalation consent is **remember-able** at the same granularity bash approvals
 use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`

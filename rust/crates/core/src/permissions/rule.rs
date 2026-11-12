@@ -38,6 +38,18 @@ pub(super) enum Rule {
         tokens: Vec<String>,
         wildcard: bool,
     },
+    /// `sandbox_network(<program>)`: a contained bash call may reach the
+    /// network when every segment with an effect runs a program so named
+    /// (plan 283). Writes stay contained; nothing else is vouched for.
+    SandboxNetwork {
+        program: String,
+    },
+    /// `sandbox_write(<absolute dir>)`: a writable root added to every
+    /// contained bash call in the project (plan 283) — a wider sandbox, not an
+    /// escape from it.
+    SandboxWrite {
+        dir: std::path::PathBuf,
+    },
 }
 
 /// The two directions of one path-glob rule. Allow only trusts the canonical
@@ -75,7 +87,10 @@ impl Rule {
         match self {
             Rule::Tool(t) => t == "bash",
             Rule::BashPrefix { tokens, wildcard } => argv_has_prefix(tokens, *wildcard, argv),
-            Rule::PathGlob { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+            Rule::PathGlob { .. }
+            | Rule::SandboxEscalatePrefix { .. }
+            | Rule::SandboxNetwork { .. }
+            | Rule::SandboxWrite { .. } => false,
         }
     }
 
@@ -88,7 +103,11 @@ impl Rule {
             Rule::SandboxEscalatePrefix { tokens, wildcard } => {
                 argv_has_prefix(tokens, *wildcard, argv)
             }
-            Rule::Tool(_) | Rule::BashPrefix { .. } | Rule::PathGlob { .. } => false,
+            Rule::Tool(_)
+            | Rule::BashPrefix { .. }
+            | Rule::PathGlob { .. }
+            | Rule::SandboxNetwork { .. }
+            | Rule::SandboxWrite { .. } => false,
         }
     }
 
@@ -151,7 +170,10 @@ impl Rule {
         match self {
             Rule::Tool(t) => t == tool,
             Rule::PathGlob { .. } => self.matches_path(tool, facts, PathDirection::Allows),
-            Rule::BashPrefix { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+            Rule::BashPrefix { .. }
+            | Rule::SandboxEscalatePrefix { .. }
+            | Rule::SandboxNetwork { .. }
+            | Rule::SandboxWrite { .. } => false,
         }
     }
 }
@@ -196,6 +218,33 @@ pub(super) fn parse_rule(entry: &str) -> Result<Rule> {
             "sandbox_escalate" => {
                 let (tokens, wildcard) = parse_prefix_pattern(tool, inner)?;
                 Ok(Rule::SandboxEscalatePrefix { tokens, wildcard })
+            }
+            "sandbox_network" => {
+                let program = inner.trim();
+                if program.is_empty()
+                    || program
+                        .chars()
+                        .any(|c| c.is_whitespace() || matches!(c, '/' | '*' | '?' | '[' | ','))
+                {
+                    bail!("rule '{entry}': sandbox_network takes one program name");
+                }
+                Ok(Rule::SandboxNetwork {
+                    program: program.to_string(),
+                })
+            }
+            "sandbox_write" => {
+                let dir = std::path::Path::new(inner);
+                if !dir.is_absolute()
+                    || dir.parent().is_none()
+                    || inner.contains(['*', '?', '[', ']', '{', '}', '\n', '\r'])
+                {
+                    bail!(
+                        "rule '{entry}': sandbox_write takes one absolute directory other than /, without glob characters"
+                    );
+                }
+                Ok(Rule::SandboxWrite {
+                    dir: dir.to_path_buf(),
+                })
             }
             "powershell" => {
                 bail!(
@@ -306,7 +355,11 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
                             }
                         }))
                 }
-                Rule::Tool(_) | Rule::PathGlob { .. } | Rule::SandboxEscalatePrefix { .. } => false,
+                Rule::Tool(_)
+                | Rule::PathGlob { .. }
+                | Rule::SandboxEscalatePrefix { .. }
+                | Rule::SandboxNetwork { .. }
+                | Rule::SandboxWrite { .. } => false,
             });
         }
         if let Some(argv) = command.argv() {

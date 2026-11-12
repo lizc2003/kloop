@@ -291,7 +291,14 @@ fn sandbox_for(
     workspace: &EffectiveWorkspace,
 ) -> Option<Arc<SandboxPolicy>> {
     match verdict.sandbox {
-        crate::permissions::SandboxPlan::Contained => workspace.sandbox.clone(),
+        crate::permissions::SandboxPlan::Contained if verdict.grants.is_empty() => {
+            workspace.sandbox.clone()
+        }
+        // Consents already given widen the sandbox for this call (plan 283).
+        crate::permissions::SandboxPlan::Contained => workspace
+            .sandbox
+            .as_ref()
+            .map(|policy| Arc::new(policy.with_grants(&verdict.grants))),
         crate::permissions::SandboxPlan::None | crate::permissions::SandboxPlan::Escalated => None,
     }
 }
@@ -419,134 +426,267 @@ pub(crate) async fn run_foreground_bash(
     if verdict.protection == crate::permissions::Protection::Required && sandbox.is_none() {
         bail!(sandbox::PROTECTION_REQUIRED);
     }
-    // A contained run marks its refusals and the system log is watched for
-    // them while it runs: what was refused, and on which path, is read from
-    // the kernel instead of guessed from the output (plan 283 stage 2a).
-    let tag = sandbox.as_ref().and_then(|_| sandbox::fresh_tag());
-    let watch = match &tag {
-        Some(tag) => sandbox::DenialWatch::start(tag).await,
-        None => None,
+    let run = |policy: Option<Arc<SandboxPolicy>>| {
+        let cwd = cwd.clone();
+        async move {
+            contained_attempt(
+                command,
+                &cwd,
+                policy.as_deref(),
+                bash,
+                timeout_ms,
+                ctx,
+                verdict.protection,
+                facts,
+            )
+            .await
+        }
     };
-    let output = run_foreground(
-        command,
-        &cwd,
-        sandbox.as_deref(),
-        tag.as_deref(),
-        bash,
-        timeout_ms,
-        ctx,
-        verdict.protection,
-    )
-    .await?;
-    fail_if_timed_out(&output, Some(&ctx.cfg.offload_dir))?;
-    let success = output.status.success();
+    let mut policy = sandbox;
+    let mut attempt = run(policy.clone()).await?;
     if remembered_escalation {
         return Ok(ForegroundRun {
             text: format!(
                 "{}{}",
                 sandbox::REMEMBERED_ESCALATION_PREFIX,
-                format_output(&output, Some(&ctx.cfg.offload_dir))
+                format_output(&attempt.output, Some(&ctx.cfg.offload_dir))
             ),
-            success,
+            success: attempt.output.status.success(),
         });
     }
 
     // 沙箱内这次的结果确实要交给模型时才格式化并落盘：升级获批会换成重跑的结果，
     // 先落盘的话第一次的全文就成了无人引用的文件。
     let mut hint = None;
-    // Sandbox denial handling applies only to an actually-sandboxed run; no
-    // policy, or a remembered escalation, leaves `sandbox` None and skips it.
-    // 判定看完整捕获的输出而不是内联文本：合并顺序是先 stdout 后 stderr，stdout 超过
-    // 内联上限时，stderr 里的拒绝行会被截掉，升级和提示就都不会出现。
-    // Only a failure — or a zero a pipe or `;` may have masked — is judged; a
-    // success that logged a refusal coped with it on its own.
-    let candidate =
-        !output.status.success() || (sandbox.is_some() && status_may_be_masked(command, facts));
-    let logged = match watch {
-        Some(watch) if candidate => Some(watch.finish().await),
-        _ => None,
-    };
-    let denial = match &sandbox {
-        Some(policy) if candidate => {
-            judge_denial(&output, logged.as_deref(), !policy.allow_network)
-        }
-        _ => None,
-    };
-    if let Some(denial) = denial {
+    // Each widening of the sandbox re-runs the command; the result says why.
+    let mut widened = String::new();
+    let mut widenings = 0;
+    while let Some(denial) = attempt.denial.take() {
         if verdict.protection == crate::permissions::Protection::Required {
             hint = Some(sandbox::PROTECTION_REQUIRED);
-        } else if denial.kind == sandbox::DenialKind::Read {
+            break;
+        }
+        if denial.kind == sandbox::DenialKind::Read {
             hint = Some(sandbox::PROTECTED_READ_DENIED);
-        } else {
-            // The code-level escalation loop (codex's retry-on-denial):
-            // ask once, and on approval re-run the command unsandboxed. The
-            // model has no way out of the sandbox of its own (plan 283).
-            let asking = workspace.permissions.escalate_sandbox_with_facts(
+            break;
+        }
+        // The network or a directory: widen the sandbox by exactly that and
+        // run again inside it (plan 283 stage 2b). A command that then runs
+        // into the other one is asked again, a bounded number of times.
+        let request = policy
+            .as_deref()
+            .filter(|_| widenings < MAX_WIDENINGS)
+            .and_then(|policy| capability_request(&denial, policy, command, facts));
+        if let (Some(request), Some(current)) = (request, policy.clone()) {
+            let escalation = ask_escalation(
+                ctx,
+                workspace
+                    .permissions
+                    .escalate_capability(command, &denial, &request, ctx.depth),
+            )
+            .await?;
+            match escalation.outcome {
+                EscalationOutcome::Approved(approval) => {
+                    widened.push_str(&sandbox::widened_prefix(
+                        &denial,
+                        approval,
+                        &escalation.grants,
+                    ));
+                    policy = Some(Arc::new(current.with_grants(&escalation.grants)));
+                    widenings += 1;
+                    attempt = run(policy.clone()).await?;
+                    continue;
+                }
+                EscalationOutcome::Declined => hint = Some(sandbox::CAPABILITY_DECLINED),
+                EscalationOutcome::Stopped => {
+                    ctx.stop.cancel();
+                    hint = Some(sandbox::CAPABILITY_STOPPED);
+                }
+                EscalationOutcome::NotAttempted => hint = Some(sandbox::DENIAL_HINT),
+            }
+            break;
+        }
+        // The code-level escalation loop (codex's retry-on-denial): ask once,
+        // and on approval re-run the command unsandboxed. The model has no way
+        // out of the sandbox of its own (plan 283).
+        let escalation = ask_escalation(
+            ctx,
+            workspace.permissions.escalate_sandbox_with_facts(
                 command,
                 Some(&denial),
                 ctx.depth,
                 facts,
-            );
-            // A prompt withdrawn by another call's stop leaves the sandboxed
-            // failure standing, exactly as a decline would; the turn is ending.
-            // Cancelling the turn itself withdraws it too, but must end the
-            // call as interrupted rather than let the stale failure read as an
-            // answer.
-            let escalation = tokio::select! {
-                biased;
-                _ = ctx.stop.cancelled() => Escalation {
-                    outcome: EscalationOutcome::Declined,
-                    notice: None,
-                    approval: None,
-                },
-                _ = ctx.cancel.cancelled() => bail!("interrupted"),
-                escalation = asking => escalation,
-            };
-            ctx.journal_approval(escalation.approval.clone()).await;
-            if let Some(notice) = &escalation.notice {
-                ctx.ui.emit(&Event::Note(notice.message.clone()));
+            ),
+        )
+        .await?;
+        match escalation.outcome {
+            EscalationOutcome::Approved(approval) => {
+                let raw = run(None).await?.output;
+                // What the sandbox refused is the only record of why this ran
+                // uncontained, and the sandboxed output is about to be dropped
+                // for the unsandboxed one. Carrying the line keeps the
+                // escalation attributable after the fact.
+                return Ok(ForegroundRun {
+                    text: format!(
+                        "{widened}{}{}",
+                        sandbox::escalated_prefix(&denial, approval),
+                        format_output(&raw, Some(&ctx.cfg.offload_dir))
+                    ),
+                    success: raw.status.success(),
+                });
             }
-            match escalation.outcome {
-                EscalationOutcome::Approved(approval) => {
-                    let raw = run_foreground(
-                        command,
-                        &cwd,
-                        None,
-                        None,
-                        bash,
-                        timeout_ms,
-                        ctx,
-                        verdict.protection,
-                    )
-                    .await?;
-                    fail_if_timed_out(&raw, Some(&ctx.cfg.offload_dir))?;
-                    // What the sandbox refused is the only record of why this
-                    // ran uncontained, and the sandboxed output is about to be
-                    // dropped for the unsandboxed one. Carrying the line keeps
-                    // the escalation attributable after the fact.
-                    return Ok(ForegroundRun {
-                        text: format!(
-                            "{}{}",
-                            sandbox::escalated_prefix(&denial, approval),
-                            format_output(&raw, Some(&ctx.cfg.offload_dir))
-                        ),
-                        success: raw.status.success(),
-                    });
-                }
-                EscalationOutcome::Declined => hint = Some(sandbox::ESCALATION_DECLINED),
-                EscalationOutcome::Stopped => {
-                    ctx.stop.cancel();
-                    hint = Some(sandbox::ESCALATION_STOPPED);
-                }
-                EscalationOutcome::NotAttempted => hint = Some(sandbox::DENIAL_HINT),
+            EscalationOutcome::Declined => hint = Some(sandbox::ESCALATION_DECLINED),
+            EscalationOutcome::Stopped => {
+                ctx.stop.cancel();
+                hint = Some(sandbox::ESCALATION_STOPPED);
             }
+            EscalationOutcome::NotAttempted => hint = Some(sandbox::DENIAL_HINT),
         }
+        break;
     }
-    let mut text = format_output(&output, Some(&ctx.cfg.offload_dir));
+    let success = attempt.output.status.success();
+    let mut text = format!(
+        "{widened}{}",
+        format_output(&attempt.output, Some(&ctx.cfg.offload_dir))
+    );
     if let Some(hint) = hint {
         text.push_str(hint);
     }
     Ok(ForegroundRun { text, success })
+}
+
+/// How many times one call may widen its sandbox before a further refusal goes
+/// to the full escalation instead.
+const MAX_WIDENINGS: usize = 3;
+
+/// One run of the command — contained when `policy` is given — and what the
+/// sandbox refused in it, if anything.
+struct Attempt {
+    output: ForegroundOutput,
+    denial: Option<sandbox::SandboxDenial>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn contained_attempt(
+    command: &str,
+    cwd: &Path,
+    policy: Option<&SandboxPolicy>,
+    bash: &ShellProgram,
+    timeout_ms: u64,
+    ctx: &ToolCtx,
+    protection: crate::permissions::Protection,
+    facts: Option<&crate::shell::BashFacts>,
+) -> Result<Attempt> {
+    // A contained run marks its refusals and the system log is watched for
+    // them while it runs: what was refused, and on which path, is read from
+    // the kernel instead of guessed from the output (plan 283 stage 2a).
+    let tag = policy.and_then(|_| sandbox::fresh_tag());
+    let watch = match &tag {
+        Some(tag) => sandbox::DenialWatch::start(tag).await,
+        None => None,
+    };
+    let output = run_foreground(
+        command,
+        cwd,
+        policy,
+        tag.as_deref(),
+        bash,
+        timeout_ms,
+        ctx,
+        protection,
+    )
+    .await?;
+    fail_if_timed_out(&output, Some(&ctx.cfg.offload_dir))?;
+    // Only a failure — or a zero a pipe or `;` may have masked — is judged; a
+    // success that logged a refusal coped with it on its own. 判定看完整捕获的
+    // 输出而不是内联文本：stdout 超过内联上限时，stderr 里的拒绝行会被截掉。
+    let candidate =
+        !output.status.success() || (policy.is_some() && status_may_be_masked(command, facts));
+    let logged = match watch {
+        Some(watch) if candidate => Some(watch.finish().await),
+        _ => None,
+    };
+    let denial = policy
+        .filter(|_| candidate)
+        .and_then(|policy| judge_denial(&output, logged.as_deref(), !policy.allow_network));
+    Ok(Attempt { output, denial })
+}
+
+/// Put an escalation question while the call can still be stopped. A prompt
+/// withdrawn by another call's stop leaves the sandboxed failure standing,
+/// exactly as a decline would; the turn is ending. Cancelling the turn itself
+/// withdraws it too, but ends the call as interrupted rather than let the
+/// stale failure read as an answer.
+async fn ask_escalation(
+    ctx: &ToolCtx,
+    asking: impl std::future::Future<Output = Escalation>,
+) -> Result<Escalation> {
+    let escalation = tokio::select! {
+        biased;
+        _ = ctx.stop.cancelled() => Escalation {
+            outcome: EscalationOutcome::Declined,
+            notice: None,
+            approval: None,
+            grants: Default::default(),
+        },
+        _ = ctx.cancel.cancelled() => bail!("interrupted"),
+        escalation = asking => escalation,
+    };
+    ctx.journal_approval(escalation.approval.clone()).await;
+    if let Some(notice) = &escalation.notice {
+        ctx.ui.emit(&Event::Note(notice.message.clone()));
+    }
+    Ok(escalation)
+}
+
+/// The sandbox widening that would answer this refusal, if one can: the
+/// network, or the parent directories of the refused writes that may be
+/// granted at all. `None` sends the refusal to the full escalation.
+fn capability_request(
+    denial: &sandbox::SandboxDenial,
+    policy: &SandboxPolicy,
+    command: &str,
+    facts: Option<&crate::shell::BashFacts>,
+) -> Option<crate::permissions::CapabilityRequest> {
+    match denial.kind {
+        sandbox::DenialKind::Network if !policy.allow_network => {
+            let computed;
+            let facts = match facts {
+                Some(facts) => facts,
+                None => {
+                    computed = crate::shell::analyze_bash_facts(command);
+                    &computed
+                }
+            };
+            Some(crate::permissions::CapabilityRequest::Network {
+                programs: facts
+                    .analysis
+                    .commands()
+                    .and_then(crate::permissions::network_programs)
+                    .filter(|programs| !programs.is_empty()),
+            })
+        }
+        sandbox::DenialKind::Write => {
+            let home = std::env::home_dir();
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            for path in &denial.paths {
+                let Some(dir) = path.parent() else {
+                    continue;
+                };
+                if crate::permissions::grantable_write_dir(dir, home.as_deref())
+                    && !policy.already_decides_writes(dir)
+                    && !dirs.iter().any(|known| known == dir)
+                {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            (!dirs.is_empty()).then_some(crate::permissions::CapabilityRequest::Write { dirs })
+        }
+        sandbox::DenialKind::Network
+        | sandbox::DenialKind::Read
+        | sandbox::DenialKind::Nested
+        | sandbox::DenialKind::Unclassified => None,
+    }
 }
 
 /// One foreground shell run. The root is awaited independently from pipe EOF:
@@ -2204,6 +2344,15 @@ mod tests {
             tag: &str,
             decision: crate::permissions::Decision,
         ) -> (crate::tools::ToolCtx, Arc<AtomicUsize>) {
+            escalating_ctx_with(tag, decision, &[])
+        }
+
+        /// [`escalating_ctx`] whose project already holds `allow` rules.
+        fn escalating_ctx_with(
+            tag: &str,
+            decision: crate::permissions::Decision,
+            allow: &[String],
+        ) -> (crate::tools::ToolCtx, Arc<AtomicUsize>) {
             let root = std::env::temp_dir().join(format!("kloop-sbx-{tag}"));
             std::fs::create_dir_all(&root).unwrap();
             let root = std::fs::canonicalize(&root).unwrap();
@@ -2214,7 +2363,10 @@ mod tests {
             });
             let perms = crate::permissions::Permissions::new(
                 crate::permissions::Mode::Manual,
-                &Default::default(),
+                &crate::permissions::PermissionRules {
+                    allow: allow.to_vec(),
+                    ..Default::default()
+                },
                 root.clone(),
                 Some(approver),
             )
@@ -2443,6 +2595,7 @@ mod tests {
                 "esc-yes",
                 crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
             );
+            let ctx = deny_writes_to(ctx, &outside_dir("esc-yes"));
             let target = outside_dir("esc-yes").join("climbed.txt");
             let _ = std::fs::remove_file(&target);
             let (out, is_error) = run_tool(
@@ -2487,7 +2640,7 @@ mod tests {
             .await;
             assert!(!is_error, "{out}");
             assert!(
-                out.contains("Re-ran without the sandbox after user approval"),
+                out.contains("Re-ran inside the sandbox with write access"),
                 "{out}"
             );
             assert!(target.exists(), "{out}");
@@ -2589,6 +2742,113 @@ mod tests {
             let _ = std::fs::remove_file(target);
         }
 
+        /// Plan 283 stage 2b: a refused write outside the root is answered by
+        /// widening the sandbox — that directory writable for the re-run — not
+        /// by lifting it; a declined widening says so; a project
+        /// `sandbox_write(...)` rule grants it before the run, with nothing
+        /// asked and nothing re-run.
+        #[tokio::test]
+        async fn a_refused_write_widens_the_sandbox_by_that_directory() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, asked) = escalating_ctx(
+                "cap-write",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let dir = outside_dir("cap-write");
+            let target = dir.join("widened.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo widened > {}", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(
+                out.starts_with(&format!(
+                    "[Re-ran inside the sandbox with write access to {} after user approval; \
+                     it had been denied (file write): file-write-create {}]",
+                    dir.display(),
+                    target.display()
+                )),
+                "{out}"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "widened\n");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            let (ctx, asked) = escalating_ctx("cap-write-no", crate::permissions::Decision::Deny);
+            let refused = outside_dir("cap-write-no").join("refused.txt");
+            let _ = std::fs::remove_file(&refused);
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!("echo no > {}", refused.display())),
+                &ctx,
+            )
+            .await;
+            assert!(out.ends_with(crate::sandbox::CAPABILITY_DECLINED), "{out}");
+            assert!(!refused.exists(), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            let granted = outside_dir("cap-write-rule");
+            let (ctx, asked) = escalating_ctx_with(
+                "cap-write-rule",
+                crate::permissions::Decision::Deny,
+                &[format!("sandbox_write({})", granted.display())],
+            );
+            let inside = granted.join("ruled.txt");
+            let _ = std::fs::remove_file(&inside);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("echo ruled > {}", inside.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(!out.contains("Re-ran"), "{out}");
+            assert_eq!(std::fs::read_to_string(&inside).unwrap(), "ruled\n");
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "{out}");
+            let _ = std::fs::remove_file(target);
+            let _ = std::fs::remove_file(inside);
+        }
+
+        /// The network is granted the same way: the re-run keeps every write
+        /// limit and only gains the network; a project `sandbox_network(...)`
+        /// rule for the program grants it before the run. Only a resolver
+        /// lookup of an `.invalid` name is attempted, which fails fast either
+        /// way — what is asserted is the sandbox the command got.
+        #[tokio::test]
+        async fn a_refused_network_widens_the_sandbox_by_the_network() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let command = "curl -sS -m 2 http://kloop-plan283.invalid/";
+            let (ctx, asked) = escalating_ctx(
+                "cap-net",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let (out, _) = run_tool("bash", bash_input(command), &ctx).await;
+            assert!(
+                out.starts_with(
+                    "[Re-ran inside the sandbox with network access after user approval; \
+                     it had been denied (network): network-outbound"
+                ),
+                "{out}"
+            );
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            let (ctx, asked) = escalating_ctx_with(
+                "cap-net-rule",
+                crate::permissions::Decision::Deny,
+                &["sandbox_network(curl)".to_string()],
+            );
+            let (out, _) = run_tool("bash", bash_input(command), &ctx).await;
+            assert!(!out.contains("Re-ran"), "{out}");
+            assert!(!out.contains("denied"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "{out}");
+        }
+
         /// A refused read is a protected path by construction — the profile
         /// reads the whole disk otherwise — so it is never offered for an
         /// escalation, whatever the approver would say.
@@ -2678,7 +2938,7 @@ mod tests {
                 "denial was not recognized: {out}"
             );
             assert!(
-                out.contains("Re-ran without the sandbox after user approval"),
+                out.contains("Re-ran inside the sandbox with write access"),
                 "{out}"
             );
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
@@ -2738,6 +2998,7 @@ mod tests {
                     crate::permissions::ApprovalScope::WorkspaceSession,
                 ),
             );
+            let ctx = deny_writes_to(ctx, &outside_dir("esc-remembered"));
             // `git init` so the remembered two-word prefix is the subcommand,
             // not the path — the second call must be a *different* argument
             // covered by the same rule, which is the point of the prefix.
@@ -2801,6 +3062,7 @@ mod tests {
                     crate::permissions::ApprovalScope::WorkspaceSession,
                 ),
             );
+            let ctx = deny_writes_to(ctx, &outside_dir("log-remembered"));
             let outside = outside_dir("log-remembered");
             let counter = ctx.cfg.sandbox.as_ref().unwrap().writable_roots[0]
                 .root
@@ -2851,6 +3113,7 @@ mod tests {
                 return;
             }
             let (ctx, asked) = escalating_ctx("esc-no", crate::permissions::Decision::Deny);
+            let ctx = deny_writes_to(ctx, &outside_dir("esc-no"));
             let target = outside_dir("esc-no").join("nope.txt");
             let _ = std::fs::remove_file(&target);
             let (out, is_error) = run_tool(
@@ -2879,6 +3142,7 @@ mod tests {
                 return;
             }
             let (ctx, asked) = escalating_ctx("esc-stop", crate::permissions::Decision::Stop);
+            let ctx = deny_writes_to(ctx, &outside_dir("esc-stop"));
             let target = outside_dir("esc-stop").join("nope.txt");
             let _ = std::fs::remove_file(&target);
             let (out, is_error) = run_tool(
