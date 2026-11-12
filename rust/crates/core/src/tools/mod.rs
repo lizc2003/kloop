@@ -433,10 +433,12 @@ pub(crate) type ToolJournalReceiver =
 
 /// A call's way to the turn's session file. `run_one` binds it to the call's
 /// id, so a note sent from anywhere below (the gate, the bash escalation) says
-/// which call it is about.
+/// which call it is about. A question asked after the round ended — a
+/// background Program's call — goes to the history's backlog instead.
 #[derive(Clone)]
 pub(crate) struct ToolJournal {
     tx: tokio::sync::mpsc::UnboundedSender<(JournalNote, tokio::sync::oneshot::Sender<()>)>,
+    backlog: crate::history::ApprovalBacklog,
     /// False for calls a program fires: the program's own call is the one the
     /// session's pairing repair has to judge, so theirs are not journaled as
     /// started. Their questions still are.
@@ -445,11 +447,12 @@ pub(crate) struct ToolJournal {
 }
 
 impl ToolJournal {
-    pub(crate) fn channel() -> (Self, ToolJournalReceiver) {
+    pub(crate) fn channel(backlog: crate::history::ApprovalBacklog) -> (Self, ToolJournalReceiver) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
                 tx,
+                backlog,
                 starts: true,
                 call_id: None,
             },
@@ -484,22 +487,24 @@ impl ToolJournal {
     }
 
     pub(crate) async fn approval(&self, record: crate::permissions::ApprovalRecord) {
-        if let Some(id) = &self.call_id {
-            self.send(JournalNote::Approval {
-                tool_use_id: id.to_string(),
-                record,
-            })
-            .await;
+        let Some(id) = &self.call_id else {
+            return;
+        };
+        let note = JournalNote::Approval {
+            tool_use_id: id.to_string(),
+            record: record.clone(),
+        };
+        if !self.send(note).await {
+            self.backlog.lock().unwrap().push((id.to_string(), record));
         }
     }
 
     /// Returns once the turn has written the line, or at once if the turn is
     /// no longer listening — a note nobody can write must not block the call.
-    async fn send(&self, note: JournalNote) {
+    /// Whether the line was written.
+    async fn send(&self, note: JournalNote) -> bool {
         let (ack, written) = tokio::sync::oneshot::channel();
-        if self.tx.send((note, ack)).is_ok() {
-            let _ = written.await;
-        }
+        self.tx.send((note, ack)).is_ok() && written.await.is_ok()
     }
 }
 
@@ -554,10 +559,12 @@ impl ToolCtx {
     /// answers to one.
     pub(crate) async fn journal_approval(
         &self,
-        record: Option<crate::permissions::ApprovalRecord>,
+        records: impl IntoIterator<Item = crate::permissions::ApprovalRecord>,
     ) {
-        if let (Some(journal), Some(record)) = (&self.journal, record) {
-            journal.approval(record).await;
+        if let Some(journal) = &self.journal {
+            for record in records {
+                journal.approval(record).await;
+            }
         }
     }
 }
@@ -1423,7 +1430,7 @@ impl PreparedCall {
         .await;
         let permission = match gated {
             Some(outcome) => {
-                ctx.journal_approval(outcome.approval).await;
+                ctx.journal_approval(outcome.approvals).await;
                 Some(outcome.result)
             }
             None => None,
@@ -2513,6 +2520,75 @@ mod tests {
 
     use super::testutil::*;
     use super::*;
+
+    /// Plan 283 review: a question asked after its round ended — a background
+    /// Program keeps calling tools once the dispatch that started it returned,
+    /// and the round's channel with it — is not lost. It waits in the
+    /// history's backlog and is written before the next line.
+    #[tokio::test]
+    async fn a_question_after_the_round_ended_is_written_before_the_next_line() {
+        let dir = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-plan283-backlog-").expect("fresh id"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.jsonl");
+        let mut history = crate::history::History::new(dir.join("offload"));
+        history.attach_rollout(crate::rollout::Rollout::new(session.clone()));
+        let (journal, notes) = ToolJournal::channel(history.approval_backlog());
+        drop(notes);
+        let record = crate::permissions::ApprovalRecord {
+            door: crate::permissions::ApprovalDoor::Gate,
+            tool: "bash".into(),
+            reason: crate::permissions::AskReason::Uncontained,
+            detail: "make install".into(),
+            keys: vec!["bash:make install".into()],
+            rules: vec!["bash(make install *)".into()],
+            offered: vec![crate::permissions::ApprovalScope::Once],
+            answer: crate::permissions::ApprovalAnswer::Allowed {
+                scope: crate::permissions::ApprovalScope::Once,
+            },
+        };
+        journal
+            .for_call("program-call")
+            .approval(record.clone())
+            .await;
+        history.note_tool_started("next-call");
+
+        let lines: Vec<Value> = std::fs::read_to_string(&session)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|line| matches!(line["type"].as_str(), Some("approval" | "tool_started")))
+            .collect();
+        let kinds: Vec<(&str, &str)> = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["type"].as_str().unwrap(),
+                    line["tool_use_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![("approval", "program-call"), ("tool_started", "next-call")]
+        );
+        let mut written = lines[0].clone();
+        for envelope in [
+            "type",
+            "tool_use_id",
+            "id",
+            "parent",
+            "ts",
+            "format_version",
+        ] {
+            written.as_object_mut().unwrap().remove(envelope);
+        }
+        assert_eq!(
+            serde_json::from_value::<crate::permissions::ApprovalRecord>(written).unwrap(),
+            record
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// The two things the synonym rename must never do. It fills a gap and it
     /// does not guess: a canonical key that is present stays, whatever its type

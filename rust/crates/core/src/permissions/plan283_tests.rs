@@ -11,7 +11,8 @@ async fn plan283_gate_record(p: &Permissions, input: Value) -> Option<ApprovalRe
         None,
     )
     .await
-    .approval
+    .approvals
+    .pop()
 }
 
 /// 门问了人，记下问题、给了哪些作用域、答了什么；同一个问题第二次被会话记忆
@@ -251,4 +252,65 @@ async fn plan283_a_write_only_escalation_is_covered_by_its_write_rule() {
     assert!(!p.sandbox_escalation_remembered(&format!("{command} && make install")));
     // 没有命令段也没有写入：没有可同意的东西，不算记住。
     assert!(!p.sandbox_escalation_remembered("ls && pwd"));
+}
+
+/// 复审：命中升级记忆、运行前就跳过沙箱的调用也要留一条记录——门在沙箱层直接放行、
+/// 执行层不再尝试沙箱，两边都不问，没有这条，记忆持续生效就看不见。被拒的调用和后台
+/// 调用（不跳过沙箱）都不记。
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn plan283_a_remembered_escalation_that_skips_the_sandbox_is_recorded() {
+    let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false);
+    let execution = || crate::sandbox::ExecutionContext::sandboxed(Some(&policy));
+    let command = "cd /x && cargo test -p core 2>&1 | tail -20";
+    let p = gate(
+        Mode::Manual,
+        rules(&["sandbox_escalate(cargo test *)"], &[], &[]),
+        ScriptedApprover::new(vec![]),
+    );
+    let outcome = p
+        .gate_call("bash", &bash(command), None, None, 0, execution(), None)
+        .await;
+    assert_eq!(outcome.result.unwrap().sandbox, SandboxPlan::Escalated);
+    assert_eq!(
+        outcome.approvals,
+        vec![ApprovalRecord {
+            door: ApprovalDoor::Escalation,
+            tool: "bash".into(),
+            reason: AskReason::EscalatedBeforeRun,
+            detail: command.into(),
+            keys: vec!["sandbox_escalate:cargo test".into()],
+            rules: vec!["sandbox_escalate(cargo test *)".into()],
+            offered: Vec::new(),
+            answer: ApprovalAnswer::Remembered {
+                by: MemorySource::Rule,
+            },
+        }]
+    );
+
+    let background = json!({"command": command, "background": true});
+    let outcome = p
+        .gate_call("bash", &background, None, None, 0, execution(), None)
+        .await;
+    assert_eq!(outcome.result.unwrap().sandbox, SandboxPlan::Contained);
+    assert_eq!(outcome.approvals, Vec::new());
+
+    // 显式 ask 规则问了、被拒：只有门自己的那条记录。
+    let p = gate(
+        Mode::Manual,
+        rules(&["sandbox_escalate(cargo test *)"], &[], &["bash(cargo test *)"]),
+        ScriptedApprover::new(vec![]),
+    );
+    let outcome = p
+        .gate_call("bash", &bash(command), None, None, 0, execution(), None)
+        .await;
+    assert!(outcome.result.is_err());
+    assert_eq!(
+        outcome
+            .approvals
+            .iter()
+            .map(|record| (record.reason.clone(), record.answer))
+            .collect::<Vec<_>>(),
+        vec![(AskReason::AskRule, ApprovalAnswer::Denied)]
+    );
 }

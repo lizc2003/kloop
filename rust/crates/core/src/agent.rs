@@ -1054,7 +1054,7 @@ impl Turn<'_> {
                 | ContentBlock::ToolResult { .. } => None,
             })
             .collect();
-        let (journal, journal_notes) = ToolJournal::channel();
+        let (journal, journal_notes) = ToolJournal::channel(self.history.approval_backlog());
         let ctx = ToolCtx {
             cfg: self.cfg.clone(),
             ui: self.ui.clone(),

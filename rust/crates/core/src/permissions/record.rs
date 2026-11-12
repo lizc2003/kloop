@@ -61,6 +61,10 @@ pub enum AskReason {
     Tool,
     /// The OS sandbox denied a contained run; `denial` is the class label.
     SandboxDenied { denial: String },
+    /// A remembered escalation took the call out of the sandbox before it
+    /// ran, sparing the question a denial would have asked; nothing was
+    /// denied this time.
+    EscalatedBeforeRun,
 }
 
 /// What came of the question.

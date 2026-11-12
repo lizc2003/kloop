@@ -724,8 +724,10 @@ turn records into its own file.
 An `approval` line (plan 283) records one permission question about a call, or
 a memory that answered one: which door asked (`gate`, or `escalation` after a
 sandbox denial), why (`hazard`, `ask_rule`, `incomplete_parse`, `uncontained`,
-`outside_workspace`, `tool`, `sandbox_denied`; `no_sandbox` only in files
-written before `disable_sandbox` was removed), the clipped
+`outside_workspace`, `tool`, `sandbox_denied`, `escalated_before_run` — a
+remembered escalation that took the call out of the sandbox before it ran, so
+neither door asked; `no_sandbox` only in files written before `disable_sandbox`
+was removed), the clipped
 detail, the session keys and durable rules a remembering answer would write,
 the scopes offered, and the answer (`allowed` with its scope, `denied`,
 `stopped`, `no_approver`, or `remembered` by a project rule or the session
@@ -733,7 +735,10 @@ cache). Memory-answered lines exist so the counts can say what memory saved,
 not only what it failed to. It travels over the same per-call channel as
 `tool_started` — which is why `run_one` binds that channel to the call's id,
 so the gate and the bash escalation below it need not know the id — and is
-written whether or not the call is from a program. Nothing on the resume path
+written whether or not the call is from a program. A background Program keeps
+calling tools after the dispatch that started it returned, taking the round's
+channel with it; its questions go to the history's backlog instead and are
+written before the next line the history writes. Nothing on the resume path
 reads it: it is for offline counting (`permissions/approval_replay.rs`, an
 ignored test that replays the local corpus through the real gate). Prompts
 withdrawn by a stop or cancel leave no line, and harness commands (`!cmd`, a
@@ -3716,7 +3721,12 @@ Objects contain process lifetime, not filesystem access.
 
 When a sandboxed command fails and the failure looks like a sandbox denial
 (keyword match ported from codex, plus DNS-failure shapes when the sandbox
-disables network), **kloop decides whether it leaves the sandbox; the model
+disables network) — "fails" including a zero exit that may hide the failure:
+bash reports only the last command's status, so `make test 2>&1 | tail -20` or
+`make install; echo done` exits 0 even when the part that did the work was
+denied, and when the last command is read-only and something before it had an
+effect or a redirect writes, the output is judged as if the status were
+unknown — **kloop decides whether it leaves the sandbox; the model
 cannot** (plan 283). The bash tool has no `disable_sandbox` parameter any more —
 a call still carrying it fails as an unknown field, and dispatch checks bash
 input before the gate so nobody is asked about a call that could never run —

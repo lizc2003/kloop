@@ -280,6 +280,38 @@ fn sandbox_for(
     }
 }
 
+/// Whether a zero exit status may hide the failure the sandbox caused. bash
+/// reports only the last command's status, so in `make test 2>&1 | tail -20`
+/// or `make install; echo done` the part that did the work can be denied while
+/// the call still exits 0 — and, with no way out of the sandbox but the
+/// escalation (plan 283), that run would end there. Only when the last command
+/// is read-only (it is not what the sandbox stopped) and something before it
+/// had an effect or a redirect writes.
+pub(super) fn status_may_be_masked(command: &str, facts: Option<&crate::shell::BashFacts>) -> bool {
+    let computed;
+    let facts = match facts {
+        Some(facts) => facts,
+        None => {
+            computed = crate::shell::analyze_bash_facts(command);
+            &computed
+        }
+    };
+    let read_only = |command: &crate::shell::CommandFact| {
+        command
+            .argv()
+            .is_some_and(|argv| crate::shell::argv_is_readonly(&argv))
+    };
+    let Some((last, earlier)) = facts.commands.split_last() else {
+        return false;
+    };
+    read_only(last)
+        && (earlier.iter().any(|command| !read_only(command))
+            || facts
+                .redirects
+                .iter()
+                .any(|redirect| redirect.direction == crate::shell::Direction::Write))
+}
+
 /// What one foreground run left behind: the model-facing text, and whether the
 /// command that produced it (the escalated re-run, when there was one)
 /// succeeded. A scheduled check needs the second without parsing the first.
@@ -349,10 +381,17 @@ pub(crate) async fn run_foreground_bash(
     // policy, or a remembered escalation, leaves `sandbox` None and skips it.
     // 判定看完整捕获的输出而不是内联文本：合并顺序是先 stdout 后 stderr，stdout 超过
     // 内联上限时，stderr 里的拒绝行会被截掉，升级和提示就都不会出现。
+    // A masked zero is judged like a failure whose status is unknown.
+    let exit_code =
+        if output.status.success() && sandbox.is_some() && status_may_be_masked(command, facts) {
+            None
+        } else {
+            output.status.code()
+        };
     if let Some(policy) = &sandbox
-        && !output.status.success()
+        && exit_code != Some(0)
         && let Some(denial) = sandbox::classify_sandbox_denial(
-            output.status.code(),
+            exit_code,
             &captured_text(&output),
             !policy.allow_network,
         )
@@ -1574,6 +1613,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(cwd);
     }
 
+    /// A zero exit can hide the denied command only when the last one is
+    /// read-only and something before it had an effect (plan 283 review).
+    #[test]
+    fn a_read_only_tail_can_mask_the_status_of_the_work_before_it() {
+        for (command, masked) in [
+            ("make test 2>&1 | tail -20", true),
+            ("cd /x && make check 2>&1 | tail -80", true),
+            ("make install; echo done", true),
+            ("cargo test | grep -E 'test result'", true),
+            ("echo hi > /elsewhere/out.txt; echo done", true),
+            ("make test", false),
+            ("cat build.log | tail -5", false),
+            ("make test | tee test.log", false),
+            ("ls && pwd", false),
+        ] {
+            assert_eq!(
+                super::status_may_be_masked(command, None),
+                masked,
+                "{command}"
+            );
+        }
+    }
+
     /// Plan 283 removed `disable_sandbox`: it is an unknown field like any
     /// other, on every platform and whatever its value.
     #[tokio::test]
@@ -2310,6 +2372,47 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
             assert_eq!(asked.load(Ordering::SeqCst), 1, "asked exactly once: {out}");
+        }
+
+        /// A pipe ending in a read-only command exits 0 even when the command
+        /// before it was denied (`make test 2>&1 | tail -20`). With no way out
+        /// of the sandbox but the escalation, that zero must not end the run
+        /// there (plan 283 review).
+        #[tokio::test]
+        async fn a_denial_masked_by_a_read_only_pipe_tail_still_escalates() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, asked) = escalating_ctx(
+                "esc-pipe",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let target = outside_dir("esc-pipe").join("piped.txt");
+            let _ = std::fs::remove_file(&target);
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!("touch {} 2>&1 | tail -5", target.display())),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert!(
+                out.contains("Re-ran without the sandbox after user approval"),
+                "{out}"
+            );
+            assert!(target.exists(), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            // A read-only pipeline has nothing the sandbox could have stopped.
+            let (out, _) = run_tool(
+                "bash",
+                bash_input("echo 'touch: x: Operation not permitted' | tail -1"),
+                &ctx,
+            )
+            .await;
+            assert!(!out.contains("Re-ran without the sandbox"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+            let _ = std::fs::remove_file(target);
         }
 
         /// 升级获批后返回的是重跑的结果：沙箱内那次的超长输出不能先落盘，否则就是

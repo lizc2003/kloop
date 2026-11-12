@@ -104,8 +104,9 @@ pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> 
     let status_line = wait_status_line(id, &status, block, timeout_ms);
     let mut tail = read_tail(&path).await;
     if let (BgStatus::Exited(code), Some(sb)) = (&status, sandboxed)
-        && *code != Some(0)
-        && sandbox::is_likely_sandbox_denied(*code, &tail, sb.network_disabled)
+        && let code = code.filter(|code| *code != 0 || !sb.status_may_be_masked)
+        && code != Some(0)
+        && sandbox::is_likely_sandbox_denied(code, &tail, sb.network_disabled)
     {
         tail.push_str(if sb.requires_protection {
             sandbox::PROTECTION_REQUIRED
@@ -218,6 +219,8 @@ fn status_text(status: &BgStatus) -> String {
 struct BgSandbox {
     network_disabled: bool,
     requires_protection: bool,
+    /// A zero exit may hide a denied earlier command ([`super::status_may_be_masked`]).
+    status_may_be_masked: bool,
 }
 
 type BackgroundShellRegistration = ExecutionRegistration;
@@ -353,6 +356,7 @@ impl BackgroundShells {
                         network_disabled: !policy.allow_network,
                         requires_protection: verdict.protection
                             == crate::permissions::Protection::Required,
+                        status_may_be_masked: super::status_may_be_masked(command, facts),
                     }),
                 },
             );

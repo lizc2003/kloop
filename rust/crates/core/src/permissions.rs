@@ -730,7 +730,39 @@ impl Permissions {
                 &mut approval,
             )
             .await;
-        GateOutcome { result, approval }
+        let mut approvals: Vec<ApprovalRecord> = approval.into_iter().collect();
+        // Only a call that will actually run uncontained spared a question.
+        if let Ok(verdict) = &result
+            && verdict.sandbox == SandboxPlan::Escalated
+            && let Some(record) = self.escalated_before_run(input, facts)
+        {
+            approvals.push(record);
+        }
+        GateOutcome { result, approvals }
+    }
+
+    /// The record for a call a remembered escalation takes out of the sandbox
+    /// before it runs. Neither the gate (which auto-allows it at the sandbox
+    /// layer) nor the executor (which skips the contained attempt) asks
+    /// anything, so without this a memory that keeps working is invisible.
+    fn escalated_before_run(
+        &self,
+        input: &Value,
+        facts: Option<&BashFacts>,
+    ) -> Option<ApprovalRecord> {
+        let command = input["command"].as_str()?;
+        let remember = escalation_remember_payload(command, self.identity.cwd(), facts)?;
+        let by = self.escalation_memory_source(&remember)?;
+        Some(ApprovalRecord {
+            door: ApprovalDoor::Escalation,
+            tool: "bash".to_string(),
+            reason: AskReason::EscalatedBeforeRun,
+            detail: clip(command),
+            keys: remember.signatures,
+            rules: remember.rules,
+            offered: Vec::new(),
+            answer: ApprovalAnswer::Remembered { by },
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1407,10 +1439,12 @@ impl Permissions {
     }
 }
 
-/// The gate's answer plus what to record about the question it asked, if any.
+/// The gate's answer plus what to record about the questions it asked or
+/// spared: at most one gate question, and a remembered escalation that skips
+/// the sandbox.
 pub(crate) struct GateOutcome {
     pub(crate) result: Result<Verdict, Refusal>,
-    pub(crate) approval: Option<ApprovalRecord>,
+    pub(crate) approvals: Vec<ApprovalRecord>,
 }
 
 /// One question put to the approver, and the record of it.

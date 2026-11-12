@@ -15,8 +15,9 @@
 //! - `KLOOP_REPLAY_ASSUME_DENIED`：原来脱沙箱跑、现在会进沙箱的调用，结果里没有拒绝痕迹，
 //!   离线不知道会不会被拒；设了它就按“全部被拒”替它们问升级，得到这部分询问的上界。
 //!
-//! 简化：每个项目的持久规则从窗口开头的空集开始累积；全局 deny/ask 规则、权限模式
-//! 都不回放（一律 manual）；fork 出来的会话按 tool_use id 去重。
+//! 调用先过生产入口的 `normalize_tool_uses`（拆 `call_tool` 外壳、参数别名改名），权限门看到的
+//! 和真实分发一样。简化：每个项目的持久规则从窗口开头的空集开始累积；全局 deny/ask 规则、
+//! 权限模式都不回放（一律 manual）；fork 出来的会话按 tool_use id 去重。
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -221,6 +222,24 @@ fn recorded_denial(result: &str) -> Option<Option<SandboxDenial>> {
     None
 }
 
+/// What the gate sees of a recorded call: the production entry point's
+/// normalization (the inner tool of a `call_tool` envelope, canonical argument
+/// names), without the removed `disable_sandbox` — a model sends the same call
+/// without it now (plan 283) — plus whether the recording carried it.
+fn replayed_call(call: &Call) -> Option<(String, Value, bool)> {
+    let (_, name, mut input) = crate::tools::normalize_tool_uses(vec![(
+        call.id.clone(),
+        call.name.clone(),
+        call.input.clone(),
+    )])
+    .pop()?;
+    let no_sandbox = name == "bash" && input["disable_sandbox"].as_bool().unwrap_or(false);
+    if let Some(fields) = input.as_object_mut() {
+        fields.remove("disable_sandbox");
+    }
+    Some((name, input, no_sandbox))
+}
+
 #[derive(Default)]
 struct Tally {
     calls: usize,
@@ -228,8 +247,6 @@ struct Tally {
     no_sandbox: usize,
     asks: BTreeMap<String, usize>,
     remembered: BTreeMap<String, usize>,
-    /// A remembered escalation let the call skip the sandbox entirely.
-    escalated_up_front: usize,
     /// Ran uncontained in the recording, contained now: whether the sandbox
     /// would have refused it cannot be known offline.
     unknown_outcome: usize,
@@ -250,7 +267,6 @@ impl Tally {
         for (key, count) in &other.remembered {
             *self.remembered.entry(key.clone()).or_default() += count;
         }
-        self.escalated_up_front += other.escalated_up_front;
         self.unknown_outcome += other.unknown_outcome;
     }
 
@@ -262,7 +278,6 @@ impl Tally {
             "asked": self.asked(),
             "asks": self.asks,
             "remembered": self.remembered,
-            "escalated_up_front": self.escalated_up_front,
             "unknown_outcome": self.unknown_outcome,
         })
     }
@@ -292,10 +307,17 @@ struct Detail {
     examples: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
-fn tally_record(tally: &mut Tally, detail: &mut Detail, record: Option<ApprovalRecord>) {
-    let Some(record) = record else {
-        return;
-    };
+fn tally_record(
+    tally: &mut Tally,
+    detail: &mut Detail,
+    records: impl IntoIterator<Item = ApprovalRecord>,
+) {
+    for record in records {
+        tally_one(tally, detail, record);
+    }
+}
+
+fn tally_one(tally: &mut Tally, detail: &mut Detail, record: ApprovalRecord) {
     let label = reason_label(&record);
     match record.answer {
         ApprovalAnswer::Remembered { by } => {
@@ -464,23 +486,18 @@ async fn approval_replay() {
             if let Some(home) = &home {
                 policy = policy.with_credential_roots(home);
             }
-            let no_sandbox =
-                call.name == "bash" && call.input["disable_sandbox"].as_bool().unwrap_or(false);
-            if call.name == "bash" {
+            let Some((name, input, no_sandbox)) = replayed_call(call) else {
+                continue;
+            };
+            if name == "bash" {
                 tally.bash += 1;
                 tally.no_sandbox += usize::from(no_sandbox);
             }
-            // `disable_sandbox` is gone from the schema (plan 283): a model
-            // sends the same call without it, and it runs contained.
-            let mut input = call.input.clone();
-            if let Some(fields) = input.as_object_mut() {
-                fields.remove("disable_sandbox");
-            }
             // The executor's choice of sandbox context, as dispatch makes it.
-            let sandbox = (call.name == "bash").then_some(&policy);
+            let sandbox = (name == "bash").then_some(&policy);
             let outcome = gate
                 .gate_call(
-                    &call.name,
+                    &name,
                     &input,
                     None,
                     None,
@@ -489,15 +506,16 @@ async fn approval_replay() {
                     None,
                 )
                 .await;
-            tally_record(&mut tally, &mut detail, outcome.approval);
+            tally_record(&mut tally, &mut detail, outcome.approvals);
             let Ok(verdict) = outcome.result else {
                 continue;
             };
-            if call.name != "bash" || input["background"].as_bool() == Some(true) {
+            if name != "bash" || input["background"].as_bool() == Some(true) {
                 continue;
             }
             match verdict.sandbox {
-                SandboxPlan::Escalated => tally.escalated_up_front += 1,
+                // Recorded by the gate as `escalated_before_run`.
+                SandboxPlan::Escalated => {}
                 SandboxPlan::Contained => {
                     let command = input["command"].as_str().unwrap_or_default();
                     match call.result.as_deref().and_then(recorded_denial) {
@@ -583,10 +601,6 @@ async fn approval_replay() {
         println!("  {count:>5}  {label}");
     }
     println!(
-        "  {:>5}  escalation remembered before the run (sandbox skipped)",
-        total.escalated_up_front
-    );
-    println!(
         "ran uncontained in the recording, contained now (outcome unknown): {}",
         total.unknown_outcome
     );
@@ -609,4 +623,40 @@ async fn approval_replay() {
         });
         std::fs::write(out, serde_json::to_string_pretty(&report).unwrap()).unwrap();
     }
+}
+
+/// The replay gates what dispatch would gate: two MCP tools behind `call_tool`
+/// are two tools, not one `call_tool` permission (plan 283 review).
+#[test]
+fn replay_gates_the_normalized_call() {
+    let call = |name: &str, input: Value| Call {
+        ts: 0,
+        order: 0,
+        depth: 0,
+        cwd: PathBuf::from("/w"),
+        id: "c1".into(),
+        name: name.into(),
+        input,
+        result: None,
+    };
+    let wrapped = call(
+        "call_tool",
+        json!({"tool_name": "mcp__notes__search", "params": {"query": "x"}}),
+    );
+    assert_eq!(
+        replayed_call(&wrapped),
+        Some((
+            "mcp__notes__search".to_string(),
+            json!({"query": "x"}),
+            false
+        ))
+    );
+    let escaped = call(
+        "bash",
+        json!({"command": "cargo test", "disable_sandbox": true}),
+    );
+    assert_eq!(
+        replayed_call(&escaped),
+        Some(("bash".to_string(), json!({"command": "cargo test"}), true))
+    );
 }

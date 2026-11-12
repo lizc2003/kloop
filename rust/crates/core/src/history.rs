@@ -58,6 +58,13 @@ pub const ROUND_OFFLOAD_CAP_CHARS: usize = 4 * OFFLOAD_CAP_CHARS;
 /// Append-only conversation history. Oversized tool results are offloaded to
 /// disk at record time; the history keeps a preview plus the file's path, which
 /// the model queries in place (cc's shape) rather than reading back.
+/// Permission questions about calls whose round has already ended — a
+/// background Program keeps calling tools after the dispatch that started it
+/// returned, and with it the round's journal channel. They wait here and are
+/// written before the next line this history writes (plan 283).
+pub(crate) type ApprovalBacklog =
+    std::sync::Arc<std::sync::Mutex<Vec<(String, crate::permissions::ApprovalRecord)>>>;
+
 pub struct History {
     items: Vec<Message>,
     offload_dir: PathBuf,
@@ -90,6 +97,7 @@ pub struct History {
     /// `items`; the stubs themselves are `request_stub` lines in the rollout.
     reduction: ReductionState,
     background_wait_reminder: Option<String>,
+    approval_backlog: ApprovalBacklog,
 }
 
 impl History {
@@ -108,6 +116,7 @@ impl History {
             staged: Vec::new(),
             reduction: ReductionState::default(),
             background_wait_reminder: None,
+            approval_backlog: ApprovalBacklog::default(),
         }
     }
 
@@ -141,6 +150,7 @@ impl History {
             staged: Vec::new(),
             reduction: ReductionState::resumed(quiet_since, resumed.request_stubs),
             background_wait_reminder: None,
+            approval_backlog: ApprovalBacklog::default(),
         }
     }
 
@@ -627,9 +637,22 @@ impl History {
         self.persist(|rollout| rollout.append_approval(tool_use_id, record));
     }
 
+    /// Where a call reports a question once its round's journal is gone.
+    pub(crate) fn approval_backlog(&self) -> ApprovalBacklog {
+        std::sync::Arc::clone(&self.approval_backlog)
+    }
+
     /// Persistence must never take down the live session: a failed write
-    /// drops the rollout and the session continues in memory only.
+    /// drops the rollout and the session continues in memory only. Questions
+    /// left in the backlog go first: they happened before whatever is being
+    /// written now.
     fn persist(&mut self, write: impl FnOnce(&mut Rollout) -> std::io::Result<()>) {
+        let backlog = std::mem::take(&mut *self.approval_backlog.lock().unwrap());
+        for (tool_use_id, record) in backlog {
+            persist_into(&mut self.rollout, |rollout| {
+                rollout.append_approval(&tool_use_id, &record)
+            });
+        }
         persist_into(&mut self.rollout, write);
     }
 
