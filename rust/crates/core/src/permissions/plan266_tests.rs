@@ -1,6 +1,8 @@
 // plan 266: 权限门一次判定执行面，执行层照单执行。
 
+#[cfg(target_os = "macos")]
 use crate::sandbox::ExecutionContext;
+#[cfg(target_os = "macos")]
 use crate::sandbox::SandboxPolicy;
 
 /// 沙箱进不进由门决定：普通调用在内，主动脱沙箱与已记住的升级在外，后台
