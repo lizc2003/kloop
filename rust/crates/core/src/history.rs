@@ -166,6 +166,11 @@ impl History {
     /// branch's file, so it is written there now: otherwise resuming the
     /// branch would send that result whole where the cache holds its stub.
     pub fn rebase(&mut self, resumed: ResumedSession) {
+        // Questions a background call asked so far belong to the conversation
+        // being left: they go to its file, and the branch starts its own
+        // backlog. A journal still holding the old one writes nowhere now.
+        self.flush_approval_backlog();
+        self.approval_backlog = ApprovalBacklog::default();
         let carried = self
             .reduction
             .unrecorded_for(&resumed.snapshot.messages, &resumed.request_stubs);
@@ -647,13 +652,17 @@ impl History {
     /// left in the backlog go first: they happened before whatever is being
     /// written now.
     fn persist(&mut self, write: impl FnOnce(&mut Rollout) -> std::io::Result<()>) {
+        self.flush_approval_backlog();
+        persist_into(&mut self.rollout, write);
+    }
+
+    fn flush_approval_backlog(&mut self) {
         let backlog = std::mem::take(&mut *self.approval_backlog.lock().unwrap());
         for (tool_use_id, record) in backlog {
             persist_into(&mut self.rollout, |rollout| {
                 rollout.append_approval(&tool_use_id, &record)
             });
         }
-        persist_into(&mut self.rollout, write);
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -2155,6 +2164,59 @@ mod tests {
             4,
             "the original branch keeps its full history"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Plan 283 review: a question a background call asked before a rewind
+    /// belongs to the conversation being left. It is written to that file, and
+    /// the branch starts with a backlog of its own — nothing the old journal
+    /// drops in later lands in the branch.
+    #[test]
+    fn rebase_leaves_pending_questions_with_the_old_branch() {
+        use crate::rollout::fork_session;
+        let dir = temp_dir("rebase-backlog");
+        let session = dir.join("session.jsonl");
+        let mut h = History::new(dir.clone());
+        h.attach_rollout(Rollout::new(session.clone()));
+        h.record(Message::user_text("one"));
+        h.record(Message::assistant(vec![ContentBlock::Text {
+            text: "done".into(),
+        }]));
+        let record = crate::permissions::ApprovalRecord {
+            door: crate::permissions::ApprovalDoor::Gate,
+            tool: "bash".into(),
+            reason: crate::permissions::AskReason::Uncontained,
+            detail: "make install".into(),
+            keys: Vec::new(),
+            rules: Vec::new(),
+            offered: vec![crate::permissions::ApprovalScope::Once],
+            answer: crate::permissions::ApprovalAnswer::Denied,
+        };
+        let old_backlog = h.approval_backlog();
+        old_backlog
+            .lock()
+            .unwrap()
+            .push(("before-rewind".into(), record.clone()));
+
+        let fork_path = fork_session(&session, Some(3), &dir).unwrap();
+        h.rebase(crate::rollout::resume_session(&fork_path).unwrap());
+        old_backlog
+            .lock()
+            .unwrap()
+            .push(("after-rewind".into(), record));
+        h.record(Message::user_text("three"));
+
+        let approvals = |path: &std::path::Path| -> Vec<String> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|line| line["type"] == "approval")
+                .map(|line| line["tool_use_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(approvals(&session), vec!["before-rewind".to_string()]);
+        assert_eq!(approvals(&fork_path), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -729,6 +729,32 @@ pub fn classify_sandbox_denial(
     if exit_code == Some(0) {
         return None;
     }
+    classify_lines(output, network_disabled, &DENIED_KEYWORDS)
+}
+
+/// The OS's own refusal texts — EPERM, EACCES, EROFS — without the mechanism
+/// names in [`DENIED_KEYWORDS`].
+const STRONG_DENIED_KEYWORDS: [&str; 3] = [
+    "operation not permitted",
+    "permission denied",
+    "read-only file system",
+];
+
+/// Denial evidence that has to stand without a failing exit status: a zero
+/// that a pipe or `;` may have masked (`make test 2>&1 | tail -20`). Only the
+/// OS's own refusal text counts, or a DNS failure while the network is denied;
+/// `sandbox`, `seccomp` and `landlock` alone do not — they are words a passing
+/// test run prints in its own test names, and taking them as a denial would
+/// re-run a suite that just passed outside the sandbox.
+pub fn classify_masked_denial(output: &str, network_disabled: bool) -> Option<SandboxDenial> {
+    classify_lines(output, network_disabled, &STRONG_DENIED_KEYWORDS)
+}
+
+fn classify_lines(
+    output: &str,
+    network_disabled: bool,
+    denied_keywords: &[&str],
+) -> Option<SandboxDenial> {
     // Per line, so the evidence handed back is the sentence that matched rather
     // than the whole (possibly enormous) output, and so the network/write hints
     // are read from the *same* line as the denial — a build log mentioning
@@ -736,7 +762,7 @@ pub fn classify_sandbox_denial(
     // verdict.
     for line in output.lines() {
         let lower = line.to_lowercase();
-        let denied = DENIED_KEYWORDS.iter().any(|k| lower.contains(k));
+        let denied = denied_keywords.iter().any(|k| lower.contains(k));
         let dns = network_disabled && DNS_KEYWORDS.iter().any(|k| lower.contains(k));
         if !denied && !dns {
             continue;
@@ -763,6 +789,33 @@ fn clip_evidence(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero exit that a pipe may have masked stands on the OS's own refusal
+    /// text, or a DNS failure with the network denied; the mechanism's name in
+    /// a test name is not a denial (plan 283 review).
+    #[test]
+    fn a_masked_zero_needs_the_os_refusal_text() {
+        let passing = "test tools::sandbox::denial_hint ... ok\n\
+                       test result: ok. 2 passed; 0 failed";
+        assert_eq!(classify_masked_denial(passing, true), None);
+        assert!(classify_sandbox_denial(Some(1), passing, true).is_some());
+        assert_eq!(
+            classify_masked_denial("mkdir: /x/y: Operation not permitted", true),
+            Some(SandboxDenial {
+                kind: DenialKind::Write,
+                evidence: "mkdir: /x/y: Operation not permitted".into(),
+            })
+        );
+        assert_eq!(
+            classify_masked_denial("curl: (6) Could not resolve host: example.com", true)
+                .map(|denial| denial.kind),
+            Some(DenialKind::Network)
+        );
+        assert_eq!(
+            classify_masked_denial("curl: (6) Could not resolve host: example.com", false),
+            None
+        );
+    }
 
     fn policy_with(roots: Vec<WritableRoot>, allow_network: bool) -> SandboxPolicy {
         SandboxPolicy {

@@ -738,7 +738,9 @@ so the gate and the bash escalation below it need not know the id — and is
 written whether or not the call is from a program. A background Program keeps
 calling tools after the dispatch that started it returned, taking the round's
 channel with it; its questions go to the history's backlog instead and are
-written before the next line the history writes. Nothing on the resume path
+written before the next line the history writes. A rewind writes the backlog
+into the file it is leaving and gives the branch a backlog of its own, so a
+question never lands in a branch it was not asked in. Nothing on the resume path
 reads it: it is for offline counting (`permissions/approval_replay.rs`, an
 ignored test that replays the local corpus through the real gate). Prompts
 withdrawn by a stop or cancel leave no line, and harness commands (`!cmd`, a
@@ -3724,9 +3726,14 @@ When a sandboxed command fails and the failure looks like a sandbox denial
 disables network) — "fails" including a zero exit that may hide the failure:
 bash reports only the last command's status, so `make test 2>&1 | tail -20` or
 `make install; echo done` exits 0 even when the part that did the work was
-denied, and when the last command is read-only and something before it had an
-effect or a redirect writes, the output is judged as if the status were
-unknown — **kloop decides whether it leaves the sandbox; the model
+denied. When the command that sets the status is read-only and something else
+had an effect or a redirect writes, a zero is judged on strong evidence only:
+the OS's own refusal text (EPERM, EACCES, EROFS) or a DNS failure with the
+network denied, never the mechanism's name alone — a passing test run prints
+`sandbox` in its own test names, and taking that as a denial would re-run the
+suite outside. The command that sets the status is not simply the last one the
+analysis lists: a `-c` wrapper's script is listed before the wrapper, one level
+deeper, and the wrapper's status is its script's — **kloop decides whether it leaves the sandbox; the model
 cannot** (plan 283). The bash tool has no `disable_sandbox` parameter any more —
 a call still carrying it fails as an unknown field, and dispatch checks bash
 input before the gate so nobody is asked about a call that could never run —

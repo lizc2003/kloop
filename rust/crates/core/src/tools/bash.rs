@@ -301,15 +301,40 @@ pub(super) fn status_may_be_masked(command: &str, facts: Option<&crate::shell::B
             .argv()
             .is_some_and(|argv| crate::shell::argv_is_readonly(&argv))
     };
-    let Some((last, earlier)) = facts.commands.split_last() else {
+    let Some((status, wrappers)) = status_command(&facts.commands) else {
         return false;
     };
-    read_only(last)
-        && (earlier.iter().any(|command| !read_only(command))
-            || facts
-                .redirects
-                .iter()
-                .any(|redirect| redirect.direction == crate::shell::Direction::Write))
+    read_only(&facts.commands[status])
+        && (facts.commands.iter().enumerate().any(|(index, command)| {
+            index != status && !wrappers.contains(&index) && !read_only(command)
+        }) || facts
+            .redirects
+            .iter()
+            .any(|redirect| redirect.direction == crate::shell::Direction::Write))
+}
+
+/// The command whose exit status the shell reports, as an index into the
+/// analysis' command list, plus the `-c` wrappers it passes through. The list
+/// is not in execution order: a wrapper's own script is analysed first, so
+/// `sh -c 'touch x | tail -5'` lists `touch`, `tail`, then `sh`, with the inner
+/// two one `script_depth` deeper. A last entry preceded by deeper commands is
+/// such a wrapper, and its status is its script's.
+fn status_command(commands: &[crate::shell::CommandFact]) -> Option<(usize, Vec<usize>)> {
+    let mut wrappers = Vec::new();
+    let (mut start, mut end) = (0, commands.len());
+    loop {
+        let last = end.checked_sub(1).filter(|last| *last >= start)?;
+        let depth = commands[last].context.script_depth;
+        let inner_start = commands[start..last]
+            .iter()
+            .rposition(|command| command.context.script_depth <= depth)
+            .map_or(start, |offset| start + offset + 1);
+        if inner_start == last {
+            return Some((last, wrappers));
+        }
+        wrappers.push(last);
+        (start, end) = (inner_start, last);
+    }
 }
 
 /// What one foreground run left behind: the model-facing text, and whether the
@@ -381,20 +406,19 @@ pub(crate) async fn run_foreground_bash(
     // policy, or a remembered escalation, leaves `sandbox` None and skips it.
     // 判定看完整捕获的输出而不是内联文本：合并顺序是先 stdout 后 stderr，stdout 超过
     // 内联上限时，stderr 里的拒绝行会被截掉，升级和提示就都不会出现。
-    // A masked zero is judged like a failure whose status is unknown.
-    let exit_code =
-        if output.status.success() && sandbox.is_some() && status_may_be_masked(command, facts) {
-            None
-        } else {
-            output.status.code()
-        };
+    // A zero a pipe or `;` may have masked is judged on strong evidence only.
     if let Some(policy) = &sandbox
-        && exit_code != Some(0)
-        && let Some(denial) = sandbox::classify_sandbox_denial(
-            exit_code,
-            &captured_text(&output),
-            !policy.allow_network,
-        )
+        && let Some(denial) = if !output.status.success() {
+            sandbox::classify_sandbox_denial(
+                output.status.code(),
+                &captured_text(&output),
+                !policy.allow_network,
+            )
+        } else if status_may_be_masked(command, facts) {
+            sandbox::classify_masked_denial(&captured_text(&output), !policy.allow_network)
+        } else {
+            None
+        }
     {
         if verdict.protection == crate::permissions::Protection::Required {
             hint = Some(sandbox::PROTECTION_REQUIRED);
@@ -1623,6 +1647,12 @@ mod tests {
             ("make install; echo done", true),
             ("cargo test | grep -E 'test result'", true),
             ("echo hi > /elsewhere/out.txt; echo done", true),
+            // A `-c` wrapper's status is its script's: the analysis lists the
+            // script's commands first and the wrapper last (plan 283 review).
+            ("sh -c 'touch /outside/x 2>&1 | tail -5'", true),
+            ("bash -c 'make test | tail -3'; echo done", true),
+            ("sh -c 'make test'", false),
+            ("sh -c 'echo a | tail -1'", false),
             ("make test", false),
             ("cat build.log | tail -5", false),
             ("make test | tee test.log", false),
@@ -2407,6 +2437,23 @@ mod tests {
             let (out, _) = run_tool(
                 "bash",
                 bash_input("echo 'touch: x: Operation not permitted' | tail -1"),
+                &ctx,
+            )
+            .await;
+            assert!(!out.contains("Re-ran without the sandbox"), "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+
+            // A masked zero needs the OS's own refusal text: a passing run whose
+            // output merely names the sandbox (test names do) is not a denial.
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!(
+                    "touch {} && echo 'test tools::sandbox::denial_hint ... ok' | tail -1",
+                    std::fs::canonicalize(std::env::temp_dir().join("kloop-sbx-esc-pipe"))
+                        .unwrap()
+                        .join("inside.txt")
+                        .display()
+                )),
                 &ctx,
             )
             .await;
