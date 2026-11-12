@@ -38,8 +38,8 @@ async fn plan266_containment_is_decided_once() {
     assert_eq!(blind.sandbox, SandboxPlan::None);
 
     // 已记住的逐命令升级：这次调用直接跳过沙箱内的尝试。
-    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-    let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+    let p = gate_with_writer(Mode::Manual, approver.clone(), ScriptedWriter::succeeding());
     assert_eq!(
         p.escalate_sandbox("go test ./pkg", None, 0).await.outcome,
         EscalationOutcome::Approved(EscalationApproval::User)

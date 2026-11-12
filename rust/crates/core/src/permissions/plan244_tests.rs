@@ -350,31 +350,29 @@ async fn plan244_effectful_wrappers_keep_nested_sensitive_reads() {
     }
 }
 
+/// 带未知效果的包装器既不能落成前缀规则，也不再记原文（plan 283）：只能允许一次。
 #[tokio::test]
-async fn plan244_effectful_wrappers_never_remember_blanket_escalation() {
+async fn plan244_effectful_wrappers_are_only_allowed_once() {
     let commands = plan244_effectful_wrappers()
         .into_iter()
         .map(|wrapper| format!("{wrapper} cargo test"))
         .chain(["bash -c '/usr/bin/time -o timing.log cargo test'".into()]);
     for command in commands {
-        let different = command.replace("cargo test", "cargo build");
-        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::WorkspaceSession),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
         let writer = ScriptedWriter::succeeding();
         let p = gate_with_writer(Mode::Manual, approver.clone(), writer.clone());
         assert_eq!(p.escalate_sandbox(&command, None, 0).await.outcome,
-            EscalationOutcome::Approved(EscalationApproval::User));
-        let asked = approver.asked();
-        assert_eq!(asked[0].approval_scopes, vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession]);
-        assert_eq!(asked[0].remember_rules, Some(vec!["only this exact command text".into()]));
-        assert!(p.sandbox_escalation_remembered(&command), "{command}");
-        assert!(!p.sandbox_escalation_remembered(&different), "{command}");
-        assert!(!p.sandbox_escalation_remembered("make install"), "{command}");
+            EscalationOutcome::Declined, "{command}: a scope that was not offered");
         assert_eq!(p.escalate_sandbox(&command, None, 0).await.outcome,
-            EscalationOutcome::Approved(EscalationApproval::Remembered));
-        assert_eq!(approver.ask_count(), 1, "{command}");
-        assert_eq!(p.escalate_sandbox(&different, None, 0).await.outcome,
-            EscalationOutcome::Declined);
-        assert_eq!(approver.ask_count(), 2, "{command}");
+            EscalationOutcome::Approved(EscalationApproval::User), "{command}");
+        for asked in approver.asked() {
+            assert_eq!(asked.approval_scopes, vec![ApprovalScope::Once], "{command}");
+            assert_eq!(asked.remember_rules, None, "{command}");
+        }
+        assert!(!p.sandbox_escalation_remembered(&command), "{command}");
         assert!(writer.calls.lock().unwrap().is_empty());
     }
 }

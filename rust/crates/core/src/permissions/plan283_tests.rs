@@ -85,35 +85,35 @@ async fn plan283_the_gate_records_questions_and_the_memories_that_answer_them() 
 #[tokio::test]
 async fn plan283_the_escalation_records_questions_and_the_memories_that_answer_them() {
     let denial = crate::sandbox::SandboxDenial {
-        kind: crate::sandbox::DenialKind::Network,
-        evidence: "curl: (6) Could not resolve host: example.com".into(),
-    paths: Vec::new(),
+        kind: crate::sandbox::DenialKind::Nested,
+        evidence: "sandbox-exec: sandbox_apply: Operation not permitted".into(),
+        paths: Vec::new(),
     };
-    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-    let p = gate(Mode::Manual, rules(&[], &[], &[]), approver);
+    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+    let p = gate_with_writer(Mode::Manual, approver, ScriptedWriter::succeeding());
     let asked = ApprovalRecord {
         door: ApprovalDoor::Escalation,
         tool: "bash".into(),
         reason: AskReason::SandboxDenied {
-            denial: "network".into(),
+            denial: "nested sandbox".into(),
         },
-        detail: "curl -sS https://example.com".into(),
-        // 第二词是选项：plan 244 起只记原文，所以键就是整条命令。
-        keys: vec!["sandbox_escalate-script:curl -sS https://example.com".into()],
-        rules: vec![],
-        offered: vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession],
+        detail: "make check 2>&1 | tail -20".into(),
+        keys: vec!["sandbox_escalate:make check".into()],
+        rules: vec!["sandbox_escalate(make check *)".into()],
+        // 整个脱沙箱只有本次与本项目（阶段 3）。
+        offered: vec![ApprovalScope::Once, ApprovalScope::Project],
         answer: ApprovalAnswer::Allowed {
-            scope: ApprovalScope::WorkspaceSession,
+            scope: ApprovalScope::Project,
         },
     };
-    let ask = || p.escalate_sandbox("curl -sS https://example.com", Some(&denial), 0);
+    let ask = || p.escalate_sandbox("make check 2>&1 | tail -20", Some(&denial), 0);
     assert_eq!(ask().await.approval, Some(asked.clone()));
     assert_eq!(
         ask().await.approval,
         Some(ApprovalRecord {
             offered: Vec::new(),
             answer: ApprovalAnswer::Remembered {
-                by: MemorySource::Session,
+                by: MemorySource::Rule,
             },
             ..asked
         })
@@ -219,11 +219,7 @@ async fn plan283_read_only_segments_and_cd_are_not_part_of_the_escalation_key() 
     let asked = approver.asked();
     assert_eq!(
         asked[0].approval_scopes,
-        vec![
-            ApprovalScope::Once,
-            ApprovalScope::WorkspaceSession,
-            ApprovalScope::Project
-        ]
+        vec![ApprovalScope::Once, ApprovalScope::Project]
     );
     assert_eq!(
         asked[0].remember_rules,

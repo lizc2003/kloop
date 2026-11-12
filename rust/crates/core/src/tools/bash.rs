@@ -2992,81 +2992,62 @@ mod tests {
             if crate::sandbox::skip_nested_seatbelt_test() {
                 return;
             }
-            let (ctx, asked) = escalating_ctx(
+            // Leaving the sandbox is remembered as a project rule only (plan
+            // 283); the asking half is covered by the permissions tests.
+            let (ctx, asked) = escalating_ctx_with(
                 "esc-remembered",
-                crate::permissions::Decision::Allow(
-                    crate::permissions::ApprovalScope::WorkspaceSession,
-                ),
+                crate::permissions::Decision::Deny,
+                &["sandbox_escalate(git init *)".to_string()],
             );
-            let ctx = deny_writes_to(ctx, &outside_dir("esc-remembered"));
             // `git init` so the remembered two-word prefix is the subcommand,
-            // not the path — the second call must be a *different* argument
-            // covered by the same rule, which is the point of the prefix.
+            // not the path: each call is a *different* argument covered by
+            // the same rule, which is the point of the prefix.
             let dir = outside_dir("esc-remembered");
-            let first = dir.join("one");
-            let second = dir.join("two");
-            let _ = std::fs::remove_dir_all(&first);
-            let _ = std::fs::remove_dir_all(&second);
-            std::fs::create_dir_all(&first).unwrap();
-            std::fs::create_dir_all(&second).unwrap();
-
-            // First call: denied inside the sandbox, asked once, approved with
-            // the workspace scope.
-            let (out, is_error) = run_tool(
-                "bash",
-                bash_input(&format!("git init {}", first.display())),
-                &ctx,
-            )
-            .await;
-            assert!(!is_error, "{out}");
-            assert!(out.contains("Re-ran without the sandbox"), "{out}");
-            assert_eq!(asked.load(Ordering::SeqCst), 1);
-
-            // Second call, same two-word prefix: no ask, and no contained
-            // attempt — the marker says the rule covered it up front rather
-            // than that a denial was escalated.
-            let (out, is_error) = run_tool(
-                "bash",
-                bash_input(&format!("git init {}", second.display())),
-                &ctx,
-            )
-            .await;
-            assert!(!is_error, "{out}");
-            assert_eq!(asked.load(Ordering::SeqCst), 1, "not asked again: {out}");
-            assert!(
-                out.contains("a remembered sandbox_escalate rule already covers this"),
-                "{out}"
-            );
-            assert!(
-                !out.contains("Re-ran without the sandbox"),
-                "the contained attempt must not have run: {out}"
-            );
-            assert!(
-                !out.contains("Operation not permitted"),
-                "no denial output from a skipped attempt: {out}"
-            );
-            assert!(
-                second.join(".git").is_dir(),
-                "the uncontained run actually did the work"
-            );
+            for name in ["one", "two"] {
+                let repo = dir.join(name);
+                let _ = std::fs::remove_dir_all(&repo);
+                std::fs::create_dir_all(&repo).unwrap();
+                let (out, is_error) = run_tool(
+                    "bash",
+                    bash_input(&format!("git init {}", repo.display())),
+                    &ctx,
+                )
+                .await;
+                assert!(!is_error, "{out}");
+                assert!(
+                    out.contains("a remembered sandbox_escalate rule already covers this"),
+                    "{out}"
+                );
+                assert!(
+                    !out.contains("Re-ran"),
+                    "the contained attempt must not have run: {out}"
+                );
+                assert!(repo.join(".git").exists(), "{out}");
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 0);
+            let _ = std::fs::remove_dir_all(dir);
         }
 
+        /// A remembered escalation that covers fixed log writes skips the
+        /// contained attempt for each of them: one attempt per call.
         #[tokio::test]
         async fn remembered_log_writes_skip_the_sandboxed_attempt() {
             if crate::sandbox::skip_nested_seatbelt_test() {
                 return;
             }
-            let (ctx, asked) = escalating_ctx(
-                "log-remembered",
-                crate::permissions::Decision::Allow(
-                    crate::permissions::ApprovalScope::WorkspaceSession,
-                ),
-            );
-            let ctx = deny_writes_to(ctx, &outside_dir("log-remembered"));
             let outside = outside_dir("log-remembered");
-            let counter = ctx.cfg.sandbox.as_ref().unwrap().writable_roots[0]
-                .root
-                .join("attempts.log");
+            let root_dir = std::env::temp_dir().join("kloop-sbx-log-remembered");
+            std::fs::create_dir_all(&root_dir).unwrap();
+            let root = std::fs::canonicalize(root_dir).unwrap();
+            let (ctx, asked) = escalating_ctx_with(
+                "log-remembered",
+                crate::permissions::Decision::Deny,
+                &[
+                    format!("sandbox_escalate_write({}/**)", root.display()),
+                    format!("sandbox_escalate_write({}/**)", outside.display()),
+                ],
+            );
+            let counter = root.join("attempts.log");
             let _ = std::fs::remove_file(&counter);
             for (index, name) in ["first.log", "next.log"].into_iter().enumerate() {
                 let command = format!(
@@ -3077,29 +3058,20 @@ mod tests {
                 );
                 let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
                 assert!(!is_error, "{out}");
-                assert_eq!(asked.load(Ordering::SeqCst), 1, "{out}");
+                assert!(
+                    out.contains("a remembered sandbox_escalate rule already covers this"),
+                    "{out}"
+                );
                 assert_eq!(
                     std::fs::read_to_string(outside.join(name)).unwrap(),
                     "complete\n"
                 );
-                if index == 0 {
-                    assert!(out.contains("Re-ran without the sandbox"), "{out}");
-                    assert_eq!(
-                        std::fs::read_to_string(&counter).unwrap(),
-                        "attempt\nEXIT:0\nattempt\nEXIT:0\n"
-                    );
-                } else {
-                    assert!(
-                        out.contains("a remembered sandbox_escalate rule already covers this"),
-                        "{out}"
-                    );
-                    assert!(!out.contains("Re-ran without the sandbox"), "{out}");
-                    assert_eq!(
-                        std::fs::read_to_string(&counter).unwrap(),
-                        "attempt\nEXIT:0\nattempt\nEXIT:0\nattempt\nEXIT:0\n"
-                    );
-                }
+                assert_eq!(
+                    std::fs::read_to_string(&counter).unwrap(),
+                    "attempt\nEXIT:0\n".repeat(index + 1)
+                );
             }
+            assert_eq!(asked.load(Ordering::SeqCst), 0);
             std::fs::remove_dir_all(outside).unwrap();
             std::fs::remove_file(counter).unwrap();
         }

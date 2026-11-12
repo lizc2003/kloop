@@ -1,28 +1,5 @@
 // plan 245: 沙箱升级与实际执行对齐。
 
-/// 通配升级是“沙箱已经拒绝过”之后的免问，不是执行前跳过沙箱的通行证。
-#[tokio::test]
-async fn plan245_blanket_escalation_never_skips_the_contained_attempt() {
-    let approver =
-        ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-    let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-    let opaque = "if true; then echo probe; fi";
-    assert_eq!(
-        p.escalate_sandbox(opaque, None, 0).await.outcome,
-        EscalationOutcome::Approved(EscalationApproval::User)
-    );
-    assert_eq!(approver.ask_count(), 1);
-
-    // 记录通配之后，任何命令仍先进沙箱；只有被拒后的升级判断才认这条通配。
-    assert!(!p.sandbox_escalation_remembered(opaque));
-    assert!(!p.sandbox_escalation_remembered("go test ./pkg"));
-    assert_eq!(
-        p.escalate_sandbox("go test ./pkg", None, 0).await.outcome,
-        EscalationOutcome::Approved(EscalationApproval::Remembered)
-    );
-    assert_eq!(approver.ask_count(), 1, "通配仍免去第二次升级询问");
-}
-
 /// 可解析但没有任何安全复用范围的命令只提供 Once，不能升级成整个会话的通配。
 #[tokio::test]
 async fn plan245_unrepresentable_escalation_offers_only_once() {

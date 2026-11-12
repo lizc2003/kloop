@@ -219,7 +219,7 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
     if crate::sandbox::skip_nested_seatbelt_test() {
         return;
     }
-    use crate::permissions::{ApprovalScope, Decision, EscalationOutcome, Mode, Permissions};
+    use crate::permissions::{ApprovalScope, Decision, Mode, Permissions};
     let mut probe = LiteralProbe::new(Mode::Manual);
     let workspace = probe.ctx.cfg.effective_workspace();
     let error = super::super::run_foreground_bash(
@@ -260,24 +260,15 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
         .unwrap(),
     );
     probe.ctx.cfg = Arc::new(cfg);
-    assert!(matches!(
-        probe
-            .ctx
-            .cfg
-            .permissions
-            .escalate_sandbox("value=$DYNAMIC", None, 0)
-            .await.outcome,
-        EscalationOutcome::Approved(_)
-    ));
     assert!(
         !probe
             .ctx
             .cfg
             .permissions
             .sandbox_escalation_remembered(&probe.command("compare")),
-        "blanket escalation must not skip the contained attempt"
+        "an opaque body has no memory that could skip the contained attempt"
     );
-    // 通配不再跳过沙箱：compare 在沙箱内正常跑完，不产生脱沙箱重试。
+    // compare 在沙箱内正常跑完，不产生脱沙箱重试。
     let (out, error) = run_tool("bash", bash_input(&probe.command("compare")), &probe.ctx).await;
     assert!(!error, "{out}");
     assert!(out.contains("literal-ok"), "{out}");
@@ -286,7 +277,7 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
         "attempt\n"
     );
     // 真正读取凭据的那次被沙箱拒绝后也不能升级：requires_protection 在拒绝
-    // 分支里优先于通配同意。
+    // 分支里优先于任何同意。
     let (out, error) = run_tool("bash", bash_input(&probe.command("read")), &probe.ctx).await;
     assert!(!error, "{out}");
     assert!(
@@ -301,7 +292,7 @@ async fn plan239_direct_executor_and_remembered_escalation_cannot_drop_protectio
     );
     assert_eq!(
         probe.asked.load(Ordering::SeqCst),
-        1,
+        0,
         "preflight never asks to discard protection"
     );
 }
@@ -339,59 +330,6 @@ async fn plan245_git_hooks_survive_renaming_the_git_directory() {
 }
 
 /// 通配升级只能省掉“被拒之后的询问”，不能省掉沙箱内的第一次尝试。
-#[tokio::test]
-async fn plan245_blanket_escalation_still_runs_the_sandboxed_attempt_first() {
-    if crate::sandbox::skip_nested_seatbelt_test() {
-        return;
-    }
-    use crate::permissions::{Decision, EscalationOutcome};
-
-    let (ctx, asked) = escalating_ctx(
-        "plan245-blanket",
-        Decision::Allow(crate::permissions::ApprovalScope::WorkspaceSession),
-    );
-
-    let ctx = deny_writes_to(ctx, &outside_dir("plan245-blanket"));
-    let root = ctx.cfg.sandbox.as_ref().unwrap().writable_roots[0]
-        .root
-        .clone();
-    let attempts = root.join("plan245-attempts");
-    let escaped = outside_dir("plan245-blanket").join("escaped");
-    let _ = std::fs::remove_file(&attempts);
-    let _ = std::fs::remove_file(&escaped);
-
-    assert!(matches!(
-        ctx.cfg
-            .permissions
-            .escalate_sandbox("value=$DYNAMIC", None, 0)
-            .await
-            .outcome,
-        EscalationOutcome::Approved(_)
-    ));
-    assert_eq!(asked.load(Ordering::SeqCst), 1);
-
-    let command = format!(
-        "if true; then echo attempt >> {}; echo escaped > {}; fi",
-        attempts.display(),
-        escaped.display()
-    );
-    let (out, is_error) = run_tool("bash", bash_input(&command), &ctx).await;
-    assert!(!is_error, "{out}");
-    assert!(
-        out.contains("Re-ran without the sandbox under a remembered"),
-        "{out}"
-    );
-    assert!(escaped.exists(), "{out}");
-    assert_eq!(
-        std::fs::read_to_string(&attempts).unwrap(),
-        "attempt\nattempt\n",
-        "the sandboxed attempt must run before the remembered escalation: {out}"
-    );
-    assert_eq!(asked.load(Ordering::SeqCst), 1, "blanket still skips the ask");
-    let _ = std::fs::remove_file(attempts);
-    let _ = std::fs::remove_file(escaped);
-}
-
 #[tokio::test]
 async fn plan239_sandbox_start_failure_does_not_retry_without_protection() {
     if crate::sandbox::skip_nested_seatbelt_test() {

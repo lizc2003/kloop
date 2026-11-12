@@ -90,8 +90,6 @@ mod testutil;
 mod verdict;
 
 use crate::shell::BashFacts;
-use describe::BLANKET_ESCALATION_RULE;
-use describe::BLANKET_ESCALATION_SIGNATURE;
 use describe::Remember;
 use describe::clip;
 use describe::describe;
@@ -99,7 +97,6 @@ use describe::describe_denial;
 use describe::describe_escalation;
 use describe::describe_parts;
 use describe::describe_plan_exit;
-use describe::escalation_memory;
 use describe::escalation_remember_payload;
 use describe::join_notices;
 use describe::remember_payload;
@@ -1285,8 +1282,7 @@ impl Permissions {
         // A remembered escalation answers before the ask, exactly as a durable
         // allow rule does for the ordinary gate. 固定输出还需写入范围；已定位但
         // 带未知效果的包装器只记原文，其余 opaque 仍用本工作区会话的通配同意。
-        let memory = escalation_memory(command, self.identity.cwd(), facts);
-        let remember = memory.remember;
+        let remember = escalation_remember_payload(command, self.identity.cwd(), facts);
         let mut record = ApprovalRecord {
             door: ApprovalDoor::Escalation,
             tool: "bash".to_string(),
@@ -1296,11 +1292,10 @@ impl Permissions {
                     .to_string(),
             },
             detail: clip(command),
-            keys: match &remember {
-                Some(remember) => remember.signatures.clone(),
-                None if memory.opaque => vec![BLANKET_ESCALATION_SIGNATURE.to_string()],
-                None => Vec::new(),
-            },
+            keys: remember
+                .as_ref()
+                .map(|remember| remember.signatures.clone())
+                .unwrap_or_default(),
             rules: remember
                 .as_ref()
                 .map(|remember| remember.rules.clone())
@@ -1308,14 +1303,10 @@ impl Permissions {
             offered: Vec::new(),
             answer: ApprovalAnswer::NoApprover,
         };
-        let remembered = if self.blanket_escalation_granted() {
-            Some(MemorySource::Session)
-        } else {
-            remember
-                .as_ref()
-                .and_then(|remember| self.escalation_memory_source(remember))
-        };
-        if let Some(by) = remembered {
+        if let Some(by) = remember
+            .as_ref()
+            .and_then(|remember| self.escalation_memory_source(remember))
+        {
             record.answer = ApprovalAnswer::Remembered { by };
             return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Remembered))
                 .recorded(record);
@@ -1323,20 +1314,18 @@ impl Permissions {
         let Some(approver) = &self.session.approver else {
             return Escalation::new(EscalationOutcome::NotAttempted).recorded(record);
         };
-        // Opaque 脚本只能按整条会话通配记住；有载荷的按载荷粒度记住。可解析但
-        // 载荷为 `None` 的形状（父目录是根、目标含元字符等）没有任何安全的复用
-        // 范围，只提供 Once，不能借机落进最宽的通配。
+        // Once, or for this project by command prefix (plan 283). No session
+        // scope: asking again each session adds nothing but the question, and
+        // the old session-wide wildcard was bypass by another name.
         let mut approval_scopes = vec![ApprovalScope::Once];
         let mut remember_rules = None;
-        if let Some(remember) = &remember {
-            approval_scopes.push(ApprovalScope::WorkspaceSession);
-            remember_rules = Some(remember.echo.clone());
-        } else if memory.opaque {
-            approval_scopes.push(ApprovalScope::WorkspaceSession);
-            remember_rules = Some(vec![BLANKET_ESCALATION_RULE.to_string()]);
-        }
-        if remember.as_ref().is_some_and(Remember::persistable) && self.project.can_persist() {
+        if let Some(remember) = remember.as_ref().filter(|remember| {
+            remember.persistable()
+                && self.project.can_persist()
+                && ProjectAllowRules::parse(&remember.rules).is_ok()
+        }) {
             approval_scopes.push(ApprovalScope::Project);
+            remember_rules = Some(remember.echo.clone());
         }
         let req = ConfirmRequest {
             description: describe_escalation(command, depth),
@@ -1353,61 +1342,34 @@ impl Permissions {
         record.offered = approval_scopes.clone();
         record.answer = ApprovalAnswer::Denied;
         let scope = match approver.confirm(req).await {
-            Decision::Allow(scope) => scope,
-            Decision::Deny => return Escalation::new(EscalationOutcome::Declined).recorded(record),
+            Decision::Allow(scope) if approval_scopes.contains(&scope) => scope,
+            Decision::Allow(_) | Decision::Deny => {
+                return Escalation::new(EscalationOutcome::Declined).recorded(record);
+            }
             Decision::Stop => {
                 record.answer = ApprovalAnswer::Stopped;
                 return Escalation::new(EscalationOutcome::Stopped).recorded(record);
             }
         };
-        if !approval_scopes.contains(&scope) {
-            return Escalation::new(EscalationOutcome::Declined).recorded(record);
-        }
         record.answer = ApprovalAnswer::Allowed { scope };
-        let escalation = match scope {
-            ApprovalScope::Once => {
-                Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
-            }
-            ApprovalScope::WorkspaceSession => {
-                let Some(signatures) = remember.map(|remember| remember.signatures).or_else(|| {
-                    memory
-                        .opaque
-                        .then(|| vec![BLANKET_ESCALATION_SIGNATURE.to_string()])
-                }) else {
-                    // 非 opaque 且无法安全描述的范围不能被一次“会话记住”变成通配。
-                    return Escalation::new(EscalationOutcome::Declined);
-                };
-                self.remember_in_session(signatures);
-                Escalation::new(EscalationOutcome::Approved(EscalationApproval::User))
-            }
-            ApprovalScope::Project => {
-                let Some(remember) = remember else {
-                    return Escalation::new(EscalationOutcome::Declined);
-                };
-                let Ok(additions) = ProjectAllowRules::parse(&remember.rules) else {
-                    // The call still runs — the user said yes — but the rule
-                    // they asked to keep could not be spelled.
-                    return Escalation::with_notice(
-                        EscalationOutcome::Approved(EscalationApproval::User),
-                        PROJECT_RULE_NOT_SAVED,
-                    );
+        let approved = EscalationOutcome::Approved(EscalationApproval::User);
+        let escalation = match (scope, remember) {
+            (ApprovalScope::Project, Some(remember)) => {
+                let saved = match ProjectAllowRules::parse(&remember.rules) {
+                    Ok(additions) => self.project.persist(additions).await.is_ok(),
+                    Err(_) => false,
                 };
                 // A failed durable write still approves this call — the user
                 // said yes. It just will not be remembered, same as the
                 // ordinary gate's project scope, and says so the same way.
-                match self.project.persist(additions).await {
-                    Ok(_) => Escalation::new(EscalationOutcome::Approved(EscalationApproval::User)),
-                    Err(_) => Escalation::with_notice(
-                        EscalationOutcome::Approved(EscalationApproval::User),
-                        PROJECT_RULE_NOT_SAVED,
-                    ),
+                if saved {
+                    Escalation::new(approved)
+                } else {
+                    Escalation::with_notice(approved, PROJECT_RULE_NOT_SAVED)
                 }
             }
+            _ => Escalation::new(approved),
         };
-        if escalation.outcome == EscalationOutcome::Declined {
-            // 会话作用域却没有可记的键：按拒绝处理，记录也照实写。
-            record.answer = ApprovalAnswer::Denied;
-        }
         escalation.recorded(record)
     }
 
@@ -1416,10 +1378,7 @@ impl Permissions {
     /// failed. Remembering the answer only skips the question; skipping the
     /// attempt is what the answer was actually for, because the contained run
     /// is the expensive half (a test suite compiles, binds a port, and only
-    /// then finds out it may not). The session-wide blanket consent is
-    /// deliberately not consulted here: it is granted only after the sandbox
-    /// refused something, so it may skip the *question* but never the
-    /// contained attempt. Bypass mode is likewise not consulted: it means "do
+    /// then finds out it may not). Bypass mode is not consulted: it means "do
     /// not ask", not "do not contain".
     pub fn sandbox_escalation_remembered(&self, command: &str) -> bool {
         if self.allow_everything {
@@ -1427,20 +1386,6 @@ impl Permissions {
         }
         escalation_remember_payload(command, self.identity.cwd(), None)
             .is_some_and(|remember| self.escalation_remembered(&remember))
-    }
-
-    /// Whether this workspace session has blanket consent to escalate. It is the
-    /// only thing an unparseable script can be remembered by: a review's probe
-    /// scripts are opaque almost by construction (`tmp=$(mktemp -d …)`, a pipe
-    /// into `tar`, a `cd`), so keying on a command prefix would offer the choice
-    /// exactly where it can never apply. Session-only and never persisted —
-    /// "stop asking me for the rest of this session" is a statement about the
-    /// sitting, not about the project.
-    fn blanket_escalation_granted(&self) -> bool {
-        let caches = self.session.cache.lock().unwrap();
-        caches
-            .get(self.identity.workspace_id())
-            .is_some_and(|cache| cache.signatures.contains(BLANKET_ESCALATION_SIGNATURE))
     }
 
     /// Record consent for the rest of this workspace session. The epoch only
@@ -1480,7 +1425,12 @@ impl Permissions {
     }
 
     /// Whether this workspace's session cache holds every key of `remember`.
+    /// A memory with no keys (one that can only match existing rules) is
+    /// never remembered by the session.
     fn session_remembers(&self, remember: &Remember) -> bool {
+        if remember.signatures.is_empty() {
+            return false;
+        }
         let caches = self.session.cache.lock().unwrap();
         caches
             .get(self.identity.workspace_id())
@@ -3537,9 +3487,9 @@ mod tests {
         let command = format!("make check > {}", outside.display());
         assert!(!ok(&p, "bash", bash(&command)).await);
         assert_eq!(approver.ask_count(), 2);
-        let approver =
-            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        // Leaving the sandbox is remembered for the project only (plan 283).
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let p = gate_with_writer(Mode::Manual, approver.clone(), ScriptedWriter::succeeding());
         assert_eq!(
             p.escalate_sandbox("make check > check.log", None, 0)
                 .await
@@ -3549,8 +3499,9 @@ mod tests {
         assert!(p.sandbox_escalation_remembered("make check jobs=2 > next.log"));
         assert!(!p.sandbox_escalation_remembered(&command));
         assert!(
-            !p.fresh_session()
-                .sandbox_escalation_remembered("make check > next.log")
+            p.fresh_session()
+                .sandbox_escalation_remembered("make check > next.log"),
+            "a project rule outlives the session"
         );
         for tool in ["bash", "sandbox_escalate"] {
             let call = CallFacts::gather(
@@ -3675,9 +3626,9 @@ mod tests {
             .await
         );
 
-        let approver =
-            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        // Leaving the sandbox is remembered for the project only (plan 283).
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let p = gate_with_writer(Mode::Manual, approver.clone(), ScriptedWriter::succeeding());
         assert_eq!(
             p.escalate_sandbox("make check > /tmp/check.log", None, 0)
                 .await
@@ -3688,8 +3639,9 @@ mod tests {
         assert!(!p.sandbox_escalation_remembered("make check > /elsewhere/next.log"));
         assert!(!p.sandbox_escalation_remembered("make install > /tmp/next.log"));
         assert!(
-            !p.fresh_session()
-                .sandbox_escalation_remembered("make check > /tmp/next.log")
+            p.fresh_session()
+                .sandbox_escalation_remembered("make check > /tmp/next.log"),
+            "a project rule outlives the session"
         );
     }
 
@@ -4235,11 +4187,9 @@ mod tests {
             EscalationOutcome::Stopped
         );
         assert_eq!(approver.ask_count(), 3);
-        assert!(
-            approver.asked()[0]
-                .description
-                .contains("[sandbox denied — run without sandbox?] bash: npm install")
-        );
+        assert!(approver.asked()[0].description.contains(
+            "[sandbox denied — run outside the sandbox, with full access?] bash: npm install"
+        ));
 
         // Bypass (--permission-mode bypass): escalate without asking.
         let approver = ScriptedApprover::new(vec![]);
@@ -4279,14 +4229,14 @@ mod tests {
     }
 
     /// The escalation ask is remember-able like any other: answering with the
-    /// workspace scope records `sandbox_escalate(...)` and the next identical
-    /// command escalates without a second prompt. This is the whole point —
-    /// one real session asked about the same `go test` over and over.
+    /// project scope records `sandbox_escalate(...)` and the next command with
+    /// that prefix escalates without a second prompt. This is the whole point —
+    /// one real session asked about the same `go test` over and over. Only the
+    /// project scope exists for it (plan 283).
     #[tokio::test]
     async fn a_remembered_escalation_is_not_asked_again() {
-        let approver =
-            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
+        let p = gate_with_writer(Mode::Manual, approver.clone(), ScriptedWriter::succeeding());
 
         assert_eq!(
             p.escalate_sandbox("go test ./pkg -run X", None, 0)
@@ -4300,10 +4250,9 @@ mod tests {
             Some(vec!["sandbox_escalate(go test *)".to_string()]),
             "the offered rule is escalation-specific, not bash(...)"
         );
-        assert!(
-            approver.asked()[0]
-                .approval_scopes
-                .contains(&ApprovalScope::WorkspaceSession)
+        assert_eq!(
+            approver.asked()[0].approval_scopes,
+            vec![ApprovalScope::Once, ApprovalScope::Project]
         );
 
         // Same two-word prefix, different arguments: covered, no second ask.
@@ -4329,77 +4278,59 @@ mod tests {
         let approver =
             ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
-        assert_eq!(
-            p.escalate_sandbox("go test ./pkg", None, 0).await.outcome,
-            EscalationOutcome::Approved(EscalationApproval::User)
-        );
-        assert!(p.sandbox_escalation_remembered("go test ./other"));
+        assert!(ok(&p, "bash", bash("go test ./pkg")).await);
+        assert!(ok(&p, "bash", bash("go test ./other")).await);
+        assert_eq!(approver.ask_count(), 1, "remembered for the session");
         p.set_mode(Mode::Bypass);
         assert!(p.enter_plan());
 
         let fresh = p.fresh_session();
         assert_eq!(fresh.mode(), Mode::Bypass);
-        assert!(!fresh.sandbox_escalation_remembered("go test ./other"));
         // The old gate is untouched: the new session did not reach into it.
         assert_eq!(p.mode(), Mode::Plan);
-        assert!(p.sandbox_escalation_remembered("go test ./other"));
+        p.set_mode(Mode::Manual);
+        assert!(ok(&p, "bash", bash("go test ./third")).await);
+        assert_eq!(approver.ask_count(), 1);
         // Same approver: back in manual, the fresh gate asks it (and, the
         // script exhausted, gets a no).
         fresh.set_mode(Mode::Manual);
-        assert_eq!(
-            fresh
-                .escalate_sandbox("go test ./pkg", None, 0)
-                .await
-                .outcome,
-            EscalationOutcome::Declined
-        );
+        assert!(!ok(&fresh, "bash", bash("go test ./other")).await);
         assert_eq!(approver.ask_count(), 2);
     }
 
-    /// An opaque script cannot be keyed on, so it gets the session scope and not
-    /// the durable one — and the prompt says the scope is every escalation, not
-    /// this command. A review's probe scripts are opaque almost by construction
-    /// (`tmp=$(mktemp -d …)`, a pipe into `tar`, a `cd`), so offering only
-    /// `Once` here was offering the memory exactly where it could never apply.
+    /// An opaque script cannot be keyed on, so leaving the sandbox for it is
+    /// asked once each time (plan 283): the session-wide wildcard it used to
+    /// offer was bypass for the rest of the session, and the probe scripts it
+    /// was for now get the network as a capability instead.
     #[tokio::test]
-    async fn an_opaque_command_can_still_be_remembered_for_the_session() {
-        let approver =
-            ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
-        let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
+    async fn an_opaque_command_is_only_allowed_once() {
+        let approver = ScriptedApprover::new(vec![
+            Decision::Allow(ApprovalScope::WorkspaceSession),
+            Decision::Allow(ApprovalScope::Once),
+        ]);
+        let p = gate_with_writer(Mode::Manual, approver.clone(), ScriptedWriter::succeeding());
         let opaque = "tmp=$(mktemp -d) && git archive HEAD | tar -x -C \"$tmp\"";
-
+        assert_eq!(
+            p.escalate_sandbox(opaque, None, 0).await.outcome,
+            EscalationOutcome::Declined,
+            "a scope that was not offered is no answer"
+        );
         assert_eq!(
             p.escalate_sandbox(opaque, None, 0).await.outcome,
             EscalationOutcome::Approved(EscalationApproval::User)
         );
-        assert_eq!(
-            approver.asked()[0].approval_scopes,
-            vec![ApprovalScope::Once, ApprovalScope::WorkspaceSession],
-            "session scope offered, durable scope withheld"
-        );
-        assert_eq!(
-            approver.asked()[0].remember_rules,
-            Some(vec!["every sandbox escalation this session".to_string()]),
-            "the prompt states the real scope"
-        );
-
-        // Blanket consent covers another opaque script and a parseable one.
+        for request in approver.asked() {
+            assert_eq!(request.approval_scopes, vec![ApprovalScope::Once]);
+            assert_eq!(request.remember_rules, None);
+        }
         assert_eq!(
             p.escalate_sandbox("x=$(date) && echo $x", None, 0)
                 .await
                 .outcome,
-            EscalationOutcome::Approved(EscalationApproval::Remembered)
+            EscalationOutcome::Declined,
+            "nothing was remembered; the exhausted approver says no"
         );
-        assert_eq!(
-            p.escalate_sandbox("go test ./pkg", None, 0).await.outcome,
-            EscalationOutcome::Approved(EscalationApproval::Remembered)
-        );
-        assert_eq!(approver.ask_count(), 1, "asked once for the whole session");
-
-        // It does not reach the pre-execution check: the blanket only skips
-        // the question after a denial, so every new script still runs sandboxed
-        // first (plan 245).
-        assert!(!p.sandbox_escalation_remembered(opaque));
+        assert_eq!(approver.ask_count(), 3);
     }
 
     /// What the sandbox refused rides the prompt. Without it the notice tells

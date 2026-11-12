@@ -3825,13 +3825,16 @@ refusal and says the sandbox was not widened. Bypass widens without asking.
 Nested sandboxes, unclassified refusals, writes that cannot be offered and
 anything left after the widenings still go to the full escalation below.
 
-Escalation consent is **remember-able** at the same granularity bash approvals
-use — a two-word command prefix — under its own `sandbox_escalate(<prefix> *)`
-rule. 可解析但两词前缀不描述命令本身的调用（`timeout 600 cargo test`、
-`git -C ../lib status`）改记逐字会话记忆，不提供 `p`。字面命令形状完整、但因为
-`xargs -I` 或 `time -o` 的未知效果成为 opaque 的调用（含嵌套形式）同样只记整条原文，
-不退成通配升级，不参与持久前缀规则匹配；普通沙箱内批准是另一种同意。固定文件输出还
-必须逐个匹配 `sandbox_escalate_write(<glob>)`，会话缓存也包含相同写入范围。升级与普通
+Escalation consent offers exactly two answers (plan 283): **once**, or **for this
+project** — a `sandbox_escalate(<prefix> *)` rule at the granularity bash
+approvals use, a two-word command prefix. There is no session scope: asking
+again every session adds a question and no safety, and the session-wide
+wildcard it used to offer was bypass by another name. There is no exact-text
+memory either: the key was the whole command, which carries this run's own test
+filter and `| tail -20`, so it never matched again. 可解析但两词前缀不描述命令本身的
+调用（`timeout 600 cargo test`、`git -C ../lib status`）和带未知效果的包装器（`xargs -I`、
+`time -o`，含嵌套形式）只能允许一次；前者仍能被已有的精确升级规则认领，不写新的。
+普通沙箱内批准是另一种同意。固定文件输出还必须逐个匹配 `sandbox_escalate_write(<glob>)`。升级与普通
 审批一样只记有效果的段：只读段（含 `cd`、`| tail -20`、`| grep`）既不进键也不参与匹配
 （plan 283）——沙箱限制的是写和网络，敏感读取由解析结果硬拦截，`cd` 本身没有效果、
 相对写入目标另行解析。于是 `cd <dir> && make check 2>&1 | tail -80` 由
@@ -3850,28 +3853,26 @@ binary and binds the port before finding out it may not. It is deliberately not
 a `bash(...)` rule: *may run* and *may run uncontained* are different
 permissions, so neither form matches the other's check.
 
-Other opaque scripts (an assignment, a substitution) cannot be keyed on at all
-here, so their `a` is blanket — *every* sandbox escalation for the rest of this
-workspace session, said in as many words on the prompt, session-only and never
-persisted. The blanket is consulted **only inside the denial handler**: every
-new command still runs contained first, and only a command the sandbox actually
-refused is re-run uncontained without another ask. That is still wider than the ordinary gate's verbatim memory on purpose:
-it waives only the escalation question, never the first contained attempt, so a
-review's probes do not re-ask after the first refusal. A parseable command whose
-memory cannot be expressed safely — a write whose parent scope is `/`, glob
-characters, an unwritable rule token — offers only `Once`; the widest scope must
-not be the fallback for a narrower one that is unavailable. Without the
-per-command half, a test suite that binds a local port re-asked on every run —
-one measured review spent 20 minutes of its 63 on escalation round-trips,
-against 1 minute for the same review without them.
+Opaque scripts (an assignment, a substitution) cannot be keyed on at all, so
+leaving the sandbox for one is allowed once at a time. They used to get a
+session-wide wildcard — every escalation for the rest of the session — for a
+review's probe scripts, whose real need was the network; that is now a
+capability the session can grant (above), which keeps the writes contained. The
+prompt says what a yes means: the command runs with full access to the user's
+files and network, including any code it builds or executes. A parseable
+command whose memory cannot be expressed safely — a write whose parent scope is
+`/`, glob characters, an unwritable rule token — likewise offers only `Once`.
+Without the per-command rule, a test suite that binds a local port re-asked on
+every run — one measured review spent 20 minutes of its 63 on escalation
+round-trips, against 1 minute for the same review without them.
 
 字面正文例外使用独立的执行上下文，不能用 `trust_sandboxed` 或免审批 bool 代替实际保护。
 关闭自动放行但保留沙箱时仍可通过敏感门，随后按 opaque 规则审批。保护要求由权限门在
 产出 `Verdict` 时算一次；前景、背景和直接前景执行器（包括 scheduler）只读
 `Protection::Required`，在第一次不带沙箱的启动前拒绝，拒绝后的分支只提示保护要求、
 不提供升级。已有逐命令升级记忆若会把这条调用带出沙箱，门在判定 `Escalated` 时就直接
-硬拒绝（这类正文都是 heredoc，解析为 opaque，实际只有会话通配能记住，而通配不在运行前
-跳过沙箱，所以这一支是防御）；保护要求由拒绝后的分支优先处理。沙箱失败也不询问或自动
+硬拒绝（这类正文都是 heredoc，解析为 opaque，没有任何升级记忆能记住它，所以这一支是
+防御）；保护要求由拒绝后的分支优先处理。沙箱失败也不询问或自动
 脱沙箱重跑。无策略、平台不支持或缺少必要读写拒绝均保持拒绝，旧升级同意不能覆盖该要求。未依赖这次正文例外的调用保持
 现有升级行为。
 

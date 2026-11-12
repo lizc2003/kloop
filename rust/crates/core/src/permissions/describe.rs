@@ -19,21 +19,19 @@ use crate::tools::Builtin;
 /// the line that proves it are what decide whether the answer is a writable
 /// root, the network switch, or a different command.
 pub(super) fn describe_denial(denial: Option<&crate::sandbox::SandboxDenial>) -> String {
+    // What a yes means, said plainly (plan 283): whatever code this command
+    // builds or runs gets the user's whole account, not just this one access.
+    const CONSEQUENCE: &str = "run it without the sandbox? It would run with full access to your \
+        files and network, including any code it builds or executes.";
     let Some(denial) = denial else {
-        return "the OS sandbox blocked this — run it without the sandbox?".to_string();
+        return format!("the OS sandbox blocked this — {CONSEQUENCE}");
     };
     format!(
-        "the OS sandbox blocked this ({}) — run it without the sandbox?\n{}",
+        "the OS sandbox blocked this ({}) — {CONSEQUENCE}\n{}",
         denial.kind.label(),
         denial.evidence
     )
 }
-
-/// The session-cache key standing for "every sandbox escalation in this
-/// workspace session". Never written to the durable store: a script this
-/// coarse cannot be spelled as a rule, and consent that broad should not
-/// outlive the sitting it was given in.
-pub(super) const BLANKET_ESCALATION_SIGNATURE: &str = "sandbox_escalate:*";
 
 /// What the ordinary gate's prompt shows under the remembering choices for a
 /// script that can only be keyed on its own text. There is no rule to echo —
@@ -44,36 +42,20 @@ pub(super) const BLANKET_ESCALATION_SIGNATURE: &str = "sandbox_escalate:*";
 /// bypass mode by another name.
 const VERBATIM_REMEMBER_RULE: &str = "only this exact command text";
 
-/// What the prompt shows under the remembering choices when the script is too
-/// opaque to key on — the scope really is every escalation, and saying so is
-/// the difference between an informed yes and a misread one.
-pub(super) const BLANKET_ESCALATION_RULE: &str = "every sandbox escalation this session";
-
 /// Escalation consent is remembered at the same granularity the ordinary gate
 /// uses for bash — a two-word command prefix per segment with an effect — but
 /// under its own `sandbox_escalate(...)` rule, because "may run" and "may run
-/// uncontained" are different permissions. 已定位但带未知效果的包装器只记原文，
-/// 不让未知效果进入持久规则匹配；其它 opaque 脚本或无法表示的前缀返回 `None`。
+/// uncontained" are different permissions. It is only ever a project rule
+/// (plan 283): no exact-text memory, which never matched again, and no
+/// session-wide wildcard, which was bypass for the rest of the session. A
+/// command whose prefix does not describe it (`timeout 600 cargo test`) gets a
+/// payload that writes nothing but can still be matched by a rule that already
+/// exists; an opaque script, or a wrapper with unknown effects, gets none.
 pub(super) fn escalation_remember_payload(
     command: &str,
     cwd: &Path,
-    facts: Option<&BashFacts>,
-) -> Option<Remember> {
-    escalation_memory(command, cwd, facts).remember
-}
-
-/// 升级记忆的形状：可复用的载荷，以及脚本是否根本没法按键值描述。
-/// Opaque 才能使用会话通配；非 opaque 但载荷为 `None` 的形状只值得再问一次本命令。
-pub(super) struct EscalationMemory {
-    pub(super) remember: Option<Remember>,
-    pub(super) opaque: bool,
-}
-
-pub(super) fn escalation_memory(
-    command: &str,
-    cwd: &Path,
     shared_facts: Option<&BashFacts>,
-) -> EscalationMemory {
+) -> Option<Remember> {
     let computed;
     let facts: &BashFacts = match shared_facts {
         Some(facts) => facts,
@@ -82,21 +64,10 @@ pub(super) fn escalation_memory(
             &computed
         }
     };
-    let opaque = matches!(facts.analysis, BashAnalysis::Opaque);
-    let remember = escalation_payload_from_facts(facts.clone(), command, cwd);
-    EscalationMemory { remember, opaque }
-}
-
-fn escalation_payload_from_facts(facts: BashFacts, command: &str, cwd: &Path) -> Option<Remember> {
     if facts.verbatim_escalation {
-        return Some(verbatim_remember(
-            "sandbox_escalate",
-            command.trim(),
-            Vec::new(),
-            Vec::new(),
-        ));
+        return None;
     }
-    let analysis = facts.analysis;
+    let analysis = &facts.analysis;
     if cfg!(windows) && !analysis.writes().is_empty() {
         return None;
     }
@@ -106,7 +77,7 @@ fn escalation_payload_from_facts(facts: BashFacts, command: &str, cwd: &Path) ->
         .iter()
         .map(|path| PathFacts::gather_with_resolved(Path::new(path), cwd, None))
         .collect();
-    bash_prefix_memory(cmds, &writes, "sandbox_escalate", Some(command.trim()))
+    bash_prefix_memory(cmds, &writes, "sandbox_escalate", Unstable::MatchOnly)
 }
 
 pub(super) fn user_denial(name: &str) -> String {
@@ -162,6 +133,16 @@ impl Remember {
     }
 }
 
+/// What to do with a segment whose two-word prefix does not describe it.
+#[derive(Clone, Copy)]
+enum Unstable<'a> {
+    /// The ordinary gate: remember this exact command text for the session.
+    Verbatim(Option<&'a str>),
+    /// The escalation: remember nothing new, but keep the facts an existing
+    /// rule is matched against.
+    MatchOnly,
+}
+
 /// One rule per distinct two-word command prefix, in `tool`'s own vocabulary:
 /// `bash(git commit *)` for the ordinary gate, `sandbox_escalate(git commit *)`
 /// for the escalation. The two consents are different permissions written at
@@ -185,7 +166,7 @@ fn bash_prefix_memory(
     cmds: &[Vec<String>],
     writes: &[PathFacts],
     tool: &str,
-    verbatim: Option<&str>,
+    unstable: Unstable<'_>,
 ) -> Option<Remember> {
     let effective: Vec<Vec<String>> = cmds
         .iter()
@@ -196,16 +177,27 @@ fn bash_prefix_memory(
     let mut signatures = Vec::new();
     for argv in &effective {
         if argv_prefix_is_unstable(argv) {
-            let command = verbatim.filter(|command| !command.is_empty())?;
-            // The exact text keys the *new* memory, but the argv and write
-            // facts still have to answer rules that already exist: a durable
-            // `sandbox_escalate(timeout 600 cargo test)` must cover this run.
-            return Some(verbatim_remember(
-                tool,
-                command,
-                effective.clone(),
-                writes.to_vec(),
-            ));
+            // The argv and write facts still have to answer rules that already
+            // exist: a durable `sandbox_escalate(timeout 600 cargo test)` must
+            // cover this run.
+            return match unstable {
+                Unstable::Verbatim(command) => {
+                    let command = command.filter(|command| !command.is_empty())?;
+                    Some(verbatim_remember(
+                        tool,
+                        command,
+                        effective.clone(),
+                        writes.to_vec(),
+                    ))
+                }
+                Unstable::MatchOnly => Some(Remember {
+                    rules: Vec::new(),
+                    echo: Vec::new(),
+                    signatures: Vec::new(),
+                    argvs: effective.clone(),
+                    writes: writes.to_vec(),
+                }),
+            };
         }
         let prefix: Vec<&str> = argv.iter().take(2).map(String::as_str).collect();
         if prefix.is_empty()
@@ -326,7 +318,12 @@ pub(super) fn remember_payload(name: &str, call: &CallFacts) -> Option<Remember>
                 BashAnalysis::Commands(cmds) | BashAnalysis::WithWrites { commands: cmds, .. },
             )),
             _,
-        ) => bash_prefix_memory(cmds, &call.writes, "bash", call.command.as_deref()),
+        ) => bash_prefix_memory(
+            cmds,
+            &call.writes,
+            "bash",
+            Unstable::Verbatim(call.command.as_deref()),
+        ),
         // PowerShell stays unremember-able: bash at least gets parsed and only
         // then gives up, while PowerShell has no analysis at all — so "every
         // call asks" is the only safety net it has left.
@@ -461,7 +458,7 @@ pub(super) fn clip(text: &str) -> String {
 pub(super) fn describe_escalation(command: &str, depth: u8) -> String {
     let agent = if depth > 0 { "[sub-agent] " } else { "" };
     let cmd: String = command.chars().take(200).collect();
-    format!("{agent}[sandbox denied — run without sandbox?] bash: {cmd}")
+    format!("{agent}[sandbox denied — run outside the sandbox, with full access?] bash: {cmd}")
 }
 
 /// The exit-plan-mode prompt heading; the plan text itself rides in the
