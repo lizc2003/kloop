@@ -31,7 +31,6 @@ use similar::ChangeTag;
 use similar::TextDiff;
 
 use crate::file_io::BoundedRead;
-use crate::file_io::FileReadError;
 use crate::file_io::read_bounded;
 use crate::text_edit::apply_text_edit;
 
@@ -82,14 +81,18 @@ pub(crate) async fn file_change_preview_with_context(
             match read_preview_file(path).await {
                 Ok(snapshot) => match String::from_utf8(snapshot.bytes) {
                     Ok(existing) => numbered_diff(&existing, content),
-                    Err(_) => new_file_preview(content),
+                    Err(_) => format!(
+                        "(overwriting existing binary file, {} bytes)",
+                        snapshot.metadata.len()
+                    ),
                 },
-                Err(error) => match oversized_file(&error) {
-                    Some(actual) => {
-                        format!("(overwriting existing file, {actual} bytes)")
-                    }
-                    None => new_file_preview(content),
-                },
+                Err(PreviewReadError::Missing) => new_file_preview(content),
+                Err(PreviewReadError::TooLarge(actual)) => {
+                    format!("(overwriting existing file, {actual} bytes)")
+                }
+                Err(PreviewReadError::Unreadable) => {
+                    "(existing file could not be previewed)".to_string()
+                }
             }
         }
         "notebook_edit" => {
@@ -105,10 +108,10 @@ pub(crate) async fn file_change_preview_with_context(
                         format!("{}\n{diff}", preview.header)
                     }
                 }
-                Err(error) => match oversized_file(&error) {
-                    Some(actual) => format!("(editing notebook cell; file is {actual} bytes)"),
-                    None => return None,
-                },
+                Err(PreviewReadError::TooLarge(actual)) => {
+                    format!("(editing notebook cell; file is {actual} bytes)")
+                }
+                Err(PreviewReadError::Missing | PreviewReadError::Unreadable) => return None,
             }
         }
         _ => return None,
@@ -132,22 +135,33 @@ pub(crate) async fn file_change_preview_with_context(
     (!preview.is_empty()).then_some(preview)
 }
 
-async fn read_preview_file(path: &str) -> anyhow::Result<BoundedRead> {
-    let path = path.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)
-            .with_context(|| format!("cannot open preview target {path}"))?;
-        read_bounded(&mut file, MAX_DIFF_INPUT).map_err(anyhow::Error::from)
-    })
-    .await
-    .context("file preview worker failed")?
+/// Why a preview could not diff against the real file. The distinction matters:
+/// only a missing target is a new file, and a binary or unreadable one must not
+/// be announced as one to the person approving the change.
+enum PreviewReadError {
+    Missing,
+    TooLarge(u64),
+    Unreadable,
 }
 
-fn oversized_file(error: &anyhow::Error) -> Option<u64> {
-    error
-        .downcast_ref::<FileReadError>()
-        .and_then(FileReadError::too_large)
-        .map(|(actual, _)| actual)
+async fn read_preview_file(path: &str) -> Result<BoundedRead, PreviewReadError> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PreviewReadError::Missing);
+            }
+            Err(_) => return Err(PreviewReadError::Unreadable),
+        };
+        read_bounded(&mut file, MAX_DIFF_INPUT).map_err(|error| match error.too_large() {
+            Some((actual, _)) => PreviewReadError::TooLarge(actual),
+            None => PreviewReadError::Unreadable,
+        })
+    })
+    .await
+    .context("file preview worker failed")
+    .map_err(|_| PreviewReadError::Unreadable)?
 }
 
 /// Apply the edit to the real file and diff old→new with file line numbers;
@@ -335,6 +349,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(preview, "(new file)\n(empty)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a missing path is `(new file)`. A binary overwrite and a target
+    /// that exists but cannot be read must say so — calling either "new" tells
+    /// the approver the wrong thing about what is being replaced.
+    #[tokio::test]
+    async fn write_file_labels_binary_and_unpreviewable_targets() {
+        let dir = temp_dir("write-labels");
+        let binary = dir.join("image.png");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        let preview = file_change_preview(
+            "write_file",
+            &json!({"path": binary.to_str().unwrap(), "content": "text"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview, "(overwriting existing binary file, 3 bytes)");
+
+        // A directory opens but cannot be read as a file, the same shape as an
+        // unreadable existing target.
+        let directory = dir.join("target");
+        std::fs::create_dir(&directory).unwrap();
+        let preview = file_change_preview(
+            "write_file",
+            &json!({"path": directory.to_str().unwrap(), "content": "text"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preview, "(existing file could not be previewed)");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

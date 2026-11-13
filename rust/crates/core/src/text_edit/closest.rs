@@ -100,10 +100,13 @@ pub(crate) fn closest_match(current: &str, old: &str) -> Option<ClosestMatch> {
         return None;
     }
 
+    if trimmed_line_count(current) > MAX_FILE_LINES {
+        return None;
+    }
     let current = normalize_newlines(current);
     let file_lines = trimmed_lines(&current);
     let height = old_lines.len();
-    if file_lines.len() > MAX_FILE_LINES || file_lines.len() < height {
+    if file_lines.len() < height {
         return None;
     }
     let folded_file: Vec<Vec<char>> = file_lines.iter().map(|line| fold(line).chars).collect();
@@ -244,6 +247,31 @@ fn trimmed_lines(text: &str) -> Vec<&str> {
         lines.pop();
     }
     lines
+}
+
+/// What [`trimmed_lines`] would count, without normalizing the text first.
+/// Otherwise a file over the ceiling paid for a full copy just to be refused.
+fn trimmed_line_count(text: &str) -> usize {
+    let mut end = text.len();
+    loop {
+        if text[..end].ends_with("\r\n") {
+            end -= 2;
+        } else if text[..end].ends_with('\n') {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    let trimmed = &text[..end];
+    if trimmed.is_empty() {
+        0
+    } else {
+        trimmed
+            .bytes()
+            .filter(|&byte| byte == b'\n')
+            .count()
+            .saturating_add(1)
+    }
 }
 
 fn join_lines(lines: &[Vec<char>]) -> Vec<char> {
@@ -429,19 +457,22 @@ fn first_difference(yours: &str, file: &str) -> FirstDifference {
         .zip(&file_folded.chars)
         .take_while(|(left, right)| left == right)
         .count();
-    let original = |text: &str, spans: &[super::Span]| {
-        spans
-            .get(index)
-            .and_then(|span| text[span.start..].chars().next())
+    let original = |text: &str, folded: &super::Folded| {
+        if index < folded.chars.len() {
+            text[folded.span_start(index)..].chars().next()
+        } else {
+            None
+        }
     };
-    let column = match your_folded.spans.get(index) {
-        Some(span) => yours[..span.start].chars().count() + 1,
-        None => yours.chars().count() + 1,
+    let column = if index < your_folded.chars.len() {
+        yours[..your_folded.span_start(index)].chars().count() + 1
+    } else {
+        yours.chars().count() + 1
     };
     FirstDifference {
         column,
-        yours: original(yours, &your_folded.spans),
-        file: original(file, &file_folded.spans),
+        yours: original(yours, &your_folded),
+        file: original(file, &file_folded),
     }
 }
 
@@ -457,6 +488,31 @@ fn quoted(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `closest_match` refuses a file over the line ceiling before it copies
+    /// it into logical LF form, so the count must match `trimmed_lines`.
+    #[test]
+    fn trimmed_line_count_matches_trimmed_lines() {
+        for text in [
+            "",
+            "\n",
+            "\n\n",
+            "a",
+            "a\n",
+            "a\nb\n",
+            "a\nb\n\n",
+            "a\r\nb\r\n",
+            "a\r\n\r\n",
+            "a\r\n\n",
+            "a\n \n",
+        ] {
+            assert_eq!(
+                trimmed_line_count(text),
+                trimmed_lines(&super::super::normalize_newlines(text)).len(),
+                "{text:?}"
+            );
+        }
+    }
 
     fn lines(range: std::ops::RangeInclusive<usize>) -> String {
         range

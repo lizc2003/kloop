@@ -230,6 +230,8 @@ fn run_grep_with_hook(
     let started = Instant::now();
     let mut timed_out = false;
     let mut hidden = 0usize;
+    let mut hard_links = 0usize;
+    let mut unreadable = 0usize;
 
     for entry in build_walk(&args.root, args.glob.as_deref(), args.file_type.as_deref())? {
         if started.elapsed() > SEARCH_BUDGET {
@@ -248,8 +250,14 @@ fn run_grep_with_hook(
         let prepared = match super::fs::prepare_read_target(entry.path(), &display) {
             Ok(prepared) => prepared,
             Err(error) => {
+                // A hard link is not a deny rule: the path is skipped because
+                // another name for the same inode cannot be classified, and
+                // saying "hidden by deny/sensitive rules" would misdescribe
+                // both the reason and the file.
                 if error.downcast_ref::<super::fs::UnsafeHardLink>().is_some() {
-                    hidden += 1;
+                    hard_links += 1;
+                } else {
+                    unreadable += 1;
                 }
                 continue;
             }
@@ -262,10 +270,6 @@ fn run_grep_with_hook(
             hidden += 1;
             continue;
         }
-        let modified = file
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
         match args.mode {
             OutputMode::Content => {
                 let sink = ContentSink {
@@ -282,6 +286,12 @@ fn run_grep_with_hook(
                 }
             }
             OutputMode::FilesWithMatches => {
+                // Only the newest-first sort reads mtime; content and count
+                // modes used to pay for a stat they never used.
+                let modified = file
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
                 let mut found = false;
                 let sink = FoundSink { found: &mut found };
                 let _ = searcher.search_reader(&matcher, file, sink);
@@ -397,6 +407,18 @@ fn run_grep_with_hook(
     out = cap_search_output(out);
     if hidden > 0 {
         out.push_str(&hidden_note(hidden));
+    }
+    if hard_links > 0 {
+        out.push_str(&format!(
+            "\n\n[{} skipped: multiple hard links]",
+            plural(hard_links, "path")
+        ));
+    }
+    if unreadable > 0 {
+        out.push_str(&format!(
+            "\n\n[{} could not be opened for reading]",
+            plural(unreadable, "file")
+        ));
     }
     if timed_out {
         out.push_str(
@@ -1447,7 +1469,36 @@ mod tests {
 
         assert!(!out.contains("needle-secret"), "{out}");
         assert!(
-            out.contains("[1 path hidden by deny/sensitive rules]"),
+            out.contains("[1 path skipped: multiple hard links]"),
+            "{out}"
+        );
+        assert!(!out.contains("hidden by deny"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grep_reports_unreadable_files_instead_of_dropping_them() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let t = Tree::new(
+            "grep-unreadable",
+            &[("readable.rs", "needle\n"), ("blocked.rs", "needle\n")],
+        );
+        let blocked = t.root.join("blocked.rs");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = grep_tool(
+            &json!({"pattern": "needle", "path": t.path(), "output_mode": "content"}),
+            Path::new("."),
+            gated(t.path(), &[]),
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let out = rel(&out, &t);
+        assert!(out.contains("readable.rs:1:needle"), "{out}");
+        assert!(
+            out.contains("[1 file could not be opened for reading]"),
             "{out}"
         );
     }

@@ -1,8 +1,38 @@
 # Plan 256 — 文件工具边界
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。
+> 状态：✅ 完成(2026-11-13)。行号是 2026-10-28 的读数;9 条开工时全部复核成立。
+> 第 4、9 条开工时问过用户:超长行按 (a)(已展示前缀算该行覆盖)，notebook 可见文本
+> 对齐到 30,000。第 2 条 rustix 1.1 已暴露 `renameat_with(RenameFlags::NOREPLACE)`，
+> 不需要直接用 libc。
+
+## 完成记录(2026-11-13)
+
+- 1 notebook `cell_type`：改成 markdown 删 `execution_count`/`outputs`；改成 code
+  补 `execution_count: null`/`outputs: []` 并删 `attachments`。未给 `cell_type` 的
+  replace 保持原行为(清空已有 code 输出)。
+- 2 新建 leaf：Unix `commit_rename(replace_existing=false)` 走
+  `renameat2(RENAME_NOREPLACE)` / `renameatx_np(RENAME_EXCL)`，不支持时退回
+  `linkat + unlinkat`；测试在最终检查之后、rename 之前注入 leaf，断言不覆盖且不剩临时文件。
+- 3 rename 后的目录 fsync 失败（EINVAL/ENOSYS 等）改为结果文本里的
+  `[written, but the change may not survive a crash: …]`，不报失败；stale 观察按成功更新。
+- 4 超长行按问答 (a)：已展示前缀计入该行覆盖，提示写明 tail 未展示并给续读 offset；
+  全文指纹仍是 stale 判据。单行文件一次读完即可 write，长行后还有行时续读一次即可。
+- 5 预览只在目标 NotFound 时显示 `(new file)`；非 UTF-8 显示
+  `(overwriting existing binary file, N bytes)`；超限保持原文案；其他读取错误显示
+  `(existing file could not be previewed)`。
+- 6 grep 分开计数：deny/敏感隐藏、硬链接跳过大、打开失败文件；后两者各有文案。
+  顺带把 `modified` 只留在 `files_with_matches` 分支取。
+- 7 回退匹配层：逻辑 LF 视图只记 CRLF 偏移（u32），fold 的 span 改成每字符一个
+  packed u32（start 由前一项 end 推出），容量按字符数；`closest_match` 先数行再规范化。
+- 8 实测 `rust/crates` 254 个文件：grep 80 ms、纯 walk 4.5 ms(warm)，约 0.31 ms/文件；
+  按 10k 文件外推约 3 s，低于 20 s 预算，目录 fd 缓存不做。只做了上面的 `modified` 惰性化。
+- 9 `MAX_NOTEBOOK_TEXT_CHARS` 从 7,000 改为引用 `READ_CONTENT_CHARS`(30,000)；
+  7,001 字符的 notebook 现在仍可编辑。
+- 验证：`cargo test -p kloop-core --lib` 1411 过、1 ignored（首次运行有一个与本次
+  无关的 bash 管道用例在环境里偶发失败，单跑与再次全跑都通过）；`cargo clippy
+  -p kloop-core --lib -- -D warnings` 通过；DESIGN 文件工具/预览/notebook/search 段已更新。
+  未跑全量 `make check`。
 
 ## 问题
 

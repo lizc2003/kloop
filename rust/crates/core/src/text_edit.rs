@@ -126,8 +126,8 @@ pub(crate) fn apply_text_edit(
     let mut updated = String::with_capacity(current.len().saturating_add(logical_new.len()));
     let mut copied_until = 0usize;
     for &(logical_start, logical_end) in selected {
-        let raw_start = raw_boundaries[logical_start];
-        let raw_end = raw_boundaries[logical_end];
+        let raw_start = raw_boundaries.raw(logical_start);
+        let raw_end = raw_boundaries.raw(logical_end);
         updated.push_str(&current[copied_until..raw_start]);
         let replacement_eol = dominant_eol(&current[raw_start..raw_end]).unwrap_or(file_eol);
         push_with_eol(&mut updated, &logical_new, replacement_eol);
@@ -155,7 +155,7 @@ pub(crate) fn apply_text_edit(
 fn punctuation_tolerant_edit(
     current: &str,
     logical: &str,
-    raw_boundaries: &[usize],
+    raw_boundaries: &RawBoundaries,
     logical_old: &str,
     new: &str,
     replace_all: bool,
@@ -166,7 +166,7 @@ fn punctuation_tolerant_edit(
     let match_count = starts.len();
     let first_line = starts
         .first()
-        .map(|&start| line_at(logical, haystack.spans[start].start));
+        .map(|&start| line_at(logical, haystack.span_start(start)));
     if match_count == 0 || (match_count > 1 && !replace_all) {
         return TextEditOutcome {
             updated: None,
@@ -181,14 +181,14 @@ fn punctuation_tolerant_edit(
     let folded_new = fold(&logical_new);
     let (prefix, suffix) = shared_ends(logical_old, &needle, &logical_new, &folded_new);
     let delta = (prefix < folded_new.chars.len() - suffix).then(|| {
-        let start = folded_new.spans[prefix].start;
-        let end = folded_new.spans[folded_new.chars.len() - suffix - 1].end;
+        let start = folded_new.span_start(prefix);
+        let end = folded_new.span_end(folded_new.chars.len() - suffix - 1);
         &logical_new[start..end]
     });
 
     let length = needle.chars.len();
     let last = needle.spans[length - 1];
-    let needle_ends_with_space = last.end > last.core_end;
+    let needle_ends_with_space = last.end() > last.core_end();
     let file_eol = dominant_eol(current).unwrap_or(Eol::Lf);
     let selected = if replace_all {
         &starts[..]
@@ -202,29 +202,29 @@ fn punctuation_tolerant_edit(
         // the match unless the needle absorbed one too: `old` ending in "，"
         // must not swallow the space after the file's ", ".
         let final_span = haystack.spans[start + length - 1];
-        let logical_start = haystack.spans[start].start;
+        let logical_start = haystack.span_start(start);
         let logical_end = if needle_ends_with_space {
-            final_span.end
+            final_span.end()
         } else {
-            final_span.core_end
+            final_span.core_end()
         };
         let prefix_end = match prefix {
             0 => logical_start,
-            n => haystack.spans[start + n - 1].end.min(logical_end),
+            n => haystack.span_end(start + n - 1).min(logical_end),
         };
         let suffix_start = match suffix {
             0 => logical_end,
-            n => haystack.spans[start + length - n].start,
+            n => haystack.span_start(start + length - n),
         };
-        let raw_start = raw_boundaries[logical_start];
-        let raw_end = raw_boundaries[logical_end];
+        let raw_start = raw_boundaries.raw(logical_start);
+        let raw_end = raw_boundaries.raw(logical_end);
         updated.push_str(&current[copied_until..raw_start]);
-        updated.push_str(&current[raw_start..raw_boundaries[prefix_end]]);
+        updated.push_str(&current[raw_start..raw_boundaries.raw(prefix_end)]);
         if let Some(delta) = delta {
             let replacement_eol = dominant_eol(&current[raw_start..raw_end]).unwrap_or(file_eol);
             push_with_eol(&mut updated, delta, replacement_eol);
         }
-        updated.push_str(&current[raw_boundaries[suffix_start]..raw_end]);
+        updated.push_str(&current[raw_boundaries.raw(suffix_start)..raw_end]);
         copied_until = raw_end;
     }
     updated.push_str(&current[copied_until..]);
@@ -244,10 +244,9 @@ fn punctuation_tolerant_edit(
 /// `new`), that difference is the edit, and it has to come from `new`.
 fn shared_ends(old: &str, folded_old: &Folded, new: &str, folded_new: &Folded) -> (usize, usize) {
     let same = |old_index: usize, new_index: usize| {
-        let old_span = folded_old.spans[old_index];
-        let new_span = folded_new.spans[new_index];
         folded_old.chars[old_index] == folded_new.chars[new_index]
-            && old[old_span.start..old_span.end] == new[new_span.start..new_span.end]
+            && old[folded_old.span_start(old_index)..folded_old.span_end(old_index)]
+                == new[folded_new.span_start(new_index)..folded_new.span_end(new_index)]
     };
     let old_len = folded_old.chars.len();
     let new_len = folded_new.chars.len();
@@ -265,15 +264,42 @@ fn shared_ends(old: &str, folded_old: &Folded, new: &str, folded_new: &Folded) -
     (prefix, suffix)
 }
 
-/// One character of a folded view, and the source bytes it stands for.
-/// `core_end` ends the character itself; `end` also covers the typesetting
-/// space it absorbed, if any. Spans tile the source: each one starts where
-/// the previous one ended.
+/// One character of a folded view, and where it ends in the source.
+///
+/// The `start` is implicit: spans tile the source, so each one starts where
+/// the previous one ended. The high bit records that one typesetting space was
+/// absorbed; `core_end` excludes it and `end` includes it. Packing it into a
+/// word is what keeps the tolerant layer from allocating 24 bytes per character
+/// of a 5 MiB file just to remember byte offsets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Span {
-    start: usize,
-    core_end: usize,
-    end: usize,
+struct Span(u32);
+
+const SPAN_ABSORBED_SPACE: u32 = 1 << 31;
+const SPAN_END_MASK: u32 = SPAN_ABSORBED_SPACE - 1;
+
+impl Span {
+    fn new(end: usize, absorbed_space: bool) -> Self {
+        assert!(
+            end < SPAN_ABSORBED_SPACE as usize,
+            "folded text exceeds the file read limit"
+        );
+        Self(
+            end as u32
+                | if absorbed_space {
+                    SPAN_ABSORBED_SPACE
+                } else {
+                    0
+                },
+        )
+    }
+
+    fn end(self) -> usize {
+        (self.0 & SPAN_END_MASK) as usize
+    }
+
+    fn core_end(self) -> usize {
+        self.end() - usize::from(self.0 & SPAN_ABSORBED_SPACE != 0)
+    }
 }
 
 struct Folded {
@@ -281,23 +307,32 @@ struct Folded {
     spans: Vec<Span>,
 }
 
+impl Folded {
+    fn span_start(&self, index: usize) -> usize {
+        match index {
+            0 => 0,
+            _ => self.spans[index - 1].end(),
+        }
+    }
+
+    fn span_end(&self, index: usize) -> usize {
+        self.spans[index].end()
+    }
+}
+
 fn fold(text: &str) -> Folded {
-    let mut chars = Vec::with_capacity(text.len());
-    let mut spans = Vec::with_capacity(text.len());
+    let char_count = text.chars().count();
+    let mut chars = Vec::with_capacity(char_count);
+    let mut spans = Vec::with_capacity(char_count);
     let mut iter = text.char_indices().peekable();
     while let Some((start, character)) = iter.next() {
         let folded = fold_char(character);
         let core_end = start + character.len_utf8();
-        let mut end = core_end;
-        if absorbs_following_space(folded) && iter.next_if(|&(_, next)| next == ' ').is_some() {
-            end += 1;
-        }
+        let absorbed_space =
+            absorbs_following_space(folded) && iter.next_if(|&(_, next)| next == ' ').is_some();
+        let end = core_end + usize::from(absorbed_space);
         chars.push(folded);
-        spans.push(Span {
-            start,
-            core_end,
-            end,
-        });
+        spans.push(Span::new(end, absorbed_space));
     }
     Folded { chars, spans }
 }
@@ -374,19 +409,21 @@ pub(crate) fn first_match_line(current: &str, old: &str) -> Option<usize> {
     }
     let haystack = fold(&logical);
     let start = *tolerant_match_starts(&haystack, &fold(&logical_old)).first()?;
-    Some(line_at(&logical, haystack.spans[start].start))
+    Some(line_at(&logical, haystack.span_start(start)))
 }
 
-fn logical_lf_view(raw: &str) -> (String, Vec<usize>) {
+fn logical_lf_view(raw: &str) -> (String, RawBoundaries) {
     let bytes = raw.as_bytes();
     let mut logical = String::with_capacity(raw.len());
-    let mut boundaries = vec![usize::MAX; raw.len() + 1];
-    boundaries[0] = 0;
+    let mut crlf_newline_offsets = Vec::new();
     let mut raw_offset = 0usize;
     while raw_offset < bytes.len() {
         if bytes[raw_offset] == b'\r'
             && bytes.get(raw_offset + 1).is_some_and(|byte| *byte == b'\n')
         {
+            crlf_newline_offsets.push(
+                u32::try_from(logical.len()).expect("file text is bounded by the read limit"),
+            );
             logical.push('\n');
             raw_offset += 2;
         } else {
@@ -397,10 +434,30 @@ fn logical_lf_view(raw: &str) -> (String, Vec<usize>) {
             logical.push(character);
             raw_offset += character.len_utf8();
         }
-        boundaries[logical.len()] = raw_offset;
     }
-    boundaries.truncate(logical.len() + 1);
-    (logical, boundaries)
+    (
+        logical,
+        RawBoundaries {
+            crlf_newline_offsets,
+        },
+    )
+}
+
+/// Maps a logical LF offset back to the raw text. A per-byte table costs
+/// 8 bytes for every byte of a 5 MiB file; the view only drops one byte at each
+/// CRLF, so the number of CRLFs before the offset is the whole correction.
+struct RawBoundaries {
+    /// Logical offsets of the `\n` written in place of a CRLF, ascending.
+    crlf_newline_offsets: Vec<u32>,
+}
+
+impl RawBoundaries {
+    fn raw(&self, logical: usize) -> usize {
+        logical
+            + self
+                .crlf_newline_offsets
+                .partition_point(|&offset| (offset as usize) < logical)
+    }
 }
 
 fn normalize_newlines(text: &str) -> String {
@@ -519,6 +576,35 @@ mod tests {
         assert_eq!(first_match_line("x\ny\nx\n", "x"), Some(1));
         assert_eq!(first_match_line("a\nb\n", "missing"), None);
         assert_eq!(first_match_line("a\nb\n", ""), None);
+    }
+
+    /// The old view allocated eight bytes per raw byte just to remember where
+    /// each logical offset came from. Only CRLF removal moves an offset, so
+    /// only those positions need remembering.
+    #[test]
+    fn logical_view_records_only_crlf_offsets() {
+        let (logical, boundaries) = logical_lf_view("a\r\nb\n");
+        assert_eq!(logical, "a\nb\n");
+        assert_eq!(boundaries.crlf_newline_offsets, vec![1]);
+        assert_eq!(
+            [0, 1, 2, 3, 4].map(|offset| boundaries.raw(offset)),
+            [0, 1, 3, 4, 5]
+        );
+
+        let (_, lf_only) = logical_lf_view("a\nb\n");
+        assert!(lf_only.crlf_newline_offsets.is_empty());
+    }
+
+    /// The tolerant layer's largest allocation is one packed word per folded
+    /// character; the source offsets come from the tiling invariant.
+    #[test]
+    fn folded_spans_are_one_word_per_character() {
+        assert_eq!(std::mem::size_of::<Span>(), 4);
+        let text = "，a b,c".repeat(1_000);
+        let folded = fold(&text);
+        assert_eq!(folded.spans.len(), folded.chars.len());
+        let last = folded.spans.len() - 1;
+        assert_eq!(folded.span_end(last), text.len());
     }
 
     fn tolerant(current: &str, old: &str, new: &str) -> TextEditOutcome {

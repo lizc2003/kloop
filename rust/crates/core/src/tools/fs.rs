@@ -204,7 +204,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// the provider served 93–95% of it from cache — and a round trip is ~20s. Must
 /// stay below [`crate::history::OFFLOAD_CAP_CHARS`], or every large read spills
 /// to disk and the model gets a preview instead.
-const READ_CONTENT_CHARS: usize = 30_000;
+pub(super) const READ_CONTENT_CHARS: usize = 30_000;
 
 #[derive(Clone)]
 enum Mutation {
@@ -268,6 +268,13 @@ enum CommitFault {
     /// window between kloop reading it and kloop replacing it.
     #[cfg(test)]
     ChangeTargetBeforeRename,
+    /// Create a new leaf after the final freshness checks and before the
+    /// rename, the window a non-replacing commit exists to close.
+    #[cfg(test)]
+    CreateTargetBeforeRename,
+    /// Pretend the parent directory's fsync failed after the rename landed.
+    #[cfg(test)]
+    UnsyncedParent,
 }
 
 pub(super) async fn prepare_read(
@@ -540,6 +547,12 @@ fn numbered_text_page(
                 let (prefix, _) = super::char_prefix(&rendered, READ_CONTENT_CHARS);
                 out.push_str(prefix);
                 partial_line = Some(display_start + relative);
+                // The prefix is what the model can see, so the line counts as
+                // covered: a file whose only unread part is past the character
+                // cut must still be able to earn `write_file`. The stale check
+                // still hashes the whole file, and the notice says the tail was
+                // never shown.
+                observed_end = start + relative + 1;
             }
             break;
         }
@@ -556,8 +569,15 @@ fn numbered_text_page(
     // a bigger limit — measured on one review session: one file read 7 times,
     // another 3, twice in a single round with overlapping ranges.
     if let Some(line) = partial_line {
+        let continuation = (observed_end < total_lines).then(|| {
+            format!(
+                "; call read_file with offset={} to continue",
+                observed_end + 1
+            )
+        });
         out.push_str(&format!(
-            "\n\n[read output truncated within line {line} of {total_lines}; use grep or a narrower reader to inspect it]"
+            "\n\n[read output truncated within line {line} of {total_lines}; its tail is not shown. Use grep or a narrower reader to inspect it{}]",
+            continuation.unwrap_or_default()
         ));
     } else if observed_end < total_lines {
         out.push_str(&format!(
@@ -1216,7 +1236,7 @@ fn commit_mutation(
         }
     };
 
-    atomic_replace(target, &bytes, permissions, expected_target.as_ref(), fault)?;
+    let durability = atomic_replace(target, &bytes, permissions, expected_target.as_ref(), fault)?;
     let mut committed = open_regular_target(parent, parent_path, leaf, tool, display_path)?
         .with_context(|| format!("{tool}: committed file disappeared: {display_path}"))?;
     let (matches, metadata) = file_contents_equal(&mut committed.file, &bytes)
@@ -1227,6 +1247,12 @@ fn commit_mutation(
             "{tool}: {display_path} changed immediately after commit; read it again before modifying it"
         );
     }
+    let content = match durability {
+        None => content,
+        Some(error) => {
+            format!("{content}\n[written, but the change may not survive a crash: {error}]")
+        }
+    };
     Ok(CommitOutcome {
         content,
         bytes,
@@ -1558,7 +1584,7 @@ fn atomic_replace(
     permissions: Option<std::fs::Permissions>,
     expected_target: Option<&ExpectedTarget>,
     fault: CommitFault,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let CommitTarget {
         parent,
         parent_path,
@@ -1587,7 +1613,7 @@ fn atomic_replace(
         // same way on both platforms; see the `ReplaceTempName` arm below.
         #[cfg(test)]
         let mut decoy = None;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Option<String>> {
             file.write_all(bytes).with_context(|| {
                 format!("{tool}: cannot write temporary file for {display_path}")
             })?;
@@ -1627,6 +1653,12 @@ fn atomic_replace(
             )?;
             verify_parent_binding(parent, parent_path, tool, display_path)?;
             verify_temp_binding(parent, parent_path, &temp, &file, bytes, display_path, tool)?;
+            #[cfg(test)]
+            if matches!(fault, CommitFault::CreateTargetBeforeRename) {
+                std::fs::write(parent_path.join(leaf), FAULT_TARGET_BYTES).with_context(|| {
+                    format!("{tool}: cannot inject target creation for {display_path}")
+                })?;
+            }
             commit_rename(
                 &file,
                 parent,
@@ -1635,8 +1667,20 @@ fn atomic_replace(
                 /* replace_existing */ expected_target.is_some(),
             )
             .with_context(|| format!("{tool}: cannot atomically replace {display_path}"))?;
-            sync_parent(parent, tool, display_path)?;
-            Ok(())
+            #[cfg(test)]
+            if matches!(fault, CommitFault::UnsyncedParent) {
+                return Ok(Some(format!(
+                    "{tool}: cannot sync parent directory for {display_path}: injected failure"
+                )));
+            }
+            // The rename landed, so the bytes are visible. A directory fsync
+            // that the filesystem/OS refuses (EINVAL/ENOSYS on some FUSE and
+            // network mounts, for example) says durability is unconfirmed, not
+            // that the write failed; reporting failure here would send the
+            // model to retry an edit that already happened.
+            Ok(sync_parent(parent, tool, display_path)
+                .err()
+                .map(|error| format!("{error:#}")))
         })();
         if result.is_err() {
             discard_temp(&file, parent, &temp);
@@ -2044,6 +2088,59 @@ mod tests {
         let _ = std::fs::remove_file(empty);
         let _ = std::fs::remove_file(pdf);
         let _ = std::fs::remove_file(long);
+    }
+
+    /// Plan 256 (a): a line longer than the read budget cannot be shown whole,
+    /// so its shown prefix counts as covering the line. Without that, a
+    /// minified JS/JSON/SVG file could never earn `write_file`. The tail is
+    /// named in the notice, and the stale check still hashes every byte.
+    #[tokio::test]
+    async fn a_truncated_long_line_can_still_earn_write_file() {
+        let body = format!("{}tail\n", "x".repeat(super::READ_CONTENT_CHARS + 100));
+        let path = temp_file("read-long-line-write", &body);
+        let key = std::fs::canonicalize(&path).unwrap();
+        let target = path.to_str().unwrap();
+        let ctx = test_ctx(0, "read-long-line-write");
+
+        let (out, is_error) = run_tool("read_file", json!({"path": target}), &ctx).await;
+        assert!(!is_error);
+        assert!(out.contains("truncated within line 1 of 2"), "{out}");
+        assert!(out.contains("its tail is not shown"), "{out}");
+        assert!(out.contains("offset=2"), "{out}");
+        assert!(!ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+
+        let (out, is_error) = run_tool(
+            "read_file",
+            json!({"path": target, "offset": 2, "limit": 1}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+
+        let (out, is_error) = run_tool(
+            "write_file",
+            json!({"path": target, "content": "replaced\n"}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_long_line_at_eof_is_covered_by_one_read() {
+        let body = "x".repeat(super::READ_CONTENT_CHARS + 100);
+        let path = temp_file("read-long-line-eof", &body);
+        let key = std::fs::canonicalize(&path).unwrap();
+        let ctx = test_ctx(0, "read-long-line-eof");
+
+        let (out, is_error) =
+            run_tool("read_file", json!({"path": path.to_str().unwrap()}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(ctx.cfg.file_state.observation(&key).unwrap().is_complete());
+        let _ = std::fs::remove_file(path);
     }
 
     /// read_file sniffs the magic bytes: a PNG file returns a single image
@@ -4096,6 +4193,80 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), super::FAULT_TARGET_BYTES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A new leaf's commit must not replace a file that appeared after the
+    /// last freshness check. `renameat` always replaces, so the platform asks
+    /// for a non-replacing rename (or falls back to `linkat`) instead.
+    #[test]
+    fn a_leaf_created_inside_the_commit_window_is_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("kloop-commit-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("new.txt");
+        let prepared =
+            super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
+
+        let error = super::commit_mutation(
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
+            None,
+            super::Mutation::Write {
+                bytes: b"ours".to_vec(),
+            },
+            super::CommitFault::CreateTargetBeforeRename,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot atomically replace"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), super::FAULT_TARGET_BYTES);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("new.txt")]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Directory fsync is unavailable on some filesystems. The rename has
+    /// already made the change visible, so that must be a durability note, not
+    /// a failed edit the model would retry.
+    #[test]
+    fn an_unsynced_parent_is_reported_but_the_write_stands() {
+        let dir = std::env::temp_dir().join(format!("kloop-unsynced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let expected = full_observation(&path, b"original");
+        let prepared =
+            super::prepare_mutation(&dir, &path, "write_file", path.to_str().unwrap()).unwrap();
+
+        let outcome = super::commit_mutation(
+            commit_target(&prepared, path.to_str().unwrap(), "write_file"),
+            Some(&expected),
+            super::Mutation::Write {
+                bytes: b"replacement".to_vec(),
+            },
+            super::CommitFault::UnsyncedParent,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.content.contains("may not survive a crash"),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.contains("cannot sync parent directory"),
+            "{}",
+            outcome.content
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert!(outcome.metadata.len() == b"replacement".len() as u64);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -180,18 +180,73 @@ pub(super) fn create_temp(parent: &std::fs::File, name: &OsStr) -> Result<std::f
 
 /// Move the temp file onto `leaf`, both relative to `parent`.
 ///
-/// `replace_existing` is the one genuine difference between the platforms:
-/// Windows has to be told, while `renameat` always replaces — there is no
-/// portable non-replacing rename, so unix answers the question by ignoring it.
+/// `replace_existing` is the one genuine difference between the platforms.
+/// When false, a plain `renameat` would silently overwrite a leaf that appeared
+/// after the freshness check, so the commit asks the filesystem not to replace:
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS.
+/// Filesystems without either fall back to `linkat`, which cannot replace and
+/// fails with `EEXIST` exactly when the leaf appeared.
 pub(super) fn commit_rename(
     _temp: &std::fs::File,
     parent: &std::fs::File,
     name: &OsStr,
     leaf: &OsStr,
-    _replace_existing: bool,
+    replace_existing: bool,
 ) -> Result<()> {
-    rustix::fs::renameat(parent, name, parent, leaf)
-        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()).into())
+    if replace_existing {
+        return rustix::fs::renameat(parent, name, parent, leaf)
+            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()).into());
+    }
+    rename_no_replace(parent, name, leaf)
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rename_no_replace(parent: &std::fs::File, name: &OsStr, leaf: &OsStr) -> Result<()> {
+    use rustix::fs::RenameFlags;
+
+    match rustix::fs::renameat_with(parent, name, parent, leaf, RenameFlags::NOREPLACE) {
+        Ok(()) => return Ok(()),
+        // The flag, the syscall, or the filesystem may lack non-replacing
+        // rename. Anything else (notably EEXIST) is the answer, not a reason
+        // to try a weaker primitive.
+        Err(
+            rustix::io::Errno::INVAL
+            | rustix::io::Errno::NOSYS
+            | rustix::io::Errno::NOTSUP
+            | rustix::io::Errno::OPNOTSUPP,
+        ) => {}
+        Err(error) => {
+            return Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into());
+        }
+    }
+    link_no_replace(parent, name, leaf)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+fn rename_no_replace(parent: &std::fs::File, name: &OsStr, leaf: &OsStr) -> Result<()> {
+    link_no_replace(parent, name, leaf)
+}
+
+/// `linkat` is the portable non-replacing commit: the new name either points
+/// at the temp inode or the call fails with `EEXIST`. The temp name is dropped
+/// only after the link exists, so a crash leaves either both names or one.
+fn link_no_replace(parent: &std::fs::File, name: &OsStr, leaf: &OsStr) -> Result<()> {
+    rustix::fs::linkat(parent, name, parent, leaf, rustix::fs::AtFlags::empty())
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+    // The leaf now names the bytes; failing to drop the other name is a
+    // leftover temp, not a failed commit.
+    let _ = rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty());
+    Ok(())
 }
 
 /// Best effort removal of a temp file a failed commit left behind. unix drops

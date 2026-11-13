@@ -17,7 +17,10 @@ use crate::image::image_block_from_bytes;
 
 pub(crate) const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
 const MAX_NOTEBOOK_CELLS: usize = 10_000;
-const MAX_NOTEBOOK_TEXT_CHARS: usize = 7_000;
+/// One budget for visible text, notebook or not: a notebook read over the cap
+/// cannot be edited at all, so a lower one would turn ordinary notebooks into
+/// `write_file`-only territory for no gain in what fits in context.
+const MAX_NOTEBOOK_TEXT_CHARS: usize = super::fs::READ_CONTENT_CHARS;
 const MAX_NOTEBOOK_IMAGES: usize = 16;
 const MAX_NOTEBOOK_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_RESULT_SOURCE_CHARS: usize = 200;
@@ -296,22 +299,27 @@ pub(super) fn apply_edit(bytes: &[u8], request: &NotebookEditRequest) -> Result<
             let cell = cells[index]
                 .as_object_mut()
                 .context("Notebook cell must be a JSON object")?;
-            if let Some(cell_type) = &request.cell_type {
-                cell.insert(
-                    "cell_type".to_string(),
-                    OrderedValue::String(cell_type.clone()),
-                );
+            match request.cell_type.as_deref() {
+                Some(cell_type) => {
+                    cell.insert(
+                        "cell_type".to_string(),
+                        OrderedValue::String(cell_type.to_string()),
+                    );
+                    migrate_cell_type_fields(cell, cell_type);
+                }
+                None => {
+                    if cell.contains_key("execution_count") {
+                        cell.insert("execution_count".to_string(), OrderedValue::Null);
+                    }
+                    if cell.contains_key("outputs") {
+                        cell.insert("outputs".to_string(), OrderedValue::Array(Vec::new()));
+                    }
+                }
             }
             cell.insert(
                 "source".to_string(),
                 OrderedValue::String(request.new_source.clone()),
             );
-            if cell.contains_key("execution_count") {
-                cell.insert("execution_count".to_string(), OrderedValue::Null);
-            }
-            if cell.contains_key("outputs") {
-                cell.insert("outputs".to_string(), OrderedValue::Array(Vec::new()));
-            }
             format!(
                 "Updated cell {requested} with {}",
                 result_source(&request.new_source)
@@ -365,6 +373,24 @@ pub(super) fn apply_edit(bytes: &[u8], request: &NotebookEditRequest) -> Result<
         bail!("Notebook edit result exceeds the {MAX_NOTEBOOK_BYTES} byte limit");
     }
     Ok(NotebookMutation { bytes, content })
+}
+
+/// nbformat validates fields per cell type: code cells carry
+/// `outputs`/`execution_count` and markdown cells carry `attachments`, so a
+/// type change has to move both sets or the result is not a valid notebook.
+fn migrate_cell_type_fields(cell: &mut IndexMap<String, OrderedValue>, cell_type: &str) {
+    match cell_type {
+        "code" => {
+            cell.insert("execution_count".to_string(), OrderedValue::Null);
+            cell.insert("outputs".to_string(), OrderedValue::Array(Vec::new()));
+            cell.shift_remove("attachments");
+        }
+        "markdown" => {
+            cell.shift_remove("execution_count");
+            cell.shift_remove("outputs");
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn change_preview(bytes: &[u8], input: &Value) -> Result<NotebookPreview> {
@@ -704,6 +730,65 @@ mod tests {
     }
 
     #[test]
+    fn replacing_a_code_cell_with_markdown_drops_code_only_fields() {
+        let request = request_from_input(&json!({
+            "notebook_path": "/tmp/a.ipynb",
+            "cell_id": "c",
+            "new_source": "notes\n",
+            "cell_type": "markdown"
+        }))
+        .unwrap();
+        let result = apply_edit(&notebook(), &request).unwrap();
+        let value: Value = serde_json::from_slice(&result.bytes).unwrap();
+        assert_eq!(
+            value["cells"][1],
+            json!({
+                "cell_type": "markdown",
+                "id": "c",
+                "metadata": {"collapsed": false},
+                "source": "notes\n",
+                "unknown": 2
+            })
+        );
+    }
+
+    #[test]
+    fn replacing_a_markdown_cell_with_code_drops_attachments_and_adds_outputs() {
+        let bytes = serde_json::to_vec(&json!({
+            "nbformat": 4,
+            "nbformat_minor": 5,
+            "cells": [{
+                "cell_type": "markdown",
+                "id": "m",
+                "metadata": {},
+                "source": "old\n",
+                "attachments": {"x": {"image/png": PNG_BASE64}}
+            }]
+        }))
+        .unwrap();
+        let request = request_from_input(&json!({
+            "notebook_path": "/tmp/a.ipynb",
+            "cell_id": "m",
+            "new_source": "print(1)\n",
+            "cell_type": "code"
+        }))
+        .unwrap();
+        let result = apply_edit(&bytes, &request).unwrap();
+        let value: Value = serde_json::from_slice(&result.bytes).unwrap();
+        assert_eq!(
+            value["cells"][0],
+            json!({
+                "cell_type": "code",
+                "id": "m",
+                "metadata": {},
+                "source": "print(1)\n",
+                "execution_count": null,
+                "outputs": []
+            })
+        );
+    }
+
+    #[test]
     fn insert_and_delete_use_exact_cell_positions() {
         let insert = request_from_input(&json!({
             "notebook_path": "/tmp/a.ipynb",
@@ -777,6 +862,23 @@ mod tests {
         assert!(!output.editable);
         assert!(
             output
+                .content
+                .as_text()
+                .contains("[notebook output truncated")
+        );
+    }
+
+    #[test]
+    fn text_under_the_shared_read_budget_stays_editable() {
+        let source = "x".repeat(7_001);
+        let bytes = serde_json::to_vec(&json!({
+            "cells": [{"cell_type": "markdown", "id": "m", "source": source}]
+        }))
+        .unwrap();
+        let output = read_notebook(&bytes).unwrap();
+        assert!(output.editable);
+        assert!(
+            !output
                 .content
                 .as_text()
                 .contains("[notebook output truncated")

@@ -1536,7 +1536,13 @@ independently converge on it), `edit_file` **reads the target, applies the edit,
 and diffs the whole file** — the change shown in its real surrounding lines with
 real line numbers, not the edit strings in isolation. `write_file` diffs an
 existing file old→new,
-or shows a `(new file)` insert preview for a fresh path. When the file can't be
+or shows a `(new file)` insert preview for a fresh path. Only a missing target is
+`(new file)`: an existing binary file is labelled
+`(overwriting existing binary file, N bytes)`, one over the diff limit keeps
+`(overwriting existing file, N bytes)`, and any other read failure
+(permissions, a directory, a file that moved) says
+`(existing file could not be previewed)` — the approver is told what is being
+replaced, or that kloop could not tell. When the file can't be
 read, is over 1 MiB, or the `old_string` doesn't uniquely match, it falls back
 to diffing the two edit strings (numbered from 1) — claude-code's same
 degradation. Each line is `{+/-/space}{line-number}  {content}`; hunks carry
@@ -2674,7 +2680,13 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   whole-file line index, numbered, and capped at `READ_CONTENT_CHARS` model-visible characters;
   `offset`/`limit`, trailing empty lines, PDF/non-UTF-8 errors, and structured
   PNG/JPEG/GIF/WebP blocks retain their prior behavior. CRLF is shown as logical LF,
-  while an isolated `\r` remains content. On Unix, regular files with multiple hard
+  while an isolated `\r` remains content. A line too long to render within the
+  character budget is shown as a prefix, and that prefix counts as covering the
+  line: the notice says its tail was not shown, the coverage table advances past
+  it, and the whole-file fingerprint is still what the stale check compares. Without
+  that, a minified JS/JSON/SVG file (one line over 30 000 characters) could never
+  reach a complete read and therefore never earn `write_file`. On Unix, regular files
+  with multiple hard
   links are rejected because pathname sensitivity cannot safely classify another
   name for the same inode.
 - Only a range that reaches the model in a final successful `tool_result` qualifies
@@ -2739,7 +2751,11 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   "close enough" becomes the target and the fallback becomes the norm. The CRLF
   sentence stays in it because that one is a promise about the file, not a tolerance.
   Executor and approval preview use this one helper, so duplicate/`replace_all`
-  decisions and shown bytes cannot drift.
+  decisions and shown bytes cannot drift. The fallback's working set stays small on
+  a 5 MiB miss: the logical view stores only the offsets of CRLFs it removed instead
+  of a USize per raw byte, folded spans are one packed word per character (start is
+  the previous span's end, and one high bit marks an absorbed space), and the
+  closest-match line ceiling is checked before the text is copied into LF form.
   When all three miss, the refusal is built to stop the one reaction it used to
   invite — retyping `old_string` from memory. It searches the file (line windows of
   the block's height ±1, seeded by the block's rarest line that survives verbatim,
@@ -2794,8 +2810,16 @@ file observations (`core/src/file_state.rs`) rather than trusting a path forever
   volume + 128-bit file ID. No Windows pathname-open/rename fallback is used.
 - At the final parent, target reads, streaming fingerprints/equality checks,
   same-directory exclusive temp creation, final freshness/identity checks, rename,
-  and cleanup stay capability-relative. Unix uses `renameat`/`unlinkat` plus file and
-  directory sync; Windows flushes the file handle and uses
+  and cleanup stay capability-relative. A new leaf's commit uses a **non-replacing**
+  rename: Linux `renameat2(RENAME_NOREPLACE)`, macOS `renameatx_np(RENAME_EXCL)`,
+  and `linkat(temp→leaf)` + `unlinkat(temp)` on filesystems or kernels that refuse
+  the flag. A plain `renameat` there would silently replace a leaf created after the
+  final freshness check, which is the race the check exists to lose. Unix also uses
+  `unlinkat` plus file and directory sync; a directory fsync the filesystem refuses
+  after the rename landed (EINVAL/ENOSYS on some FUSE and network mounts) is reported
+  in the tool result as unconfirmed durability, not as a failed edit — the bytes are
+  already visible, and reporting failure sent the model to retry an edit that had
+  happened. Windows flushes the file handle and uses
   `NtSetInformationFile(FileRenameInformationEx)` with a retained parent HANDLE for
   handle-relative atomic visibility. Windows does not claim a portable
   POSIX-equivalent directory-entry durability guarantee. On Windows, failed nested
@@ -2915,7 +2939,10 @@ missing IDs are displayed as `cell-N` without modifying the file. Code outputs
 preserve text/image/text order, and supported PNG/JPEG/GIF/WebP outputs use the
 same structured image blocks as ordinary image reads. Markdown attachments are
 not treated as code outputs. Notebook input is capped at 10 MiB, visible text at
-7,000 characters, and decoded output images at 16 files / 5 MiB total. Paging a
+the same 30,000-character budget an ordinary read uses, and decoded output images
+at 16 files / 5 MiB total. The budget used to be 7,000, which made any notebook
+that large permanently uneditable (`editable=false` ⇒ no `notebook_edit`
+qualification) while an ordinary file of the same size still qualified; paging a
 notebook is rejected instead of presenting partial cells as complete.
 
 A complete, untruncated cell-aware read grants a separate notebook-qualified
@@ -2923,10 +2950,13 @@ observation. The model-visible **`notebook_edit`** tool then accepts an absolute
 lowercase `.ipynb` `notebook_path`, required `new_source`, optional `cell_id`,
 `cell_type` (`code|markdown`), and `edit_mode` (`replace|insert|delete`, default
 `replace`). Replace preserves unknown fields and metadata, while resetting code
-outputs/execution count; insert requires a type and creates an 8-hex ID for
-nbformat 4.5+; delete removes only the selected cell. The ordered serializer
-preserves untouched object order, uses one-space indentation, and emits no
-trailing newline.
+outputs/execution count. A `cell_type` change moves the fields nbformat validates
+per type: code gains `execution_count: null` and `outputs: []` and loses
+`attachments`; markdown loses `execution_count` and `outputs` (both make
+`nbformat.validate` reject the document). Insert requires a type and creates an
+8-hex ID for nbformat 4.5+; delete removes only the selected cell. The ordered
+serializer preserves untouched object order, uses one-space indentation, and
+emits no trailing newline.
 
 `notebook_edit` requires the current file to be complete, fresh, and
 notebook-qualified. A generic raw read or ordinary `write_file`/`edit_file` does
@@ -2964,7 +2994,7 @@ Grep/Glob:
   never descends into VCS dirs, skips binary files, binds each candidate to a
   canonical no-follow regular-file descriptor before filtering and searches that
   descriptor (not a later pathname lookup), clips matched lines at 500
-  characters, caps model-facing text at 7,000 characters, and stops after a
+  characters, caps model-facing text at 30,000 characters, and stops after a
   20s budget with a partial-results note.
 - **glob**: gitignore-style `pattern` under `path` (an empty pattern lists the
   tree), newest-first, capped at exactly 100 paths with an explicit count of
@@ -2984,9 +3014,14 @@ covered by a `read_file` deny rule (`read_file(**/*.pem)`, or the whole-tool
 private `~/.kloop`, …) is dropped from grep/glob output — before its contents are read —
 so a deny meant for reads is not slipped by grep, and secrets do not leak
 through a search. Grep also skips files with multiple hard links because the
-pathname cannot classify another name for the same inode. The dropped count is reported (`[N path(s) hidden by
-deny/sensitive rules]`) rather than silently swallowed. This is an output
-filter, not an approval prompt (a tree walk touches too many paths for the
+pathname cannot classify another name for the same inode. Each reason has its own
+count: deny/sensitive files are `[N paths hidden by deny/sensitive rules]`, hard
+links are `[N paths skipped: multiple hard links]`, and a candidate that could not
+be opened (EACCES, a leaf that vanished, a non-regular file) is
+`[N files could not be opened for reading]` — a hard link used to be counted as a
+deny, and every other open error used to disappear, so a filtered result could
+claim nothing was hidden. These are output
+filters, not an approval prompt (a tree walk touches too many paths for the
 gate's one-path ask); it applies in every mode but `--mock`, `--permission-mode
 bypass` included.
 
