@@ -307,6 +307,29 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
     })
 }
 
+/// The shell a hook test can rely on, matching the core hook tests: native
+/// Windows resolves its validated Git for Windows Bash (with forward-slash
+/// paths in the script), other platforms use `sh -c`.
+fn hook_shell_command(script: String) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let (programs, _) = kloop_core::shell_programs::resolve_shell_programs(Default::default())
+            .expect("native Windows shell discovery succeeds");
+        let bash = programs
+            .bash
+            .expect("hook tests require a validated Git for Windows Bash");
+        vec![
+            bash.executable.to_string_lossy().into_owned(),
+            "-lc".into(),
+            script.replace('\\', "/"),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["sh".into(), "-c".into(), script]
+    }
+}
+
 /// A factory whose `pre_turn` hook records one line per run and then exits 2,
 /// so a blocked turn is observable without depending on model behavior.
 fn blocked_hook_factory(offload: PathBuf, marker: PathBuf) -> ConfigFactory {
@@ -316,14 +339,10 @@ fn blocked_hook_factory(offload: PathBuf, marker: PathBuf) -> ConfigFactory {
         cfg.hooks = Arc::new(kloop_core::hooks::Hooks {
             defs: vec![kloop_core::hooks::HookDef {
                 event: kloop_core::hooks::HookEvent::PreTurn,
-                command: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        "echo run >> '{}'; echo blocked by test hook >&2; exit 2",
-                        marker.display()
-                    ),
-                ],
+                command: hook_shell_command(format!(
+                    "echo run >> '{}'; echo blocked by test hook >&2; exit 2",
+                    marker.display()
+                )),
                 matcher: None,
                 timeout_ms: 10_000,
             }],
