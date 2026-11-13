@@ -90,7 +90,13 @@ impl StdioTransport {
         // group / Job Object: shutting down an `npx`-style launcher must take
         // the grandchild server with it, not leave it as an orphan.
         let cwd = std::env::current_dir().context("mcp server working directory")?;
-        let resolved = kloop_process_spawn::resolve_program(program);
+        // A configured PATH replaces the inherited one for the child, so it is
+        // also what a bare command must be resolved against.
+        let path_env = env
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| std::ffi::OsStr::new(value));
+        let resolved = kloop_process_spawn::resolve_program(program, &cwd, path_env);
         let mut spec = ProcessSpec::new(resolved, cwd);
         for arg in args {
             spec.arg(arg);
@@ -295,7 +301,15 @@ async fn write_line_before(
 /// server waiting for its stdout to drain would then block the whole link.
 /// Losing the refusal only costs a server an answer to a request this client
 /// does not support.
-async fn write_refusal(writer: &SharedWriter, msg: &Value) -> Option<Result<()>> {
+///
+/// A stalled write is *not* harmless: cancelling `write_all` may leave a
+/// partial frame in the pipe, and the next message would then be glued to it.
+/// The caller closes the transport on `Err`.
+async fn write_refusal(
+    writer: &SharedWriter,
+    msg: &Value,
+    timeout: Duration,
+) -> Option<Result<()>> {
     let mut line = msg.to_string();
     line.push('\n');
     let Ok(mut writer) = writer.try_lock() else {
@@ -308,12 +322,12 @@ async fn write_refusal(writer: &SharedWriter, msg: &Value) -> Option<Result<()>>
             .context("mcp write failed")?;
         writer.flush().await.context("mcp flush failed")
     };
-    Some(
-        match tokio::time::timeout(REFUSAL_WRITE_TIMEOUT, write).await {
-            Ok(result) => result,
-            Err(_) => Ok(()),
-        },
-    )
+    Some(match tokio::time::timeout(timeout, write).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "mcp write: refusal stalled and may have left a partial frame"
+        )),
+    })
 }
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
@@ -407,7 +421,9 @@ async fn read_loop(
                     "id": id,
                     "error": {"code": -32601, "message": "method not supported by this client"},
                 });
-                if let Some(Err(error)) = write_refusal(&writer, &refusal).await {
+                if let Some(Err(error)) =
+                    write_refusal(&writer, &refusal, REFUSAL_WRITE_TIMEOUT).await
+                {
                     break (
                         McpTransportFailure::WriteFailed,
                         format!("mcp write failed: {error}"),
@@ -610,11 +626,71 @@ mod wire_tests {
             write_refusal(
                 &transport.writer,
                 &json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32601}}),
+                Duration::from_millis(50),
             ),
         )
         .await
         .expect("refusal must not block on the lock");
         assert!(outcome.is_none());
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// A writer that accepts a few bytes once and then never makes progress:
+    /// the cancelled `write_all` has already left a partial frame in the pipe.
+    struct PartialThenStall {
+        wrote: bool,
+    }
+
+    impl tokio::io::AsyncWrite for PartialThenStall {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.wrote {
+                return std::task::Poll::Pending;
+            }
+            self.wrote = true;
+            std::task::Poll::Ready(Ok(buf.len().min(8)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A stalled refusal write must report failure so the caller closes the
+    /// link: its prefix is already on the wire and the next message would be
+    /// appended to an unfinished frame.
+    #[tokio::test]
+    async fn stalled_refusal_write_reports_failure_instead_of_continuing() {
+        use super::write_refusal;
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let writer: super::SharedWriter =
+            Arc::new(tokio::sync::Mutex::new(Box::new(PartialThenStall {
+                wrote: false,
+            })));
+        let outcome = write_refusal(
+            &writer,
+            &json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32601}}),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("the lock is free");
+        let error = outcome.expect_err("a stalled write must not report success");
+        assert!(error.to_string().contains("partial frame"), "{error:#}");
     }
 }

@@ -1132,7 +1132,7 @@ pub(super) fn canonical_cwd(cwd: &Path) -> PathBuf {
 }
 
 impl PathFacts {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn gather(raw: &Path, cwd: &Path) -> Self {
         Self::gather_with_resolved(raw, cwd, None)
     }

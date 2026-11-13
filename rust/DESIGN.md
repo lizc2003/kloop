@@ -2415,7 +2415,10 @@ A stdio write shares the request's deadline (queueing for the write lock
 included), so a child that stops draining stdin cannot park a request and the
 lock forever; the reader task answers unsupported server requests on a
 best-effort basis and never waits for that lock, so it keeps reading stdout
-instead of deadlocking against a full stdin pipe.
+instead of deadlocking against a full stdin pipe. A refusal write that stalls
+is treated as failure rather than success: a cancelled `write_all` may have
+left a partial frame, and the transport closes instead of gluing the next
+message to it.
 
 The TUI splits "the screen is up" from "the first turn may run". Its `Config` is
 built over planned sources (each server source plus the shared resource helpers,
@@ -6180,13 +6183,18 @@ crates/provider/    kloop-provider — the adapter seam; owns reqwest
   src/sse.rs        bounded incremental SSE parser
 
 crates/process-spawn/ process-wide child-creation gate + owned process trees
-  src/lib.rs        spawn/output helpers that take the Windows creation gate
+  src/lib.rs        spawn/output helpers that take the Windows creation gate;
+                    `resolve_program` (Windows: child cwd then the child's PATH,
+                    `.exe` like `Command`) and the pure resolution rule
   src/process_tree/
     mod.rs          ProcessSpec/Child/Killer façade, piped stdin/stdout/stderr,
                     lifecycle tests
+    batch.rs        cmd.exe command line for `.bat`/`.cmd` (second-pass
+                    escaping: quotes doubled, trailing backslashes, `%` no-op)
     unix.rs         process-group spawn, kill, reap, and residual checks
     windows.rs      suspended CreateProcessW, stdio handle list (including the
-                    stdin pipe), Job Object RAII, descendant debugging
+                    stdin pipe), Job Object RAII, descendant debugging; batch
+                    scripts launch through cmd.exe with `batch.rs`'s command line
 
 crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)
@@ -6277,7 +6285,8 @@ crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAu
   src/stdio.rs      newline-delimited JSON-RPC over a child's stdio: reader
                     task, responses routed to pending requests by id, request
                     deadline shared by the write and the reply; the child is
-                    spawned as a whole process tree so shutdown has no orphans
+                    spawned as a whole process tree so shutdown has no orphans,
+                    with the configured PATH used to resolve a bare command
   src/http.rs       streamable HTTP transport: one POST per request,
                     Mcp-Session-Id sessions, re-handshake on 404, replay only
                     when the server cannot have run the operation

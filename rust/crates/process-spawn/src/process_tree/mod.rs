@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 
+mod batch;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

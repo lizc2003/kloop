@@ -9,7 +9,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::os::windows::io::FromRawHandle as _;
-#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
@@ -97,6 +97,7 @@ use super::ProcessPipe;
 use super::ProcessSpec;
 use super::ProcessStdio;
 use super::ProcessWriter;
+use super::batch;
 
 #[derive(Debug)]
 struct OwnedHandle(HANDLE);
@@ -418,9 +419,9 @@ fn spawn_impl(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
     let stdio = prepare_stdio(stdin, stdout, stderr)?;
     let attributes =
         AttributeList::for_handles(&[stdio.stdin.raw(), stdio.stdout.raw(), stdio.stderr.raw()])?;
-    let executable_wide = wide_nul(executable.as_os_str(), "executable")?;
+    let (application, mut command_line) = application_and_command_line(&executable, &args)?;
+    let executable_wide = wide_nul(application.as_os_str(), "executable")?;
     let cwd_wide = wide_nul(cwd.as_os_str(), "working directory")?;
-    let mut command_line = command_line(executable.as_os_str(), &args)?;
     let environment = environment_block(env_add, env_remove)?;
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -642,9 +643,9 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
     let mut stdio = prepare_stdio(stdin, stdout, stderr)?;
     let attributes =
         AttributeList::for_handles(&[stdio.stdin.raw(), stdio.stdout.raw(), stdio.stderr.raw()])?;
-    let executable_wide = wide_nul(executable.as_os_str(), "executable")?;
+    let (application, mut command_line) = application_and_command_line(&executable, &args)?;
+    let executable_wide = wide_nul(application.as_os_str(), "executable")?;
     let cwd_wide = wide_nul(cwd.as_os_str(), "working directory")?;
-    let mut command_line = command_line(executable.as_os_str(), &args)?;
     let environment = environment_block(env_add, env_remove)?;
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -1034,6 +1035,29 @@ fn create_suspended_test_process(cwd: &std::path::Path) -> io::Result<(OwnedHand
         OwnedHandle::new(info.hProcess)?,
         OwnedHandle::new(info.hThread)?,
     ))
+}
+
+/// The application to create and its command line. `CreateProcessW` runs a
+/// batch file through `cmd.exe`; naming the interpreter explicitly (with the
+/// escaping from [`batch`]) is the documented form and keeps cmd's parsing
+/// away from our own argv quoting.
+fn application_and_command_line(
+    executable: &Path,
+    args: &[OsString],
+) -> io::Result<(PathBuf, Vec<u16>)> {
+    if batch::is_batch_script(executable) {
+        let script = batch::wide_units(executable.as_os_str());
+        let args = batch::wide_args(args);
+        Ok((
+            batch::command_prompt()?,
+            batch::command_line(&script, &args)?,
+        ))
+    } else {
+        Ok((
+            executable.to_path_buf(),
+            command_line(executable.as_os_str(), args)?,
+        ))
+    }
 }
 
 fn prepare_stdio(

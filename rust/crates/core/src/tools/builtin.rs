@@ -505,7 +505,7 @@ impl Builtin {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn concurrency_safe(self, input: &Value) -> bool {
         self.concurrency_safe_with(input, None)
     }

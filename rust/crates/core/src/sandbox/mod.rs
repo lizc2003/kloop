@@ -731,7 +731,7 @@ pub fn seatbelt_command(
 /// plan 283). `KLOOP_REQUIRE_SEATBELT_TESTS` turns the skip off; `make test`
 /// and `make check` set it, so a full check fails for real rather than pass
 /// without its sandbox coverage.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn skip_nested_seatbelt_test() -> bool {
     if std::env::var_os("KLOOP_SANDBOX").is_none_or(|value| value != "seatbelt") {
         return false;

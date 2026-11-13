@@ -63,37 +63,67 @@ pub fn spawn(command: &mut tokio::process::Command) -> io::Result<tokio::process
 
 /// Resolve a configured command for [`ProcessSpec`]: a bare name keeps its
 /// `PATH` meaning on Unix, but the Windows spawner hands `CreateProcessW` an
-/// explicit application path, and that form does neither search `PATH` nor
-/// append `.exe`. Mirroring what `std::process::Command` does (current
-/// directory, then `PATH`, then `.exe`) keeps `command = ["npx", …]` working.
-pub fn resolve_program(program: &str) -> std::path::PathBuf {
-    let path = std::path::Path::new(program);
+/// explicit application path, and that form neither searches `PATH` nor
+/// completes a relative path beyond the current directory. Mirroring what
+/// `std::process::Command` does keeps `command = ["npx", …]` and
+/// `command = [".\\tools\\server.exe", …]` working.
+///
+/// `cwd` is the directory the child will run in. `path_env` is the `PATH` the
+/// child will actually get (a configured environment may replace the inherited
+/// one, e.g. a virtualenv); `None` means "inherit".
+pub fn resolve_program(
+    program: &str,
+    cwd: &std::path::Path,
+    path_env: Option<&std::ffi::OsStr>,
+) -> std::path::PathBuf {
     #[cfg(not(windows))]
     {
-        path.to_path_buf()
+        let _ = (cwd, path_env);
+        std::path::PathBuf::from(program)
     }
     #[cfg(windows)]
     {
-        if path.is_absolute() || program.contains(['/', '\\']) {
-            return path.to_path_buf();
-        }
-        if let Ok(cwd) = std::env::current_dir()
-            && let Some(found) = find_program_in(&cwd, program)
-        {
-            return found;
-        }
-        if let Some(dirs) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&dirs) {
-                if let Some(found) = find_program_in(&dir, program) {
-                    return found;
-                }
-            }
-        }
-        path.to_path_buf()
+        let search = match path_env {
+            Some(value) => Some(value.to_os_string()),
+            None => std::env::var_os("PATH"),
+        };
+        let dirs = search
+            .map(|dirs| std::env::split_paths(&dirs).collect())
+            .unwrap_or_default();
+        resolve_relative(program, cwd, dirs)
     }
 }
 
-#[cfg(windows)]
+/// The Windows resolution rule, kept free of platform APIs so it can be tested
+/// on any host. `dirs` are the `PATH` entries in search order.
+#[cfg(any(windows, test))]
+fn resolve_relative(
+    program: &str,
+    cwd: &std::path::Path,
+    dirs: Vec<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    let path = std::path::Path::new(program);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    // A relative path with separators is relative to the child's working
+    // directory, not to whatever directory happens to be current when the
+    // launcher runs.
+    if program.contains(['/', '\\']) {
+        return cwd.join(path);
+    }
+    if let Some(found) = find_program_in(cwd, program) {
+        return found;
+    }
+    for dir in dirs {
+        if let Some(found) = find_program_in(&dir, program) {
+            return found;
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(any(windows, test))]
 fn find_program_in(dir: &std::path::Path, program: &str) -> Option<std::path::PathBuf> {
     let direct = dir.join(program);
     if direct.is_file() {
@@ -167,5 +197,74 @@ mod tests {
                 .success()
         );
         worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kloop-resolve-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_relative_path_is_completed_against_the_child_cwd() {
+        let cwd = Path::new("/work/dir");
+        assert_eq!(
+            resolve_relative("./tools/server.exe", cwd, Vec::new()),
+            cwd.join("./tools/server.exe")
+        );
+        assert_eq!(
+            resolve_relative("tools\\server.exe", cwd, Vec::new()),
+            cwd.join("tools\\server.exe")
+        );
+    }
+
+    #[test]
+    fn the_cwd_is_searched_before_path() {
+        let cwd = temp_dir("cwd-first");
+        let other = temp_dir("cwd-first-other");
+        std::fs::write(cwd.join("server.exe"), b"").unwrap();
+        std::fs::write(other.join("server.exe"), b"").unwrap();
+        assert_eq!(
+            resolve_relative("server.exe", &cwd, vec![other.clone()]),
+            cwd.join("server.exe")
+        );
+        std::fs::remove_dir_all(&cwd).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    #[test]
+    fn path_entries_resolve_bare_names_and_add_exe() {
+        let cwd = temp_dir("path-search");
+        let bin = temp_dir("path-search-bin");
+        std::fs::write(bin.join("server.exe"), b"").unwrap();
+        assert_eq!(
+            resolve_relative("server", &cwd, vec![bin.clone()]),
+            bin.join("server.exe")
+        );
+        // An extension is never doubled.
+        assert_eq!(
+            resolve_relative("server.exe", &cwd, vec![bin.clone()]),
+            bin.join("server.exe")
+        );
+        std::fs::remove_dir_all(&cwd).unwrap();
+        std::fs::remove_dir_all(&bin).unwrap();
+    }
+
+    #[test]
+    fn an_unresolvable_name_is_left_for_the_spawn_error() {
+        let cwd = temp_dir("unresolved");
+        assert_eq!(
+            resolve_relative("missing-server", &cwd, Vec::new()),
+            PathBuf::from("missing-server")
+        );
+        std::fs::remove_dir_all(&cwd).unwrap();
     }
 }

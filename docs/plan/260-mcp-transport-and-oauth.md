@@ -105,8 +105,19 @@
      `terminate_and_wait(5s)`。
    - 回归：piped stdin 往返；root 退出后后台孙进程仍在、`cleanup_after_exit` 收掉整组。
 
-验证：`cargo test -p kloop-mcp`（42 lib + 14 集成）、`cargo test -p kloop-process-spawn`
-（4 项，含新增两项）、`cargo test -p kloop-core --lib`、`cargo test -p kloop --bin kloop mcp_auth`
+复审修正（同日，四条）：(1) 读循环拒绝写超时不再当成功——`write_all` 被取消可能已在管道
+里留下半帧，下一条消息会粘上去；现在返回错误让传输关闭，并用“先写 8 字节再卡住”的 writer
+钉住。(2) Windows 批处理入口：`CreateProcessW` 会把 `.bat`/`.cmd` 交给 `cmd.exe`，而 cmd 有
+第二遍解析（`%VAR%` 展开、`^` 转义、引号规则），std 为此专门转义；新 `process_tree/batch.rs`
+按同样的规则自己构造 `cmd.exe /e:ON /v:OFF /d /c "<script>" …`，普通与 debug 两条 spawn 路径
+都走它，纯 u16 函数在本机单测（空格/引号/尾反斜杠/百分号/非法脚本名）。(3) 相对可执行路径
+带分隔符时按子进程 cwd 补成绝对路径，不再被“必须绝对”拒绝。(4) `resolve_program` 接收
+子进程实际会拿到的 PATH（配置 env 里的 PATH 覆盖继承值），先查 cwd 再查该 PATH。另修
+`make check-windows`：给三条只在 unix/macOS 测试里用到的 helper 补 `cfg`，整仓 msvc 目标
+clippy 现在全绿（仍未在 Windows 实跑）。
+
+验证：`cargo test -p kloop-mcp`（43 lib + 14 集成）、`cargo test -p kloop-process-spawn`
+（15 项，含 piped stdin、孙进程收尾、批处理转义与路径解析）、`cargo test -p kloop-core --lib`、`cargo test -p kloop --bin kloop mcp_auth`
 （10 项）、`cargo clippy -p kloop-mcp -p kloop --all-targets -D warnings`、`cargo fmt --check`。
 Windows：`cargo xwin clippy --target x86_64-pc-windows-msvc -p kloop-process-spawn -p kloop-mcp
 --all-targets -D warnings` 与 `-p kloop-core --lib` 通过；整仓 `make check-windows` 仍被
