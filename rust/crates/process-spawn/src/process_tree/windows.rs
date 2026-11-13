@@ -1040,13 +1040,15 @@ fn create_suspended_test_process(cwd: &std::path::Path) -> io::Result<(OwnedHand
 /// The application to create and its command line. `CreateProcessW` runs a
 /// batch file through `cmd.exe`; naming the interpreter explicitly (with the
 /// escaping from [`batch`]) is the documented form and keeps cmd's parsing
-/// away from our own argv quoting.
+/// away from our own argv quoting. cmd does not understand verbatim paths, so
+/// the script goes through the same `\\?\` conversion the standard library
+/// applies.
 fn application_and_command_line(
     executable: &Path,
     args: &[OsString],
 ) -> io::Result<(PathBuf, Vec<u16>)> {
     if batch::is_batch_script(executable) {
-        let script = batch::wide_units(executable.as_os_str());
+        let script = batch::to_user_script_path(&batch::wide_units(executable.as_os_str()));
         let args = batch::wide_args(args);
         Ok((
             batch::command_prompt()?,

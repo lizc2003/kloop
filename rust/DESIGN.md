@@ -6190,7 +6190,8 @@ crates/process-spawn/ process-wide child-creation gate + owned process trees
     mod.rs          ProcessSpec/Child/Killer façade, piped stdin/stdout/stderr,
                     lifecycle tests
     batch.rs        cmd.exe command line for `.bat`/`.cmd` (second-pass
-                    escaping: quotes doubled, trailing backslashes, `%` no-op)
+                    escaping: quotes doubled, trailing backslashes, `%` no-op;
+                    verbatim `\\?\` paths converted, NUL rejected)
     unix.rs         process-group spawn, kill, reap, and residual checks
     windows.rs      suspended CreateProcessW, stdio handle list (including the
                     stdin pipe), Job Object RAII, descendant debugging; batch

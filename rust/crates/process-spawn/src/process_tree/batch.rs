@@ -43,14 +43,33 @@ pub(crate) fn is_batch_script(path: &Path) -> bool {
         })
 }
 
+/// `cmd.exe` does not understand verbatim (`\\?\`) paths. Convert the two forms
+/// the standard library converts (`\\?\C:\…` and `\\?\UNC\…`) and leave
+/// anything else untouched, as it does.
+pub(crate) fn to_user_script_path(script: &[u16]) -> Vec<u16> {
+    const SEP: u16 = b'\\' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const COLON: u16 = b':' as u16;
+    const UNC: [u16; 3] = [b'U' as u16, b'N' as u16, b'C' as u16];
+    match script {
+        [SEP, SEP, QUERY, SEP, u, n, c, SEP, rest @ ..] if [*u, *n, *c] == UNC => {
+            let mut out = vec![SEP, SEP];
+            out.extend_from_slice(rest);
+            out
+        }
+        [SEP, SEP, QUERY, SEP, _, COLON, SEP, ..] => script[4..].to_vec(),
+        _ => script.to_vec(),
+    }
+}
+
 /// The full command line (NUL terminated) that runs `script` through `cmd.exe`
 /// with arguments a batch file can reconstruct.
 pub(crate) fn command_line(script: &[u16], args: &[Vec<u16>]) -> io::Result<Vec<u16>> {
-    const INVALID_SCRIPT: &str = "batch script path contains `\"`, `^` or `%`, or ends with `\\`";
-    if script
-        .iter()
-        .any(|unit| matches!(*unit, u if u == b'"' as u16 || u == b'^' as u16 || u == b'%' as u16))
-        || script.last() == Some(&(b'\\' as u16))
+    const INVALID_SCRIPT: &str =
+        "batch script path contains NUL, `\"`, `^` or `%`, or ends with `\\`";
+    if script.iter().any(|unit| {
+        *unit == 0 || *unit == b'"' as u16 || *unit == b'^' as u16 || *unit == b'%' as u16
+    }) || script.last() == Some(&(b'\\' as u16))
     {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, INVALID_SCRIPT));
     }
@@ -203,6 +222,33 @@ mod tests {
             render("a.cmd", &["100%"]),
             "cmd.exe /e:ON /v:OFF /d /c \"\"a.cmd\" \"100%%cd:~,%\"\""
         );
+    }
+
+    #[test]
+    fn verbatim_script_paths_are_converted_for_cmd() {
+        let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+        assert_eq!(
+            to_user_script_path(&units(r"\\?\C:\tools\server.cmd")),
+            units(r"C:\tools\server.cmd")
+        );
+        assert_eq!(
+            to_user_script_path(&units(r"\\?\UNC\srv\share\a.cmd")),
+            units(r"\\srv\share\a.cmd")
+        );
+        // Anything that is not one of those two forms stays as it is.
+        for path in [r"C:\tools\server.cmd", r"\\?\Volume{2}\a.cmd", r"a.cmd"] {
+            assert_eq!(to_user_script_path(&units(path)), units(path));
+        }
+    }
+
+    #[test]
+    fn a_script_path_with_nul_is_rejected() {
+        let script: Vec<u16> = r"C:\tools\server.cmd"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let error = command_line(&script, &[]).unwrap_err();
+        assert!(error.to_string().contains("NUL"), "{error}");
     }
 
     #[test]
