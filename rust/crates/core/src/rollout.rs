@@ -39,10 +39,10 @@ pub use line::{
 };
 pub use sessions::{
     ClaimedSession, ForkPoint, ResumedSession, SessionDigest, SessionOrigin, SessionRead,
-    checked_session_path, claim_new_session, first_user_snippet, fork_origin, fork_points,
-    fork_session, inspect_session, inspect_session_for_writing, is_subagent_session, load_session,
-    load_session_snapshot, resume_session, session_digest, session_id_of, session_origin,
-    session_path, sessions_by_recency,
+    SessionSummary, checked_session_path, claim_new_session, first_user_snippet, fork_origin,
+    fork_points, fork_session, inspect_session, inspect_session_for_writing, is_subagent_session,
+    load_session, load_session_snapshot, resume_session, session_digest, session_id_of,
+    session_origin, session_path, session_summary, sessions_by_recency,
 };
 pub(crate) use sessions::{civil_from_days, timestamp_id};
 

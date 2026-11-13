@@ -299,6 +299,15 @@ fn validate_provider_message(
     })
 }
 
+/// The three structural checks a replayed session must pass. Exposed to the
+/// lightweight listing summary so a file it reports is one `thread/read` and
+/// `thread/resume` can actually open.
+pub(super) fn validate_session_lines(lines: &[RolloutLine]) -> io::Result<()> {
+    validate_format(lines)?;
+    validate_provider_routes(lines)?;
+    validate_envelope(lines)
+}
+
 pub(super) fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
     let (lines, intact_end) = intact_lines(raw)?;
     // A file with nothing intact but bytes before the first line is not an
@@ -311,9 +320,7 @@ pub(super) fn parse_session(raw: &[u8]) -> io::Result<ParsedSession> {
             "session does not start with an intact line",
         ));
     }
-    validate_format(&lines)?;
-    validate_provider_routes(&lines)?;
-    validate_envelope(&lines)?;
+    validate_session_lines(&lines)?;
     let mut parsed = ParsedSession {
         items: Vec::new(),
         provider_usage: UsageLedger::default(),

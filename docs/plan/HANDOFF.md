@@ -23,18 +23,21 @@ MCP 启动失败映射成类别（启动进程/超时/HTTP 状态码/认证/协�
 
 **Plan 259 ✅：server 输入、worker 与事件投影（2026-11-13）**：七条复核全部成立。
 第 7 条按推荐不改：out 通道保持无界，只在 DESIGN 写明客户端不读 stdout 时内存
-增长、不做背压。worker 在普通 turn、switch、`/provider` 命令三处把 `running`
-放回 false 后都重查 inbox，非空就补一次唤醒；`/provider` 改由 `turn_start`
-识别成 `ProviderCommand`，不分配投影里的 turn、不开 steer 窗口，响应仍带一个
-只用于应答的 id。serve 按字节读行并设 8 MiB 上限，超长行排到换行、非 UTF-8
-行都回 `PARSE_ERROR(id:null)` 后继续，只有真正的 IO 错误才结束并走正常收尾。
-`item/delta` 改成 `push_str`；out 通道改预序列化字节，事件 ring 的留存大小与
-实际写出一致，publish 不再克隆 params 做第二次序列化。`thread/list` 改用扩展
-后的 `session_digest`（messages/runtime/最后 route），四个重读方法都进
+增长、不做背压。worker 在 switch 与 `/provider` 命令后总是重查 inbox；model turn
+结束后只对“本轮期间新到”的动静补唤醒，纯 slash 命令仍总是补——steer 不会卡住，
+`pre_turn` hook 拒绝后也不会把同一批消息反复重投（回归修前 300 ms 跑 59 次）。
+`/provider` 改由 `turn_start` 识别成 `ProviderCommand`，不分配投影里的 turn、
+不开 steer 窗口，响应仍带一个只用于应答的 id。serve 按字节读行并设 8 MiB
+上限，超长行排到换行、非 UTF-8 行都回 `PARSE_ERROR(id:null)` 后继续，只有真正
+的 IO 错误才结束并走正常收尾。`item/delta` 改成 `push_str`；out 通道改预序列化
+字节，事件 ring 的留存大小与实际写出一致，publish 不再克隆 params 做第二次
+序列化。`thread/list` 改用新的 `session_summary`：整文件一遍，跑与重放相同的
+format/父链/envelope/provider timeline 校验，但不建历史、不做 pairing repair；
+CLI 的 `session_digest` 恢复在第一个用户消息处提前退出。四个重读方法都进
 `spawn_blocking`，响应允许乱序；配置/技能的 scope 解析也一起进阻塞任务。
 抽了 `public_route_from_record`、`route_switch_error_kind`、
 `optional_nonempty_str`，`model`/`provider_id` 统一 trim。验证：server 集成
-49 项、server lib 27 项、core lib 1429 项（1 ignored）、CLI bin 167 项通过；
+50 项、server lib 27 项、core lib 1429 项（1 ignored）、CLI bin 167 项通过；
 三个 crate 的 `clippy --all-targets -D warnings` 通过；未跑全量 `make check`、
 parity 与真实 API。教训 384。
 
@@ -4994,4 +4997,4 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 
 383. **“stdout 只放最终答案”是契约时，启动路径也算在契约里；同一个 stdin 有两个读者时，加锁不如共用一个队列。** `--headless` 之前只在 turn 里守 stdout，`open_history` 的 `[forked …]`/`[resumed …]` 仍是 `println!`，`--json` 的第一行就可能不是 JSON——把输出契约当成“输出层”的性质会漏掉所有在输出层之前发生的打印，排查时按“进程从启动到退出的每一条 stdout 写入”过一遍。plain 的 stdin 竞争则是另一种形状：REPL 的 `select!` 先发一个读请求再丢弃 future，读线程已经阻塞在 `read_line`，审批再起一个读者就抢同一行；修法是让两者共用一个容量为 1 的队列（线程持续读、谁在提问谁取），而不是给两个读者加锁或取消。顺带两条：信任门的修复要按“用户回答之前有哪些副作用”排序，MCP 从连接改成先 plan、信任后再 connect，测试必须用真的会留下痕迹的假 server（写标记文件），只断言顺序不够；配置里的数字（`memory_mb`）和 `[env]` 都是外部输入，换算用 checked、拒绝前先想清楚哪个字段可能带凭据（回显名字、不回显值）。
 
-384. **把一个同步单读者循环改成异步读循环，先列“谁依赖到达顺序”。** JSON-RPC 用 id 配对，把 `thread/list`/`thread/read`/`config/read`/`skills/list` 放到阻塞池后，响应本来就会乱序；测试若按“下一行一定是 list 的响应”写，会把正确实现判红。回归要按 id 找消息，顺序断言只留给真正有顺序语义的通道（`turn/started` → item → `turn/completed`）。同一轮的三条：把 `running` 放回 false 要在**每一处**出口补 inbox 重唤醒（普通 turn 结束也算，steer 可能落在最后一次 drain 之后）；`item/delta` 的 `format!("{current}{text}")` 是在投影锁里的平方复制，直接 `push_str`，输出通道改成预序列化字节后 ring 的留存大小才和实际写出一致；`session_digest` 一旦服务列表，就不能再停在第一个用户行——message count 和最后一个 route 都在后面，而且“有 runtime 行”不是会话有效性的判据（旧夹具会话只有 route 行）。
+384. **把一个同步单读者循环改成异步读循环，先列“谁依赖到达顺序”。** JSON-RPC 用 id 配对，把 `thread/list`/`thread/read`/`config/read`/`skills/list` 放到阻塞池后，响应本来就会乱序；测试若按“下一行一定是 list 的响应”写，会把正确实现判红。回归要按 id 找消息，顺序断言只留给真正有顺序语义的通道（`turn/started` → item → `turn/completed`）。同一轮的三条：`item/delta` 的 `format!("{current}{text}")` 是在投影锁里的平方复制，直接 `push_str`，输出通道改成预序列化字节后 ring 的留存大小才和实际写出一致；把“失败后重查队列”当成普遍正确的补唤醒，会在 `pre_turn` hook 拒绝、队列没被消费时变成“拒绝→唤醒→再拒绝”的死循环——只有本轮期间新到的动静才算，switch/纯 slash 命令这种从不 drain 的出口才总是补；列表摘要不能为了拿 message count/route 就顺手删掉重放的有效性校验，也不能让 CLI 首屏为它扫全文件——拆成轻量 `session_digest`（第一个用户行就停）和 server 专用的 `session_summary`（整文件但共用 `validate_session_lines`，不建历史、不 repair），并且“有 runtime 行”不是会话有效性的判据（旧夹具会话只有 route 行）。

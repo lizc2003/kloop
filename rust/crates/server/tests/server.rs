@@ -307,6 +307,31 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
     })
 }
 
+/// A factory whose `pre_turn` hook records one line per run and then exits 2,
+/// so a blocked turn is observable without depending on model behavior.
+fn blocked_hook_factory(offload: PathBuf, marker: PathBuf) -> ConfigFactory {
+    let inner = factory(vec![vec![text("unused")]], offload, false);
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        let mut cfg = inner(options, catalog, approver, questioner, notify)?;
+        cfg.hooks = Arc::new(kloop_core::hooks::Hooks {
+            defs: vec![kloop_core::hooks::HookDef {
+                event: kloop_core::hooks::HookEvent::PreTurn,
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "echo run >> '{}'; echo blocked by test hook >&2; exit 2",
+                        marker.display()
+                    ),
+                ],
+                matcher: None,
+                timeout_ms: 10_000,
+            }],
+        });
+        Ok(cfg)
+    })
+}
+
 fn clocked_scheduler_factory(
     turns: Vec<Vec<AssistantBlock>>,
     offload: PathBuf,
@@ -4057,6 +4082,17 @@ async fn thread_list_pages_past_unreadable_transcripts() {
         "{\"type\":\"session\",\"id\":\"20260109-000009#1\",\"ts\":0}\n",
     )
     .unwrap();
+    // A complete, otherwise valid transcript written in a format this kloop
+    // does not read. `thread/read`/`thread/resume` would refuse it, so the list
+    // must not advertise it as resumable.
+    let valid =
+        String::from_utf8(std::fs::read(dirs.sessions.join("20260101-000001.jsonl")).unwrap())
+            .unwrap();
+    std::fs::write(
+        dirs.sessions.join("20260110-000010.jsonl"),
+        valid.replacen("\"format_version\":1", "\"format_version\":2", 1),
+    )
+    .unwrap();
 
     let mut client = start_server(factory(Vec::new(), dirs.offload.clone(), false), &dirs);
     client.initialize().await;
@@ -4451,6 +4487,48 @@ async fn steer_sent_during_a_provider_command_is_delivered_afterwards() {
             "the steer queued behind /provider was never delivered"
         );
     }
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A delivery turn blocked by a `pre_turn` hook leaves its inbox items
+/// unconsumed. Re-announcing that same batch would run the hook again forever,
+/// so only activity that arrived during the turn may wake the worker.
+#[tokio::test]
+async fn a_blocked_pre_turn_hook_does_not_retry_the_same_delivery() {
+    let dirs = test_dirs("hook-block");
+    let marker = dirs.root.join("hook-runs");
+    let mut client = start_server(
+        blocked_hook_factory(dirs.offload.clone(), marker.clone()),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+
+    // Idle steer: the worker's inbox branch starts a delivery-only turn.
+    client
+        .request(
+            "turn/steer",
+            json!({"thread_id": thread_id, "input": "work"}),
+        )
+        .await;
+    let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+    assert_eq!(log.last().unwrap()["params"]["turn"]["status"], "error");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let runs = std::fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(
+        runs, 1,
+        "the same blocked delivery was retried {runs} times"
+    );
+
+    // The server is still alive and serving other methods.
+    let request = client.request("provider/catalog/read", json!({})).await;
+    let response = client.recv_until(|m| m["id"] == request).await;
+    assert!(response.last().unwrap()["result"].is_object());
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);

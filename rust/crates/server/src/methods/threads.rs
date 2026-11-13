@@ -507,12 +507,14 @@ fn thread_list_blocking(
             next_cursor = Some(index.to_string());
             break;
         }
-        // A digest reads only what the listing shows: no full replay, no
-        // pairing repair, no retained message vector.
-        let digest = match rollout::session_digest(path) {
-            Ok(digest) => digest,
+        // The summary validates the same format/route/envelope rules a replay
+        // does, then keeps only listing fields: no replayed history and no
+        // pairing repair.
+        let summary = match rollout::session_summary(path) {
+            Ok(summary) => summary,
             Err(_) => continue,
         };
+        let digest = summary.digest;
         let thread_id = digest.id.clone();
         let in_progress = running.get(&thread_id).copied().unwrap_or(false);
         let updated_at_ms = digest
@@ -521,17 +523,17 @@ fn thread_list_blocking(
             .ok()
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let route = digest
+        let route = summary
             .route
             .as_ref()
             .map(|route| public_route_from_record(route, catalog));
         threads.push(json!({
             "id": thread_id,
-            "messages": digest.messages,
+            "messages": summary.messages,
             "snippet": clip_chars(&digest.title, 60, "…"),
-            "cwd": digest.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
+            "cwd": summary.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
             "route": route,
-            "resumable": digest.runtime.is_some(),
+            "resumable": summary.runtime.is_some(),
             "in_progress": in_progress,
             "forked_from": fork_origin_value(digest.origin.as_ref()),
             "updated_at_ms": updated_at_ms,

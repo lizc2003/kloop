@@ -863,22 +863,22 @@ starting anything. It asks for a viewport as tall as the list needs rather than
 the whole screen, and hands the terminal back cleared, so the session banner
 prints where the picker began. Off a terminal (a pipe, a harness, a terminal
 that refuses raw mode) it falls back to the numbered stdout list it used to be.
-Rows are built from `session_digest`, which reads a transcript line by line
-without replaying it: no history vector is retained and no pairing repair runs,
-so a picker still avoids the cost that made a list of 74 sessions unusable. The
-digest keeps the first user prompt, lineage, current message count (compaction
-replacements included), runtime cwd and the last durable route; the picker shows
-only the prompt, age and size, while `thread/list` uses the rest. It scans to the
-end because a compaction can replace the message list and the last route can sit
-anywhere before it. A line that is not UTF-8 is skipped like any other
-unparseable line, so a torn multi-byte tail cannot turn a row into an unreadable
-error row and lose its lineage (which would put a sub-agent transcript back in
-the picker); a non-empty file whose *first* line is unreadable is not a session
-and is skipped. `thread/list`'s message count is the stored count before
-in-memory pairing repair, not a replayed history size. `--list-sessions` reads
-the same digest instead of replaying every transcript, and `--continue` takes
-the first row that qualifies, digesting no session behind it; the listing
-therefore reports the prompt and lineage, not a message count. Native-protocol
+Rows are built from `session_digest`, which reads each file only up to its first
+user line: replaying dozens of megabyte-sized transcripts just to label them is
+what a list of 74 sessions cannot afford. A line that is not UTF-8 is skipped
+like any other unparseable line, so a torn multi-byte tail cannot turn a row
+into an unreadable error row and lose its lineage (which would put a sub-agent
+transcript back in the picker). `--list-sessions` reads the same digest instead
+of replaying every transcript, and `--continue` takes the first row that
+qualifies, digesting no session behind it; the listing therefore reports the
+prompt and lineage, not a message count. The server's `thread/list` needs more
+(message count, cwd, last route) and must not advertise a transcript that
+`thread/read` or `thread/resume` would refuse, so it reads a different,
+validated summary: one full scan under the same format, parent-chain, envelope
+and provider-timeline checks a replay performs, but with no replayed history and
+no pairing repair. That scan runs on the blocking pool (see **Transport and read
+loop**), so it cannot stall the read loop; the CLI picker never pays for it.
+Native-protocol
 sessions additionally restore the exact canonical cwd and resolved model that
 were pinned at `thread/start`; a legacy rollout without this metadata remains
 readable but requires its original `cwd` once on `thread/resume` before it is
@@ -2161,9 +2161,12 @@ transcripts (`thread/list`, `thread/read`, `config/read`, `skills/list`) run on
 the blocking pool, so a large page or a dormant-session replay cannot hold up
 approvals or `turn/interrupt`; JSON-RPC responses may therefore arrive out of
 order, and clients match them by id. After a non-model operation (`/provider`,
-`thread/provider/switch`) releases the thread's single-flight gate, the worker
-re-announces a non-empty inbox: a steer or scheduled delivery that arrived while
-`running` was already set would otherwise sit there until an unrelated event.
+`thread/provider/switch`, a slash command) releases the thread's single-flight
+gate, the worker re-announces a non-empty inbox: a steer or scheduled delivery
+that arrived while `running` was already set would otherwise sit there until an
+unrelated event. A model turn instead re-announces only activity that arrived
+during it: a turn blocked by a `pre_turn` hook exits without draining the queue,
+and waking that same batch again would run the hook forever.
 
 **Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched. `model` and `provider_id` are trimmed before lookup, so `" m "` and `"m"` name the same allowlisted model; one parser serves `thread/start` and `thread/provider/switch`.
 

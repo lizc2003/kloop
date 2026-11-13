@@ -66,9 +66,10 @@
 七条开工复核全部成立。第 7 条按推荐不改：out 通道保持无界，只在 DESIGN
 写明「客户端不读 stdout 时内存增长，不做背压」。
 
-1. worker 在每次把 `running` 放回 false 后（普通 turn、switch、`/provider`
-   命令）检查 inbox，非空就 `notify_activity()` 补一次唤醒；普通 turn 结束
-   同样补，覆盖 last drain 之后到达的 steer。
+1. worker 在 switch 与 `/provider` 命令后总是重查 inbox，非空就
+   `notify_activity()`；model turn 结束后只对「本轮期间新到的动静」补唤醒，
+   slash 命令（没有跑 model turn）仍总是补。这样 steer 不会卡住，`pre_turn`
+   hook 拒绝后也不会把同一批消息反复重投。
 2. serve 改成按字节读行并设 8 MiB 上限（照 mcp 的 `read_bounded_line`）：
    超长行排到换行后回 `PARSE_ERROR(id:null)`，非 UTF-8 同样处理并继续；
    只有真正的 IO 错误才结束循环，且仍走取消 turn、清 pending、等 writer 的
@@ -79,16 +80,33 @@
 4. `item/delta` 直接对 `Value::String` `push_str`；out 通道改成预序列化字节，
    writer 只补换行，事件 ring 的留存大小与实际写出的字节一致，`publish` 不再
    克隆 params 做第二次序列化。
-5. `session_digest` 扩出 messages / runtime / 最后一个 route，`thread/list`
-   改用它；`thread/list`、`thread/read`、`config/read`、`skills/list` 都移到
+5. `thread/list` 改用新的 `session_summary`：整文件一遍，跑与重放相同的
+   format/父链/envelope/provider timeline 校验，但不构建历史、不做 pairing
+   repair；`thread/list`、`thread/read`、`config/read`、`skills/list` 都移到
    `spawn_blocking`，响应可以乱序。配置/技能读取前的 scope 解析也带进阻塞任务，
-   包括休眠会话的 path 定位与重放。
+   包括休眠会话的 path 定位与重放。CLI 的 `session_digest` 恢复在第一个用户
+   消息处提前退出，pick 首屏不再扫全文件。
 6. 抽 `public_route_from_record`、`route_switch_error_kind`、
    `optional_nonempty_str`；`model`/`provider_id` 统一 trim，
    `" m "` 在 provider/switch 不再报 unknown_model。
 
-回归：server 集成 49 项（含 `/provider` 无 in_progress turn、`/provider` 期间
-steer 仍投递、非 UTF-8/超长行后继续服务、`thread/list` 期间 interrupt 先回、
+回归：server 集成 50 项（含 `/provider` 无 in_progress turn、`/provider` 期间
+steer 仍投递、pre_turn hook 拒绝不重投、非 UTF-8/超长行后继续服务、
+`thread/list` 期间 interrupt 先回、不支持 format_version 的会话不入列表、
 `" m "` 被 trim），server lib 27 项，core lib 1429 项（1 ignored），CLI bin
 167 项通过；`clippy -p kloop-server -p kloop-core -p kloop --all-targets -D warnings`
 通过；未跑全量 `make check`、parity 和真实 API。
+
+### 复查修正（同日）
+
+- **P1 hook 拒绝无限重试**：model turn（含 delivery turn）结束时只在「本轮期间
+  inbox 有新动静」时补唤醒；switch/`/provider`/纯 slash 命令仍总是补。回归用一个
+  每次 `exit 2` 的 `pre_turn` hook 加一条 idle steer：修前 300 ms 内跑 59 次，
+  修后 1 次。
+- **P2 列表缺少有效性校验**：新增 `session_summary`，在 `intact_lines` 之后跑
+  `validate_format`/`validate_provider_routes`/`validate_envelope`（与
+  `parse_session` 共用 `validate_session_lines`）。不支持的 `format_version`
+  不再出现在 `thread/list` 里；paging 回归加了这种文件。
+- **P3 CLI 摘要退化**：`session_digest` 恢复在第一个用户消息处提前退出；
+  需要 messages/runtime/route 的 `thread/list` 改用 `session_summary`，它只在
+  server 的阻塞任务里跑，CLI pick 首屏不受影响。

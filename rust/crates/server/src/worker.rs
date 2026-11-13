@@ -77,6 +77,11 @@ pub(super) async fn thread_worker(
                 })
             }
         };
+        // From here on, only activity that arrives *during* this operation is
+        // new. Anything already pending was either swallowed while `running`
+        // was set by the caller, or is the delivery this turn was started for;
+        // both are the same batch and must not be re-announced on failure.
+        let _ = inbox_activity.borrow_and_update();
         let turn = match message {
             ThreadWorkerMsg::Turn(turn) => turn,
             ThreadWorkerMsg::ProviderCommand { text } => {
@@ -155,7 +160,7 @@ pub(super) async fn thread_worker(
             }
         };
         ui.notify("turn/started", wire::turn_started_params(turn.id));
-        let reason = run_turn_or_command(
+        let run = run_turn_or_command(
             &mut cfg,
             &provider_state,
             &active_route,
@@ -169,7 +174,7 @@ pub(super) async fn thread_worker(
         )));
         ui.notify(
             "turn/completed",
-            wire::turn_completed_params(turn.id, &reason),
+            wire::turn_completed_params(turn.id, &run.reason),
         );
         // Usually already closed by the final drain; this covers the endings
         // that never reach it (error, max rounds, interrupt).
@@ -177,7 +182,17 @@ pub(super) async fn thread_worker(
         *current_cancel.lock().unwrap() = None;
         running.store(false, Ordering::SeqCst);
         *ui.turn.lock().unwrap() = None;
-        wake_for_pending_inbox(&inbox);
+        if run.model_turn {
+            // A model turn drains the queue at its round boundaries. If it
+            // failed before doing so (a blocked pre_turn hook is the common
+            // case), waking the same batch again would retry it forever. Only
+            // activity that arrived during the turn is new work.
+            wake_for_new_inbox_activity(&inbox, &inbox_activity);
+        } else {
+            // Slash commands never drain the inbox, so a steer queued behind
+            // one would otherwise wait for an unrelated event.
+            wake_for_pending_inbox(&inbox);
+        }
     }
     let shutdown_ui: Arc<dyn Ui> = ui.clone();
     let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
@@ -199,6 +214,15 @@ fn wake_for_pending_inbox(inbox: &kloop_core::inbox::Inbox) {
         // consumed while the loop was still busy. Re-announce the queue once the
         // operation releases the thread; otherwise a steer or scheduled
         // delivery would sit there until some unrelated event happened.
+        inbox.notify_activity();
+    }
+}
+
+fn wake_for_new_inbox_activity(
+    inbox: &kloop_core::inbox::Inbox,
+    activity: &tokio::sync::watch::Receiver<u64>,
+) {
+    if !inbox.is_empty() && activity.has_changed().unwrap_or(false) {
         inbox.notify_activity();
     }
 }
@@ -290,6 +314,13 @@ fn run_provider_command(
     }
 }
 
+struct TurnRun {
+    reason: EndReason,
+    /// Whether the turn entered `run_turn`/`run_turn_with_input`, and could
+    /// therefore have drained the inbox at its round boundaries.
+    model_turn: bool,
+}
+
 /// Run one turn's work and return its end reason, without touching the turn
 /// bracket (the caller owns that). A slash command line reads/rewrites History
 /// like a turn but is not a model turn: no user message is recorded and nothing
@@ -303,12 +334,15 @@ async fn run_turn_or_command(
     history: &mut History,
     ui: &Arc<ThreadUi>,
     turn: &Turn,
-) -> EndReason {
+) -> TurnRun {
     if turn.delivery_only {
         let dyn_ui: Arc<dyn Ui> = ui.clone();
-        return run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
-            .await
-            .reason;
+        return TurnRun {
+            reason: run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
+                .await
+                .reason,
+            model_turn: true,
+        };
     }
     if turn.images.is_empty() && commands::is_command_or_skill(&turn.text, &cfg.skills) {
         let result = commands::run_with_provider_state(
@@ -333,7 +367,10 @@ async fn run_turn_or_command(
                 "system",
                 json!({"text": "/exit is for interactive sessions; the server keeps running — close the connection to end this one"}),
             );
-            return EndReason::Completed;
+            return TurnRun {
+                reason: EndReason::Completed,
+                model_turn: false,
+            };
         }
         // `/clear` starts a new session, and here a session is a thread the
         // client addressed by id: switching it underneath the client is what
@@ -343,7 +380,10 @@ async fn run_turn_or_command(
                 "system",
                 json!({"text": "/clear is not available on the server — start a new thread with thread/start"}),
             );
-            return EndReason::Completed;
+            return TurnRun {
+                reason: EndReason::Completed,
+                model_turn: false,
+            };
         }
         if !result.output.is_empty() {
             ui.notify("system", json!({"text": result.output}));
@@ -353,11 +393,17 @@ async fn run_turn_or_command(
         if let Some(prompt) = result.run_turn {
             history.record(Message::user_text(prompt));
             let dyn_ui: Arc<dyn Ui> = ui.clone();
-            return run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
-                .await
-                .reason;
+            return TurnRun {
+                reason: run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
+                    .await
+                    .reason,
+                model_turn: true,
+            };
         }
-        return EndReason::Completed;
+        return TurnRun {
+            reason: EndReason::Completed,
+            model_turn: false,
+        };
     }
     let msg = if turn.images.is_empty() {
         Message::user_text(turn.text.clone())
@@ -375,5 +421,8 @@ async fn run_turn_or_command(
         // the text it sent.
         ui.projection.discard_turn(turn.id);
     }
-    outcome.reason
+    TurnRun {
+        reason: outcome.reason,
+        model_turn: true,
+    }
 }
