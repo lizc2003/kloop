@@ -208,37 +208,39 @@ fn read_session(path: &Path, partition: &str, default_cwd: Option<&Path>) -> Opt
 /// or nothing anyone could have been asked about (a protected read).
 fn recorded_denials(result: &str) -> Vec<Option<SandboxDenial>> {
     let mut denials = Vec::new();
-    for line in result.lines() {
-        let prefixed = line.starts_with("[Re-ran inside the sandbox with")
-            || line.starts_with("[Re-ran without the sandbox");
-        if !prefixed {
+    let mut body = result;
+    loop {
+        let (line, rest) = body.split_once('\n').unwrap_or((body, ""));
+        if !(line.starts_with("[Re-ran inside the sandbox with")
+            || line.starts_with("[Re-ran without the sandbox"))
+        {
             break;
         }
         denials.push(denial_from_prefix(line));
+        body = rest;
     }
-    if !denials.is_empty() {
-        return denials;
-    }
-    if result.starts_with("[Ran without the sandbox: a remembered") {
+    if denials.is_empty() && body.starts_with("[Ran without the sandbox: a remembered") {
         return vec![None];
     }
-    // The hints are appended as the result's last line; the same words inside
-    // the output (a file that documents them) are not a denial.
-    let last = result.trim_end().lines().last().unwrap_or_default();
-    if last.starts_with("[kloop's sandbox kept this command from reading a protected path") {
-        return Vec::new();
-    }
+    // What is left is the last run's output. A hint is appended as its last
+    // line (the same words inside the output, a file that documents them, are
+    // not a denial), and the class is read from that run alone — never from
+    // the prefixes above it, which describe earlier refusals, nor from the
+    // hint's own wording.
+    let trimmed = body.trim_end();
+    let (output, last) = trimmed.rsplit_once('\n').unwrap_or(("", trimmed));
     if last.starts_with("[This command ran inside kloop's sandbox")
         || last.starts_with("[The user declined to run this outside kloop's sandbox")
         || last.starts_with("[The user declined to widen kloop's sandbox")
     {
-        return vec![crate::sandbox::classify_sandbox_denial(
+        denials.push(crate::sandbox::classify_sandbox_denial(
             Some(1),
-            result,
+            output,
             /*network_disabled*/ true,
-        )];
+        ));
     }
-    Vec::new()
+    // A protected read, or no hint at all: nothing more was asked.
+    denials
 }
 
 /// `[Re-ran … ; it had been denied (<class>): <evidence>]`. A write's evidence
@@ -818,6 +820,20 @@ fn recorded_denials_read_widenings_and_hints() {
             Some((DenialKind::Write, vec![PathBuf::from("/opt/out/a")])),
             Some((DenialKind::Nested, Vec::new())),
         ]
+    );
+    // Granted the network, then refused a directory: two questions, and the
+    // second one's class comes from the last run, not from the prefix above.
+    let widened_then_declined = "[Re-ran inside the sandbox with network access after user approval; \
+                                 it had been denied (network): network-outbound /private/var/run/mDNSResponder]\n\
+                                 fetched\n\
+                                 mkdir: /opt/out: Operation not permitted\n\
+                                 [The user declined to widen kloop's sandbox for this command. Do not retry it.]";
+    assert_eq!(
+        recorded_denials(widened_then_declined)
+            .into_iter()
+            .map(|denial| denial.map(|denial| denial.kind))
+            .collect::<Vec<_>>(),
+        vec![Some(DenialKind::Network), Some(DenialKind::Write)]
     );
     let declined = "mkdir: /opt/out: Operation not permitted\n\
                     [The user declined to widen kloop's sandbox for this command. Do not retry it.]";
