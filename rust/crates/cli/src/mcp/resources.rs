@@ -113,22 +113,29 @@ impl McpResourceSource {
     }
 
     fn server(&self, requested: &str) -> Result<McpResourceServer> {
+        // Exact spelling wins: `Foo` and `foo` can both be configured, so a
+        // normalized fallback must never shadow the server actually named.
+        if let Some(exact) = self.servers.iter().find(|server| server.name == requested) {
+            return Ok(exact.clone());
+        }
         let normalized = normalize_server_name(requested);
-        self.servers
+        let mut candidates = self
+            .servers
             .iter()
-            .find(|server| {
-                server.name == requested || normalize_server_name(&server.name) == normalized
-            })
-            .cloned()
-            .with_context(|| {
-                let available = self
-                    .servers
-                    .iter()
-                    .map(|server| server.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("Server \"{requested}\" not found. Available servers: {available}")
-            })
+            .filter(|server| normalize_server_name(&server.name) == normalized);
+        let fallback = match (candidates.next(), candidates.next()) {
+            (Some(only), None) => Some(only.clone()),
+            _ => None,
+        };
+        fallback.with_context(|| {
+            let available = self
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Server \"{requested}\" not found. Available servers: {available}")
+        })
     }
 
     async fn list(&self, requested: Option<&str>) -> Result<SourceOutput> {
@@ -520,6 +527,33 @@ mod tests {
     use super::super::config::McpTransport;
     use super::super::lifecycle::McpFailureKind;
     use super::super::testutil::resource_pair;
+
+    /// `Foo` and `foo` are two configured servers whose normalized names
+    /// collide; an exact request must reach the exact one, and a normalized
+    /// fallback must not guess when several servers match.
+    #[tokio::test]
+    async fn resource_lookup_prefers_exact_names_and_refuses_ambiguous_fallbacks() {
+        let (upper, _upper_end) = resource_pair("Foo");
+        let (lower, _lower_end) = resource_pair("foo");
+        let source = McpResourceSource::new(vec![upper, lower]);
+        assert_eq!(source.server("Foo").unwrap().name, "Foo");
+        assert_eq!(source.server("foo").unwrap().name, "foo");
+
+        // A unique normalized match is still useful (the model may write
+        // `alphaserver` for `alpha-server`).
+        let (alpha, _alpha_end) = resource_pair("alpha-server");
+        let unique = McpResourceSource::new(vec![alpha]);
+        assert_eq!(unique.server("ALPHASERVER").unwrap().name, "alpha-server");
+
+        let (hyphen, _hyphen_end) = resource_pair("a-b");
+        let (plain, _plain_end) = resource_pair("ab");
+        let ambiguous = McpResourceSource::new(vec![hyphen, plain]);
+        let error = match ambiguous.server("a_b") {
+            Ok(server) => panic!("ambiguous lookup picked '{}'", server.name),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("not found"), "{error}");
+    }
 
     #[tokio::test]
     async fn resource_reads_require_a_currently_advertised_uri() {

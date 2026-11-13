@@ -389,6 +389,9 @@ pub struct PtyOptions<'a> {
     /// with `(home, workspace)`, for state outside the workspace (a pre-seeded
     /// session or scheduler store).
     pub prepare: Option<SandboxPrepare<'a>>,
+    /// Starts the workspace untrusted, so the launch asks first. Every other
+    /// scenario starts trusted, the way a returning session does.
+    pub untrusted: bool,
     /// Answer only the viewport's construction cursor query, then leave later
     /// queries unanswered — a front-end that lost the terminal to another
     /// client. A resize must not depend on a reply.
@@ -690,9 +693,10 @@ impl PtyHarness {
         // the sandbox starts out already trusted, the way a returning session
         // does: its partition directory exists, holding the label a first run
         // would have written. The id comes from the real resolver rather than a
-        // second copy of the hashing rule.
+        // second copy of the hashing rule. A scenario about the question itself
+        // sets `untrusted` and answers it on the PTY.
         let identity = kloop_core::project::WorkspaceIdentity::resolve(&workspace);
-        if let Some(project_id) = identity.project_id() {
+        if let Some(project_id) = identity.project_id().filter(|_| !options.untrusted) {
             let mut project = kloop_home.clone();
             for component in ["projects", "v1", project_id.as_str()] {
                 project.push(component);

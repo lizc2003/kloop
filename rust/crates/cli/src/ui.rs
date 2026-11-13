@@ -20,6 +20,8 @@ use kloop_core::permissions::ConfirmPreview;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 
+use crate::plain::PlainStdin;
+
 /// The preview block the plain prompt prints above its answer line, leading
 /// newline included, or empty when there is nothing to show.
 ///
@@ -49,15 +51,24 @@ fn color_diff(preview: &str) -> String {
         .join("\n")
 }
 
-/// Interactive y/a/p/n prompt on the terminal. The REPL's own stdin reader
-/// is idle while a turn runs, so a direct blocking read is safe; if the turn
-/// is Ctrl+C-interrupted mid-prompt, the orphaned read may swallow one
-/// subsequent input line — accepted edge for a line-based REPL.
-#[derive(Default)]
+/// Interactive y/a/p/n prompt on the terminal. Prompts and the REPL share one
+/// stdin handle ([`PlainStdin`]), so a line typed for an approval cannot be
+/// read as the next user message (or the reverse). An interrupted turn can
+/// still leave a line queued for the next prompt; the REPL treats it as input.
 pub(crate) struct CliApprover {
+    input: PlainStdin,
     /// Parallel sub-agents ask concurrently; one prompt owns the terminal at
     /// a time, the rest wait here (the TUI gets the same via its queue).
     prompting: tokio::sync::Mutex<()>,
+}
+
+impl CliApprover {
+    pub(crate) fn new(input: PlainStdin) -> Self {
+        Self {
+            input,
+            prompting: tokio::sync::Mutex::new(()),
+        }
+    }
 }
 
 impl Approver for CliApprover {
@@ -83,13 +94,8 @@ impl Approver for CliApprover {
                 .unwrap_or_default();
             print!("\n[{heading}] {subject}{notice}{preview}\n  {options} > ");
             let _ = std::io::stdout().flush();
-            let line = tokio::task::spawn_blocking(|| {
-                let mut buf = String::new();
-                std::io::stdin().read_line(&mut buf).map(|_| buf)
-            })
-            .await;
-            match line {
-                Ok(Ok(answer)) => approval_decision(answer.trim(), &req),
+            match self.input.line().await {
+                Ok(Some(answer)) => approval_decision(answer.trim(), &req),
                 // Reader died or stdin closed: the safe answer is no.
                 _ => Decision::Stop,
             }
@@ -137,18 +143,12 @@ impl Questioner for CliApprover {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QuestionOutcome> + Send + '_>> {
         Box::pin(async move {
             let _one_at_a_time = self.prompting.lock().await;
-            let prompt = tokio::task::spawn_blocking(move || prompt_questions(&request)).await;
-            match prompt {
-                Ok(outcome) => outcome,
-                Err(error) => QuestionOutcome::Unavailable(format!(
-                    "terminal question reader panicked: {error}"
-                )),
-            }
+            prompt_questions(&request, &self.input).await
         })
     }
 }
 
-fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
+async fn prompt_questions(request: &QuestionRequest, input: &PlainStdin) -> QuestionOutcome {
     let mut answers = Vec::with_capacity(request.questions.len());
     for (question_index, question) in request.questions.iter().enumerate() {
         loop {
@@ -181,7 +181,7 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
             };
             print!("  {hint}; c = cancel > ");
             let _ = std::io::stdout().flush();
-            let line = match read_terminal_line() {
+            let line = match input.line().await {
                 Ok(Some(line)) => line,
                 Ok(None) => {
                     return QuestionOutcome::Unavailable("terminal input reached EOF".into());
@@ -211,7 +211,7 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
             let other = if wants_other {
                 print!("  Other answer > ");
                 let _ = std::io::stdout().flush();
-                match read_terminal_line() {
+                match input.line().await {
                     Ok(Some(value)) if !value.trim().is_empty() => Some(value.trim().to_string()),
                     Ok(Some(_)) => {
                         eprintln!("[Other answer cannot be empty]");
@@ -240,12 +240,6 @@ fn prompt_questions(request: &QuestionRequest) -> QuestionOutcome {
         }
     }
     QuestionOutcome::Answered(answers)
-}
-
-fn read_terminal_line() -> std::io::Result<Option<String>> {
-    let mut line = String::new();
-    let bytes = std::io::stdin().read_line(&mut line)?;
-    Ok((bytes != 0).then_some(line))
 }
 
 fn parse_selection(input: &str, option_count: usize, multi_select: bool) -> Option<Vec<usize>> {

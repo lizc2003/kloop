@@ -230,6 +230,11 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
     if parsed.headless && parsed.serve {
         bail!("--headless and --serve are different modes; pick one");
     }
+    // Headless stdin is the prompt; a numbered picker would read it as an
+    // answer. `-c` and `--fork` still work.
+    if parsed.headless && matches!(parsed.session, SessionChoice::Pick) {
+        bail!("--resume needs a session id with --headless; use -c/--continue to take the latest");
+    }
     Ok(parsed)
 }
 
@@ -258,7 +263,8 @@ pub(crate) fn help_text() -> &'static str {
      \n\
      SESSIONS:\n\
      \x20   -c, --continue        resume the most recent session\n\
-     \x20   -r, --resume [id]     resume a session (no id = pick from a list)\n\
+     \x20   -r, --resume [id]     resume a session (no id = pick from a list;\n\
+     \x20                         --headless needs an id)\n\
      \x20       --fork <id>[#<seq>]  branch a session at line <seq> (rewind)\n\
      \x20       --list-sessions   list this project's saved sessions and exit\n\
      \x20       --all             (with --list-sessions) list every project's sessions\n\
@@ -595,7 +601,9 @@ pub(crate) fn open_history(
             let src = session_in_this_project(store, dirs, id)?;
             let path = fork_session(&src, *cut, sessions_dir)
                 .with_context(|| format!("cannot fork session '{id}'"))?;
-            println!(
+            // stderr: `--headless` owns stdout for the answer / NDJSON stream,
+            // and this line runs before the front-end does.
+            eprintln!(
                 "[forked {id}#{cut} → {fork_id}]",
                 cut = fork_origin(&path)
                     .and_then(|origin| origin.rsplit('#').next().map(str::to_string))
@@ -608,7 +616,8 @@ pub(crate) fn open_history(
     let id = session_id_of(&resume_path);
     let resumed = resume_session(&resume_path)
         .with_context(|| format!("cannot resume session {}", resume_path.display()))?;
-    println!(
+    // stderr for the same reason as the fork line above.
+    eprintln!(
         "[resumed session {id}: {} message(s)]",
         resumed.messages().len()
     );
@@ -870,6 +879,18 @@ mod tests {
         assert!(
             parse_args(&strings(&["--headless", "--serve"])).is_err(),
             "headless and serve conflict"
+        );
+        // Headless has one stdin: a numbered picker would read the prompt as
+        // the selection, so a bare --resume is rejected; -c stays valid.
+        assert!(
+            parse_args(&strings(&["--headless", "--resume"])).is_err(),
+            "headless cannot interactively pick a session"
+        );
+        assert_eq!(
+            parse_args(&strings(&["--headless", "--continue"]))
+                .unwrap()
+                .session,
+            SessionChoice::Continue
         );
     }
 

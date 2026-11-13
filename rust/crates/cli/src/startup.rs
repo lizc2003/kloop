@@ -591,27 +591,27 @@ pub(crate) fn load_skills(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
         command_roots.push(home.join(".kloop").join("commands"));
     }
     let (skills, mut warnings) = skills_from_roots(&skill_roots);
-    let skills = merge_builtins(skills, kloop_core::skills::builtin());
+    let skills = merge_first_wins(skills, kloop_core::skills::builtin());
     // User commands (plan 36) join the same registry as `SkillSource::Command`
     // entries, so the rest of the wiring is unchanged.
     let (commands, command_warnings) = commands_from_roots(&command_roots);
     warnings.extend(command_warnings);
-    (merge_commands(skills, commands), warnings)
+    (merge_first_wins(skills, commands), warnings)
 }
 
-/// Fold the compiled-in skills (plan 119) into the discovered ones, with a
-/// discovered skill winning on a name collision — the same first-name-wins rule
-/// the two discovery roots already follow between themselves, extended one layer
-/// down so a project can replace a shipped skill by writing its own. Split out
-/// so the precedence is testable without touching the filesystem.
-fn merge_builtins(mut skills: Vec<Skill>, builtins: Vec<Skill>) -> Vec<Skill> {
-    let taken: std::collections::HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-    let fresh: Vec<Skill> = builtins
+/// Fold `extra` behind `primary`, with `primary` keeping a name collision — the
+/// same first-name-wins rule the discovery roots already follow between
+/// themselves. It is extended one layer down in two places, so a project can
+/// replace a shipped skill, and a skill wins over a command of the same name.
+/// Split out so both precedences are testable without touching the filesystem.
+fn merge_first_wins(mut primary: Vec<Skill>, extra: Vec<Skill>) -> Vec<Skill> {
+    let taken: std::collections::HashSet<&str> = primary.iter().map(|s| s.name.as_str()).collect();
+    let fresh: Vec<Skill> = extra
         .into_iter()
-        .filter(|b| !taken.contains(b.name.as_str()))
+        .filter(|s| !taken.contains(s.name.as_str()))
         .collect();
-    skills.extend(fresh);
-    skills
+    primary.extend(fresh);
+    primary
 }
 
 /// Cwd-scoped metadata for the native `skills/list` read surface. User commands
@@ -660,18 +660,28 @@ pub(crate) fn server_skills_snapshot(cwd: &Path) -> SkillsSnapshot {
     }
 }
 
-/// Fold discovered commands into the skill registry, with a skill winning on a
-/// name collision — the directory form is the fuller one, so a command only
-/// fills a name no skill already claimed (silently, like project-over-global).
-/// Split out so the precedence is testable without touching the filesystem.
-fn merge_commands(mut skills: Vec<Skill>, commands: Vec<Skill>) -> Vec<Skill> {
-    let taken: std::collections::HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-    let fresh: Vec<Skill> = commands
-        .into_iter()
-        .filter(|c| !taken.contains(c.name.as_str()))
-        .collect();
-    skills.extend(fresh);
-    skills
+/// Sorted top-level candidates under `roots`, in root order. `wanted` maps one
+/// directory entry to the file to read, or `None` when it is not a candidate.
+/// Sorting keeps the catalog (and the prompt-cache prefix it rides in) stable
+/// across runs; a missing root is simply absent.
+fn entries_from_roots(
+    roots: &[PathBuf],
+    wanted: impl Fn(&Path) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter_map(|path| wanted(&path))
+            .collect();
+        found.sort();
+        files.extend(found);
+    }
+    files
 }
 
 /// Walk command roots in order (earlier roots win on name collision), reading
@@ -682,35 +692,30 @@ fn commands_from_roots(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
     let mut commands = Vec::new();
     let mut warnings = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
+    let files = entries_from_roots(roots, |path| {
+        (path.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md")))
+        .then(|| path.to_path_buf())
+    });
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(&file) else {
             continue;
         };
-        // Stable order so the unknown-command listing is deterministic.
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")))
-            .collect();
-        files.sort();
-        for file in files {
-            let Ok(content) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            let name = file
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            let dir = file
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            match Skill::parse_command(name, &dir, &content) {
-                // First name wins: a project command overrides a global one.
-                Ok(cmd) if seen.insert(cmd.name.clone()) => commands.push(cmd),
-                Ok(_) => {}
-                Err(e) => warnings.push(format!("skipped command at {}: {e}", file.display())),
-            }
+        let name = file
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let dir = file
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        match Skill::parse_command(name, &dir, &content) {
+            // First name wins: a project command overrides a global one.
+            Ok(cmd) if seen.insert(cmd.name.clone()) => commands.push(cmd),
+            Ok(_) => {}
+            Err(e) => warnings.push(format!("skipped command at {}: {e}", file.display())),
         }
     }
     (commands, warnings)
@@ -723,31 +728,19 @@ fn skills_from_roots(roots: &[PathBuf]) -> (Vec<Skill>, Vec<String>) {
     let mut skills = Vec::new();
     let mut warnings = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
+    let files = entries_from_roots(roots, |path| path.is_dir().then(|| path.join("SKILL.md")));
+    for skill_md in files {
+        let Ok(content) = std::fs::read_to_string(&skill_md) else {
             continue;
         };
-        // read_dir order is filesystem-dependent; sort so the catalog (and the
-        // prompt-cache prefix it rides in) is stable across runs.
-        let mut dirs: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        dirs.sort();
-        for dir in dirs {
-            let skill_md = dir.join("SKILL.md");
-            let Ok(content) = std::fs::read_to_string(&skill_md) else {
-                continue;
-            };
-            let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            match Skill::parse(dir_name, &dir.display().to_string(), &content) {
-                // First name wins: a project skill silently overrides a global
-                // one (the ecosystem's expected override), so no shadow warning.
-                Ok(skill) if seen.insert(skill.name.clone()) => skills.push(skill),
-                Ok(_) => {}
-                Err(e) => warnings.push(format!("skipped skill at {}: {e}", skill_md.display())),
-            }
+        let dir = skill_md.parent().unwrap_or(Path::new(""));
+        let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        match Skill::parse(dir_name, &dir.display().to_string(), &content) {
+            // First name wins: a project skill silently overrides a global
+            // one (the ecosystem's expected override), so no shadow warning.
+            Ok(skill) if seen.insert(skill.name.clone()) => skills.push(skill),
+            Ok(_) => {}
+            Err(e) => warnings.push(format!("skipped skill at {}: {e}", skill_md.display())),
         }
     }
     (skills, warnings)
@@ -811,9 +804,18 @@ fn load_program_limits(root: &toml::Table) -> Result<kloop_core::ProgramLimits> 
                     .filter(|&number| number > 0)
                     .with_context(|| format!("program.{key} must be a positive integer"))
             };
+            // A config number is unbounded; the multiplication into bytes is
+            // not. Saturating silently would make a typo look like a real
+            // limit, so reject the pair instead.
+            let scaled = |factor: i64| -> Result<usize> {
+                need()?
+                    .checked_mul(factor)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .with_context(|| format!("program.{key} is too large"))
+            };
             match key.as_str() {
-                "memory_mb" => limits.memory_bytes = need()? as usize * 1024 * 1024,
-                "stack_kb" => limits.max_stack_bytes = need()? as usize * 1024,
+                "memory_mb" => limits.memory_bytes = scaled(1024 * 1024)?,
+                "stack_kb" => limits.max_stack_bytes = scaled(1024)?,
                 "cpu_secs" => limits.cpu_burst = Duration::from_secs(need()? as u64),
                 "max_agents" => limits.max_agents = need()? as u64,
                 "max_concurrency" => limits.max_concurrency = need()? as usize,
@@ -1736,14 +1738,14 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             dir: "/p/.kloop/skills/code-review".into(),
             ..Default::default()
         };
-        let merged = merge_builtins(vec![mine], kloop_core::skills::builtin());
+        let merged = merge_first_wins(vec![mine], kloop_core::skills::builtin());
         let review: Vec<&Skill> = merged.iter().filter(|s| s.name == "code-review").collect();
         assert_eq!(review.len(), 1, "no duplicate name: {merged:?}");
         assert_eq!(review[0].description, "my own review");
         assert_eq!(review[0].source, SkillSource::Skill);
 
         // Nothing discovered: the builtins are the whole registry.
-        let only_builtins = merge_builtins(Vec::new(), kloop_core::skills::builtin());
+        let only_builtins = merge_first_wins(Vec::new(), kloop_core::skills::builtin());
         assert!(
             only_builtins
                 .iter()
@@ -1806,7 +1808,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
     }
 
     #[test]
-    fn merge_commands_lets_skills_win_on_name_collision() {
+    fn merge_first_wins_lets_skills_win_on_name_collision() {
         let skill = |name: &str| Skill {
             name: name.into(),
             description: format!("skill {name}"),
@@ -1819,7 +1821,7 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             source: kloop_core::skills::SkillSource::Command,
             ..Default::default()
         };
-        let merged = merge_commands(
+        let merged = merge_first_wins(
             vec![skill("commit")],
             vec![command("commit"), command("deploy")],
         );
@@ -1913,6 +1915,8 @@ http_headers = { Authorization = "SENTINEL-MCP" }
             "[program]\nmax_agents = 0\n",
             "[program]\nmax_concurrency = 0\n",
             "[program]\nmemory_mb = \"large\"\n",
+            "[program]\nmemory_mb = 9223372036854775807\n",
+            "[program]\nstack_kb = 9223372036854775807\n",
             "[program]\nunknown = 1\n",
         ] {
             assert!(

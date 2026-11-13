@@ -5,6 +5,22 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 258 ✅：CLI headless 输出、plain 输入与启动（2026-11-13）**：7 条复核全部成立，
+两个开工问题按推荐定：(a) headless 不带 id 的 `--resume` 在 `parse_args` 拒绝，
+(5a) MCP 启动失败只给安全类别。headless 的 `[forked …]`/`[resumed …]` 改走 stderr，
+`--json` 的 stdout 每行都是 NDJSON。plain 前端收成一个 `PlainStdin` 读者：线程容量 1
+持续读行，REPL、审批、提问共用；`prompt_questions` 改 async，删掉
+`spawn_blocking`/`read_terminal_line`。Inbox 唤醒后的审批回答不再落进下一条消息
+（回归钉住）。`--plain` 的 MCP 服务器先 plan、信任通过后再连接，未信任目录回答 No 后
+配置的 stdio server 不会启动（PTY 回归用写标记文件的假 server）。`[env]` 拒绝 `=`/NUL
+名字与 NUL 值且不回显值，argv 改 `args_os()`，`memory_mb`/`stack_kb` 用 checked 乘法。
+MCP 启动失败映射成类别（启动进程/超时/HTTP 状态码/认证/协议）写进 warn 与状态，删掉
+不存在的 “see engine log”。资源工具 server 查找先精确匹配，唯一归一化命中才回退。
+`merge_first_wins` 合并两个 merge 函数，两个 `*_from_roots` 共用 `entries_from_roots`。
+验证：`cargo fmt --all -- --check`、`cargo check -p kloop --all-targets`、
+`clippy -p kloop --all-targets -- -D warnings`、bin 测试 167 项、headless_contract 7 项、plain_pty 9 项通过；未跑全量 `make check`。
+教训 383。
+
 **Plan 257 ✅：子 agent、Program、Workflow 与调度器（2026-11-13）**：9 条开工复核全部
 成立。按用户定的三条做：Program 的 `AgentOptions` 不再声明/转发 `max_rounds`（workflow
 不带 `schema` 的 `agent()` 改报"只有带 schema 才接受"），structured agent 与 fork skill
@@ -725,7 +741,7 @@ TUI 直接复用 slash 目录；路径规则不会再把这类技能挡在命令
 权限/沙箱、agent 主循环、子 agent/编排、配置/持久化、provider、TUI、CLI、server/mcp/web、跨 crate
 重复),再逐条回读代码复核;没有编译、没有跑测试。P1 共 25 条，其中 22 条已人工复核触发路径，其余 3 条在
 plan 里标「待复核」,开工第一步先核实。随后与用户讨论了架构层面的优化，一并立项。28 条的分组、顺序
-与依赖见下文「〇⁵」节;plan 241 记下的 `args::open_history` stdout 污染并入 plan 258。
+与依赖见下文「〇⁵」节;plan 241 记下的 `args::open_history` stdout 污染并入 plan 258（已完成）。
 
 **Plan 242 ✅：图片作为输入框里的行内占位（2026-10-27）**：
 Ctrl+V/Alt+V 与拖入的图片路径不再挂在输入框上方的 `📎` 行，而是在光标处插入
@@ -1613,7 +1629,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **255** ✅ bash 输出、超时与 hook IO | setsid 后代持管道让成功变错误;超时丢输出;`timeout_ms: 0`;stderr 被挤掉;hook 输出无上限 | 中 | — |
 | **256** 文件工具边界 | notebook 改类型、Unix 非覆盖 rename、长行永远不可写、二进制预览写成新文件、text_edit 内存放大 | 中 | — |
 | **257** 子 agent、Program、Workflow、调度 | `agent()` 的 `max_rounds` 必失败;Promise 不 settle 时 stop 无效;journal O(n²);休眠后定时延迟 | 中 | — |
-| **258** CLI 前端 | headless stdout 污染(含 plan 241 那条);plain 两个 stdin 读者;`--plain` 信任前连 MCP;启动期 panic | 中 | — |
+| **258** ✅ CLI 前端 | headless stdout 污染(含 plan 241 那条);plain 两个 stdin 读者;`--plain` 信任前连 MCP;启动期 panic | 中 | — |
 | **259** server 输入与 worker | 唤醒信号被吞 steer 卡住;一行非 UTF-8 让 server 退出;`/provider` 残留 in_progress turn;delta O(n²) | 中 | — |
 | **260** MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
 | **261** web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
@@ -4958,3 +4974,5 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 381. **一个“守护进程”只在它以为的那些时刻被打断时才是守护进程。** 取消靠 `set_interrupt_handler`，而那个回调只在 JS 真的在跑时被调用；程序停在 `await new Promise(() => {})` 上时没有任何东西会来叫它，于是 `stop_program` 只把状态改成 CancelRequested，registry 一直把它算作在跑，直到整个会话关闭。凡是“靠被守护者主动检查”的取消，都要问一句“它不运行时谁来叫醒它”，答案是 `select!` 等取消令牌，而不是把取消塞进回调里。同一族的另一处：burst 计时用“两个 tick 间隔 < 50ms 就算没让出”，而 tick 只在执行时产生、tool 等待期完全不出现，于是“很多次很快的宿主调用”看起来和“一次很长的同步计算”一模一样，5 秒后被当成死循环杀掉——**宿主调用返回本身就是让出的证据**，别用间接的时间特征去猜。两个洞都是先写测试、在旧实现上看到红（超时/`exceeded CPU time limit`）才动的手；不先红，改完也分不清是修好了还是测试太松。还有一条小纪律：`Option<T>` 是 `#[must_use]`，把无返回值的“记一条日志”改成“返回可选警告”时，所有旧调用点都会变成编译错误——这恰好是好事，它逼你逐个决定警告该发到哪。
 
 382. **把“原子替换整个文件”改成“就地追加”，等于把文件从“我们自己的一份数据”变成“一个共享 inode 的写入端”，安全属性要重新证一遍。** 原子替换只动目录项，所以符号链接、硬链接、FIFO、目录、被外部截断都无所谓；就地追加会跟随硬链接写别人的文件（`O_NOFOLLOW` 挡不住硬链接，要看 `nlink`）、会在无读端的 FIFO 上永久阻塞（`O_WRONLY` 的 open 本身阻塞，类型检查来不及跑，所以要 `O_NONBLOCK`）、会把新记录拼到上次被杀留下的半行后面（恢复时必须按最后一个换行**物理**截断，只跳过不截断等于把下一条也赔进去）、还会因为整文件 `from_utf8` 解码而让坏尾截在多字节字符中间时丢掉全部好记录（逐行解码）。附带两条：`sync_data` 只覆盖字节，首次创建还要同步目录；换解析库或语法后，旧的正则/文本判定要重新对一次真实节点（动态 `import()` 的 callee 是 `import` 节点，不是 `identifier`，`starts_with("import(")` 只是碰巧对）。判据：换一种写入方式时，把“这个文件可能是什么”重新列一遍——类型、链接数、打开语义、可用长度、断电点。两条补充：做不到的平台别写一个恒真的桩（`link_count` 恒返回 1 等于放行），仓库里通常已经有按句柄查的实现（`tools::fs` 的 `has_multiple_hard_links` 三平台齐全），跨模块复用它比临时写一个 nightly-only 的 API 更省；以及“修不了就报告”——截尾失败被 `let _ =` 吞掉，比失败本身更糟，它会让下一条记录拼进坏行还算作已落盘。
+
+383. **“stdout 只放最终答案”是契约时，启动路径也算在契约里；同一个 stdin 有两个读者时，加锁不如共用一个队列。** `--headless` 之前只在 turn 里守 stdout，`open_history` 的 `[forked …]`/`[resumed …]` 仍是 `println!`，`--json` 的第一行就可能不是 JSON——把输出契约当成“输出层”的性质会漏掉所有在输出层之前发生的打印，排查时按“进程从启动到退出的每一条 stdout 写入”过一遍。plain 的 stdin 竞争则是另一种形状：REPL 的 `select!` 先发一个读请求再丢弃 future，读线程已经阻塞在 `read_line`，审批再起一个读者就抢同一行；修法是让两者共用一个容量为 1 的队列（线程持续读、谁在提问谁取），而不是给两个读者加锁或取消。顺带两条：信任门的修复要按“用户回答之前有哪些副作用”排序，MCP 从连接改成先 plan、信任后再 connect，测试必须用真的会留下痕迹的假 server（写标记文件），只断言顺序不够；配置里的数字（`memory_mb`）和 `[env]` 都是外部输入，换算用 checked、拒绝前先想清楚哪个字段可能带凭据（回显名字、不回显值）。

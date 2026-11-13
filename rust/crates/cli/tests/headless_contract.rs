@@ -37,6 +37,44 @@ impl Drop for TestRoot {
     }
 }
 
+/// The global config this test binary would read is never the developer's:
+/// every run gets a private HOME, and on Unix the file must be mode 0600 to be
+/// read at all.
+fn write_config(root: &TestRoot, contents: &str) {
+    let directory = root.root.join("home/.kloop");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = directory.join("config.toml");
+    std::fs::write(&path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+/// A writer killed between its runtime line and its first turn leaves a
+/// session file with a preamble and nothing else.
+fn seed_preamble_only_session(root: &TestRoot, id: &str) -> PathBuf {
+    let path = root
+        .root
+        .join(".kloop/sessions")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let line = serde_json::json!({
+        "type": "session",
+        "id": format!("{id}#1"),
+        "ts": 0,
+        "format_version": 1,
+        "runtime": { "cwd": root.root.to_string_lossy() },
+    });
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+    path
+}
+
 #[test]
 fn mock_headless_text_keeps_answer_on_stdout() {
     let root = TestRoot::new("text");
@@ -116,19 +154,7 @@ fn help_and_list_sessions_ignore_invalid_provider_environment() {
 fn mock_headless_resumes_a_preamble_only_session() {
     let root = TestRoot::new("preamble-resume");
     let id = "20260101-000001";
-    let path = root
-        .root
-        .join(".kloop/sessions")
-        .join(format!("{id}.jsonl"));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let line = serde_json::json!({
-        "type": "session",
-        "id": format!("{id}#1"),
-        "ts": 0,
-        "format_version": 1,
-        "runtime": { "cwd": root.root.to_string_lossy() },
-    });
-    std::fs::write(&path, format!("{line}\n")).unwrap();
+    let path = seed_preamble_only_session(&root, id);
 
     let output = root
         .command(&["--mock", "--headless", "--resume", id])
@@ -150,4 +176,89 @@ fn mock_headless_resumes_a_preamble_only_session() {
         transcript.contains("\"type\":\"message\""),
         "the mock turn did not run on the resumed session: {transcript}"
     );
+}
+
+/// Session notices are diagnostics: `--headless --json` promises stdout is
+/// only NDJSON, so "[resumed session …]" must not lead the stream.
+#[test]
+fn mock_headless_json_continue_keeps_stdout_ndjson() {
+    let root = TestRoot::new("json-continue");
+    // The first run writes a real transcript (route + message); the second
+    // continues it, which is the path that used to print "[resumed …]" first.
+    let first = root
+        .command(&["--mock", "--headless", "first"])
+        .output()
+        .expect("start kloop");
+    assert!(first.status.success());
+
+    let output = root
+        .command(&["--mock", "--headless", "--json", "-c", "go"])
+        .output()
+        .expect("start kloop");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.is_empty());
+    for line in stdout.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|error| panic!("stdout line is not NDJSON ({error}): {line:?}"));
+    }
+    assert!(
+        stderr.contains("[resumed session "),
+        "the resume notice belongs on stderr: {stderr}"
+    );
+}
+
+/// `[env]` is applied before the runtime exists; a name or value `set_var`
+/// would panic on must be a normal startup error, and the error must not quote
+/// a value that could be a credential.
+#[test]
+fn an_unsettable_env_entry_fails_without_quoting_the_value() {
+    let root = TestRoot::new("env-unsettable");
+    write_config(
+        &root,
+        "provider = \"openai-compat\"\n\n\
+         [providers.openai-compat]\n\
+         wire_api = \"chat\"\n\
+         base_url = \"http://127.0.0.1:1\"\n\
+         auth_header = { Authorization = \"Bearer synthetic-key\" }\n\
+         model = \"m\"\n\n\
+         [env]\n\
+         \"A=B\" = \"s3cret\"\n",
+    );
+
+    let output = root
+        .command(&["--headless", "hi"])
+        .output()
+        .expect("start kloop");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("[env]"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("s3cret"),
+        "stderr quoted the value: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_is_an_error_not_a_panic() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = TestRoot::new("argv-non-utf8");
+    let output = root
+        .command(&[])
+        .arg(std::ffi::OsString::from_vec(b"--prompt-\xff".to_vec()))
+        .output()
+        .expect("start kloop");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("valid UTF-8"), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
 }

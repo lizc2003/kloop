@@ -108,6 +108,38 @@ fn classify_startup_failure(
     (failed_auth, failure)
 }
 
+/// A startup failure as one safe category. The categories are the ones a person
+/// can act on; everything else is a protocol error, because printing the raw
+/// chain can quote credentials, commands, or env.
+fn startup_failure_reason(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<McpAuthenticationError>().is_some())
+    {
+        return "authentication rejected".to_string();
+    }
+    for cause in error.chain() {
+        let text = cause.to_string();
+        // `mcp http <status>: <body>` — the body is the server's, not ours.
+        if let Some(rest) = text.strip_prefix("mcp http ")
+            && let Some(code) = rest.split_whitespace().next()
+            && !code.is_empty()
+            && code.chars().all(|character| character.is_ascii_digit())
+        {
+            return format!("server returned HTTP {code}");
+        }
+        if text.contains("no response within") {
+            return "the server did not respond before the deadline".to_string();
+        }
+        // Both the stdio spawn context and the child's stdio setup use this
+        // shape; the process never reached the handshake.
+        if text.starts_with("cannot spawn mcp server") {
+            return "could not start the server process".to_string();
+        }
+    }
+    "protocol or transport error".to_string()
+}
+
 /// One configured server's startup work: the immutable planning state (built in
 /// config order) plus whatever the concurrent connect produced.
 struct ServerStartup {
@@ -426,21 +458,25 @@ impl McpStartup {
                         startup_auth,
                     );
                     source.startup_failed(failed_auth, failure);
+                    // A category, never the raw chain: errors may quote URL
+                    // credentials, commands, or env, and Desktop forwards this
+                    // to the WebView. There is no engine log to point at.
+                    let reason = startup_failure_reason(&error);
                     let hint = if oauth_capable {
                         format!("; if it needs OAuth, run: kloop mcp login {}", server.name)
                     } else {
                         String::new()
                     };
-                    warn(&format!("mcp server '{}' unavailable{hint}", server.name));
+                    warn(&format!(
+                        "mcp server '{}' unavailable: {reason}{hint}",
+                        server.name
+                    ));
                     statuses.push(McpServerStatus {
                         name: server.name.clone(),
                         transport,
                         state: McpServerState::Unavailable,
                         tools: Vec::new(),
-                        // Never reflect the raw anyhow chain onto the protocol or
-                        // warning stream: Desktop forwards stderr into the WebView,
-                        // and errors may quote URL credentials, commands, or env.
-                        message: Some("connection or tool discovery failed; see engine log".into()),
+                        message: Some(format!("connection or tool discovery failed: {reason}")),
                     });
                 }
             }
@@ -472,6 +508,41 @@ mod tests {
     use kloop_server::McpTransportKind;
     #[cfg(unix)]
     use serde_json::json;
+
+    /// The warning and the protocol status both show this string; it must name
+    /// what happened without carrying the chain that says where and with what.
+    #[test]
+    fn startup_failure_reason_is_a_category_only() {
+        let spawn = anyhow::Error::new(std::io::Error::from_raw_os_error(2))
+            .context("cannot spawn mcp server '/x/secret-command'");
+        assert_eq!(
+            startup_failure_reason(&spawn),
+            "could not start the server process"
+        );
+
+        for timed_out in [
+            anyhow::anyhow!("initialize: no response within 30s"),
+            anyhow::anyhow!("mcp http: no response within 30s"),
+        ] {
+            assert_eq!(
+                startup_failure_reason(&timed_out),
+                "the server did not respond before the deadline"
+            );
+        }
+
+        let http = anyhow::anyhow!("mcp http 503 Service Unavailable: TOKEN=secret");
+        assert_eq!(startup_failure_reason(&http), "server returned HTTP 503");
+        assert!(startup_failure_reason(&http).find("secret").is_none());
+
+        let auth = anyhow::Error::new(McpAuthenticationError);
+        assert_eq!(startup_failure_reason(&auth), "authentication rejected");
+
+        let protocol = anyhow::anyhow!("invalid json-rpc envelope");
+        assert_eq!(
+            startup_failure_reason(&protocol),
+            "protocol or transport error"
+        );
+    }
 
     #[tokio::test]
     async fn failed_connections_remain_visible_without_leaking_details() {
@@ -505,7 +576,10 @@ mod tests {
                 transport: McpTransportKind::Stdio,
                 state: McpServerState::Unavailable,
                 tools: Vec::new(),
-                message: Some("connection or tool discovery failed; see engine log".into()),
+                message: Some(
+                    "connection or tool discovery failed: could not start the server process"
+                        .into(),
+                ),
             }]
         );
         let wire = serde_json::to_string(&connections.statuses).unwrap();
@@ -514,7 +588,7 @@ mod tests {
         let warnings = warnings.lock().unwrap();
         assert_eq!(
             *warnings,
-            vec!["mcp server 'broken' unavailable".to_string()]
+            vec!["mcp server 'broken' unavailable: could not start the server process".to_string()]
         );
         assert!(!warnings[0].contains("SUPER-SECRET"));
         assert!(!warnings[0].contains("kloop-mcp-secret"));

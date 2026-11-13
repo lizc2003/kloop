@@ -2380,8 +2380,11 @@ opens the loop re-checks the inbox once, so work queued during the wait is
 delivered immediately instead of stranded until unrelated activity. Warnings
 from the deferred connect go to the transcript as notes
 (stderr would fight the viewport), and the tool-merge pass runs once the
-catalogs exist. Plain, headless and server mode still connect before they start,
-because they have nothing to show until the catalog settles.
+catalogs exist. Headless and server mode still connect before they start,
+because they have nothing to show until the catalog settles. Plain also has
+nothing to show, but it asks the trust question first; its servers stay planned
+until that answer is in, so declining trust never leaves a configured stdio
+server running in the checkout.
 
 启动门的 PTY 回归用显式屏障阻塞 MCP `tools/list` 响应：先确认请求已到达，
 在屏障关闭期间观察 provider 零请求，再由测试放行并核对首请求含定时 prompt
@@ -2415,7 +2418,11 @@ is unchanged. Streamable HTTP still has no long-lived server-notification stream
 so its catalog is explicitly startup-fixed. A recovered HTTP 404 session emits a
 lifecycle event and revalidates the catalog once rather than treating a new wire
 session as proof that the old catalog is current; OAuth refresh/relogin state is
-likewise reflected in readiness. MCP startup failure never blocks kloop.
+likewise reflected in readiness. MCP startup failure never blocks kloop. The
+warning and the server status name one safe category — could not start the
+process, no response before the deadline, `HTTP <status>`, authentication
+rejected, or protocol/transport error — because the raw chain can quote URL
+credentials, commands, or env and Desktop forwards statuses into its WebView.
 Name sanitization folds everything outside `[A-Za-z0-9_]` to `_` (so persisted
 allow rules round-trip through the permission-rule grammar); collisions warn at
 startup and the colliding later definitions are skipped.
@@ -2455,7 +2462,10 @@ leaks into the wire crate). CLI 内部由 `mcp.rs` 保留启动编排和原有�
 Whenever MCP is configured, kloop exposes three global resource helpers. Each
 helper routes through the same per-server readiness receipt; a ready server must
 also advertise `resources`, while a failed/degraded/stale server reports its
-availability state before URI lookup or approval. The helpers are always deferred
+availability state before URI lookup or approval. A requested `server` matches
+its exact spelling first; the normalized fallback (case and punctuation folded)
+is used only when it names exactly one configured server, so `Foo` and `foo`
+remain two distinct servers. The helpers are always deferred
 behind `tool_search`, even when the ordinary tool count is below the threshold:
 
 - **list_mcp_resources** `{server?}` lists one server or aggregates all
@@ -4523,6 +4533,8 @@ Program or Workflow cannot start one more child. Orchestration limits are:
 All six knobs override via `[program]` in global `~/.kloop/config.toml`
 (`memory_mb`, `stack_kb`, `cpu_secs`, `max_agents`, `max_concurrency`,
 `max_items`) — the section is named after the `run_program` tool it bounds.
+`memory_mb` and `stack_kb` are converted to bytes with checked arithmetic; a
+value that would overflow is a startup error, not a wrapped or saturated limit.
 Detached Agent/Program/Workflow executions retain their separate,
 session-wide cap of 8.
 
@@ -5357,7 +5369,9 @@ kloop --mock --headless --json
 
 - **Prompt = positional argument and/or piped stdin** (either alone, or both
   combined). Neither present is an error. `--headless` is a mode switch, not a
-  value holder — the prompt never rides the flag itself (cc's shape).
+  value holder — the prompt never rides the flag itself (cc's shape). Because
+  stdin is the prompt, a bare `--resume` (the numbered picker, which reads
+  stdin) is rejected here; an explicit id, `-c`, and `--fork` all work.
 - **Two output contracts.** Default (human): the final answer prints once to
   **stdout**, progress notes go to **stderr**, so `result=$(kloop --headless "…")`
   captures a clean result. `--json` (machine): every event is one NDJSON line on
@@ -5366,7 +5380,9 @@ kloop --mock --headless --json
   `thread/token_usage/updated`, `note`,
   `turn/completed` — the **exact same item vocabulary the native protocol server
   emits** (via one shared `project_event`), `thread_id` and all. One event
-  vocabulary, two front-ends.
+  vocabulary, two front-ends. Session notices (`[resumed session …]`,
+  `[forked …]`) are diagnostics and go to stderr, so neither contract's stdout
+  ever starts with a plain-text line.
 - **Approval defaults to deny.** There is nobody at the keyboard, so any
   permission ask is auto-denied (fail-safe, like server mode's "reply lost =
   deny"). What never reaches the approver still runs: existing project grants,
@@ -5537,7 +5553,10 @@ cargo run -- --mock
 # over the same name in the environment**: one file decides what this run's
 # environment is, for the same reason it decides everything else about the run.
 # Names it leaves out are inherited untouched. `HOME` cannot be set there: the
-# file was just read from it. A name written there also wins over the login
+# file was just read from it. A name containing '=' or NUL, and a value
+# containing NUL, are startup errors (only the name is ever quoted); `set_var`
+# would panic on them, and this table is applied before the runtime exists.
+# A name written there also wins over the login
 # shell's own export. Plan 223 在捕获后合并 `[env]` 的实际值，并在 shell 启动文件之后
 # 再恢复一次，保持 `[env]` > 登录环境 > 继承环境。模型 shell 的密钥过滤、启动钩子
 # 移除及 shell 自己派生的变量不受该覆盖规则改变。
@@ -5752,6 +5771,11 @@ two-tap clear) and Ctrl+C (two taps) exits (see the TUI section). In
 `--plain`, one Ctrl+C cancels any running operation, waits for that repair, and
 then exits; `exit` and `/exit` also quit. As in a conventional line-based REPL,
 an actual stdin EOF ends input, but it is not advertised as an application key.
+One reader thread owns stdin for the whole front-end; the REPL prompt and the
+approval/question prompts take lines from the same queue, so whichever asks at
+that moment gets the line. A line typed at a prompt therefore answers it, and no
+second reader can turn it into a message that reappears afterwards; a line typed
+between turns waits for the next REPL prompt.
 Every session is saved and resumable — see Session persistence above.
 
 ## Behavior evals
@@ -6212,8 +6236,8 @@ crates/codemode/    kloop-codemode — the QuickJS engine for code mode (owns rq
 crates/cli/         kloop — the binary
   src/main.rs       进程/会话初始化与前端分派（TUI、plain、headless、server）；
                     保留 headless 的管道输入与单次 Ctrl+C watcher
-  src/plain.rs      行式 REPL 与 --mock demo；会话级 Ctrl+C、按需 stdin
-                    线程、Inbox 唤醒、命令/turn 运行与退出清理
+  src/plain.rs      行式 REPL 与 --mock demo；会话级 Ctrl+C、单一 stdin 读者
+                    （REPL 与审批/提问共用）、Inbox 唤醒、命令/turn 运行与退出清理
   src/ui.rs         StdoutUi、CliApprover 与 plain 交互呈现
   src/headless.rs   单 turn 输出与退出码契约
   src/args.rs       参数解析、版本串与会话选择（--continue、--resume、

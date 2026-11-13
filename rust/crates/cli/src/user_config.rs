@@ -75,6 +75,12 @@ pub(crate) fn load_env_overrides(root: &toml::Table) -> Result<Vec<(String, Stri
         if name.is_empty() {
             bail!("[env] has an empty variable name");
         }
+        // `set_var` panics on both of these, and `main` applies this table
+        // before the runtime exists. Reject them at parse time; the message
+        // deliberately does not echo the name.
+        if name.contains(['=', '\0']) {
+            bail!("[env] has a variable name containing '=' or a NUL byte");
+        }
         // HOME is where this very file was just found. Reassigning it would
         // leave the config and everything derived from it — sessions,
         // projects, the OAuth store — pointing at two different homes.
@@ -89,6 +95,9 @@ pub(crate) fn load_env_overrides(root: &toml::Table) -> Result<Vec<(String, Stri
         let value = value
             .as_str()
             .with_context(|| format!("[env].{name} must be a string"))?;
+        if value.contains('\0') {
+            bail!("[env].{name} contains a NUL byte");
+        }
         out.push((name.clone(), value.to_string()));
     }
     Ok(out)
@@ -287,6 +296,26 @@ max_agents = 3
             refused("[env]\nUSERPROFILE = \"C:/other\"").contains("cannot be set"),
             "USERPROFILE is HOME on the other platform"
         );
+
+        // `set_var` panics on these; parsing has to refuse them instead, and
+        // the error must not quote the value (it may be a credential).
+        let env_table = |name: &str, value: &str| {
+            let mut env = toml::Table::new();
+            env.insert(name.to_string(), toml::Value::String(value.to_string()));
+            let mut root = toml::Table::new();
+            root.insert("env".to_string(), toml::Value::Table(env));
+            root
+        };
+        let rejected = |name: &str, value: &str| {
+            load_env_overrides(&env_table(name, value))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(rejected("A=B", "x").contains("'=' or a NUL byte"));
+        assert!(rejected("A\0B", "x").contains("'=' or a NUL byte"));
+        let nul_value = rejected("TOKEN", "s3cret\0tail");
+        assert!(nul_value.contains("NUL"), "{nul_value}");
+        assert!(!nul_value.contains("s3cret"), "{nul_value}");
     }
 
     /// `config/config-demo.toml` is what a new user copies into place, and

@@ -1,9 +1,10 @@
 # Plan 258 — CLI 前端：headless 输出、plain 输入与启动
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。会话驱动的统一(四个前端各写一份
-> turn 生命周期)在 plan 269,这里只修具体 bug。
+> 状态：✅ 完成(2026-11-13)。行号是 2026-10-28 的读数;开工时 7 条全部复核成立。
+> 开工问过用户：第 1 条按 (a)(headless 不带 id 的 `--resume` 在 `parse_args` 拒绝);
+> 第 5 条按 (a)(错误映射成不含敏感信息的类别写进 warn，不建私有日志)。
+> 会话驱动的统一(四个前端各写一份 turn 生命周期)在 plan 269,这里只修具体 bug。
 
 ## 问题
 
@@ -66,3 +67,30 @@
   未信任目录 `--plain` 选 No 时没有 MCP 子进程启动过(用会写标记文件的假 server);坏 `[env]` 与
   非 UTF-8 argv 报错不 panic 且错误里不含值;`Foo`/`foo` 两个 server 各读各的。
 - 外层执行沙箱之外 `make check`(含 plain PTY 用例);HANDOFF 删掉 plan 241 那条待修记录并记进展。
+
+## 完成记录(2026-11-13)
+
+- 1 `[forked …]` 与 `[resumed session …]` 改走 stderr；headless 下不带 id 的
+  `--resume` 在 `parse_args` 直接拒绝（提示改用 `-c`），`-c`/`--fork` 不变。回归：
+  `--mock --headless --json -c` 的 stdout 每行都是 NDJSON、resume 提示在 stderr；
+  首次运行写真实会话文件再 `-c`，不手写 route 夹具。
+- 2 plain 前端只有一个 stdin 读者：新增 `PlainStdin`（容量 1 的队列，线程持续读行），
+  REPL、审批、提问都从同一句柄取行；不再有“先发读请求、Inbox 胜出后丢弃”的路径。
+  `prompt_questions` 改成 async 读同一队列，删掉 `spawn_blocking` 与
+  `read_terminal_line`。回归钉住：Inbox 唤醒后审批拿到 `y`，REPL 下一条消息读不到它；
+  原调度器唤醒回归改用真实 `next_plain_input`。
+- 3 `--plain` 的 MCP 服务器改为先 plan、信任通过后再 `connect_deferred_mcp()`；
+  serve/headless 仍立即连接（都不问信任）。PTY 回归：未信任目录配置一个会写标记文件的
+  stdio server，回答 No 后标记文件不存在。
+- 4 `[env]` 拒绝名字含 `=`/NUL、值含 NUL（错误不回显值）；argv 改 `args_os()`
+  并对非 UTF-8 给正常错误；`memory_mb`/`stack_kb` 用 checked 乘法，溢出报配置错误。
+- 5 MCP 启动失败映射成单一类别（进程启动失败/超时/`HTTP <status>`/认证被拒/协议或传输
+  错误）写进 warn 与状态消息，去掉不存在的 “see engine log”；原始错误链仍不外露。
+- 6 资源工具的 server 查找先精确匹配；归一化回退只在唯一命中时使用，`Foo`/`foo`
+  各读各的。
+- 7 `merge_builtins`/`merge_commands` 合并为 `merge_first_wins`；两个 `*_from_roots`
+  共用 `entries_from_roots` 的 read_dir + 排序骨架。
+
+验证：`cargo fmt --all -- --check`、`cargo check -p kloop --all-targets`、
+`cargo clippy -p kloop --all-targets -- -D warnings`、`cargo test -p kloop --bin kloop`（167 项）、`--test headless_contract`
+（7 项）、`--test plain_pty`（9 项，含新 PTY 回归）通过；未跑全量 `make check`。

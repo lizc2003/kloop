@@ -3,6 +3,8 @@
 mod tui_pty_support;
 
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -207,5 +209,68 @@ async fn running_ctrl_c_before_any_output_discards_the_turn() -> Result<()> {
         &harness.raw(),
         "[interrupted before the model replied — that message was not recorded]".as_bytes()
     ));
+    Ok(())
+}
+
+/// Trust comes before anything a front-end starts. A configured stdio MCP
+/// server used to be spawned during process setup, so declining trust still
+/// ran the command inside an untrusted checkout. The fake server writes a
+/// marker into its cwd (the workspace) the moment it starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declining_trust_in_plain_never_starts_a_configured_mcp_server() -> Result<()> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let fixture = ChatFixture::start(vec![sse_text("unused")]).await;
+    let workspace: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::new(std::sync::Mutex::new(None));
+    let recorded = Arc::clone(&workspace);
+    let prepare = move |_: &Path, workspace: &Path| -> Result<()> {
+        *recorded.lock().unwrap() = Some(workspace.to_path_buf());
+        Ok(())
+    };
+    let config = format!(
+        "provider = \"openai-compat\"\n\n\
+         [providers.openai-compat]\n\
+         wire_api = \"chat\"\n\
+         base_url = \"{}\"\n\
+         auth_header = {{ Authorization = \"Bearer synthetic-pty-key\" }}\n\
+         model = \"pty-model\"\n\n\
+         [mcp.servers.probe]\n\
+         command = [\"/bin/sh\", \"-c\", \"touch mcp-started-marker\"]\n",
+        fixture.uri()
+    );
+    let mut harness = PtyHarness::spawn_with_options(
+        Path::new(env!("CARGO_BIN_EXE_kloop")),
+        &fixture.uri(),
+        24,
+        120,
+        &PtyOptions {
+            args: &["--plain"],
+            provider_config: Some(&config),
+            prepare: Some(&prepare),
+            untrusted: true,
+            ..PtyOptions::default()
+        },
+    )?;
+    harness.wait_for("trust question", Duration::from_secs(10), |frame| {
+        frame.contains("Accessing workspace") && frame.contains("Yes, I trust this directory")
+    })?;
+    let workspace = workspace
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("prepare callback ran");
+    let marker = workspace.join("mcp-started-marker");
+    assert!(
+        !marker.exists(),
+        "the MCP server started before the trust question was answered"
+    );
+
+    // `Exit` is preselected: Enter declines.
+    harness.write(b"\r")?;
+    let status = harness.wait_for_exit(Duration::from_secs(10))?;
+    assert!(status.success());
+    assert!(
+        !marker.exists(),
+        "the MCP server ran even though the directory was not trusted"
+    );
     Ok(())
 }

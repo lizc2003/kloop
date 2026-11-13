@@ -94,9 +94,9 @@ struct ProcessState {
     runtime: Arc<RuntimeSettings>,
     tool_sources: Vec<Arc<dyn ToolSource>>,
     mcp_statuses: Vec<kloop_server::McpServerStatus>,
-    /// Set only by the TUI path: sources exist and read as starting, but the
-    /// handshakes run after the terminal owns the screen. Every other
-    /// front-end connects before it starts.
+    /// Set by the TUI path (connect after the terminal owns the screen) and by
+    /// `--plain` (connect after the trust question); every other front-end
+    /// connects before it starts.
     mcp_startup: Option<mcp::McpStartup>,
 }
 
@@ -131,7 +131,11 @@ impl ProcessState {
             let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
             sources.extend(web::build_web_source(&web_cfg, &warn));
             let servers = mcp::load_mcp_servers(user_config.table())?;
-            if args.serve || args.plain || args.headless {
+            // `--serve` and `--headless` never ask the trust question (whoever
+            // starts them owns that call), so they connect now. `--plain` does
+            // ask, later than this, so its servers stay planned until then — a
+            // declined directory must not have started one.
+            if args.serve || args.headless {
                 let mcp::McpConnections {
                     sources: mcp_sources,
                     statuses,
@@ -152,8 +156,9 @@ impl ProcessState {
             } else {
                 let startup = mcp::McpStartup::plan(servers)?;
                 let lifecycle = startup.lifecycle();
-                // The merge warnings need the settled catalogs, so the TUI task
-                // runs them after connecting; here the sources are only planned.
+                // The merge warnings need the settled catalogs, so each
+                // front-end runs them after connecting; here the sources are
+                // only planned.
                 sources.extend(startup.sources());
                 (sources, Vec::new(), lifecycle, Some(startup))
             }
@@ -168,6 +173,26 @@ impl ProcessState {
             },
             mcp_lifecycle,
         ))
+    }
+
+    /// Connect the planned servers. The TUI does this from its startup task; the
+    /// plain REPL does it after the trust question, so an untrusted directory
+    /// never gets as far as spawning one. The planned sources become ready in
+    /// place, so no `Config` rebuild is needed.
+    async fn connect_deferred_mcp(&mut self) -> Result<()> {
+        if let Some(startup) = self.mcp_startup.take() {
+            let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+            startup.connect(&warn, None).await?;
+        }
+        let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+        for warning in tool_merge_warnings(
+            &self.tool_sources,
+            self.runtime.defer_threshold(),
+            self.runtime.shell_programs(),
+        ) {
+            warn(&warning);
+        }
+        Ok(())
     }
 }
 
@@ -278,11 +303,14 @@ impl SessionState {
 /// runtime built on the next line is what ends that. The file wins over what
 /// the shell exported — see `load_env_overrides`.
 fn main() -> Result<ExitCode> {
+    // Read argv as `OsString` here: a non-UTF-8 argument is reported by `run`
+    // like any other bad input, instead of panicking on `std::env::args`.
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // A conservative scan rather than the real parser, which needs the
     // subcommand normalization that lives inside `run`. Erring towards "this
     // is --mock" only means declining to read the config, which --mock never
     // does anyway.
-    if !std::env::args().any(|arg| arg == "--mock") {
+    if !arguments.iter().any(|arg| arg == "--mock") {
         for (name, value) in user_config::config_env() {
             // SAFETY: no second thread exists yet — the runtime below has not
             // been built, and nothing above this point spawns one.
@@ -293,11 +321,19 @@ fn main() -> Result<ExitCode> {
         .enable_all()
         .build()
         .context("cannot start the async runtime")?
-        .block_on(run())
+        .block_on(run(arguments))
 }
 
-async fn run() -> Result<ExitCode> {
-    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+async fn run(arguments: Vec<std::ffi::OsString>) -> Result<ExitCode> {
+    let mut raw = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        // The flag parser works on `String`; there is nothing to guess for a
+        // path or prompt that is not UTF-8.
+        let argument = argument
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("command-line arguments must be valid UTF-8"))?;
+        raw.push(argument);
+    }
     // `kloop mcp …` is the one subcommand (OAuth login); everything else is
     // flag-shaped and goes through the flag parser.
     if raw.first().map(String::as_str) == Some("mcp") {
@@ -365,7 +401,7 @@ fn launch_rule() {
 /// Pick the front-end the flags asked for and run it to completion.
 async fn run_front_end(
     args: CliArgs,
-    process: ProcessState,
+    mut process: ProcessState,
     session_store: SessionStore,
     cwd: std::path::PathBuf,
 ) -> Result<ExitCode> {
@@ -389,6 +425,12 @@ async fn run_front_end(
         if !trust::ensure_trusted(process.runtime.project_store(), &identity) {
             return Ok(ExitCode::SUCCESS);
         }
+    }
+    // `--plain` planned its MCP servers instead of connecting them: now that
+    // the directory is trusted (or was already), start the handshakes. A
+    // declined directory returned above, so no configured server ever ran.
+    if args.plain {
+        process.connect_deferred_mcp().await?;
     }
     let Some(session) = SessionState::open(&args, &cwd, &process, &session_store, identity)? else {
         return Ok(ExitCode::SUCCESS);

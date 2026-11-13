@@ -6,10 +6,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(test)]
-use tokio::io::AsyncBufReadExt;
-#[cfg(test)]
-use tokio::io::BufReader;
 use tokio_util::sync::CancellationToken;
 
 use kloop_core::agent::EndReason;
@@ -110,66 +106,59 @@ impl Drop for PlainCtrlC {
     }
 }
 
-struct PlainInputThread {
-    requests: std::sync::mpsc::Sender<()>,
-    receiver: tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Option<String>>>,
+/// The one stdin reader for the plain front-end. The REPL prompt and the
+/// approval / question prompts all take lines from this handle, so a line typed
+/// for one of them can never be swallowed by the other. The reader thread reads
+/// one line ahead (the channel's bound) — enough to see EOF, no further.
+#[derive(Clone)]
+pub(crate) struct PlainStdin {
+    lines: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<std::io::Result<Option<String>>>>>,
 }
 
-impl PlainInputThread {
-    fn spawn() -> std::io::Result<Self> {
-        let (requests, requested) = std::sync::mpsc::channel();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+impl PlainStdin {
+    fn spawn_stdin() -> std::io::Result<Self> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         std::thread::Builder::new()
             .name("kloop-plain-stdin".into())
             .spawn(move || {
-                while requested.recv().is_ok() {
+                loop {
                     let mut line = String::new();
                     let read = std::io::stdin()
                         .read_line(&mut line)
                         .map(|bytes| (bytes != 0).then_some(line));
                     let done = !matches!(read, Ok(Some(_)));
-                    if sender.send(read).is_err() || done {
+                    if sender.blocking_send(read).is_err() || done {
                         break;
                     }
                 }
             })?;
-        Ok(Self { requests, receiver })
+        Ok(Self::from_receiver(receiver))
     }
 
-    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
-        self.requests.send(()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "plain stdin reader stopped")
-        })?;
-        self.receiver.recv().await.unwrap_or(Ok(None))
+    fn from_receiver(
+        receiver: tokio::sync::mpsc::Receiver<std::io::Result<Option<String>>>,
+    ) -> Self {
+        Self {
+            lines: Arc::new(tokio::sync::Mutex::new(receiver)),
+        }
     }
-}
 
-#[cfg(test)]
-async fn next_plain_input_with_lines<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut tokio::io::Lines<R>,
-    inbox_activity: &mut tokio::sync::watch::Receiver<u64>,
-    ctrl_c: &mut PlainCtrlC,
-) -> PlainInput {
-    tokio::select! {
-        biased;
-        () = ctrl_c.recv() => PlainInput::CtrlC,
-        line = lines.next_line() => PlainInput::Line(line),
-        activity = inbox_activity.changed() => match activity {
-            Ok(()) => PlainInput::Inbox,
-            Err(_) => PlainInput::InboxClosed,
-        },
+    /// The next line typed (or EOF / a read error). Callers share one queue, so
+    /// whoever is prompting at that moment gets the line.
+    pub(crate) async fn line(&self) -> std::io::Result<Option<String>> {
+        self.lines.lock().await.recv().await.unwrap_or(Ok(None))
     }
 }
 
 async fn next_plain_input(
-    input: &mut PlainInputThread,
+    input: &PlainStdin,
     inbox_activity: &mut tokio::sync::watch::Receiver<u64>,
     ctrl_c: &mut PlainCtrlC,
 ) -> PlainInput {
     tokio::select! {
         biased;
         () = ctrl_c.recv() => PlainInput::CtrlC,
-        line = input.next_line() => PlainInput::Line(line),
+        line = input.line() => PlainInput::Line(line),
         activity = inbox_activity.changed() => match activity {
             Ok(()) => PlainInput::Inbox,
             Err(_) => PlainInput::InboxClosed,
@@ -217,7 +206,10 @@ async fn plain_main(
 ) -> Result<()> {
     let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
-    let interaction = Arc::new(CliApprover::default());
+    // Spawned before the config because the same handle answers approvals and
+    // questions during a turn; a second reader would race the REPL for stdin.
+    let input = PlainStdin::spawn_stdin().context("cannot start plain stdin reader")?;
+    let interaction = Arc::new(CliApprover::new(input.clone()));
     let mut cfg = config_from_settings(
         &args,
         &provider,
@@ -277,13 +269,12 @@ async fn plain_main(
     );
     // `--image` blocks ride the first user turn; taken once, then empty.
     let mut pending_images = pending_images;
-    let mut input = PlainInputThread::spawn().context("cannot start plain stdin reader")?;
     let mut inbox_activity = cfg.inbox.subscribe_activity();
     let mut input_error = None;
     loop {
         print!("> ");
         let _ = std::io::stdout().flush();
-        let input = next_plain_input(&mut input, &mut inbox_activity, &mut ctrl_c).await;
+        let input = next_plain_input(&input, &mut inbox_activity, &mut ctrl_c).await;
         if matches!(input, PlainInput::InboxClosed) {
             break;
         }
@@ -462,14 +453,15 @@ mod tests {
             .schedule_wakeup(60.0, "test delivery", "timer work")
             .unwrap();
         let mut inbox_activity = inbox.subscribe_activity();
-        let (_writer, reader) = tokio::io::duplex(128);
-        let mut lines = BufReader::new(reader).lines();
+        // Nothing is typed: the send half stays open, so the read is idle.
+        let (_lines, receiver) = tokio::sync::mpsc::channel(1);
+        let input = PlainStdin::from_receiver(receiver);
 
         clock.set(wakeup.scheduled_for_ms);
         let mut ctrl_c = PlainCtrlC::install().unwrap();
         let input = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            next_plain_input_with_lines(&mut lines, &mut inbox_activity, &mut ctrl_c),
+            next_plain_input(&input, &mut inbox_activity, &mut ctrl_c),
         )
         .await
         .unwrap();
@@ -477,5 +469,47 @@ mod tests {
         assert!(!inbox.is_empty());
 
         scheduler.shutdown().await;
+    }
+
+    /// The bug this pins: the REPL's select used to ask for a line and then
+    /// drop the request when the inbox won, so the read stayed pending on a
+    /// second reader and the approval prompt's `y` landed in the next turn.
+    /// One shared queue means the turn (approval) takes the line, and the REPL
+    /// has nothing left to send.
+    #[tokio::test]
+    async fn an_inbox_turn_takes_the_approval_answer_not_the_next_message() {
+        use kloop_core::permissions::ApprovalScope;
+        use kloop_core::permissions::Approver;
+        use kloop_core::permissions::ConfirmRequest;
+        use kloop_core::permissions::Decision;
+
+        let (activity, mut activity_rx) = tokio::sync::watch::channel(0u64);
+        let (lines, receiver) = tokio::sync::mpsc::channel(1);
+        let input = PlainStdin::from_receiver(receiver);
+        let mut ctrl_c = PlainCtrlC::install().unwrap();
+
+        activity.send(1).unwrap();
+        let event = next_plain_input(&input, &mut activity_rx, &mut ctrl_c).await;
+        assert!(matches!(event, PlainInput::Inbox));
+
+        let approver = CliApprover::new(input.clone());
+        let request = ConfirmRequest {
+            description: "run a command".into(),
+            approval_scopes: vec![ApprovalScope::Once],
+            ..Default::default()
+        };
+        let approval = tokio::spawn(async move { approver.confirm(request).await });
+        lines.send(Ok(Some("y\n".into()))).await.unwrap();
+        assert_eq!(
+            approval.await.unwrap(),
+            Decision::Allow(ApprovalScope::Once)
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), input.line())
+                .await
+                .is_err(),
+            "the approval answer must not remain queued for the next user turn"
+        );
     }
 }
