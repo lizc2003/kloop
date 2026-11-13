@@ -271,6 +271,19 @@ impl RunDir {
         Ok(())
     }
 
+    /// Drop everything past `len`. An append killed mid-write leaves an
+    /// unterminated line; continuing after it would merge the next record into
+    /// that line and lose it.
+    pub(super) fn truncate(&self, name: &'static str, len: u64) -> Result<()> {
+        validate_file_name(name)?;
+        self.verify()?;
+        #[cfg(unix)]
+        self.truncate_unix(name, len)?;
+        #[cfg(not(unix))]
+        self.truncate_path(name, len)?;
+        Ok(())
+    }
+
     fn check_append_cap(bytes: &[u8], existing: u64) -> Result<()> {
         if bytes.len() > MAX_FILE_BYTES || existing > (MAX_FILE_BYTES - bytes.len()) as u64 {
             return Err(anyhow!("run file exceeds the {MAX_FILE_BYTES}-byte limit"));
@@ -278,23 +291,100 @@ impl RunDir {
         Ok(())
     }
 
-    #[cfg(unix)]
-    fn append_unix(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
-        use rustix::fs::Mode;
-        use rustix::fs::OFlags;
-
-        let fd = rustix::fs::openat(
-            &*self.dir,
-            name,
-            OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .with_context(|| format!("cannot open run file {}", self.path.join(name).display()))?;
-        let mut file = std::fs::File::from(fd);
-        let metadata = file.metadata().context("cannot stat run file")?;
+    /// An appended file is written in place, so it must be a single-link regular
+    /// file: a hard link would make the append modify whatever else shares the
+    /// inode, and `O_NOFOLLOW` does not stand in the way of one. The atomic
+    /// replace this replaced only ever touched its own directory entry.
+    fn check_appended_artifact(name: &'static str, metadata: &std::fs::Metadata) -> Result<()> {
         if !metadata.is_file() {
             return Err(anyhow!("run artifact {name} is not a regular file"));
         }
+        if link_count(metadata) != 1 {
+            return Err(anyhow!(
+                "run artifact {name} has another name outside its run directory"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn open_for_append(&self, name: &'static str) -> Result<(std::fs::File, bool)> {
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+
+        // NONBLOCK is what keeps the open itself from hanging: a FIFO with no
+        // reader blocks a WRONLY open forever, before the type check below can
+        // reject it, and that wait is not cancellable.
+        let base =
+            OFlags::WRONLY | OFlags::APPEND | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        let path = self.path.join(name);
+        match rustix::fs::openat(&*self.dir, name, base, Mode::empty()) {
+            Ok(fd) => Ok((std::fs::File::from(fd), false)),
+            Err(rustix::io::Errno::NOENT) => {
+                match rustix::fs::openat(
+                    &*self.dir,
+                    name,
+                    base | OFlags::CREATE | OFlags::EXCL,
+                    Mode::RUSR | Mode::WUSR,
+                ) {
+                    Ok(fd) => Ok((std::fs::File::from(fd), true)),
+                    // Another writer created it between the two opens.
+                    Err(rustix::io::Errno::EXIST) => {
+                        let fd = rustix::fs::openat(&*self.dir, name, base, Mode::empty())
+                            .with_context(|| format!("cannot open run file {}", path.display()))?;
+                        Ok((std::fs::File::from(fd), false))
+                    }
+                    Err(error) => Err(error)
+                        .with_context(|| format!("cannot create run file {}", path.display())),
+                }
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("cannot open run file {}", path.display()))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn append_unix(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
+        let (mut file, created) = self.open_for_append(name)?;
+        let metadata = file.metadata().context("cannot stat run file")?;
+        Self::check_appended_artifact(name, &metadata)?;
+        Self::check_append_cap(bytes, metadata.len())?;
+        use std::io::Write as _;
+        file.write_all(bytes).context("cannot append to run file")?;
+        file.sync_data().context("cannot sync run file")?;
+        if created {
+            // `sync_data` covers the bytes, not the new directory entry; without
+            // this a crash can lose the whole journal, including records already
+            // reported as written.
+            self.dir.sync_all().context("cannot sync run directory")?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn append_path(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
+        let path = self.file_path(name)?;
+        let (mut file, _created) = match std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("cannot open run file {}", path.display()))?,
+                false,
+            ),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot create run file {}", path.display()));
+            }
+        };
+        let metadata = file.metadata().context("cannot stat run file")?;
+        Self::check_appended_artifact(name, &metadata)?;
         Self::check_append_cap(bytes, metadata.len())?;
         use std::io::Write as _;
         file.write_all(bytes).context("cannot append to run file")?;
@@ -302,30 +392,36 @@ impl RunDir {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn truncate_unix(&self, name: &'static str, len: u64) -> Result<()> {
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+
+        let fd = rustix::fs::openat(
+            &*self.dir,
+            name,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .with_context(|| format!("cannot open run file {}", self.path.join(name).display()))?;
+        let file = std::fs::File::from(fd);
+        let metadata = file.metadata().context("cannot stat run file")?;
+        Self::check_appended_artifact(name, &metadata)?;
+        file.set_len(len).context("cannot truncate run file")?;
+        file.sync_data().context("cannot sync run file")?;
+        Ok(())
+    }
+
     #[cfg(not(unix))]
-    fn append_path(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
+    fn truncate_path(&self, name: &'static str, len: u64) -> Result<()> {
         let path = self.file_path(name)?;
-        let existing = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.is_file() {
-                    return Err(anyhow!("run artifact {name} is not a regular file"));
-                }
-                metadata.len()
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot stat run file {}", path.display()));
-            }
-        };
-        Self::check_append_cap(bytes, existing)?;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
+        let file = std::fs::OpenOptions::new()
+            .write(true)
             .open(&path)
             .with_context(|| format!("cannot open run file {}", path.display()))?;
-        use std::io::Write as _;
-        file.write_all(bytes).context("cannot append to run file")?;
+        let metadata = file.metadata().context("cannot stat run file")?;
+        Self::check_appended_artifact(name, &metadata)?;
+        file.set_len(len).context("cannot truncate run file")?;
         file.sync_data().context("cannot sync run file")?;
         Ok(())
     }
@@ -575,6 +671,21 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+/// How many directory entries name this inode. An in-place append follows every
+/// one of them; the atomic replace it replaced only ever touched its own entry.
+/// Windows exposes the count only through a nightly API, so the non-Unix path
+/// keeps the documented reparse-point gap instead of guessing.
+#[cfg(unix)]
+fn link_count(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +769,58 @@ mod tests {
         assert!(RunDir::check_append_cap(b"ok", MAX_FILE_BYTES as u64 - 2).is_ok());
         assert!(RunDir::check_append_cap(b"toolong", MAX_FILE_BYTES as u64 - 2).is_err());
         assert!(RunDir::check_append_cap(&vec![0; MAX_FILE_BYTES + 1], 0).is_err());
+    }
+
+    /// An in-place append writes through every name of the inode. A hard link
+    /// planted in the run directory must not turn a journal record into an
+    /// edit of some other file.
+    #[cfg(unix)]
+    #[test]
+    fn appends_refuse_a_hard_link_to_an_outside_file() {
+        let base =
+            std::env::temp_dir().join(crate::resource_id::fresh("kloop-run-hardlink-").unwrap());
+        let store = RunStore::new(&base.join("offload"), RunNamespace::Program).unwrap();
+        let run = store.create(&RunId::parse("run-linked").unwrap()).unwrap();
+        let outside = base.join("outside.jsonl");
+        std::fs::write(&outside, b"outside\n").unwrap();
+        std::fs::hard_link(&outside, run.path().join("journal.jsonl")).unwrap();
+        let error = match run.append("journal.jsonl", b"record\n") {
+            Ok(()) => panic!("append followed a hard link"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("another name"), "{error}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Opening a FIFO for writing blocks until a reader appears, before any type
+    /// check can run. The open is non-blocking, so this returns an error instead
+    /// of hanging the append (and the turn that awaited it).
+    #[cfg(unix)]
+    #[test]
+    fn appends_do_not_block_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let base = std::env::temp_dir().join(crate::resource_id::fresh("kloop-run-fifo-").unwrap());
+        let store = RunStore::new(&base.join("offload"), RunNamespace::Program).unwrap();
+        let run = store.create(&RunId::parse("run-fifo").unwrap()).unwrap();
+        let fifo = run.path().join("journal.jsonl");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string outlives the call, and mkfifo only creates the
+        // named pipe.
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(created, 0, "mkfifo: {}", std::io::Error::last_os_error());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let appending = run.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(appending.append("journal.jsonl", b"x\n"));
+        });
+        let outcome = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "append neither refused nor finished: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -4573,6 +4573,14 @@ and a later line for the same topology ID wins on reopen. Only successful
 one that cannot be written publishes a single Note and stops claiming resume
 coverage — `is_active()` reports what is actually on disk, so a run that
 journaled nothing no longer advertises a resume hint that would replay nothing.
+Writing in place changes what the file has to be: the open is non-blocking (a
+FIFO would otherwise hang it before any type check), the target must be a
+single-link regular file (a hard link would send the record into whatever else
+shares the inode, which the old atomic replace never did), and a freshly created
+file is followed by a directory sync so the entry itself survives a crash.
+Reopening cuts an unterminated tail left by a killed append — leaving it would
+merge the next record into that line — and decodes each line on its own, so one
+damaged line cannot hide the records before it.
 Replay is best-effort memoization of
 that model call — it does not make generated text deterministic, prove unchanged
 workspace state, or provide exactly-once semantics for external side effects.

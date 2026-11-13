@@ -361,14 +361,10 @@ fn reject_nondeterminism(root: tree_sitter::Node<'_>, source: &str) -> Result<()
 /// the old full-text comparison rebuilt a `String` for every node in the tree.
 fn is_nondeterministic(node: tree_sitter::Node<'_>, source: &str) -> Result<bool> {
     match node.kind() {
-        "import_statement" => Ok(true),
+        // Dynamic `import(...)` names the keyword itself, so the node is `import`
+        // — not an identifier, which is why matching the callee text missed it.
+        "import_statement" | "import" => Ok(true),
         "identifier" => Ok(node_text(node, source)? == "Date"),
-        "call_expression" => {
-            let Some(callee) = node.child_by_field_name("function") else {
-                return Ok(false);
-            };
-            Ok(callee.kind() == "identifier" && node_text(callee, source)? == "import")
-        }
         "member_expression" => {
             let (Some(object), Some(property)) = (
                 node.child_by_field_name("object"),

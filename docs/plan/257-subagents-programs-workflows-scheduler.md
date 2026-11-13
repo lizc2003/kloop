@@ -32,6 +32,18 @@
 - 验证：`cargo test -p kloop-codemode` 28 项、`cargo test -p kloop-core --lib` 1421 项通过
   (1 ignored，真实 seatbelt 用例在 kloop 沙箱内自动跳过)；`cargo clippy -p kloop-core
   -p kloop-codemode --all-targets -- -D warnings` 通过；未跑全量 `make check`。
+- 复审修正（同日）：
+  - 追加可能留下半行；恢复时先按最后一个换行物理截断，再逐行解码解析。否则下一条成功
+    记录会拼进坏行，坏尾截在 UTF-8 中间时整文件解码失败、此前的记录全部变 Miss。
+  - 原地追加会跟随硬链接写到外部文件(`NOFOLLOW` 挡不住硬链接)：写前要求普通文件且
+    nlink == 1。非 Unix 没有稳定的链接计数 API(Windows 只有 nightly)，保持原样的
+    reparse-point 缺口。
+  - 打开补 `O_NONBLOCK`：没有读端的 FIFO 会让 `openat(WRONLY)` 永久阻塞，且拦截不了。
+  - 首次创建 journal 后同步一次目录，`sync_data` 只覆盖字节、不保证目录项。
+  - 动态 `import(...)` 的 callee 节点类型是 `import` 而不是 `identifier`，改成按节点类型
+    拒绝(回归在旧检查下先红)。
+- 复审验证：`cargo test -p kloop-codemode` 28 项、`cargo test -p kloop-core --lib` 1424 项
+  通过(1 ignored)；`clippy --all-targets -D warnings` 通过；Windows 未编译。
 
 ## 问题
 

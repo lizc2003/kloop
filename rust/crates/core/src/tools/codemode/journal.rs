@@ -81,6 +81,23 @@ impl Storage {
             Self::Run(run_dir, name) => run_dir.append(name, line.as_bytes()),
         }
     }
+
+    /// The journal bytes as they are on disk, or `None` when there is no file.
+    fn read(&self) -> Option<Vec<u8>> {
+        match self {
+            #[cfg(test)]
+            Self::Path(path) => std::fs::read(path).ok(),
+            Self::Run(run_dir, name) => run_dir.read(name).ok(),
+        }
+    }
+
+    fn truncate(&self, len: u64) -> Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::Path(path) => truncate_path(path, len),
+            Self::Run(run_dir, name) => run_dir.truncate(name, len),
+        }
+    }
 }
 
 /// One run's agent journal. Every live call appends one JSONL line, so a
@@ -112,35 +129,37 @@ impl Journal {
 
     fn from_storage(storage: Storage) -> Self {
         let expected_parent_durable = storage.expected_parent_durable().map(str::to_string);
-        let raw = match &storage {
-            #[cfg(test)]
-            Storage::Path(path) => std::fs::read_to_string(path).ok(),
-            Storage::Run(run_dir, name) => run_dir
-                .read(name)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok()),
-        };
-        let old: HashMap<String, Entry> = raw
-            .map(|raw| {
-                raw.lines()
-                    .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
-                    .filter(|entry| entry.version == JOURNAL_VERSION)
-                    .map(|mut entry| {
-                        entry.provenance = entry.provenance.take().and_then(|value| {
-                            ExecutionProvenanceReceipt::from_persisted_value(&value)
-                                .ok()
-                                .filter(|receipt| {
-                                    receipt.is_agent_journal_evidence(
-                                        expected_parent_durable.as_deref(),
-                                    )
-                                })
-                                .map(|receipt| receipt.to_persisted_value())
-                        });
-                        (entry.call_id.clone(), entry)
-                    })
-                    .collect()
+        // A killed append can leave an unterminated tail: cut it before parsing.
+        // Parsing would only skip it, and the next append would then land on that
+        // same line and be lost with it. Lines are decoded one at a time, so a
+        // tail cut inside a multi-byte character cannot take the whole file with
+        // it.
+        let bytes = storage.read().unwrap_or_default();
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |last| last + 1);
+        if complete != bytes.len() {
+            let _ = storage.truncate(complete as u64);
+        }
+        let old: HashMap<String, Entry> = bytes[..complete]
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter_map(|line| serde_json::from_str::<Entry>(line).ok())
+            .filter(|entry| entry.version == JOURNAL_VERSION)
+            .map(|mut entry| {
+                entry.provenance = entry.provenance.take().and_then(|value| {
+                    ExecutionProvenanceReceipt::from_persisted_value(&value)
+                        .ok()
+                        .filter(|receipt| {
+                            receipt.is_agent_journal_evidence(expected_parent_durable.as_deref())
+                        })
+                        .map(|receipt| receipt.to_persisted_value())
+                });
+                (entry.call_id.clone(), entry)
             })
-            .unwrap_or_default();
+            .collect();
         let persisted = old.len();
         Self {
             old,
@@ -216,6 +235,14 @@ fn append_path(path: &PathBuf, bytes: &[u8]) -> Result<()> {
         .open(path)?;
     use std::io::Write as _;
     file.write_all(bytes)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn truncate_path(path: &PathBuf, len: u64) -> Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(len)?;
     file.sync_data()?;
     Ok(())
 }
@@ -578,6 +605,50 @@ mod tests {
         ));
         assert!(matches!(
             reopened.claim("root/agent/1", "second", &json!({})),
+            Claim::Hit(value) if value == "R1"
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A killed append leaves an unterminated tail. It has to be cut, not just
+    /// skipped: the next record would otherwise be appended to it and lost, and
+    /// decoding the file as one string would discard every record before it when
+    /// the cut landed inside a multi-byte character.
+    #[test]
+    fn an_unterminated_tail_is_cut_before_the_next_record() {
+        let path = tmp("partial-tail-v3");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let complete = json!({
+            "version": 3,
+            "call_id": "root/agent/0",
+            "input": {"prompt": "done", "opts": {}},
+            "result": "R0"
+        });
+        let mut bytes = format!("{}\n", serde_json::to_string(&complete).unwrap()).into_bytes();
+        bytes.extend_from_slice(br#"{"version":3,"call_id":"root/agent/1","input":{"prompt":"do"#);
+        bytes.extend_from_slice(&[0xe4, 0xb8]); // half a UTF-8 sequence
+        std::fs::write(&path, &bytes).unwrap();
+
+        let journal = Journal::open(path.clone());
+        assert!(journal.is_active());
+        assert!(matches!(
+            journal.claim("root/agent/0", "done", &json!({})),
+            Claim::Hit(value) if value == "R0"
+        ));
+        record(
+            &journal,
+            "root/agent/1".into(),
+            "redo".into(),
+            json!({}),
+            "R1".into(),
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2, "{raw}");
+
+        let reopened = Journal::open(path.clone());
+        assert!(matches!(
+            reopened.claim("root/agent/1", "redo", &json!({})),
             Claim::Hit(value) if value == "R1"
         ));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

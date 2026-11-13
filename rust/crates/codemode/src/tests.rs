@@ -630,6 +630,9 @@ fn workflow_meta_parser_accepts_pure_literal_and_rejects_code() {
         "export const meta = buildMeta(); return 1;",
         "export const meta = { name: 'x', description: Date.now() }; return 1;",
         "export const meta = { name: 'x', description: 'x' }; return Math.random();",
+        // Dynamic import names the keyword itself (`import` node), not an
+        // identifier, so it must be rejected before any agent work starts.
+        "export const meta = { name: 'x', description: 'x' }; await agent('run'); await import('fs');",
         "return 1;",
     ] {
         assert!(prepare_workflow(bad).is_err(), "accepted bad script: {bad}");
