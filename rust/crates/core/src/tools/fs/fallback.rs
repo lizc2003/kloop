@@ -40,7 +40,7 @@ pub(super) fn open_parent_directory(
     bail!("safe file mutation is unsupported on this platform")
 }
 
-pub(super) fn has_multiple_hard_links(_file: &std::fs::File) -> Result<bool> {
+pub(in crate::tools) fn has_multiple_hard_links(_file: &std::fs::File) -> Result<bool> {
     Ok(false)
 }
 

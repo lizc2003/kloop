@@ -28,6 +28,9 @@ mod platform;
 mod platform;
 
 use platform::*;
+// The run store appends in place, so it needs the same hard-link probe the file
+// tools use before writing through an already-open handle.
+pub(super) use platform::has_multiple_hard_links;
 
 use super::ToolCtx;
 use super::notebook;

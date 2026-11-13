@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -110,9 +110,19 @@ pub struct Journal {
     old: HashMap<String, Entry>,
     /// Reusable entries known to be on disk: what resumed runs can actually skip.
     persisted: AtomicUsize,
-    /// Set after the first failed append so the warning is published only once.
-    write_failed: AtomicBool,
+    /// Held across every append (they must not interleave), and carries the
+    /// reason persistence stopped when it did.
+    persistence: Mutex<Persistence>,
     storage: Storage,
+}
+
+/// Whether more records can be appended, and how the stop gets reported once.
+enum Persistence {
+    Open,
+    /// Blocked before any record; the next `record` publishes this reason.
+    Stopped(String),
+    /// Blocked and already reported.
+    Reported,
 }
 
 impl Journal {
@@ -139,9 +149,20 @@ impl Journal {
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |last| last + 1);
-        if complete != bytes.len() {
-            let _ = storage.truncate(complete as u64);
-        }
+        // A tail that cannot be cut must stop appends outright: appending after it
+        // would merge the next record into the damaged line while still reporting
+        // it as written.
+        let persistence = if complete == bytes.len() {
+            Persistence::Open
+        } else {
+            match storage.truncate(complete as u64) {
+                Ok(()) => Persistence::Open,
+                Err(error) => Persistence::Stopped(format!(
+                    "agent() journal has an unfinished last record that could not be cut \
+                     ({error:#}); new results cannot be appended because they would merge into it"
+                )),
+            }
+        };
         let old: HashMap<String, Entry> = bytes[..complete]
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -164,7 +185,7 @@ impl Journal {
         Self {
             old,
             persisted: AtomicUsize::new(persisted),
-            write_failed: AtomicBool::new(false),
+            persistence: Mutex::new(persistence),
             storage,
         }
     }
@@ -181,7 +202,9 @@ impl Journal {
 
     /// Record a successful live call with its admitted child receipt. A failed
     /// append returns a warning the first time: the live Program/Workflow keeps
-    /// running, but the calls from here on cannot be replayed on resume.
+    /// running, but the calls from here on cannot be replayed on resume. The
+    /// lock serializes appends, so two agents finishing at once cannot interleave
+    /// their lines.
     pub fn record(
         &self,
         call_id: String,
@@ -199,15 +222,23 @@ impl Journal {
                 .is_agent_journal_evidence(self.storage.expected_parent_durable())
                 .then(|| receipt.to_persisted_value()),
         };
+        let mut persistence = self.persistence.lock().unwrap();
+        match &*persistence {
+            Persistence::Stopped(reason) => {
+                let warning = reason.clone();
+                *persistence = Persistence::Reported;
+                return Some(warning);
+            }
+            Persistence::Reported => return None,
+            Persistence::Open => {}
+        }
         match self.storage.append(&entry) {
             Ok(()) => {
                 self.persisted.fetch_add(1, Ordering::Relaxed);
                 None
             }
             Err(error) => {
-                if self.write_failed.swap(true, Ordering::Relaxed) {
-                    return None;
-                }
+                *persistence = Persistence::Reported;
                 Some(format!(
                     "agent() journal stopped persisting ({error:#}); completed calls from here on \
                      cannot be replayed if this run has to be resumed"
@@ -651,6 +682,106 @@ mod tests {
             reopened.claim("root/agent/1", "redo", &json!({})),
             Claim::Hit(value) if value == "R1"
         ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// If an unterminated tail cannot be cut, appending would merge the next
+    /// record into it while still reporting it as written. Block appends and say
+    /// so once instead.
+    #[cfg(unix)]
+    #[test]
+    fn an_uncuttable_tail_blocks_appends_and_warns_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = tmp("uncuttable-tail-v3");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"version\":3,").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            // The mode does not stop this user (root or an override); there is no
+            // failure to assert.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            return;
+        }
+
+        let journal = Journal::open(path.clone());
+        assert!(!journal.is_active());
+        let receipt = ExecutionProvenanceReceipt::test_journal_agent("agent-1", "run-1-1");
+        let warning = journal
+            .record(
+                "root/agent/0".into(),
+                "do X".into(),
+                json!({}),
+                "R0".into(),
+                &receipt,
+            )
+            .expect("a blocked journal must report itself");
+        assert!(warning.contains("could not be cut"), "{warning}");
+        assert!(
+            journal
+                .record(
+                    "root/agent/1".into(),
+                    "do Y".into(),
+                    json!({}),
+                    "R1".into(),
+                    &receipt,
+                )
+                .is_none(),
+            "the warning is published once"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"version\":3,");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Concurrent completions append through one lock; interleaved writes would
+    /// merge two records into one unparseable line.
+    #[test]
+    fn concurrent_records_do_not_interleave() {
+        let path = tmp("concurrent-v3");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let journal = std::sync::Arc::new(Journal::open(path.clone()));
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let journal = journal.clone();
+                scope.spawn(move || {
+                    let receipt =
+                        ExecutionProvenanceReceipt::test_journal_agent("agent-1", "run-1-1");
+                    for index in 0..25 {
+                        let id = format!("root/agent/{worker}-{index}");
+                        assert!(
+                            journal
+                                .record(
+                                    id.clone(),
+                                    id,
+                                    json!({"pad": "x".repeat(2048)}),
+                                    "R".into(),
+                                    &receipt,
+                                )
+                                .is_none(),
+                            "append failed"
+                        );
+                    }
+                });
+            }
+        });
+
+        let reopened = Journal::open(path.clone());
+        for worker in 0..4 {
+            for index in 0..25 {
+                let id = format!("root/agent/{worker}-{index}");
+                assert!(
+                    matches!(
+                        reopened.claim(&id, &id, &json!({"pad": "x".repeat(2048)})),
+                        Claim::Hit(_)
+                    ),
+                    "{id}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

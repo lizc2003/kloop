@@ -4575,12 +4575,17 @@ coverage — `is_active()` reports what is actually on disk, so a run that
 journaled nothing no longer advertises a resume hint that would replay nothing.
 Writing in place changes what the file has to be: the open is non-blocking (a
 FIFO would otherwise hang it before any type check), the target must be a
-single-link regular file (a hard link would send the record into whatever else
-shares the inode, which the old atomic replace never did), and a freshly created
-file is followed by a directory sync so the entry itself survives a crash.
-Reopening cuts an unterminated tail left by a killed append — leaving it would
-merge the next record into that line — and decodes each line on its own, so one
-damaged line cannot hide the records before it.
+single-link regular file probed through the opened handle — the same check the
+file tools use, so Unix and Windows agree — because a hard link would send the
+record into whatever else shares the inode, and a freshly created file is
+followed by a directory sync so the entry itself survives a crash. An append that
+created the file and then failed removes it, so the next attempt is a create
+again rather than one that silently skips that sync. Reopening cuts an
+unterminated tail left by a killed append — leaving it would merge the next
+record into that line — and decodes each line on its own, so one damaged line
+cannot hide the records before it; when the tail cannot be cut, appends stop and
+report it once instead of writing past it. Appends from concurrent completions
+serialize on one lock, so two records cannot interleave into an unparseable line.
 Replay is best-effort memoization of
 that model call — it does not make generated text deterministic, prove unchanged
 workspace state, or provide exactly-once semantics for external side effects.

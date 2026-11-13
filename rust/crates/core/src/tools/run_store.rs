@@ -295,11 +295,12 @@ impl RunDir {
     /// file: a hard link would make the append modify whatever else shares the
     /// inode, and `O_NOFOLLOW` does not stand in the way of one. The atomic
     /// replace this replaced only ever touched its own directory entry.
-    fn check_appended_artifact(name: &'static str, metadata: &std::fs::Metadata) -> Result<()> {
+    fn check_appended_artifact(name: &'static str, file: &std::fs::File) -> Result<()> {
+        let metadata = file.metadata().context("cannot stat run file")?;
         if !metadata.is_file() {
             return Err(anyhow!("run artifact {name} is not a regular file"));
         }
-        if link_count(metadata) != 1 {
+        if super::fs::has_multiple_hard_links(file)? {
             return Err(anyhow!(
                 "run artifact {name} has another name outside its run directory"
             ));
@@ -347,25 +348,39 @@ impl RunDir {
     #[cfg(unix)]
     fn append_unix(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
         let (mut file, created) = self.open_for_append(name)?;
-        let metadata = file.metadata().context("cannot stat run file")?;
-        Self::check_appended_artifact(name, &metadata)?;
-        Self::check_append_cap(bytes, metadata.len())?;
-        use std::io::Write as _;
-        file.write_all(bytes).context("cannot append to run file")?;
-        file.sync_data().context("cannot sync run file")?;
-        if created {
-            // `sync_data` covers the bytes, not the new directory entry; without
-            // this a crash can lose the whole journal, including records already
-            // reported as written.
-            self.dir.sync_all().context("cannot sync run directory")?;
+        let result = (|| -> Result<()> {
+            Self::check_appended_artifact(name, &file)?;
+            let existing = file.metadata().context("cannot stat run file")?.len();
+            Self::check_append_cap(bytes, existing)?;
+            use std::io::Write as _;
+            file.write_all(bytes).context("cannot append to run file")?;
+            file.sync_data().context("cannot sync run file")?;
+            if created {
+                // `sync_data` covers the bytes, not the new directory entry;
+                // without this a crash can lose the whole journal, including
+                // records already reported as written.
+                self.dir.sync_all().context("cannot sync run directory")?;
+            }
+            Ok(())
+        })();
+        if result.is_err() && created {
+            // This call created the file, so dropping it loses no record and keeps
+            // the next append on the create path, where the directory entry is the
+            // thing being synced. Leaving it behind would make every later append
+            // skip that sync while still reporting success.
+            drop(file);
+            let _ = rustix::fs::unlinkat(&*self.dir, name, rustix::fs::AtFlags::empty());
         }
-        Ok(())
+        result
     }
 
     #[cfg(not(unix))]
     fn append_path(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
         let path = self.file_path(name)?;
+        // `read` is not needed to append; it grants FILE_READ_ATTRIBUTES on
+        // Windows, which the hard-link probe queries through the handle.
         let (mut file, _created) = match std::fs::OpenOptions::new()
+            .read(true)
             .append(true)
             .create_new(true)
             .open(&path)
@@ -373,6 +388,7 @@ impl RunDir {
             Ok(file) => (file, true),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
                 std::fs::OpenOptions::new()
+                    .read(true)
                     .append(true)
                     .open(&path)
                     .with_context(|| format!("cannot open run file {}", path.display()))?,
@@ -383,8 +399,8 @@ impl RunDir {
                     .with_context(|| format!("cannot create run file {}", path.display()));
             }
         };
+        Self::check_appended_artifact(name, &file)?;
         let metadata = file.metadata().context("cannot stat run file")?;
-        Self::check_appended_artifact(name, &metadata)?;
         Self::check_append_cap(bytes, metadata.len())?;
         use std::io::Write as _;
         file.write_all(bytes).context("cannot append to run file")?;
@@ -405,8 +421,7 @@ impl RunDir {
         )
         .with_context(|| format!("cannot open run file {}", self.path.join(name).display()))?;
         let file = std::fs::File::from(fd);
-        let metadata = file.metadata().context("cannot stat run file")?;
-        Self::check_appended_artifact(name, &metadata)?;
+        Self::check_appended_artifact(name, &file)?;
         file.set_len(len).context("cannot truncate run file")?;
         file.sync_data().context("cannot sync run file")?;
         Ok(())
@@ -416,11 +431,11 @@ impl RunDir {
     fn truncate_path(&self, name: &'static str, len: u64) -> Result<()> {
         let path = self.file_path(name)?;
         let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .open(&path)
             .with_context(|| format!("cannot open run file {}", path.display()))?;
-        let metadata = file.metadata().context("cannot stat run file")?;
-        Self::check_appended_artifact(name, &metadata)?;
+        Self::check_appended_artifact(name, &file)?;
         file.set_len(len).context("cannot truncate run file")?;
         file.sync_data().context("cannot sync run file")?;
         Ok(())
@@ -671,21 +686,6 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-/// How many directory entries name this inode. An in-place append follows every
-/// one of them; the atomic replace it replaced only ever touched its own entry.
-/// Windows exposes the count only through a nightly API, so the non-Unix path
-/// keeps the documented reparse-point gap instead of guessing.
-#[cfg(unix)]
-fn link_count(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    metadata.nlink()
-}
-
-#[cfg(not(unix))]
-fn link_count(_metadata: &std::fs::Metadata) -> u64 {
-    1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +769,27 @@ mod tests {
         assert!(RunDir::check_append_cap(b"ok", MAX_FILE_BYTES as u64 - 2).is_ok());
         assert!(RunDir::check_append_cap(b"toolong", MAX_FILE_BYTES as u64 - 2).is_err());
         assert!(RunDir::check_append_cap(&vec![0; MAX_FILE_BYTES + 1], 0).is_err());
+    }
+
+    /// A first append that creates the file and then fails removes it, so the
+    /// next append still takes the create path and syncs its directory entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_first_append_leaves_no_file_behind() {
+        let base = std::env::temp_dir()
+            .join(crate::resource_id::fresh("kloop-run-first-append-").unwrap());
+        let store = RunStore::new(&base.join("offload"), RunNamespace::Program).unwrap();
+        let run = store
+            .create(&RunId::parse("run-first-append").unwrap())
+            .unwrap();
+        assert!(
+            run.append("journal.jsonl", &vec![b'x'; MAX_FILE_BYTES + 1])
+                .is_err()
+        );
+        assert!(!run.path().join("journal.jsonl").exists());
+        run.append("journal.jsonl", b"record\n").unwrap();
+        assert_eq!(run.read("journal.jsonl").unwrap(), b"record\n");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// An in-place append writes through every name of the inode. A hard link

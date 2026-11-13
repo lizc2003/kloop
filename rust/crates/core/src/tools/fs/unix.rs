@@ -109,7 +109,7 @@ pub(super) fn open_parent_directory(
     Ok(std::fs::File::from(fd))
 }
 
-pub(super) fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
+pub(in crate::tools) fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
     Ok(file.metadata()?.nlink() > 1)

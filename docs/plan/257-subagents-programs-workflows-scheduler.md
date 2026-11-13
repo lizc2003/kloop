@@ -42,7 +42,16 @@
   - 首次创建 journal 后同步一次目录，`sync_data` 只覆盖字节、不保证目录项。
   - 动态 `import(...)` 的 callee 节点类型是 `import` 而不是 `identifier`，改成按节点类型
     拒绝(回归在旧检查下先红)。
-- 复审验证：`cargo test -p kloop-codemode` 28 项、`cargo test -p kloop-core --lib` 1424 项
+- 复审第二轮（同日）：
+  - 非 Unix 的链接计数不再恒为 1：改用 `tools::fs` 已有、按打开的句柄查询的
+    `has_multiple_hard_links`（Windows 用 `FileStandardInfo.NumberOfLinks`，非 nightly），
+    否则 Windows 上截尾会把外部硬链接文件截成 0 字节。
+  - 截尾失败不再被吞掉：journal 记成 Stopped，后续 `record` 拒绝追加并在第一次调用时
+    返回警告，不会把记录拼进坏行却算作已落盘。追加也改成持有同一把锁，两个并发的
+    `agent()` 完成不会把两条记录写进同一行。
+  - 首次追加创建文件后失败（超限或写入错误）会删掉该文件，下一次追加重新走创建路径并
+    同步新目录项，不再出现"文件留下、此后每次 created 都是 false、目录项从未同步"。
+- 复审验证：`cargo test -p kloop-codemode` 28 项、`cargo test -p kloop-core --lib` 1427 项
   通过(1 ignored)；`clippy --all-targets -D warnings` 通过；Windows 未编译。
 
 ## 问题

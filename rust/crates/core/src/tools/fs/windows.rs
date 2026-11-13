@@ -255,7 +255,7 @@ pub(super) fn remove_directory_by_identity(
     set_delete_disposition(&named)
 }
 
-pub(super) fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
+pub(in crate::tools) fn has_multiple_hard_links(file: &std::fs::File) -> Result<bool> {
     let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
     let success = unsafe {
         GetFileInformationByHandleEx(
