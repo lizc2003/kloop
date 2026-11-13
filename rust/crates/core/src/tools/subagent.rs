@@ -79,7 +79,20 @@ struct RunAgentInput {
 /// cc uses: a fixed bound, large enough that real work never reaches it, small
 /// enough to stop a runaway. Hitting it now returns what the child produced
 /// (plan 108), which is what makes a fixed bound safe to impose.
+///
+/// Every child gets it — `run_agent`, a structured workflow agent, and a
+/// `context: fork` skill. Only the structured agent takes an explicit value, and
+/// that may only tighten the cap (plan 257).
 const SUBAGENT_MAX_ROUNDS: usize = 200;
+
+/// A child's round bound: the fixed cap, tightened by an explicit caller value.
+fn child_round_cap(explicit: Option<u64>) -> usize {
+    explicit.map_or(SUBAGENT_MAX_ROUNDS, |rounds| {
+        usize::try_from(rounds)
+            .unwrap_or(usize::MAX)
+            .min(SUBAGENT_MAX_ROUNDS)
+    })
+}
 
 pub(super) async fn run_agent_tool(
     input: &Value,
@@ -235,16 +248,16 @@ pub(crate) async fn structured_agent_admitted(
     }
     crate::structured_output::validate_schema(&schema)?;
     let prompt = str_arg(input, "prompt", "workflow agent")?.to_string();
-    let max_rounds = match input.get("max_rounds") {
+    let explicit_rounds = match input.get("max_rounds") {
         None | Some(Value::Null) => None,
-        Some(value) => {
-            let rounds = value
+        Some(value) => Some(
+            value
                 .as_u64()
                 .filter(|rounds| *rounds > 0)
-                .ok_or_else(|| anyhow!("workflow agent: max_rounds must be a positive integer"))?;
-            Some(usize::try_from(rounds).unwrap_or(usize::MAX))
-        }
+                .ok_or_else(|| anyhow!("workflow agent: max_rounds must be a positive integer"))?,
+        ),
     };
+    let max_rounds = child_round_cap(explicit_rounds);
     let agent_type = match input.get("agent_type") {
         None | Some(Value::Null) => None,
         Some(Value::String(name)) if !name.trim().is_empty() => Some(
@@ -268,7 +281,7 @@ pub(crate) async fn structured_agent_admitted(
     };
     let agent = crate::resource_id::fresh("agent-")?;
     let workspace = ctx.cfg.effective_workspace();
-    let mut sub = build_sub_config(ctx, &workspace, max_rounds, agent.clone(), agent_type)?;
+    let mut sub = build_sub_config(ctx, &workspace, Some(max_rounds), agent.clone(), agent_type)?;
     if let Some(model) = model.as_ref() {
         sub.provider_route = sub
             .provider_route
@@ -708,7 +721,7 @@ pub(crate) async fn fork_skill(
         return Ok(body);
     }
     let agent = crate::resource_id::fresh("agent-")?;
-    let mut sub = clone_for_subagent(ctx, workspace, None, agent.clone());
+    let mut sub = clone_for_subagent(ctx, workspace, Some(SUBAGENT_MAX_ROUNDS), agent.clone());
     if let Some(model) = &skill.model {
         let model = InheritedProviderModelOverride::parse(model)
             .map_err(|error| anyhow!("skill fork: {error}"))?;
@@ -1293,6 +1306,18 @@ mod tests {
 
         assert!(is_error, "{out}");
         assert!(out.contains("max_rounds"), "{out}");
+    }
+
+    /// Every child kind shares the fixed cap; only the structured workflow agent
+    /// may name one, and only below it (plan 257).
+    #[test]
+    fn a_child_round_cap_can_only_tighten_the_fixed_bound() {
+        assert_eq!(SUBAGENT_MAX_ROUNDS, 200);
+        assert_eq!(child_round_cap(None), SUBAGENT_MAX_ROUNDS);
+        assert_eq!(child_round_cap(Some(5)), 5);
+        assert_eq!(child_round_cap(Some(200)), 200);
+        assert_eq!(child_round_cap(Some(201)), SUBAGENT_MAX_ROUNDS);
+        assert_eq!(child_round_cap(Some(u64::MAX)), SUBAGENT_MAX_ROUNDS);
     }
 
     /// The other half of the same claim: the cap is real, and hitting it hands

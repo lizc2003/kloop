@@ -36,6 +36,10 @@ const ONE_SHOT_JITTER_MAX_MS: i64 = 90 * 1_000;
 /// session actually holding durable jobs pays it; everyone else sleeps on
 /// `notify_change`.
 const STORE_POLL_MS: i64 = 15_000;
+/// Longest single sleep before the wall clock is consulted again. A monotonic
+/// timer does not advance while the machine is suspended, so one long sleep
+/// would return hours late after a system sleep (plan 257).
+const MAX_SLEEP_STEP_MS: i64 = 60_000;
 
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -51,8 +55,25 @@ impl Clock for SystemClock {
     }
 
     fn sleep_until(&self, deadline_ms: i64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        let delay = deadline_ms.saturating_sub(self.now_ms()).max(0) as u64;
-        Box::pin(tokio::time::sleep(Duration::from_millis(delay)))
+        Box::pin(sleep_until_wall_clock(
+            deadline_ms,
+            || Utc::now().timestamp_millis(),
+            MAX_SLEEP_STEP_MS,
+        ))
+    }
+}
+
+/// Sleeps until the wall clock reaches `deadline_ms`, in bounded steps so a clock
+/// jump (the machine woke from sleep) is noticed instead of waiting out a
+/// monotonic-only delay that no longer corresponds to wall time.
+async fn sleep_until_wall_clock(deadline_ms: i64, now_ms: impl Fn() -> i64 + Send, step_ms: i64) {
+    loop {
+        let now = now_ms();
+        if now >= deadline_ms {
+            return;
+        }
+        let step = (deadline_ms - now).min(step_ms).max(1);
+        tokio::time::sleep(Duration::from_millis(step as u64)).await;
     }
 }
 
@@ -995,6 +1016,27 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].recurring);
         scheduler.shutdown().await;
+    }
+
+    /// The machine slept: the monotonic timer advanced by one step while the wall
+    /// clock jumped past the deadline. The sleep must return on the wall clock
+    /// rather than wait out the remaining monotonic delay.
+    #[tokio::test]
+    async fn a_wall_clock_jump_ends_the_sleep_at_the_wall_deadline() {
+        let calls = AtomicUsize::new(0);
+        let start = utc_ms(2026, 8, 3, 12, 0);
+        let deadline = start + 3 * 60 * 60 * 1000;
+        let now = || match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => start,
+            _ => deadline,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sleep_until_wall_clock(deadline, now, 20),
+        )
+        .await
+        .expect("the sleep outlived a wall-clock jump");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// A check that answers `outcome` every time, counting its runs; with a

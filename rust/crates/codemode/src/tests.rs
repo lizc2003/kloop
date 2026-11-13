@@ -496,6 +496,90 @@ async fn program_is_sandboxed_from_host_capabilities() {
 }
 
 #[tokio::test]
+async fn cancellation_ends_a_program_parked_on_a_never_settling_promise() {
+    let cancel = CancellationToken::new();
+    let waiter = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel.cancel();
+        }
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_program(
+            "await new Promise(() => {}); return 'never';",
+            &tool_names(),
+            TestBridge::echo(),
+            cancel,
+            Limits::default(),
+        ),
+    )
+    .await;
+    waiter.await.unwrap();
+    let error = outcome
+        .expect("cancellation did not end a suspended program")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("interrupted"), "{error}");
+}
+
+/// Tool calls that return quickly used to look like one continuous synchronous
+/// burst (the interrupt handler only fires while JS executes, so its tick gaps
+/// stayed under the await threshold), and a program that spent most of its time
+/// waiting on fast hosts was killed for "CPU time".
+#[tokio::test]
+async fn many_quick_host_calls_are_not_one_cpu_burst() {
+    let source = "let total = 0;
+        for (let i = 0; i < 40; i++) {
+            let spin = 0;
+            for (let j = 0; j < 150000; j++) spin += j;
+            total += spin;
+            total += (await tools.read_file({ path: 'x' })).length;
+        }
+        return String(total);";
+    let out = run_program(
+        source,
+        &tool_names(),
+        TestBridge::echo(),
+        CancellationToken::new(),
+        Limits {
+            cpu_burst: Duration::from_millis(50),
+            ..Limits::default()
+        },
+    )
+    .await;
+    assert!(out.is_ok(), "{out:?}");
+}
+
+#[test]
+fn deeply_nested_scripts_are_rejected_instead_of_walked() {
+    let depth = MAX_SCRIPT_DEPTH + 8;
+    let script = format!(
+        "export const meta = {{ name: 'deep', description: 'deep' }}; return {}1{};",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    let error = prepare_workflow(&script).unwrap_err().to_string();
+    assert!(error.contains("nesting"), "{error}");
+
+    let literal_depth = MAX_META_DEPTH + 8;
+    let meta = format!(
+        "export const meta = {{ name: 'deep', description: 'deep', phases: {}{} }}; return 1;",
+        "[".repeat(literal_depth),
+        "]".repeat(literal_depth)
+    );
+    let error = prepare_workflow(&meta).unwrap_err().to_string();
+    assert!(error.contains("meta nesting"), "{error}");
+
+    // Ordinary nesting in the body still parses.
+    let prepared =
+        prepare_workflow("export const meta = { name: 'ok', description: 'ok' }; return (((1)));")
+            .unwrap();
+    assert!(prepared.body.contains("(((1)))"));
+}
+
+#[tokio::test]
 async fn module_import_is_rejected() {
     let err = run("import x from 'fs'; return x;", TestBridge::echo())
         .await

@@ -464,6 +464,10 @@ impl HostBridge for WorkflowBridge {
         let cancel = ctx.cancel.clone();
         let journal = self.journal.clone();
         Box::pin(async move {
+            // A stopped workflow must not start new children; see CoreBridge.
+            if cancel.is_cancelled() {
+                return Err("workflow interrupted".into());
+            }
             if let Claim::Hit(value) = claim {
                 return Ok(value);
             }
@@ -471,19 +475,32 @@ impl HostBridge for WorkflowBridge {
                 return Err(format!("workflow exceeds the agent cap of {max}"));
             }
             let _permit = tokio::select! {
-                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
-                    "workflow agent concurrency limiter closed unexpectedly".to_string()
-                })?,
+                biased;
                 _ = cancel.cancelled() => {
                     return Err("workflow interrupted while waiting for an agent slot".into());
                 }
+                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
+                    "workflow agent concurrency limiter closed unexpectedly".to_string()
+                })?,
             };
+            if cancel.is_cancelled() {
+                return Err("workflow interrupted".into());
+            }
             let schema = opts.get("schema").cloned();
+            // A plain workflow agent has the same fixed round cap as run_agent, so
+            // it does not take one; a structured agent does, and may only tighten it.
+            if schema.is_none() && opts.get("max_rounds").is_some() {
+                return Err(
+                    "workflow agent: max_rounds is only accepted together with a schema".into(),
+                );
+            }
             let mut input = json!({"prompt": prompt.clone()});
             copy_option(&opts, &mut input, "agent_type", "agent_type");
-            copy_option(&opts, &mut input, "max_rounds", "max_rounds");
             copy_option(&opts, &mut input, "isolation", "isolation");
             copy_option(&opts, &mut input, "model", "model");
+            if schema.is_some() {
+                copy_option(&opts, &mut input, "max_rounds", "max_rounds");
+            }
             let workspace = ctx.cfg.effective_workspace();
             let admitted = match schema {
                 Some(schema) => {
@@ -498,13 +515,15 @@ impl HostBridge for WorkflowBridge {
             };
             match admitted {
                 Ok(admitted) => {
-                    journal.record(
+                    if let Some(warning) = journal.record(
                         call_id,
                         prompt,
                         opts,
                         admitted.value.clone(),
                         &admitted.receipt,
-                    );
+                    ) {
+                        ctx.ui.emit(&Event::Note(warning));
+                    }
                     Ok(admitted.value)
                 }
                 Err(error) => Err(format!("{error:#}")),
@@ -592,6 +611,37 @@ mod tests {
             .lines()
             .find_map(|line| line.split_once(prefix).map(|(_, value)| value))
             .unwrap_or_else(|| panic!("missing {prefix:?} in launch result: {launched}"))
+    }
+
+    /// Without a schema there is no round limit to set: a plain workflow agent
+    /// has the same fixed cap as `run_agent` (plan 257).
+    #[tokio::test]
+    async fn a_plain_workflow_agent_rejects_a_round_limit() {
+        let ctx = enabled_ctx("workflow-round-limit");
+        let journal = Arc::new(Journal::open(std::env::temp_dir().join(format!(
+            "kloop-workflow-journal-{}-rounds.jsonl",
+            std::process::id()
+        ))));
+        let bridge = WorkflowBridge::new(
+            ctx,
+            kloop_codemode::Limits::default(),
+            journal,
+            "workflow-1".into(),
+            "wf_1".into(),
+            "round limit".into(),
+        );
+        let error = bridge
+            .call_agent(
+                "root/agent/0".into(),
+                "inspect".into(),
+                json!({"max_rounds": 5}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("only accepted together with a schema"),
+            "{error}"
+        );
     }
 
     #[test]

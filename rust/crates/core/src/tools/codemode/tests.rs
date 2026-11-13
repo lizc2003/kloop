@@ -749,6 +749,51 @@ async fn run_program_null_description_uses_source_preview() {
     assert_eq!(output, "null description accepted");
 }
 
+/// A background program can be suspended with no host future to interrupt —
+/// `await new Promise(() => {})` parks the interpreter with nothing to wake it.
+/// `stop_program` must still bring it to a terminal state, or the registry keeps
+/// counting it as running until the session shuts down.
+#[tokio::test]
+async fn a_background_program_parked_on_a_promise_stops_cleanly() {
+    let ctx = test_ctx(0, "bg-prog-suspended-stop");
+    let (out, _) = run_tool(
+        "run_program",
+        json!({ "source": "await new Promise(() => {}); return 'never';", "background": true }),
+        &ctx,
+    )
+    .await;
+    let id = out
+        .split_whitespace()
+        .find(|w| w.starts_with("program-"))
+        .unwrap()
+        .to_string();
+    for _ in 0..200 {
+        if ctx.cfg.background_executions.running_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(ctx.cfg.background_executions.running_count(), 1);
+
+    let (stop_out, is_error) = run_tool("stop_program", json!({ "program_id": id }), &ctx).await;
+    assert!(!is_error, "{stop_out}");
+    for _ in 0..300 {
+        if ctx.cfg.background_executions.running_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        ctx.cfg.background_executions.running_count(),
+        0,
+        "a suspended program never reached a terminal state"
+    );
+    assert!(
+        ctx.cfg.inbox.is_empty(),
+        "a stopped program reinjects nothing"
+    );
+}
+
 /// A background program cancelled via stop_program ends Aborted and reinjects
 /// NOTHING — only an activity wake is published.
 #[tokio::test]
@@ -1188,9 +1233,7 @@ fn run_program_def_renders_a_typescript_api() {
     assert!(d.contains(r#"output_mode?: "content" | "count""#), "{d}");
     assert!(d.contains("declare function agent("), "{d}");
     assert!(
-        d.contains(
-            "type AgentOptions = { agent_type?: string; max_rounds?: number; model?: string }"
-        ),
+        d.contains("type AgentOptions = { agent_type?: string; model?: string }"),
         "{d}"
     );
     assert!(d.contains("declare function parallel<T>"), "{d}");
@@ -1279,6 +1322,48 @@ async fn core_bridge_rejects_names_outside_the_program_catalog() {
         error,
         "program tool 'run_agent' is not in this run's callable catalog"
     );
+}
+
+/// A stopped program must not start a new child. The check has to be in the
+/// bridge, because `stop_program` only cancels the token: everything downstream
+/// (journal hits, the slot wait, the spawn) would otherwise go ahead.
+#[tokio::test]
+async fn a_stopped_program_cannot_start_a_subagent() {
+    let mut ctx = test_ctx(0, "bridge-cancelled");
+    ctx.cancel = CancellationToken::new();
+    ctx.cancel.cancel();
+    let bridge = CoreBridge::new(
+        ctx,
+        kloop_codemode::Limits::default(),
+        None,
+        Arc::new(capture_program_tool_manifest(
+            &[],
+            &crate::shell_programs::ShellPrograms::test_fixture(),
+        )),
+    );
+    let error = bridge
+        .call_agent("root/agent/0".into(), "escape".into(), json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "program interrupted");
+}
+
+#[tokio::test]
+async fn a_program_agent_call_takes_no_round_limit() {
+    // The generated TypeScript is the model's only description of agent(); it
+    // no longer declares max_rounds, and the bridge no longer forwards one, so a
+    // script that still passes it is not rejected.
+    let text = |t: &str| vec![kloop_protocol::AssistantBlock::Text { text: t.into() }];
+    let provider = kloop_provider::Provider::mock(vec![text("INSPECTED")]);
+    let ctx = with_provider(test_ctx(0, "program-agent-rounds"), provider);
+    let (out, is_error) = run_tool(
+        "run_program",
+        json!({"source": "return await agent('inspect', { max_rounds: 5 });"}),
+        &ctx,
+    )
+    .await;
+    assert!(!is_error, "{out}");
+    assert_eq!(out, "INSPECTED");
 }
 
 // ---- External source (MCP) tools exposed to programs (plan 27) ----

@@ -17,6 +17,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -191,8 +192,7 @@ pub fn prepare_workflow(source: &str) -> Result<PreparedWorkflow> {
         serde_json::from_value(value).map_err(|e| anyhow!("workflow: invalid meta object: {e}"))?;
     validate_meta(&meta)?;
 
-    let mut cursor = tree.root_node().walk();
-    reject_nondeterminism(tree.root_node(), source, &mut cursor)?;
+    reject_nondeterminism(tree.root_node(), source)?;
     let body = source[first.end_byte()..].to_string();
     Ok(PreparedWorkflow { meta, body })
 }
@@ -213,6 +213,15 @@ fn node_text<'a>(node: tree_sitter::Node<'_>, source: &'a str) -> Result<&'a str
 }
 
 fn literal_value(node: tree_sitter::Node<'_>, source: &str) -> Result<Value> {
+    literal_value_at(node, source, 0)
+}
+
+fn literal_value_at(node: tree_sitter::Node<'_>, source: &str, depth: usize) -> Result<Value> {
+    if depth > MAX_META_DEPTH {
+        return Err(anyhow!(
+            "workflow: meta nesting exceeds the {MAX_META_DEPTH}-level limit"
+        ));
+    }
     match node.kind() {
         "object" => {
             let mut object = serde_json::Map::new();
@@ -235,14 +244,14 @@ fn literal_value(node: tree_sitter::Node<'_>, source: &str) -> Result<Value> {
                 let value = pair
                     .child_by_field_name("value")
                     .ok_or_else(|| anyhow!("workflow: meta property `{key}` has no value"))?;
-                object.insert(key, literal_value(value, source)?);
+                object.insert(key, literal_value_at(value, source, depth + 1)?);
             }
             Ok(Value::Object(object))
         }
         "array" => {
             let mut cursor = node.walk();
             node.named_children(&mut cursor)
-                .map(|child| literal_value(child, source))
+                .map(|child| literal_value_at(child, source, depth + 1))
                 .collect::<Result<Vec<_>>>()
                 .map(Value::Array)
         }
@@ -317,32 +326,63 @@ fn validate_meta(meta: &WorkflowMeta) -> Result<()> {
     Ok(())
 }
 
-fn reject_nondeterminism(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-) -> Result<()> {
-    let text = node_text(node, source)?;
-    if node.kind() == "import_statement"
-        || (node.kind() == "call_expression" && text.trim_start().starts_with("import("))
-        || (node.kind() == "identifier" && text == "Date")
-        || (node.kind() == "member_expression"
-            && text.split_whitespace().collect::<String>() == "Math.random")
-    {
-        return Err(anyhow!(
-            "workflow: imports, Date, and randomness are unavailable for deterministic resume"
-        ));
-    }
-    if cursor.goto_first_child() {
-        loop {
-            reject_nondeterminism(cursor.node(), source, cursor)?;
-            if !cursor.goto_next_sibling() {
-                break;
-            }
+/// Deeply nested source is refused instead of walked. A parse tree inside the
+/// source limit can be tens of thousands of nodes deep, which is more stack than
+/// the worker has: the check used to recurse per node (plan 257).
+const MAX_SCRIPT_DEPTH: usize = 1024;
+/// Nesting allowed inside the pure `meta` literal. Real metadata is a handful of
+/// levels; only generated pathological input goes deep.
+const MAX_META_DEPTH: usize = 64;
+
+fn reject_nondeterminism(root: tree_sitter::Node<'_>, source: &str) -> Result<()> {
+    let mut pending = vec![(root, 0usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_SCRIPT_DEPTH {
+            return Err(anyhow!(
+                "workflow: script nesting exceeds the {MAX_SCRIPT_DEPTH}-level limit"
+            ));
         }
-        cursor.goto_parent();
+        if is_nondeterministic(node, source)? {
+            return Err(anyhow!(
+                "workflow: imports, Date, and randomness are unavailable for deterministic resume"
+            ));
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, depth + 1)),
+        );
     }
     Ok(())
+}
+
+/// Only the node kinds that can name a forbidden construct are inspected, and
+/// each is compared field by field rather than by collapsing its whole text —
+/// the old full-text comparison rebuilt a `String` for every node in the tree.
+fn is_nondeterministic(node: tree_sitter::Node<'_>, source: &str) -> Result<bool> {
+    match node.kind() {
+        "import_statement" => Ok(true),
+        "identifier" => Ok(node_text(node, source)? == "Date"),
+        "call_expression" => {
+            let Some(callee) = node.child_by_field_name("function") else {
+                return Ok(false);
+            };
+            Ok(callee.kind() == "identifier" && node_text(callee, source)? == "import")
+        }
+        "member_expression" => {
+            let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("property"),
+            ) else {
+                return Ok(false);
+            };
+            Ok(object.kind() == "identifier"
+                && property.kind() == "property_identifier"
+                && node_text(object, source)? == "Math"
+                && node_text(property, source)? == "random")
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Run one program to completion. Returns the program's return value coerced to
@@ -419,52 +459,65 @@ async fn run_js(
     rt.set_memory_limit(limits.memory_bytes).await;
     rt.set_max_stack_size(limits.max_stack_bytes).await;
     let stop_reason = Arc::new(AtomicU8::new(STOP_NONE));
-    install_interrupt_handler(&rt, cancel.clone(), stop_reason.clone(), limits.cpu_burst).await;
+    let host_activity = Arc::new(AtomicBool::new(false));
+    install_interrupt_handler(
+        &rt,
+        cancel.clone(),
+        stop_reason.clone(),
+        host_activity.clone(),
+        limits.cpu_burst,
+    )
+    .await;
     let ctx = AsyncContext::full(&rt)
         .await
         .map_err(|e| anyhow!("codemode: context init failed: {e}"))?;
 
-    #[allow(clippy::let_and_return)]
-    {
-        let result = ctx
-            .async_with(async |ctx| {
-                install_host_functions(&ctx, bridge, tools_enabled, phase_enabled)?;
-                ctx.eval::<(), _>(prelude.as_bytes())
+    // A program parked on a promise that never settles (or on a host future that
+    // ignores cancellation) is not executing JS, so the interrupt handler never
+    // fires for it. Racing the cancellation token here is what actually ends it.
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow!("program interrupted")),
+        result = ctx.async_with(async |ctx| {
+            install_host_functions(&ctx, bridge, tools_enabled, phase_enabled, host_activity)?;
+            ctx.eval::<(), _>(prelude.as_bytes())
+                .catch(&ctx)
+                .map_err(|e| anyhow!("codemode: prelude failed: {e}"))?;
+            let outcome: std::result::Result<String, String> = async {
+                let promise: rquickjs::Promise = ctx
+                    .eval(wrapped.as_bytes())
                     .catch(&ctx)
-                    .map_err(|e| anyhow!("codemode: prelude failed: {e}"))?;
-                let outcome: std::result::Result<String, String> = async {
-                    let promise: rquickjs::Promise = ctx
-                        .eval(wrapped.as_bytes())
-                        .catch(&ctx)
-                        .map_err(|e| e.to_string())?;
-                    promise
-                        .into_future::<String>()
-                        .await
-                        .catch(&ctx)
-                        .map_err(|e| e.to_string())
-                }
-                .await;
-                outcome.map_err(|raw| match stop_reason.load(Ordering::Relaxed) {
-                    STOP_CANCEL => anyhow!("program interrupted"),
-                    STOP_CPU => anyhow!("program killed: exceeded CPU time limit"),
-                    _ => anyhow!("{raw}"),
-                })
-            })
+                    .map_err(|e| e.to_string())?;
+                promise
+                    .into_future::<String>()
+                    .await
+                    .catch(&ctx)
+                    .map_err(|e| e.to_string())
+            }
             .await;
-        result
-    }
+            outcome.map_err(|raw| match stop_reason.load(Ordering::Relaxed) {
+                STOP_CANCEL => anyhow!("program interrupted"),
+                STOP_CPU => anyhow!("program killed: exceeded CPU time limit"),
+                _ => anyhow!("{raw}"),
+            })
+        }) => result,
+    };
+    result
 }
 
 async fn install_interrupt_handler(
     rt: &AsyncRuntime,
     cancel: CancellationToken,
     stop_reason: Arc<AtomicU8>,
+    host_activity: Arc<AtomicBool>,
     cpu_burst: Duration,
 ) {
     // The handler fires periodically *while JS executes*, not while it is
-    // suspended awaiting a host future. So a gap between ticks means an await
-    // happened → the current synchronous burst restarts; a burst that runs
-    // longer than `cpu_burst` without such a gap is a runaway loop.
+    // suspended awaiting a host future. A returning host call is the explicit
+    // signal that the synchronous burst ended; the tick-gap check stays as a
+    // fallback for a suspension it cannot see. Without the explicit signal, a
+    // program that makes many quick tool calls (each shorter than the gap) looks
+    // like one long synchronous burst and is killed for spending no CPU at all.
     const AWAIT_GAP: Duration = Duration::from_millis(50);
     let mut burst_start: Option<Instant> = None;
     let mut last_tick: Option<Instant> = None;
@@ -474,9 +527,13 @@ async fn install_interrupt_handler(
             return true;
         }
         let now = Instant::now();
-        match last_tick {
-            Some(t) if now.duration_since(t) < AWAIT_GAP => {}
-            _ => burst_start = Some(now),
+        if host_activity.swap(false, Ordering::Relaxed) {
+            burst_start = Some(now);
+        } else {
+            match last_tick {
+                Some(t) if now.duration_since(t) < AWAIT_GAP => {}
+                _ => burst_start = Some(now),
+            }
         }
         last_tick = Some(now);
         if burst_start.is_some_and(|s| now.duration_since(s) > cpu_burst) {
@@ -493,18 +550,23 @@ fn install_host_functions(
     bridge: Arc<dyn HostBridge>,
     tools_enabled: bool,
     phase_enabled: bool,
+    host_activity: Arc<AtomicBool>,
 ) -> Result<()> {
     let globals = ctx.globals();
 
     if tools_enabled {
         let tool_bridge = bridge.clone();
+        let tool_activity = host_activity.clone();
         let call_tool = Function::new(
             ctx.clone(),
             Async(move |name: String, args_json: String| {
                 let bridge = tool_bridge.clone();
+                let activity = tool_activity.clone();
                 async move {
                     let args: Value = serde_json::from_str(&args_json).unwrap_or(Value::Null);
-                    envelope(bridge.call_tool(name, args).await)
+                    let result = bridge.call_tool(name, args).await;
+                    activity.store(true, Ordering::Relaxed);
+                    envelope(result)
                 }
             }),
         )
@@ -515,13 +577,17 @@ fn install_host_functions(
     }
 
     let agent_bridge = bridge.clone();
+    let agent_activity = host_activity;
     let agent = Function::new(
         ctx.clone(),
         Async(move |call_id: String, prompt: String, opts_json: String| {
             let bridge = agent_bridge.clone();
+            let activity = agent_activity.clone();
             async move {
                 let opts: Value = serde_json::from_str(&opts_json).unwrap_or(Value::Null);
-                envelope(bridge.call_agent(call_id, prompt, opts).await)
+                let result = bridge.call_agent(call_id, prompt, opts).await;
+                activity.store(true, Ordering::Relaxed);
+                envelope(result)
             }
         }),
     )

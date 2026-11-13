@@ -257,6 +257,79 @@ impl RunDir {
         Ok(self.path.join(name))
     }
 
+    /// Append one journal record. The file is capped like any other run artifact,
+    /// and synced so a crash keeps every completed call up to this point
+    /// resumable — there is no full rewrite, so the cost stays linear in what the
+    /// run records.
+    pub(super) fn append(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
+        validate_file_name(name)?;
+        self.verify()?;
+        #[cfg(unix)]
+        self.append_unix(name, bytes)?;
+        #[cfg(not(unix))]
+        self.append_path(name, bytes)?;
+        Ok(())
+    }
+
+    fn check_append_cap(bytes: &[u8], existing: u64) -> Result<()> {
+        if bytes.len() > MAX_FILE_BYTES || existing > (MAX_FILE_BYTES - bytes.len()) as u64 {
+            return Err(anyhow!("run file exceeds the {MAX_FILE_BYTES}-byte limit"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn append_unix(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+
+        let fd = rustix::fs::openat(
+            &*self.dir,
+            name,
+            OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .with_context(|| format!("cannot open run file {}", self.path.join(name).display()))?;
+        let mut file = std::fs::File::from(fd);
+        let metadata = file.metadata().context("cannot stat run file")?;
+        if !metadata.is_file() {
+            return Err(anyhow!("run artifact {name} is not a regular file"));
+        }
+        Self::check_append_cap(bytes, metadata.len())?;
+        use std::io::Write as _;
+        file.write_all(bytes).context("cannot append to run file")?;
+        file.sync_data().context("cannot sync run file")?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn append_path(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
+        let path = self.file_path(name)?;
+        let existing = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(anyhow!("run artifact {name} is not a regular file"));
+                }
+                metadata.len()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot stat run file {}", path.display()));
+            }
+        };
+        Self::check_append_cap(bytes, existing)?;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("cannot open run file {}", path.display()))?;
+        use std::io::Write as _;
+        file.write_all(bytes).context("cannot append to run file")?;
+        file.sync_data().context("cannot sync run file")?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn write_atomic_unix(&self, name: &'static str, bytes: &[u8]) -> Result<()> {
         use rustix::fs::AtFlags;
@@ -568,10 +641,22 @@ mod tests {
             let artifact = run.path().join("journal.jsonl");
             std::os::unix::fs::symlink(&outside, &artifact).unwrap();
             assert!(run.read("journal.jsonl").is_err());
+            assert!(run.append("journal.jsonl", b"appended").is_err());
             run.write_atomic("journal.jsonl", b"safe").unwrap();
             assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
             assert_eq!(run.read("journal.jsonl").unwrap(), b"safe");
+            run.append("journal.jsonl", b"-more").unwrap();
+            assert_eq!(run.read("journal.jsonl").unwrap(), b"safe-more");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The cap applies to appends too, so a journal that fills up stops growing
+    /// instead of failing a rewrite it never did.
+    #[test]
+    fn appends_are_bounded_by_the_run_file_cap() {
+        assert!(RunDir::check_append_cap(b"ok", MAX_FILE_BYTES as u64 - 2).is_ok());
+        assert!(RunDir::check_append_cap(b"toolong", MAX_FILE_BYTES as u64 - 2).is_err());
+        assert!(RunDir::check_append_cap(&vec![0; MAX_FILE_BYTES + 1], 0).is_err());
     }
 }

@@ -678,6 +678,11 @@ impl HostBridge for CoreBridge {
         let agent_slots = self.agent_slots.clone();
         let cancel = ctx.cancel.clone();
         Box::pin(async move {
+            // A stopped program must not start new children: the journal hit path
+            // and the slot wait below would otherwise both let one through.
+            if cancel.is_cancelled() {
+                return Err("program interrupted".into());
+            }
             if let Some(Claim::Hit(cached)) = claim {
                 return Ok(cached);
             }
@@ -688,15 +693,19 @@ impl HostBridge for CoreBridge {
                 ));
             }
             let _permit = tokio::select! {
-                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
-                    "program agent concurrency limiter closed unexpectedly".to_string()
-                })?,
+                biased;
                 _ = cancel.cancelled() => {
                     return Err("program interrupted while waiting for an agent slot".into());
                 }
+                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
+                    "program agent concurrency limiter closed unexpectedly".to_string()
+                })?,
             };
+            if cancel.is_cancelled() {
+                return Err("program interrupted".into());
+            }
             let mut agent_input = json!({ "prompt": prompt.clone() });
-            for k in ["agent_type", "max_rounds", "model"] {
+            for k in ["agent_type", "model"] {
                 if let Some(v) = opts.get(k) {
                     agent_input[k] = v.clone();
                 }
@@ -705,8 +714,11 @@ impl HostBridge for CoreBridge {
             match super::subagent::run_agent_admitted(&agent_input, &ctx, &workspace).await {
                 Ok(admitted) => {
                     let output = Value::String(admitted.value);
-                    if let Some(journal) = &journal {
-                        journal.record(call_id, prompt, opts, output.clone(), &admitted.receipt);
+                    if let Some(journal) = &journal
+                        && let Some(warning) =
+                            journal.record(call_id, prompt, opts, output.clone(), &admitted.receipt)
+                    {
+                        ctx.ui.emit(&crate::event::Event::Note(warning));
                     }
                     Ok(output)
                 }
@@ -783,7 +795,7 @@ pub(super) fn run_program_def(
     }
     decls.push_str("};\n");
     decls.push_str(
-        "type AgentOptions = { agent_type?: string; max_rounds?: number; model?: string };\n\
+        "type AgentOptions = { agent_type?: string; model?: string };\n\
          type OrchestrationScope = {\n\
            agent(prompt: string, opts?: AgentOptions): Promise<string>;\n\
            parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;\n\

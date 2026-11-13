@@ -3378,6 +3378,11 @@ step is only taken as far as the UTC offset is known to be constant and halves
 toward the transition otherwise, which keeps a DST gap firing once and a DST fold
 firing twice.
 
+The dom/dow rule is Vixie's, keyed on the **field text**: either field beginning
+with `*` makes the pair an AND, otherwise it is an OR. Coverage is not the
+signal — `1-31` lists every day but is a restricted field, so `0 0 1-31 * 1`
+fires daily rather than only on Mondays, while `*/2` on dom keeps the AND side.
+
 The worker polls the durable store only while this session actually holds a
 durable job; a session with none sleeps on in-process change notifications and
 never touches the disk. When it does poll, the interval is fifteen seconds, which
@@ -3385,6 +3390,14 @@ bounds only how soon a job written by a second runtime of the same session is
 noticed — single delivery is the store lock's job, not the interval's — and stays
 well under the one minute past which a claim would count as missed and need the
 user's confirmation.
+
+The wall clock decides when a job is due, but a sleep runs on the monotonic
+timer, which does not advance while the machine is suspended: one
+`sleep_until(deadline)` would wake hours late after a laptop sleep and fire the
+job it was waiting for at the wrong time. `SystemClock` sleeps in bounded steps
+and re-reads the wall clock after each one, so a clock jump ends the wait at the
+first step instead of waiting out a delay that no longer corresponds to wall
+time. `ManualClock` already re-checks on every wake.
 
 Due work enters the typed Inbox rather than mutating an in-flight provider request. The
 TUI sends one idle `Wake`; the plain frontend selects between stdin and Inbox activity; and
@@ -3525,12 +3538,16 @@ modifies the child prompt; omission falls back to the first-line prompt preview.
 Invalid metadata fails before label allocation, worktree creation, registration,
 or spawn. A configured `agent_type` remains a display decoration rather than an
 instance identity.
-**Sampling rounds are unbounded by default**, matching codex's child-thread
-turn loop; `max_rounds` is an optional per-call guardrail for callers that
-explicitly need one. The recursion-depth and background-concurrency limits stay
-separate. An `Item::ToolCall` names the `agent` that made the call ("" = main
-agent), and an `Item::SubAgent` (started → completed) brackets the sub-agent's
-life.
+**Sampling rounds are capped at a fixed 200 for every child** — `run_agent`, a
+structured Workflow `agent()` (which may name a smaller cap alongside its
+`schema`, never a larger one), and a `context: fork` skill. The number is not a
+knob the model gets: asked to pick one it guessed 12 and 10 for an 11-file
+review and ran out, while no cap at all once let a child run 158 rounds and
+turned 70 provider requests into 342. Hitting the cap returns what the child
+produced (plan 108), which is what makes a fixed bound safe. The recursion-depth
+and background-concurrency limits stay separate. An `Item::ToolCall` names the
+`agent` that made the call ("" = main agent), and an `Item::SubAgent` (started →
+completed) brackets the sub-agent's life.
 Presentation per frontend:
 
 - **TUI**: one live row per sub-agent (`… agent-1 <task> — 3 tools · bash
@@ -3570,7 +3587,7 @@ further sub-agents, and they share the parent's permission gate — the human's
 last word doesn't loosen inside a sub-agent. `--mock` reads no config, so it
 sees no types.
 
-Sub-agent transcripts are persisted in their own `{parent}-agent-*.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `run_agent {"background": true}` plus `wait_for_activity`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; `max_rounds` remains a per-call native guardrail.
+Sub-agent transcripts are persisted in their own `{parent}-agent-*.jsonl` files with a `subagent_of` back-pointer, synchronous and background dispatch share that audit path, and sub-agent hooks/tool events carry the agent label. `run_agent {"background": true}` plus `wait_for_activity`/`stop_agent` and the completion inbox are described below. Still deliberate: per-type effort/max-turn policy is not exposed; the fixed child cap is the only bound.
 
 ### Worktree isolation
 
@@ -4412,7 +4429,7 @@ The program calls:
 
 ```ts
 declare const tools: { read_file(args: { path: string; … }): Promise<string>; … };
-type AgentOptions = { agent_type?: string; max_rounds?: number };
+type AgentOptions = { agent_type?: string; model?: string };
 type OrchestrationScope = {
   agent(prompt: string, opts?: AgentOptions): Promise<string>;
   parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;
@@ -4432,7 +4449,9 @@ fourth argument of a pipeline stage. Nested fan-out uses `scope.parallel` /
 `scope.pipeline`. Calling global `agent`/`parallel`/`pipeline` from such a
 callback fails closed because it has no topology-stable resume identity. Global
 `agent()` remains available before/after helpers and for top-level
-`Promise.all` calls whose invocation order is explicit.
+`Promise.all` calls whose invocation order is explicit. `AgentOptions` carries
+`agent_type` and `model` only: a program cannot set a child's round cap, which is
+the same fixed bound every other child gets.
 
 The `tools` API and its TypeScript declarations are generated from the tool
 schemas and carried in `run_program`'s description (typed declarations markedly
@@ -4483,7 +4502,15 @@ nothing, and every op the program makes re-enters the whole gate.
 **Resource limits** (`Limits`, per Program/Workflow run) are two layers. Engine
 limits guard the interpreter: a QuickJS heap cap, a stack cap, and an interrupt
 handler that kills a runaway synchronous loop (a CPU-burst deadline that ignores
-await-suspended time) or a user Ctrl+C. Orchestration limits are:
+await-suspended time) or a user Ctrl+C. The handler only fires *while JS
+executes*, so a returning host call is what marks the end of a synchronous
+burst; the tick-gap heuristic alone treated a program making many quick tool
+calls as one endless burst and killed it for waiting, not computing. A program
+suspended on a promise that never settles has no tick and no host future at all,
+so the engine races the cancellation token against the whole execution — that
+race, not the handler, is what lets `stop_program` end it. Both agent bridges
+also check the token at entry and prefer it in their slot `select!`, so a stopped
+Program or Workflow cannot start one more child. Orchestration limits are:
 
 - `max_agents` — hard cap on total live-miss `agent()` calls (default 1000); the
   next call throws instead of allowing an unbounded loop.
@@ -4538,8 +4565,15 @@ requires both identity and complete input, so opposite future completion orders
 and repeated prompts cannot cross-wire results. Journal v1/v2 and future-version
 entries are safe cache misses; there is no migration or dual-write path. A
 missing or invalid receipt on an otherwise valid v3 result remains unavailable
-audit evidence rather than becoming a cache key or execution checkpoint. Only
-successful `agent()` calls are journaled. Replay is best-effort memoization of
+audit evidence rather than becoming a cache key or execution checkpoint. Each
+record is appended as one JSONL line and fsynced, so the file grows linearly
+with completed calls instead of being rewritten (and fsynced twice) every time,
+and a later line for the same topology ID wins on reopen. Only successful
+`agent()` calls are journaled. Appends share the run-file byte cap: the first
+one that cannot be written publishes a single Note and stops claiming resume
+coverage — `is_active()` reports what is actually on disk, so a run that
+journaled nothing no longer advertises a resume hint that would replay nothing.
+Replay is best-effort memoization of
 that model call — it does not make generated text deterministic, prove unchanged
 workspace state, or provide exactly-once semantics for external side effects.
 
@@ -4597,6 +4631,16 @@ per-item/no-stage-barrier. `phase()` updates display-only background detail and
 `log()` emits live notes; neither is a checkpoint, transaction, idempotency, or
 exactly-once boundary, and neither changes the return value.
 
+The meta literal and the body are checked on the parse tree, not by recursion:
+the tree is walked iteratively with a nesting limit (1024 levels for the script,
+64 for the meta literal), because a deeply nested source inside the size limit is
+too deep for the worker's stack. Only the node kinds that can name a forbidden
+construct are inspected, and `Math.random` is recognised by its object and
+property fields rather than by collapsing each node's whole text. `max_rounds`
+belongs to a structured `agent()` only (see the `schema` paragraph below); a
+plain Workflow agent carries the same fixed 200-round cap as `run_agent` and
+rejects the option instead of silently ignoring it.
+
 Each run is stored under `.kloop/workflow-runs/<run-id>/`; a versioned
 manifest governs its managed script, args, journal, terminal result/error, and
 private bounded `provenance.json` attempt history. Every launch/resume receives a
@@ -4625,7 +4669,9 @@ and observable through global `wait_for_activity`; cancellation uses
 Passing `schema` in a Workflow `agent()` call activates the internal
 **`structured_output`** protocol for that child. The requested JSON Schema is
 installed as a one-turn synthetic tool definition, then the host validates the
-returned object/array/scalar again. Invalid values receive a paired error result
+returned object/array/scalar again. This is the only `agent()` form that accepts
+`max_rounds`, and the value may only tighten the fixed 200-round cap. Invalid
+values receive a paired error result
 and bounded retry; a missing call receives a nudge; exhaustion rejects the
 Workflow promise rather than falling back to unvalidated text. A valid value
 ends the child turn and reaches JavaScript as its native JSON type. A value

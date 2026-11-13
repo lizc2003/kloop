@@ -9,21 +9,19 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::path::PathBuf;
-use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
-#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::anyhow;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
 use super::super::run_store::RunDir;
 use crate::execution_provenance::ExecutionProvenanceReceipt;
-
-#[cfg(test)]
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const JOURNAL_VERSION: u8 = 3;
 
@@ -73,16 +71,30 @@ impl Storage {
             Self::Run(run_dir, _) => Some(run_dir.id().as_str()),
         }
     }
+
+    fn append(&self, entry: &Entry) -> Result<()> {
+        let mut line = serde_json::to_string(entry)?;
+        line.push('\n');
+        match self {
+            #[cfg(test)]
+            Self::Path(path) => append_path(path, line.as_bytes()),
+            Self::Run(run_dir, name) => run_dir.append(name, line.as_bytes()),
+        }
+    }
 }
 
-/// One run's agent journal, persisted whenever a live call completes.
+/// One run's agent journal. Every live call appends one JSONL line, so a
+/// mid-run failure leaves a resumable journal and the cost is linear: rewriting
+/// every entry and fsyncing twice per completed call was quadratic, and an
+/// over-limit rewrite used to fail silently (plan 257).
 pub struct Journal {
-    /// Only current-version entries are eligible for replay. Versions 1 and 2,
-    /// and unknown future versions, are deliberately cache misses.
+    /// Entries loaded at open. Only current-version entries are eligible for
+    /// replay; versions 1 and 2, and unknown future versions, are cache misses.
     old: HashMap<String, Entry>,
-    /// Hits carried over plus fresh records, persisted on every change so a
-    /// mid-run failure leaves a resumable journal.
-    written: Mutex<HashMap<String, Entry>>,
+    /// Reusable entries known to be on disk: what resumed runs can actually skip.
+    persisted: AtomicUsize,
+    /// Set after the first failed append so the warning is published only once.
+    write_failed: AtomicBool,
     storage: Storage,
 }
 
@@ -129,9 +141,11 @@ impl Journal {
                     .collect()
             })
             .unwrap_or_default();
+        let persisted = old.len();
         Self {
-            written: Mutex::new(old.clone()),
             old,
+            persisted: AtomicUsize::new(persisted),
+            write_failed: AtomicBool::new(false),
             storage,
         }
     }
@@ -146,7 +160,9 @@ impl Journal {
         }
     }
 
-    /// Record a successful live call with its admitted child receipt.
+    /// Record a successful live call with its admitted child receipt. A failed
+    /// append returns a warning the first time: the live Program/Workflow keeps
+    /// running, but the calls from here on cannot be replayed on resume.
     pub fn record(
         &self,
         call_id: String,
@@ -154,73 +170,54 @@ impl Journal {
         opts: Value,
         result: Value,
         receipt: &ExecutionProvenanceReceipt,
-    ) {
-        let mut written = self.written.lock().unwrap();
-        written.insert(
-            call_id.clone(),
-            Entry {
-                version: JOURNAL_VERSION,
-                call_id,
-                input: AgentInput { prompt, opts },
-                result,
-                provenance: receipt
-                    .is_agent_journal_evidence(self.storage.expected_parent_durable())
-                    .then(|| receipt.to_persisted_value()),
-            },
-        );
-        persist(&self.storage, &written);
+    ) -> Option<String> {
+        let entry = Entry {
+            version: JOURNAL_VERSION,
+            call_id,
+            input: AgentInput { prompt, opts },
+            result,
+            provenance: receipt
+                .is_agent_journal_evidence(self.storage.expected_parent_durable())
+                .then(|| receipt.to_persisted_value()),
+        };
+        match self.storage.append(&entry) {
+            Ok(()) => {
+                self.persisted.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(error) => {
+                if self.write_failed.swap(true, Ordering::Relaxed) {
+                    return None;
+                }
+                Some(format!(
+                    "agent() journal stopped persisting ({error:#}); completed calls from here on \
+                     cannot be replayed if this run has to be resumed"
+                ))
+            }
+        }
     }
 
-    /// Whether this run has any reusable current-version agent result.
+    /// Whether resume can actually skip a completed call — entries still in
+    /// memory but never written do not count.
     pub fn is_active(&self) -> bool {
-        !self.written.lock().unwrap().is_empty()
-    }
-}
-
-/// Rewrite current-version entries in stable topology order. Persistence is
-/// best-effort: losing resume data must not fail the live Program/Workflow.
-fn persist(storage: &Storage, written: &HashMap<String, Entry>) {
-    let mut entries: Vec<&Entry> = written.values().collect();
-    entries.sort_by(|left, right| left.call_id.cmp(&right.call_id));
-    let mut out = String::new();
-    for entry in entries {
-        if let Ok(line) = serde_json::to_string(entry) {
-            out.push_str(&line);
-            out.push('\n');
-        }
-    }
-    match storage {
-        #[cfg(test)]
-        Storage::Path(path) => persist_path(path, &out),
-        Storage::Run(run_dir, name) => {
-            let _ = run_dir.write_atomic(name, out.as_bytes());
-        }
+        self.persisted.load(Ordering::Relaxed) > 0
     }
 }
 
 #[cfg(test)]
-fn persist_path(path: &PathBuf, out: &str) {
+fn append_path(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     let Some(dir) = path.parent() else {
-        return;
+        return Err(anyhow!("journal path has no parent directory"));
     };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = dir.join(format!(".journal.tmp-{}-{seq}", std::process::id()));
-    let write = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .and_then(|mut file| {
-            use std::io::Write as _;
-            file.write_all(out.as_bytes())?;
-            file.sync_all()
-        });
-    if write.is_ok() {
-        let _ = std::fs::rename(&temp, path);
-    }
-    let _ = std::fs::remove_file(temp);
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    use std::io::Write as _;
+    file.write_all(bytes)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -239,7 +236,10 @@ mod tests {
 
     fn record(journal: &Journal, call_id: String, prompt: String, opts: Value, result: Value) {
         let receipt = ExecutionProvenanceReceipt::test_journal_agent("agent-1", "run-1-1");
-        Journal::record(journal, call_id, prompt, opts, result, &receipt);
+        assert!(
+            Journal::record(journal, call_id, prompt, opts, result, &receipt).is_none(),
+            "path-backed journal append should succeed"
+        );
     }
 
     #[test]
@@ -447,11 +447,8 @@ mod tests {
             "provenance": ExecutionProvenanceReceipt::test_program("program-1", "run-1-1")
                 .to_persisted_value()
         });
-        std::fs::write(
-            &path,
-            format!("{missing}\n{malformed}\n{oversized}\n{non_agent}\n"),
-        )
-        .unwrap();
+        let seeded = format!("{missing}\n{malformed}\n{oversized}\n{non_agent}\n");
+        std::fs::write(&path, &seeded).unwrap();
         let journal = Journal::open(path.clone());
         assert!(matches!(
             journal.claim("root/agent/0", "missing", &json!({})),
@@ -478,18 +475,13 @@ mod tests {
             json!({}),
             "fresh".into(),
         );
-        let entries: Vec<Value> = std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(entries.len(), 5);
-        assert!(
-            entries[..4]
-                .iter()
-                .all(|entry| entry["provenance"].is_null())
-        );
-        assert_eq!(entries[4]["provenance"]["execution"]["kind"], "agent");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 5);
+        // Append-only: the seeded lines are left byte-for-byte alone. An unusable
+        // receipt is ignored when the journal is opened, not scrubbed on disk.
+        assert!(raw.starts_with(&seeded), "{raw}");
+        let appended: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(appended["provenance"]["execution"]["kind"], "agent");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -510,11 +502,9 @@ mod tests {
             result: json!("cached"),
             provenance: Some(wrong.to_persisted_value()),
         };
+        let seeded = format!("{}\n", serde_json::to_string(&entry).unwrap());
         run_dir
-            .write_atomic(
-                "journal.jsonl",
-                format!("{}\n", serde_json::to_string(&entry).unwrap()).as_bytes(),
-            )
+            .write_atomic("journal.jsonl", seeded.as_bytes())
             .unwrap();
 
         let journal = Journal::open_run(run_dir.clone(), "journal.jsonl");
@@ -523,23 +513,26 @@ mod tests {
             Claim::Hit(value) if value == "cached"
         ));
         let right = ExecutionProvenanceReceipt::test_journal_agent("agent-2", &run_id_text);
-        journal.record(
-            "root/agent/1".into(),
-            "live".into(),
-            json!({}),
-            json!("fresh"),
-            &right,
+        assert!(
+            journal
+                .record(
+                    "root/agent/1".into(),
+                    "live".into(),
+                    json!({}),
+                    json!("fresh"),
+                    &right,
+                )
+                .is_none(),
+            "run-backed journal append should succeed"
         );
 
-        let entries: Vec<Value> = String::from_utf8(run_dir.read("journal.jsonl").unwrap())
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0]["provenance"].is_null());
+        let raw = String::from_utf8(run_dir.read("journal.jsonl").unwrap()).unwrap();
+        // The foreign receipt stays as written; it is not trusted on open, and an
+        // append never rewrites what is already on disk.
+        assert!(raw.starts_with(&seeded), "{raw}");
+        let appended: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
         assert_eq!(
-            entries[1]["provenance"]["parent"]["durable"]["id"],
+            appended["provenance"]["parent"]["durable"]["id"],
             run_id_text
         );
         drop(journal);
@@ -547,29 +540,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]
-    fn out_of_order_completions_persist_in_topology_order() {
-        let path = tmp("order-v3");
+    fn records_append_instead_of_rewriting_and_later_wins_on_replay() {
+        let path = tmp("append-v3");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         let journal = Journal::open(path.clone());
-        for id in [
-            "root/parallel/0/branch/2/agent/0",
-            "root/parallel/0/branch/0/agent/0",
-            "root/parallel/0/branch/1/agent/0",
-        ] {
-            record(&journal, id.into(), id.into(), json!({}), id.into());
+        record(
+            &journal,
+            "root/agent/0".into(),
+            "first".into(),
+            json!({}),
+            "R0".into(),
+        );
+        let first = std::fs::read_to_string(&path).unwrap();
+        record(
+            &journal,
+            "root/agent/1".into(),
+            "second".into(),
+            json!({}),
+            "R1".into(),
+        );
+        let both = std::fs::read_to_string(&path).unwrap();
+        // Append-only: the earlier bytes are still a prefix of the file.
+        assert!(both.starts_with(&first), "{both}");
+        // A rewritten entry for the same topology id is appended too; the last
+        // line is the one resume sees.
+        record(
+            &journal,
+            "root/agent/0".into(),
+            "first".into(),
+            json!({}),
+            "R0-v2".into(),
+        );
+        let reopened = Journal::open(path.clone());
+        assert!(matches!(
+            reopened.claim("root/agent/0", "first", &json!({})),
+            Claim::Hit(value) if value == "R0-v2"
+        ));
+        assert!(matches!(
+            reopened.claim("root/agent/1", "second", &json!({})),
+            Claim::Hit(value) if value == "R1"
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_thousand_records_round_trip() {
+        let path = tmp("many-v3");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        {
+            let journal = Journal::open(path.clone());
+            for index in 0..1000 {
+                let id = format!("root/parallel/{index}/agent/0");
+                record(&journal, id.clone(), id.clone(), json!({}), id.into());
+            }
+            assert!(journal.is_active());
         }
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let ids: Vec<String> = raw
-            .lines()
-            .map(|line| serde_json::from_str::<Entry>(line).unwrap().call_id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec![
-                "root/parallel/0/branch/0/agent/0",
-                "root/parallel/0/branch/1/agent/0",
-                "root/parallel/0/branch/2/agent/0"
-            ]
+        let lines = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 1000);
+        let reopened = Journal::open(path.clone());
+        assert!(matches!(
+            reopened.claim(
+                "root/parallel/999/agent/0",
+                "root/parallel/999/agent/0",
+                &json!({})
+            ),
+            Claim::Hit(value) if value == "root/parallel/999/agent/0"
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_unwritable_journal_warns_once_and_is_not_active() {
+        let path = tmp("unwritable-v3");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(&path).unwrap();
+        let journal = Journal::open(path.clone());
+        let receipt = ExecutionProvenanceReceipt::test_journal_agent("agent-1", "run-1-1");
+        let warning = Journal::record(
+            &journal,
+            "root/agent/0".into(),
+            "do X".into(),
+            json!({}),
+            "result".into(),
+            &receipt,
+        )
+        .expect("a failed append must be reported");
+        assert!(warning.contains("stopped persisting"), "{warning}");
+        // Nothing reached the disk, so resume would skip nothing.
+        assert!(!journal.is_active());
+        // The warning is published once, not once per call.
+        assert!(
+            Journal::record(
+                &journal,
+                "root/agent/1".into(),
+                "do Y".into(),
+                json!({}),
+                "result".into(),
+                &receipt,
+            )
+            .is_none()
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -81,6 +81,11 @@ pub struct CronSpec {
     day_of_month: Vec<u8>,
     month: Vec<u8>,
     day_of_week: Vec<u8>,
+    /// Vixie decides the dom/dow rule from the field's *syntax*: a first
+    /// character of `*` marks that side unrestricted, however much it covers.
+    /// `1-31` is a restricted field that happens to list every day.
+    dom_star: bool,
+    dow_star: bool,
 }
 
 impl CronSpec {
@@ -96,6 +101,8 @@ impl CronSpec {
             day_of_month: parse_field(fields[2], 1, 31, false)?,
             month: parse_field(fields[3], 1, 12, false)?,
             day_of_week: parse_field(fields[4], 0, 6, true)?,
+            dom_star: fields[2].starts_with('*'),
+            dow_star: fields[4].starts_with('*'),
         };
         Ok(spec)
     }
@@ -215,18 +222,16 @@ impl CronSpec {
             && self.day_matches(parts)
     }
 
-    /// Vixie cron's day rule: two unrestricted fields match every day, one
-    /// unrestricted field defers to the other, two restricted fields are an OR.
+    /// Vixie cron's day rule: if either field starts with `*`, both must match;
+    /// otherwise either one may. The test is on the source text, not on how many
+    /// values the field ended up covering — `1-31` is still a restricted field.
     fn day_matches(&self, parts: LocalParts) -> bool {
-        let dom_all = self.day_of_month.len() == 31;
-        let dow_all = self.day_of_week.len() == 7;
         let dom = self.day_of_month.contains(&parts.day_of_month);
         let dow = self.day_of_week.contains(&parts.day_of_week);
-        match (dom_all, dow_all) {
-            (true, true) => true,
-            (true, false) => dow,
-            (false, true) => dom,
-            (false, false) => dom || dow,
+        if self.dom_star || self.dow_star {
+            dom && dow
+        } else {
+            dom || dow
         }
     }
 }
@@ -323,6 +328,25 @@ mod tests {
         assert_eq!(spec.next_after(after, tz), Some(utc_ms(2026, 4, 13, 0, 0)));
         let after = utc_ms(2026, 4, 13, 0, 0);
         assert_eq!(spec.next_after(after, tz), Some(utc_ms(2026, 4, 20, 0, 0)));
+    }
+
+    /// Vixie's rule keys off the field text, not how much it covers: `1-31` lists
+    /// every day but is not `*`, so the two restricted fields are an OR and the
+    /// expression fires daily instead of only on Mondays (plan 257).
+    #[test]
+    fn dom_and_dow_restriction_follows_the_syntax() {
+        let tz = SchedulerTimeZone::Named(Tz::UTC);
+        let covering = CronSpec::parse("0 0 1-31 * 1").unwrap();
+        assert_eq!(
+            covering.next_after(utc_ms(2026, 4, 13, 0, 0), tz),
+            Some(utc_ms(2026, 4, 14, 0, 0))
+        );
+        // A leading `*` (here with a step) keeps the AND side of the rule.
+        let stepped = CronSpec::parse("0 0 */2 * 1").unwrap();
+        assert_eq!(
+            stepped.next_after(utc_ms(2026, 4, 13, 0, 0), tz),
+            Some(utc_ms(2026, 4, 27, 0, 0))
+        );
     }
 
     #[test]

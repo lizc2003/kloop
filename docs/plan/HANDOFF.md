@@ -5,6 +5,21 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 257 ✅：子 agent、Program、Workflow 与调度器（2026-11-13）**：9 条开工复核全部
+成立。按用户定的三条做：Program 的 `AgentOptions` 不再声明/转发 `max_rounds`（workflow
+不带 `schema` 的 `agent()` 改报"只有带 schema 才接受"），structured agent 与 fork skill
+都默认 200 轮、显式值只能收紧，cron 的 dom/dow 改按 Vixie 字面星号判"无限制"
+（`0 0 1-31 * 1` 从此每天触发）。引擎侧：`run_js` 把整段执行与取消令牌一起 select，
+停在永不 settle 的 Promise 上的 program 现在能被 stop 结束（旧实现只能等 session
+shutdown）；两个 `call_agent` bridge 入口先查取消、槽位 select 加 `biased;` 并复查，
+stop 之后不会再起子 agent。CPU burst 误杀实测成立：快速宿主调用之间 tick 间距一直小于
+50ms，5 秒被当成一次同步 burst 杀掉，改为宿主调用返回时重置。journal 改 append-only
+JSONL（每条一次 fdatasync，受 16MB 上限），第一次写失败发一条 Note 且 `is_active()`
+只认落盘条目；workflow 脚本检查改迭代遍历并设 1024/64 层深度上限，`Math.random` 按字段
+比较；`SystemClock` 分步 sleep 并重读墙钟，系统休眠后不再迟触发。验证：codemode 28
+项、kloop-core 库 1421 项通过（1 ignored，真实 seatbelt 用例在沙箱内跳过），
+`clippy --all-targets -D warnings` 通过；未跑全量 `make check`。教训 381。
+
 **Plan 256 ✅：文件工具边界（2026-11-13）**：9 条全部复核成立并修完。notebook
 `cell_type` 转换按目标类型迁移字段；Unix 新建 leaf 用非覆盖 rename
 （`RENAME_NOREPLACE`/`RENAME_EXCL`，退回 `linkat`）；rename 后的目录 fsync 失败只
@@ -4931,3 +4946,5 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 旧根的保护一起带上。改动影响询问次数时，逐条说明是增加、减少还是不变，并给出用回放核对的数。
 
 380. **“完整读过”这种资格证，要按审核它的人真正需要的事实定义，而不是按展示形状定义。** `write_file` 需要的是“这些字节还是你读过的那份”，这个事实由全文指纹给出；用“每一行都完整展示过”当资格，遇到一行就超过 30k 显示预算的 minified 文件时，那个状态永远不可达——不是模型不够努力，是规则自相矛盾。修的时候不是降低门槛（stale 检查照旧比对全文），而是让覆盖的计量单位和门槛的目的对齐：前缀也算这一行读过，提示里说清没展示的尾部。另一条：参考项目没有这个洞，先分清是它们解决了还是门槛本来就更松（claude-code 接受任意一次读、codex 没有读前置），别把“别人没有”当成“别人已经想过”。
+
+381. **一个“守护进程”只在它以为的那些时刻被打断时才是守护进程。** 取消靠 `set_interrupt_handler`，而那个回调只在 JS 真的在跑时被调用；程序停在 `await new Promise(() => {})` 上时没有任何东西会来叫它，于是 `stop_program` 只把状态改成 CancelRequested，registry 一直把它算作在跑，直到整个会话关闭。凡是“靠被守护者主动检查”的取消，都要问一句“它不运行时谁来叫醒它”，答案是 `select!` 等取消令牌，而不是把取消塞进回调里。同一族的另一处：burst 计时用“两个 tick 间隔 < 50ms 就算没让出”，而 tick 只在执行时产生、tool 等待期完全不出现，于是“很多次很快的宿主调用”看起来和“一次很长的同步计算”一模一样，5 秒后被当成死循环杀掉——**宿主调用返回本身就是让出的证据**，别用间接的时间特征去猜。两个洞都是先写测试、在旧实现上看到红（超时/`exceeded CPU time limit`）才动的手；不先红，改完也分不清是修好了还是测试太松。还有一条小纪律：`Option<T>` 是 `#[must_use]`，把无返回值的“记一条日志”改成“返回可选警告”时，所有旧调用点都会变成编译错误——这恰好是好事，它逼你逐个决定警告该发到哪。

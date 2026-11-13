@@ -1,9 +1,37 @@
 # Plan 257 — 子 agent、Program、Workflow 与调度器
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。中断时的 worktree 泄漏在 plan 249;
-> 两个 `call_agent` bridge 的合并在 plan 267。
+> 状态：✅ 完成(2026-11-13)。行号是 2026-10-28 的读数;开工时 9 条全部复核成立。
+> 第 1、4、9 条开工时问过用户：1 按 (a)(删掉转发与声明)，4 要(structured agent 与
+> fork skill 默认 200 轮、显式只能收紧)，9 对齐 Vixie(按字面星号)。
+> 中断时的 worktree 泄漏在 plan 249;两个 `call_agent` bridge 的合并在 plan 267。
+
+## 完成记录(2026-11-13)
+
+- 1 Program 的 `AgentOptions` 去掉 `max_rounds`，`call_agent` 也不再转发；`run_program`
+  的 TS 声明只剩 `agent_type`/`model`。workflow 不带 `schema` 的 `agent()` 收到
+  `max_rounds` 直接报 "only accepted together with a schema"，不再退成
+  `run_agent: invalid input: unknown field max_rounds`。
+- 2 `run_js` 用 `tokio::select!`(biased) 同时等 `ctx.async_with` 与取消令牌；停在
+  `await new Promise(() => {})` 上的 program 现在能被 stop 结束，后台 program 结束后
+  `running_count` 归零(新增 core 回归)。旧实现下该测试 2 秒超时(实测)。
+- 3 两个 bridge 的 `call_agent` 入口先查取消，槽位 `select!` 加 `biased;` 且取消分支在前，
+  拿到许可后再查一次；`stop_program` 之后 `agent()` 必定被拒(直接对 `CoreBridge` 断言)。
+- 4 structured agent 与 fork skill 都默认 `SUBAGENT_MAX_ROUNDS`；显式 `max_rounds` 经
+  `child_round_cap` 只能往下收紧。
+- 5 journal 改 append-only JSONL：每条一行 + `fdatasync`，受 run-store 16MB 上限约束；
+  第一次写失败发一条 Note 并停止宣称可重放，`is_active()` 只认真正落盘的条目。
+  "按拓扑顺序重写"的测试改成 append 语义(已有字节是前缀、后写覆盖前写)。
+- 6 改迭代遍历并设深度上限(脚本 1024 层、meta 字面量 64 层)；`Math.random` 按
+  object/property 字段比较，不再为每个节点拼一份文本。
+- 7 误判成立：快速宿主调用之间 tick 间距始终小于 50ms，累计超过 burst 即被杀；改为宿主
+  调用返回时置标记并重置 burst 起点。测试在旧判定下先红(实测 `exceeded CPU time limit`)。
+- 8 `SystemClock::sleep_until` 改成分步 sleep(60s 上限)，每次醒来重读墙钟。
+- 9 dom/dow 的"无限制"改看字段首字符是否 `*`：`0 0 1-31 * 1` 从此每天触发，`*/2` 仍在
+  AND 侧。DESIGN 已写明。
+- 验证：`cargo test -p kloop-codemode` 28 项、`cargo test -p kloop-core --lib` 1421 项通过
+  (1 ignored，真实 seatbelt 用例在 kloop 沙箱内自动跳过)；`cargo clippy -p kloop-core
+  -p kloop-codemode --all-targets -- -D warnings` 通过；未跑全量 `make check`。
 
 ## 问题
 
