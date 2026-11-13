@@ -8,12 +8,15 @@ use serde::Serializer;
 use serde::de::Error as _;
 use serde_json::Value;
 use serde_json::json;
+use tokio::sync::mpsc;
 
 use kloop_core::rollout::SessionRuntime;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_core::rollout::SnapshotTerminal;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::Message;
+
+use crate::wire;
 
 const MAX_RETAINED_EVENTS: usize = 4_096;
 const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
@@ -203,7 +206,6 @@ enum VolatileState {
 pub(crate) enum ProjectionError {
     SequenceExhausted,
     InvalidParams,
-    Encode(serde_json::Error),
 }
 
 impl std::fmt::Display for ProjectionError {
@@ -211,18 +213,11 @@ impl std::fmt::Display for ProjectionError {
         match self {
             Self::SequenceExhausted => formatter.write_str("public event sequence exhausted"),
             Self::InvalidParams => formatter.write_str("public event params must be an object"),
-            Self::Encode(error) => write!(formatter, "cannot encode public event: {error}"),
         }
     }
 }
 
 impl std::error::Error for ProjectionError {}
-
-impl From<serde_json::Error> for ProjectionError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Encode(error)
-    }
-}
 
 #[derive(Debug)]
 pub(crate) enum CursorError {
@@ -361,16 +356,31 @@ impl ThreadProjection {
     }
 
     /// Materialize, retain, and enqueue one public notification under one lock.
-    /// The enqueue callback must be non-blocking; the server passes an unbounded
-    /// channel send, so sync sees either the whole event or none of it.
-    pub fn publish<F>(
+    /// The enqueue is a non-blocking channel send, so sync sees either the whole
+    /// event or none of it, and the bytes measured for retention are the same
+    /// bytes the writer emits.
+    pub fn publish(
+        &self,
+        method: &'static str,
+        params: Value,
+        out: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<(), ProjectionError> {
+        self.publish_with(method, params, |bytes| {
+            let _ = out.send(bytes);
+        })
+    }
+
+    /// The test seam behind [`Self::publish`]: the enqueue runs while the
+    /// projection lock is held, so a caller that blocks there proves `sync`
+    /// cannot observe a retained event before it is fully published.
+    fn publish_with<F>(
         &self,
         method: &'static str,
         mut params: Value,
         enqueue: F,
     ) -> Result<(), ProjectionError>
     where
-        F: FnOnce(Value),
+        F: FnOnce(Vec<u8>),
     {
         let mut state = self.state.lock().unwrap();
         if state.unavailable {
@@ -393,14 +403,14 @@ impl ThreadProjection {
         apply_event(&mut state, method, &params);
         let envelope = PublicEventEnvelope {
             method: method.to_string(),
-            params: params.clone(),
+            params,
         };
-        let encoded_bytes = serde_json::to_vec(&envelope)?.len();
+        let bytes = wire::encode_notification(method, &envelope.params);
         state.high_water_seq = seq;
-        state.retained_bytes = state.retained_bytes.saturating_add(encoded_bytes);
+        state.retained_bytes = state.retained_bytes.saturating_add(bytes.len());
         state.ring.push_back(RetainedEvent {
             seq,
-            encoded_bytes,
+            encoded_bytes: bytes.len(),
             envelope,
         });
         while state.ring.len() > self.max_events || state.retained_bytes > self.max_bytes {
@@ -410,7 +420,7 @@ impl ThreadProjection {
             state.retained_bytes = state.retained_bytes.saturating_sub(evicted.encoded_bytes);
             state.evicted_through = evicted.seq;
         }
-        enqueue(params);
+        enqueue(bytes);
         Ok(())
     }
 
@@ -674,8 +684,13 @@ fn apply_item_delta(turns: &mut [SnapshotTurn], params: &Value) {
     else {
         return;
     };
-    let current = item.get(field).and_then(Value::as_str).unwrap_or("");
-    item[field] = Value::String(format!("{current}{text}"));
+    match item.get_mut(field) {
+        Some(Value::String(current)) => current.push_str(text),
+        Some(other) => *other = Value::String(text.to_string()),
+        None => {
+            item[field] = Value::String(text.to_string());
+        }
+    }
 }
 
 fn upsert_value(values: &mut Vec<Value>, value: &Value, id_field: &str) {
@@ -752,11 +767,11 @@ mod tests {
     }
 
     fn publish(projection: &ThreadProjection, method: &'static str, params: Value) -> Value {
-        let mut sent = None;
-        projection
-            .publish(method, params, |params| sent = Some(params))
-            .unwrap();
-        sent.unwrap()
+        let (out, mut rx) = mpsc::unbounded_channel();
+        projection.publish(method, params, &out).unwrap();
+        let bytes = rx.try_recv().unwrap();
+        let line: Value = serde_json::from_slice(&bytes).unwrap();
+        line["params"].clone()
     }
 
     #[test]
@@ -1014,6 +1029,35 @@ mod tests {
         assert_eq!(snapshot["snapshot"]["tail"]["notices"][0]["kind"], "note");
     }
 
+    /// Delta accumulation appends in place; a long stream must still read back
+    /// as one exact string in the snapshot (the optimization is only visible as
+    /// allocation behavior, so this pins the result it must preserve).
+    #[test]
+    fn delta_accumulation_preserves_a_long_stream() {
+        let projection = projection(4_096, usize::MAX);
+        publish(&projection, "turn/started", json!({"turn": {"id": 9}}));
+        publish(
+            &projection,
+            "item/started",
+            json!({"turn_id": 9, "item": {"id": "reasoning-0", "type": "reasoning", "status": "in_progress", "text": ""}}),
+        );
+        let mut expected = String::new();
+        for index in 0..1_000 {
+            let chunk = format!("chunk-{index};");
+            expected.push_str(&chunk);
+            publish(
+                &projection,
+                "item/delta",
+                json!({"turn_id": 9, "item_id": "reasoning-0", "channel": "reasoning", "text": chunk}),
+            );
+        }
+        let snapshot = serde_json::to_value(projection.sync(None).unwrap()).unwrap();
+        assert_eq!(
+            snapshot["snapshot"]["tail"]["turns"][0]["items"][0]["text"],
+            expected
+        );
+    }
+
     #[test]
     fn byte_retention_expires_only_replay_not_snapshot_state() {
         let projection = projection(8, 1);
@@ -1043,12 +1087,12 @@ mod tests {
     fn sequence_overflow_terminates_the_projection_without_reuse() {
         let projection = projection(8, usize::MAX);
         projection.state.lock().unwrap().high_water_seq = u64::MAX;
-        let mut enqueued = false;
+        let (out, mut rx) = mpsc::unbounded_channel();
         assert!(matches!(
-            projection.publish("note", json!({"text": "never"}), |_| enqueued = true),
+            projection.publish("note", json!({"text": "never"}), &out),
             Err(ProjectionError::SequenceExhausted)
         ));
-        assert!(!enqueued);
+        assert!(rx.try_recv().is_err(), "nothing is enqueued on overflow");
         assert!(matches!(
             projection.sync(None),
             Err(CursorError::ProjectionUnavailable)
@@ -1067,7 +1111,7 @@ mod tests {
         let publisher_projection = projection.clone();
         let publisher = std::thread::spawn(move || {
             publisher_projection
-                .publish("note", json!({"text": "atomic"}), |_| {
+                .publish_with("note", json!({"text": "atomic"}), |_| {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                 })

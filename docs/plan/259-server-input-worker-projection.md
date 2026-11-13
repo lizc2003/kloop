@@ -1,8 +1,8 @@
 # Plan 259 — server 输入、worker 与事件投影
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。`thread/fork` 的孤儿文件在 plan 249。
+> 状态：✅ 已完成（2026-11-13）。行号是 2026-10-28 的读数，保留为当时的依据。
+> `thread/fork` 的孤儿文件在 plan 249。
 
 ## 问题
 
@@ -60,3 +60,35 @@
   得到 PARSE_ERROR 且后续请求正常;超长行被拒;`/provider` 之后的 events/sync 没有 in_progress turn;
   `thread/list` 期间 `turn/interrupt` 不被阻塞(用大量会话夹具);provider/switch 的 model 被 trim。
 - 外层执行沙箱之外 `make check`;DESIGN 的 server 一节先读再改;HANDOFF 记进展与教训。
+
+## 实施结果（2026-11-13）
+
+七条开工复核全部成立。第 7 条按推荐不改：out 通道保持无界，只在 DESIGN
+写明「客户端不读 stdout 时内存增长，不做背压」。
+
+1. worker 在每次把 `running` 放回 false 后（普通 turn、switch、`/provider`
+   命令）检查 inbox，非空就 `notify_activity()` 补一次唤醒；普通 turn 结束
+   同样补，覆盖 last drain 之后到达的 steer。
+2. serve 改成按字节读行并设 8 MiB 上限（照 mcp 的 `read_bounded_line`）：
+   超长行排到换行后回 `PARSE_ERROR(id:null)`，非 UTF-8 同样处理并继续；
+   只有真正的 IO 错误才结束循环，且仍走取消 turn、清 pending、等 writer 的
+   正常收尾。
+3. 选「在 `turn_start` 里识别」：新增 `ThreadWorkerMsg::ProviderCommand`，
+   `/provider` 不再 `record_input`、不开 steer 窗口、不进入事件投影；响应仍带
+   一个只用于应答的 turn id，任何事件都不使用它。
+4. `item/delta` 直接对 `Value::String` `push_str`；out 通道改成预序列化字节，
+   writer 只补换行，事件 ring 的留存大小与实际写出的字节一致，`publish` 不再
+   克隆 params 做第二次序列化。
+5. `session_digest` 扩出 messages / runtime / 最后一个 route，`thread/list`
+   改用它；`thread/list`、`thread/read`、`config/read`、`skills/list` 都移到
+   `spawn_blocking`，响应可以乱序。配置/技能读取前的 scope 解析也带进阻塞任务，
+   包括休眠会话的 path 定位与重放。
+6. 抽 `public_route_from_record`、`route_switch_error_kind`、
+   `optional_nonempty_str`；`model`/`provider_id` 统一 trim，
+   `" m "` 在 provider/switch 不再报 unknown_model。
+
+回归：server 集成 49 项（含 `/provider` 无 in_progress turn、`/provider` 期间
+steer 仍投递、非 UTF-8/超长行后继续服务、`thread/list` 期间 interrupt 先回、
+`" m "` 被 trim），server lib 27 项，core lib 1429 项（1 ignored），CLI bin
+167 项通过；`clippy -p kloop-server -p kloop-core -p kloop --all-targets -D warnings`
+通过；未跑全量 `make check`、parity 和真实 API。

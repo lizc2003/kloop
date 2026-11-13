@@ -16,6 +16,7 @@ use crate::params::SteerError;
 use crate::params::parse_input;
 use crate::params::str_param;
 use crate::wire;
+use crate::worker::provider_command_args;
 
 impl Server {
     pub(crate) fn turn_start(&mut self, params: &Value) -> MethodResult {
@@ -33,9 +34,24 @@ impl Server {
                 format!("a turn is already running on thread '{thread_id}'"),
             ));
         }
+        // `/provider` runs through the idle provider transaction: it never
+        // opens a turn, so it must not allocate a projected turn or a steering
+        // window that are never completed. The id below only answers this
+        // request; no event ever carries it.
+        let turn_id = handle.turn_seq.fetch_add(1, Ordering::SeqCst);
+        if images.is_empty() && provider_command_args(&text).is_some() {
+            if handle
+                .turn_tx
+                .send(ThreadWorkerMsg::ProviderCommand { text })
+                .is_err()
+            {
+                handle.running.store(false, Ordering::SeqCst);
+                return Err((wire::SERVER_ERROR, "thread worker is gone".into()));
+            }
+            return Ok(json!({"turn": {"id": turn_id}}));
+        }
         // Allocate the turn id and publish it before the worker picks up the
         // turn, so a `turn/steer` racing in sees the running turn's id.
-        let turn_id = handle.turn_seq.fetch_add(1, Ordering::SeqCst);
         *handle.turn.lock().unwrap() = Some(turn_id);
         handle.inbox.open_steer_window(turn_id);
         let cancel = CancellationToken::new();

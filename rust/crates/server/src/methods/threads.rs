@@ -1,11 +1,13 @@
 //! 线程持久化、恢复、fork、公开快照与工作者启动。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -16,12 +18,15 @@ use kloop_core::agent::Ui;
 use kloop_core::event::Event;
 use kloop_core::history::History;
 use kloop_core::interaction::Questioner;
+use kloop_core::provider_route::ProviderCatalog;
 use kloop_core::rollout;
 use kloop_core::rollout::Rollout;
 use kloop_core::rollout::SessionSnapshot;
 use kloop_core::session_store::SessionDirs;
 use kloop_protocol::ActiveProviderRoute;
+use kloop_protocol::clip_chars;
 
+use crate::RequestId;
 use crate::Server;
 use crate::ThreadHandle;
 use crate::ThreadStartOptions;
@@ -32,13 +37,16 @@ use crate::events::RecoverySource;
 use crate::events::ThreadProjection;
 use crate::params::MethodResult;
 use crate::params::fork_origin_json;
+use crate::params::fork_origin_value;
 use crate::params::parse_thread_start_options;
+use crate::params::public_route_from_record;
 use crate::params::resume_options;
 use crate::params::runtime_from_options;
 use crate::params::str_param;
 use crate::params::thread_runtime_json;
 use crate::thread_ui::ThreadUi;
 use crate::wire;
+use crate::wire::Outgoing;
 use crate::worker::thread_worker;
 
 impl Server {
@@ -50,20 +58,7 @@ impl Server {
         &self,
         thread_id: &str,
     ) -> Result<(PathBuf, SessionDirs), (i64, String)> {
-        let path = rollout::checked_session_path(&self.default_dirs.sessions, thread_id)
-            .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
-        if path.exists() {
-            return Ok((path, self.default_dirs.clone()));
-        }
-        self.paths
-            .store
-            .buckets()
-            .into_iter()
-            .find_map(|bucket| {
-                let path = rollout::checked_session_path(&bucket.dirs.sessions, thread_id).ok()?;
-                path.exists().then_some((path, bucket.dirs))
-            })
-            .ok_or((wire::SERVER_ERROR, format!("no session '{thread_id}'")))
+        locate_thread_in(thread_id, &self.default_dirs, &self.paths.store)
     }
 
     pub(crate) fn thread_start(&mut self, params: &Value) -> MethodResult {
@@ -228,125 +223,52 @@ impl Server {
         }))
     }
 
-    pub(crate) fn thread_list(&self, params: &Value) -> MethodResult {
-        let limit = match params.get("limit") {
-            None | Some(Value::Null) => 50,
-            Some(value) => value
-                .as_u64()
-                .filter(|limit| *limit > 0)
-                .map(|limit| limit.min(500) as usize)
-                .ok_or((
-                    wire::INVALID_PARAMS,
-                    "'limit' must be a positive integer".to_string(),
-                ))?,
-        };
-        let offset = match params.get("cursor") {
-            None | Some(Value::Null) => 0,
-            Some(Value::String(cursor)) => cursor.parse::<usize>().map_err(|_| {
-                (
-                    wire::INVALID_PARAMS,
-                    "'cursor' must be a cursor returned by thread/list".to_string(),
-                )
-            })?,
-            Some(_) => {
-                return Err((
-                    wire::INVALID_PARAMS,
-                    "'cursor' must be a string".to_string(),
-                ));
-            }
-        };
-        let paths: Vec<PathBuf> = rollout::sessions_by_recency(&self.default_dirs.sessions)
-            .into_iter()
-            // Sub-agent transcripts share the sessions dir but are internal;
-            // like cc's sidechains and codex's source filter, keep them out
-            // of the thread list (still readable by explicit id).
-            .filter(|path| !rollout::is_subagent_session(path))
-            .collect();
-        let mut threads = Vec::new();
-        let mut next_cursor = None;
-        // Filtering past unreadable transcripts happens *inside* the page: the
-        // old `skip(offset).take(limit)` filled a page with paths and then
-        // dropped the broken ones, so one bad file silently shortened a page
-        // and the cursor still stepped over it.
-        for (index, path) in paths.iter().enumerate().skip(offset) {
-            if threads.len() == limit {
-                next_cursor = Some(index.to_string());
-                break;
-            }
-            let snapshot = match rollout::load_session_snapshot(path) {
-                Ok(snapshot) => snapshot,
-                Err(_) => continue,
-            };
-            let runtime = snapshot.runtime.as_ref();
-            let thread_id = rollout::session_id_of(path);
-            let in_progress = self
-                .threads
-                .get(&thread_id)
-                .is_some_and(|handle| handle.running.load(Ordering::SeqCst));
-            let updated_at_ms = path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            let route = snapshot
-                .provider_routes
-                .last()
-                .map(|route| ActiveProviderRoute {
-                    revision: route.route_revision,
-                    effort: self.provider_catalog.default_effort(&route.provider_id),
-                    provider_id: route.provider_id.clone(),
-                    api_family: route.api_family,
-                    model: route.model.clone(),
-                    continuity: route.continuity,
+    /// `thread/list` is a disk read that can touch hundreds of transcripts, so
+    /// it runs on the blocking pool instead of the single read loop. JSON-RPC
+    /// responses may arrive out of order; the client matches them by id.
+    pub(crate) fn start_thread_list(&mut self, id: RequestId, params: &Value) {
+        let (limit, offset) = match parse_thread_list_params(params) {
+            Ok(parsed) => parsed,
+            Err((code, message)) => {
+                return self.send(Outgoing::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                    data: None,
                 });
-            threads.push(json!({
-                "id": thread_id,
-                "messages": snapshot.messages.len(),
-                "snippet": rollout::first_user_snippet(&snapshot.messages),
-                "cwd": runtime.map(|runtime| runtime.cwd.as_str()),
-                "route": route,
-                "resumable": runtime.is_some(),
-                "in_progress": in_progress,
-                "forked_from": fork_origin_json(path),
-                "updated_at_ms": updated_at_ms,
-            }));
-        }
-        Ok(json!({"threads": threads, "next_cursor": next_cursor}))
+            }
+        };
+        let sessions = self.default_dirs.sessions.clone();
+        let catalog = self.provider_catalog.clone();
+        let running: HashMap<String, bool> = self
+            .threads
+            .iter()
+            .map(|(thread_id, handle)| (thread_id.clone(), handle.running.load(Ordering::SeqCst)))
+            .collect();
+        self.spawn_read(id, move || {
+            thread_list_blocking(&sessions, &catalog, &running, limit, offset)
+        });
     }
 
-    pub(crate) fn thread_read(&self, params: &Value) -> MethodResult {
-        let thread_id = str_param(params, "thread_id")?;
-        let (path, _) = self.locate_thread(thread_id)?;
-        let snapshot = events::into_public_session_snapshot(
-            rollout::load_session_snapshot(&path)
-                .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?,
-        );
-        let route = snapshot
-            .provider_routes
-            .last()
-            .map(|route| ActiveProviderRoute {
-                revision: route.route_revision,
-                // Effort never enters the durable timeline, so a route read off
-                // disk reports the effort a session there would start at.
-                effort: self.provider_catalog.default_effort(&route.provider_id),
-                provider_id: route.provider_id.clone(),
-                api_family: route.api_family,
-                model: route.model.clone(),
-                continuity: route.continuity,
-            });
-        Ok(json!({
-            "thread": {
-                "id": thread_id,
-                "cwd": snapshot.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
-                "route": route,
-                "resumable": snapshot.runtime.is_some(),
-                "forked_from": fork_origin_json(&path),
-                "messages": snapshot.messages,
-                "terminals": snapshot.terminals,
+    pub(crate) fn start_thread_read(&mut self, id: RequestId, params: &Value) {
+        let thread_id = match str_param(params, "thread_id") {
+            Ok(thread_id) => thread_id.to_string(),
+            Err((code, message)) => {
+                return self.send(Outgoing::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                    data: None,
+                });
             }
-        }))
+        };
+        let default_dirs = self.default_dirs.clone();
+        let store = self.paths.store.clone();
+        let catalog = self.provider_catalog.clone();
+        self.spawn_read(id, move || {
+            let (path, _) = locate_thread_in(&thread_id, &default_dirs, &store)?;
+            thread_read_blocking(thread_id, path, catalog)
+        });
     }
 
     pub(crate) fn thread_events_sync(&self, params: &Value) -> MethodResult {
@@ -505,4 +427,141 @@ impl Server {
         );
         Ok(())
     }
+}
+
+/// Locate a thread's transcript and the partition holding it, without borrowing
+/// the server. Kept free so blocking read tasks can use it after the read loop
+/// has moved on.
+pub(super) fn locate_thread_in(
+    thread_id: &str,
+    default_dirs: &SessionDirs,
+    store: &kloop_core::session_store::SessionStore,
+) -> Result<(PathBuf, SessionDirs), (i64, String)> {
+    let path = rollout::checked_session_path(&default_dirs.sessions, thread_id)
+        .map_err(|e| (wire::INVALID_PARAMS, format!("invalid thread id: {e}")))?;
+    if path.exists() {
+        return Ok((path, default_dirs.clone()));
+    }
+    store
+        .buckets()
+        .into_iter()
+        .find_map(|bucket| {
+            let path = rollout::checked_session_path(&bucket.dirs.sessions, thread_id).ok()?;
+            path.exists().then_some((path, bucket.dirs))
+        })
+        .ok_or((wire::SERVER_ERROR, format!("no session '{thread_id}'")))
+}
+
+fn parse_thread_list_params(params: &Value) -> Result<(usize, usize), (i64, String)> {
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => 50,
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit.min(500) as usize)
+            .ok_or((
+                wire::INVALID_PARAMS,
+                "'limit' must be a positive integer".to_string(),
+            ))?,
+    };
+    let offset = match params.get("cursor") {
+        None | Some(Value::Null) => 0,
+        Some(Value::String(cursor)) => cursor.parse::<usize>().map_err(|_| {
+            (
+                wire::INVALID_PARAMS,
+                "'cursor' must be a cursor returned by thread/list".to_string(),
+            )
+        })?,
+        Some(_) => {
+            return Err((
+                wire::INVALID_PARAMS,
+                "'cursor' must be a string".to_string(),
+            ));
+        }
+    };
+    Ok((limit, offset))
+}
+
+fn thread_list_blocking(
+    sessions: &std::path::Path,
+    catalog: &ProviderCatalog,
+    running: &HashMap<String, bool>,
+    limit: usize,
+    offset: usize,
+) -> MethodResult {
+    let paths: Vec<PathBuf> = rollout::sessions_by_recency(sessions)
+        .into_iter()
+        // Sub-agent transcripts share the sessions dir but are internal;
+        // like cc's sidechains and codex's source filter, keep them out of
+        // the thread list (still readable by explicit id).
+        .filter(|path| !rollout::is_subagent_session(path))
+        .collect();
+    let mut threads = Vec::new();
+    let mut next_cursor = None;
+    // Filtering past unreadable transcripts happens *inside* the page: the old
+    // `skip(offset).take(limit)` filled a page with paths and then dropped the
+    // broken ones, so one bad file silently shortened a page and the cursor
+    // still stepped over it.
+    for (index, path) in paths.iter().enumerate().skip(offset) {
+        if threads.len() == limit {
+            next_cursor = Some(index.to_string());
+            break;
+        }
+        // A digest reads only what the listing shows: no full replay, no
+        // pairing repair, no retained message vector.
+        let digest = match rollout::session_digest(path) {
+            Ok(digest) => digest,
+            Err(_) => continue,
+        };
+        let thread_id = digest.id.clone();
+        let in_progress = running.get(&thread_id).copied().unwrap_or(false);
+        let updated_at_ms = digest
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let route = digest
+            .route
+            .as_ref()
+            .map(|route| public_route_from_record(route, catalog));
+        threads.push(json!({
+            "id": thread_id,
+            "messages": digest.messages,
+            "snippet": clip_chars(&digest.title, 60, "…"),
+            "cwd": digest.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
+            "route": route,
+            "resumable": digest.runtime.is_some(),
+            "in_progress": in_progress,
+            "forked_from": fork_origin_value(digest.origin.as_ref()),
+            "updated_at_ms": updated_at_ms,
+        }));
+    }
+    Ok(json!({"threads": threads, "next_cursor": next_cursor}))
+}
+
+fn thread_read_blocking(
+    thread_id: String,
+    path: PathBuf,
+    catalog: Arc<ProviderCatalog>,
+) -> MethodResult {
+    let snapshot = events::into_public_session_snapshot(
+        rollout::load_session_snapshot(&path)
+            .map_err(|e| (wire::SERVER_ERROR, format!("cannot read session: {e}")))?,
+    );
+    let route = snapshot
+        .provider_routes
+        .last()
+        .map(|route| public_route_from_record(route, &catalog));
+    Ok(json!({
+        "thread": {
+            "id": thread_id,
+            "cwd": snapshot.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
+            "route": route,
+            "resumable": snapshot.runtime.is_some(),
+            "forked_from": fork_origin_json(&path),
+            "messages": snapshot.messages,
+            "terminals": snapshot.terminals,
+        }
+    }))
 }

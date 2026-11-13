@@ -8,13 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::inbox::STEERING_PREFIX;
 use crate::request_reduction::FrozenStub;
 use crate::usage::UsageLedger;
-use kloop_protocol::{ContentBlock, Injected, Message, Role};
+use kloop_protocol::{ContentBlock, Injected, Message, ProviderRouteReceipt, Role};
 
 use super::line::{LineMeta, RolloutLine};
 use super::validate::{intact_lines, parse_session, seq_of};
 use super::{
-    PairingRepairStats, Rollout, SESSION_FORMAT_VERSION, SessionLease, SessionSnapshot,
-    SnapshotTerminal,
+    PairingRepairStats, Rollout, SESSION_FORMAT_VERSION, SessionLease, SessionRuntime,
+    SessionSnapshot, SnapshotTerminal,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -541,9 +541,12 @@ fn read_first_meta(path: &Path) -> Option<LineMeta> {
 }
 
 /// Everything a session list shows for one file, read without replaying it.
-/// `inspect_session` reads and JSON-parses every byte; a picker facing dozens
-/// of megabyte-sized transcripts would pay that for all of them before drawing
-/// its first frame, so this stops at the first user text instead.
+/// `inspect_session` reads and JSON-parses every byte and then repairs pairing;
+/// a picker facing dozens of megabyte-sized transcripts would pay that for all
+/// of them before drawing its first frame. A digest keeps only the shape a list
+/// draws: the first user text, lineage, the current message count and the last
+/// durable route. It still scans to the end because a compaction can replace the
+/// message list and the last route can sit anywhere before it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionDigest {
     pub id: String,
@@ -555,6 +558,12 @@ pub struct SessionDigest {
     pub bytes: u64,
     /// The file holds a conversation, not just the opening preamble.
     pub has_content: bool,
+    /// Message count after the same compaction replacement rules replay uses.
+    pub messages: usize,
+    /// The runtime line's cwd-bearing metadata, when the file has one.
+    pub runtime: Option<SessionRuntime>,
+    /// The last durable provider route receipt in the file.
+    pub route: Option<ProviderRouteReceipt>,
 }
 
 pub fn session_digest(path: &Path) -> io::Result<SessionDigest> {
@@ -568,10 +577,14 @@ pub fn session_digest(path: &Path) -> io::Result<SessionDigest> {
         modified: metadata.modified()?,
         bytes: metadata.len(),
         has_content: false,
+        messages: 0,
+        runtime: None,
+        route: None,
     };
     let mut reader = std::io::BufReader::new(file);
     let mut raw = Vec::new();
     let mut at_first_line = true;
+    let mut first_line_invalid = false;
     loop {
         raw.clear();
         if reader.read_until(b'\n', &mut raw)? == 0 {
@@ -584,31 +597,48 @@ pub fn session_digest(path: &Path) -> io::Result<SessionDigest> {
         // line cannot fail the whole digest and hide the session's lineage.
         let first = std::mem::take(&mut at_first_line);
         let Ok(text) = std::str::from_utf8(&raw) else {
+            first_line_invalid |= first;
             continue;
         };
         let Ok(line) = serde_json::from_str::<RolloutLine>(text.trim()) else {
+            first_line_invalid |= first;
             continue;
         };
         if first {
             digest.origin = origin_of(line.meta());
         }
-        match &line {
+        match line {
+            RolloutLine::Session { runtime, .. } => digest.runtime = Some(runtime),
+            RolloutLine::ProviderRouteInitial { receipt, .. }
+            | RolloutLine::ProviderRouteChanged { receipt, .. } => {
+                digest.route = Some(receipt);
+            }
             RolloutLine::Message { message, .. } => {
                 digest.has_content = true;
+                digest.messages = digest.messages.saturating_add(1);
                 if digest.title.is_empty() {
                     // Wide enough for any terminal the picker will draw in; it
                     // truncates to the real width itself.
-                    digest.title = user_snippet(std::slice::from_ref(message), 200);
+                    digest.title = user_snippet(std::slice::from_ref(&message), 200);
                 }
             }
-            RolloutLine::Compacted { .. } | RolloutLine::Repaired { .. } => {
+            RolloutLine::Compacted { replacement, .. }
+            | RolloutLine::Repaired { replacement, .. } => {
                 digest.has_content = true;
+                digest.messages = replacement.len();
             }
             _ => {}
         }
-        if digest.has_content && !digest.title.is_empty() {
-            break;
-        }
+    }
+    // A damaged first line means the file is not a session a replay could
+    // recover (`parse_session` validates the opening line too); listing it
+    // would hand the client an id that only fails later. A valid first line
+    // without a runtime is still an old fixture session and stays listable.
+    if digest.bytes > 0 && first_line_invalid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session does not start with a readable line",
+        ));
     }
     Ok(digest)
 }
@@ -1693,7 +1723,7 @@ mod tests {
     /// must not change the answer — the picker has to list a damaged session,
     /// not fail on it.
     #[test]
-    fn session_digest_stops_at_the_first_user_line() {
+    fn session_digest_keeps_the_first_user_line_and_tolerates_a_torn_tail() {
         use std::io::Write as _;
 
         let path = temp_file("digest");
@@ -1722,6 +1752,7 @@ mod tests {
         assert_eq!(digest.title, "review the picker");
         assert_eq!(digest.origin, None);
         assert!(digest.has_content);
+        assert_eq!(digest.messages, 3);
         assert_eq!(digest.bytes, std::fs::metadata(&path).unwrap().len());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -1755,6 +1786,65 @@ mod tests {
         assert!(matches!(digest.origin, Some(SessionOrigin::Fork(_))));
         assert_eq!(digest.title, "one");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A list row needs more than the title: the message count, runtime cwd and
+    /// last route come from the same one pass. A compaction replaces the count
+    /// exactly as replay would.
+    #[test]
+    fn session_digest_counts_messages_and_keeps_runtime_and_route() {
+        let path = temp_file("digest-shape");
+        let mut rollout = Rollout::new_with_runtime(
+            path.clone(),
+            SessionRuntime {
+                cwd: "/work".into(),
+            },
+        )
+        .unwrap();
+        rollout.append_message(&Message::user_text("one")).unwrap();
+        rollout.append_message(&Message::user_text("two")).unwrap();
+
+        let digest = session_digest(&path).unwrap();
+        assert_eq!(digest.messages, 2);
+        assert_eq!(
+            digest.runtime.as_ref().map(|runtime| runtime.cwd.as_str()),
+            Some("/work")
+        );
+        assert!(digest.route.is_some());
+
+        rollout
+            .append_compacted(&[Message::user_text("the summary")])
+            .unwrap();
+        let digest = session_digest(&path).unwrap();
+        assert_eq!(digest.messages, 1);
+        assert_eq!(digest.title, "one");
+        drop(rollout);
+        cleanup(&path);
+    }
+
+    /// A non-empty file whose opening line is unreadable is not a session; a
+    /// list must skip it instead of handing the client an id that only fails
+    /// on resume. A readable opening line without a runtime (old fixture
+    /// sessions) is still listable.
+    #[test]
+    fn session_digest_rejects_an_unreadable_first_line() {
+        let path = temp_file("digest-no-runtime");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"type":"session","id":"session#1","ts":0}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let error = session_digest(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let fixture = temp_file("digest-route-only");
+        std::mem::forget(Rollout::new(fixture.clone()));
+        let digest = session_digest(&fixture).unwrap();
+        assert!(digest.runtime.is_none());
+        assert!(digest.route.is_some());
+        cleanup(&path);
+        cleanup(&fixture);
     }
 
     /// One line that is not UTF-8 — a torn multi-byte character, a stray

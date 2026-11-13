@@ -863,15 +863,22 @@ starting anything. It asks for a viewport as tall as the list needs rather than
 the whole screen, and hands the terminal back cleared, so the session banner
 prints where the picker began. Off a terminal (a pipe, a harness, a terminal
 that refuses raw mode) it falls back to the numbered stdout list it used to be.
-Rows are built from `session_digest`, which reads each file only up to its first
-user line: replaying dozens of megabyte-sized transcripts just to label them is
-what a list of 74 sessions cannot afford. A line that is not UTF-8 is skipped
-like any other unparseable line, so a torn multi-byte tail cannot turn a row
-into an unreadable error row and lose its lineage (which would put a sub-agent
-transcript back in the picker). `--list-sessions` reads the same digest instead
-of replaying every transcript, and `--continue` takes the first row that
-qualifies, digesting no session behind it; the listing therefore reports the
-prompt and lineage, not a message count. Native-protocol
+Rows are built from `session_digest`, which reads a transcript line by line
+without replaying it: no history vector is retained and no pairing repair runs,
+so a picker still avoids the cost that made a list of 74 sessions unusable. The
+digest keeps the first user prompt, lineage, current message count (compaction
+replacements included), runtime cwd and the last durable route; the picker shows
+only the prompt, age and size, while `thread/list` uses the rest. It scans to the
+end because a compaction can replace the message list and the last route can sit
+anywhere before it. A line that is not UTF-8 is skipped like any other
+unparseable line, so a torn multi-byte tail cannot turn a row into an unreadable
+error row and lose its lineage (which would put a sub-agent transcript back in
+the picker); a non-empty file whose *first* line is unreadable is not a session
+and is skipped. `thread/list`'s message count is the stored count before
+in-memory pairing repair, not a replayed history size. `--list-sessions` reads
+the same digest instead of replaying every transcript, and `--continue` takes
+the first row that qualifies, digesting no session behind it; the listing
+therefore reports the prompt and lineage, not a message count. Native-protocol
 sessions additionally restore the exact canonical cwd and resolved model that
 were pinned at `thread/start`; a legacy rollout without this metadata remains
 readable but requires its original `cwd` once on `thread/resume` before it is
@@ -2139,7 +2146,26 @@ text behind it.
 `methods.rs` 仅声明三个子模块。`worker.rs` 拥有每线程 History、操作串行化及
 turn/命令执行，`thread_ui.rs` 适配事件、审批和提问；两者共用原来的状态与交互回执。
 
-**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched.
+**Transport and read loop.** Inbound frames are read as bounded bytes, not as an
+unbounded `lines()` stream: a frame over 8 MiB is drained to its newline and
+answered with `PARSE_ERROR` (`id:null`), and a frame that is not UTF-8 gets the
+same answer. Neither ends the server — later requests keep working from a clean
+line boundary. Only a real input IO error ends `serve`, and even then it runs
+the normal shutdown (cancel every turn, clear pending interactions, let the
+writer drain). Outbound frames are serialized once and queued as bytes: the
+writer only appends the newline. The output queue is deliberately unbounded
+(same choice as the event ring's non-blocking publish): a client that stops
+reading stdout makes memory grow instead of applying backpressure that could
+deadlock a turn or its cancellation. Read-only methods that may touch whole
+transcripts (`thread/list`, `thread/read`, `config/read`, `skills/list`) run on
+the blocking pool, so a large page or a dormant-session replay cannot hold up
+approvals or `turn/interrupt`; JSON-RPC responses may therefore arrive out of
+order, and clients match them by id. After a non-model operation (`/provider`,
+`thread/provider/switch`) releases the thread's single-flight gate, the worker
+re-announces a non-empty inbox: a steer or scheduled delivery that arrived while
+`running` was already set would otherwise sit there until an unrelated event.
+
+**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched. `model` and `provider_id` are trimmed before lookup, so `" m "` and `"m"` name the same allowlisted model; one parser serves `thread/start` and `thread/provider/switch`.
 
 
 **Handshake.** `initialize {client_info, protocol_version, capabilities}` →
@@ -2210,7 +2236,7 @@ status:"scheduled"|"fired"|"cancelled"|"failed", scheduled_for_ms?, reason?, det
 for owner-scoped scheduler lifecycle (**no `turn_id`**),
 `thread/token_usage/updated {token_usage:{total}}`, `note {text}`,
 `thread/cwd/updated {cwd, branch}`; and `turn/completed {turn:{id, status,
-error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/context`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` is refused with a `system` note pointing at `thread/start` (a thread is one session addressed by its id; switching the session under that id is what `thread/start` exists to avoid), `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket or usage event. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
+error?}}`. A `turn/start` whose input is a slash command (`/help`, `/cost`, `/context`, `/compact`, `/clear`, and an inert `/exit`) runs the command instead of the model: its output comes back as a `system` notification, `/clear` is refused with a `system` note pointing at `thread/start` (a thread is one session addressed by its id; switching the session under that id is what `thread/start` exists to avoid), `/compact` emits a `note` before it starts (its result exists only once the summary request is over, which is the whole wait), and the turn bracket is unchanged. `/provider` is the exception: it uses the idle provider transaction directly, emits the bounded provider result (and `thread/provider/changed` on a real switch), and creates no turn bracket, no projected turn, no steering window, and no usage event. The `turn/start` response still carries a turn id for protocol shape, but no event ever uses it and `thread/events/sync` shows no `in_progress` turn for the command. `/effort` and `/model` run on the ordinary command path but likewise re-freeze the session route, so a new `effort` or model reaches the next turn and the published route.
 
 **Event recovery.** `thread/events/sync {thread_id, event_cursor?}` is the one
 atomic recovery entry point for an active thread. The typed cursor is

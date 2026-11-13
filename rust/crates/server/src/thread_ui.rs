@@ -34,7 +34,7 @@ use crate::wire::Outgoing;
 /// confirmations become `approval/request` server requests answered by id.
 pub(super) struct ThreadUi {
     pub(super) thread_id: String,
-    pub(super) out: mpsc::UnboundedSender<Value>,
+    pub(super) out: mpsc::UnboundedSender<Vec<u8>>,
     pub(super) pending: PendingInteractions,
     pub(super) reverse_request_seq: Arc<AtomicU64>,
     /// The running turn's id (shared with the handle), used to tag item events.
@@ -44,10 +44,7 @@ pub(super) struct ThreadUi {
 
 impl ThreadUi {
     pub(super) fn notify(&self, method: &'static str, params: Value) {
-        let out = self.out.clone();
-        let _ = self.projection.publish(method, params, move |params| {
-            let _ = out.send(Outgoing::Notification { method, params }.to_json());
-        });
+        let _ = self.projection.publish(method, params, &self.out);
     }
 
     fn active_turn_id(&self) -> Option<u64> {
@@ -141,7 +138,7 @@ impl Approver for ThreadUi {
                     method: "approval/request",
                     params,
                 }
-                .to_json(),
+                .into_bytes(),
             )
             .is_ok();
         let guard = PendingGuard {
@@ -202,7 +199,7 @@ impl Questioner for ThreadUi {
                             method: "question/request",
                             params,
                         }
-                        .to_json(),
+                        .into_bytes(),
                     )
                     .is_err()
                 {

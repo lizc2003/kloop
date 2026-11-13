@@ -21,6 +21,23 @@ MCP 启动失败映射成类别（启动进程/超时/HTTP 状态码/认证/协�
 `clippy -p kloop --all-targets -- -D warnings`、bin 测试 167 项、headless_contract 7 项、plain_pty 9 项通过；未跑全量 `make check`。
 教训 383。
 
+**Plan 259 ✅：server 输入、worker 与事件投影（2026-11-13）**：七条复核全部成立。
+第 7 条按推荐不改：out 通道保持无界，只在 DESIGN 写明客户端不读 stdout 时内存
+增长、不做背压。worker 在普通 turn、switch、`/provider` 命令三处把 `running`
+放回 false 后都重查 inbox，非空就补一次唤醒；`/provider` 改由 `turn_start`
+识别成 `ProviderCommand`，不分配投影里的 turn、不开 steer 窗口，响应仍带一个
+只用于应答的 id。serve 按字节读行并设 8 MiB 上限，超长行排到换行、非 UTF-8
+行都回 `PARSE_ERROR(id:null)` 后继续，只有真正的 IO 错误才结束并走正常收尾。
+`item/delta` 改成 `push_str`；out 通道改预序列化字节，事件 ring 的留存大小与
+实际写出一致，publish 不再克隆 params 做第二次序列化。`thread/list` 改用扩展
+后的 `session_digest`（messages/runtime/最后 route），四个重读方法都进
+`spawn_blocking`，响应允许乱序；配置/技能的 scope 解析也一起进阻塞任务。
+抽了 `public_route_from_record`、`route_switch_error_kind`、
+`optional_nonempty_str`，`model`/`provider_id` 统一 trim。验证：server 集成
+49 项、server lib 27 项、core lib 1429 项（1 ignored）、CLI bin 167 项通过；
+三个 crate 的 `clippy --all-targets -D warnings` 通过；未跑全量 `make check`、
+parity 与真实 API。教训 384。
+
 **Plan 257 ✅：子 agent、Program、Workflow 与调度器（2026-11-13）**：9 条开工复核全部
 成立。按用户定的三条做：Program 的 `AgentOptions` 不再声明/转发 `max_rounds`（workflow
 不带 `schema` 的 `agent()` 改报"只有带 schema 才接受"），structured agent 与 fork skill
@@ -4976,3 +4993,5 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 382. **把“原子替换整个文件”改成“就地追加”，等于把文件从“我们自己的一份数据”变成“一个共享 inode 的写入端”，安全属性要重新证一遍。** 原子替换只动目录项，所以符号链接、硬链接、FIFO、目录、被外部截断都无所谓；就地追加会跟随硬链接写别人的文件（`O_NOFOLLOW` 挡不住硬链接，要看 `nlink`）、会在无读端的 FIFO 上永久阻塞（`O_WRONLY` 的 open 本身阻塞，类型检查来不及跑，所以要 `O_NONBLOCK`）、会把新记录拼到上次被杀留下的半行后面（恢复时必须按最后一个换行**物理**截断，只跳过不截断等于把下一条也赔进去）、还会因为整文件 `from_utf8` 解码而让坏尾截在多字节字符中间时丢掉全部好记录（逐行解码）。附带两条：`sync_data` 只覆盖字节，首次创建还要同步目录；换解析库或语法后，旧的正则/文本判定要重新对一次真实节点（动态 `import()` 的 callee 是 `import` 节点，不是 `identifier`，`starts_with("import(")` 只是碰巧对）。判据：换一种写入方式时，把“这个文件可能是什么”重新列一遍——类型、链接数、打开语义、可用长度、断电点。两条补充：做不到的平台别写一个恒真的桩（`link_count` 恒返回 1 等于放行），仓库里通常已经有按句柄查的实现（`tools::fs` 的 `has_multiple_hard_links` 三平台齐全），跨模块复用它比临时写一个 nightly-only 的 API 更省；以及“修不了就报告”——截尾失败被 `let _ =` 吞掉，比失败本身更糟，它会让下一条记录拼进坏行还算作已落盘。
 
 383. **“stdout 只放最终答案”是契约时，启动路径也算在契约里；同一个 stdin 有两个读者时，加锁不如共用一个队列。** `--headless` 之前只在 turn 里守 stdout，`open_history` 的 `[forked …]`/`[resumed …]` 仍是 `println!`，`--json` 的第一行就可能不是 JSON——把输出契约当成“输出层”的性质会漏掉所有在输出层之前发生的打印，排查时按“进程从启动到退出的每一条 stdout 写入”过一遍。plain 的 stdin 竞争则是另一种形状：REPL 的 `select!` 先发一个读请求再丢弃 future，读线程已经阻塞在 `read_line`，审批再起一个读者就抢同一行；修法是让两者共用一个容量为 1 的队列（线程持续读、谁在提问谁取），而不是给两个读者加锁或取消。顺带两条：信任门的修复要按“用户回答之前有哪些副作用”排序，MCP 从连接改成先 plan、信任后再 connect，测试必须用真的会留下痕迹的假 server（写标记文件），只断言顺序不够；配置里的数字（`memory_mb`）和 `[env]` 都是外部输入，换算用 checked、拒绝前先想清楚哪个字段可能带凭据（回显名字、不回显值）。
+
+384. **把一个同步单读者循环改成异步读循环，先列“谁依赖到达顺序”。** JSON-RPC 用 id 配对，把 `thread/list`/`thread/read`/`config/read`/`skills/list` 放到阻塞池后，响应本来就会乱序；测试若按“下一行一定是 list 的响应”写，会把正确实现判红。回归要按 id 找消息，顺序断言只留给真正有顺序语义的通道（`turn/started` → item → `turn/completed`）。同一轮的三条：把 `running` 放回 false 要在**每一处**出口补 inbox 重唤醒（普通 turn 结束也算，steer 可能落在最后一次 drain 之后）；`item/delta` 的 `format!("{current}{text}")` 是在投影锁里的平方复制，直接 `push_str`，输出通道改成预序列化字节后 ring 的留存大小才和实际写出一致；`session_digest` 一旦服务列表，就不能再停在第一个用户行——message count 和最后一个 route 都在后面，而且“有 runtime 行”不是会话有效性的判据（旧夹具会话只有 route 行）。

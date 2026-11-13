@@ -54,6 +54,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -99,7 +100,7 @@ where
         config_reader,
         skills_reader,
     } = config;
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<Value>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_loop(output, out_rx));
 
     let default_cwd =
@@ -125,15 +126,45 @@ where
         initialized: false,
         client_questions: false,
     };
-    let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = BufReader::new(input);
+    let mut read_error = None;
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_INPUT_LINE_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            // A line over the wire limit is a client error, not a reason to
+            // tear down every thread. The reader has already discarded the
+            // rest of the line, so the stream stays framed.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                server.send(Outgoing::Error {
+                    id: None,
+                    code: wire::PARSE_ERROR,
+                    message: error.to_string(),
+                    data: None,
+                });
+                continue;
+            }
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        };
+        let Ok(line) = std::str::from_utf8(&line) else {
+            server.send(Outgoing::Error {
+                id: None,
+                code: wire::PARSE_ERROR,
+                message: "unparseable line: input is not UTF-8".into(),
+                data: None,
+            });
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        server.handle_line(&line);
+        server.handle_line(line);
     }
-    // Input closed: cancel in-flight turns so workers wind down, then drop
-    // our sender so the writer drains and exits once every worker is gone.
+    // Input closed or failed: cancel in-flight turns so workers wind down, then
+    // drop our sender so the writer drains and exits once every worker is gone.
     for handle in server.threads.values() {
         let mut current_cancel = handle.current_cancel.lock().unwrap();
         if let Some(cancel) = current_cancel.take() {
@@ -143,15 +174,75 @@ where
     server.pending.lock().unwrap().clear();
     drop(server);
 
-    writer.await.context("writer task panicked")?
+    writer.await.context("writer task panicked")??;
+    match read_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
+}
+
+/// The largest accepted inbound line. Matching the MCP wire cap keeps one
+/// client message from growing server memory without bound; a longer line is
+/// drained to its newline and answered with `PARSE_ERROR`, not deserialized.
+const MAX_INPUT_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read one newline-delimited frame without ever holding more than `limit`
+/// bytes. On overflow the rest of the line is consumed so the next frame is
+/// still read from a line boundary.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let (consumed, ended) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                if oversized {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("input line exceeds the {limit}-byte wire limit"),
+                    ));
+                }
+                return if line.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(line))
+                };
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let take = newline.unwrap_or(buffer.len());
+            if !oversized {
+                if line.len().saturating_add(take) > limit {
+                    oversized = true;
+                } else {
+                    line.extend_from_slice(&buffer[..take]);
+                }
+            }
+            (take + usize::from(newline.is_some()), newline.is_some())
+        };
+        reader.consume(consumed);
+        if ended {
+            if oversized {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("input line exceeds the {limit}-byte wire limit"),
+                ));
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
 }
 
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut output: W,
-    mut rx: mpsc::UnboundedReceiver<Value>,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<()> {
-    while let Some(value) = rx.recv().await {
-        let mut line = serde_json::to_vec(&value)?;
+    while let Some(mut line) = rx.recv().await {
         line.push(b'\n');
         output.write_all(&line).await?;
         output.flush().await?;
@@ -176,6 +267,11 @@ struct Turn {
 
 enum ThreadWorkerMsg {
     Turn(Turn),
+    /// `/provider ...` on the idle-transaction path: no turn bracket and no
+    /// turn in the event projection, just the command's bounded result.
+    ProviderCommand {
+        text: String,
+    },
     SwitchProvider {
         provider_id: String,
         model: Option<String>,
@@ -240,7 +336,7 @@ impl Drop for PendingGuard {
 }
 
 struct Server {
-    out: mpsc::UnboundedSender<Value>,
+    out: mpsc::UnboundedSender<Vec<u8>>,
     threads: HashMap<String, ThreadHandle>,
     pending: PendingInteractions,
     reverse_request_seq: Arc<AtomicU64>,
@@ -268,7 +364,29 @@ struct Server {
 
 impl Server {
     fn send(&self, outgoing: Outgoing) {
-        let _ = self.out.send(outgoing.to_json());
+        let _ = self.out.send(outgoing.into_bytes());
+    }
+
+    /// Run a read-only method on the blocking pool and deliver its response
+    /// through the same writer. JSON-RPC matches responses by id, so these may
+    /// complete out of order relative to later requests.
+    fn spawn_read<F>(&self, id: RequestId, work: F)
+    where
+        F: FnOnce() -> MethodResult + Send + 'static,
+    {
+        let out = self.out.clone();
+        tokio::task::spawn_blocking(move || {
+            let outgoing = match work() {
+                Ok(result) => Outgoing::Response { id, result },
+                Err((code, message)) => Outgoing::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                    data: None,
+                },
+            };
+            let _ = out.send(outgoing.into_bytes());
+        });
     }
 
     fn handle_line(&mut self, line: &str) {
@@ -338,17 +456,31 @@ impl Server {
             }
             return;
         }
+        // These read whole transcripts; answer from the blocking pool so a
+        // large list cannot hold up approvals or `turn/interrupt`.
+        if method == "thread/list" {
+            self.start_thread_list(id, &params);
+            return;
+        }
+        if method == "thread/read" {
+            self.start_thread_read(id, &params);
+            return;
+        }
+        if method == "config/read" {
+            self.start_config_read(id, &params);
+            return;
+        }
+        if method == "skills/list" {
+            self.start_skills_list(id, &params);
+            return;
+        }
         let result = match method {
             "initialize" => self.initialize(&params),
             "thread/start" => self.thread_start(&params),
             "thread/resume" => self.thread_resume(&params),
             "thread/fork" => self.thread_fork(&params),
-            "thread/list" => self.thread_list(&params),
-            "thread/read" => self.thread_read(&params),
             "thread/events/sync" => self.thread_events_sync(&params),
             "provider/catalog/read" => self.provider_catalog_read(&params),
-            "config/read" => self.config_read(&params),
-            "skills/list" => self.skills_list(&params),
             "mcp_server_status/list" => self.mcp_server_status_list(&params),
             "turn/start" => self.turn_start(&params),
             "turn/interrupt" => self.turn_interrupt(&params),

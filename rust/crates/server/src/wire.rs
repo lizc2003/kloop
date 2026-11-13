@@ -68,10 +68,6 @@ pub enum Outgoing {
         message: String,
         data: Option<Value>,
     },
-    Notification {
-        method: &'static str,
-        params: Value,
-    },
     /// Server-initiated request (approvals); the client answers with a
     /// response carrying the same id.
     ServerRequest {
@@ -116,14 +112,42 @@ impl Outgoing {
                 }
                 json!({"jsonrpc": "2.0", "id": id, "error": error})
             }
-            Outgoing::Notification { method, params } => {
-                json!({"jsonrpc": "2.0", "method": method, "params": params})
-            }
             Outgoing::ServerRequest { id, method, params } => {
                 json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
             }
         }
     }
+
+    /// Encode one wire line for the writer channel. The writer only appends the
+    /// newline, so a message is serialized exactly once no matter how its size
+    /// is also used (the event ring accounts retention in encoded bytes).
+    pub fn into_bytes(self) -> Vec<u8> {
+        serde_json::to_vec(&self.to_json()).unwrap_or_else(|_| ENCODE_FAILURE.to_vec())
+    }
+}
+
+/// `Value` serialization only fails on a non-string map key or a non-finite
+/// float, neither of which can come from parsed JSON or this module's shapes.
+/// Keep a static answer in case a future field breaks that assumption.
+const ENCODE_FAILURE: &[u8] =
+    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"cannot encode response"}}"#;
+
+#[derive(Serialize)]
+struct WireNotification<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: &'a Value,
+}
+
+/// Serialize a notification envelope without cloning its params. Used by the
+/// event projection, which already owns the params it retains for replay.
+pub fn encode_notification(method: &str, params: &Value) -> Vec<u8> {
+    serde_json::to_vec(&WireNotification {
+        jsonrpc: "2.0",
+        method,
+        params,
+    })
+    .unwrap_or_else(|_| ENCODE_FAILURE.to_vec())
 }
 
 /// The wire status token for an item status.
@@ -383,13 +407,6 @@ mod tests {
                 r#"{"error":{"code":-32700,"message":"bad line"},"id":null,"jsonrpc":"2.0"}"#,
             ),
             (
-                Outgoing::Notification {
-                    method: "item/delta",
-                    params: json!({"thread_id": "t", "item_id": "msg-0"}),
-                },
-                r#"{"jsonrpc":"2.0","method":"item/delta","params":{"item_id":"msg-0","thread_id":"t"}}"#,
-            ),
-            (
                 Outgoing::ServerRequest {
                     id: RequestId::Num(1),
                     method: "approval/request",
@@ -404,6 +421,14 @@ mod tests {
                 expected
             );
         }
+        assert_eq!(
+            String::from_utf8(encode_notification(
+                "item/delta",
+                &json!({"thread_id": "t", "item_id": "msg-0"})
+            ))
+            .unwrap(),
+            r#"{"jsonrpc":"2.0","method":"item/delta","params":{"item_id":"msg-0","thread_id":"t"}}"#
+        );
     }
 
     #[test]

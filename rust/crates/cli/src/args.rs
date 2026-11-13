@@ -456,6 +456,9 @@ fn resumable_rows(
                     modified: SystemTime::UNIX_EPOCH,
                     bytes: 0,
                     has_content: true,
+                    messages: 0,
+                    runtime: None,
+                    route: None,
                 },
                 path,
                 error: Some(error.to_string()),
@@ -1047,6 +1050,9 @@ mod tests {
             modified: SystemTime::UNIX_EPOCH,
             bytes: 0,
             has_content,
+            messages: 0,
+            runtime: None,
+            route: None,
         }
     }
 

@@ -67,6 +67,12 @@ impl TestClient {
             .unwrap();
     }
 
+    /// Send an already-framed line (or a fragment), including bytes that are
+    /// not valid UTF-8.
+    async fn send_bytes(&mut self, raw: &[u8]) {
+        self.writer.write_all(raw).await.unwrap();
+    }
+
     /// Send a request with an auto-allocated id and return that id (so a test
     /// can match the response without hand-tracking ids).
     async fn request(&mut self, method: &str, params: Value) -> i64 {
@@ -400,7 +406,7 @@ fn scripted_switch_factory(
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
-                models: vec!["shared".into(), format!("{id}-other")],
+                models: vec!["shared".into(), format!("{id}-other"), "m".into()],
                 context_window: None,
                 max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
@@ -1216,7 +1222,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
                 api_family: kloop_protocol::ProviderApiFamily::Mock,
                 endpoint_fingerprint: Provider::mock(Vec::new()).endpoint_fingerprint(),
                 default_model: "shared".into(),
-                models: vec!["shared".into(), "b-other".into()],
+                models: vec!["shared".into(), "b-other".into(), "m".into()],
                 context_window: None,
                 max_output_tokens: None,
                 availability: kloop_protocol::ProviderAvailabilityCode::Ready,
@@ -1252,7 +1258,9 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
             json!({
                 "thread_id": thread_id,
                 "provider_id": "b",
-                "model": "shared",
+                // Surrounding whitespace is trimmed before the allowlist
+                // lookup, on both the queued switch and the preflight.
+                "model": " m ",
                 "expected_route_revision": 1,
             }),
         )
@@ -1275,6 +1283,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
         .find(|message| message["id"] == switch_id)
         .unwrap();
     assert_eq!(switched["result"]["route"]["revision"], 2);
+    assert_eq!(switched["result"]["route"]["model"], "m");
     assert_eq!(switched["result"]["continuity"], "preserved");
     assert_eq!(switched["result"]["route"]["continuity"], "preserved");
     assert!(seen_a.lock().unwrap().is_empty());
@@ -1310,7 +1319,7 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
             "revision": 2,
             "provider_id": "b",
             "api_family": "mock",
-            "model": "shared",
+            "model": "m",
             "continuity": "preserved",
         })
     );
@@ -3809,6 +3818,35 @@ async fn protocol_errors_do_not_kill_the_server() {
     assert_eq!(err["id"], Value::Null);
     assert_eq!(err["error"]["code"], -32700);
 
+    // One bad frame is answered, not fatal to every thread on the server.
+    client.send_bytes(b"\xff\xfe\n").await;
+    let err = client.recv().await;
+    assert_eq!(err["id"], Value::Null);
+    assert_eq!(err["error"]["code"], -32700);
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not UTF-8"),
+        "{err}"
+    );
+
+    // A line over the wire cap is drained to its newline and refused; the next
+    // request is read from a clean line boundary.
+    let mut oversized = vec![b'a'; 8 * 1024 * 1024 + 1];
+    oversized.push(b'\n');
+    client.send_bytes(&oversized).await;
+    let err = client.recv().await;
+    assert_eq!(err["id"], Value::Null);
+    assert_eq!(err["error"]["code"], -32700);
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("wire limit"),
+        "{err}"
+    );
+
     let id = client.request("no/such/method", json!({})).await;
     let err = client.recv().await;
     assert_eq!(err["id"], id);
@@ -4048,6 +4086,82 @@ async fn thread_list_pages_past_unreadable_transcripts() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// A listing reads whole transcripts, so it runs on the blocking pool: while a
+/// page is being digested, the read loop still answers `turn/interrupt`. The
+/// fixture fills a maximum page with real (if trivial) transcripts so the old
+/// synchronous implementation reliably answered the list first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_list_does_not_block_turn_interrupt() {
+    let dirs = test_dirs("list-blocking");
+    let target = dirs.root.join("list-blocking.txt");
+    let script = vec![vec![tool_use(
+        "t1",
+        "write_file",
+        json!({"path": target.to_str().unwrap(), "content": "x"}),
+    )]];
+    let mut client = start_server(factory(script, dirs.offload.clone(), true), &dirs);
+    let thread_id = client.init_and_start().await;
+
+    // A running turn parked at its approval gate, so `turn/interrupt` has
+    // something to answer.
+    client
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "write it"}),
+        )
+        .await;
+    client
+        .recv_until(|m| m["method"] == "approval/request")
+        .await;
+
+    // One valid transcript, copied to fill the 500-entry page cap.
+    let template = dirs.root.join("template.jsonl");
+    let mut rollout = Rollout::new_with_runtime(
+        template.clone(),
+        SessionRuntime {
+            cwd: dirs.root.to_string_lossy().to_string(),
+        },
+    )
+    .unwrap();
+    let body = "x".repeat(400);
+    for index in 0..200 {
+        rollout
+            .append_message(&Message::user_text(format!("message {index} {body}")))
+            .unwrap();
+    }
+    drop(rollout);
+    let bytes = std::fs::read(&template).unwrap();
+    for index in 0..300 {
+        std::fs::write(
+            dirs.sessions.join(format!("20260101-{index:06}.jsonl")),
+            &bytes,
+        )
+        .unwrap();
+    }
+
+    let list_id = client.request("thread/list", json!({"limit": 500})).await;
+    let interrupt_id = client
+        .request("turn/interrupt", json!({"thread_id": thread_id}))
+        .await;
+    // Stop as soon as the list answers; the interrupt must already be in the
+    // stream, otherwise the read loop was blocked behind the page.
+    let messages = client.recv_until(|m| m["id"] == list_id).await;
+    let interrupt_at = messages
+        .iter()
+        .position(|m| m["id"] == interrupt_id)
+        .unwrap_or_else(|| {
+            panic!("turn/interrupt was not answered until the list finished: {messages:?}")
+        });
+    let list_at = messages.iter().position(|m| m["id"] == list_id).unwrap();
+    assert!(
+        interrupt_at < list_at,
+        "the list answered before the interrupt: {messages:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 /// `thread/fork` copies a session prefix into a fresh thread and spawns it
 /// live: the client can turn/start on the fork immediately, the fork's lineage
 /// points back into the source at the cut, and the source file is untouched.
@@ -4242,6 +4356,103 @@ async fn slash_commands_surface_as_system_notifications() {
     // Nothing past the preamble was ever written, so shutdown removes the
     // file like any thread that never ran a turn (plan 251).
     assert!(!path.exists(), "an unused thread left its session file");
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// `/provider` uses the idle provider transaction, so it must not leave a turn
+/// id in the event projection that never completes. The id still comes back on
+/// the `turn/start` response its client sent.
+#[tokio::test]
+async fn provider_command_creates_no_turn_in_the_event_projection() {
+    let dirs = test_dirs("provider-command-projection");
+    let mut client = start_server(
+        factory(vec![vec![text("unused")]], dirs.offload.clone(), false),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+
+    let start = client
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "/provider"}),
+        )
+        .await;
+    let log = client.recv_until(|m| m["method"] == "system").await;
+    assert!(
+        log.iter()
+            .any(|m| m["id"] == start && m["result"]["turn"]["id"].is_u64()),
+        "turn/start is still answered: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|m| m["method"] == "turn/started"),
+        "a provider command opens no turn bracket: {log:?}"
+    );
+
+    let sync = client
+        .request("thread/events/sync", json!({"thread_id": thread_id}))
+        .await;
+    let snapshot = client.recv_until(|m| m["id"] == sync).await;
+    let snapshot = snapshot.last().unwrap();
+    assert_eq!(
+        snapshot["result"]["snapshot"]["tail"]["turns"],
+        json!([]),
+        "a provider command must not leave an in_progress turn: {snapshot}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A steer pushed while `/provider` holds the thread's single-flight gate is
+/// still queued in the inbox. Releasing the thread has to re-announce it: the
+/// activity notification that arrived during the idle-transaction window was
+/// consumed while `running` was already true.
+#[tokio::test]
+async fn steer_sent_during_a_provider_command_is_delivered_afterwards() {
+    let dirs = test_dirs("provider-command-steer");
+    let mut client = start_server(
+        factory(
+            vec![vec![text("delivery answer")]],
+            dirs.offload.clone(),
+            false,
+        ),
+        &dirs,
+    );
+    client.initialize().await;
+
+    for attempt in 0..12 {
+        let started = client.request("thread/start", json!({})).await;
+        let started = client.recv_until(|m| m["id"] == started).await;
+        let thread_id = started.last().unwrap()["result"]["thread"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        client
+            .request(
+                "turn/start",
+                json!({"thread_id": thread_id, "input": "/provider"}),
+            )
+            .await;
+        client
+            .request(
+                "turn/steer",
+                json!({"thread_id": thread_id, "input": format!("steer {attempt}")}),
+            )
+            .await;
+        let log = client.recv_until(|m| m["method"] == "turn/completed").await;
+        assert!(
+            log.iter().any(|m| m["method"] == "system"),
+            "the provider command still reports its result: {log:?}"
+        );
+        assert_eq!(
+            steered_texts(&dirs, &thread_id),
+            vec![format!("steer {attempt}")],
+            "the steer queued behind /provider was never delivered"
+        );
+    }
+
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

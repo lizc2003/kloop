@@ -79,6 +79,23 @@ pub(super) async fn thread_worker(
         };
         let turn = match message {
             ThreadWorkerMsg::Turn(turn) => turn,
+            ThreadWorkerMsg::ProviderCommand { text } => {
+                let args = provider_command_args(&text).unwrap_or_default();
+                let output = run_provider_command(
+                    &args,
+                    &mut cfg,
+                    &provider_state,
+                    &active_route,
+                    &mut history,
+                    &ui,
+                );
+                ui.notify("system", json!({"text": output}));
+                inbox.close_steer_window();
+                *current_cancel.lock().unwrap() = None;
+                running.store(false, Ordering::SeqCst);
+                wake_for_pending_inbox(&inbox);
+                continue;
+            }
             ThreadWorkerMsg::SwitchProvider {
                 provider_id,
                 model,
@@ -132,28 +149,11 @@ pub(super) async fn thread_worker(
                     },
                 };
                 running.store(false, Ordering::SeqCst);
-                let _ = ui.out.send(outgoing.to_json());
+                let _ = ui.out.send(outgoing.into_bytes());
+                wake_for_pending_inbox(&inbox);
                 continue;
             }
         };
-        if turn.images.is_empty()
-            && let Some(args) = provider_command_args(&turn.text)
-        {
-            let output = run_provider_command(
-                &args,
-                &mut cfg,
-                &provider_state,
-                &active_route,
-                &mut history,
-                &ui,
-            );
-            ui.notify("system", json!({"text": output}));
-            inbox.close_steer_window();
-            *current_cancel.lock().unwrap() = None;
-            running.store(false, Ordering::SeqCst);
-            *ui.turn.lock().unwrap() = None;
-            continue;
-        }
         ui.notify("turn/started", wire::turn_started_params(turn.id));
         let reason = run_turn_or_command(
             &mut cfg,
@@ -177,6 +177,7 @@ pub(super) async fn thread_worker(
         *current_cancel.lock().unwrap() = None;
         running.store(false, Ordering::SeqCst);
         *ui.turn.lock().unwrap() = None;
+        wake_for_pending_inbox(&inbox);
     }
     let shutdown_ui: Arc<dyn Ui> = ui.clone();
     let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
@@ -191,7 +192,18 @@ pub(super) async fn thread_worker(
     }
 }
 
-fn provider_command_args(text: &str) -> Option<Vec<&str>> {
+fn wake_for_pending_inbox(inbox: &kloop_core::inbox::Inbox) {
+    if !inbox.is_empty() {
+        // `turn_start`/switch set `running` before the worker sees their
+        // message, so an activity notification that arrived in that window was
+        // consumed while the loop was still busy. Re-announce the queue once the
+        // operation releases the thread; otherwise a steer or scheduled
+        // delivery would sit there until some unrelated event happened.
+        inbox.notify_activity();
+    }
+}
+
+pub(super) fn provider_command_args(text: &str) -> Option<Vec<&str>> {
     let rest = text.strip_prefix("/provider")?;
     if rest
         .chars()

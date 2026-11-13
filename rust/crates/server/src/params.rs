@@ -8,6 +8,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use kloop_core::history::ProviderSwitchError;
+use kloop_core::provider_route::ProviderCatalog;
 use kloop_core::provider_route::SwitchError;
 use kloop_core::rollout;
 use kloop_core::rollout::SessionRuntime;
@@ -15,6 +16,7 @@ use kloop_core::rollout::SessionSnapshot;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ImageSource;
+use kloop_protocol::ProviderRouteReceipt;
 
 use crate::ThreadStartOptions;
 use crate::wire;
@@ -81,19 +83,43 @@ impl std::fmt::Display for SwitchRequestError {
 
 pub(super) fn switch_error_kind(error: &ProviderSwitchError) -> &'static str {
     match error {
-        ProviderSwitchError::Route(SwitchError::UnknownProvider(_)) => "unknown_provider",
-        ProviderSwitchError::Route(SwitchError::UnknownModel { .. }) => "unknown_model",
-        ProviderSwitchError::Route(SwitchError::Unavailable { .. }) => "provider_unavailable",
-        ProviderSwitchError::Route(SwitchError::StaleRevision { .. }) => "stale_revision",
+        ProviderSwitchError::Route(error) => route_switch_error_kind(error),
         ProviderSwitchError::Persistence(_) => "route_persistence_failed",
         ProviderSwitchError::History(_) => "history_projection_failed",
-        ProviderSwitchError::Route(
-            SwitchError::RouteDrift(_)
-            | SwitchError::RevisionExhausted
-            | SwitchError::InvalidRevision
-            | SwitchError::InvalidTimeline
-            | SwitchError::InvalidInheritedProviderModel,
-        ) => "invalid_route",
+    }
+}
+
+/// The `data.kind` token for a route-level switch refusal. Both the queued
+/// switch transaction and the read-loop preflight answer with the same
+/// vocabulary.
+pub(super) fn route_switch_error_kind(error: &SwitchError) -> &'static str {
+    match error {
+        SwitchError::UnknownProvider(_) => "unknown_provider",
+        SwitchError::UnknownModel { .. } => "unknown_model",
+        SwitchError::Unavailable { .. } => "provider_unavailable",
+        SwitchError::StaleRevision { .. } => "stale_revision",
+        SwitchError::RouteDrift(_)
+        | SwitchError::RevisionExhausted
+        | SwitchError::InvalidRevision
+        | SwitchError::InvalidTimeline
+        | SwitchError::InvalidInheritedProviderModel => "invalid_route",
+    }
+}
+
+/// The public route projection of the last durable receipt. Effort never enters
+/// the timeline, so a route read off disk reports the effort a session there
+/// would start at.
+pub(super) fn public_route_from_record(
+    record: &ProviderRouteReceipt,
+    catalog: &ProviderCatalog,
+) -> ActiveProviderRoute {
+    ActiveProviderRoute {
+        revision: record.route_revision,
+        effort: catalog.default_effort(&record.provider_id),
+        provider_id: record.provider_id.clone(),
+        api_family: record.api_family,
+        model: record.model.clone(),
+        continuity: record.continuity,
     }
 }
 
@@ -229,10 +255,16 @@ pub(super) fn thread_runtime_json(
 }
 
 pub(super) fn fork_origin_json(path: &Path) -> Value {
-    let Some(origin) = rollout::fork_origin(path) else {
+    fork_origin_value(rollout::session_origin(path).as_ref())
+}
+
+/// The public `forked_from` projection. A sub-agent origin has no cross-file
+/// cut point and stays null here, like a fresh session.
+pub(super) fn fork_origin_value(origin: Option<&rollout::SessionOrigin>) -> Value {
+    let Some(rollout::SessionOrigin::Fork(parent)) = origin else {
         return Value::Null;
     };
-    let Some((thread_id, cut)) = origin.rsplit_once('#') else {
+    let Some((thread_id, cut)) = parent.rsplit_once('#') else {
         return Value::Null;
     };
     json!({
@@ -246,38 +278,29 @@ pub(super) fn parse_thread_start_options(
     default_cwd: &Path,
 ) -> Result<ThreadStartOptions, (i64, String)> {
     let cwd = resolve_cwd(params.get("cwd"), default_cwd)?;
-
-    let model = match params.get("model") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(raw)) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
-        Some(Value::String(_)) => {
-            return Err((wire::INVALID_PARAMS, "'model' must not be empty".into()));
-        }
-        Some(_) => return Err((wire::INVALID_PARAMS, "'model' must be a string".into())),
-    };
-
-    let provider_id = match params.get("provider_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(raw)) if !raw.trim().is_empty() => Some(raw.trim().to_string()),
-        Some(Value::String(_)) => {
-            return Err((
-                wire::INVALID_PARAMS,
-                "'provider_id' must not be empty".into(),
-            ));
-        }
-        Some(_) => {
-            return Err((
-                wire::INVALID_PARAMS,
-                "'provider_id' must be a string".into(),
-            ));
-        }
-    };
+    let model = optional_nonempty_str(params, "model")?;
+    let provider_id = optional_nonempty_str(params, "provider_id")?;
 
     Ok(ThreadStartOptions {
         cwd,
         provider_id,
         model,
     })
+}
+
+/// An optional string parameter that is trimmed before use. An empty value is
+/// refused rather than silently treated as absent: the client meant to name
+/// something, and sending the default instead would hide the typo.
+pub(super) fn optional_nonempty_str(
+    params: &Value,
+    key: &str,
+) -> Result<Option<String>, (i64, String)> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) if !raw.trim().is_empty() => Ok(Some(raw.trim().to_string())),
+        Some(Value::String(_)) => Err((wire::INVALID_PARAMS, format!("'{key}' must not be empty"))),
+        Some(_) => Err((wire::INVALID_PARAMS, format!("'{key}' must be a string"))),
+    }
 }
 
 pub(super) fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, (i64, String)> {
