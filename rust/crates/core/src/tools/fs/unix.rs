@@ -213,18 +213,28 @@ fn rename_no_replace(parent: &std::fs::File, name: &OsStr, leaf: &OsStr) -> Resu
         Ok(()) => return Ok(()),
         // The flag, the syscall, or the filesystem may lack non-replacing
         // rename. Anything else (notably EEXIST) is the answer, not a reason
-        // to try a weaker primitive.
-        Err(
-            rustix::io::Errno::INVAL
-            | rustix::io::Errno::NOSYS
-            | rustix::io::Errno::NOTSUP
-            | rustix::io::Errno::OPNOTSUPP,
-        ) => {}
+        // to try a weaker primitive. Compared with `==` rather than an
+        // or-pattern: on Linux ENOTSUP and EOPNOTSUPP are the same value, and
+        // listing both patterns is an unreachable-pattern warning there.
+        Err(error) if rename_flags_unsupported(error) => {}
         Err(error) => {
             return Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into());
         }
     }
     link_no_replace(parent, name, leaf)
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rename_flags_unsupported(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::INVAL
+        || error == rustix::io::Errno::NOSYS
+        || error == rustix::io::Errno::NOTSUP
+        || error == rustix::io::Errno::OPNOTSUPP
 }
 
 #[cfg(not(any(

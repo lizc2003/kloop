@@ -33,6 +33,9 @@
   无关的 bash 管道用例在环境里偶发失败，单跑与再次全跑都通过）；`cargo clippy
   -p kloop-core --lib -- -D warnings` 通过；DESIGN 文件工具/预览/notebook/search 段已更新。
   未跑全量 `make check`。
+- 复审修正：`renameat_with` 的不支持 errno 改用 `==` 比较（Linux 上 ENOTSUP 与
+  EOPNOTSUPP 同值，or-pattern 会触发 `unreachable_patterns`）；不可读文件测试先确认
+  `chmod 000` 真的挡住打开，CAP_DAC_OVERRIDE 环境下跳过该断言。
 
 ## 问题
 

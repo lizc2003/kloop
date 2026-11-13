@@ -1486,6 +1486,14 @@ mod tests {
         );
         let blocked = t.root.join("blocked.rs");
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root with CAP_DAC_OVERRIDE (the default in many containers) reads a
+        // mode-000 file anyway. Without the restriction this environment has no
+        // way to produce an open failure, so fail the premise rather than the
+        // assertion.
+        if std::fs::File::open(&blocked).is_ok() {
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
         let out = grep_tool(
             &json!({"pattern": "needle", "path": t.path(), "output_mode": "content"}),
             Path::new("."),
