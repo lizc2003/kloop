@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -20,6 +19,9 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use kloop_process_spawn::ProcessSpec;
+use kloop_process_spawn::ProcessStdio;
+use kloop_process_spawn::ProcessTreeChild;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufRead;
@@ -70,7 +72,7 @@ pub(crate) struct StdioTransport {
     health: tokio::sync::watch::Sender<McpTransportHealth>,
     next_id: AtomicU64,
     reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    child: Mutex<Option<tokio::process::Child>>,
+    child: Mutex<Option<ProcessTreeChild>>,
 }
 
 impl Drop for StdioTransport {
@@ -84,20 +86,26 @@ impl StdioTransport {
         let (program, args) = command
             .split_first()
             .context("mcp server command must not be empty")?;
-        let mut process = tokio::process::Command::new(program);
-        process
-            .args(args)
-            .envs(env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = kloop_process_spawn::spawn(&mut process)
+        // The shared process-tree spawner gives the server its own process
+        // group / Job Object: shutting down an `npx`-style launcher must take
+        // the grandchild server with it, not leave it as an orphan.
+        let cwd = std::env::current_dir().context("mcp server working directory")?;
+        let resolved = kloop_process_spawn::resolve_program(program);
+        let mut spec = ProcessSpec::new(resolved, cwd);
+        for arg in args {
+            spec.arg(arg);
+        }
+        for (name, value) in env {
+            spec.env(name, value);
+        }
+        spec.stdin = ProcessStdio::Pipe;
+        spec.stdout = ProcessStdio::Pipe;
+        spec.stderr = ProcessStdio::Null;
+        let mut child = kloop_process_spawn::spawn_process_tree(spec)
             .with_context(|| format!("cannot spawn mcp server '{program}'"))?;
-        let stdin = child.stdin.take().context("mcp child stdin unavailable")?;
+        let stdin = child.take_stdin().context("mcp child stdin unavailable")?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .context("mcp child stdout unavailable")?;
         Ok(Self::over(stdout, stdin, Some(child)))
     }
@@ -105,7 +113,7 @@ impl StdioTransport {
     pub(crate) fn over(
         reader: impl AsyncRead + Send + Unpin + 'static,
         writer: impl AsyncWrite + Send + Unpin + 'static,
-        child: Option<tokio::process::Child>,
+        child: Option<ProcessTreeChild>,
     ) -> Self {
         let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(Box::new(writer)));
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -246,8 +254,8 @@ impl Transport for StdioTransport {
 
     fn abort(&self) {
         self.close_local(McpTransportFailure::ExplicitShutdown);
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.start_kill();
+        if let Some(child) = self.child.lock().unwrap().as_ref() {
+            let _ = child.killer().terminate();
         }
     }
 
@@ -256,7 +264,7 @@ impl Transport for StdioTransport {
             self.close_local(McpTransportFailure::ExplicitShutdown);
             let child = self.child.lock().unwrap().take();
             if let Some(mut child) = child {
-                let _ = child.kill().await;
+                let _ = child.terminate_and_wait(Duration::from_secs(5)).await;
             }
         })
     }

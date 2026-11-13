@@ -313,7 +313,7 @@ pub(crate) trait Transport: Send + Sync {
 
 /// One connected MCP server. All methods take `&self`; concurrent calls are
 /// multiplexed by the transport. Dropping the client tears the transport down
-/// (stdio kills the child via kill_on_drop and stops the reader task).
+/// (stdio terminates the child's whole process tree and stops the reader task).
 pub struct McpClient {
     transport: Box<dyn Transport>,
     capabilities: Mutex<McpServerCapabilities>,
@@ -335,7 +335,7 @@ impl McpClient {
     pub fn over(
         reader: impl AsyncRead + Send + Unpin + 'static,
         writer: impl AsyncWrite + Send + Unpin + 'static,
-        child: Option<tokio::process::Child>,
+        child: Option<kloop_process_spawn::ProcessTreeChild>,
     ) -> Self {
         Self {
             transport: Box::new(StdioTransport::over(reader, writer, child)),

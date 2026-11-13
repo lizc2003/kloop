@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 
 #[cfg(unix)]
 mod unix;
@@ -17,15 +18,16 @@ use unix as platform;
 #[cfg(windows)]
 use windows as platform;
 
-pub(crate) type ProcessPipe = Pin<Box<dyn AsyncRead + Send>>;
+pub type ProcessPipe = Pin<Box<dyn AsyncRead + Send>>;
+pub type ProcessWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
-pub(crate) enum ProcessStdio {
+pub enum ProcessStdio {
     Null,
     Pipe,
     File(File),
 }
 
-pub(crate) struct ProcessSpec {
+pub struct ProcessSpec {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
@@ -39,7 +41,7 @@ pub(crate) struct ProcessSpec {
 }
 
 impl ProcessSpec {
-    pub(crate) fn new(executable: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+    pub fn new(executable: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
             args: Vec::new(),
@@ -54,96 +56,97 @@ impl ProcessSpec {
         }
     }
 
-    pub(crate) fn arg(&mut self, arg: impl Into<OsString>) {
+    pub fn arg(&mut self, arg: impl Into<OsString>) {
         self.args.push(arg.into());
     }
 
-    pub(crate) fn env(&mut self, name: impl Into<OsString>, value: impl Into<OsString>) {
+    pub fn env(&mut self, name: impl Into<OsString>, value: impl Into<OsString>) {
         self.env_add.push((name.into(), value.into()));
     }
 
-    pub(crate) fn env_remove(&mut self, name: impl Into<OsString>) {
+    pub fn env_remove(&mut self, name: impl Into<OsString>) {
         self.env_remove.push(name.into());
     }
 
     #[cfg(windows)]
-    pub(crate) fn require_windows_descendant_debugging(&mut self) {
+    pub fn require_windows_descendant_debugging(&mut self) {
         self.windows_debug_descendants = true;
     }
 
-    #[cfg(all(test, windows))]
-    pub(crate) fn windows_debug_descendants(&self) -> bool {
+    #[cfg(windows)]
+    pub fn windows_debug_descendants(&self) -> bool {
         self.windows_debug_descendants
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ProcessExit {
+pub struct ProcessExit {
     code: Option<i32>,
     success: bool,
 }
 
 impl ProcessExit {
-    pub(crate) fn code(self) -> Option<i32> {
+    pub fn code(self) -> Option<i32> {
         self.code
     }
 
-    pub(crate) fn success(self) -> bool {
+    pub fn success(self) -> bool {
         self.success
     }
 }
 
-pub(crate) struct ProcessTreeChild {
+pub struct ProcessTreeChild {
     inner: platform::Child,
 }
 
 #[derive(Clone)]
-pub(crate) struct ProcessTreeKiller {
+pub struct ProcessTreeKiller {
     inner: platform::Killer,
 }
 
-pub(crate) fn spawn(spec: ProcessSpec) -> io::Result<ProcessTreeChild> {
+pub fn spawn(spec: ProcessSpec) -> io::Result<ProcessTreeChild> {
     platform::spawn(spec).map(|inner| ProcessTreeChild { inner })
 }
 
 impl ProcessTreeChild {
-    pub(crate) fn take_stdout(&mut self) -> Option<ProcessPipe> {
+    pub fn take_stdin(&mut self) -> Option<ProcessWriter> {
+        self.inner.take_stdin()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<ProcessPipe> {
         self.inner.take_stdout()
     }
 
-    pub(crate) fn take_stderr(&mut self) -> Option<ProcessPipe> {
+    pub fn take_stderr(&mut self) -> Option<ProcessPipe> {
         self.inner.take_stderr()
     }
 
-    pub(crate) fn killer(&self) -> ProcessTreeKiller {
+    pub fn killer(&self) -> ProcessTreeKiller {
         ProcessTreeKiller {
             inner: self.inner.killer(),
         }
     }
 
-    pub(crate) async fn wait(&mut self) -> io::Result<ProcessExit> {
+    pub async fn wait(&mut self) -> io::Result<ProcessExit> {
         self.inner.wait().await
     }
 
-    pub(crate) async fn cleanup_after_exit(&mut self, timeout: Duration) -> io::Result<()> {
+    pub async fn cleanup_after_exit(&mut self, timeout: Duration) -> io::Result<()> {
         self.inner.cleanup_after_exit(timeout).await
     }
 
-    pub(crate) async fn terminate_and_wait(
-        &mut self,
-        timeout: Duration,
-    ) -> io::Result<ProcessExit> {
+    pub async fn terminate_and_wait(&mut self, timeout: Duration) -> io::Result<ProcessExit> {
         self.inner.terminate_and_wait(timeout).await
     }
 }
 
 impl ProcessTreeKiller {
-    pub(crate) fn terminate(&self) -> io::Result<()> {
+    pub fn terminate(&self) -> io::Result<()> {
         self.inner.terminate()
     }
 
     #[cfg(test)]
-    pub(crate) fn is_alive(&self) -> io::Result<bool> {
+    pub fn is_alive(&self) -> io::Result<bool> {
         self.inner.is_alive()
     }
 }
@@ -180,6 +183,58 @@ mod tests {
         killer.terminate().unwrap();
         child
             .terminate_and_wait(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(!killer.is_alive().unwrap());
+    }
+
+    /// A piped stdin is writable from the parent and reaches the child.
+    #[tokio::test]
+    async fn piped_stdin_round_trips() {
+        use tokio::io::AsyncBufReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut spec = ProcessSpec::new("/bin/sh", std::env::current_dir().unwrap());
+        spec.arg("-c");
+        spec.arg("read line; printf 'got:%s\\n' \"$line\"");
+        spec.stdin = ProcessStdio::Pipe;
+        spec.stdout = ProcessStdio::Pipe;
+        let mut child = spawn(spec).unwrap();
+        let mut stdin = child.take_stdin().expect("piped stdin");
+        let stdout = child.take_stdout().expect("piped stdout");
+        stdin.write_all(b"hello\n").await.unwrap();
+        stdin.flush().await.unwrap();
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("child must answer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "got:hello");
+        drop(stdin);
+        assert!(child.wait().await.unwrap().success());
+        child
+            .cleanup_after_exit(Duration::from_secs(2))
+            .await
+            .unwrap();
+    }
+
+    /// The tree outlives the root: a launcher that exits while its child keeps
+    /// running is still fully terminated.
+    #[tokio::test]
+    async fn terminating_the_tree_reaches_a_grandchild_after_the_root_exits() {
+        let mut spec = ProcessSpec::new("/bin/sh", std::env::current_dir().unwrap());
+        spec.arg("-c");
+        spec.arg("sleep 30 & exit 0");
+        let mut child = spawn(spec).unwrap();
+        let killer = child.killer();
+        child.wait().await.unwrap();
+        assert!(
+            killer.is_alive().unwrap(),
+            "the background child outlives sh"
+        );
+        child
+            .cleanup_after_exit(Duration::from_secs(2))
             .await
             .unwrap();
         assert!(!killer.is_alive().unwrap());

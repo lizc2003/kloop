@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::process_tree::ProcessSpec;
+use kloop_process_spawn::ProcessSpec;
 
 /// Provider/search credentials belong to the parent process, never to a
 /// model-controlled shell. The capture must not bring them back: the user's own

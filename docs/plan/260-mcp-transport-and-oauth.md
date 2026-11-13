@@ -1,8 +1,9 @@
 # Plan 260 — MCP 传输与 OAuth
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。
+> 状态：✅ 已完成（2026-11-13）。行号是 2026-10-28 的读数，开工时已按函数重核。
+> 9 条全部成立，无划掉条目；第 5、9 条按用户拍板：`tools/call` 只重试“未处理”，
+> stdio 改用共用的 `process_tree`（第二个提交）。
 
 ## 问题
 
@@ -36,12 +37,12 @@
 9. **stdio 子进程只杀直接子进程**(观察)。`kill_on_drop`/`start_kill`:`npx` 这类再起孙进程的命令
    退出时可能留下孤儿;TUI 退出时中止连接任务也依赖这个机制。
 
-## 开工先问用户
+## 开工先问用户（已定）
 
-- 第 5 条：`tools/call` 只重试 `is_connect()` 与 429/503 这类明确"未处理"的情况，其余直接把失败
-  交给模型——要不要?推荐要;其它幂等方法(`tools/list`、`resources/read`)维持现状。
-- 第 9 条要不要改用 `process_tree` 起 stdio server(整棵树终止)?推荐要，但单独一个提交，Windows
-  只能交叉编译验证(教训 183/201)。
+- 第 5 条：用户同意。`tools/call` 只重试 `is_connect()` 与 429/503；500/502/504 等等不再重放，
+  其它幂等方法维持原重试表。
+- 第 9 条：用户选择“共用”。`core/src/process_tree/` 整体搬进 `kloop-process-spawn`，
+  core 与 MCP stdio 共用同一套整树终止；Windows 补 stdin 管道分支，只能交叉编译验证。
 
 ## 做法
 
@@ -63,3 +64,52 @@
   不被锁;不响应的 token endpoint 让刷新按时失败;503 后刷新成功 `needs_relogin` 复位;tools/call
   遇 502 不重放;回调端口上一个哑连接不阻塞真实回调。
 - DESIGN 约 1967 行先读再改;外层执行沙箱之外 `make check`;HANDOFF 记进展与教训。
+
+## 完成记录（2026-11-13）
+
+两个提交：
+
+1. **第 1–8 条**（`fix(plan260): bound MCP writes, OAuth requests and SSE scans`）
+   - 第 1 条：Windows 改用 `rundll32 url.dll,FileProtocolHandler <url>`（不经 cmd 解析，
+     不需要新 windows-sys feature）；`browser_command(platform, url)` 可单测，断言整条
+     带 `&` 的授权 URL 是一个 argv 元素。
+   - 第 2 条：`write_line_before` 用 `timeout_at(deadline)` 把“排队拿写锁 + 写 + flush”
+     放进与响应同一个 deadline；notify 用 `HANDSHAKE_TIMEOUT`；read_loop 的 -32601 拒绝
+     改 `try_lock`（拿不到就放弃这条拒绝），写本身也带 5s 上限。回归：64 字节 duplex 上
+     64KiB 请求 100ms 超时、health=Closed(WriteFailed)、后续请求立即失败；锁被占用时
+     `write_refusal` 立刻返回 None。
+   - 第 3 条：OAuth 统一 `oauth_http_client()`（connect 10s、整请求 30s），login 的发现/
+     注册/换码与 request-time refresh 共用；MCP HTTP client 加 10s connect 预算。
+     回归：只 accept 不应答的 token endpoint 在 200ms 客户端预算内失败，且不置 relogin。
+   - 第 4 条：`refresh_failure_is_definitive`——只有 400/401 且 error 为
+     invalid_grant/invalid_client/unauthorized_client 才置 `needs_relogin`；5xx/429/非 JSON
+     视为瞬时；刷新成功 `store(false)`。回归：503 → 不置位；成功后清位。
+   - 第 5 条：`Attempt::NotProcessed`（connect 失败、429/503）与 `MaybeProcessed`（其余
+     408/5xx、读失败）分开，`Replay::OnlyUnprocessed` 给 `tools/call`。回归：502 只请求
+     一次；503 重试后成功；其它方法保持旧行为。
+   - 第 6 条：回调每个连接 5s 租约，state 不匹配 / 无 state 的 `error=` / 无 code 一律
+     忽略继续等，匹配的 `error=` 才终止。回归：错误 state 后仍能完成登录；哑连接不挡住
+     真回调；匹配的 error redirect 仍报错。
+   - 第 7 条：`SseParser` 记录 `scanned`，从 `scanned-3` 继续扫；回归用 `examined` 计数
+     钉住 1MiB/64 块只扫约一遍。
+   - 第 8 条：SSE 上限改计 data 字节 + 未完成帧大小；回归：8MiB+ keep-alive 注释后仍能
+     收到响应。
+2. **第 9 条**（`fix(plan260): share the process tree with MCP stdio`）
+   - `core/src/process_tree/` 搬进 `kloop-process-spawn`（`spawn_process_tree`，公共类型
+     `ProcessSpec/ProcessStdio/ProcessTreeChild/Killer/Exit/Pipe/Writer`），core 只改 `use`。
+   - Unix 侧加 `ProcessStdio::Pipe` stdin 与 `take_stdin`；Windows 补 `prepare_input`
+     （CreatePipe，读端可继承、写端清除继承标志）并贯通普通与 debug 两条 spawn 路径。
+   - `resolve_program`：Windows 的 `CreateProcessW` 显式 application path 不查 PATH，
+     按 cwd → PATH → `.exe` 解析，保持 `command = ["npx", …]` 可用；Unix 原样。
+   - MCP stdio 改用它起子进程；abort 用 `killer().terminate()`，shutdown 用
+     `terminate_and_wait(5s)`。
+   - 回归：piped stdin 往返；root 退出后后台孙进程仍在、`cleanup_after_exit` 收掉整组。
+
+验证：`cargo test -p kloop-mcp`（42 lib + 14 集成）、`cargo test -p kloop-process-spawn`
+（4 项，含新增两项）、`cargo test -p kloop-core --lib`、`cargo test -p kloop --bin kloop mcp_auth`
+（10 项）、`cargo clippy -p kloop-mcp -p kloop --all-targets -D warnings`、`cargo fmt --check`。
+Windows：`cargo xwin clippy --target x86_64-pc-windows-msvc -p kloop-process-spawn -p kloop-mcp
+--all-targets -D warnings` 与 `-p kloop-core --lib` 通过；整仓 `make check-windows` 仍被
+core 测试目标里三条既有 dead-code（`PathFacts::gather`、`skip_nested_seatbelt_test`、
+`Builtin::concurrency_safe`，都与本计划无关）挡住，未在 Windows 上实际运行。
+未跑全量 `make check`、parity 与真实 API。

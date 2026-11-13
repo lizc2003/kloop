@@ -11,9 +11,9 @@ use super::ToolCtx;
 use super::bash;
 use super::str_arg;
 use crate::config::EffectiveWorkspace;
-use crate::process_tree::ProcessSpec;
 use crate::shell_programs::ShellFlavor;
 use crate::shell_programs::ShellProgram;
+use kloop_process_spawn::ProcessSpec;
 
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 

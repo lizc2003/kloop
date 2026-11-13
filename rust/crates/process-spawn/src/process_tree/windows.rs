@@ -96,6 +96,7 @@ use super::ProcessExit;
 use super::ProcessPipe;
 use super::ProcessSpec;
 use super::ProcessStdio;
+use super::ProcessWriter;
 
 #[derive(Debug)]
 struct OwnedHandle(HANDLE);
@@ -250,6 +251,7 @@ pub(super) struct Child {
     process: OwnedHandle,
     killer: Killer,
     debugger: Option<Debugger>,
+    stdin: Option<ProcessWriter>,
     stdout: Option<ProcessPipe>,
     stderr: Option<ProcessPipe>,
     waiter: Option<tokio::task::JoinHandle<io::Result<()>>>,
@@ -260,6 +262,7 @@ struct ChildStdio {
     stdin: OwnedHandle,
     stdout: OwnedHandle,
     stderr: OwnedHandle,
+    parent_stdin: Option<File>,
     parent_stdout: Option<File>,
     parent_stderr: Option<File>,
 }
@@ -278,6 +281,7 @@ struct DebugFailure {
 struct DebugSpawned {
     process: OwnedHandle,
     jobs: Arc<JobSet>,
+    stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
 }
@@ -286,6 +290,7 @@ struct DebugThreadRoot {
     process: OwnedHandle,
     jobs: Arc<JobSet>,
     root_pid: u32,
+    stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
 }
@@ -395,12 +400,6 @@ fn spawn_impl(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
             "Windows process executable must be absolute",
         ));
     }
-    if !matches!(stdin, ProcessStdio::Null) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Windows process stdin currently must be null",
-        ));
-    }
 
     let jobs = Arc::new(create_job_set()?);
     #[cfg(test)]
@@ -415,8 +414,8 @@ fn spawn_impl(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
     } else {
         None
     };
-    let creation_guard = kloop_process_spawn::lock();
-    let stdio = prepare_stdio(stdout, stderr)?;
+    let creation_guard = crate::lock();
+    let stdio = prepare_stdio(stdin, stdout, stderr)?;
     let attributes =
         AttributeList::for_handles(&[stdio.stdin.raw(), stdio.stdout.raw(), stdio.stderr.raw()])?;
     let executable_wide = wide_nul(executable.as_os_str(), "executable")?;
@@ -499,6 +498,10 @@ fn spawn_impl(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
     drop(stdio.stderr);
     drop(creation_guard);
 
+    let stdin = stdio
+        .parent_stdin
+        .map(tokio::fs::File::from_std)
+        .map(|pipe| Box::pin(pipe) as ProcessWriter);
     let stdout = stdio
         .parent_stdout
         .map(tokio::fs::File::from_std)
@@ -511,6 +514,7 @@ fn spawn_impl(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
         process,
         killer: Killer { jobs },
         debugger: None,
+        stdin,
         stdout,
         stderr,
         waiter: None,
@@ -536,6 +540,7 @@ fn spawn_debugged(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
                 let spawned = DebugSpawned {
                     process: parent_process,
                     jobs: root.jobs.clone(),
+                    stdin: root.stdin,
                     stdout: root.stdout,
                     stderr: root.stderr,
                 };
@@ -569,6 +574,10 @@ fn spawn_debugged(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
             )));
         }
     };
+    let stdin = spawned
+        .stdin
+        .map(tokio::fs::File::from_std)
+        .map(|pipe| Box::pin(pipe) as ProcessWriter);
     let stdout = spawned
         .stdout
         .map(tokio::fs::File::from_std)
@@ -584,6 +593,7 @@ fn spawn_debugged(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
             thread: Some(thread),
             failure,
         }),
+        stdin,
         stdout,
         stderr,
         waiter: None,
@@ -611,12 +621,6 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
             "Windows process executable must be absolute",
         ));
     }
-    if !matches!(stdin, ProcessStdio::Null) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Windows process stdin currently must be null",
-        ));
-    }
     let jobs = Arc::new(create_job_set()?);
     #[cfg(test)]
     if fault == SpawnFault::DebugDescendantBreakaway {
@@ -634,8 +638,8 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
     } else {
         None
     };
-    let creation_guard = kloop_process_spawn::lock();
-    let mut stdio = prepare_stdio(stdout, stderr)?;
+    let creation_guard = crate::lock();
+    let mut stdio = prepare_stdio(stdin, stdout, stderr)?;
     let attributes =
         AttributeList::for_handles(&[stdio.stdin.raw(), stdio.stdout.raw(), stdio.stderr.raw()])?;
     let executable_wide = wide_nul(executable.as_os_str(), "executable")?;
@@ -726,6 +730,7 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
         process,
         jobs,
         root_pid: info.dwProcessId,
+        stdin: stdio.parent_stdin.take(),
         stdout: stdio.parent_stdout.take(),
         stderr: stdio.parent_stderr.take(),
     })
@@ -1031,17 +1036,53 @@ fn create_suspended_test_process(cwd: &std::path::Path) -> io::Result<(OwnedHand
     ))
 }
 
-fn prepare_stdio(stdout: ProcessStdio, stderr: ProcessStdio) -> io::Result<ChildStdio> {
-    let stdin = open_null(GENERIC_READ)?;
+fn prepare_stdio(
+    stdin: ProcessStdio,
+    stdout: ProcessStdio,
+    stderr: ProcessStdio,
+) -> io::Result<ChildStdio> {
+    let (stdin, parent_stdin) = prepare_input(stdin)?;
     let (stdout, parent_stdout) = prepare_output(stdout)?;
     let (stderr, parent_stderr) = prepare_output(stderr)?;
     Ok(ChildStdio {
         stdin,
         stdout,
         stderr,
+        parent_stdin,
         parent_stdout,
         parent_stderr,
     })
+}
+
+/// The child's stdin handle and, for a pipe, the parent's write end. Mirrors
+/// [`prepare_output`]: the child end is inheritable, the parent end is not.
+fn prepare_input(stdio: ProcessStdio) -> io::Result<(OwnedHandle, Option<File>)> {
+    match stdio {
+        ProcessStdio::Null => Ok((open_null(GENERIC_READ)?, None)),
+        ProcessStdio::Pipe => {
+            let security = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: ptr::null_mut(),
+                bInheritHandle: 1,
+            };
+            let mut read: HANDLE = ptr::null_mut();
+            let mut write: HANDLE = ptr::null_mut();
+            if unsafe { CreatePipe(&mut read, &mut write, &security, 0) } == 0 {
+                return Err(last_error());
+            }
+            let read = OwnedHandle::new(read)?;
+            let write = OwnedHandle::new(write)?;
+            if unsafe { SetHandleInformation(write.raw(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(last_error());
+            }
+            Ok((read, Some(write.into_file())))
+        }
+        ProcessStdio::File(file) => {
+            let source = file.as_raw_handle() as HANDLE;
+            let inherited = duplicate_handle(source, true)?;
+            Ok((inherited, None))
+        }
+    }
 }
 
 fn prepare_output(stdio: ProcessStdio) -> io::Result<(OwnedHandle, Option<File>)> {
@@ -1271,6 +1312,10 @@ impl Child {
     #[cfg(test)]
     pub(super) fn waiter_id(&self) -> Option<tokio::task::Id> {
         self.waiter.as_ref().map(tokio::task::JoinHandle::id)
+    }
+
+    pub(super) fn take_stdin(&mut self) -> Option<ProcessWriter> {
+        self.stdin.take()
     }
 
     pub(super) fn take_stdout(&mut self) -> Option<ProcessPipe> {

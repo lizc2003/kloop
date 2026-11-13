@@ -1848,7 +1848,10 @@ dependencies = [
 name = "kloop-process-spawn"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "rustix",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

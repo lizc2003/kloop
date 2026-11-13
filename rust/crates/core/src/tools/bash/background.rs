@@ -47,16 +47,15 @@ use crate::execution_provenance::TransientExecutionId;
 use crate::execution_provenance::WorkspaceProvenance;
 use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
-use crate::process_tree;
-use crate::process_tree::ProcessStdio;
-use crate::process_tree::ProcessTreeChild;
-use crate::process_tree::ProcessTreeKiller;
 use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
 use crate::shell_programs::ShellProgram;
 use crate::tools::ToolCtx;
 use crate::tools::str_arg;
 use crate::tools::strict_str_arg;
+use kloop_process_spawn::ProcessStdio;
+use kloop_process_spawn::ProcessTreeChild;
+use kloop_process_spawn::ProcessTreeKiller;
 
 /// Tail returned inline by bash_output; the rest stays in the output file
 /// (cc's BASH_MAX_OUTPUT_DEFAULT is 30k chars).
@@ -342,7 +341,8 @@ impl BackgroundShells {
             if registry.closed {
                 bail!("bash: the session is closing; no new background commands may start");
             }
-            let child = process_tree::spawn(spec).context("bash: failed to spawn sh")?;
+            let child = kloop_process_spawn::spawn_process_tree(spec)
+                .context("bash: failed to spawn sh")?;
             let killer = child.killer();
             let kill = CancellationToken::new();
             let stop_reason = Arc::new(Mutex::new(None));

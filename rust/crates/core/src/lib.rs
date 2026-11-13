@@ -32,7 +32,6 @@ pub mod interaction;
 mod path_resolve;
 pub mod paths;
 pub mod permissions;
-mod process_tree;
 pub mod project;
 pub mod provider_route;
 pub mod request_reduction;

@@ -11,6 +11,7 @@ use super::ProcessExit;
 use super::ProcessPipe;
 use super::ProcessSpec;
 use super::ProcessStdio;
+use super::ProcessWriter;
 
 #[derive(Clone)]
 pub(super) struct Killer {
@@ -25,6 +26,7 @@ struct Tree {
 pub(super) struct Child {
     child: tokio::process::Child,
     killer: Killer,
+    stdin: Option<ProcessWriter>,
     stdout: Option<ProcessPipe>,
     stderr: Option<ProcessPipe>,
 }
@@ -51,6 +53,10 @@ pub(super) fn spawn(spec: ProcessSpec) -> io::Result<Child> {
     let pid = child
         .id()
         .ok_or_else(|| io::Error::other("spawned process has no pid"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .map(|pipe| Box::pin(pipe) as ProcessWriter);
     let stdout = child
         .stdout
         .take()
@@ -67,6 +73,7 @@ pub(super) fn spawn(spec: ProcessSpec) -> io::Result<Child> {
                 terminated: AtomicBool::new(false),
             }),
         },
+        stdin,
         stdout,
         stderr,
     })
@@ -81,6 +88,10 @@ fn to_stdio(stdio: ProcessStdio) -> io::Result<Stdio> {
 }
 
 impl Child {
+    pub(super) fn take_stdin(&mut self) -> Option<ProcessWriter> {
+        self.stdin.take()
+    }
+
     pub(super) fn take_stdout(&mut self) -> Option<ProcessPipe> {
         self.stdout.take()
     }

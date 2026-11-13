@@ -1,11 +1,27 @@
-//! Process-wide serialization for child creation.
+//! Process-wide serialization for child creation, plus the owned process tree
+//! shared by core's shells and the MCP stdio transport.
 //!
 //! Windows requires stdio handles named by `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
 //! to be inheritable while `CreateProcessW` runs. Every production Windows
 //! child-spawn path takes this same gate so an unrelated concurrent child cannot
 //! inherit those temporary handles.
+//!
+//! [`spawn_process_tree`] starts a child in its own process group (Unix) or Job
+//! Object (Windows) so terminating it also terminates whatever it launched;
+//! [`spawn`] is the gated plain `tokio` spawn for one-shot helpers.
 
 use std::io;
+
+mod process_tree;
+
+pub use process_tree::ProcessExit;
+pub use process_tree::ProcessPipe;
+pub use process_tree::ProcessSpec;
+pub use process_tree::ProcessStdio;
+pub use process_tree::ProcessTreeChild;
+pub use process_tree::ProcessTreeKiller;
+pub use process_tree::ProcessWriter;
+pub use process_tree::spawn as spawn_process_tree;
 
 #[cfg(windows)]
 use std::sync::Mutex;
@@ -43,6 +59,53 @@ pub fn lock() -> ProcessCreationGuard {
 pub fn spawn(command: &mut tokio::process::Command) -> io::Result<tokio::process::Child> {
     let _guard = lock();
     command.spawn()
+}
+
+/// Resolve a configured command for [`ProcessSpec`]: a bare name keeps its
+/// `PATH` meaning on Unix, but the Windows spawner hands `CreateProcessW` an
+/// explicit application path, and that form does neither search `PATH` nor
+/// append `.exe`. Mirroring what `std::process::Command` does (current
+/// directory, then `PATH`, then `.exe`) keeps `command = ["npx", …]` working.
+pub fn resolve_program(program: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(program);
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        if path.is_absolute() || program.contains(['/', '\\']) {
+            return path.to_path_buf();
+        }
+        if let Ok(cwd) = std::env::current_dir()
+            && let Some(found) = find_program_in(&cwd, program)
+        {
+            return found;
+        }
+        if let Some(dirs) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&dirs) {
+                if let Some(found) = find_program_in(&dir, program) {
+                    return found;
+                }
+            }
+        }
+        path.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
+fn find_program_in(dir: &std::path::Path, program: &str) -> Option<std::path::PathBuf> {
+    let direct = dir.join(program);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    if std::path::Path::new(program).extension().is_none() {
+        let exe = dir.join(format!("{program}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    None
 }
 
 pub async fn output(command: &mut tokio::process::Command) -> io::Result<std::process::Output> {

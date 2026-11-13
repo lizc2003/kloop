@@ -6157,8 +6157,10 @@ than being presented as Windows execution.
 Cargo workspace, ten crates; the main dependency graph remains a strict line up
 to core, then two sibling frontends under the cli, with the MCP wire client, Web
 network operations, and the QuickJS code-mode engine kept behind explicit seams.
-The small `kloop-process-spawn` utility is shared by core/MCP/CLI/TUI solely for
-process-wide child-creation serialization
+The small `kloop-process-spawn` utility is shared by core/MCP/CLI/TUI for
+process-wide child-creation serialization and owns the cross-platform child
+process tree (process group on Unix, Job Object on Windows) that core's shells
+and the MCP stdio transport both use
 (protocol ← provider ← core ← {tui, server} ← cli; protocol ← mcp ← cli;
 web ← cli; codemode ← core):
 
@@ -6177,17 +6179,20 @@ crates/provider/    kloop-provider — the adapter seam; owns reqwest
   src/tool_id.rs    tool-call ids as each rail will take them
   src/sse.rs        bounded incremental SSE parser
 
-crates/process-spawn/ process-wide child-creation gate shared across crates
+crates/process-spawn/ process-wide child-creation gate + owned process trees
+  src/lib.rs        spawn/output helpers that take the Windows creation gate
+  src/process_tree/
+    mod.rs          ProcessSpec/Child/Killer façade, piped stdin/stdout/stderr,
+                    lifecycle tests
+    unix.rs         process-group spawn, kill, reap, and residual checks
+    windows.rs      suspended CreateProcessW, stdio handle list (including the
+                    stdin pipe), Job Object RAII, descendant debugging
 
 crates/core/        kloop-core — the agent, network-free
   src/config.rs     Config (construction is the caller's concern)
   src/history.rs    append-only history, record-time offloading,
                     context estimation, provider usage ledger ownership
   src/usage.rs      canonical per-response records + checked aggregate
-  src/process_tree/ cross-platform owned shell process trees
-    mod.rs          ProcessSpec/Child/Killer façade and lifecycle tests
-    unix.rs         process-group spawn, kill, reap, and residual checks
-    windows.rs      suspended CreateProcessW, stdio handle list, Job Object RAII
   src/shell_env.rs   the user's login environment, captured once
   src/shell_programs.rs shell identities, `$SHELL`/override resolution, Windows trusted discovery
   src/tools/        the tool seam and the built-in tools
@@ -6271,7 +6276,8 @@ crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAu
                     tools/list + resources pagination, tools/call validation
   src/stdio.rs      newline-delimited JSON-RPC over a child's stdio: reader
                     task, responses routed to pending requests by id, request
-                    deadline shared by the write and the reply
+                    deadline shared by the write and the reply; the child is
+                    spawned as a whole process tree so shutdown has no orphans
   src/http.rs       streamable HTTP transport: one POST per request,
                     Mcp-Session-Id sessions, re-handshake on 404, replay only
                     when the server cannot have run the operation

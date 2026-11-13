@@ -29,16 +29,15 @@ use crate::config::EffectiveWorkspace;
 use crate::event::Event;
 use crate::permissions::Escalation;
 use crate::permissions::EscalationOutcome;
-use crate::process_tree;
-use crate::process_tree::ProcessExit;
-use crate::process_tree::ProcessSpec;
-use crate::process_tree::ProcessStdio;
 use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
 use crate::shell_env::MODEL_SHELL_SECRET_ENV;
 use crate::shell_env::ShellLoginEnv;
 use crate::shell_programs::ShellFlavor;
 use crate::shell_programs::ShellProgram;
+use kloop_process_spawn::ProcessExit;
+use kloop_process_spawn::ProcessSpec;
+use kloop_process_spawn::ProcessStdio;
 
 /// Each foreground fd is drained to EOF while retaining at most this many
 /// bytes. The final model-visible merge is tighter, matching CC's default
@@ -737,8 +736,8 @@ pub(super) async fn run_process_foreground(
     spec.stdin = ProcessStdio::Null;
     spec.stdout = ProcessStdio::Pipe;
     spec.stderr = ProcessStdio::Pipe;
-    let mut child =
-        process_tree::spawn(spec).with_context(|| format!("{tool}: failed to spawn shell"))?;
+    let mut child = kloop_process_spawn::spawn_process_tree(spec)
+        .with_context(|| format!("{tool}: failed to spawn shell"))?;
     let stdout = child
         .take_stdout()
         .with_context(|| format!("{tool}: stdout pipe missing"))?;
@@ -1175,7 +1174,10 @@ mod tests {
         let shell = crate::shell_programs::ShellPrograms::test_fixture()
             .bash
             .expect("test shell is available");
-        let mut spec = super::ProcessSpec::new(shell.executable, std::env::current_dir().unwrap());
+        let mut spec = kloop_process_spawn::ProcessSpec::new(
+            shell.executable,
+            std::env::current_dir().unwrap(),
+        );
         spec.arg("-lc");
         spec.arg("env");
         spec.env("OPENAI_API_KEY", "SENTINEL-OPENAI");
@@ -1183,9 +1185,9 @@ mod tests {
         spec.env("TAVILY_API_KEY", "SENTINEL-TAVILY");
         spec.env("KEEP_ME", "visible");
         super::scrub_model_shell_env(&mut spec);
-        spec.stdout = super::ProcessStdio::Pipe;
-        spec.stderr = super::ProcessStdio::Pipe;
-        let mut child = crate::process_tree::spawn(spec).unwrap();
+        spec.stdout = kloop_process_spawn::ProcessStdio::Pipe;
+        spec.stderr = kloop_process_spawn::ProcessStdio::Pipe;
+        let mut child = kloop_process_spawn::spawn_process_tree(spec).unwrap();
         let mut stdout = child.take_stdout().unwrap();
         let mut bytes = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut bytes)
@@ -1207,7 +1209,7 @@ mod tests {
     /// 必须在 spawn 前返回 interrupted，结果不依赖子进程调度时机。
     #[tokio::test]
     async fn cancelled_foreground_process_never_spawns() {
-        let spec = super::ProcessSpec::new(
+        let spec = kloop_process_spawn::ProcessSpec::new(
             std::path::PathBuf::from("/nonexistent/kloop-cancel-spawn-probe"),
             std::env::current_dir().unwrap(),
         );

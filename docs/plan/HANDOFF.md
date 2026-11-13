@@ -5,6 +5,27 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 260 ✅：MCP 传输与 OAuth（2026-11-13）**：9 条复核全部成立，两个提交。第 5 条按用户
+同意收窄重放：`tools/call` 只在“服务端不可能已执行”时重试（连接没建起来、429/503），
+502/504 或读响应失败直接交给模型；其它方法维持原 408/429/5xx 与网络错误重试。第 9 条按用户
+选择“共用”：`core/src/process_tree/` 整体搬进 `kloop-process-spawn`，core 只改 `use`，MCP
+stdio 改用它起子进程（abort 用 `killer().terminate()`，shutdown 用 `terminate_and_wait(5s)`），
+顺带给共用 crate 补了 stdin 管道（Unix `Stdio::piped()` + `take_stdin`，Windows `prepare_input`
+建 CreatePipe，读端可继承、写端清继承位）和 `resolve_program`（Windows 的 `CreateProcessW`
+显式 application path 不查 PATH，按 cwd→PATH→`.exe` 解析）。其余：Windows 浏览器改用
+`rundll32 url.dll,FileProtocolHandler <url>`（不经 cmd，`&` 不再被切）；stdio 请求的
+deadline 同时包住“拿写锁+写+等响应”，notify 也封顶，read_loop 的 -32601 拒绝改 `try_lock`
+且不再阻塞读；OAuth 所有请求（login 的发现/注册/换码与 refresh）统一 connect 10s / 整体 30s，
+MCP HTTP 加 10s connect；`needs_relogin` 只由 400/401 的 invalid_grant/invalid_client/
+unauthorized_client 置位、刷新成功复位，5xx/429/非 JSON 视为瞬时；回调每个连接 5s 租约，
+state 不匹配、无 code、无 state 的 `error=` 一律忽略继续等；SSE 分隔符扫描从上次位置续扫，
+8 MiB 上限改计 data 字节与未完成帧（keep-alive 不再吃掉预算）。验证：kloop-mcp 42 lib +
+14 集成、process-spawn 4 项（含 piped stdin 与“root 退出后孙进程仍被收掉”）、kloop-core 库
+1427 过 1 ignored、CLI bin 的 mcp_auth 10 项、两个 crate 的 `clippy --all-targets -D warnings`、
+`fmt --check`；Windows 用 `cargo xwin clippy ... -p kloop-process-spawn -p kloop-mcp --all-targets`
+与 `-p kloop-core --lib` 通过，未在 Windows 实跑；未跑全量 `make check`、parity、真实 API。
+教训 385、386。
+
 **Plan 258 ✅：CLI headless 输出、plain 输入与启动（2026-11-13）**：7 条复核全部成立，
 两个开工问题按推荐定：(a) headless 不带 id 的 `--resume` 在 `parse_args` 拒绝，
 (5a) MCP 启动失败只给安全类别。headless 的 `[forked …]`/`[resumed …]` 改走 stderr，
@@ -1651,7 +1672,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **257** 子 agent、Program、Workflow、调度 | `agent()` 的 `max_rounds` 必失败;Promise 不 settle 时 stop 无效;journal O(n²);休眠后定时延迟 | 中 | — |
 | **258** ✅ CLI 前端 | headless stdout 污染(含 plan 241 那条);plain 两个 stdin 读者;`--plain` 信任前连 MCP;启动期 panic | 中 | — |
 | **259** server 输入与 worker | 唤醒信号被吞 steer 卡住;一行非 UTF-8 让 server 退出;`/provider` 残留 in_progress turn;delta O(n²) | 中 | — |
-| **260** MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
+| **260** ✅ MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
 | **261** web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
 | **262** TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
 | **263** TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
@@ -4998,3 +5019,6 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 383. **“stdout 只放最终答案”是契约时，启动路径也算在契约里；同一个 stdin 有两个读者时，加锁不如共用一个队列。** `--headless` 之前只在 turn 里守 stdout，`open_history` 的 `[forked …]`/`[resumed …]` 仍是 `println!`，`--json` 的第一行就可能不是 JSON——把输出契约当成“输出层”的性质会漏掉所有在输出层之前发生的打印，排查时按“进程从启动到退出的每一条 stdout 写入”过一遍。plain 的 stdin 竞争则是另一种形状：REPL 的 `select!` 先发一个读请求再丢弃 future，读线程已经阻塞在 `read_line`，审批再起一个读者就抢同一行；修法是让两者共用一个容量为 1 的队列（线程持续读、谁在提问谁取），而不是给两个读者加锁或取消。顺带两条：信任门的修复要按“用户回答之前有哪些副作用”排序，MCP 从连接改成先 plan、信任后再 connect，测试必须用真的会留下痕迹的假 server（写标记文件），只断言顺序不够；配置里的数字（`memory_mb`）和 `[env]` 都是外部输入，换算用 checked、拒绝前先想清楚哪个字段可能带凭据（回显名字、不回显值）。
 
 384. **把一个同步单读者循环改成异步读循环，先列“谁依赖到达顺序”。** JSON-RPC 用 id 配对，把 `thread/list`/`thread/read`/`config/read`/`skills/list` 放到阻塞池后，响应本来就会乱序；测试若按“下一行一定是 list 的响应”写，会把正确实现判红。回归要按 id 找消息，顺序断言只留给真正有顺序语义的通道（`turn/started` → item → `turn/completed`）。同一轮的三条：`item/delta` 的 `format!("{current}{text}")` 是在投影锁里的平方复制，直接 `push_str`，输出通道改成预序列化字节后 ring 的留存大小才和实际写出一致；把“失败后重查队列”当成普遍正确的补唤醒，会在 `pre_turn` hook 拒绝、队列没被消费时变成“拒绝→唤醒→再拒绝”的死循环——只有本轮期间新到的动静才算，switch/纯 slash 命令这种从不 drain 的出口才总是补；列表摘要不能为了拿 message count/route 就顺手删掉重放的有效性校验，也不能让 CLI 首屏为它扫全文件——拆成轻量 `session_digest`（第一个用户行就停）和 server 专用的 `session_summary`（整文件但共用 `validate_session_lines`，不建历史、不 repair），并且“有 runtime 行”不是会话有效性的判据（旧夹具会话只有 route 行）。
+
+385. **“超时”要包住整段等待，包括拿锁；而“重试”要先问这次失败能不能确定服务端没执行。** stdio 那条链是三个错误叠出来的：写子进程 stdin 不受任何 deadline 约束、写期间握着同一把 `tokio::sync::Mutex`、读循环要回答服务端请求还得拿同一把锁去写。子进程不读 stdin 时管道（约 64KB）写满，请求永久卡在写里，读循环也停在拿锁上不再读 stdout——服务端等着 stdout 被读、我们等着 stdin 被写，互锁。修法不是给写加个超时了事，而是让“排队拿锁 + 写 + flush + 等响应”共用一个 `timeout_at(deadline)`，并让读循环的拒绝写走 `try_lock`（宁可不回 -32601 也不阻塞读）。同族检查：凡是“持锁做可能阻塞的 IO，而另一条必须前进的路径也要这把锁”，都要先问锁的持有时间上界是什么。重试的判据则不是状态码的“5xx 都可重试”，而是**这次失败能否证明操作没执行**：连接都没建立、429/503 可以；502/504 和读响应时连接被重置不行——`tools/call` 这类有副作用的调用最多执行三次的 bug，就藏在这个区分里。同一条计划里另外两条同类错误：8 MiB 上限按整条 SSE 流累计，把 keep-alive 注释也算了进去，长任务的预算被心跳吃掉（上限应按它要保护的对象计量：data 字节 + 未完成帧，而不是“从连接建立以来的所有字节”）；`needs_relogin` 一次临时 5xx 就永久置真、成功路径从不复位，于是一个瞬时故障让之后所有普通错误都被判成认证失败（粘滞状态要有明确的置位条件与复位路径，不能“一次失败终身有效”）。
+386. **把一个内部模块搬进共用 crate，等于把它原来“只有一个调用方”的隐含前提变成公开契约——先把调用方的用法差异列出来。** `process_tree` 在 core 里只有 shell 用，所以 Windows 实现可以写死 `stdin` 必须为 null；MCP stdio 一搬进去就需要可写的 stdin 管道，而 Windows 那条路径是 `CreateProcessW` 手写的，得自己补 `CreatePipe`（读端可继承、父端清继承位，并把它带进 handle list）。第二处差异更隐蔽：`CreateProcessW` 拿到显式 `lpApplicationName` 后既不查 `PATH` 也不补 `.exe`，而原来 `tokio::process::Command` 会——共用后 `command = ["npx", …]` 在 Windows 上会从“可能能跑”变成“一定跑不起来”，所以搬的时候顺手补了 `resolve_program`（cwd → PATH → `.exe`）并把差异写在函数注释里。判据：搬迁前逐项对比新旧两边的**输入形状**（stdio 三种、env、cwd、可执行文件解析）和**生命周期语义**（谁负责杀、杀多深），差异要么在共用实现里补齐，要么在调用方显式转换。另外两条：跨 crate 的测试辅助访问器不要用 `#[cfg(all(test, windows))]`，依赖方编译自己的测试时看不到这个方法，用 `#[cfg(windows)]`；验证 Windows 改动按 crate 跑 `cargo xwin clippy`，因为整仓 `make check-windows` 会被 core 测试目标里既有的、只在 unix/macOS 测试里使用的 helper（dead code）挡住——那是旧账，不是本次改动的证据，别把“全仓红”当成自己的问题，也别顺手静音它。
