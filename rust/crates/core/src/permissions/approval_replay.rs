@@ -201,44 +201,70 @@ fn read_session(path: &Path, partition: &str, default_cwd: Option<&Path>) -> Opt
     })
 }
 
-/// What the recorded run says the sandbox did to this bash call: `Some(None)`
-/// for a denial of unknown class, `None` when nothing says it was denied.
-fn recorded_denial(result: &str) -> Option<Option<SandboxDenial>> {
-    if let Some(rest) = result
-        .strip_prefix("[Re-ran without the sandbox")
-        .and_then(|rest| rest.split_once("it had been denied (").map(|(_, r)| r))
-    {
-        let (label, evidence) = rest.split_once("): ")?;
-        let kind = match label {
-            "file write" => DenialKind::Write,
-            "network" => DenialKind::Network,
-            "protected read" => DenialKind::Read,
-            "nested sandbox" => DenialKind::Nested,
-            _ => DenialKind::Unclassified,
-        };
-        let evidence = evidence.lines().next().unwrap_or_default();
-        return Some(Some(SandboxDenial {
-            kind,
-            evidence: evidence.trim_end_matches(']').to_string(),
-            paths: Vec::new(),
-        }));
+/// What the recorded run says the sandbox refused, in the order it happened.
+/// Each widening (plan 283 stage 2b) and the full escalation prefix one line
+/// to the result; a run that ended at a hint says so in its last line. `None`
+/// in the list is a refusal of unknown class; an empty list, nothing refused —
+/// or nothing anyone could have been asked about (a protected read).
+fn recorded_denials(result: &str) -> Vec<Option<SandboxDenial>> {
+    let mut denials = Vec::new();
+    for line in result.lines() {
+        let prefixed = line.starts_with("[Re-ran inside the sandbox with")
+            || line.starts_with("[Re-ran without the sandbox");
+        if !prefixed {
+            break;
+        }
+        denials.push(denial_from_prefix(line));
+    }
+    if !denials.is_empty() {
+        return denials;
     }
     if result.starts_with("[Ran without the sandbox: a remembered") {
-        return Some(None);
+        return vec![None];
     }
     // The hints are appended as the result's last line; the same words inside
     // the output (a file that documents them) are not a denial.
     let last = result.trim_end().lines().last().unwrap_or_default();
+    if last.starts_with("[kloop's sandbox kept this command from reading a protected path") {
+        return Vec::new();
+    }
     if last.starts_with("[This command ran inside kloop's sandbox")
         || last.starts_with("[The user declined to run this outside kloop's sandbox")
+        || last.starts_with("[The user declined to widen kloop's sandbox")
     {
-        return Some(crate::sandbox::classify_sandbox_denial(
+        return vec![crate::sandbox::classify_sandbox_denial(
             Some(1),
             result,
             /*network_disabled*/ true,
-        ));
+        )];
     }
-    None
+    Vec::new()
+}
+
+/// `[Re-ran … ; it had been denied (<class>): <evidence>]`. A write's evidence
+/// from the system log names the refused path.
+fn denial_from_prefix(line: &str) -> Option<SandboxDenial> {
+    let (_, rest) = line.split_once("it had been denied (")?;
+    let (label, evidence) = rest.split_once("): ")?;
+    let kind = match label {
+        "file write" => DenialKind::Write,
+        "network" => DenialKind::Network,
+        "protected read" => DenialKind::Read,
+        "nested sandbox" => DenialKind::Nested,
+        _ => DenialKind::Unclassified,
+    };
+    let evidence = evidence.trim_end_matches(']').to_string();
+    let paths = match evidence.split_once(' ') {
+        Some((operation, path)) if operation.starts_with("file-write") && path.starts_with('/') => {
+            vec![PathBuf::from(path)]
+        }
+        _ => Vec::new(),
+    };
+    Some(SandboxDenial {
+        kind,
+        evidence,
+        paths,
+    })
 }
 
 /// What the gate sees of a recorded call: the production entry point's
@@ -383,37 +409,62 @@ fn tally_one(tally: &mut Tally, detail: &mut Detail, record: ApprovalRecord) {
     }
 }
 
-/// The questions a recorded denial leads to now (plan 283 stage 2b): a refused
-/// network is asked as a capability — and not at all when a remembered consent
-/// already gave the call the network — and anything else as the full
-/// escalation. Recorded writes carry no paths, so they cannot be offered as a
-/// directory and go to the full escalation as before.
+/// The question a recorded denial leads to now (plan 283 stage 2b): a refused
+/// network, or a refused write whose logged path names a directory that may be
+/// granted, is asked as a capability — and not at all when the call already
+/// carried that grant from a remembered consent; anything else is the full
+/// escalation. A write recorded before the log gave paths has none, so it goes
+/// to the full escalation as it did then.
 async fn replay_escalation(
     gate: &Permissions,
     command: &str,
     denial: Option<SandboxDenial>,
-    network_granted: bool,
+    policy: &SandboxPolicy,
+    grants: &super::SandboxGrants,
     depth: u8,
 ) -> Option<ApprovalRecord> {
-    match denial {
+    let home = std::env::home_dir();
+    let request = match &denial {
         Some(denial) if denial.kind == DenialKind::Network => {
-            if network_granted {
+            if grants.network {
                 return None;
             }
-            let programs = crate::shell::analyze_bash(command)
-                .commands()
-                .and_then(super::network_programs)
-                .filter(|programs| !programs.is_empty());
-            gate.escalate_capability(
-                command,
-                &denial,
-                &super::CapabilityRequest::Network { programs },
-                depth,
-            )
-            .await
-            .approval
+            Some(super::CapabilityRequest::Network {
+                programs: crate::shell::analyze_bash(command)
+                    .commands()
+                    .and_then(super::network_programs)
+                    .filter(|programs| !programs.is_empty()),
+            })
         }
-        denial => {
+        Some(denial) if denial.kind == DenialKind::Write && !denial.paths.is_empty() => {
+            let mut dirs: Vec<PathBuf> = Vec::new();
+            for dir in denial.paths.iter().filter_map(|path| path.parent()) {
+                if grants
+                    .writable
+                    .iter()
+                    .any(|granted| dir.starts_with(granted))
+                {
+                    return None;
+                }
+                if super::grantable_write_dir(dir, home.as_deref())
+                    && !policy.already_decides_writes(dir)
+                    && !dirs.iter().any(|known| known == dir)
+                {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            (!dirs.is_empty()).then_some(super::CapabilityRequest::Write { dirs })
+        }
+        Some(denial) if denial.kind == DenialKind::Read => return None,
+        _ => None,
+    };
+    match (request, denial) {
+        (Some(request), Some(denial)) => {
+            gate.escalate_capability(command, &denial, &request, depth)
+                .await
+                .approval
+        }
+        (_, denial) => {
             gate.escalate_sandbox(command, denial.as_ref(), depth)
                 .await
                 .approval
@@ -571,7 +622,6 @@ async fn approval_replay() {
             let Ok(verdict) = outcome.result else {
                 continue;
             };
-            let network_granted = verdict.grants.network;
             if name != "bash" || input["background"].as_bool() == Some(true) {
                 continue;
             }
@@ -587,19 +637,37 @@ async fn approval_replay() {
                             paths: Vec::new(),
                         })
                     };
-                    let denial = match call.result.as_deref().and_then(recorded_denial) {
-                        Some(denial) => Some(denial),
-                        None if no_sandbox => {
-                            tally.unknown_outcome += 1;
-                            assume_denied.map(assumed)
-                        }
-                        None => None,
-                    };
-                    if let Some(denial) = denial {
-                        let records =
-                            replay_escalation(&gate, command, denial, network_granted, call.depth)
+                    let mut denials = call
+                        .result
+                        .as_deref()
+                        .map(recorded_denials)
+                        .unwrap_or_default();
+                    if denials.is_empty() && no_sandbox {
+                        tally.unknown_outcome += 1;
+                        denials.extend(assume_denied.map(assumed));
+                    }
+                    // Each widening a recorded run went through, in order; a
+                    // grant given for one carries into the next.
+                    let mut grants = verdict.grants.clone();
+                    for denial in denials {
+                        let record =
+                            replay_escalation(&gate, command, denial, &policy, &grants, call.depth)
                                 .await;
-                        tally_record(&mut tally, &mut detail, records);
+                        if let Some(record) = &record
+                            && matches!(record.answer, ApprovalAnswer::Allowed { .. })
+                        {
+                            for rule in &record.rules {
+                                if let Some(dir) = rule
+                                    .strip_prefix("sandbox_write(")
+                                    .and_then(|rest| rest.strip_suffix(')'))
+                                {
+                                    grants.writable.push(PathBuf::from(dir));
+                                }
+                            }
+                            grants.network |=
+                                record.keys.iter().any(|key| key == "sandbox_network:*");
+                        }
+                        tally_record(&mut tally, &mut detail, record);
                     }
                 }
                 SandboxPlan::None => {}
@@ -727,4 +795,40 @@ fn replay_gates_the_normalized_call() {
         replayed_call(&escaped),
         Some(("bash".to_string(), json!({"command": "cargo test"}), true))
     );
+}
+
+/// The replay reads every widening a recorded run went through, in order, and
+/// the new hints; a protected read asks nothing (plan 283 review).
+#[test]
+fn recorded_denials_read_widenings_and_hints() {
+    let widened = "[Re-ran inside the sandbox with network access after user approval; \
+                   it had been denied (network): network-outbound /private/var/run/mDNSResponder]\n\
+                   [Re-ran inside the sandbox with write access to /opt/out after user approval; \
+                   it had been denied (file write): file-write-create /opt/out/a]\n\
+                   [Re-ran without the sandbox after user approval; \
+                   it had been denied (nested sandbox): sandbox-exec: sandbox_apply: Operation not permitted]\n\
+                   done";
+    assert_eq!(
+        recorded_denials(widened)
+            .into_iter()
+            .map(|denial| denial.map(|denial| (denial.kind, denial.paths)))
+            .collect::<Vec<_>>(),
+        vec![
+            Some((DenialKind::Network, Vec::new())),
+            Some((DenialKind::Write, vec![PathBuf::from("/opt/out/a")])),
+            Some((DenialKind::Nested, Vec::new())),
+        ]
+    );
+    let declined = "mkdir: /opt/out: Operation not permitted\n\
+                    [The user declined to widen kloop's sandbox for this command. Do not retry it.]";
+    assert_eq!(
+        recorded_denials(declined)
+            .into_iter()
+            .map(|denial| denial.map(|denial| denial.kind))
+            .collect::<Vec<_>>(),
+        vec![Some(DenialKind::Write)]
+    );
+    let protected = "cat: x: Operation not permitted\n\
+                     [kloop's sandbox kept this command from reading a protected path (credentials).]";
+    assert_eq!(recorded_denials(protected).len(), 0);
 }

@@ -557,15 +557,16 @@ pub(crate) fn seatbelt_profile_tagged(
 fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) {
     let mut params: Vec<(String, PathBuf)> = Vec::new();
     let mut write_parts: Vec<String> = Vec::new();
-    for (i, wr) in policy.writable_roots.iter().enumerate() {
+    let protected = protected_subpaths_by_root(policy);
+    for (i, (wr, read_only)) in policy.writable_roots.iter().zip(&protected).enumerate() {
         let key = format!("WRITABLE_ROOT_{i}");
         params.push((key.clone(), wr.root.clone()));
-        if wr.read_only_subpaths.is_empty() {
+        if read_only.is_empty() {
             write_parts.push(format!("(subpath (param \"{key}\"))"));
             continue;
         }
         let mut parts = vec![format!("(subpath (param \"{key}\"))")];
-        for (j, ro) in wr.read_only_subpaths.iter().enumerate() {
+        for (j, ro) in read_only.iter().enumerate() {
             let ro_key = format!("{key}_RO_{j}");
             params.push((ro_key.clone(), ro.clone()));
             // literal AND subpath: subpath alone leaves a gap for creating
@@ -625,8 +626,8 @@ fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) 
     // 可写根内的只读子路径同样怕父目录被改名：`(require-not subpath .git/hooks)`
     // 在 `.git` 被改成别的名字后就不再有意义，新名字下写入也不受它约束。
     // 只固定严格位于可写根内的祖先（关键是 `<root>/.git`），不动根本身。
-    for root in &policy.writable_roots {
-        for subpath in &root.read_only_subpaths {
+    for (root, read_only) in policy.writable_roots.iter().zip(&protected) {
+        for subpath in read_only {
             for ancestor in subpath.ancestors().skip(1) {
                 if ancestor.starts_with(&root.root)
                     && ancestor != root.root
@@ -676,6 +677,30 @@ fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) 
         sections.push(SEATBELT_LOOPBACK_POLICY.to_string());
     }
     (sections.join("\n"), params)
+}
+
+/// Each writable root's protected subpaths as the profile must state them: its
+/// own, plus those of every other root that lie inside it. Write allows are a
+/// union, so a root containing another — a granted parent of the workspace
+/// (plan 283), a configured extra root above it — would otherwise make the
+/// inner root's `.git/hooks`, `.git/config` and `.kloop` writable through
+/// itself.
+fn protected_subpaths_by_root(policy: &SandboxPolicy) -> Vec<Vec<PathBuf>> {
+    policy
+        .writable_roots
+        .iter()
+        .map(|root| {
+            let mut read_only = root.read_only_subpaths.clone();
+            for other in &policy.writable_roots {
+                for subpath in &other.read_only_subpaths {
+                    if subpath.starts_with(&root.root) && !read_only.contains(subpath) {
+                        read_only.push(subpath.clone());
+                    }
+                }
+            }
+            read_only
+        })
+        .collect()
 }
 
 /// Wrap an already-resolved program + argv in macOS Seatbelt. Containment of
@@ -956,6 +981,51 @@ fn clip_evidence(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write allows are a union, so a root that contains the workspace — a
+    /// granted parent directory (plan 283) — must keep the workspace's
+    /// protected subpaths, and guard their ancestors against renames, or
+    /// `.git/hooks` becomes writable through the outer root.
+    #[test]
+    fn a_containing_root_keeps_the_inner_roots_protected_subpaths() {
+        let workspace = PathBuf::from("/work/repo");
+        let policy = policy_with(
+            vec![WritableRoot {
+                root: workspace.clone(),
+                origins: vec![WritableRootOrigin::Workspace],
+                read_only_subpaths: protected_subpaths(&workspace),
+            }],
+            false,
+        )
+        .with_grants(&crate::permissions::SandboxGrants {
+            network: false,
+            writable: vec![PathBuf::from("/work")],
+        });
+        let (_, params) = seatbelt_profile(&policy);
+        let index = policy
+            .writable_roots
+            .iter()
+            .position(|root| root.root == Path::new("/work"))
+            .expect("the granted root");
+        let prefix = format!("WRITABLE_ROOT_{index}_RO_");
+        let protected: Vec<&PathBuf> = params
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, path)| path)
+            .collect();
+        for inner in [".git/hooks", ".git/config", ".kloop"] {
+            assert!(
+                protected.contains(&&workspace.join(inner)),
+                "{inner}: {protected:?}"
+            );
+        }
+        let renames: Vec<&PathBuf> = params
+            .iter()
+            .filter(|(key, _)| key.starts_with("DENIED_RENAME_"))
+            .map(|(_, path)| path)
+            .collect();
+        assert!(renames.contains(&&workspace.join(".git")), "{renames:?}");
+    }
 
     /// Every deny rule — the base policy's `(deny default)` and the generated
     /// credential, write and rename denies — carries the call's marker, so each

@@ -3743,7 +3743,10 @@ a `network` one, and a read a `protected read` — the profile reads the whole
 disk otherwise, so that is a credential or kloop's own state, never offered for
 an escalation. A failure the log shows nothing relevant for was not the
 sandbox's doing, whatever its output says (a test named `sandbox_…`, a failed
-`echo ===`). Two things the log does not show are read off the output: a nested
+`echo ===`). A masked zero is the other way round: a run can be refused on
+purpose and still succeed (a test that expects `PermissionError` and catches
+it), so the log alone never says the work failed — only output showing the
+OS's own refusal text does, and the log then says precisely what was refused. Two things the log does not show are read off the output: a nested
 `sandbox-exec` (`sandbox_apply: Operation not permitted`, a built-in refusal the
 marker does not reach — `nested sandbox`) and, should an event have been
 dropped, the OS's own refusal text. Without a watch — another platform, a `log`
@@ -3811,12 +3814,18 @@ next command that needs it is covered whatever its text.
   credential directories), and not one the policy already decides (inside a
   writable root, where the refusal came from a protected subpath, or inside a
   denied path). The added root gets the usual protected subpaths, and every
-  write deny still wins over it. No session scope: a directory is about the
+  write deny still wins over it. Write allows are a union across roots, so a
+  root containing another — a granted parent of the workspace, or a configured
+  extra root above it — also carries the inner root's protected subpaths
+  (`.git/hooks`, `.git/config`, `.kloop`) and their rename guards; without that
+  the inner protections would be writable through the outer root. No session scope: a directory is about the
   project, and nothing is gained by asking again next session.
 
 The gate puts remembered capabilities into the `Verdict` (`grants`), and the
 executor widens the contained policy by them before the run, so a covered
-command is neither asked nor re-run. After a consent the command re-runs inside
+command is neither asked nor re-run. The question itself checks again: a
+consent given since the verdict — another sub-agent's session-wide network, a
+project rule just written — answers it without asking. After a consent the command re-runs inside
 the widened sandbox (`[Re-ran inside the sandbox with network access after user
 approval; it had been denied (network): …]`); if that run is refused the other
 capability, it is asked again, at most three widenings per call, after which a

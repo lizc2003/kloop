@@ -15,6 +15,7 @@ use super::Decision;
 use super::Escalation;
 use super::EscalationApproval;
 use super::EscalationOutcome;
+use super::MemorySource;
 use super::Mode;
 use super::PROJECT_RULE_NOT_SAVED;
 use super::Permissions;
@@ -102,6 +103,29 @@ pub(crate) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
 }
 
 impl Permissions {
+    /// Whether a consent already on record covers this widening now: the
+    /// session's network, the project's rules for these programs, or project
+    /// directories containing every requested one.
+    fn capability_remembered(&self, request: &CapabilityRequest) -> Option<MemorySource> {
+        match request {
+            CapabilityRequest::Network { programs } => {
+                if self.session_network_granted() {
+                    return Some(MemorySource::Session);
+                }
+                programs
+                    .as_ref()
+                    .filter(|programs| self.project.network_programs_covered(programs))
+                    .map(|_| MemorySource::Rule)
+            }
+            CapabilityRequest::Write { dirs } => {
+                let granted = self.project.sandbox_write_dirs();
+                dirs.iter()
+                    .all(|dir| granted.iter().any(|root| dir.starts_with(root)))
+                    .then_some(MemorySource::Rule)
+            }
+        }
+    }
+
     pub(crate) async fn escalate_capability(
         &self,
         command: &str,
@@ -113,10 +137,6 @@ impl Permissions {
             return Escalation::new(EscalationOutcome::NotAttempted);
         }
         let grants = request.grants();
-        if self.mode() == Mode::Bypass {
-            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Bypass))
-                .granting(grants);
-        }
         let network = matches!(request, CapabilityRequest::Network { .. });
         let rules = request.rules();
         let mut record = ApprovalRecord {
@@ -135,6 +155,18 @@ impl Permissions {
             offered: Vec::new(),
             answer: ApprovalAnswer::NoApprover,
         };
+        // The verdict was made before the run; a concurrent call (another
+        // sub-agent) may have been granted the same capability since.
+        if let Some(by) = self.capability_remembered(request) {
+            record.answer = ApprovalAnswer::Remembered { by };
+            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Remembered))
+                .granting(grants)
+                .recorded(record);
+        }
+        if self.mode() == Mode::Bypass {
+            return Escalation::new(EscalationOutcome::Approved(EscalationApproval::Bypass))
+                .granting(grants);
+        }
         let Some(approver) = &self.session.approver else {
             return Escalation::new(EscalationOutcome::NotAttempted).recorded(record);
         };

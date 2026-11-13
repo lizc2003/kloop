@@ -361,15 +361,17 @@ fn status_command(commands: &[crate::shell::CommandFact]) -> Option<(usize, Vec<
 }
 
 /// What the sandbox refused in a run that failed (or whose zero may be
-/// masked), if anything. When the system log was watched it is the witness:
-/// its events name the operation and the path, and a failure that logged
-/// nothing relevant was not the sandbox's doing, whatever words the output
-/// happens to contain — a test named `sandbox_…`, a resolver named in a log.
-/// Two things the log does not show are read off the output instead: a nested
-/// `sandbox-exec`, a built-in refusal the per-call marker does not reach, and —
-/// in case the log dropped an event — the OS's own refusal text. Without a
-/// watch the output is all there is: a failure gets the keyword classifier, a
-/// masked zero only the strong evidence.
+/// masked), if anything. When the system log was watched it is the witness of
+/// a failure: its events name the operation and the path, and a failure that
+/// logged nothing relevant was not the sandbox's doing, whatever words the
+/// output happens to contain — a test named `sandbox_…`, a resolver named in a
+/// log. A masked zero is different: a run can be refused on purpose and still
+/// succeed (a test that expects `PermissionError` and catches it), so the log
+/// alone never says the work failed. Only when the output itself shows the
+/// failure — the OS's own refusal text — is it judged, and then the log, if
+/// watched, says precisely what was refused. A nested `sandbox-exec` is read
+/// off the output either way: its refusal is a built-in one the per-call marker
+/// does not reach. Without a watch a failure gets the keyword classifier.
 fn judge_denial(
     output: &ForegroundOutput,
     logged: Option<&[sandbox::LoggedDenial]>,
@@ -379,10 +381,13 @@ fn judge_denial(
     if let Some(nested) = sandbox::nested_sandbox_denial(&text) {
         return Some(nested);
     }
+    if output.status.success() {
+        let shown = sandbox::classify_masked_denial(&text, network_disabled)?;
+        return Some(logged.and_then(sandbox::classify_logged).unwrap_or(shown));
+    }
     match logged {
         Some(events) => sandbox::classify_logged(events)
             .or_else(|| sandbox::classify_masked_denial(&text, network_disabled)),
-        None if output.status.success() => sandbox::classify_masked_denial(&text, network_disabled),
         None => sandbox::classify_sandbox_denial(output.status.code(), &text, network_disabled),
     }
 }
@@ -2847,6 +2852,68 @@ mod tests {
             assert!(!out.contains("Re-ran"), "{out}");
             assert!(!out.contains("denied"), "{out}");
             assert_eq!(asked.load(Ordering::SeqCst), 0, "{out}");
+        }
+
+        /// A granted parent of the workspace widens writes around it, not into
+        /// the workspace's protected subpaths (plan 283 review).
+        #[tokio::test]
+        async fn a_granted_parent_keeps_the_workspace_protection() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, root) = sandbox_ctx("cap-parent");
+            // A fixed temp root: an earlier run must not leave the target behind.
+            let _ = std::fs::remove_dir_all(root.join(".kloop"));
+            let parent = root.parent().unwrap().to_path_buf();
+            let mut cfg = ctx.cfg.test_clone();
+            let policy = cfg.sandbox.take().unwrap();
+            cfg.sandbox = Some(Arc::new(policy.with_grants(
+                &crate::permissions::SandboxGrants {
+                    network: false,
+                    writable: vec![parent],
+                },
+            )));
+            let ctx = crate::tools::ToolCtx {
+                cfg: Arc::new(cfg),
+                ..ctx
+            };
+            let (out, _) = run_tool(
+                "bash",
+                bash_input(&format!("mkdir -p {}", root.join(".kloop").display())),
+                &ctx,
+            )
+            .await;
+            assert!(out.contains("Operation not permitted"), "{out}");
+            assert!(!root.join(".kloop").exists(), "{out}");
+        }
+
+        /// A zero a pipe or `;` may have masked needs the output to show the
+        /// failure: a run refused on purpose that succeeds anyway — a test
+        /// that expects the refusal and catches it — is not re-run with more
+        /// access, whatever the system log recorded (plan 283 review).
+        #[tokio::test]
+        async fn an_expected_refusal_in_a_passing_run_is_not_escalated() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, asked) = escalating_ctx(
+                "cap-expected",
+                crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
+            );
+            let target = outside_dir("cap-expected").join("expected.txt");
+            let (out, is_error) = run_tool(
+                "bash",
+                bash_input(&format!(
+                    "touch {} 2>/dev/null; echo refused-as-expected",
+                    target.display()
+                )),
+                &ctx,
+            )
+            .await;
+            assert!(!is_error, "{out}");
+            assert_eq!(out.trim(), "refused-as-expected", "{out}");
+            assert_eq!(asked.load(Ordering::SeqCst), 0, "{out}");
+            assert!(!target.exists());
         }
 
         /// A refused read is a protected path by construction — the profile

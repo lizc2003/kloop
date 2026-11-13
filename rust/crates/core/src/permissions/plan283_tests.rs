@@ -534,3 +534,50 @@ async fn plan283_capability_questions_offer_their_scopes_and_write_their_rules()
         )
     );
 }
+
+/// 复审：能力询问前重查已有同意。别的调用刚给了“本会话联网”，或者项目已有覆盖它的
+/// 写目录规则，就直接放宽、不再问人，记录写成被记忆答掉。
+#[tokio::test]
+async fn plan283_a_capability_granted_meanwhile_is_not_asked_again() {
+    let network_denial = crate::sandbox::SandboxDenial {
+        kind: crate::sandbox::DenialKind::Network,
+        evidence: "network-outbound /private/var/run/mDNSResponder".into(),
+        paths: Vec::new(),
+    };
+    let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
+    let p = gate(Mode::Manual, rules(&["sandbox_write(/opt)"], &[], &[]), approver.clone());
+    let network = CapabilityRequest::Network { programs: None };
+    let first = p.escalate_capability("curl -sS a", &network_denial, &network, 0).await;
+    assert_eq!(first.outcome, EscalationOutcome::Approved(EscalationApproval::User));
+    // A second call that ran under the old verdict, refused the same way.
+    let second = p.escalate_capability("wget -q b", &network_denial, &network, 0).await;
+    assert_eq!(
+        (second.outcome, second.grants.network, second.approval.map(|record| record.answer)),
+        (
+            EscalationOutcome::Approved(EscalationApproval::Remembered),
+            true,
+            Some(ApprovalAnswer::Remembered {
+                by: MemorySource::Session
+            })
+        )
+    );
+    let write_denial = crate::sandbox::SandboxDenial {
+        kind: crate::sandbox::DenialKind::Write,
+        evidence: "file-write-create /opt/out/a".into(),
+        paths: vec![std::path::PathBuf::from("/opt/out/a")],
+    };
+    let write = CapabilityRequest::Write {
+        dirs: vec![std::path::PathBuf::from("/opt/out")],
+    };
+    let third = p.escalate_capability("cp a /opt/out/a", &write_denial, &write, 0).await;
+    assert_eq!(
+        (third.outcome, third.approval.map(|record| record.answer)),
+        (
+            EscalationOutcome::Approved(EscalationApproval::Remembered),
+            Some(ApprovalAnswer::Remembered {
+                by: MemorySource::Rule
+            })
+        )
+    );
+    assert_eq!(approver.ask_count(), 1);
+}
