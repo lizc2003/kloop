@@ -41,6 +41,14 @@ use crate::Transport;
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 type SharedWriter = Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 
+/// `notifications/initialized` and other fire-and-forget writes reuse the
+/// handshake budget; a pipe that never drains must not pin the write lock.
+const NOTIFY_TIMEOUT: Duration = crate::HANDSHAKE_TIMEOUT;
+
+/// A reader-task refusal write is best effort: it never queues behind a
+/// request write and never holds up reading stdout.
+const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct PendingRequest {
     id: u64,
     pending: Pending,
@@ -176,11 +184,15 @@ impl Transport for StdioTransport {
                 bail!("{method}: MCP transport closed while registering the request");
             }
             let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-            if let Err(error) = write_line(&self.writer, &msg).await {
+            // One deadline covers queueing behind another write, the write
+            // itself, and the response: a child that stops draining stdin
+            // must not park this request (and the write lock) forever.
+            let deadline = tokio::time::Instant::now() + timeout;
+            if let Err(error) = write_line_before(&self.writer, &msg, deadline).await {
                 self.close_local(McpTransportFailure::WriteFailed);
                 return Err(error);
             }
-            match tokio::time::timeout(timeout, rx).await {
+            match tokio::time::timeout_at(deadline, rx).await {
                 Ok(Ok(result)) => {
                     self.publish_health(McpTransportState::Healthy);
                     result
@@ -222,7 +234,8 @@ impl Transport for StdioTransport {
                 Some(params) => json!({"jsonrpc": "2.0", "method": method, "params": params}),
                 None => json!({"jsonrpc": "2.0", "method": method}),
             };
-            if let Err(error) = write_line(&self.writer, &msg).await {
+            let deadline = tokio::time::Instant::now() + NOTIFY_TIMEOUT;
+            if let Err(error) = write_line_before(&self.writer, &msg, deadline).await {
                 self.close_local(McpTransportFailure::WriteFailed);
                 return Err(error);
             }
@@ -249,15 +262,50 @@ impl Transport for StdioTransport {
     }
 }
 
-async fn write_line(writer: &SharedWriter, msg: &Value) -> Result<()> {
+async fn write_line_before(
+    writer: &SharedWriter,
+    msg: &Value,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let mut line = msg.to_string();
     line.push('\n');
-    let mut writer = writer.lock().await;
-    writer
-        .write_all(line.as_bytes())
+    let write = async {
+        let mut writer = writer.lock().await;
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .context("mcp write failed")?;
+        writer.flush().await.context("mcp flush failed")
+    };
+    tokio::time::timeout_at(deadline, write)
         .await
-        .context("mcp write failed")?;
-    writer.flush().await.context("mcp flush failed")
+        .map_err(|_| anyhow!("mcp write: server did not accept the request in time"))?
+}
+
+/// The reader task's refusal write. It must not wait for the write lock — a
+/// request write blocked on a full pipe would otherwise stop us reading, and a
+/// server waiting for its stdout to drain would then block the whole link.
+/// Losing the refusal only costs a server an answer to a request this client
+/// does not support.
+async fn write_refusal(writer: &SharedWriter, msg: &Value) -> Option<Result<()>> {
+    let mut line = msg.to_string();
+    line.push('\n');
+    let Ok(mut writer) = writer.try_lock() else {
+        return None;
+    };
+    let write = async {
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .context("mcp write failed")?;
+        writer.flush().await.context("mcp flush failed")
+    };
+    Some(
+        match tokio::time::timeout(REFUSAL_WRITE_TIMEOUT, write).await {
+            Ok(result) => result,
+            Err(_) => Ok(()),
+        },
+    )
 }
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(
@@ -351,7 +399,7 @@ async fn read_loop(
                     "id": id,
                     "error": {"code": -32601, "message": "method not supported by this client"},
                 });
-                if let Err(error) = write_line(&writer, &refusal).await {
+                if let Some(Err(error)) = write_refusal(&writer, &refusal).await {
                     break (
                         McpTransportFailure::WriteFailed,
                         format!("mcp write failed: {error}"),
@@ -476,5 +524,89 @@ mod wire_tests {
         let _ = request.await;
         tokio::task::yield_now().await;
         assert!(transport.pending.lock().unwrap().is_empty());
+    }
+
+    /// A server that never reads stdin fills the pipe; the request must fail on
+    /// its own deadline instead of parking forever and holding the write lock.
+    #[tokio::test]
+    async fn blocked_write_times_out_and_closes_the_transport() {
+        use super::McpTransportFailure;
+        use super::McpTransportState;
+        use super::StdioTransport;
+        use super::Transport;
+        use serde_json::json;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        // The server half is split and kept, never read: the 64-byte pipe
+        // buffer fills and the client's write parks inside the runtime.
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(client_io);
+        let (_server_reader, _server_writer) = tokio::io::split(server_io);
+        let transport = StdioTransport::over(reader, writer, None);
+        let mut health = transport.subscribe_health().unwrap();
+
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            transport.request(
+                "tools/call",
+                json!({"blob": "x".repeat(64 * 1024)}),
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("request must not park on a full pipe")
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2), "{error:#}");
+        assert!(error.to_string().contains("mcp write"), "{error:#}");
+        health.changed().await.unwrap();
+        assert_eq!(
+            health.borrow_and_update().state,
+            McpTransportState::Closed(McpTransportFailure::WriteFailed)
+        );
+
+        // The lock is free and the transport is closed, so a later request
+        // fails at once instead of queueing behind the dead write.
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.request("tools/list", json!({}), Duration::from_millis(100)),
+        )
+        .await
+        .expect("a closed transport must answer immediately")
+        .unwrap_err();
+        assert!(error.to_string().contains("closed"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// The refusal path from the reader task never waits for the write lock:
+    /// while a request write holds it, the reader keeps reading instead of
+    /// deadlocking against the server.
+    #[tokio::test]
+    async fn refusal_write_does_not_wait_for_the_write_lock() {
+        use super::StdioTransport;
+        use super::write_refusal;
+        use serde_json::json;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let (client_io, _server_io) = tokio::io::duplex(64);
+        let (reader, writer) = tokio::io::split(client_io);
+        let transport = StdioTransport::over(reader, writer, None);
+        let _busy = transport.writer.try_lock().expect("writer is idle");
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            write_refusal(
+                &transport.writer,
+                &json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32601}}),
+            ),
+        )
+        .await
+        .expect("refusal must not block on the lock");
+        assert!(outcome.is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

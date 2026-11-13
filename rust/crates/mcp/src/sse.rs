@@ -7,10 +7,18 @@
 //! character split across a chunk boundary would mangle into `U+FFFD` if each
 //! chunk were decoded on its own; a complete frame is always valid UTF-8
 //! because the `\n`/`\r` separators are ASCII.
+//!
+//! Scanning resumes where the previous feed stopped (minus a few bytes for a
+//! separator split across the boundary): a large frame arriving in many chunks
+//! costs one pass, not one pass per chunk.
 
 #[derive(Default)]
 pub(crate) struct SseParser {
     buf: Vec<u8>,
+    /// Bytes of `buf` already searched for a frame separator.
+    scanned: usize,
+    #[cfg(test)]
+    pub(crate) examined: usize,
 }
 
 impl SseParser {
@@ -18,8 +26,19 @@ impl SseParser {
     pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(end) = frame_end(&self.buf) {
+        loop {
+            // A `\r\n\r\n` separator may straddle the previous scan point.
+            let start = self.scanned.saturating_sub(3);
+            #[cfg(test)]
+            {
+                self.examined += self.buf.len().saturating_sub(start);
+            }
+            let Some(end) = frame_end(&self.buf, start) else {
+                self.scanned = self.buf.len();
+                break;
+            };
             let raw: Vec<u8> = self.buf.drain(..end).collect();
+            self.scanned = self.scanned.saturating_sub(end);
             let raw = String::from_utf8_lossy(&raw);
             let mut data_lines = Vec::new();
             for line in raw.lines() {
@@ -34,12 +53,17 @@ impl SseParser {
         }
         out
     }
+
+    /// Bytes buffered for an unfinished frame.
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
 }
 
 /// Byte index just past the first blank-line frame separator (`\n\n` or
-/// `\r\n\r\n`), or None if no complete frame is buffered yet.
-fn frame_end(buf: &[u8]) -> Option<usize> {
-    for i in 0..buf.len() {
+/// `\r\n\r\n`) at or after `from`, or None if no complete frame is buffered yet.
+fn frame_end(buf: &[u8], from: usize) -> Option<usize> {
+    for i in from..buf.len() {
         if buf[i] != b'\n' {
             continue;
         }
@@ -76,5 +100,28 @@ mod tests {
         let split = 8; // 'data: ' (6) + first byte of '你'
         assert_eq!(p.feed(&full[..split]), Vec::<String>::new());
         assert_eq!(p.feed(&full[split..]), vec!["你好".to_string()]);
+    }
+
+    /// A frame split across many chunks is scanned once, not once per chunk.
+    #[test]
+    fn unfinished_frame_is_not_rescanned_from_the_start() {
+        const CHUNK: usize = 16 * 1024;
+        const CHUNKS: usize = 64; // 1 MiB, below the wire cap
+        let mut p = SseParser::default();
+        for _ in 0..CHUNKS {
+            assert!(p.feed(&vec![b'x'; CHUNK]).is_empty());
+        }
+        assert_eq!(p.buffered_len(), CHUNK * CHUNKS);
+        // The old parser examined the whole buffer every feed (CHUNKS/2 × the
+        // buffer size, ~32 MiB); the resuming scan touches each byte about once.
+        assert!(
+            p.examined < 2 * CHUNK * CHUNKS,
+            "examined {} bytes",
+            p.examined
+        );
+
+        // A separator that straddles the boundary still closes the frame.
+        assert!(p.feed(b"\n\n").is_empty());
+        assert_eq!(p.buffered_len(), 0);
     }
 }

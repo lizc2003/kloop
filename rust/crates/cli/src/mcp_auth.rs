@@ -215,14 +215,7 @@ pub async fn run_login(server_name: &str) -> Result<()> {
 /// Best-effort browser open. The URL is always printed too, so a failure here
 /// (headless box, no handler) is harmless — the user pastes it.
 fn open_browser(url: &str) {
-    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else if cfg!(target_os = "windows") {
-        // `start` is a cmd builtin; the empty arg is the window title.
-        ("cmd", vec!["/C", "start", "", url])
-    } else {
-        ("xdg-open", vec![url])
-    };
+    let (program, args) = browser_command(current_browser_platform(), url);
     let mut command = std::process::Command::new(program);
     command
         .args(args)
@@ -231,9 +224,68 @@ fn open_browser(url: &str) {
     let _ = kloop_process_spawn::spawn_std(&mut command);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserPlatform {
+    MacOs,
+    Windows,
+    Other,
+}
+
+fn current_browser_platform() -> BrowserPlatform {
+    if cfg!(target_os = "macos") {
+        BrowserPlatform::MacOs
+    } else if cfg!(target_os = "windows") {
+        BrowserPlatform::Windows
+    } else {
+        BrowserPlatform::Other
+    }
+}
+
+/// The handler command for one platform. Windows must not go through `cmd`:
+/// the authorization URL joins its query with `&`, which `Command` neither
+/// quotes nor escapes, so `cmd /C start` hands the browser a truncated URL and
+/// runs the rest as commands. `rundll32` receives the whole URL as one argv
+/// element and no shell parses it.
+fn browser_command(platform: BrowserPlatform, url: &str) -> (&'static str, Vec<String>) {
+    match platform {
+        BrowserPlatform::MacOs => ("open", vec![url.to_string()]),
+        BrowserPlatform::Windows => (
+            "rundll32",
+            vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+        ),
+        BrowserPlatform::Other => ("xdg-open", vec![url.to_string()]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The authorization URL's query is joined with `&`; on Windows the URL
+    /// must reach the protocol handler as one argv element, with no `cmd`
+    /// in between to split it.
+    #[test]
+    fn windows_browser_command_keeps_the_whole_authorize_url_as_one_argument() {
+        let url = "https://as.example.com/authorize?response_type=code&client_id=c\
+                   &redirect_uri=http%3A%2F%2F127.0.0.1%3A5000%2Fcallback&state=s&resource=r";
+        let (program, args) = browser_command(BrowserPlatform::Windows, url);
+        assert_eq!(program, "rundll32");
+        assert_ne!(program.to_ascii_lowercase(), "cmd");
+        assert_eq!(args, vec!["url.dll,FileProtocolHandler", url]);
+        assert_eq!(args.iter().filter(|arg| arg.contains('&')).count(), 1);
+    }
+
+    #[test]
+    fn browser_command_uses_the_platform_opener() {
+        assert_eq!(
+            browser_command(BrowserPlatform::MacOs, "https://x/"),
+            ("open", vec!["https://x/".to_string()])
+        );
+        assert_eq!(
+            browser_command(BrowserPlatform::Other, "https://x/"),
+            ("xdg-open", vec!["https://x/".to_string()])
+        );
+    }
 
     fn store_in(tag: &str) -> (CredentialStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!("kloop-oauth-{}-{tag}", std::process::id()));

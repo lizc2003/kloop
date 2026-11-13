@@ -2354,8 +2354,14 @@ refused. Over HTTP, one POST carries each request, the reply comes back as
 session-bearing request re-runs the handshake once but does **not** transparently
 replay the original operation. The adapter first revalidates capabilities and the
 tool catalog under its lifecycle gate; only a later freshly discovered call may
-retry. 408/429/5xx and transient network errors retry (250ms, 1s, then a final
-try), while 401/403 are terminal.
+retry. Idempotent methods (`initialize`, `tools/list`, `resources/read`, …)
+retry 408/429/5xx and transient network errors (250ms, 1s, then a final try),
+while 401/403 are terminal. A non-idempotent `tools/call` replays only when the
+server cannot have run it — a connect failure, or a 429/503 that says "not
+processed" — because a gateway 502/504 or a reset while reading the reply may
+follow a completed side effect. Every HTTP request carries its own deadline and
+connection setup has a separate connect budget, so a host that accepts and then
+stalls cannot pin the transport.
 
 **OAuth (plan 34b).** A remote server with no `bearer_token` takes the
 OAuth 2.1 authorization-code path — the way the hosted MCP servers (GitHub,
@@ -2370,13 +2376,24 @@ WWW-Authenticate` header), registers a client if none is preconfigured
 (RFC 7591 dynamic client registration), opens your browser to authorize with
 PKCE (S256) + a CSRF `state`, catches the redirect on a loopback listener, and
 saves the token to `~/.kloop/mcp-oauth.json` (mode `0600`, keyed by
-`name|hash(url)`, with an **absolute** expiry). Thereafter kloop injects the
-bearer per request and refreshes it proactively before expiry (and once more on
-a 401); a failed refresh clears the token and asks you to log in again. Startup
-never blocks: a server that needs OAuth but has no stored token degrades to a
-warning pointing at `kloop mcp login <name>`. Keyring storage, cross-process
-refresh locks, the legacy SSE transport, and the manual-paste (no-browser)
-fallback are out of scope (see the plan).
+`name|hash(url)`, with an **absolute** expiry). The browser hand-off never goes
+through a shell: on Windows it is `rundll32 url.dll,FileProtocolHandler <url>`,
+so the `&`-joined authorization query stays one argument instead of being split
+by `cmd`. The loopback listener gives each connection a short lease and ignores
+requests it did not ask for (another path, a mismatched `state`, an `error=`
+redirect without this flow's `state`, a pre-connect that never sends a request
+line), so nothing else on the machine can cancel the login; only the matching
+redirect ends it. Thereafter kloop injects the bearer per request and refreshes
+it proactively before expiry (and once more on a 401). Every OAuth request —
+discovery, registration, exchange, refresh — carries its own deadline so a
+stalled token endpoint cannot hold the refresh lock. A refresh rejected for good
+(400/401 carrying `invalid_grant`/`invalid_client`/`unauthorized_client`) marks
+the server as needing a fresh login and clears the flag on the next successful
+refresh; 5xx/429 and network failures stay transient and are retried by the next
+request. Startup never blocks: a server that needs OAuth but has no stored token
+degrades to a warning pointing at `kloop mcp login <name>`. Keyring storage,
+cross-process refresh locks, the legacy SSE transport, and the manual-paste
+(no-browser) fallback are out of scope (see the plan).
 本地凭据文件的读改写使用 `mcp-oauth.lock` 跨进程串行化：锁内重新读取后更新
 目标条目，再原子替换；不同实例更新不同服务不会互相覆盖。此锁只保护文件更新，
 不把远端 refresh 请求包进同一个事务。
@@ -2394,6 +2411,11 @@ shutdown/reap on every frontend exit, and uses Drop only as an error-path abort
 fallback. Stdio EOF/read/write failure and request timeout publish a bounded
 health transition, fail all pending requests, and close the matching refresh
 worker; dropping a cancelled request also removes its pending route immediately.
+A stdio write shares the request's deadline (queueing for the write lock
+included), so a child that stops draining stdin cannot park a request and the
+lock forever; the reader task answers unsupported server requests on a
+best-effort basis and never waits for that lock, so it keeps reading stdout
+instead of deadlocking against a full stdin pipe.
 
 The TUI splits "the screen is up" from "the first turn may run". Its `Config` is
 built over planned sources (each server source plus the shared resource helpers,
@@ -2514,7 +2536,10 @@ behind `tool_search`, even when the ordinary tool count is below the threshold:
   is unsuitable.
 
 Both stdio frames and HTTP JSON/SSE response bodies have an 8 MiB wire cap
-before JSON parsing. Tool/resource pagination then rejects repeated cursors and
+before JSON parsing. The SSE cap counts `data` bytes and each unfinished frame,
+not keep-alive comments: a long-running call may receive comments for as long as
+it runs without eating the budget its actual messages need. Tool/resource
+pagination then rejects repeated cursors and
 adds page/item/byte budgets; resource reads also cap content count/bytes, while
 tools/call validates content count and supported image base64/decoded size before
 an image can enter history. Large text within those wire budgets still uses the
@@ -6245,11 +6270,15 @@ crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAu
   src/lib.rs        wire types, the Transport trait, and McpClient: handshake,
                     tools/list + resources pagination, tools/call validation
   src/stdio.rs      newline-delimited JSON-RPC over a child's stdio: reader
-                    task, responses routed to pending requests by id
+                    task, responses routed to pending requests by id, request
+                    deadline shared by the write and the reply
   src/http.rs       streamable HTTP transport: one POST per request,
-                    Mcp-Session-Id sessions, re-handshake on 404
-  src/sse.rs        incremental text/event-stream frame parser
-  src/oauth.rs      OAuth 2.1 — PKCE, discovery, registration, token refresh
+                    Mcp-Session-Id sessions, re-handshake on 404, replay only
+                    when the server cannot have run the operation
+  src/sse.rs        incremental text/event-stream frame parser, resuming its
+                    separator scan instead of restarting it every chunk
+  src/oauth.rs      OAuth 2.1 — PKCE, discovery, registration, token refresh;
+                    every request bounded, terminal vs transient rejections
   src/render.rs     MCP content array → tool_result text / ContentBlocks
 
 crates/web/         kloop-web — web_fetch/web_search network operations (owns reqwest)

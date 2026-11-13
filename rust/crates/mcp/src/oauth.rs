@@ -46,6 +46,17 @@ const REFRESH_SKEW_SECS: u64 = 60;
 /// up (both references use 5 minutes).
 pub(crate) const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// One loopback connection gets a short lease: a browser pre-connect or a
+/// local port scanner that never sends a request line must not consume the
+/// whole login window.
+const CALLBACK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Every OAuth HTTP request carries its own deadline. Without one, a token
+/// endpoint that accepts the connection and never answers pins the refresh
+/// lock (and the transport's session gate) forever.
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The loopback redirect path. RFC 8252 §7.3: for a loopback redirect only the
 /// path must match a registration — the port is chosen fresh each login.
 const REDIRECT_PATH: &str = "/callback";
@@ -117,6 +128,19 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The one client shape both login and request-time refresh use: a connect
+/// budget and a whole-request budget, so no OAuth step can hang a caller.
+fn oauth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(OAUTH_CONNECT_TIMEOUT)
+        .timeout(OAUTH_HTTP_TIMEOUT)
+        .build()
+        // The builder fails only if the TLS backend cannot initialise, which
+        // no OAuth request could survive anyway; this constructor is not
+        // fallible for callers that hold a token already.
+        .expect("building the OAuth HTTP client")
 }
 
 /// True when `token` expires within the proactive skew (so it should be
@@ -346,54 +370,76 @@ fn build_authorize_url(
 }
 
 /// Wait for the browser to hit the loopback redirect, returning the `code` once
-/// the `state` matches. Rejects a mismatched state (CSRF) and an `error=`
-/// redirect; any other path (favicon, root) is answered and ignored. Bounded by
-/// `timeout`.
+/// the `state` matches. Ignores any other request (favicon, root, a wrong
+/// state, an idle pre-connect) and keeps waiting: aborting on one stray local
+/// request would let anything on the machine cancel the login. Bounded by
+/// `timeout` overall and `connection_timeout` per connection.
 async fn await_callback(
     listener: TcpListener,
     expected_state: &str,
     timeout: Duration,
+    connection_timeout: Duration,
 ) -> Result<String> {
     let accept = async {
         loop {
             let (mut stream, _) = listener.accept().await?;
-            let line = read_request_line(&mut stream).await?;
-            let target = line.split_whitespace().nth(1).unwrap_or("");
-            let params = parse_query(target);
-            if let Some(error) = params.get("error") {
-                let desc = params.get("error_description").map(String::as_str);
-                write_response(
-                    &mut stream,
-                    "Authorization failed",
-                    "You can close this window.",
-                )
-                .await;
-                bail!(
-                    "authorization server returned error '{error}'{}",
-                    desc.map(|d| format!(": {d}")).unwrap_or_default()
-                );
-            }
-            let (Some(code), Some(state)) = (params.get("code"), params.get("state")) else {
-                write_response(&mut stream, "Waiting…", "Waiting for the OAuth redirect.").await;
-                continue;
-            };
-            if state != expected_state {
-                write_response(&mut stream, "State mismatch", "Login aborted.").await;
-                bail!("OAuth state mismatch (possible CSRF); login aborted");
-            }
-            write_response(
-                &mut stream,
-                "Login complete",
-                "kloop is now authorized. You can close this window.",
+            let outcome = tokio::time::timeout(
+                connection_timeout,
+                handle_callback_connection(&mut stream, expected_state),
             )
             .await;
-            return Ok(code.clone());
+            match outcome {
+                Ok(Ok(Some(code))) => return Ok(code),
+                Ok(Ok(None)) | Err(_) => continue,
+                Ok(Err(error)) => return Err(error),
+            }
         }
     };
     match tokio::time::timeout(timeout, accept).await {
         Ok(result) => result,
         Err(_) => bail!("timed out after {timeout:?} waiting for the OAuth callback"),
     }
+}
+
+/// One loopback connection. `Ok(Some(code))` is the authorization code,
+/// `Ok(None)` a request to ignore, and `Err` the authorization server's own
+/// `error=` redirect (with a matching state), which ends the login.
+async fn handle_callback_connection(
+    stream: &mut tokio::net::TcpStream,
+    expected_state: &str,
+) -> Result<Option<String>> {
+    let line = read_request_line(stream).await?;
+    let target = line.split_whitespace().nth(1).unwrap_or("");
+    let params = parse_query(target);
+    let state_matches = params
+        .get("state")
+        .is_some_and(|state| state == expected_state);
+    if let Some(error) = params.get("error") {
+        if !state_matches {
+            // A forged error redirect (or one for another flow) must not end
+            // this login.
+            write_response(stream, "Waiting…", "Waiting for the OAuth redirect.").await;
+            return Ok(None);
+        }
+        let desc = params.get("error_description").map(String::as_str);
+        write_response(stream, "Authorization failed", "You can close this window.").await;
+        bail!(
+            "authorization server returned error '{error}'{}",
+            desc.map(|d| format!(": {d}")).unwrap_or_default()
+        );
+    }
+    let (Some(code), true) = (params.get("code"), state_matches) else {
+        // No code, or a code this flow did not ask for: ignore it.
+        write_response(stream, "Waiting…", "Waiting for the OAuth redirect.").await;
+        return Ok(None);
+    };
+    write_response(
+        stream,
+        "Login complete",
+        "kloop is now authorized. You can close this window.",
+    )
+    .await;
+    Ok(Some(code.clone()))
 }
 
 /// Read the HTTP request line (up to the first newline) — all we need is the
@@ -495,7 +541,7 @@ pub async fn login(
     configured_scopes: &[String],
     open_url: impl FnOnce(&str) -> Result<()>,
 ) -> Result<LoginOutcome> {
-    let http = &reqwest::Client::new();
+    let http = &oauth_http_client();
     let (meta, prm_scopes) = discover(http, server_url).await?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -529,7 +575,13 @@ pub async fn login(
     )?;
 
     open_url(&authorize_url)?;
-    let code = await_callback(listener, &state, CALLBACK_TIMEOUT).await?;
+    let code = await_callback(
+        listener,
+        &state,
+        CALLBACK_TIMEOUT,
+        CALLBACK_CONNECTION_TIMEOUT,
+    )
+    .await?;
 
     let token = exchange_code(
         http,
@@ -637,8 +689,26 @@ impl OAuthSession {
         token: OAuthToken,
         on_update: Box<dyn Fn(&OAuthToken) + Send + Sync>,
     ) -> Self {
+        Self::with_client(
+            oauth_http_client(),
+            token_endpoint,
+            client_id,
+            resource,
+            token,
+            on_update,
+        )
+    }
+
+    fn with_client(
+        http: reqwest::Client,
+        token_endpoint: String,
+        client_id: String,
+        resource: String,
+        token: OAuthToken,
+        on_update: Box<dyn Fn(&OAuthToken) + Send + Sync>,
+    ) -> Self {
         OAuthSession {
-            http: reqwest::Client::new(),
+            http,
             token_endpoint,
             client_id,
             resource,
@@ -703,18 +773,19 @@ impl OAuthSession {
             .post(&self.token_endpoint)
             .form(&form)
             .send()
-            .await;
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) => bail!("token refresh request failed: {e}"),
-        };
+            .await
+            .context("token refresh request failed")?;
         if !resp.status().is_success() {
-            // invalid_grant (revoked/expired refresh token) and friends are not
-            // recoverable by retrying — clear and demand a fresh login.
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            self.needs_relogin.store(true, Ordering::Relaxed);
-            bail!("token refresh failed: {status}: {body}; re-run `kloop mcp login`");
+            // Only a definitive rejection means the stored credential is dead:
+            // a 5xx/429 from the token endpoint is transient and must not make
+            // every later request look like an auth failure.
+            if refresh_failure_is_definitive(status.as_u16(), &body) {
+                self.needs_relogin.store(true, Ordering::Relaxed);
+                bail!("token refresh failed: {status}: {body}; re-run `kloop mcp login`");
+            }
+            bail!("token refresh failed: {status}: {body}; will retry on the next request");
         }
         let parsed: TokenResponse = resp
             .json()
@@ -722,9 +793,27 @@ impl OAuthSession {
             .context("token refresh response is not JSON")?;
         let refreshed = parsed.into_token(Some(refresh_token), now_unix());
         *self.token.lock().unwrap() = refreshed.clone();
+        self.needs_relogin.store(false, Ordering::Relaxed);
         (self.on_update)(&refreshed);
         Ok(())
     }
+}
+
+/// A token endpoint rejected the refresh for good: only 400/401 carrying one
+/// of OAuth's terminal error codes (RFC 6749 §5.2) means logging in again is
+/// the only way forward. Everything else (5xx, 429, an unparsable body) is
+/// treated as transient and left for the next request.
+fn refresh_failure_is_definitive(status: u16, body: &str) -> bool {
+    if !matches!(status, 400 | 401) {
+        return false;
+    }
+    let error = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|doc| doc["error"].as_str().map(str::to_string));
+    matches!(
+        error.as_deref(),
+        Some("invalid_grant" | "invalid_client" | "unauthorized_client")
+    )
 }
 
 #[cfg(test)]
@@ -919,37 +1008,115 @@ mod tests {
                 .send()
                 .await;
         });
-        let code = await_callback(listener, "st", Duration::from_secs(5))
-            .await
-            .unwrap();
+        let code = await_callback(
+            listener,
+            "st",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(code, "the-code");
     }
 
+    /// A wrong-state request is ignored, not fatal: the real redirect still
+    /// completes the login.
     #[tokio::test]
-    async fn callback_rejects_mismatched_state() {
+    async fn callback_ignores_mismatched_state_and_keeps_waiting() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let _ = reqwest::Client::new()
+            let client = reqwest::Client::new();
+            let _ = client
                 .get(format!(
                     "http://127.0.0.1:{port}/callback?code=c&state=WRONG"
                 ))
                 .send()
                 .await;
+            let _ = client
+                .get(format!(
+                    "http://127.0.0.1:{port}/callback?code=right&state=expected"
+                ))
+                .send()
+                .await;
         });
-        let err = await_callback(listener, "expected", Duration::from_secs(5))
+        let code = await_callback(
+            listener,
+            "expected",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, "right");
+    }
+
+    /// A matching authorization-server error ends the login with its message.
+    #[tokio::test]
+    async fn callback_surfaces_matching_error_redirect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = reqwest::Client::new()
+                .get(format!(
+                    "http://127.0.0.1:{port}/callback?error=access_denied&state=st"
+                ))
+                .send()
+                .await;
+        });
+        let error = await_callback(
+            listener,
+            "st",
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("access_denied"), "{error:#}");
+    }
+
+    /// A connection that never sends a request line (browser pre-connect, port
+    /// scan) must not consume the whole login window.
+    #[tokio::test]
+    async fn idle_callback_connection_does_not_block_the_real_redirect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let idle = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("state mismatch"), "got: {err}");
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{port}/callback?code=c&state=st"))
+                .send()
+                .await;
+        });
+        let started = std::time::Instant::now();
+        let code = await_callback(
+            listener,
+            "st",
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, "c");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(idle);
     }
 
     #[tokio::test]
     async fn callback_times_out() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let err = await_callback(listener, "s", Duration::from_millis(50))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("timed out"), "got: {err}");
+        let error = await_callback(
+            listener,
+            "s",
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "got: {error}");
     }
 
     #[tokio::test]
@@ -1051,6 +1218,113 @@ mod tests {
         let err = session.bearer().await.unwrap_err();
         assert!(err.to_string().contains("invalid_grant"), "got: {err}");
         assert!(session.needs_relogin());
+    }
+
+    #[test]
+    fn only_terminal_rejections_are_definitive() {
+        let grant = r#"{"error":"invalid_grant"}"#;
+        assert!(refresh_failure_is_definitive(400, grant));
+        assert!(refresh_failure_is_definitive(
+            401,
+            r#"{"error":"invalid_client"}"#
+        ));
+        assert!(refresh_failure_is_definitive(
+            400,
+            r#"{"error":"unauthorized_client"}"#
+        ));
+        // Transient or ambiguous: keep the credential and retry later.
+        assert!(!refresh_failure_is_definitive(503, grant));
+        assert!(!refresh_failure_is_definitive(429, grant));
+        assert!(!refresh_failure_is_definitive(500, grant));
+        assert!(!refresh_failure_is_definitive(400, "not json"));
+        assert!(!refresh_failure_is_definitive(
+            400,
+            r#"{"error":"temporarily_unavailable"}"#
+        ));
+        assert!(!refresh_failure_is_definitive(401, ""));
+    }
+
+    /// A stalled token endpoint must not pin the refresh: the request fails on
+    /// its own deadline, and the failure stays transient (no relogin verdict).
+    #[tokio::test]
+    async fn unresponsive_token_endpoint_fails_the_refresh_on_its_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let session = OAuthSession::with_client(
+            http,
+            endpoint,
+            "client-1".into(),
+            "https://mcp.example.com/mcp".into(),
+            OAuthToken {
+                access_token: "at-old".into(),
+                refresh_token: Some("rt-1".into()),
+                expires_at: Some(0),
+                scope: None,
+            },
+            Box::new(|_| {}),
+        );
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(2), session.bearer())
+            .await
+            .expect("refresh must fail on its own deadline, not hang")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("token refresh request failed"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!session.needs_relogin());
+    }
+
+    /// A 5xx from the token endpoint is not an authentication verdict; a later
+    /// successful refresh clears an earlier relogin flag.
+    #[tokio::test]
+    async fn transient_refresh_failure_keeps_credential_and_success_clears_relogin() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"access_token": "at-new"})),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let session = OAuthSession::new(
+            format!("{}/token", server.uri()),
+            "client-1".into(),
+            "https://mcp.example.com/mcp".into(),
+            OAuthToken {
+                access_token: "at-old".into(),
+                refresh_token: Some("rt-1".into()),
+                expires_at: Some(0),
+                scope: None,
+            },
+            Box::new(|_| {}),
+        );
+        let error = session.bearer().await.unwrap_err();
+        assert!(error.to_string().contains("503"), "got: {error}");
+        assert!(!session.needs_relogin());
+
+        session.mark_relogin_required();
+        assert_eq!(session.bearer().await.unwrap(), "at-new");
+        assert!(!session.needs_relogin());
     }
 
     /// Full login over a mock AS: discovery + DCR + token exchange, with the

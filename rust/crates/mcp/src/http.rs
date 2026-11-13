@@ -41,12 +41,25 @@ use crate::oauth::OAuthSession;
 use crate::sse::SseParser;
 
 /// codex's schedule: back off 250ms, then 1s, then one final attempt (3
-/// tries total). Only 408/429/5xx and transient network errors retry.
+/// tries total). Only reruns that cannot have executed the operation, and
+/// transient network errors for idempotent methods, retry.
 const DEFAULT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 /// `notifications/initialized` and re-handshake POSTs are quick; reuse the
 /// handshake budget for them.
 const NOTIFY_TIMEOUT: Duration = crate::HANDSHAKE_TIMEOUT;
+
+/// Bound connection setup even though each request already has a whole-request
+/// deadline: a dead host fails fast instead of consuming that budget.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether a failed attempt may be replayed. `tools/call` is not idempotent,
+/// so it only replays when the server cannot have acted on the request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    Idempotent,
+    OnlyUnprocessed,
+}
 
 pub(crate) struct HttpTransport {
     client: reqwest::Client,
@@ -112,7 +125,10 @@ impl HttpTransport {
         }
         let (health, _) = tokio::sync::watch::channel(crate::McpTransportHealth::healthy());
         Ok(HttpTransport {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .build()
+                .context("building the mcp http client")?,
             url,
             base_headers,
             next_id: AtomicU64::new(1),
@@ -194,30 +210,37 @@ impl HttpTransport {
 
     /// POST one JSON-RPC message. `expect_id` is the request id whose response
     /// we await (`None` for a notification — the server 202s with no body). On
-    /// a session-expired 404 the caller re-handshakes; other retryable failures
-    /// back off per the schedule; the rest are terminal.
+    /// a session-expired 404 the caller re-handshakes; retryable failures back
+    /// off per the schedule under `replay`'s rules; the rest are terminal.
     async fn post_with_retry(
         &self,
         body: &Value,
         expect_id: Option<u64>,
         timeout: Duration,
+        replay: Replay,
     ) -> std::result::Result<Option<Value>, PostError> {
         let mut attempt = 0;
         loop {
-            let outcome = self.post_once(body, expect_id, timeout).await;
-            match outcome {
+            let error = match self.post_once(body, expect_id, timeout).await {
                 Ok(v) => return Ok(v),
                 Err(Attempt::SessionExpired) => return Err(PostError::SessionExpired),
-                Err(Attempt::Unauthorized(bearer)) => return Err(PostError::Unauthorized(bearer)),
-                Err(Attempt::Fatal(e)) => return Err(PostError::Other(e)),
-                Err(Attempt::Retryable(e)) => {
-                    let Some(delay) = self.retry_delays.get(attempt).copied() else {
-                        return Err(PostError::Other(e));
-                    };
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
+                Err(Attempt::Unauthorized(bearer)) => {
+                    return Err(PostError::Unauthorized(bearer));
                 }
-            }
+                Err(Attempt::Fatal(e)) => return Err(PostError::Other(e)),
+                Err(Attempt::NotProcessed(e)) => e,
+                Err(Attempt::MaybeProcessed(e)) => {
+                    if replay == Replay::OnlyUnprocessed {
+                        return Err(PostError::Other(e));
+                    }
+                    e
+                }
+            };
+            let Some(delay) = self.retry_delays.get(attempt).copied() else {
+                return Err(PostError::Other(error));
+            };
+            tokio::time::sleep(delay).await;
+            attempt += 1;
         }
     }
 
@@ -270,10 +293,16 @@ impl HttpTransport {
             req = req.header("MCP-Protocol-Version", ver);
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Attempt::Retryable(anyhow!("mcp http request failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            // A connection that never opened cannot have been processed;
+            // anything later (reset while reading headers) may have been.
+            let message = anyhow!("mcp http request failed: {e}");
+            if e.is_connect() {
+                Attempt::NotProcessed(message)
+            } else {
+                Attempt::MaybeProcessed(message)
+            }
+        })?;
 
         if let Some(sid) = resp
             .headers()
@@ -302,10 +331,14 @@ impl HttpTransport {
             let bytes = read_body_bounded(resp).await?;
             let text = String::from_utf8_lossy(&bytes);
             let msg = anyhow!("mcp http {status}: {text}");
-            // 403 and other 4xx are terminal (retrying won't help); the
-            // server-error and transient-load codes retry.
-            if code == 408 || code == 429 || (500..600).contains(&code) {
-                return Err(Attempt::Retryable(msg));
+            // 429/503 are explicit backpressure ("not processed"). Other
+            // server errors may have run the operation, so only idempotent
+            // methods replay them; 4xx is terminal.
+            if code == 429 || code == 503 {
+                return Err(Attempt::NotProcessed(msg));
+            }
+            if code == 408 || (500..600).contains(&code) {
+                return Err(Attempt::MaybeProcessed(msg));
             }
             return Err(Attempt::Fatal(msg));
         }
@@ -386,14 +419,22 @@ impl HttpTransport {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let init = json!({"jsonrpc": "2.0", "id": id, "method": "initialize", "params": params});
         let result = self
-            .post_with_retry(&init, Some(id), crate::HANDSHAKE_TIMEOUT)
+            .post_with_retry(
+                &init,
+                Some(id),
+                crate::HANDSHAKE_TIMEOUT,
+                Replay::Idempotent,
+            )
             .await
             .map_err(PostError::into_anyhow)
             .context("mcp re-initialize failed")?
             .context("mcp re-initialize produced no response")?;
         let capabilities = crate::McpServerCapabilities::from_initialize(&result);
         let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        if let Err(error) = self.post_with_retry(&notif, None, NOTIFY_TIMEOUT).await {
+        if let Err(error) = self
+            .post_with_retry(&notif, None, NOTIFY_TIMEOUT, Replay::Idempotent)
+            .await
+        {
             self.clear_recovered_session();
             return Err(error.into_anyhow());
         }
@@ -436,7 +477,14 @@ impl Transport for HttpTransport {
                 return Err(anyhow::Error::new(McpSessionReinitialized { capabilities }));
             }
             let session_before = self.session_id.lock().unwrap().clone();
-            let result = match self.post_with_retry(&body, Some(id), timeout).await {
+            // `tools/call` may create issues or send messages: a gateway 5xx
+            // or a broken reply must go to the model instead of being replayed.
+            let replay = if method == "tools/call" {
+                Replay::OnlyUnprocessed
+            } else {
+                Replay::Idempotent
+            };
+            let result = match self.post_with_retry(&body, Some(id), timeout, replay).await {
                 Ok(v) => v,
                 Err(PostError::SessionExpired) => {
                     drop(session_guard);
@@ -450,7 +498,7 @@ impl Transport for HttpTransport {
                         .as_ref()
                         .expect("Unauthorized requires an OAuth session");
                     oauth.refresh_after_401(&used_bearer).await?;
-                    match self.post_with_retry(&body, Some(id), timeout).await {
+                    match self.post_with_retry(&body, Some(id), timeout, replay).await {
                         Ok(value) => {
                             self.publish_authentication_refreshed();
                             value
@@ -494,7 +542,7 @@ impl Transport for HttpTransport {
                 Some(params) => json!({"jsonrpc": "2.0", "method": method, "params": params}),
                 None => json!({"jsonrpc": "2.0", "method": method}),
             };
-            self.post_with_retry(&body, None, NOTIFY_TIMEOUT)
+            self.post_with_retry(&body, None, NOTIFY_TIMEOUT, Replay::Idempotent)
                 .await
                 .map_err(PostError::into_anyhow)?;
             Ok(())
@@ -526,7 +574,10 @@ enum Attempt {
     SessionExpired,
     /// A 401 under OAuth; carries the rejected bearer for the refresh dedup.
     Unauthorized(String),
-    Retryable(anyhow::Error),
+    /// The server cannot have acted on the request (connect failure, 429/503).
+    NotProcessed(anyhow::Error),
+    /// The server may have acted on the request (other 5xx, a broken reply).
+    MaybeProcessed(anyhow::Error),
     Fatal(anyhow::Error),
 }
 
@@ -563,14 +614,17 @@ async fn read_body_bounded(resp: reqwest::Response) -> std::result::Result<Vec<u
 /// Read an SSE response stream until the JSON-RPC message answering `want`
 /// arrives. Server→client requests/notifications interleaved before it are
 /// ignored (we advertise no capabilities). The stream is consumed
-/// incrementally so keep-alives don't force buffering the whole body.
+/// incrementally so keep-alives don't force buffering the whole body. The wire
+/// cap counts `data` bytes only: a long-running call's keep-alive comments do
+/// not eat the budget meant for its messages, while an unfinished frame may not
+/// grow past the cap either.
 async fn read_sse_message(
     resp: reqwest::Response,
     want: u64,
 ) -> std::result::Result<Value, Attempt> {
     let mut parser = SseParser::default();
     let mut stream = resp.bytes_stream();
-    let mut total_bytes = 0usize;
+    let mut data_bytes = 0usize;
     loop {
         let next = stream.next().await;
         let Some(chunk) = next else {
@@ -578,14 +632,21 @@ async fn read_sse_message(
         };
         let chunk = chunk
             .map_err(|e| Attempt::Fatal(anyhow!("mcp http: reading event stream failed: {e}")))?;
-        total_bytes = total_bytes.saturating_add(chunk.len());
-        if total_bytes > crate::MAX_WIRE_MESSAGE_BYTES {
+        let payloads = parser.feed(&chunk);
+        if parser.buffered_len() > crate::MAX_WIRE_MESSAGE_BYTES {
             return Err(Attempt::Fatal(anyhow!(
-                "mcp http: event stream exceeds the {}-byte wire limit",
+                "mcp http: event stream frame exceeds the {}-byte wire limit",
                 crate::MAX_WIRE_MESSAGE_BYTES
             )));
         }
-        for data in parser.feed(&chunk) {
+        for data in payloads {
+            data_bytes = data_bytes.saturating_add(data.len());
+            if data_bytes > crate::MAX_WIRE_MESSAGE_BYTES {
+                return Err(Attempt::Fatal(anyhow!(
+                    "mcp http: event stream exceeds the {}-byte wire limit",
+                    crate::MAX_WIRE_MESSAGE_BYTES
+                )));
+            }
             let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
@@ -825,6 +886,78 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",
 
         let client = client(server.uri(), BTreeMap::new());
         assert!(client.list_tools().await.is_ok());
+    }
+
+    /// A 502 may have run the operation already, so a non-idempotent
+    /// `tools/call` is not replayed; the failure goes back to the model.
+    #[tokio::test]
+    async fn tools_call_is_not_replayed_after_a_gateway_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client(server.uri(), BTreeMap::new());
+        let error = client
+            .call_tool("create_issue", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("502"), "{error:#}");
+        server.verify().await;
+    }
+
+    /// 503 is explicit backpressure: the server did not process the call, so
+    /// even `tools/call` retries it.
+    #[tokio::test]
+    async fn tools_call_retries_an_unprocessed_503() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(RpcResult::new(
+                json!({"content": [{"type": "text", "text": "created"}]}),
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let client = client(server.uri(), BTreeMap::new());
+        assert_eq!(
+            client.call_tool("create_issue", &json!({})).await.unwrap(),
+            "created"
+        );
+    }
+
+    /// Keep-alive comments may run for as long as a slow tool does; they must
+    /// not consume the wire budget that bounds actual message data.
+    #[tokio::test]
+    async fn sse_keep_alives_do_not_consume_the_wire_cap() {
+        let server = MockServer::start().await;
+        let keep_alive = b": keep-alive\n\n";
+        let mut body = Vec::with_capacity(crate::MAX_WIRE_MESSAGE_BYTES + 1024);
+        while body.len() <= crate::MAX_WIRE_MESSAGE_BYTES {
+            body.extend_from_slice(keep_alive);
+        }
+        body.extend_from_slice(
+            b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let client = client(server.uri(), BTreeMap::new());
+        assert_eq!(client.call_tool("slow", &json!({})).await.unwrap(), "hi");
     }
 
     /// 401 is terminal — one request, no retry, surfaced as an error.
