@@ -85,19 +85,51 @@ fn strip_container(html: &str, tag: &str) -> String {
     out
 }
 
+/// Only a `<!--` in text starts a comment. A `<!--` inside a quoted attribute
+/// value (or inside a tag) is data; treating it as a comment start would drop
+/// the rest of the page.
 fn strip_comments(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
-    let mut pos = 0;
-    while let Some(start) = html[pos..].find("<!--") {
-        let start = pos + start;
-        out.push_str(&html[pos..start]);
-        pos = match html[start..].find("-->") {
-            Some(rel) => start + rel + 3,
-            None => html.len(),
-        };
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(offset) = html[from..].find('<') {
+        let start = from + offset;
+        if html[start..].starts_with("<!--") {
+            out.push_str(&html[copied..start]);
+            let end = html[start + b"<!--".len()..]
+                .find("-->")
+                .map_or(html.len(), |rel| start + b"<!--".len() + rel + b"-->".len());
+            copied = end;
+            from = end;
+            continue;
+        }
+        let starts_tag = html[start + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '!' | '?' | '/'));
+        match (starts_tag, tag_end(html, start)) {
+            (true, Some(end)) => from = end + 1,
+            _ => from = start + 1,
+        }
     }
-    out.push_str(&html[pos..]);
+    out.push_str(&html[copied..]);
     out
+}
+
+/// The byte index of the `>` closing the tag that starts at `start`, ignoring a
+/// `>` inside a quoted attribute value.
+fn tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, c) in html[start..].char_indices() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '>' => return Some(start + offset),
+            None => {}
+        }
+    }
+    None
 }
 
 fn is_block_tag(tag: &str) -> bool {
@@ -206,6 +238,20 @@ mod tests {
         assert!(!text.contains("color: red"));
         assert!(!text.contains("hidden note"));
         assert!(!text.contains('<'));
+    }
+
+    /// A `<!--` inside a quoted attribute value is data; treating it as a
+    /// comment start would delete the whole rest of the page.
+    #[test]
+    fn a_comment_marker_inside_an_attribute_is_not_a_comment() {
+        assert_eq!(
+            html_to_text("<div data-marker=\"<!--\"><p>kept</p></div>"),
+            "kept"
+        );
+        assert_eq!(
+            html_to_text("<p>a</p><!-- real comment --><p>b</p>"),
+            "a\n\nb"
+        );
     }
 
     #[test]

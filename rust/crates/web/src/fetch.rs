@@ -368,34 +368,60 @@ fn charset_from_content_type(content_type: &str) -> Option<&str> {
 /// The `<meta>` encoding declaration inside the first 1024 bytes — the prescan
 /// window browsers use, so a declaration further down is not consulted.
 /// Comments are skipped: a commented-out `<meta charset=…>` is not authoritative
-/// and would otherwise override the real declaration that follows it.
+/// and would otherwise override the real declaration that follows it. Only a
+/// `<!--` in text starts a comment — one inside a quoted attribute value is not
+/// a comment start, and treating it as one would drop the declaration after it.
 fn html_meta_charset(bytes: &[u8]) -> Option<&str> {
     let head = &bytes[..bytes.len().min(1024)];
     let mut from = 0;
-    loop {
-        let meta = find_ascii_ci(&head[from..], b"<meta").map(|offset| from + offset);
-        let comment = find_bytes(&head[from..], b"<!--").map(|offset| from + offset);
-        if comment.is_some_and(|comment| meta.is_none_or(|meta| comment < meta)) {
-            let comment = comment.unwrap();
-            let end = find_bytes(&head[comment + b"<!--".len()..], b"-->")?;
-            from = comment + b"<!--".len() + end + b"-->".len();
+    while from < head.len() {
+        if head[from] != b'<' {
+            from += 1;
             continue;
         }
-        let start = meta?;
+        if head[from..].starts_with(b"<!--") {
+            let end = find_bytes(&head[from + b"<!--".len()..], b"-->")?;
+            from = from + b"<!--".len() + end + b"-->".len();
+            continue;
+        }
+        let starts_tag = head
+            .get(from + 1)
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'!' | b'?' | b'/'));
+        if !starts_tag {
+            from += 1;
+            continue;
+        }
+        let end = tag_end(head, from)?;
+        let tag = &head[from..end];
         // `<metadata>` is not `<meta>`.
-        if !head
-            .get(start + b"<meta".len())
-            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+        if tag.len() >= b"<meta".len()
+            && tag[..b"<meta".len()].eq_ignore_ascii_case(b"<meta")
+            && tag
+                .get(b"<meta".len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+            && let Some(label) = charset_attribute(tag)
         {
-            from = start + b"<meta".len();
-            continue;
-        }
-        let end = head[start..].iter().position(|&byte| byte == b'>')? + start;
-        if let Some(label) = charset_attribute(&head[start..end]) {
             return Some(label);
         }
         from = end + 1;
     }
+    None
+}
+
+/// The index of the `>` that closes the tag starting at `start`, ignoring any
+/// `>` inside a quoted attribute value.
+fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        match quote {
+            Some(open) if *byte == open => quote = None,
+            Some(_) => {}
+            None if matches!(*byte, b'"' | b'\'') => quote = Some(*byte),
+            None if *byte == b'>' => return Some(start + offset),
+            None => {}
+        }
+    }
+    None
 }
 
 fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -482,7 +508,11 @@ fn is_client_rendered(html_bytes: usize, has_script: bool, text: &str) -> bool {
 /// resolves only the proxy, so a name that resolves privately would never be
 /// seen at all. A name this host cannot resolve is refused too: letting a proxy
 /// resolve it is exactly the case where an internal target would otherwise
-/// arrive without any local address check.
+/// arrive without any local address check. The configured proxy endpoint itself
+/// is not a fetch target: the resolver exempts it by name, and that exemption is
+/// only sound while the name is used for the proxy connection. Refusing direct
+/// fetches of it (a `NO_PROXY` match would otherwise connect directly) is what
+/// keeps the exemption bound to the proxy leg.
 async fn guard(dns: &PublicResolver, url: &Url, allow_private: bool) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
@@ -496,6 +526,9 @@ async fn guard(dns: &PublicResolver, url: &Url, allow_private: bool) -> Result<(
         Some(url::Host::Ipv4(ip)) if !ip_is_public(IpAddr::V4(ip)) => bail!(refuse_private(&ip)),
         Some(url::Host::Ipv6(ip)) if !ip_is_public(IpAddr::V6(ip)) => bail!(refuse_private(&ip)),
         Some(url::Host::Domain(name)) => {
+            if dns.is_proxy(name) {
+                bail!("web_fetch: '{name}' is the configured proxy endpoint, not a fetch target");
+            }
             if is_localhost_name(name) {
                 bail!(refuse_private(&name));
             }
@@ -1007,6 +1040,30 @@ mod tests {
         assert!(err.to_string().contains("SSRF guard"), "{err}");
     }
 
+    /// The name-based exemption must never cover a direct fetch. A `NO_PROXY`
+    /// match would connect to this host directly, so the fetch is refused
+    /// outright instead of reaching a private address unexamined.
+    #[tokio::test]
+    async fn a_configured_proxy_endpoint_is_not_a_fetch_target() {
+        let dns = scripted_resolver(vec![addr("10.0.0.5")], &["proxy.test"]);
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::clone(&dns))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let err = fetch_url(
+            &client,
+            &dns,
+            "https://proxy.test:8443/",
+            /*allow_private*/ false,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("configured proxy endpoint"), "{message}");
+    }
+
     #[test]
     fn proxy_hosts_are_read_like_reqwest_reads_them() {
         let env = |name: &str| match name {
@@ -1113,6 +1170,11 @@ mod tests {
             html_meta_charset(b"<head><!-- note --><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">"),
             Some("utf-8")
         );
+        // `<!--` inside a quoted attribute is not a comment start.
+        assert_eq!(
+            html_meta_charset(b"<html data-marker=\"<!--\"><meta charset=gbk>"),
+            Some("gbk")
+        );
         // Only the prescan window counts, as in browsers.
         let mut late = vec![b' '; 1024];
         late.extend_from_slice(b"<meta charset=gbk>");
@@ -1200,6 +1262,28 @@ mod tests {
             .mount(&server)
             .await;
         let out = fetch_private(&format!("{}/comment", server.uri()))
+            .await
+            .unwrap();
+        assert!(out.contains(text), "{out}");
+    }
+
+    /// A `<!--` inside a quoted attribute value is text, not a comment start:
+    /// treating it as one would swallow the real declaration after the tag.
+    #[tokio::test]
+    async fn a_comment_marker_inside_an_attribute_does_not_hide_the_declaration() {
+        let server = MockServer::start().await;
+        let text = "中文标题";
+        let page = format!(
+            "<html data-marker=\"<!--\"><head><meta charset=gbk></head>\
+             <body>{text}</body></html>"
+        );
+        let (bytes, _, _) = encoding_rs::GBK.encode(&page);
+        Mock::given(method("GET"))
+            .and(path("/marker"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(bytes.into_owned(), "text/html"))
+            .mount(&server)
+            .await;
+        let out = fetch_private(&format!("{}/marker", server.uri()))
             .await
             .unwrap();
         assert!(out.contains(text), "{out}");

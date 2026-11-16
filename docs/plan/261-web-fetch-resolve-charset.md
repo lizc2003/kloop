@@ -48,6 +48,12 @@
     私网/回环地址不再被拒，否则 `HTTPS_PROXY=http://localhost:7890` 会让全部 web 工具不可用。
   - `<meta>` 预扫描跳过 HTML 注释：注释里的编码声明不再盖掉其后的真实声明
     （原先会把 UTF-8 页面按 windows-1252 解成无告警的乱码）。
+- **第二轮复核修正（同日）**：
+  - 代理豁免绑定到代理腿：按名字豁免会让 `NO_PROXY` 命中时的直连目标也跳过地址检查。
+    现在配置的代理端点本身被当作非抓取目标直接拒绝，fetch 的每一跳都必经此门，于是叫
+    这个名字的连接只可能是 reqwest 走代理的那一条；代理腿的私网地址仍被豁免。
+  - 注释识别只在正文生效：`<!--` 位于带引号的属性值里不算注释（预扫描与 HTML→text 的
+    注释剥离都改了），否则属性里的 `<!--` 会连同其后的真实 `<meta charset>` 一起被丢掉。
 - **解析固定**：`PublicResolver` 实现 `reqwest::dns::Resolve`，在 `WebTools` 的 client 上经
   `dns_resolver` 接入；不在公网范围内的答案在连接实际使用的那次解析里被拒，每跳重定向经同一
   client 与解析器，`accepted TOCTOU` 注释已删。每跳的静态检查与目标名预检保留：http 代理下
@@ -58,8 +64,9 @@
   编码仍按 UTF-8 有损解码；未知标签或字节不合声明编码时退回有损解码并在正文尾部注明。
 - **早拒**：非文本 Content-Type 在 `read_body` 之前拒绝，空类型仍按正文开头嗅探；夹具只发
   响应头、不承诺正文，断言客户端未等正文就关闭连接。
-- **验证**：`cargo test -p kloop-web --locked --offline`（43 passed，1 ignored 的 20 MiB
-  capped 用例未跑；含 rebinding、不可解析目标、代理豁免、注释 meta 四条回归）、
+- **验证**：`cargo test -p kloop-web --locked --offline`（46 passed，1 ignored 的 20 MiB
+  capped 用例未跑；含 rebinding、不可解析目标、代理豁免、代理端点拒抓、注释 meta、
+  属性内 <!-- 六条回归）、
   `cargo clippy -p kloop-web --all-targets -- -D warnings`、
   `cargo fmt -p kloop-web -- --check`。按 2026-11-06 验证约定未跑 `make check`：改动只落在
   `kloop-web` 及其依赖声明，局部用例覆盖了三条行为；`WebTools` 的其它调用方只有本 crate 的
