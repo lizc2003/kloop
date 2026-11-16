@@ -54,6 +54,9 @@
     这个名字的连接只可能是 reqwest 走代理的那一条；代理腿的私网地址仍被豁免。
   - 注释识别只在正文生效：`<!--` 位于带引号的属性值里不算注释（预扫描与 HTML→text 的
     注释剥离都改了），否则属性里的 `<!--` 会连同其后的真实 `<meta charset>` 一起被丢掉。
+- **第三轮复核修正（同日）**：注释剥离退化成平方复杂度——`tag_end` 在非标签起点也被
+  调用，正文里大量孤立 `<`（无 `>`）时每个 `<` 都重扫整个尾部。现在只在标签起点扫描，
+  标签不闭合即结束；回归用 1M 个孤立 `<` 在 5s 超时内完成来证明不再整段重扫。
 - **解析固定**：`PublicResolver` 实现 `reqwest::dns::Resolve`，在 `WebTools` 的 client 上经
   `dns_resolver` 接入；不在公网范围内的答案在连接实际使用的那次解析里被拒，每跳重定向经同一
   client 与解析器，`accepted TOCTOU` 注释已删。每跳的静态检查与目标名预检保留：http 代理下
@@ -64,9 +67,9 @@
   编码仍按 UTF-8 有损解码；未知标签或字节不合声明编码时退回有损解码并在正文尾部注明。
 - **早拒**：非文本 Content-Type 在 `read_body` 之前拒绝，空类型仍按正文开头嗅探；夹具只发
   响应头、不承诺正文，断言客户端未等正文就关闭连接。
-- **验证**：`cargo test -p kloop-web --locked --offline`（46 passed，1 ignored 的 20 MiB
+- **验证**：`cargo test -p kloop-web --locked --offline`（47 passed，1 ignored 的 20 MiB
   capped 用例未跑；含 rebinding、不可解析目标、代理豁免、代理端点拒抓、注释 meta、
-  属性内 <!-- 六条回归）、
+  属性内 <!-- 与孤立 `<` 扫描七条回归）、
   `cargo clippy -p kloop-web --all-targets -- -D warnings`、
   `cargo fmt -p kloop-web -- --check`。按 2026-11-06 验证约定未跑 `make check`：改动只落在
   `kloop-web` 及其依赖声明，局部用例覆盖了三条行为；`WebTools` 的其它调用方只有本 crate 的

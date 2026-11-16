@@ -107,9 +107,16 @@ fn strip_comments(html: &str) -> String {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '!' | '?' | '/'));
-        match (starts_tag, tag_end(html, start)) {
-            (true, Some(end)) => from = end + 1,
-            _ => from = start + 1,
+        if !starts_tag {
+            from = start + 1;
+            continue;
+        }
+        // Scanning for the tag end is linear in the tag, so it must only run on
+        // an actual tag start. An unterminated tag swallows the rest of the
+        // document: there is no text after it, hence no comment start either.
+        match tag_end(html, start) {
+            Some(end) => from = end + 1,
+            None => break,
         }
     }
     out.push_str(&html[copied..]);
@@ -252,6 +259,24 @@ mod tests {
             html_to_text("<p>a</p><!-- real comment --><p>b</p>"),
             "a\n\nb"
         );
+    }
+
+    /// A body full of stray `<` must be scanned once, not once per `<`: the
+    /// conversion is synchronous, so a quadratic scan over a 20 MiB download
+    /// cannot be interrupted by the HTTP timeout.
+    #[test]
+    fn stray_angle_brackets_do_not_rescan_the_tail() {
+        for input in ["<".repeat(1_000_000), "<a".repeat(500_000)] {
+            let expected = input.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(strip_comments(&input));
+            });
+            let out = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("strip_comments rescanned the tail for every `<`");
+            assert_eq!(out, expected);
+        }
     }
 
     #[test]
