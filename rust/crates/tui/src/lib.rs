@@ -1137,6 +1137,7 @@ fn spawn_file_search(
     cwd: std::path::PathBuf,
     target: menu::CompletionTarget,
     seq: u64,
+    popup_generation: u64,
     latest: Arc<std::sync::atomic::AtomicU64>,
     tasks: mpsc::UnboundedSender<UiTask>,
 ) {
@@ -1151,8 +1152,41 @@ fn spawn_file_search(
         })
         .await
         .unwrap_or_default();
-        let _ = tasks.send(UiTask::FileSearch { seq, target, paths });
+        let _ = tasks.send(UiTask::FileSearch {
+            seq,
+            popup_generation,
+            target,
+            paths,
+        });
     });
+}
+
+/// Whether a landed `@` search still belongs to the state that asked for it:
+/// a later query has not superseded it, and the user has not dismissed the menu
+/// it was meant to fill. The token itself may be unchanged across Esc, so the
+/// target check in `set_file_results` cannot decide this alone.
+fn search_lands(seq: u64, latest: u64, generation: u64, current_generation: u64) -> bool {
+    seq == latest && generation == current_generation
+}
+
+/// Whether this key is the submit that has to wait for an image still loading.
+/// Enter on a popup or a panel answers that surface and is never held; a
+/// newline chord is not a submit either.
+fn enter_waits_for_paste(
+    pending_pastes: usize,
+    app: &App,
+    key: &crossterm::event::KeyEvent,
+) -> bool {
+    use crossterm::event::KeyModifiers;
+    pending_pastes > 0
+        && key.code == crossterm::event::KeyCode::Enter
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        && app.popup.is_none()
+        && !app.interaction_active()
+        && app.fork_picker.is_none()
+        && app.provider_picker.is_none()
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
@@ -1206,22 +1240,42 @@ fn resolve_cwd_branch(cwd: &std::path::Path) -> Option<String> {
 /// spinner and anything streaming in. Each result comes back here and is applied
 /// only if it still matches the state that asked for it.
 enum UiTask {
-    /// `@` completion results; `seq` is the newest search the loop asked for.
+    /// `@` completion results; `seq` is the newest search the loop asked for,
+    /// `popup_generation` the menu state it was asked in.
     FileSearch {
         seq: u64,
+        popup_generation: u64,
         target: menu::CompletionTarget,
         paths: Vec<String>,
     },
     /// Ctrl+V: an image, or why there was none.
-    Clipboard(std::result::Result<ImageSource, String>),
+    Clipboard {
+        snapshot: PasteSnapshot,
+        image: std::result::Result<ImageSource, String>,
+    },
     /// A pasted path: the attachment, or None when it did not read — then the
     /// paste goes into the composer as text.
     ImagePaste {
+        snapshot: PasteSnapshot,
         text: String,
         source: Option<ImageSource>,
     },
     /// A cwd change that arrived without its branch.
     Branch { cwd: String, branch: Option<String> },
+}
+
+/// The draft a paste was aimed at. Both reads run off the event loop, so the
+/// result has to find the place the user pasted into — or learn that the draft
+/// is gone rather than land in the next message.
+#[derive(Clone, Debug)]
+struct PasteSnapshot {
+    /// [`App::draft_generation`] when the paste was asked for.
+    generation: u64,
+    /// The composer's text then; a different text only means the draft was
+    /// edited, but the recorded seam may no longer exist.
+    text: String,
+    /// The cursor then, in expanded-text bytes.
+    at: crate::text_layout::ByteOffset,
 }
 
 /// How long `@` typing settles before a tree walk starts: one walk per burst of
@@ -1260,6 +1314,12 @@ struct UiState {
     /// dropped, and one still sleeping when a key moves the query on skips its
     /// walk entirely.
     file_search_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Pastes whose image read is still in flight. Enter waits for them so the
+    /// image rides the message the user sent.
+    pending_pastes: usize,
+    /// The Enter that arrived while a paste was in flight; replayed once the
+    /// composer has the attachment.
+    deferred_enter: Option<(crossterm::event::KeyEvent, usize)>,
 }
 
 impl UiState {
@@ -1304,28 +1364,100 @@ impl UiState {
             self.cwd.clone(),
             target,
             seq,
+            self.app.popup_generation(),
             Arc::clone(&self.file_search_seq),
             self.tasks.clone(),
         );
     }
 
+    /// What a paste read off the loop has to remember: which draft it was asked
+    /// for, and where in it the attachment belongs.
+    fn paste_snapshot(&self) -> PasteSnapshot {
+        PasteSnapshot {
+            generation: self.app.draft_generation(),
+            text: self.app.composer.text().to_string(),
+            at: self.app.composer.cursor(),
+        }
+    }
+
     /// Ctrl+V: reading the OS clipboard (arboard) and PNG-encoding a screenshot
     /// are both blocking.
-    fn read_clipboard(&self) {
+    fn read_clipboard(&mut self) {
+        let snapshot = self.paste_snapshot();
+        self.pending_pastes += 1;
         let tasks = self.tasks.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = tasks.send(UiTask::Clipboard(clipboard::clipboard_image()));
+        tokio::spawn(async move {
+            // The wrapper keeps a panicking read from stranding the count, and
+            // with it the Enter waiting on it.
+            let image = tokio::task::spawn_blocking(clipboard::clipboard_image)
+                .await
+                .unwrap_or_else(|error| Err(format!("clipboard read failed: {error}")));
+            let _ = tasks.send(UiTask::Clipboard { snapshot, image });
         });
     }
 
     /// A pasted path may name an image: read it off the loop, and if it does not
     /// read, paste the text as ordinary input.
-    fn read_image_paste(&self, text: String, path: std::path::PathBuf) {
+    fn read_image_paste(&mut self, text: String, path: std::path::PathBuf) {
+        let snapshot = self.paste_snapshot();
+        self.pending_pastes += 1;
         let tasks = self.tasks.clone();
-        tokio::task::spawn_blocking(move || {
-            let source = load_image_paste(&path);
-            let _ = tasks.send(UiTask::ImagePaste { text, source });
+        tokio::spawn(async move {
+            let source = tokio::task::spawn_blocking(move || load_image_paste(&path))
+                .await
+                .ok()
+                .flatten();
+            let _ = tasks.send(UiTask::ImagePaste {
+                snapshot,
+                text,
+                source,
+            });
         });
+    }
+
+    /// Put a pasted attachment where it was asked for: at the recorded seam when
+    /// the draft still has one, at the cursor when the draft was edited under
+    /// it, and nowhere when that draft was submitted or cleared meanwhile — the
+    /// image must not turn up in the next message. A dropped paste says so.
+    fn attach_pasted_image(&mut self, snapshot: PasteSnapshot, source: ImageSource) {
+        if self.app.draft_generation() != snapshot.generation {
+            self.note(
+                "pasted image arrived after that draft was sent or cleared — not attached".into(),
+            );
+            return;
+        }
+        let source = match self.app.attach_image_at(snapshot.at, source) {
+            Ok(()) => return,
+            Err(source) => source,
+        };
+        // The seam is gone (an edit crossed it, or an atom sits there now): the
+        // cursor is the one place the user can still see the attachment land.
+        if self.app.composer.text() != snapshot.text {
+            self.note(
+                "pasted image attached at the cursor — the draft changed while it loaded".into(),
+            );
+        }
+        self.app.attach_image(source);
+    }
+
+    /// One dim transcript note, the same channel every other loop-side notice
+    /// uses.
+    fn note(&mut self, text: String) {
+        self.app.apply(AgentEvent::Core(CoreEvent::Note(text)));
+    }
+
+    /// A paste result landed: count it in, write it where it was asked for, and
+    /// replay the Enter that waited for it once nothing else is in flight.
+    fn settle_paste(&mut self) -> ControlFlow<()> {
+        self.pending_pastes = self.pending_pastes.saturating_sub(1);
+        if self.pending_pastes > 0 {
+            return ControlFlow::Continue(());
+        }
+        if let Some((key, width)) = self.deferred_enter.take() {
+            let command = self.app.on_key(width, key);
+            return self.on_command(command);
+        }
+        ControlFlow::Continue(())
     }
 
     /// A cwd change arrived without its branch (the worktree tool leaving a
@@ -1346,23 +1478,51 @@ impl UiState {
         }
     }
 
-    /// Deliver one off-loop result. A stale one — a moved-on `@` query, a branch
-    /// for a directory the session already left — is dropped.
+    /// Deliver one off-loop result. A stale one — a moved-on `@` query, a menu
+    /// the user dismissed, a draft that was sent, a branch for a directory the
+    /// session already left — is dropped.
     fn on_task(&mut self, task: UiTask) -> ControlFlow<()> {
         match task {
-            UiTask::FileSearch { seq, target, paths } => {
-                if seq == self.file_search_seq.load(Ordering::Relaxed) {
+            UiTask::FileSearch {
+                seq,
+                popup_generation,
+                target,
+                paths,
+            } => {
+                if search_lands(
+                    seq,
+                    self.file_search_seq.load(Ordering::Relaxed),
+                    popup_generation,
+                    self.app.popup_generation(),
+                ) {
                     self.app.set_file_results(target, paths);
                 }
             }
-            UiTask::Clipboard(Ok(source)) => self.app.attach_image(source),
-            UiTask::Clipboard(Err(error)) => {
-                self.app.apply(AgentEvent::Core(CoreEvent::Note(error)));
+            UiTask::Clipboard { snapshot, image } => {
+                match image {
+                    Ok(source) => self.attach_pasted_image(snapshot, source),
+                    Err(error) => self.note(error),
+                }
+                return self.settle_paste();
             }
-            UiTask::ImagePaste { text, source } => match source {
-                Some(source) => self.app.attach_image(source),
-                None => self.paste(&text),
-            },
+            UiTask::ImagePaste {
+                snapshot,
+                text,
+                source,
+            } => {
+                match source {
+                    Some(source) => self.attach_pasted_image(snapshot, source),
+                    // Not an image after all: the paste is plain text, and it
+                    // belongs to the draft it was pasted into just the same.
+                    None if self.app.draft_generation() == snapshot.generation => {
+                        self.paste(&text);
+                    }
+                    None => self.note(
+                        "paste arrived after that draft was sent or cleared — not inserted".into(),
+                    ),
+                }
+                return self.settle_paste();
+            }
             UiTask::Branch { cwd, branch } => self.app.fill_branch(&cwd, branch),
         }
         ControlFlow::Continue(())
@@ -1387,6 +1547,13 @@ impl UiState {
         }
         match input {
             Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                // A paste is still loading its image: Enter waits for it, so the
+                // image rides the message the user just sent instead of landing
+                // in the next draft.
+                if enter_waits_for_paste(self.pending_pastes, &self.app, &k) {
+                    self.deferred_enter = Some((k, viewport_width));
+                    return ControlFlow::Continue(());
+                }
                 let command = self.app.on_key(viewport_width, k);
                 self.on_command(command)
             }
@@ -1639,6 +1806,8 @@ async fn ui_loop(
         thinking_started: None,
         tasks: task_tx,
         file_search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        pending_pastes: 0,
+        deferred_enter: None,
     };
     let outcome = loop {
         if std::mem::take(&mut state.clear_terminal)
@@ -2012,6 +2181,7 @@ mod tests {
             root.clone(),
             target("alpha"),
             1,
+            0,
             Arc::clone(&latest),
             tx.clone(),
         );
@@ -2020,6 +2190,7 @@ mod tests {
             root.clone(),
             target("beta"),
             2,
+            0,
             Arc::clone(&latest),
             tx.clone(),
         );
@@ -2042,10 +2213,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Enter is held only for a paste that is actually loading an image, and
+    /// only where Enter would submit: a popup, a panel or a newline chord keeps
+    /// its own meaning.
+    #[test]
+    fn enter_waits_for_a_paste_only_while_one_is_loading() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let mut app = App::new("paste-enter".into());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!enter_waits_for_paste(0, &app, &enter));
+        assert!(enter_waits_for_paste(1, &app, &enter));
+        assert!(
+            !enter_waits_for_paste(1, &app, &KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            "shift+Enter is a newline, not a submit"
+        );
+
+        // A popup consumes Enter itself (accept), so it is not held.
+        app.composer.paste("@mai");
+        let target = app.detect_trigger().expect("@ token");
+        app.set_file_results(target, vec!["main.rs".into()]);
+        assert!(app.popup.is_some());
+        assert!(!enter_waits_for_paste(1, &app, &enter));
+    }
+
+    /// A search lands only while it is the newest one and the menu state that
+    /// asked for it is still current; Esc closes the menu without touching the
+    /// token, so the sequence alone would reopen it.
+    #[test]
+    fn a_dismissed_search_does_not_land() {
+        assert!(search_lands(3, 3, 1, 1));
+        assert!(!search_lands(2, 3, 1, 1), "superseded by a later query");
+        assert!(!search_lands(3, 3, 1, 2), "menu dismissed since");
+    }
+
     fn task_name(task: &UiTask) -> &'static str {
         match task {
             UiTask::FileSearch { .. } => "file search",
-            UiTask::Clipboard(_) => "clipboard",
+            UiTask::Clipboard { .. } => "clipboard",
             UiTask::ImagePaste { .. } => "image paste",
             UiTask::Branch { .. } => "branch",
         }

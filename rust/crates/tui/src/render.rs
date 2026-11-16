@@ -823,15 +823,16 @@ fn shown_cell(app: &App, i: usize, cell: &Cell, width: usize, thinking_secs: u64
 /// long answer streams below it, re-parsing the text above it each frame is pure
 /// waste. Entries are keyed by the cell itself — content, width and liveness —
 /// so every mutation path in the `App` invalidates them without a revision to
-/// maintain; the index only keeps the cache bounded to the current tail.
+/// maintain; the slot is the cell's index, so a frame with a long resumed
+/// history stays linear instead of scanning the cache per cell.
 #[derive(Debug, Default)]
 pub struct ShownCache {
-    entries: Vec<CachedCell>,
+    /// One slot per `App::cells` index, aligned in the frame just rendered.
+    entries: Vec<Option<CachedCell>>,
 }
 
 #[derive(Debug)]
 struct CachedCell {
-    index: usize,
     width: usize,
     live: bool,
     cell: Cell,
@@ -845,8 +846,14 @@ impl ShownCache {
     pub fn shown_cells(&mut self, app: &App, width: usize, thinking_secs: u64) -> Vec<ShownCell> {
         let width = width.max(1);
         let last = app.cells.len().saturating_sub(1);
-        self.entries.retain(|entry| entry.index < app.cells.len());
-        app.cells
+        // Slots are positional: a drain shifts which cell each one is compared
+        // against, and the content check below re-renders whatever changed (or
+        // moved). Entries past the new tail length are dropped here.
+        let mut previous = std::mem::take(&mut self.entries);
+        previous.resize_with(app.cells.len(), || None);
+        let mut entries = Vec::with_capacity(app.cells.len());
+        let shown = app
+            .cells
             .iter()
             .enumerate()
             .map(|(index, cell)| {
@@ -855,28 +862,30 @@ impl ShownCache {
                     && ((app.streaming_assistant() && matches!(cell, Cell::Assistant(_)))
                         || (app.streaming_thinking() && matches!(cell, Cell::Thinking { .. })));
                 if streaming {
+                    entries.push(None);
                     return shown_cell(app, index, cell, width, thinking_secs);
                 }
-                if let Some(entry) = self.entries.iter().find(|entry| {
-                    entry.index == index
-                        && entry.width == width
-                        && entry.live == live
-                        && entry.cell == *cell
-                }) {
-                    return entry.shown.clone();
+                if let Some(entry) = previous[index].take()
+                    && entry.width == width
+                    && entry.live == live
+                    && entry.cell == *cell
+                {
+                    let shown = entry.shown.clone();
+                    entries.push(Some(entry));
+                    return shown;
                 }
                 let shown = shown_cell(app, index, cell, width, thinking_secs);
-                self.entries.retain(|entry| entry.index != index);
-                self.entries.push(CachedCell {
-                    index,
+                entries.push(Some(CachedCell {
                     width,
                     live,
                     cell: cell.clone(),
                     shown: shown.clone(),
-                });
+                }));
                 shown
             })
-            .collect()
+            .collect();
+        self.entries = entries;
+        shown
     }
 }
 
@@ -3510,6 +3519,48 @@ mod tests {
             "a sealed answer must not re-parse on later frames: {counts:?}"
         );
         assert!(counts[1] <= 2, "{counts:?}");
+    }
+
+    /// The cache slot follows a cell's index, so a commit that drops the head
+    /// re-renders at most what moved; unchanged tails cost no parser run at all.
+    #[test]
+    fn the_cell_cache_follows_the_committed_prefix() {
+        let mut app = App::new("cache-slots".into());
+        app.cells = (0..100)
+            .map(|index| Cell::Assistant(format!("answer {index}")))
+            .collect();
+        let rendered = |shown: &[ShownCell]| -> Vec<Vec<String>> {
+            shown
+                .iter()
+                .map(|cell| cell.lines.iter().map(line_text).collect())
+                .collect()
+        };
+        let expected = |app: &App| -> Vec<Vec<String>> {
+            app.cells
+                .iter()
+                .map(|cell| cell_lines(cell, 40).iter().map(line_text).collect())
+                .collect()
+        };
+        let mut cache = ShownCache::default();
+        let first = rendered(&cache.shown_cells(&app, 40, 0));
+        assert_eq!(first, expected(&app));
+        crate::markdown::take_parse_count();
+        assert_eq!(
+            rendered(&cache.shown_cells(&app, 40, 0)),
+            first,
+            "a still tail renders the same lines"
+        );
+        assert_eq!(
+            crate::markdown::take_parse_count(),
+            0,
+            "a still tail parses nothing"
+        );
+
+        // Committing the first cell shifts every other one down a slot; the
+        // content check re-renders what the slot no longer matches, and the
+        // lines still describe the cells that are there now.
+        app.drain_committed(1);
+        assert_eq!(rendered(&cache.shown_cells(&app, 40, 0)), expected(&app));
     }
 
     /// The plan's `transcript` is the same tail `visible_transcript` builds —

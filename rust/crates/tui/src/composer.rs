@@ -758,6 +758,36 @@ impl Composer {
         self.insert_image(number, Arc::new(source));
     }
 
+    /// Insert `[Image #N]` at `at` instead of the cursor, handing `source` back
+    /// when `at` no longer names a seam in this text (the draft was rewritten,
+    /// or the byte sits inside an atom). A paste read off the event loop lands
+    /// after the cursor may have moved, and the attachment belongs where the
+    /// key was pressed.
+    pub fn attach_image_at(
+        &mut self,
+        at: ByteOffset,
+        source: ImageSource,
+    ) -> std::result::Result<(), ImageSource> {
+        if at > ByteOffset::new(self.text().len())
+            || !is_grapheme_boundary(self.text(), at)
+            || self.range_touches_atom(TextRange::empty(at))
+        {
+            return Err(source);
+        }
+        let number = self.document.image_high_water + 1;
+        self.begin_edit();
+        self.cursor = self.document.insert_atom(
+            at,
+            image_label(number),
+            AtomPayload::Image {
+                number,
+                source: Arc::new(source),
+            },
+        );
+        self.goal_column = None;
+        Ok(())
+    }
+
     fn insert_image(&mut self, number: usize, source: Arc<ImageSource>) {
         self.begin_edit();
         self.cursor = self.document.insert_atom(

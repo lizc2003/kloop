@@ -76,3 +76,21 @@
   未变);`clippy -p kloop-tui --all-targets -D warnings`、`cargo fmt --check`、
   `cargo check --workspace`。未跑全量 `make check`、parity、真实 API。
 - **教训**：HANDOFF 394(合并绘制路径时丢掉帧交接,PTY 才看得出来)、395(内容相等当缓存键)。
+
+## 同日复审修正(2026-11-16)
+
+- **异步粘贴的归属**：`PasteSnapshot`(draft generation + 当时的文本 + 光标字节位)随任务走。
+  落地时 generation 不符(草稿已提交/清空)就丢弃并留一条 note；记录的位置仍是文本里的接缝
+  就插在那里(光标挪过也不影响)，接缝没了才退回光标并说明。`Composer::attach_image_at` 只在
+  字素边界且不落在 atom 内时插入，否则把 source 交还。粘贴在途时 Enter 被暂存
+  (`enter_waits_for_paste` 只拦真正会提交的 Enter，弹窗/面板的 Enter 不拦)，最后一个粘贴落地
+  后回放，图片因此随这条消息发出而不是下一条；读取任务用 `spawn_blocking` 的 JoinError 兜底，
+  计数不会因 panic 卡住 Enter。
+- **关闭补全作废在途搜索**：`App::close_popup` 关闭菜单时 bump `popup_generation`，搜索任务带上
+  它，`search_lands` 同时要求序号最新且 generation 未变——Esc 不改 token，只靠目标校验会让结果
+  把菜单重新打开。
+- **缓存查找改成按槽位**：`ShownCache.entries` 与 `App::cells` 下标对齐(每帧重建、越界槽丢弃)，
+  每帧 O(cells) 而不是每 cell 扫一遍缓存；提交移动下标后由内容比较兜底重画。
+- **验证**：kloop-tui 338 项(新增 6 项：粘贴位置/代际、菜单关闭作废搜索、Enter 等待条件、
+  搜索落地条件、缓存槽位跟随提交)；`cargo test -p kloop --test tui_pty` 25 项仍全过；
+  clippy、fmt。

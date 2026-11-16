@@ -649,6 +649,14 @@ pub struct App {
     /// open at a time; it floats above the composer and captures navigation /
     /// accept / cancel keys (plan 38 slice 4).
     pub popup: Option<menu::Popup>,
+    /// Bumped whenever the popup is closed. An `@` search walks the tree off the
+    /// event loop; this is how its result learns the user dismissed the menu
+    /// meanwhile instead of reopening it (plan 263 review).
+    popup_generation: u64,
+    /// Which draft the composer holds. A paste read off the event loop was asked
+    /// for against one draft; this tells its result when that draft is gone
+    /// (submitted or cleared) rather than merely edited.
+    draft_generation: u64,
     /// The slash-command catalog (built-ins + skills/commands), used to filter
     /// the `/` menu. Seeded once at startup via [`App::with_commands`].
     commands: Vec<menu::CommandInfo>,
@@ -709,6 +717,8 @@ impl App {
             ctrl_c_exit_armed: false,
             esc_clear_armed: false,
             popup: None,
+            popup_generation: 0,
+            draft_generation: 0,
             commands: Vec::new(),
             cwd: String::new(),
             branch: None,
@@ -1646,6 +1656,7 @@ impl App {
                         return Command::None;
                     }
                     self.composer.clear();
+                    self.draft_generation += 1;
                 } else if self.running {
                     return Command::Interrupt;
                 }
@@ -1700,17 +1711,34 @@ impl App {
             // popup (if any) until the results land so the menu doesn't flicker.
             Some(target) => Command::SearchFiles(target),
             None => {
-                self.popup = None;
+                self.close_popup();
                 Command::None
             }
         }
+    }
+
+    /// Close the completion menu, and tell any `@` search still walking the
+    /// tree that its result is no longer wanted: the composer may still hold
+    /// the same token (Esc does not edit it), so the target check in
+    /// [`App::set_file_results`] alone would let it reopen a menu the user
+    /// dismissed.
+    fn close_popup(&mut self) {
+        if self.popup.take().is_some() {
+            self.popup_generation += 1;
+        }
+    }
+
+    /// The generation of the current popup state; a file search carries it so a
+    /// dismissal invalidates results already in flight.
+    pub fn popup_generation(&self) -> u64 {
+        self.popup_generation
     }
 
     /// The completion trigger at the cursor, unless the token sits inside a
     /// paste atom's label. A big paste whose last line ends in `@` leaves the
     /// cursor on `@]` — label text, not a mention — and accepting a completion
     /// there would rewrite the whole paste it stands for.
-    fn detect_trigger(&self) -> Option<menu::CompletionTarget> {
+    pub(crate) fn detect_trigger(&self) -> Option<menu::CompletionTarget> {
         let target =
             menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running)?;
         (!self.composer.range_touches_atom(target.range)).then_some(target)
@@ -1747,7 +1775,7 @@ impl App {
             // Esc closes the menu without touching the composer (a running turn's
             // interrupt / idle clear is a second Esc, once the menu is gone).
             KeyCode::Esc => {
-                self.popup = None;
+                self.close_popup();
                 Some(Command::None)
             }
             _ => None,
@@ -1815,6 +1843,7 @@ impl App {
                 .trim()
                 .to_string();
             self.cells.push(Cell::User(display.clone()));
+            self.draft_generation += 1;
             self.running = true;
             self.freeze_selected_route();
             return Command::Slash(command);
@@ -1834,11 +1863,13 @@ impl App {
             // (absorbed at its next round boundary). No new turn starts. The echo
             // is the text alone, as a resumed steer replays.
             let sub = self.composer.submit().expect("checked not blank");
+            self.draft_generation += 1;
             self.cells.push(Cell::User(sub.text.trim().to_string()));
             self.submit_images = sub.images;
             return Command::Steer(sub.text);
         }
         let sub = self.composer.submit().expect("checked not blank");
+        self.draft_generation += 1;
         let echo = sub.text.trim().to_string();
         if !echo.is_empty() {
             self.cells.push(Cell::User(echo));
@@ -1967,7 +1998,27 @@ impl App {
     /// it). The cursor now follows a label, which no completion menu answers.
     pub fn attach_image(&mut self, source: ImageSource) {
         self.composer.attach_image(source);
-        self.popup = None;
+        self.close_popup();
+    }
+
+    /// Attach a pasted image at the position it was pasted into, when the
+    /// composer still has a seam there. The read runs off the event loop; `Err`
+    /// hands the source back so the caller can fall back to the cursor.
+    pub fn attach_image_at(
+        &mut self,
+        at: crate::text_layout::ByteOffset,
+        source: ImageSource,
+    ) -> std::result::Result<(), ImageSource> {
+        self.composer.attach_image_at(at, source)?;
+        self.close_popup();
+        Ok(())
+    }
+
+    /// Which draft the composer holds. A paste carries this from the moment it
+    /// was asked for, so a result for a draft that was since submitted or
+    /// cleared is not spliced into the next one.
+    pub fn draft_generation(&self) -> u64 {
+        self.draft_generation
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Command {
@@ -4535,6 +4586,82 @@ mod tests {
             0,
             "and opens on its own safe default"
         );
+    }
+
+    /// A paste read off the event loop lands at the seam it was asked for, even
+    /// after the cursor moved — and the draw order around it is the one the
+    /// user typed, not the one the read finished in.
+    #[test]
+    fn an_image_attaches_where_it_was_pasted() {
+        let mut app = App::new("paste-seam".into());
+        app.composer.paste("hello world");
+        // The paste was asked for after "hello"; the cursor then moved to the
+        // end of the line before the read finished.
+        app.attach_image_at(crate::text_layout::ByteOffset::new(5), png("one"))
+            .expect("a seam exists between the words");
+        assert_eq!(app.composer.text(), "hello[Image #1] world");
+
+        // A position that is not a seam (inside an atom) hands the source back
+        // rather than splicing into the label.
+        let inside = crate::text_layout::ByteOffset::new(7);
+        assert!(app.attach_image_at(inside, png("two")).is_err());
+    }
+
+    /// A submitted or cleared draft is a new draft: a paste still loading for the
+    /// old one must be able to tell, or it would land in the next message.
+    #[test]
+    fn sending_or_clearing_the_draft_starts_a_new_generation() {
+        let mut app = App::new("paste-generation".into());
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(80, key(KeyCode::Char('h')));
+        app.on_key(80, key(KeyCode::Char('i')));
+        let before = app.draft_generation();
+        assert!(matches!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Submit(_)
+        ));
+        let after_send = app.draft_generation();
+        assert!(after_send > before, "a sent draft is not the same draft");
+
+        // Typing into the next draft keeps the generation...
+        app.on_key(80, key(KeyCode::Char('x')));
+        assert_eq!(app.draft_generation(), after_send);
+        // ...and an empty-composer Esc is the interrupt/clear; the two-tap clear
+        // that actually empties the draft moves on.
+        app.on_key(80, key(KeyCode::Esc));
+        app.on_key(80, key(KeyCode::Esc));
+        assert_eq!(app.composer.text(), "");
+        assert!(
+            app.draft_generation() > after_send,
+            "a cleared draft is not the same draft"
+        );
+    }
+
+    /// Esc on an open completion menu closes it and bumps the popup generation,
+    /// which is what invalidates a file search still walking the tree (the token
+    /// itself is untouched, so the target check alone would let it reopen).
+    #[test]
+    fn dismissing_the_menu_invalidates_a_search_in_flight() {
+        let mut app = App::new("popup-generation".into());
+        app.composer.paste("@mai");
+        let target = app.detect_trigger().expect("an @ token is at the cursor");
+        let generation = app.popup_generation();
+        app.set_file_results(target.clone(), vec!["main.rs".into()]);
+        assert!(app.popup.is_some());
+        assert_eq!(
+            app.popup_generation(),
+            generation,
+            "results opening the menu are not a dismissal"
+        );
+
+        app.on_key(80, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.popup.is_none());
+        assert!(
+            app.popup_generation() > generation,
+            "closing the menu must invalidate its searches"
+        );
+        // The trigger is still there: only the generation stops a late result.
+        assert_eq!(app.detect_trigger(), Some(target));
     }
 
     /// Every numbered list panel navigates through one helper, so the row

@@ -1998,8 +1998,15 @@ that can still fit the viewport. Work that blocks — an `@` completion walk ove
 the whole tree, an OS clipboard read with PNG encoding, a dropped image file's
 read, a `git` branch lookup after a cwd change — runs on the blocking pool and
 reports back over a task channel; the loop drops a result whose query or
-directory it has already moved past, and file searches are debounced so a burst
-of keystrokes starts one walk rather than one per key.
+directory it has already moved past (a dismissed completion menu bumps a popup
+generation, which is what invalidates a search the same unchanged token would
+otherwise let reopen it), and file searches are debounced so a burst of
+keystrokes starts one walk rather than one per key. A paste carries the draft it
+was asked for and the byte position it belongs at: the attachment lands at that
+seam when it still exists (at the cursor when an edit crossed it), is refused
+with a note when the draft was sent or cleared meanwhile, and Enter is replayed
+only after the paste settles, so an image can never ride the next message
+instead of the one the user sent.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
 (see below); **Esc** is about the composer first: while it holds anything (text
