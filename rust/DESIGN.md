@@ -3489,7 +3489,12 @@ network-free, reqwest lives only in provider and web):
   `reqwest::dns::Resolve` that filters the addresses the connection actually
   uses, so a rebinding answer cannot slip between check and connect; the per-hop
   lookup stays because with an HTTP proxy reqwest resolves only the proxy, and a
-  privately-resolving target would otherwise go unseen),
+  privately-resolving target would otherwise go unseen — and it fails closed: a
+  name this host cannot resolve is refused rather than handed to a proxy, which
+  could resolve it into the internal network; proxy endpoints from
+  `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` (either case, `host:port` accepted, none
+  under CGI as in reqwest) are the user's declared egress route and are exempt
+  from the public-address filter),
   same-site redirects followed (max 5), cross-host redirects reported for an
   explicit re-fetch, 20 MiB download cap (paired with the 90s whole-request
   timeout), HTML→text.
@@ -3517,7 +3522,9 @@ network-free, reqwest lives only in provider and web):
   20 MiB 才报 unsupported；空 Content-Type 仍按正文开头的 `<` 嗅探。
   正文编码取自 Content-Type 的 `charset` 参数；HTML 在没有该参数时再看头部
   1024 字节内的 `<meta charset>` 与 `http-equiv` 的 content，BOM 由
-  `encoding_rs` 优先于两者。已知编码（GBK、Shift_JIS 等）按声明解码；未声明
+  `encoding_rs` 优先于两者。预扫描先跳过 HTML 注释——注释里的
+  `<meta charset=…>` 不是声明，否则会盖掉紧跟其后的真实声明并静默解出乱码。
+  已知编码（GBK、Shift_JIS 等）按声明解码；未声明
   编码仍按 UTF-8 有损解码。声明了无法识别的编码、或字节不符合声明编码时，退回
   有损解码并在正文尾部注明——旧的无条件 `from_utf8_lossy` 会把 GBK 页面变成
   满屏 U+FFFD 却仍像一次成功抓取（plan 261）。

@@ -26,13 +26,14 @@ const MAX_REDIRECTS: usize = 5;
 
 pub(crate) async fn fetch_url(
     client: &reqwest::Client,
+    dns: &PublicResolver,
     raw_url: &str,
     allow_private: bool,
 ) -> Result<String> {
     let mut url = normalize_url(raw_url, /*upgrade_http*/ !allow_private)?;
     let requested = url.clone();
     for _ in 0..=MAX_REDIRECTS {
-        guard(&url, allow_private).await?;
+        guard(dns, &url, allow_private).await?;
         let resp = client
             .get(url.clone())
             .send()
@@ -366,11 +367,21 @@ fn charset_from_content_type(content_type: &str) -> Option<&str> {
 
 /// The `<meta>` encoding declaration inside the first 1024 bytes — the prescan
 /// window browsers use, so a declaration further down is not consulted.
+/// Comments are skipped: a commented-out `<meta charset=…>` is not authoritative
+/// and would otherwise override the real declaration that follows it.
 fn html_meta_charset(bytes: &[u8]) -> Option<&str> {
     let head = &bytes[..bytes.len().min(1024)];
     let mut from = 0;
-    while let Some(offset) = find_ascii_ci(&head[from..], b"<meta") {
-        let start = from + offset;
+    loop {
+        let meta = find_ascii_ci(&head[from..], b"<meta").map(|offset| from + offset);
+        let comment = find_bytes(&head[from..], b"<!--").map(|offset| from + offset);
+        if comment.is_some_and(|comment| meta.is_none_or(|meta| comment < meta)) {
+            let comment = comment.unwrap();
+            let end = find_bytes(&head[comment + b"<!--".len()..], b"-->")?;
+            from = comment + b"<!--".len() + end + b"-->".len();
+            continue;
+        }
+        let start = meta?;
         // `<metadata>` is not `<meta>`.
         if !head
             .get(start + b"<meta".len())
@@ -385,13 +396,18 @@ fn html_meta_charset(bytes: &[u8]) -> Option<&str> {
         }
         from = end + 1;
     }
-    None
 }
 
 fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Both spellings in the wild: `<meta charset=…>` and the `http-equiv`
@@ -464,9 +480,10 @@ fn is_client_rendered(html_bytes: usize, has_script: bool, text: &str) -> bool {
 /// one in [`PublicResolver`] on the addresses the connection actually uses.
 /// The resolver alone is not enough — with an HTTP proxy configured reqwest
 /// resolves only the proxy, so a name that resolves privately would never be
-/// seen at all. A lookup failure here is left to the connection stage, which
-/// (or whose proxy) may still resolve the name and reports its own failure.
-async fn guard(url: &Url, allow_private: bool) -> Result<()> {
+/// seen at all. A name this host cannot resolve is refused too: letting a proxy
+/// resolve it is exactly the case where an internal target would otherwise
+/// arrive without any local address check.
+async fn guard(dns: &PublicResolver, url: &Url, allow_private: bool) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
         other => bail!("web_fetch: only http/https URLs are supported (got '{other}:')"),
@@ -482,12 +499,7 @@ async fn guard(url: &Url, allow_private: bool) -> Result<()> {
             if is_localhost_name(name) {
                 bail!(refuse_private(&name));
             }
-            let port = url.port_or_known_default().unwrap_or(443);
-            if let Ok(addrs) = tokio::net::lookup_host((name, port)).await
-                && addrs.into_iter().any(|addr| !ip_is_public(addr.ip()))
-            {
-                bail!(refuse_private(&name));
-            }
+            dns.check_target(name).await?;
         }
         Some(_) => {}
     }
@@ -507,14 +519,90 @@ fn is_localhost_name(name: &str) -> bool {
 /// addresses, and every redirect hop is another request through this client.
 pub(crate) struct PublicResolver {
     lookup: Arc<dyn Lookup>,
+    /// Proxy endpoints from the environment. They are the user's declared
+    /// egress route, not fetch targets, so the public-address filter must not
+    /// block them — a local or corporate proxy commonly sits on a private
+    /// address.
+    proxy_hosts: Vec<String>,
 }
 
 impl PublicResolver {
     pub(crate) fn system() -> Self {
         Self {
             lookup: Arc::new(SystemLookup),
+            proxy_hosts: proxy_hosts_from_env(),
         }
     }
+
+    /// The per-hop target check. Fail-closed on a lookup error: a name this
+    /// host cannot resolve may still be resolvable by the proxy, which is how
+    /// an internal target could otherwise be reached without any local address
+    /// check.
+    async fn check_target(&self, host: &str) -> Result<()> {
+        let addrs = self.answers(host).await.map_err(anyhow::Error::msg)?;
+        public_answers(host, &addrs).map_err(anyhow::Error::msg)
+    }
+
+    async fn answers(&self, host: &str) -> std::result::Result<Vec<SocketAddr>, String> {
+        let addrs = self
+            .lookup
+            .lookup(host.to_owned())
+            .await
+            .map_err(|err| format!("web_fetch: cannot resolve host '{host}': {err}"))?;
+        if addrs.is_empty() {
+            return Err(format!("web_fetch: host '{host}' resolves to no addresses"));
+        }
+        Ok(addrs)
+    }
+
+    fn is_proxy(&self, host: &str) -> bool {
+        self.proxy_hosts
+            .iter()
+            .any(|proxy| proxy.eq_ignore_ascii_case(host))
+    }
+}
+
+fn public_answers(host: &str, addrs: &[SocketAddr]) -> std::result::Result<(), String> {
+    if addrs.iter().any(|addr| !ip_is_public(addr.ip())) {
+        return Err(refuse_private(&host));
+    }
+    Ok(())
+}
+
+/// Proxy endpoints from the same variables reqwest reads, so a configured
+/// proxy is reachable even when it resolves to a private address. reqwest
+/// ignores all of them under CGI (to avoid httpoxy), and so does this.
+fn proxy_hosts_from_env() -> Vec<String> {
+    proxy_hosts(|name| std::env::var(name).ok())
+}
+
+fn proxy_hosts(env: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    if env("REQUEST_METHOD").is_some() {
+        return Vec::new();
+    }
+    [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .into_iter()
+    .filter_map(env)
+    .filter_map(|value| proxy_host(&value))
+    .collect()
+}
+
+/// A proxy value may omit the scheme (`host:port`), which `Url::parse` would
+/// read as a scheme with no host; reqwest assumes `http` in that case.
+fn proxy_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    let url = Url::parse(value)
+        .ok()
+        .filter(|url| url.host_str().is_some())
+        .or_else(|| Url::parse(&format!("http://{value}")).ok())?;
+    url.host_str().map(str::to_owned)
 }
 
 /// The DNS source, split out so tests can answer without real DNS.
@@ -536,8 +624,9 @@ impl Resolve for PublicResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_owned();
         let lookup = Arc::clone(&self.lookup);
+        let is_proxy = self.is_proxy(&host);
         Box::pin(async move {
-            if is_localhost_name(&host) {
+            if !is_proxy && is_localhost_name(&host) {
                 return Err(io::Error::other(refuse_private(&host)).into());
             }
             let addrs = lookup.lookup(host.clone()).await.map_err(|err| {
@@ -552,7 +641,7 @@ impl Resolve for PublicResolver {
                 ))
                 .into());
             }
-            if addrs.iter().any(|addr| !ip_is_public(addr.ip())) {
+            if !is_proxy && addrs.iter().any(|addr| !ip_is_public(addr.ip())) {
                 return Err(io::Error::other(refuse_private(&host)).into());
             }
             Ok(Box::new(addrs.into_iter()) as Addrs)
@@ -703,6 +792,9 @@ mod tests {
     }
     use super::*;
     use crate::testutil::fetch_private;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
@@ -739,15 +831,38 @@ mod tests {
                     })
                     .collect(),
             )),
+            proxy_hosts: Vec::new(),
         }
     }
 
-    fn test_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap()
+    /// Answers lookups in order, so one test can show a public answer at the
+    /// pre-check and a private one at connect time.
+    struct ScriptedLookup(Mutex<VecDeque<io::Result<Vec<SocketAddr>>>>);
+
+    impl Lookup for ScriptedLookup {
+        fn lookup(&self, _host: String) -> LookupFuture {
+            let next = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()));
+            Box::pin(async move { next })
+        }
+    }
+
+    fn scripted_resolver(
+        answers: Vec<io::Result<Vec<SocketAddr>>>,
+        proxy_hosts: &[&str],
+    ) -> Arc<PublicResolver> {
+        Arc::new(PublicResolver {
+            lookup: Arc::new(ScriptedLookup(Mutex::new(answers.into()))),
+            proxy_hosts: proxy_hosts.iter().map(|host| (*host).to_owned()).collect(),
+        })
+    }
+
+    fn addr(ip: &str) -> io::Result<Vec<SocketAddr>> {
+        Ok(vec![SocketAddr::new(ip.parse().unwrap(), 0)])
     }
 
     #[test]
@@ -783,7 +898,6 @@ mod tests {
 
     #[tokio::test]
     async fn guard_rejects_schemes_and_private_hosts() {
-        let client = crate::testutil::client();
         for url in [
             "file:///etc/passwd",
             "ftp://example.com/x",
@@ -794,7 +908,7 @@ mod tests {
             "http://localhost:3000/",
             "http://foo.localhost/",
         ] {
-            let err = fetch_url(&client, url, /*allow_private*/ false)
+            let err = crate::testutil::fetch(url, /*allow_private*/ false)
                 .await
                 .unwrap_err();
             let msg = format!("{err:#}");
@@ -833,27 +947,85 @@ mod tests {
         assert_eq!(addrs, vec![SocketAddr::from(([93, 184, 216, 34], 0))]);
     }
 
-    /// The fetch client really goes through that resolver: a name whose answer
-    /// is loopback fails before any connection is attempted. This is the
-    /// regression for the old two-lookup window (guard, then connect).
+    /// End to end through `WebTools`: the pre-check sees a public answer and the
+    /// connection's own lookup sees loopback. Only the resolver-level filter can
+    /// catch that. This is the regression for the old two-lookup window (guard,
+    /// then connect).
     #[tokio::test]
-    async fn the_fetch_client_checks_the_answer_it_connects_to() {
+    async fn a_rebinding_answer_is_refused_at_connect_time() {
+        let dns = scripted_resolver(vec![addr("93.184.216.34"), addr("127.0.0.1")], &[]);
+        let tools = crate::WebTools::with_resolver(None, Duration::from_secs(2), dns).unwrap();
+        let err = tools
+            .fetch(&json!({"url": "http://rebind.test/x"}))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("SSRF guard"), "{message}");
+        assert!(message.contains("rebind.test"), "{message}");
+    }
+
+    /// A name this host cannot resolve is refused at the pre-check, even with a
+    /// proxy configured: the proxy might resolve it into the internal network,
+    /// and the connection-time filter only ever sees the proxy's own address.
+    #[tokio::test]
+    async fn an_unresolvable_target_is_refused_instead_of_being_handed_to_a_proxy() {
+        let dns = scripted_resolver(vec![Err(io::Error::other("no such host"))], &["proxy.test"]);
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(resolver_answering(&[("rebind.test", "127.0.0.1")]))
+            .dns_resolver(Arc::clone(&dns))
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
         let err = fetch_url(
             &client,
-            "http://rebind.test/x",
+            &dns,
+            "http://internal.test/x",
             /*allow_private*/ false,
         )
         .await
         .unwrap_err();
         let message = format!("{err:#}");
-        assert!(message.contains("SSRF guard"), "{message}");
-        assert!(message.contains("rebind.test"), "{message}");
+        assert!(message.contains("cannot resolve host"), "{message}");
+    }
+
+    /// The proxy endpoint is the user's declared egress route, not a fetch
+    /// target: a private or loopback answer must not lock every web tool out
+    /// from behind a local/corporate proxy. Ordinary hosts keep the filter.
+    #[tokio::test]
+    async fn a_configured_proxy_endpoint_may_resolve_privately() {
+        let dns = scripted_resolver(vec![addr("10.0.0.5"), addr("10.0.0.6")], &["proxy.test"]);
+        let proxy: Vec<SocketAddr> = dns
+            .resolve("proxy.test".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(proxy, vec![SocketAddr::from(([10, 0, 0, 5], 0))]);
+
+        let Err(err) = dns.resolve("target.test".parse().unwrap()).await else {
+            panic!("a non-proxy host must keep the public-address filter");
+        };
+        assert!(err.to_string().contains("SSRF guard"), "{err}");
+    }
+
+    #[test]
+    fn proxy_hosts_are_read_like_reqwest_reads_them() {
+        let env = |name: &str| match name {
+            "HTTPS_PROXY" => Some("http://user:pass@proxy.test:3128".to_string()),
+            "all_proxy" => Some("10.0.0.9:1080".to_string()),
+            "no_proxy" => Some("*".to_string()),
+            _ => None,
+        };
+        let mut hosts = proxy_hosts(env);
+        hosts.sort();
+        assert_eq!(hosts, vec!["10.0.0.9", "proxy.test"]);
+
+        // reqwest ignores proxy variables under CGI, to avoid httpoxy.
+        let cgi = |name: &str| match name {
+            "REQUEST_METHOD" => Some("GET".to_string()),
+            "HTTPS_PROXY" => Some("http://proxy.test:3128".to_string()),
+            _ => None,
+        };
+        assert!(proxy_hosts(cgi).is_empty());
     }
 
     /// The Content-Type is refused before the body is read. The fixture promises
@@ -889,10 +1061,9 @@ mod tests {
             let _ = closed_tx.send(matches!(closed, Ok(Ok(0))));
         });
 
-        let err = fetch_url(
-            &test_client(),
+        let err = crate::testutil::fetch_private_with_timeout(
             &format!("http://{addr}/blob"),
-            /*allow_private*/ true,
+            Duration::from_secs(2),
         )
         .await
         .unwrap_err();
@@ -931,6 +1102,16 @@ mod tests {
         assert_eq!(
             html_meta_charset(b"<meta name=\"x\"><metadata charset=gbk>"),
             None
+        );
+        // A commented-out declaration is not authoritative, and must not
+        // override the real one after it.
+        assert_eq!(
+            html_meta_charset(b"<!-- <meta charset=windows-1252> --><meta charset=utf-8>"),
+            Some("utf-8")
+        );
+        assert_eq!(
+            html_meta_charset(b"<head><!-- note --><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">"),
+            Some("utf-8")
         );
         // Only the prescan window counts, as in browsers.
         let mut late = vec![b' '; 1024];
@@ -1000,6 +1181,28 @@ mod tests {
                 .unwrap();
             assert!(out.contains(text), "{meta}: {out}");
         }
+    }
+
+    /// A commented-out declaration used to win over the real one, decoding a
+    /// correct UTF-8 page as windows-1252 with no replacement characters to
+    /// warn about — just mojibake.
+    #[tokio::test]
+    async fn a_commented_out_meta_charset_does_not_override_the_real_one() {
+        let server = MockServer::start().await;
+        let text = "中文标题";
+        let page = format!(
+            "<html><head><!-- <meta charset=windows-1252> --><meta charset=utf-8></head>\
+             <body>{text}</body></html>"
+        );
+        Mock::given(method("GET"))
+            .and(path("/comment"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(page.into_bytes(), "text/html"))
+            .mount(&server)
+            .await;
+        let out = fetch_private(&format!("{}/comment", server.uri()))
+            .await
+            .unwrap();
+        assert!(out.contains(text), "{out}");
     }
 
     /// An unknown label still yields text, but the result says the decode was

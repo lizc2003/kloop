@@ -8,6 +8,7 @@ mod html;
 mod limits;
 mod search;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -39,6 +40,7 @@ struct FetchRequest {
 
 pub struct WebTools {
     client: reqwest::Client,
+    dns: Arc<fetch::PublicResolver>,
     search: Option<Box<dyn SearchBackend>>,
 }
 
@@ -48,18 +50,30 @@ impl WebTools {
     }
 
     fn with_timeout(search: Option<Box<dyn SearchBackend>>, timeout: Duration) -> Result<Self> {
+        Self::with_resolver(search, timeout, Arc::new(fetch::PublicResolver::system()))
+    }
+
+    pub(crate) fn with_resolver(
+        search: Option<Box<dyn SearchBackend>>,
+        timeout: Duration,
+        dns: Arc<fetch::PublicResolver>,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             // Redirects are followed manually so every hop passes the SSRF
             // guard (a public host can 302 to an internal address).
             .redirect(reqwest::redirect::Policy::none())
             // The guard checks the resolution the connection will use, so a
             // rebinding answer cannot differ from the checked one.
-            .dns_resolver(fetch::PublicResolver::system())
+            .dns_resolver(Arc::clone(&dns))
             .timeout(timeout)
             .user_agent("kloop/0.1")
             .build()
             .context("building http client")?;
-        Ok(WebTools { client, search })
+        Ok(WebTools {
+            client,
+            dns,
+            search,
+        })
     }
 
     pub fn search_backend_name(&self) -> Option<&'static str> {
@@ -68,7 +82,13 @@ impl WebTools {
 
     pub async fn fetch(&self, input: &Value) -> Result<String> {
         let request: FetchRequest = parse_input(input, "web_fetch")?;
-        fetch::fetch_url(&self.client, &request.url, /*allow_private*/ false).await
+        fetch::fetch_url(
+            &self.client,
+            &self.dns,
+            &request.url,
+            /*allow_private*/ false,
+        )
+        .await
     }
 
     pub async fn search(&self, input: &Value) -> Result<String> {
@@ -97,15 +117,29 @@ fn parse_input<'de, T: Deserialize<'de>>(input: &'de Value, tool: &str) -> Resul
 
 #[cfg(test)]
 pub(crate) mod testutil {
-    /// A WebTools whose fetch skips the SSRF guard so wiremock (loopback)
-    /// is reachable. The guard itself is unit-tested directly.
-    pub(crate) async fn fetch_private(url: &str) -> anyhow::Result<String> {
+    /// Fetch through a real `WebTools` client. `allow_private` skips the guard
+    /// so wiremock (loopback) is reachable; the guard is unit-tested directly.
+    pub(crate) async fn fetch(url: &str, allow_private: bool) -> anyhow::Result<String> {
         let tools = super::WebTools::new(None).unwrap();
-        super::fetch::fetch_url(&tools.client, url, /*allow_private*/ true).await
+        super::fetch::fetch_url(&tools.client, &tools.dns, url, allow_private).await
+    }
+
+    pub(crate) async fn fetch_private(url: &str) -> anyhow::Result<String> {
+        fetch(url, /*allow_private*/ true).await
     }
 
     pub(crate) fn client() -> reqwest::Client {
         super::WebTools::new(None).unwrap().client
+    }
+
+    /// The same, with a short client timeout: lets a test tell "refused before
+    /// reading the body" apart from "waited for a body that never came".
+    pub(crate) async fn fetch_private_with_timeout(
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        let tools = super::WebTools::with_timeout(None, timeout).unwrap();
+        super::fetch::fetch_url(&tools.client, &tools.dns, url, /*allow_private*/ true).await
     }
 }
 
