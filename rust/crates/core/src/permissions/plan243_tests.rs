@@ -623,7 +623,7 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
             let approver = ScriptedApprover::new(vec![]);
             let p = gate(mode, ruleset, approver.clone());
             let verdict = p.check_call("bash", &bash(command), 0, true).await;
-            assert_eq!(verdict, allowed_verdict(true), "{mode:?}: {command}");
+            assert_eq!(verdict, allowed_in(mode, true), "{mode:?}: {command}");
             assert_eq!(approver.ask_count(), 0, "{command}");
         }
     }

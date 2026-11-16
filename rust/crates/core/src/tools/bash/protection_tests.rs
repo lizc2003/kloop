@@ -393,3 +393,28 @@ async fn plan239_symlinked_credential_root_is_denied_under_both_names() {
     assert!(error, "{out}");
     assert!(out.contains("sensitive path"), "{out}");
 }
+
+/// plan 285：bypass 不进沙箱，程序自己读凭据（ssh 读私钥、`security` 读 Keychain
+/// 这类）照常成功；manual 下同一条命令仍被沙箱挡住。命令原文不拼凭据路径，静态门
+/// 不拦，差别全在执行面。
+#[tokio::test]
+async fn plan285_bypass_lets_programs_use_credentials_manual_keeps_them_contained() {
+    if crate::sandbox::skip_nested_seatbelt_test() {
+        return;
+    }
+    use crate::permissions::Mode;
+    for (mode, readable) in [(Mode::Bypass, true), (Mode::Manual, false)] {
+        let probe = LiteralProbe::new(mode);
+        let script = probe.root.join("reader.sh");
+        let secret = probe.root.join("home/.ssh/sentinel");
+        std::fs::write(&script, format!("/bin/cat '{}'\n", secret.display())).unwrap();
+        let command = format!("/bin/sh {}", script.display());
+        let (out, _) = run_tool("bash", bash_input(&command), &probe.ctx).await;
+        assert_eq!(
+            out.contains("PLAN239-SYNTHETIC-SECRET"),
+            readable,
+            "{mode:?}: {out}"
+        );
+        assert!(!out.contains("automatically in bypass mode"), "{mode:?}: {out}");
+    }
+}

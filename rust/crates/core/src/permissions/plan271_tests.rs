@@ -38,7 +38,7 @@ async fn plan271_project_kloop_reads_pass() {
             assert_eq!(
                 p.check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
                     .await,
-                allowed_verdict(/*sandbox_auto_allow*/ true),
+                allowed_in(mode, /*sandbox_auto_allow*/ true),
                 "{mode:?}: {command}"
             );
         }
@@ -57,7 +57,7 @@ async fn plan271_project_kloop_reads_pass() {
     assert_eq!(
         p.check_call("bash", &bash(&command), 0, /*sandbox_auto_allow*/ true)
             .await,
-        allowed_verdict(/*sandbox_auto_allow*/ true),
+        allowed_in(Mode::Bypass, /*sandbox_auto_allow*/ true),
         "{command}"
     );
     let _ = std::fs::remove_dir_all(&root);

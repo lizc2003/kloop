@@ -33,7 +33,7 @@ impl SandboxGrants {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SandboxPlan {
-    /// No OS sandbox is in play: no policy, or not bash.
+    /// No OS sandbox is in play: no policy, not bash, or bypass mode (plan 285).
     #[default]
     None,
     /// Run inside the workspace sandbox.

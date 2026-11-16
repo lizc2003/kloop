@@ -1382,7 +1382,8 @@ shell 的参数或 `-c` 正文，或后续动态参数无法排除替换，则�
 （`BashFacts::reliable` 为假）；或同一条命令原文里写出了凭据文件名（`.env*`、rc 文件，
 按 shell 分隔符与 `/` 切词），未知目标很可能就是它。其余未决读取（`mysql -e "CREATE
 DATABASE $DB"`、`gofmt -l "$f"`、`cat "$FOO"`）照普通命令走：沙箱内自动放行，由 OS 沙箱挡
-凭据目录与 `~/.kloop`；无沙箱时未知参数证明不了只读，进入普通审批；bypass 直接执行。
+凭据目录与 `~/.kloop`；无沙箱时未知参数证明不了只读，进入普通审批；bypass 直接执行，
+plan 285 起也不进沙箱，没有运行时兜底。
 接受的缺口：沙箱运行时不挡 `.env*` 与 rc 文件，跨调用把这些名字送进变量（上一条命令写进
 文件、下一条读出来当路径）不再静态拦截。此前未决一律硬拒绝，报错说成“敏感路径”，
 日常带变量的命令全被拦，模型连把变量改写成字面值都不试。
@@ -3903,10 +3904,13 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   without a prompt — protected `.git` internals aside, git history is the
   recovery path. `trust_sandboxed = false` reverts to pure containment (approve
   first, then run sandboxed). `--permission-mode bypass` 跳过全部工具权限审批，
-  包括复杂脚本和危险命令。它不关闭已配置的 OS 沙箱；普通调用仍先在沙箱内执行，
-  沙箱拒绝后的升级免审批。依赖字面正文例外的调用必须保留凭据隔离，任何模式都不能升级移除它。
-  用户选择该模式即接受这些调用的执行代价；deny 与敏感读写
-  硬拦截仍优先，权限模式本身不提供命令内容或文件系统隔离保证。
+  包括复杂脚本和危险命令，bash 也不进 OS 沙箱（plan 285）：ssh、git over SSH、
+  `security` 读 Keychain、DNS 与非 HTTP 网络照本机身份工作。此前 bypass 仍先在沙箱内跑、
+  被拒后免审批脱沙箱重跑，留在沙箱里只剩运行时挡凭据读取：凭据读被拒从不升级，ssh 永远
+  拿不到身份；系统服务连接（Keychain 的 `com.apple.SecurityServer`）被拒不在拒绝分类里，
+  命令带着误导性的输出失败；能升级的也要跑两遍。依赖字面正文例外的调用
+  （`Protection::Required`）仍只在沙箱内跑，任何模式都不能升级移除它。deny 与敏感读写
+  硬拦截仍优先；用户选择该模式即接受代价：用变量绕开拼写的凭据读取不再有运行时兜底。
 
 On platforms without an OS shell sandbox, worktree separation still anchors
 ordinary relative paths and parallel edits, but it cannot contain a model that
@@ -3964,7 +3968,8 @@ outside the sandbox") pushed it onto every `cargo test`; measured, it was 67 of
   widened goes on to the escalation.
 - **Escalation** (codex's retry-on-denial): 沙箱拒绝后，在同一次工具调用内决定是否
   脱沙箱重跑。非 bypass 模式下先查已有升级授权，再询问用户；用户拒绝则保留失败并告诉
-  模型不要重试；`--permission-mode bypass` 自动放行。升级结果携带实际放行来源；前缀区分
+  模型不要重试；`--permission-mode bypass` 自动放行（plan 285 起 bypass 的普通调用不进沙箱，
+  走到这里的只剩会话中途切进 bypass 的调用）。升级结果携带实际放行来源；前缀区分
   用户批准、bypass 自动放行与已有升级授权，同时保留拒绝类型和证据。无人被询问时不写成
   “用户批准后重跑”。
 - **Nobody to ask** (headless, tests): neither is offered; the failure stands, and the result ends
@@ -4022,7 +4027,8 @@ the widened sandbox (`[Re-ran inside the sandbox with network access after user
 approval; it had been denied (network): …]`); if that run is refused the other
 capability, it is asked again, at most three widenings per call, after which a
 refusal goes to the escalation. A declined or stopped widening keeps the
-refusal and says the sandbox was not widened. Bypass widens without asking.
+refusal and says the sandbox was not widened. Bypass widens without asking (since plan 285
+an ordinary bypass call never runs contained in the first place).
 Nested sandboxes, unclassified refusals, writes that cannot be offered and
 anything left after the widenings still go to the full escalation below.
 

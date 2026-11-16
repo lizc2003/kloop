@@ -3013,8 +3013,10 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
         }
 
+        /// Bypass 不进沙箱（plan 285）：越界写入第一次就成功，没有被拒再重跑，
+        /// 结果里也就没有升级说明和内核拒绝记录。
         #[tokio::test]
-        async fn escalation_in_bypass_attributes_the_retry_without_an_approver() {
+        async fn bypass_runs_outside_the_sandbox_from_the_first_attempt() {
             if crate::sandbox::skip_nested_seatbelt_test() {
                 return;
             }
@@ -3041,13 +3043,8 @@ mod tests {
             assert!(!is_error, "{out}");
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "climbed\n");
             let _ = std::fs::remove_file(&target);
-            assert!(out.contains("automatically in bypass mode"), "{out}");
-            // The evidence is the kernel's own record of the refusal (stage 2a).
-            assert!(
-                out.contains(&format!("file-write-create {}", target.display())),
-                "{out}"
-            );
-            assert!(!out.contains("after user approval"), "{out}");
+            assert!(!out.contains("automatically in bypass mode"), "{out}");
+            assert!(!out.contains("file-write-create"), "{out}");
             assert!(!out.contains("looks like a sandbox"), "{out}");
         }
 

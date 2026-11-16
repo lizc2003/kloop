@@ -19,12 +19,13 @@
 //! whose yes would break the read-only promise. `exit_plan_mode` counts as
 //! read-only here (it only shows the plan and flips the mode), so it passes.
 //!
-//! Bypass mode ([`Mode::Bypass`]) 不改变 OS 沙箱配置：普通调用仍在配置的沙箱内执行，
-//! 沙箱拒绝后的脱沙箱重跑免审批。选择该模式即接受执行代价；
-//! 权限免审批本身不提供命令内容或文件系统隔离保证。
+//! Bypass mode ([`Mode::Bypass`]) 下 bash 不进 OS 沙箱（plan 285）：ssh、git、Keychain、
+//! 网络照本机身份工作。前置硬限制照旧：deny 规则、明确拼出的凭据读取；字面正文点名
+//! 凭据路径的调用（`Protection::Required`）仍只在沙箱里跑。选择该模式即接受执行代价：
+//! 用变量绕开拼写的凭据读取不再有运行时兜底。
 //!
 //! 离开沙箱只由 kloop 决定（plan 283）：模型没有自己脱沙箱的参数，越界只发生在
-//! 沙箱拒绝之后的升级，或已记住的逐命令升级跳过沙箱内的尝试。
+//! 沙箱拒绝之后的升级、已记住的逐命令升级跳过沙箱内的尝试，或用户选了 bypass。
 //!
 //! The contained-writes layer is the file-tool counterpart of sandbox
 //! auto-allow, and the reason kloop has no `acceptEdits` mode. `write_file` /
@@ -878,8 +879,19 @@ impl Permissions {
             return Err(Refusal::Denied(crate::sandbox::PROTECTION_REQUIRED.into()));
         }
 
-        // 4. Bypass — 用户显式选择工具免审批，前面的硬限制仍优先。
+        // 4. Bypass — 用户显式选择工具免审批，前面的硬限制仍优先。bypass 也不进沙箱
+        // （plan 285）：沙箱拒绝后本来就免审批脱沙箱重跑，留在沙箱里只剩运行时挡凭据
+        // 读取，换来的是 ssh/Keychain 用不了、拒绝认不出时说不清的失败和重跑两遍。
+        // 正文凭据探针（`Protection::Required`）仍只在沙箱里跑。
         if self.mode() == Mode::Bypass {
+            if sandbox == SandboxPlan::Contained && protection != Protection::Required {
+                return Ok(Verdict {
+                    sandbox: SandboxPlan::None,
+                    protection,
+                    notice: None,
+                    grants: SandboxGrants::default(),
+                });
+            }
             return Ok(allow(None));
         }
 
@@ -1519,6 +1531,7 @@ mod tests {
     include!("permissions/plan271_tests.rs");
     include!("permissions/plan283_tests.rs");
     include!("permissions/plan284_tests.rs");
+    include!("permissions/plan285_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;
@@ -1614,6 +1627,11 @@ mod tests {
             },
             ..Verdict::default()
         })
+    }
+
+    /// [`allowed_verdict`] under a mode: bypass never contains bash (plan 285).
+    fn allowed_in(mode: Mode, sandbox_auto_allow: bool) -> Result<Verdict, String> {
+        allowed_verdict(mode != Mode::Bypass && sandbox_auto_allow)
     }
 
     fn bash(cmd: &str) -> Value {
@@ -2032,7 +2050,7 @@ mod tests {
                 ScriptedApprover::new(vec![]),
             );
             let verdict = p.check_call("bash", &bash(command), 0, true).await;
-            assert_eq!(verdict, allowed_verdict(true), "{command}");
+            assert_eq!(verdict, allowed_in(Mode::Bypass, true), "{command}");
         }
     }
 
@@ -2428,7 +2446,7 @@ mod tests {
                 assert_eq!(
                     p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                         .await,
-                    allowed_verdict(sandbox_auto_allow)
+                    allowed_in(mode, sandbox_auto_allow)
                 );
                 assert_eq!(
                     approver.ask_count(),
@@ -2464,7 +2482,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        allowed_verdict(sandbox_auto_allow),
+                        allowed_in(mode, sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2535,7 +2553,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        allowed_verdict(sandbox_auto_allow),
+                        allowed_in(mode, sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2560,7 +2578,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        allowed_verdict(sandbox_auto_allow),
+                        allowed_in(mode, sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2655,7 +2673,7 @@ mod tests {
                     assert_eq!(
                         p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                             .await,
-                        allowed_verdict(sandbox_auto_allow),
+                        allowed_in(mode, sandbox_auto_allow),
                         "{mode:?}: {command}"
                     );
                 }
@@ -2852,12 +2870,12 @@ mod tests {
                 .unwrap();
                 for (name, input) in &cases {
                     for sandbox_auto_allow in [false, true] {
-                        let contained = *name == "bash" && sandbox_auto_allow;
+                        // plan 285：bypass 下 bash 也不进沙箱。
                         assert_eq!(
                             permissions
                                 .check_call(name, input, 1, sandbox_auto_allow)
                                 .await,
-                            allowed_verdict(contained),
+                            allowed_verdict(false),
                             "{name}: {input}, ask={ask_rules:?}, approver={approver_available}, sandbox={sandbox_auto_allow}"
                         );
                     }

@@ -19,7 +19,7 @@ async fn plan284_dynamic_targets_run_like_literal_ones() {
             let approver = ScriptedApprover::new(vec![]);
             let p = gate(mode, rules(&[], &[], &[]), approver.clone());
             let verdict = p.check_call("bash", &bash(command), 0, true).await;
-            assert_eq!(verdict, allowed_verdict(true), "{mode:?}: {command}");
+            assert_eq!(verdict, allowed_in(mode, true), "{mode:?}: {command}");
             assert_eq!(approver.ask_count(), 0, "{mode:?}: {command}");
         }
     }
@@ -107,7 +107,7 @@ async fn plan284_unknown_words_cannot_slip_past_deny_but_add_no_new_denials() {
     }
     for command in ["git status \"$PATHSPEC\"", "make test \"$EXTRA\"", "go test -run \"$T\" ./..."] {
         let verdict = p.check_call("bash", &bash(command), 0, true).await;
-        assert_eq!(verdict, allowed_verdict(true), "{command}");
+        assert_eq!(verdict, allowed_in(Mode::Bypass, true), "{command}");
     }
 
     // `rm` 的参数角色已知，不是未决读取：plan 284 前后都照常在沙箱里放行。

@@ -733,7 +733,7 @@ async fn plan244_dynamic_reads_fail_closed_after_data_and_scalar_assignments() {
             "cat < \"$FOO\"",
         ] {
             let verdict = p.check_call("bash", &bash(command), 0, true).await;
-            assert_eq!(verdict, allowed_verdict(true), "{mode:?}: {command}");
+            assert_eq!(verdict, allowed_in(mode, true), "{mode:?}: {command}");
         }
         assert_eq!(approver.ask_count(), 0);
     }
