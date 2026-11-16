@@ -2001,12 +2001,17 @@ reports back over a task channel; the loop drops a result whose query or
 directory it has already moved past (a dismissed completion menu bumps a popup
 generation, which is what invalidates a search the same unchanged token would
 otherwise let reopen it), and file searches are debounced so a burst of
-keystrokes starts one walk rather than one per key. A paste carries the draft it
-was asked for and the byte position it belongs at: the attachment lands at that
-seam when it still exists (at the cursor when an edit crossed it), is refused
-with a note when the draft was sent or cleared meanwhile, and Enter is replayed
-only after the paste settles, so an image can never ride the next message
-instead of the one the user sent.
+keystrokes starts one walk rather than one per key. A paste reserves its
+`[Image #N]` in the draft when the key is pressed: the label is ordinary draft
+content from that moment, so edits carry it along, a second paste lands after
+the first, and the bytes fill that exact label when they arrive (a read that
+produces no image leaves the paste's text in the label's place; a label deleted,
+or a draft sent or cleared meanwhile, is refused — with a note when the draft
+itself went). Enter is held while a paste is loading and, once it lands,
+submits the draft directly rather than replaying the key: same draft and no
+panel or popup on the keyboard, or not at all. An image can therefore never ride
+the next message instead of the one the user sent, and a held Enter can never
+answer an approval that appeared while the bytes were loading.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
 (see below); **Esc** is about the composer first: while it holds anything (text

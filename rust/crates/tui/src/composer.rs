@@ -65,15 +65,25 @@ enum AtomPayload {
         number: usize,
         source: Arc<ImageSource>,
     },
+    /// An image whose bytes are still being read (Ctrl+V, a dropped file).
+    /// The label is in the draft from the moment the paste is asked for, so
+    /// edits move it like any other image, two pastes keep their order, and the
+    /// reader has a place to land. `token` names the reservation; deleting the
+    /// label or the draft drops it, and the late result is then refused.
+    PendingImage {
+        number: usize,
+        token: u64,
+    },
 }
 
 impl Atom {
     /// What an edit cutting into the atom leaves behind. An image has no text
-    /// form, so cutting its label drops the image with it.
+    /// form, so cutting its label drops the image with it; a reservation is in
+    /// the same position until its bytes arrive.
     fn materialized(&self) -> &str {
         match &self.payload {
             AtomPayload::Paste { content, .. } => content,
-            AtomPayload::Image { .. } => "",
+            AtomPayload::Image { .. } | AtomPayload::PendingImage { .. } => "",
         }
     }
 }
@@ -104,7 +114,9 @@ impl ComposerDocument {
             expanded.push_str(&self.display[copied..atom.range.start().get()]);
             match &atom.payload {
                 AtomPayload::Paste { content, .. } => expanded.push_str(content),
-                AtomPayload::Image { .. } => expanded.push_str(&atom.label),
+                AtomPayload::Image { .. } | AtomPayload::PendingImage { .. } => {
+                    expanded.push_str(&atom.label)
+                }
             }
             copied = atom.range.end().get();
         }
@@ -120,7 +132,10 @@ impl ComposerDocument {
             .iter()
             .filter_map(|atom| match &atom.payload {
                 AtomPayload::Image { number, source } => Some((*number, Arc::clone(source))),
-                AtomPayload::Paste { .. } => None,
+                // A reservation has no bytes yet; a submit while one is in
+                // flight would claim an image the message does not carry, and
+                // Enter is held until it settles for exactly that reason.
+                AtomPayload::PendingImage { .. } | AtomPayload::Paste { .. } => None,
             })
             .collect()
     }
@@ -185,7 +200,7 @@ impl ComposerDocument {
                 }
                 // 图片没有文字形态可退：在缺边界的一侧补一个空格，标签就落在
                 // 字素边界上(前面是 Prepend 字符，或后面紧跟组合符时)。
-                AtomPayload::Image { .. } => {
+                AtomPayload::Image { .. } | AtomPayload::PendingImage { .. } => {
                     let mut at = at;
                     if !fits_start {
                         at = self.replace_raw(TextRange::empty(at), " ");
@@ -200,7 +215,9 @@ impl ComposerDocument {
 
         let cursor = self.replace(TextRange::empty(at), &label);
         debug_assert_eq!(cursor, end);
-        if let AtomPayload::Image { number, .. } = &payload {
+        if let AtomPayload::Image { number, .. } | AtomPayload::PendingImage { number, .. } =
+            &payload
+        {
             self.image_high_water = self.image_high_water.max(*number);
         }
         self.atoms.push(Atom {
@@ -219,7 +236,10 @@ impl ComposerDocument {
         let mut cursor = self.replace_raw(range, replacement);
         // 先隔开图片再对齐光标：否则光标会被对齐进与标签粘成一体的字素里。
         while let Some(index) = self.atoms.iter().position(|atom| {
-            matches!(atom.payload, AtomPayload::Image { .. }) && self.breaks_boundary(atom)
+            matches!(
+                atom.payload,
+                AtomPayload::Image { .. } | AtomPayload::PendingImage { .. }
+            ) && self.breaks_boundary(atom)
         }) {
             cursor = self.separate_image(index, cursor);
         }
@@ -239,7 +259,9 @@ impl ComposerDocument {
         {
             cursor = match self.atoms[index].payload {
                 AtomPayload::Paste { .. } => self.materialize_atom(index, cursor),
-                AtomPayload::Image { .. } => self.separate_image(index, cursor),
+                AtomPayload::Image { .. } | AtomPayload::PendingImage { .. } => {
+                    self.separate_image(index, cursor)
+                }
             };
         }
         self.assert_invariants();
@@ -357,14 +379,15 @@ impl ComposerDocument {
             );
             previous_end = atom.range.end();
         }
-        let mut numbers: Vec<usize> = self
-            .atoms
-            .iter()
-            .filter_map(|atom| match atom.payload {
-                AtomPayload::Image { number, .. } => Some(number),
-                AtomPayload::Paste { .. } => None,
-            })
-            .collect();
+        let mut numbers: Vec<usize> =
+            self.atoms
+                .iter()
+                .filter_map(|atom| match atom.payload {
+                    AtomPayload::Image { number, .. }
+                    | AtomPayload::PendingImage { number, .. } => Some(number),
+                    AtomPayload::Paste { .. } => None,
+                })
+                .collect();
         numbers.sort_unstable();
         debug_assert!(numbers.windows(2).all(|pair| pair[0] < pair[1]));
         debug_assert!(
@@ -654,6 +677,9 @@ pub struct Composer {
     draft: ComposerDocument,
     goal_column: Option<usize>,
     next_paste_id: u64,
+    /// Names the reservations of reads still in flight, so a result fills the
+    /// label it was asked for and nothing else.
+    next_image_token: u64,
 }
 
 impl Composer {
@@ -666,6 +692,7 @@ impl Composer {
             draft: ComposerDocument::default(),
             goal_column: None,
             next_paste_id: 1,
+            next_image_token: 1,
         }
     }
 
@@ -758,34 +785,66 @@ impl Composer {
         self.insert_image(number, Arc::new(source));
     }
 
-    /// Insert `[Image #N]` at `at` instead of the cursor, handing `source` back
-    /// when `at` no longer names a seam in this text (the draft was rewritten,
-    /// or the byte sits inside an atom). A paste read off the event loop lands
-    /// after the cursor may have moved, and the attachment belongs where the
-    /// key was pressed.
-    pub fn attach_image_at(
-        &mut self,
-        at: ByteOffset,
-        source: ImageSource,
-    ) -> std::result::Result<(), ImageSource> {
-        if at > ByteOffset::new(self.text().len())
-            || !is_grapheme_boundary(self.text(), at)
-            || self.range_touches_atom(TextRange::empty(at))
-        {
-            return Err(source);
-        }
+    /// Reserve `[Image #N]` at the cursor for bytes still being read. The label
+    /// is in the draft from now on: edits before it move it like any other
+    /// image, a second paste reserves after the first, and the reader lands on
+    /// the label it was asked for. `token` is that reservation's name; a
+    /// deleted label (or draft) leaves nothing to fill, and the late result is
+    /// refused instead of landing somewhere else.
+    pub fn reserve_image(&mut self) -> u64 {
         let number = self.document.image_high_water + 1;
+        let token = self.next_image_token;
+        self.next_image_token += 1;
         self.begin_edit();
         self.cursor = self.document.insert_atom(
-            at,
+            self.cursor,
             image_label(number),
-            AtomPayload::Image {
-                number,
-                source: Arc::new(source),
-            },
+            AtomPayload::PendingImage { number, token },
         );
         self.goal_column = None;
-        Ok(())
+        token
+    }
+
+    /// Fill a reservation with the bytes that arrived. `false` when the label
+    /// is gone (deleted, materialized, or the draft was sent or cleared).
+    pub fn resolve_image(&mut self, token: u64, source: ImageSource) -> bool {
+        let Some(atom) = self.document.atoms.iter_mut().find(
+            |atom| matches!(atom.payload, AtomPayload::PendingImage { token: held, .. } if held == token),
+        ) else {
+            return false;
+        };
+        let AtomPayload::PendingImage { number, .. } = atom.payload else {
+            unreachable!("matched a reservation");
+        };
+        atom.payload = AtomPayload::Image {
+            number,
+            source: Arc::new(source),
+        };
+        true
+    }
+
+    /// A reservation whose read produced no image: drop the label and say where
+    /// it stood, so the paste's text can take that place. `None` when the label
+    /// is already gone.
+    pub fn abandon_image(&mut self, token: u64) -> Option<ByteOffset> {
+        let index = self.document.atoms.iter().position(
+            |atom| matches!(atom.payload, AtomPayload::PendingImage { token: held, .. } if held == token),
+        )?;
+        let at = self.document.atoms[index].range.start();
+        self.document.delete_atom(index);
+        Some(at)
+    }
+
+    /// Insert text at `at` (the spot a reservation just gave up) and leave the
+    /// cursor after it, as a paste does.
+    pub fn insert_text_at(&mut self, at: ByteOffset, text: &str) -> bool {
+        if at > ByteOffset::new(self.text().len()) || !is_grapheme_boundary(self.text(), at) {
+            return false;
+        }
+        self.begin_edit();
+        self.cursor = self.document.replace(TextRange::empty(at), text);
+        self.goal_column = None;
+        true
     }
 
     fn insert_image(&mut self, number: usize, source: Arc<ImageSource>) {
@@ -1619,6 +1678,84 @@ mod tests {
             submitted(&mut composer),
             ("[Image #1] \u{301}".into(), vec!["one".into()])
         );
+    }
+
+    /// A reservation is part of the draft the moment the paste is asked for:
+    /// edits before it carry the label along, so the bytes land where the user
+    /// pasted even though they arrive later.
+    #[test]
+    fn a_reserved_label_moves_with_the_edits_around_it() {
+        let mut composer = Composer::new();
+        composer.insert_text("hello");
+        composer.left();
+        let token = composer.reserve_image();
+        assert_eq!(composer.text(), "hell[Image #1]o");
+
+        // Move to the start and type: the label keeps its place in the text.
+        for _ in 0..20 {
+            composer.left();
+        }
+        composer.insert_text("> ");
+        assert_eq!(composer.text(), "> hell[Image #1]o");
+
+        assert!(composer.resolve_image(token, image("one")));
+        assert_eq!(
+            submitted(&mut composer),
+            ("> hell[Image #1]o".into(), vec!["one".into()])
+        );
+    }
+
+    /// Two pastes asked for at the same cursor keep the order they were asked
+    /// in, whatever order their reads finish in.
+    #[test]
+    fn reservations_keep_paste_order_not_read_order() {
+        let mut composer = Composer::new();
+        composer.insert_text("ab");
+        composer.left();
+        let first = composer.reserve_image();
+        let second = composer.reserve_image();
+        assert_eq!(composer.text(), "a[Image #1][Image #2]b");
+
+        assert!(composer.resolve_image(second, image("two")));
+        assert!(composer.resolve_image(first, image("one")));
+        assert_eq!(
+            submitted(&mut composer),
+            (
+                "a[Image #1][Image #2]b".into(),
+                vec!["one".into(), "two".into()]
+            )
+        );
+    }
+
+    /// A reservation whose read produced no image gives its spot back, and the
+    /// caller's text takes exactly that place; a result for a label that is
+    /// already gone is refused.
+    #[test]
+    fn an_abandoned_reservation_leaves_its_text_in_place() {
+        let mut composer = Composer::new();
+        composer.insert_text("a  b");
+        composer.left();
+        composer.left();
+        let token = composer.reserve_image();
+        assert_eq!(composer.text(), "a [Image #1] b");
+
+        let at = composer.abandon_image(token).expect("the label is there");
+        assert!(composer.insert_text_at(at, "note"));
+        assert_eq!(composer.text(), "a note b");
+
+        assert!(!composer.resolve_image(token, image("late")));
+        assert!(composer.abandon_image(token).is_none());
+    }
+
+    /// Backspacing the label is a request to drop the image; the read that
+    /// lands afterwards finds nothing to fill.
+    #[test]
+    fn a_deleted_reservation_is_no_longer_fillable() {
+        let mut composer = Composer::new();
+        let token = composer.reserve_image();
+        composer.backspace();
+        assert!(composer.is_blank());
+        assert!(!composer.resolve_image(token, image("late")));
     }
 
     #[test]

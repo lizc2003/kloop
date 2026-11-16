@@ -1169,6 +1169,16 @@ fn search_lands(seq: u64, latest: u64, generation: u64, current_generation: u64)
     seq == latest && generation == current_generation
 }
 
+/// Whether a modal surface owns the keyboard right now. A held submit is
+/// neither routed through `on_key` nor replayed while one does: an Enter meant
+/// for the composer must never answer an approval that appeared meanwhile.
+fn surface_owns_keyboard(app: &App) -> bool {
+    app.popup.is_some()
+        || app.interaction_active()
+        || app.fork_picker.is_some()
+        || app.provider_picker.is_some()
+}
+
 /// Whether this key is the submit that has to wait for an image still loading.
 /// Enter on a popup or a panel answers that surface and is never held; a
 /// newline chord is not a submit either.
@@ -1183,10 +1193,15 @@ fn enter_waits_for_paste(
         && !key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-        && app.popup.is_none()
-        && !app.interaction_active()
-        && app.fork_picker.is_none()
-        && app.provider_picker.is_none()
+        && !surface_owns_keyboard(app)
+}
+
+/// Whether a submit held for a paste still applies when the paste lands: the
+/// draft it was pressed on is still the one in the composer, and nothing modal
+/// has taken the keyboard since. A held Enter is submitted directly, never
+/// replayed as a key, so it cannot approve a prompt it never saw.
+fn deferred_submit_still_applies(generation: u64, app: &App) -> bool {
+    generation == app.draft_generation() && !surface_owns_keyboard(app)
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
@@ -1248,34 +1263,22 @@ enum UiTask {
         target: menu::CompletionTarget,
         paths: Vec<String>,
     },
-    /// Ctrl+V: an image, or why there was none.
+    /// Ctrl+V: an image filled into reservation `token`, or why there was none.
     Clipboard {
-        snapshot: PasteSnapshot,
+        token: u64,
+        generation: u64,
         image: std::result::Result<ImageSource, String>,
     },
-    /// A pasted path: the attachment, or None when it did not read — then the
-    /// paste goes into the composer as text.
+    /// A pasted path: the attachment for reservation `token`, or None when it
+    /// did not read — then the paste's text takes the label's place.
     ImagePaste {
-        snapshot: PasteSnapshot,
+        token: u64,
+        generation: u64,
         text: String,
         source: Option<ImageSource>,
     },
     /// A cwd change that arrived without its branch.
     Branch { cwd: String, branch: Option<String> },
-}
-
-/// The draft a paste was aimed at. Both reads run off the event loop, so the
-/// result has to find the place the user pasted into — or learn that the draft
-/// is gone rather than land in the next message.
-#[derive(Clone, Debug)]
-struct PasteSnapshot {
-    /// [`App::draft_generation`] when the paste was asked for.
-    generation: u64,
-    /// The composer's text then; a different text only means the draft was
-    /// edited, but the recorded seam may no longer exist.
-    text: String,
-    /// The cursor then, in expanded-text bytes.
-    at: crate::text_layout::ByteOffset,
 }
 
 /// How long `@` typing settles before a tree walk starts: one walk per burst of
@@ -1317,9 +1320,10 @@ struct UiState {
     /// Pastes whose image read is still in flight. Enter waits for them so the
     /// image rides the message the user sent.
     pending_pastes: usize,
-    /// The Enter that arrived while a paste was in flight; replayed once the
-    /// composer has the attachment.
-    deferred_enter: Option<(crossterm::event::KeyEvent, usize)>,
+    /// The draft generation an Enter was held on while a paste was in flight.
+    /// The submit happens once that paste lands, but only if this is still the
+    /// draft in front of the user and no panel has taken over.
+    deferred_submit: Option<u64>,
 }
 
 impl UiState {
@@ -1370,20 +1374,11 @@ impl UiState {
         );
     }
 
-    /// What a paste read off the loop has to remember: which draft it was asked
-    /// for, and where in it the attachment belongs.
-    fn paste_snapshot(&self) -> PasteSnapshot {
-        PasteSnapshot {
-            generation: self.app.draft_generation(),
-            text: self.app.composer.text().to_string(),
-            at: self.app.composer.cursor(),
-        }
-    }
-
-    /// Ctrl+V: reading the OS clipboard (arboard) and PNG-encoding a screenshot
-    /// are both blocking.
+    /// Ctrl+V: reserve the label now (edits move it, a second paste lands after
+    /// it) and read the OS clipboard — arboard plus PNG encoding — off the loop.
     fn read_clipboard(&mut self) {
-        let snapshot = self.paste_snapshot();
+        let token = self.app.reserve_image();
+        let generation = self.app.draft_generation();
         self.pending_pastes += 1;
         let tasks = self.tasks.clone();
         tokio::spawn(async move {
@@ -1392,14 +1387,19 @@ impl UiState {
             let image = tokio::task::spawn_blocking(clipboard::clipboard_image)
                 .await
                 .unwrap_or_else(|error| Err(format!("clipboard read failed: {error}")));
-            let _ = tasks.send(UiTask::Clipboard { snapshot, image });
+            let _ = tasks.send(UiTask::Clipboard {
+                token,
+                generation,
+                image,
+            });
         });
     }
 
-    /// A pasted path may name an image: read it off the loop, and if it does not
-    /// read, paste the text as ordinary input.
+    /// A pasted path may name an image. Its label is reserved now; a read that
+    /// does not produce an image leaves the text in the label's place.
     fn read_image_paste(&mut self, text: String, path: std::path::PathBuf) {
-        let snapshot = self.paste_snapshot();
+        let token = self.app.reserve_image();
+        let generation = self.app.draft_generation();
         self.pending_pastes += 1;
         let tasks = self.tasks.clone();
         tokio::spawn(async move {
@@ -1408,36 +1408,23 @@ impl UiState {
                 .ok()
                 .flatten();
             let _ = tasks.send(UiTask::ImagePaste {
-                snapshot,
+                token,
+                generation,
                 text,
                 source,
             });
         });
     }
 
-    /// Put a pasted attachment where it was asked for: at the recorded seam when
-    /// the draft still has one, at the cursor when the draft was edited under
-    /// it, and nowhere when that draft was submitted or cleared meanwhile — the
-    /// image must not turn up in the next message. A dropped paste says so.
-    fn attach_pasted_image(&mut self, snapshot: PasteSnapshot, source: ImageSource) {
-        if self.app.draft_generation() != snapshot.generation {
+    /// An image landed: fill the reservation it was asked for. When the label is
+    /// gone, say so only if the draft itself was sent or cleared — otherwise the
+    /// user deleted it and knows.
+    fn land_paste(&mut self, token: u64, generation: u64, source: ImageSource) {
+        if !self.app.resolve_image(token, source) && self.app.draft_generation() != generation {
             self.note(
                 "pasted image arrived after that draft was sent or cleared — not attached".into(),
             );
-            return;
         }
-        let source = match self.app.attach_image_at(snapshot.at, source) {
-            Ok(()) => return,
-            Err(source) => source,
-        };
-        // The seam is gone (an edit crossed it, or an atom sits there now): the
-        // cursor is the one place the user can still see the attachment land.
-        if self.app.composer.text() != snapshot.text {
-            self.note(
-                "pasted image attached at the cursor — the draft changed while it loaded".into(),
-            );
-        }
-        self.app.attach_image(source);
     }
 
     /// One dim transcript note, the same channel every other loop-side notice
@@ -1446,15 +1433,20 @@ impl UiState {
         self.app.apply(AgentEvent::Core(CoreEvent::Note(text)));
     }
 
-    /// A paste result landed: count it in, write it where it was asked for, and
-    /// replay the Enter that waited for it once nothing else is in flight.
+    /// A paste result landed. Once nothing else is in flight, a submit that
+    /// waited for it goes through — as a submit, not as a replayed key: the
+    /// draft must still be the one that was in front, and no panel may own the
+    /// keyboard, or the Enter is dropped rather than answered at whatever is.
     fn settle_paste(&mut self) -> ControlFlow<()> {
         self.pending_pastes = self.pending_pastes.saturating_sub(1);
         if self.pending_pastes > 0 {
             return ControlFlow::Continue(());
         }
-        if let Some((key, width)) = self.deferred_enter.take() {
-            let command = self.app.on_key(width, key);
+        let Some(generation) = self.deferred_submit.take() else {
+            return ControlFlow::Continue(());
+        };
+        if deferred_submit_still_applies(generation, &self.app) {
+            let command = self.app.submit_draft();
             return self.on_command(command);
         }
         ControlFlow::Continue(())
@@ -1498,28 +1490,45 @@ impl UiState {
                     self.app.set_file_results(target, paths);
                 }
             }
-            UiTask::Clipboard { snapshot, image } => {
+            UiTask::Clipboard {
+                token,
+                generation,
+                image,
+            } => {
                 match image {
-                    Ok(source) => self.attach_pasted_image(snapshot, source),
-                    Err(error) => self.note(error),
+                    Ok(source) => self.land_paste(token, generation, source),
+                    Err(error) => {
+                        // No image on the clipboard: drop the label it was
+                        // holding and say why Ctrl+V did nothing.
+                        self.app.abandon_image(token);
+                        self.note(error);
+                    }
                 }
                 return self.settle_paste();
             }
             UiTask::ImagePaste {
-                snapshot,
+                token,
+                generation,
                 text,
                 source,
             } => {
                 match source {
-                    Some(source) => self.attach_pasted_image(snapshot, source),
+                    Some(source) => self.land_paste(token, generation, source),
                     // Not an image after all: the paste is plain text, and it
-                    // belongs to the draft it was pasted into just the same.
-                    None if self.app.draft_generation() == snapshot.generation => {
-                        self.paste(&text);
+                    // takes the place the label held — never the cursor of
+                    // whatever draft is current by then.
+                    None => {
+                        if let Command::SearchFiles(target) =
+                            self.app.paste_text_at_reservation(token, &text)
+                        {
+                            self.search_files(target);
+                        } else if self.app.draft_generation() != generation {
+                            self.note(
+                                "paste arrived after that draft was sent or cleared — not inserted"
+                                    .into(),
+                            );
+                        }
                     }
-                    None => self.note(
-                        "paste arrived after that draft was sent or cleared — not inserted".into(),
-                    ),
                 }
                 return self.settle_paste();
             }
@@ -1551,7 +1560,7 @@ impl UiState {
                 // image rides the message the user just sent instead of landing
                 // in the next draft.
                 if enter_waits_for_paste(self.pending_pastes, &self.app, &k) {
-                    self.deferred_enter = Some((k, viewport_width));
+                    self.deferred_submit = Some(self.app.draft_generation());
                     return ControlFlow::Continue(());
                 }
                 let command = self.app.on_key(viewport_width, k);
@@ -1807,7 +1816,7 @@ async fn ui_loop(
         tasks: task_tx,
         file_search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         pending_pastes: 0,
-        deferred_enter: None,
+        deferred_submit: None,
     };
     let outcome = loop {
         if std::mem::take(&mut state.clear_terminal)
@@ -2237,6 +2246,52 @@ mod tests {
         app.set_file_results(target, vec!["main.rs".into()]);
         assert!(app.popup.is_some());
         assert!(!enter_waits_for_paste(1, &app, &enter));
+    }
+
+    /// A submit held for a paste goes through only while it is still the same
+    /// draft in front of the user and nothing modal has taken the keyboard — in
+    /// particular, an approval that appeared while the image loaded must not be
+    /// answered by that Enter.
+    #[test]
+    fn a_held_submit_is_dropped_when_the_draft_or_the_keyboard_moves_on() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use kloop_core::permissions::ApprovalScope;
+        use kloop_core::permissions::ConfirmRequest;
+        use kloop_core::permissions::Decision;
+        use tokio::sync::oneshot;
+
+        let mut app = App::new("held-submit".into());
+        app.composer.paste("hi");
+        let generation = app.draft_generation();
+        assert!(deferred_submit_still_applies(generation, &app));
+
+        // Editing the same draft keeps the submit: that is what Enter would do.
+        app.composer.insert_char('!');
+        assert!(deferred_submit_still_applies(generation, &app));
+
+        // A panel taking the keyboard drops it.
+        let (reply, _rx) = oneshot::channel::<Decision>();
+        app.apply(AgentEvent::Confirm {
+            req: ConfirmRequest {
+                description: "bash: rm -rf build".into(),
+                approval_scopes: vec![ApprovalScope::Once],
+                ..Default::default()
+            },
+            reply,
+        });
+        assert!(!deferred_submit_still_applies(generation, &app));
+
+        // So does a draft that was cleared (two-Esc) and replaced.
+        let mut app = App::new("held-submit-clear".into());
+        app.composer.paste("hi");
+        let generation = app.draft_generation();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(80, esc);
+        app.on_key(80, esc);
+        assert!(app.composer.is_blank());
+        assert!(!deferred_submit_still_applies(generation, &app));
     }
 
     /// A search lands only while it is the newest one and the menu state that

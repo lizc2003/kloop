@@ -1668,7 +1668,7 @@ impl App {
                     return Command::RequestForkPoints;
                 }
             }
-            (KeyCode::Enter, _) => return self.on_enter(),
+            (KeyCode::Enter, _) => return self.submit_draft(),
             // shift+Tab cycles the permission mode (manual ⇄ plan; bypass is
             // opt-in via the CLI flag only). Allowed any time — the gate reads
             // the mode live per tool call.
@@ -1811,9 +1811,12 @@ impl App {
         });
     }
 
-    /// Enter: submit the composer (or run a slash command / steer a running
-    /// turn). Newline-insert (Shift/Alt+Enter, Ctrl+J) is handled before this.
-    fn on_enter(&mut self) -> Command {
+    /// Enter on the composer: submit it (or run a slash command / steer a
+    /// running turn). Newline-insert (Shift/Alt+Enter, Ctrl+J) is routed before
+    /// this. Public so a front-end that held the key — a paste still loading —
+    /// can submit on its own instead of replaying an Enter that a panel opened
+    /// meanwhile would answer.
+    pub fn submit_draft(&mut self) -> Command {
         if self.composer.is_blank() {
             return Command::None;
         }
@@ -1922,7 +1925,7 @@ impl App {
     }
 
     /// Drop the cells this input was echoed as — the text line plus one
-    /// placeholder per attachment, exactly what [`App::on_enter`] pushed.
+    /// placeholder per attachment, exactly what [`App::submit_draft`] pushed.
     /// Matched against the returned text rather than counted blindly: if the
     /// tail is not that echo, the transcript keeps everything. A stale echo is
     /// cosmetic; deleting a cell that belongs to something else is not.
@@ -1994,24 +1997,54 @@ impl App {
         }
     }
 
-    /// Attach a pasted image at the cursor (the loop already read + validated
-    /// it). The cursor now follows a label, which no completion menu answers.
+    /// Attach an already-read image at the cursor: a reservation filled on the
+    /// spot. The live path reserves and resolves across the read instead; this
+    /// is the one-step form tests and one-off callers want.
+    #[cfg(test)]
     pub fn attach_image(&mut self, source: ImageSource) {
-        self.composer.attach_image(source);
+        let token = self.composer.reserve_image();
+        self.composer.resolve_image(token, source);
         self.close_popup();
     }
 
-    /// Attach a pasted image at the position it was pasted into, when the
-    /// composer still has a seam there. The read runs off the event loop; `Err`
-    /// hands the source back so the caller can fall back to the cursor.
-    pub fn attach_image_at(
-        &mut self,
-        at: crate::text_layout::ByteOffset,
-        source: ImageSource,
-    ) -> std::result::Result<(), ImageSource> {
-        self.composer.attach_image_at(at, source)?;
+    /// Reserve the `[Image #N]` a paste still reading its bytes will fill. The
+    /// label is in the draft immediately, so it moves with edits and keeps its
+    /// order among pastes; the token names it.
+    pub fn reserve_image(&mut self) -> u64 {
+        let token = self.composer.reserve_image();
+        // The label edits the line under an open completion menu, so the menu
+        // and any search filling it no longer describe this text.
         self.close_popup();
-        Ok(())
+        token
+    }
+
+    /// Fill a reservation; `false` when its label is gone (deleted, or the
+    /// draft was sent or cleared).
+    pub fn resolve_image(&mut self, token: u64, source: ImageSource) -> bool {
+        let filled = self.composer.resolve_image(token, source);
+        if filled {
+            self.close_popup();
+        }
+        filled
+    }
+
+    /// Drop a reservation with no image behind it. `false` when its label is
+    /// already gone.
+    pub fn abandon_image(&mut self, token: u64) -> bool {
+        self.composer.abandon_image(token).is_some()
+    }
+
+    /// The pasted path did not read as an image: drop its reservation and put
+    /// the paste's text where the label stood — never at the cursor of whatever
+    /// draft is current by then. Returns the same completion command a text
+    /// paste would.
+    pub fn paste_text_at_reservation(&mut self, token: u64, text: &str) -> Command {
+        let Some(at) = self.composer.abandon_image(token) else {
+            return Command::None;
+        };
+        let text = canonicalize_paste(text);
+        self.composer.insert_text_at(at, &text);
+        self.after_edit()
     }
 
     /// Which draft the composer holds. A paste carries this from the moment it
@@ -4299,12 +4332,12 @@ mod tests {
         );
 
         let expanded = format!("look at {pasted}");
-        assert_eq!(app.on_enter(), Command::Submit(expanded.clone()));
+        assert_eq!(app.submit_draft(), Command::Submit(expanded.clone()));
         assert_eq!(app.cells, vec![Cell::User(expanded.trim().to_string())]);
 
         // Steering echoes it in full too.
         app.paste_text(&pasted);
-        assert_eq!(app.on_enter(), Command::Steer(pasted.clone()));
+        assert_eq!(app.submit_draft(), Command::Steer(pasted.clone()));
         assert_eq!(
             app.cells.last(),
             Some(&Cell::User(pasted.trim().to_string()))
@@ -4588,23 +4621,61 @@ mod tests {
         );
     }
 
-    /// A paste read off the event loop lands at the seam it was asked for, even
-    /// after the cursor moved — and the draw order around it is the one the
-    /// user typed, not the one the read finished in.
+    /// A paste reserves its `[Image #N]` when the key is pressed: the label
+    /// joins the draft immediately, so typing before it moves it and two pastes
+    /// keep the order they were asked in instead of the order their reads
+    /// finished in.
     #[test]
-    fn an_image_attaches_where_it_was_pasted() {
-        let mut app = App::new("paste-seam".into());
+    fn a_paste_reserves_its_place_and_keeps_paste_order() {
+        let mut app = App::new("paste-reserve".into());
         app.composer.paste("hello world");
-        // The paste was asked for after "hello"; the cursor then moved to the
-        // end of the line before the read finished.
-        app.attach_image_at(crate::text_layout::ByteOffset::new(5), png("one"))
-            .expect("a seam exists between the words");
-        assert_eq!(app.composer.text(), "hello[Image #1] world");
+        // Cursor back between "hello" and " world".
+        for _ in 0..6 {
+            app.composer.left();
+        }
+        let first = app.reserve_image();
+        let second = app.reserve_image();
+        assert_eq!(app.composer.text(), "hello[Image #1][Image #2] world");
 
-        // A position that is not a seam (inside an atom) hands the source back
-        // rather than splicing into the label.
-        let inside = crate::text_layout::ByteOffset::new(7);
-        assert!(app.attach_image_at(inside, png("two")).is_err());
+        // Typing before the labels carries them along.
+        for _ in 0..20 {
+            app.composer.left();
+        }
+        app.composer.insert_char('>');
+        assert_eq!(app.composer.text(), ">hello[Image #1][Image #2] world");
+
+        // Filling in reverse order keeps #1 before #2 (the label order is what
+        // decides, not the order the reads finished in).
+        assert!(app.resolve_image(second, png("two")));
+        assert!(app.resolve_image(first, png("one")));
+        let submitted = app.submit_draft();
+        assert_eq!(app.take_submit_images(), vec![png("one"), png("two")]);
+        assert!(matches!(submitted, Command::Submit(_)));
+    }
+
+    /// A label whose read produced no image is dropped, and the paste's text
+    /// takes exactly that place rather than wherever the cursor is by then.
+    #[test]
+    fn a_failed_image_paste_leaves_its_text_in_place() {
+        let mut app = App::new("paste-text".into());
+        app.composer.paste("a  b");
+        // Between the two spaces: left twice from the end.
+        app.composer.left();
+        app.composer.left();
+        let token = app.reserve_image();
+        assert_eq!(app.composer.text(), "a [Image #1] b");
+
+        // The user keeps typing at the cursor (after the label) while the read
+        // runs; the fallback takes the label's place, exactly where a
+        // synchronous paste would have put it, and the later typing follows.
+        app.composer.insert_char('x');
+        assert!(matches!(
+            app.paste_text_at_reservation(token, "note"),
+            Command::None
+        ));
+        assert_eq!(app.composer.text(), "a notex b");
+        // The reservation is gone, so a late result cannot land anywhere.
+        assert!(!app.abandon_image(token));
     }
 
     /// A submitted or cleared draft is a new draft: a paste still loading for the
