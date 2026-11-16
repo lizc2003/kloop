@@ -1,7 +1,7 @@
 # Plan 262 — TUI 正确性
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
+> 状态：✅ 2026-11-16 完成。行号是 2026-10-28 的读数;标「待复核」的条目开工第一步
 > 先读代码确认，不成立就在本文件划掉并写明原因。渲染缓存与事件循环阻塞在 plan 263。
 
 ## 问题
@@ -41,6 +41,7 @@
 
 - 第 4 条 Tab 展开成几个空格?推荐 4(与多数编辑器默认一致);其余控制字符去掉(与 toolrow 的
   `clean()` 一致)。也可以改成让 `display_width` 把控制字符算 0 宽，但那样粘贴进去的 Tab 仍不可见。
+  **已问(2026-11-16)：4 个空格，按字面展开不按列对齐；其余控制字符去掉。**
 
 ## 做法
 
@@ -55,6 +56,22 @@
 6. Composer 暴露 `range_touches_atom`,`detect_trigger` 在 token 与原子相交时不触发。
 7. 改注释，或从放行名单去掉 Ctrl+D。
 8. `run()` 结束时恢复原 panic hook。
+
+## 结果(2026-11-16)
+
+八条全部复核成立并实现,两处与上面的做法不同:
+
+- 第 1 条:raw mode 与 hand-back 合成一个 `PickerSession`,`Drop` 里一起撤(PickerIo trait
+  注入 fake 终端);handle 里 resize 走 `PinnedBackend`,不再发 CPR。error 路径也回收屏
+  幕,因为行已经画上去了。
+- 第 3 条:删掉 markdown 自己的逐 char 宽度,改按字素簇(簇宽用 `text_layout::display_width`
+  量簇自身的字符串);`truncate_chars` 仍自己实现(要保留样式),但按簇切,不再复用
+  `text_layout::truncate`。
+- 第 6 条:检查放在 `App::detect_trigger`(三个调用点都改走它),`menu::detect_trigger`
+  仍是纯文本函数;`Composer::range_touches_atom` 提供原子范围。行为就是「token 与原子
+  相交时不触发」,单测在 App 层。
+- 第 8 条没有加单测:panic hook 是进程全局,并行测试里换 hook 会和别处的
+  panic/`should_panic` 抢;guard 只做「装 hook + Drop 时装回」,人工复核。
 
 ## 验收
 

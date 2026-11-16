@@ -11,8 +11,10 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::event::Event;
 use ratatui::TerminalOptions;
 use ratatui::Viewport;
+use ratatui::backend::Backend;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -20,6 +22,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::render::BRAND;
 use crate::render::DIM;
+use crate::terminal::PinnedBackend;
 use crate::text_layout::display_width;
 use crate::text_layout::truncate;
 
@@ -354,60 +357,146 @@ fn human_bytes(bytes: u64) -> String {
 /// Run the picker on the real terminal. `Ok(None)` is a cancel — the caller
 /// exits without starting a session.
 pub fn pick_session(entries: Vec<SessionEntry>, project: &str) -> Result<Option<usize>> {
-    pick(Picker::new(entries, project))
+    let mut picker = Picker::new(entries, project);
+    pick_with(&mut picker, &mut CrosstermIo)
 }
 
-fn pick(mut picker: Picker) -> Result<Option<usize>> {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let height = picker.height(cols as usize, rows as usize) as u16;
-    crossterm::terminal::enable_raw_mode()?;
-    let terminal = ratatui::Terminal::with_options(
-        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height.max(1)),
-        },
-    );
-    let mut terminal = match terminal {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let _ = crossterm::terminal::disable_raw_mode();
-            return Err(error.into());
-        }
-    };
-    let outcome = loop {
-        // `draw` autoresizes first, so a resized terminal re-lays out here
-        // rather than needing its own branch below.
-        terminal.draw(|frame| {
-            let area = frame.area();
-            let lines = picker.lines(area.width as usize, area.height as usize);
-            frame.render_widget(Paragraph::new(lines), area);
-        })?;
-        if let crossterm::event::Event::Key(key) = crossterm::event::read()?
-            && key.kind == crossterm::event::KeyEventKind::Press
-        {
-            match picker.on_key(key) {
-                Outcome::Stay => {}
-                other => break other,
+/// The terminal work the picker does outside ratatui, behind a trait so the
+/// failure paths can be exercised without a tty.
+trait PickerIo {
+    type Backend: Backend<Error = std::io::Error>;
+
+    fn size(&mut self) -> (u16, u16);
+    fn enable_raw(&mut self) -> Result<()>;
+    fn disable_raw(&mut self);
+    fn read_event(&mut self) -> Result<Event>;
+    fn backend(&mut self) -> Self::Backend;
+    /// Put the shell prompt back on the row the picker's first line occupied.
+    fn hand_back(&mut self, viewport_top: u16);
+}
+
+struct CrosstermIo;
+
+impl PickerIo for CrosstermIo {
+    type Backend = ratatui::backend::CrosstermBackend<std::io::Stdout>;
+
+    fn size(&mut self) -> (u16, u16) {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    }
+
+    fn enable_raw(&mut self) -> Result<()> {
+        Ok(crossterm::terminal::enable_raw_mode()?)
+    }
+
+    fn disable_raw(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+
+    fn read_event(&mut self) -> Result<Event> {
+        Ok(crossterm::event::read()?)
+    }
+
+    fn backend(&mut self) -> Self::Backend {
+        ratatui::backend::CrosstermBackend::new(std::io::stdout())
+    }
+
+    fn hand_back(&mut self, viewport_top: u16) {
+        let mut out = std::io::stdout();
+        let _ = crossterm::execute!(
+            out,
+            crossterm::cursor::MoveTo(0, viewport_top),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
+            crossterm::cursor::Show,
+        );
+        let _ = out.flush();
+    }
+}
+
+/// Raw mode for exactly as long as the picker holds it. The old code disabled it
+/// next to the constructor's error branch and after a clean loop exit only, so a
+/// failed draw — a resize while the picker is up is the easy trigger — returned
+/// through `?` and left the shell raw.
+struct RawMode<'a, I: PickerIo>(&'a mut I);
+
+impl<'a, I: PickerIo> RawMode<'a, I> {
+    fn enter(io: &'a mut I) -> Result<Self> {
+        io.enable_raw()?;
+        Ok(Self(io))
+    }
+
+    fn io(&mut self) -> &mut I {
+        self.0
+    }
+}
+
+impl<I: PickerIo> Drop for RawMode<'_, I> {
+    fn drop(&mut self) {
+        self.0.disable_raw();
+    }
+}
+
+/// The picker's claim on the terminal. Raw mode and the rewind to the row the
+/// picker started on are both undone in `Drop`, however [`PickerSession::run`]
+/// returns.
+struct PickerSession<'a, I: PickerIo> {
+    io: RawMode<'a, I>,
+    terminal: ratatui::Terminal<PinnedBackend<I::Backend>>,
+}
+
+impl<'a, I: PickerIo> PickerSession<'a, I> {
+    fn open(io: &'a mut I, height: u16) -> Result<Self> {
+        let mut io = RawMode::enter(io)?;
+        // `PinnedBackend` answers ratatui's cursor query from its last known
+        // position, so an inline autoresize costs no CPR the terminal may not
+        // answer — the same mismatch the main TUI pins away (lesson 268).
+        let terminal = ratatui::Terminal::with_options(
+            PinnedBackend::new(io.io().backend()),
+            TerminalOptions {
+                viewport: Viewport::Inline(height.max(1)),
+            },
+        )?;
+        Ok(Self { io, terminal })
+    }
+
+    fn run(&mut self, picker: &mut Picker) -> Result<Outcome> {
+        loop {
+            // `draw` autoresizes first, so a resized terminal re-lays out here
+            // rather than needing its own branch below.
+            self.terminal.draw(|frame| {
+                let area = frame.area();
+                let lines = picker.lines(area.width as usize, area.height as usize);
+                frame.render_widget(Paragraph::new(lines), area);
+            })?;
+            if let Event::Key(key) = self.io.io().read_event()?
+                && key.kind == crossterm::event::KeyEventKind::Press
+            {
+                match picker.on_key(key) {
+                    Outcome::Stay => {}
+                    other => return Ok(other),
+                }
             }
         }
-    };
-    // Hand the screen back the way it was found: the picker's rows are chrome,
-    // not transcript, and whatever runs next starts where they began. Dropping
-    // the terminal parks the cursor at the bottom of the inline viewport, so
-    // the rewind to its top row happens after that, not before — otherwise the
-    // session banner prints under a screenful of blanks.
-    let viewport_top = terminal.get_frame().area().y;
-    let _ = terminal.clear();
-    drop(terminal);
-    let mut out = std::io::stdout();
-    let _ = crossterm::execute!(
-        out,
-        crossterm::cursor::MoveTo(0, viewport_top),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown),
-        crossterm::cursor::Show,
-    );
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = out.flush();
+    }
+}
+
+impl<I: PickerIo> Drop for PickerSession<'_, I> {
+    fn drop(&mut self) {
+        // Hand the screen back the way it was found: the picker's rows are
+        // chrome, not transcript, and whatever runs next starts where they
+        // began. Dropping the terminal parks the cursor at the bottom of the
+        // inline viewport, so the rewind to its top row happens after that, not
+        // before — otherwise the session banner prints under a screenful of
+        // blanks.
+        let viewport_top = self.terminal.get_frame().area().y;
+        let _ = self.terminal.clear();
+        self.io.io().hand_back(viewport_top);
+    }
+}
+
+fn pick_with<I: PickerIo>(picker: &mut Picker, io: &mut I) -> Result<Option<usize>> {
+    let (cols, rows) = io.size();
+    let height = picker.height(cols as usize, rows as usize) as u16;
+    let outcome = PickerSession::open(io, height)?.run(picker)?;
     Ok(match outcome {
         Outcome::Chose(index) => Some(index),
         _ => None,
@@ -602,5 +691,175 @@ mod tests {
         assert_eq!(human_bytes(587_878), "574.1KB");
         assert_eq!(human_bytes(1_048_576), "1MB");
         assert_eq!(human_bytes(1_258_291), "1.2MB");
+    }
+
+    /// A terminal that never touches the process's real modes: the picker's
+    /// enter/leave and hand-back counts are the whole assertion surface.
+    struct FakeIo<B> {
+        backend: Option<B>,
+        events: std::collections::VecDeque<Result<Event>>,
+        enabled: usize,
+        disabled: usize,
+        hand_backs: Vec<u16>,
+    }
+
+    impl<B: Backend> FakeIo<B> {
+        fn new(backend: B) -> Self {
+            Self {
+                backend: Some(backend),
+                events: std::collections::VecDeque::new(),
+                enabled: 0,
+                disabled: 0,
+                hand_backs: Vec::new(),
+            }
+        }
+
+        fn event(mut self, event: Result<Event>) -> Self {
+            self.events.push_back(event);
+            self
+        }
+    }
+
+    impl<B: Backend<Error = std::io::Error>> PickerIo for FakeIo<B> {
+        type Backend = B;
+
+        fn size(&mut self) -> (u16, u16) {
+            (80, 24)
+        }
+
+        fn enable_raw(&mut self) -> Result<()> {
+            self.enabled += 1;
+            Ok(())
+        }
+
+        fn disable_raw(&mut self) {
+            self.disabled += 1;
+        }
+
+        fn read_event(&mut self) -> Result<Event> {
+            self.events
+                .pop_front()
+                .unwrap_or_else(|| Ok(Event::Resize(80, 24)))
+        }
+
+        fn backend(&mut self) -> Self::Backend {
+            self.backend.take().expect("backend taken twice")
+        }
+
+        fn hand_back(&mut self, viewport_top: u16) {
+            self.hand_backs.push(viewport_top);
+        }
+    }
+
+    /// A backend that draws nothing and can be told to fail, standing in for
+    /// the autoresize error the old code returned straight through `?`.
+    struct FakeBackend {
+        fail_draw: bool,
+        cursor: ratatui::layout::Position,
+    }
+
+    impl Backend for FakeBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            if self.fail_draw {
+                return Err(std::io::Error::other("draw failed"));
+            }
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            Ok(self.cursor)
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clear_region(
+            &mut self,
+            _clear_type: ratatui::backend::ClearType,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            Ok(ratatui::layout::Size::new(80, 24))
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            Ok(ratatui::backend::WindowSize {
+                columns_rows: ratatui::layout::Size::new(80, 24),
+                pixels: ratatui::layout::Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_read_leaves_raw_mode() {
+        let mut io = FakeIo::new(FakeBackend {
+            fail_draw: false,
+            cursor: ratatui::layout::Position::new(0, 0),
+        })
+        .event(Err(anyhow::anyhow!("the tty went away")));
+        let mut picker = Picker::new(sample(), "kloop");
+        assert!(pick_with(&mut picker, &mut io).is_err());
+        assert_eq!(io.enabled, 1);
+        assert_eq!(io.disabled, 1);
+        // The rows are already on screen, so even a failed loop cleans them up.
+        assert_eq!(io.hand_backs.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_draw_leaves_raw_mode() {
+        let mut io = FakeIo::new(FakeBackend {
+            fail_draw: true,
+            cursor: ratatui::layout::Position::new(0, 0),
+        });
+        let mut picker = Picker::new(sample(), "kloop");
+        let result = pick_with(&mut picker, &mut io);
+        assert!(result.is_err());
+        assert_eq!(io.enabled, 1);
+        assert_eq!(io.disabled, 1);
+    }
+
+    #[test]
+    fn a_clean_cancel_hands_the_screen_back() {
+        let mut io = FakeIo::new(FakeBackend {
+            fail_draw: false,
+            cursor: ratatui::layout::Position::new(0, 0),
+        })
+        .event(Ok(Event::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))));
+        let mut picker = Picker::new(sample(), "kloop");
+        assert_eq!(pick_with(&mut picker, &mut io).unwrap(), None);
+        assert_eq!(io.enabled, 1);
+        assert_eq!(io.disabled, 1);
+        assert_eq!(io.hand_backs.len(), 1);
     }
 }

@@ -5,6 +5,24 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 262 ✅：TUI 正确性（2026-11-16）**：八条复核全部成立，开工问题定为 Tab 展开 4 个空格。
+选择器:新增 `PickerIo` trait(注入 fake 终端)与 `PickerSession`,raw mode 和 hand-back 一起在
+`Drop` 里撤,draw/read 失败也恢复;backend 换成 `PinnedBackend`,resize 的 inline 重排不再发
+CPR(旧路径终端不应答要等 2 秒)。`@` 补全:`filter_entry` 只存一个谓词,原来四次调用只剩
+`.jj`;合成一个 `is_vcs_dir`,测试给 `.git` 放真文件(HEAD/config/objects)加 `.hg/.svn/.jj`。
+宽度:markdown 删掉自己的逐 char 宽度,按字素簇切/量(簇宽量簇自身字符串),表格列宽、硬折行、
+单元格截断共用;`truncate_chars` 要保留样式所以自己实现,但按簇切。粘贴入口 `canonicalize_paste`:
+CRLF/CR→LF、Tab→4 空格、其余控制字符丢弃(与 toolrow `clean` 一致),测试钉住第二行缩进与
+光标列。scrollback:`insert_before` 的高度是 `u16`,超过 `u16::MAX` 行的批次按 `split_rows`
+切开(测试把 cap 缩小走真实 commit,7 行全部进 scrollback)。`@` 触发:`Composer::range_touches_atom`
++ `App::detect_trigger`,标签里的 `@]` 不再弹菜单(检查放在 App 层,`menu::detect_trigger` 仍是
+纯文本函数)。Ctrl+D 从启动放行名单去掉,三处「Ctrl+D 立即退出」注释改对。`run()` 结束时用
+`PanicHookGuard` 把原 panic hook 装回去(放 slot 里惰性转发,panic 过也不会把原 hook 用掉)。
+验证:`cargo fmt --all -- --check`、`clippy -p kloop-tui -p kloop-core --all-targets -- -D warnings`、
+`cargo check --workspace --all-targets`、kloop-tui 322 项 lib 测试、kloop-core 的 fs_complete 4 项;
+未跑全量 `make check`、parity、PTY 测试(现有 PTY 用例不含 Tab/emoji 表格,选择器也没有 PTY 覆盖,
+真实终端上的 picker 路径只做了手工推理)。教训 389。
+
 **Plan 260 ✅：MCP 传输与 OAuth（2026-11-13）**：9 条复核全部成立，两个提交。第 5 条按用户
 同意收窄重放：`tools/call` 只在“服务端不可能已执行”时重试（连接没建起来、429/503），
 502/504 或读响应失败直接交给模型；其它方法维持原 408/429/5xx 与网络错误重试。第 9 条按用户
@@ -1683,7 +1701,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **259** server 输入与 worker | 唤醒信号被吞 steer 卡住;一行非 UTF-8 让 server 退出;`/provider` 残留 in_progress turn;delta O(n²) | 中 | — |
 | **260** ✅ MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
 | **261** ✅ web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
-| **262** TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
+| **262** ✅ TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
 | **263** TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
 | **264** 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
 | **265** 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
@@ -5034,5 +5052,26 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 
 387. **“写超时就当没写”是错的，管道不是消息边界；搬共用启动器时，std 的“隐藏语义”要逐条对齐。** tokio 的 `write_all` 是一串 `poll_write`，`timeout` 取消它时已经写出去的字节留在管道里；读循环的拒绝写如果超时后返回 `Ok(())`，下一条 JSON-RPC 消息就会接在半帧后面，协议从此失步且没有任何一方报错。判据：**取消一个写入 future 之后，那条流只能用“关闭”来兜底，不能继续用**；同一条纪律也适用于请求路径（超时后本来就会 `close_local`）。Windows 那边的教训是另一类：`ProcessSpec` 直接调用 `CreateProcessW`，而 `std::process::Command` 在 Windows 上不是它的薄包装——`.bat`/`.cmd` 会被隐式转成 `cmd.exe /c`，cmd 有第二遍解析（`%VAR%` 展开、`^` 转义、引号加倍），std 为此在 `make_bat_command_line` 里专门转义；`PATH` 里只找 `.exe`、相对路径按 cwd 补全、显式 `lpApplicationName` 不查 PATH，也都是 std 在替调用方做的事。共用/自建启动器时，把这些“Command 帮你做了但你没意识到”的行为列一遍：批处理解释器、参数转义、PATH 来源（配置 env 覆盖继承值时要跟着换）、相对路径基准、扩展名补全。跨平台可测的做法是把规则写成纯函数（u16 命令行、路径解析），Windows 胶水只负责取 `SystemRoot`、`encode_wide` 和传参数，这样 CI 之外的本机也能跑回归。还有三个容易漏的输入边界：verbatim 路径（`\\?\`）cmd 不认识，std 会在交给它之前转换，自己拼命令行时要照做；但删前缀不是字符串操作——Win32 会去掉路径组件末尾的点和空格，`\\?\C:\tools.\server.cmd` 删前缀后指向的是另一份文件，所以要先让 `GetFullPathNameW` 规范化候选并逐字节比较，不一致就保留原路径让 cmd 明确失败（判定逻辑接可注入的规范化函数，本机就能测）；OsString 可以含 NUL，而命令行是 NUL 结尾的字符串，脚本路径里的 NUL 会截断整条命令——凡是拼 UTF-16 命令行的地方，NUL 必须像引号/`%` 一样进拒绝名单。
 
+
+389. **“只留最后一个”的配置 API 是按调用次数算的,不是按名字算的;同一个值有几个来源时,测试要喂真的那种。**
+`ignore` 的 `filter_entry` 是 `self.filter = Some(..)`,循环四次设置四个名字,结果只剩最后一个——
+代码读起来像“跳过这四个目录”,实际只跳过 `.jj`。这类“看起来可累加”的 builder(setter 覆盖语
+义)在 review 里很难靠命名发现,判据是**读一次实现**:`filter_entry` 到底存一个还是存一组?
+错误测试兜不住它,因为 fixture 里的 `.git` 是空目录——空目录跳不跳过结果一样,测试只证明了“没有
+输出”,没有证明“没有走进去”。凡是“不要碰 X”的断言,fixture 里 X 必须有可发现的真内容,否则它
+测的是“没东西”而不是“排除了东西”。
+
+另一族教训在宽度与光标上:一个字符的显示宽度只有**作为字素簇整体**才有意义(ZWJ 家庭 emoji 是
+2 列,逐 char 相加是 8;`❤️` 是 2,逐 char 是 1+0),而 `unicode-width` 对控制字符在
+`UnicodeWidthStr`(1 列)和 `UnicodeWidthChar`(None)上还不一致,ratatui 又会把含控制字符的
+字素整个丢掉。所以三条必须同时成立才不出错:测量单位是簇、布局与渲染用同一个测量、入口把渲染
+会丢掉的字符换成渲染得出来的等价物(Tab→空格)。只在其中一处修,症状会从“表格错位”变成“光标
+偏一列”,看起来像另一个 bug。截断/换行按簇切的实现方式:把 `Vec<(char, Style)>` 拼成字符串,
+用簇的字节范围二分回 char 下标,样式仍然按 char 走。
+
+还有两条小的:凡是把行数交给 `as u16` 的地方,都要问一句“它的上限是谁给的”——这里
+`insert_before` 的签名是 `u16`,而调用方拿的是 `usize`,超过就到不了终端,既不报错也不回滚;
+进程全局的 panic hook 可以包装,但“装回去”要留一个恢复路径(共享 slot 惰性转发,而不是把原
+hook move 进闭包),否则一次 panic 就把原来那个吃掉了,`run` 返回后钩子还挂在进程上。
 
 388. **“校验过的地址”只有放进实际连接用的解析器里才算数；有个代理时，本地解析的甚至不是目标。** 在请求前另做一次 `lookup_host`，无论把结果保存得多好，连接阶段都会重新解析，rebinding 窗口就还在；reqwest 的 `dns_resolver` 收到的只是主机名、返回的 `SocketAddr` 端口填 0 由客户端替换成 scheme 默认端口，所以在那里按 `ip_is_public` 过滤才是连接真正用的答案，把解析源抽成可注入的 trait 就能不碰真实 DNS 地测私网/回环/链路本地。但这层单独不够：配了 HTTP 代理时 reqwest 只解析代理主机，目标名根本不会进这个解析器，私网目标会直接放行——每跳的目标名预检要保留，而且必须 fail-closed：本机解析不了的名称一旦交给代理，代理可能把它解进内网，连接期过滤器只看得到代理地址。反向的坑同样真实——解析器也作用在代理主机上，`HTTPS_PROXY=http://localhost:7890` 或解析到私网的企业代理会被当成 SSRF 拒掉，让两个 web 工具一起失灵；代理端点要从 reqwest 读的那几个变量（大小写、无 scheme 的 `host:port`、CGI 下忽略）取出来豁免，目标名照旧过滤；但按名字豁免同样是全局的——`NO_PROXY` 命中时代理会走直连，同一名字就成了未过滤的目标，所以代理端点本身要拒绝作为抓取目标，豁免才只剩代理那一腿。同一条计划里的另一半是“解码成功”不等于“拿到了原文”：`from_utf8_lossy` 对 GBK/Shift_JIS 页面产出满屏 U+FFFD 却仍像成功抓取，声明编码是数据不是事实，HTML 还要看 1024 字节预扫描窗口内的 `<meta charset>`/`http-equiv`（两种拼写，且要先跳过 HTML 注释，否则注释里的声明会盖掉真实声明、静默解出无告警的乱码；只有正文里的 `<!--` 才算注释，属性值里的 `<!--` 是数据，按注释处理会连同其后的声明和正文一起吞掉，HTML→text 的注释剥离也有同一个坑。这类“找下一个标记”的扫描还要看清代价：在非标签起点也调用标签尾定位，会让正文里大量孤立 `<` 变成每个都重扫一遍尾部；20 MiB 正文的同步转换没有可中断的 HTTP 超时兜底，复杂度必须事先算清），BOM 优先于声明，未知标签或字节不符必须退回有损解码并在结果里写明。反面同理：不能解码的 `application/octet-stream` 要在读 body 前拒绝，夹具只发响应头、不承诺正文，靠“客户端是否等正文”就能证明早拒真的生效。

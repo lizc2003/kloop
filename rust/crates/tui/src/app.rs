@@ -44,17 +44,30 @@ use crate::composer::Draft;
 use crate::events::AgentEvent;
 use crate::menu;
 
-fn canonicalize_paste_newlines(text: &str) -> String {
+/// Tab stop for pasted text. A raw `\t` is one column to `UnicodeWidthStr` but
+/// ratatui drops any grapheme holding a control char, so it would vanish on
+/// screen while still shifting the cursor: expand it where it enters.
+const PASTE_TAB_WIDTH: usize = 4;
+
+/// Paste arrives as the terminal (or the clipboard) sent it: CRLF from other
+/// systems, tabs from indented code, and the odd control byte. Newlines become
+/// the composer's own, a tab becomes [`PASTE_TAB_WIDTH`] spaces, and every other
+/// control character is dropped — the same rule `toolrow`'s `clean` applies.
+fn canonicalize_paste(text: &str) -> String {
     let mut canonical = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(character) = chars.next() {
-        if character == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
+        match character {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                canonical.push('\n');
             }
-            canonical.push('\n');
-        } else {
-            canonical.push(character);
+            '\t' => canonical.extend(std::iter::repeat_n(' ', PASTE_TAB_WIDTH)),
+            '\n' => canonical.push('\n'),
+            control if control.is_control() => {}
+            other => canonical.push(other),
         }
     }
     canonical
@@ -1522,7 +1535,8 @@ impl App {
         // Ctrl+C is a two-tap quit on every surface — main input, confirm popup,
         // rewind picker: the first press arms a hint, the second quits, any other
         // key disarms. Handle it before routing so all three agree (CC parity —
-        // Esc does interrupt/dismiss, Ctrl+C exits). Ctrl+D stays immediate.
+        // Esc does interrupt/dismiss, Ctrl+C exits). Ctrl+D is not bound: the
+        // two-tap Ctrl+C is the only quit path.
         let was_armed = std::mem::take(&mut self.ctrl_c_exit_armed);
         // Both two-tap arms disarm on any key, so both are taken up front — every
         // branch below (including the ones that return early) is "any other key"
@@ -1630,7 +1644,7 @@ impl App {
     /// tree; otherwise resolves the slash menu (or closes the popup) here and
     /// returns [`Command::None`].
     fn after_edit(&mut self) -> Command {
-        match menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running) {
+        match self.detect_trigger() {
             Some(target) if target.kind == menu::PopupKind::Slash => {
                 let items = menu::slash_items(&self.commands, &target.query);
                 self.popup = (!items.is_empty()).then_some(menu::Popup {
@@ -1648,6 +1662,16 @@ impl App {
                 Command::None
             }
         }
+    }
+
+    /// The completion trigger at the cursor, unless the token sits inside a
+    /// paste atom's label. A big paste whose last line ends in `@` leaves the
+    /// cursor on `@]` — label text, not a mention — and accepting a completion
+    /// there would rewrite the whole paste it stands for.
+    fn detect_trigger(&self) -> Option<menu::CompletionTarget> {
+        let target =
+            menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running)?;
+        (!self.composer.range_touches_atom(target.range)).then_some(target)
     }
 
     /// A key while a completion popup is open. `Some(cmd)` when the popup consumed
@@ -1692,9 +1716,7 @@ impl App {
     /// completed token carries a trailing space, so its trigger no longer fires.
     fn accept_popup(&mut self) {
         if let Some(popup) = self.popup.take() {
-            let current =
-                menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running);
-            if current.as_ref() != Some(&popup.target) {
+            if self.detect_trigger().as_ref() != Some(&popup.target) {
                 return;
             }
             if let Some(item) = popup.selected() {
@@ -1708,9 +1730,7 @@ impl App {
     /// the composer has moved on, so a late result cannot reopen a same-query
     /// token at another byte range; an empty result closes the popup.
     pub fn set_file_results(&mut self, target: menu::CompletionTarget, paths: Vec<String>) {
-        let current =
-            menu::detect_trigger(self.composer.text(), self.composer.cursor(), !self.running);
-        if current.as_ref() != Some(&target) || target.kind != menu::PopupKind::File {
+        if self.detect_trigger().as_ref() != Some(&target) || target.kind != menu::PopupKind::File {
             return;
         }
         let items = menu::file_items(paths);
@@ -1868,7 +1888,7 @@ impl App {
     /// A bracketed-paste of text (the event loop routes image-file pastes to
     /// [`App::attach_image`] instead).
     pub fn paste_text(&mut self, s: &str) -> Command {
-        let text = canonicalize_paste_newlines(s);
+        let text = canonicalize_paste(s);
         if let Some(PendingInteraction::Question(question)) = self.interactions.front_mut()
             && question.phase == QuestionPhase::Other
         {
@@ -3014,14 +3034,19 @@ mod tests {
     }
 
     #[test]
-    fn paste_newlines_are_canonicalized_without_trimming_content() {
+    fn paste_newlines_and_control_chars_are_canonicalized_without_trimming_content() {
         for (input, expected) in [
             ("abc\ndef", "abc\ndef"),
             ("abc\r\ndef", "abc\ndef"),
             ("abc\rdef", "abc\ndef"),
             (" abc\r\ndef \n", " abc\ndef \n"),
+            // Indented code keeps its indentation, in columns the terminal can
+            // actually draw.
+            ("if x {\n\treturn;\n}", "if x {\n    return;\n}"),
+            // Control bytes the terminal would render as nothing at best.
+            ("a\u{7}b\u{1b}[0mc", "ab[0mc"),
         ] {
-            assert_eq!(canonicalize_paste_newlines(input), expected);
+            assert_eq!(canonicalize_paste(input), expected);
 
             let mut app = App::new("s".into());
             assert_eq!(app.paste_text(input), Command::None);
@@ -3031,6 +3056,41 @@ mod tests {
                 Command::Submit(expected.into())
             );
         }
+    }
+
+    /// A pasted tab keeps its indentation on screen — four columns wide, with
+    /// the cursor after the last one. A raw tab would have counted one column
+    /// here and been dropped by the renderer entirely.
+    #[test]
+    fn pasted_tab_indentation_is_visible_and_moves_the_cursor() {
+        let mut app = App::new("s".into());
+        assert_eq!(app.paste_text("a\n\tb"), Command::None);
+        assert_eq!(app.composer.text(), "a\n    b");
+        let view = app.composer.view(80);
+        let rows: Vec<String> = view
+            .rows
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rows, vec!["› a".to_string(), "      b".to_string()]);
+        assert_eq!((view.cursor_row, view.cursor_col), (1, 7));
+    }
+
+    /// A big paste whose preview ends in `@` leaves the cursor on `@]` — the
+    /// label's own tail, whose `]` happens to match a path like `app/[id]/page.tsx`.
+    /// That is not a mention: accepting a completion there would rewrite the
+    /// whole paste the label stands for.
+    #[test]
+    fn a_paste_label_ending_in_at_does_not_trigger_the_file_menu() {
+        let mut app = App::new("s".into());
+        let pasted = "please check cc @\nline two\nline three\nline four\nline five";
+        assert_eq!(app.paste_text(pasted), Command::None);
+        assert!(
+            app.composer.text().ends_with("@]"),
+            "{}",
+            app.composer.text()
+        );
+        assert!(app.popup.is_none());
     }
 
     #[test]
@@ -4335,7 +4395,7 @@ mod tests {
 
     /// Ctrl+C is the same two-tap quit inside a popup as in the main input —
     /// intercepted before routing, so the popup is untouched by the first tap
-    /// (its own dismissal is Esc). Ctrl+D still quits a popup immediately.
+    /// (its own dismissal is Esc). Ctrl+D is not bound in a popup either.
     #[tokio::test]
     async fn ctrl_c_two_tap_quits_from_popups() {
         // Confirm prompt up.

@@ -20,6 +20,12 @@ use super::PinnedBackend;
 /// its own, so an oversized single cell is fine as its own batch.
 const SCROLLBACK_BATCH_ROWS: usize = 512;
 
+/// `Terminal::insert_before` takes the height as `u16`. A cell taller than that
+/// (a `-c` resume with a huge output, committed on a narrow terminal) used to
+/// wrap in the `as u16` cast, and the lines past the wrap were committed
+/// nowhere. Split only such a batch.
+const MAX_INSERT_ROWS: usize = u16::MAX as usize;
+
 /// Flatten per-cell blocks into batches no taller than `max_rows`, preserving
 /// line order and content. A block is never split across batches (a cell's
 /// lines stay contiguous); a block that alone exceeds `max_rows` becomes its
@@ -75,7 +81,7 @@ where
     B: ratatui::backend::Backend,
 {
     terminal.backend_mut().begin_commit();
-    let result = insert_batches(terminal, blocks);
+    let result = insert_batches(terminal, blocks, MAX_INSERT_ROWS);
     terminal.backend_mut().end_commit();
     result
 }
@@ -83,21 +89,41 @@ where
 fn insert_batches<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     blocks: Vec<Vec<Line<'static>>>,
+    max_insert_rows: usize,
 ) -> std::result::Result<(), B::Error>
 where
     B: ratatui::backend::Backend,
 {
     for lines in coalesce_scrollback_batches(blocks, SCROLLBACK_BATCH_ROWS) {
-        let height = lines.len() as u16;
-        if height == 0 {
-            continue;
+        for chunk in split_rows(lines, max_insert_rows) {
+            let height = chunk.len() as u16;
+            if height == 0 {
+                continue;
+            }
+            terminal.insert_before(height, |buf| {
+                let area = buf.area;
+                Paragraph::new(chunk).render(area, buf);
+            })?;
         }
-        terminal.insert_before(height, |buf| {
-            let area = buf.area;
-            Paragraph::new(lines).render(area, buf);
-        })?;
     }
     Ok(())
+}
+
+/// Cut an over-tall batch into insertable pieces, keeping line order. Anything
+/// that fits comes back as the single batch it was, so ordinary commits pay
+/// nothing for the cap.
+fn split_rows(lines: Vec<Line<'static>>, max_rows: usize) -> Vec<Vec<Line<'static>>> {
+    let max_rows = max_rows.max(1);
+    if lines.len() <= max_rows {
+        return vec![lines];
+    }
+    let mut rows = lines;
+    let mut out = Vec::new();
+    while !rows.is_empty() {
+        let tail = rows.split_off(max_rows.min(rows.len()));
+        out.push(std::mem::replace(&mut rows, tail));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -231,6 +257,59 @@ mod tests {
         assert_eq!(shapes, vec![2, 3, 4, 1]);
         assert_eq!(batches[2][0].to_string(), "c1");
         assert_eq!(batches[3][0].to_string(), "d1");
+    }
+
+    #[test]
+    fn split_rows_cuts_only_what_does_not_fit() {
+        let lines = |n: usize| -> Vec<Line<'static>> {
+            (0..n).map(|i| Line::from(format!("line {i}"))).collect()
+        };
+        // Under the cap: the batch is handed back untouched.
+        assert_eq!(split_rows(lines(2), 5).len(), 1);
+        // Over it: consecutive pieces, in order, no line lost.
+        let chunks = split_rows(lines(7), 2);
+        let shapes: Vec<usize> = chunks.iter().map(Vec::len).collect();
+        assert_eq!(shapes, vec![2, 2, 2, 1]);
+        let flat: Vec<String> = chunks.iter().flatten().map(ToString::to_string).collect();
+        assert_eq!(
+            flat,
+            (0..7).map(|i| format!("line {i}")).collect::<Vec<_>>()
+        );
+    }
+
+    /// A commit taller than `u16::MAX` rows used to wrap in the `as u16` cast,
+    /// so everything past the wrap was never committed. With the cap shrunk to
+    /// keep the test small, every line must still reach scrollback.
+    #[test]
+    fn an_over_tall_cell_commits_every_line() {
+        const WIDTH: u16 = 12;
+        const HEIGHT: u16 = 4;
+        let backend = PinnedBackend::new(TestBackend::new(WIDTH, HEIGHT));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(HEIGHT),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(vec![Line::from("live tail")]), frame.area());
+            })
+            .unwrap();
+
+        let cell: Vec<Line<'static>> = (0..7).map(|i| Line::from(format!("row {i}"))).collect();
+        insert_batches(&mut terminal, vec![cell], 2).unwrap();
+
+        terminal.backend().inner.assert_scrollback_lines([
+            "row 0       ",
+            "row 1       ",
+            "row 2       ",
+            "row 3       ",
+            "row 4       ",
+            "row 5       ",
+            "row 6       ",
+        ]);
     }
 
     #[test]

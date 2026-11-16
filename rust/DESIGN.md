@@ -861,7 +861,11 @@ big it is — with `↑↓` to move, typing to filter (case-insensitive substrin
 the prompt and the id), Enter to resume and Esc to cancel, which exits without
 starting anything. It asks for a viewport as tall as the list needs rather than
 the whole screen, and hands the terminal back cleared, so the session banner
-prints where the picker began. Off a terminal (a pipe, a harness, a terminal
+prints where the picker began. Raw mode and that hand-back are owned by one
+guard and undone in `Drop`, so a failed draw or read — an autoresize while the
+picker is up is the easy one — cannot leave the shell raw; the picker's backend
+is the same `PinnedBackend` as the main TUI's, so a resize answers from the last
+cursor position instead of a CPR the terminal may not reply to. Off a terminal (a pipe, a harness, a terminal
 that refuses raw mode) it falls back to the numbered stdout list it used to be.
 Rows are built from `session_digest`, which reads each file only up to its first
 user line: replaying dozens of megabyte-sized transcripts just to label them is
@@ -1788,7 +1792,13 @@ inline `code`, fenced code blocks, ordered and unordered lists with a hanging
 indent, block quotes with a `│` bar, and GitHub-style tables drawn with
 box-drawing borders (`┌┬┐ ├┼┤ └┴┘`) and per-column alignment. A single newline
 inside a paragraph reflows to a space (CommonMark soft break), so answers re-wrap
-to the terminal width.
+to the terminal width. Widths are measured per **grapheme cluster** with the same
+`text_layout` helper the composer uses, never as a per-char sum: a ZWJ family
+emoji is 2 columns, not 8, and `❤️` is 2, not 1, so a table's borders line up and
+a paragraph does not wrap a column early around them. Only code blocks expand
+tabs; prose that reaches the renderer with one has it counted as the one column
+`UnicodeWidthStr` gives it and dropped by ratatui, which is why paste expands
+tabs on the way in (below).
 
 Emphasis is ranked so a **verdict** survives the prose around it (plan 114): bold
 spans and `#`/`##` headings take the brand accent, so the conclusion a model marks
@@ -1850,7 +1860,10 @@ concurrent interactions never overlap. Keys arrive from a dedicated
 poll thread (`poll(200ms)+read`, not crossterm's `EventStream`), so the reader
 lock is released between polls and shutdown is observed within 200ms; the
 viewport's construction probe is the only cursor query, and it runs before the
-thread starts.
+thread starts. A panic hook installed for the session sends `Quit` so the single
+UI owner restores the terminal, then chains the hook it found; `run` puts that
+hook back before returning instead of leaving the session's hook (and its event
+sender) in front for the rest of the process.
 The UI loop `select!`s those key events against agent events, folds both into
 pure state (`App`, whose `cells` are the uncommitted tail), and renders via
 pure cell→line functions — which is what makes the transcript logic testable
@@ -1906,7 +1919,10 @@ costs one full-screen scroll + clear regardless of how tall the block is, so a
 `-c` resume that commits a long backlog coalesces it into a few tall batches
 (capped rows each) rather than one `insert_before` per cell — the difference
 between a resume that lands at once and one that visibly scrolls the whole
-history for seconds. That default path blits every buffer cell verbatim,
+history for seconds. A batch taller than `u16::MAX` rows — one cell holding a
+huge `-c` output, committed on a narrow terminal — is cut into insertable
+pieces; the height argument is a `u16`, so the cast used to wrap and commit the
+rest nowhere. That default path blits every buffer cell verbatim,
 including the `" "` placeholder each wide (CJK/emoji) grapheme reserves for its
 second column; `Terminal::draw`'s diff drops those but `insert_before` does not,
 so the backend wrapper mirrors that skip for every draw — otherwise
@@ -2008,9 +2024,11 @@ and steering expand that exact payload once, while
 identical text typed by the user remains literal. The label is a **composer**
 affordance only — once the turn is sent, the transcript echoes the expanded text
 in full (the same text a resumed session replays out of history). Bracketed paste canonicalizes
-CRLF and CR line endings to the Composer's LF logical newline at the TUI ingress;
-other characters, surrounding spaces, and trailing newlines are preserved (no
-trim). Word scans treat an atom as one cell, so a word step never stops on the
+at the TUI ingress: CRLF and CR line endings become the Composer's LF logical
+newline, a tab becomes four spaces (a raw `\t` counts one column in the layout
+but ratatui filters the control char out, so it would shift the cursor and show
+nothing), and every other control character is dropped — surrounding spaces and
+trailing newlines are preserved (no trim). Word scans treat an atom as one cell, so a word step never stops on the
 spaces or punctuation inside its label; adjacent Backspace/Delete removes it
 whole. The cursor never rests inside a label: the visual layout reads the display
 text alone and can draw such a byte, so `up`/`down` land on the atom's edge (start
@@ -2056,7 +2074,9 @@ above the composer: `/` filters the slash-command catalog (built-ins plus loaded
 skills and user commands — the same set `commands::run` dispatches), and `@`
 lists files, searched from the project cwd off-thread with the same `ignore`
 crate the `grep`/`glob` tools use (`kloop_core::fs_complete`, so it honors
-.gitignore and skips VCS dirs). **↑/↓** move the selection, **Tab / Enter**
+.gitignore and prunes `.git`/`.hg`/`.svn`/`.jj` — one predicate over all four,
+whether each is a directory or a worktree pointer file; otherwise an empty query
+in a git repo fills the scan cap with `.git/objects`). **↑/↓** move the selection, **Tab / Enter**
 complete the highlighted entry into the composer (Enter completes rather than
 submits while the menu is open), **Esc** dismisses it, and every other key edits
 the query and re-filters. At most one menu is open at a time, and a pending
@@ -2070,7 +2090,11 @@ echoes into the transcript like a user turn — it records no user message, but
 `/compact` can work for a minute, and the echo is what says the command was
 accepted. Trigger detection carries the exact byte range and cursor identity
 through file search and popup accept; late results with the same query at
-another position are rejected instead of editing the wrong token.
+another position are rejected instead of editing the wrong token. A token that
+falls inside a **paste atom's label** does not trigger at all: a big paste whose
+preview ends in `@` leaves the cursor on `@]`, whose `]` matches a path like
+`app/[id]/page.tsx`, and accepting a completion there would rewrite the whole
+paste the label stands for.
 
 While a turn runs, an **animated status line** (plan 38 slice 5,
 `crates/tui/src/anim.rs`) sits just above the composer: a braille spinner, a

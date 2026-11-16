@@ -27,9 +27,9 @@ pub fn complete_files(root: &Path, query: &str, cap: usize) -> Vec<String> {
     let needle = query.to_lowercase();
     let mut walk = WalkBuilder::new(root);
     walk.hidden(/*skip_hidden*/ false);
-    for vcs in [".git", ".hg", ".svn", ".jj"] {
-        walk.filter_entry_skip(vcs);
-    }
+    // One filter, not one per name: `filter_entry` stores a single predicate,
+    // so a loop of them keeps only the last and descends into the other three.
+    walk.filter_entry(|entry| !is_vcs_dir(entry.file_name()));
 
     let mut scored: Vec<(u8, usize, String)> = Vec::new();
     for entry in walk.build().flatten() {
@@ -88,17 +88,11 @@ fn is_subsequence(haystack: &str, needle: &str) -> bool {
     needle.chars().all(|n| chars.any(|h| h == n))
 }
 
-/// A convenience on `WalkBuilder` to skip a directory by name at any depth
-/// without an `OverrideBuilder` (the search tools use overrides for glob
-/// filtering; here a plain name skip is clearer).
-trait SkipDir {
-    fn filter_entry_skip(&mut self, name: &'static str) -> &mut Self;
-}
-
-impl SkipDir for WalkBuilder {
-    fn filter_entry_skip(&mut self, name: &'static str) -> &mut Self {
-        self.filter_entry(move |e| e.file_name() != std::ffi::OsStr::new(name))
-    }
+/// The VCS internals a mention never resolves to. A `.git` can be a file (a
+/// worktree or submodule pointer), so this matches the name rather than a
+/// directory.
+fn is_vcs_dir(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some(".git" | ".hg" | ".svn" | ".jj"))
 }
 
 #[cfg(test)]
@@ -155,12 +149,24 @@ mod tests {
         let t = Tree::new("empty");
         t.write("a.txt", "");
         t.write("deep/nested/b.txt", "");
-        let got = complete_files(&t.0, "", 10);
+        // Real VCS internals: the walk has to prune them, not just produce no
+        // file for the empty `.git` marker every test tree carries.
+        t.write(".git/HEAD", "ref: refs/heads/main\n");
+        t.write(".git/config", "");
+        for object in 0..10 {
+            t.write(&format!(".git/objects/aa/{object}"), "");
+        }
+        for vcs in [".hg", ".svn", ".jj"] {
+            t.write(&format!("{vcs}/store/data"), "");
+        }
+        let got = complete_files(&t.0, "", 100);
         assert_eq!(got.first().map(String::as_str), Some("a.txt"));
-        assert!(
-            !got.iter().any(|p| p.contains(".git")),
-            "no VCS internals: {got:?}"
-        );
+        for internal in [".git", ".hg", ".svn", ".jj"] {
+            assert!(
+                !got.iter().any(|p| p.starts_with(internal)),
+                "{internal} leaked: {got:?}"
+            );
+        }
     }
 
     #[test]

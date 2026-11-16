@@ -276,12 +276,7 @@ pub async fn run(
     // the UI reading/drawing against a terminal whose owner is still alive. Ask
     // the single UI owner to stop; TerminalSession then performs the only full
     // restore, rather than having a panic hook race normal drawing.
-    let panic_events = event_tx.clone();
-    let panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = panic_events.send(AgentEvent::Quit);
-        panic_hook(info);
-    }));
+    let panic_hook = PanicHookGuard::install(event_tx.clone());
     let worker = tokio::spawn(agent_worker(
         Worker {
             cfg,
@@ -339,7 +334,51 @@ pub async fn run(
     if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
         eprintln!("{}", note.trim());
     }
+    // Nothing below this line panics into the TUI's own hook, and a host that
+    // runs `run` twice (or installs its own hook afterwards) should not find
+    // ours still in front, holding an `event_tx` clone.
+    drop(panic_hook);
     result
+}
+
+/// The session's panic hook, put back on drop.
+///
+/// It reaches the previous hook lazily through a shared slot rather than owning
+/// it, so a panic that already fired does not consume the hook the restore
+/// needs.
+struct PanicHookGuard {
+    previous: PanicHookSlot,
+}
+
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+/// Shared between the installed closure and the guard: the closure reaches the
+/// previous hook through it, the guard takes it back on drop.
+type PanicHookSlot = std::sync::Arc<std::sync::Mutex<Option<PanicHook>>>;
+
+impl PanicHookGuard {
+    fn install(events: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        let previous: PanicHookSlot =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(std::panic::take_hook())));
+        let slot = std::sync::Arc::clone(&previous);
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = events.send(AgentEvent::Quit);
+            if let Ok(previous) = slot.lock()
+                && let Some(hook) = previous.as_ref()
+            {
+                hook(info);
+            }
+        }));
+        Self { previous }
+    }
+}
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(hook) = previous {
+            std::panic::set_hook(hook);
+        }
+    }
 }
 
 /// The cwd for the session banner, with the process home contracted to `~`
@@ -1408,15 +1447,13 @@ where
     cleared
 }
 
-/// The only keys a pending startup passes through: quit. Ctrl+C is the usual
-/// two-tap exit (handled by `App::on_key`), Ctrl+D the immediate one.
+/// The only key a pending startup passes through: the quit chord. Ctrl+C is the
+/// two-tap exit (armed and fired by `App::on_key`); a key dropped here never
+/// reaches it. Ctrl+D is not bound anywhere, so it is not passed through.
 fn startup_allows_key(key: &crossterm::event::KeyEvent) -> bool {
     key.modifiers
         .contains(crossterm::event::KeyModifiers::CONTROL)
-        && matches!(
-            key.code,
-            crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('d')
-        )
+        && matches!(key.code, crossterm::event::KeyCode::Char('c'))
 }
 
 async fn ui_loop(
@@ -1568,7 +1605,7 @@ mod tests {
 
         for (code, modifiers, allowed) in [
             (KeyCode::Char('c'), KeyModifiers::CONTROL, true),
-            (KeyCode::Char('d'), KeyModifiers::CONTROL, true),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, false),
             (KeyCode::Char('c'), KeyModifiers::NONE, false),
             (KeyCode::Enter, KeyModifiers::NONE, false),
             (KeyCode::Esc, KeyModifiers::NONE, false),

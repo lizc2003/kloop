@@ -40,9 +40,10 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::render::BRAND;
+use crate::text_layout::display_width;
 use crate::text_layout::wrap;
 
 /// Code (inline spans and fenced blocks) carries a foreground only. A filled
@@ -699,12 +700,50 @@ fn span_width(s: &Span) -> usize {
     display_width(&s.content)
 }
 
-fn display_width(s: &str) -> usize {
-    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+/// One grapheme cluster in a [`Chars`] buffer: the chars it spans and the
+/// columns it takes. Width is measured on the cluster's own string, never as a
+/// per-char sum — a ZWJ family emoji is 2 columns, not 8, and `❤️` is 2, not 1.
+/// `text_layout` measures the same unit, which is what keeps markdown's wrapping
+/// and the composer's cursor in agreement.
+struct Cluster {
+    chars: std::ops::Range<usize>,
+    width: usize,
+}
+
+fn clusters(chars: &Chars) -> Vec<Cluster> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let text: String = chars.iter().map(|(c, _)| *c).collect();
+    // Where each char starts, plus one past the end: the bridge between
+    // grapheme byte ranges and char-index ranges.
+    let mut starts = Vec::with_capacity(chars.len() + 1);
+    let mut byte = 0;
+    for (c, _) in chars {
+        starts.push(byte);
+        byte += c.len_utf8();
+    }
+    starts.push(byte);
+    text.grapheme_indices(true)
+        .map(|(start, grapheme)| Cluster {
+            chars: starts.partition_point(|&b| b < start)
+                ..starts.partition_point(|&b| b < start + grapheme.len()),
+            width: display_width(grapheme),
+        })
+        .collect()
 }
 
 fn chars_width(chars: &Chars) -> usize {
-    chars.iter().map(|(c, _)| c.width().unwrap_or(0)).sum()
+    // Plain text is one column per char and most of a transcript's; only build
+    // the string when a cluster could measure differently.
+    if chars
+        .iter()
+        .all(|(c, _)| c.is_ascii() && !c.is_ascii_control())
+    {
+        return chars.len();
+    }
+    let text: String = chars.iter().map(|(c, _)| *c).collect();
+    display_width(&text)
 }
 
 /// Coalesce a wrapped line's styled chars into the minimal run of spans (one
@@ -767,14 +806,13 @@ fn wrap_segment(chars: &Chars, width: usize) -> Vec<Chars> {
             }
             let mut chunk: Chars = Vec::new();
             let mut chunk_w = 0usize;
-            for (c, st) in word {
-                let cw = c.width().unwrap_or(0);
-                if chunk_w + cw > width && !chunk.is_empty() {
+            for cluster in clusters(&word) {
+                if chunk_w + cluster.width > width && !chunk.is_empty() {
                     lines.push(std::mem::take(&mut chunk));
                     chunk_w = 0;
                 }
-                chunk.push((c, st));
-                chunk_w += cw;
+                chunk.extend_from_slice(&word[cluster.chars]);
+                chunk_w += cluster.width;
             }
             cur = chunk;
             cur_w = chunk_w;
@@ -833,14 +871,13 @@ fn hard_wrap_chars(chars: &Chars, width: usize) -> Vec<Chars> {
     let mut lines: Vec<Chars> = Vec::new();
     let mut line: Chars = Vec::new();
     let mut cols = 0usize;
-    for &(c, st) in chars {
-        let cw = c.width().unwrap_or(0);
-        if cols + cw > width && !line.is_empty() {
+    for cluster in clusters(chars) {
+        if cols + cluster.width > width && !line.is_empty() {
             lines.push(std::mem::take(&mut line));
             cols = 0;
         }
-        line.push((c, st));
-        cols += cw;
+        line.extend_from_slice(&chars[cluster.chars]);
+        cols += cluster.width;
     }
     lines.push(line);
     lines
@@ -1016,14 +1053,14 @@ fn truncate_chars(chars: &Chars, w: usize) -> Chars {
     let w = w.max(1);
     let mut out: Chars = Vec::new();
     let mut used = 0usize;
-    for &(c, st) in chars {
-        let cw = c.width().unwrap_or(0);
-        if used + cw > w.saturating_sub(1) {
-            out.push(('…', st));
+    for cluster in clusters(chars) {
+        if used + cluster.width > w.saturating_sub(1) {
+            let style = chars[cluster.chars.start].1;
+            out.push(('…', style));
             break;
         }
-        out.push((c, st));
-        used += cw;
+        out.extend_from_slice(&chars[cluster.chars]);
+        used += cluster.width;
     }
     out
 }
@@ -1557,6 +1594,26 @@ mod tests {
             .find(|s| s.content.as_ref() == "A")
             .unwrap();
         assert!(a.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// A grapheme with a per-char width sum that disagrees with the terminal
+    /// ("❤️" is two columns, its chars say 1+0) used to leave the borders one
+    /// column off and hard-wrap a row that still fit.
+    #[test]
+    fn table_borders_measure_graphemes_like_the_terminal() {
+        let md = "| a | b |\n|---|---|\n| ❤️ | x |";
+        let lines = markdown_lines(md, 40);
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| display_width(&text(line)))
+            .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "ragged table {widths:?}: {:?}",
+            texts(&lines)
+        );
+        // The cluster is one cell, never split across the border.
+        assert!(text(&lines[3]).contains("❤️"), "{:?}", texts(&lines));
     }
 
     #[test]

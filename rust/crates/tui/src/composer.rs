@@ -681,6 +681,16 @@ impl Composer {
         self.cursor
     }
 
+    /// Whether `range` overlaps a paste atom. A token that falls inside a label
+    /// (`@]` at the end of `[Pasted #1: … · cc @]`) is label text, not a
+    /// mention: completing it would rewrite the whole paste it stands for.
+    pub(crate) fn range_touches_atom(&self, range: TextRange) -> bool {
+        self.document
+            .atoms
+            .iter()
+            .any(|atom| atom.range.intersects(range))
+    }
+
     pub fn insert_char(&mut self, character: char) {
         self.insert_text(&character.to_string());
     }
