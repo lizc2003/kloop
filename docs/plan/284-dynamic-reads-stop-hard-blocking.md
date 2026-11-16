@@ -51,3 +51,22 @@ plan 244 第六轮把“未决读取”（`ReadVerdict::Unresolved`）和明确�
   通过，其中 29 项真实 seatbelt 用例实际运行（未跳过）；`cargo fmt --check`、
   `cargo clippy -p kloop-core --all-targets -D warnings` 通过。未跑全量 `make check`、parity，
   Linux/Windows 未实测。
+
+## 五、复审修复 ✅（2026-11-16）
+
+用户指出：`bash_reads_sensitive_path` 把正文保护与未决读取压进一个返回值，两者同时成立时
+只剩 `RequiresProtection`，`CallFacts::unresolved_read` 为假，deny/ask 的可能命中被跳过。
+带凭据保护的 macOS 沙箱里配 `deny = ["bash(make clean)"]`：单独的
+`TARGET=clean; make "$TARGET"` 命中禁令，前面加一段点名 `~/.ssh/id_rsa` 的 heredoc 后不再
+命中，ask 规则同样漏。
+
+修法：`ReadVerdict` 只留单条 argv/重定向的三态（Clear/Sensitive/Unresolved）；整条命令的
+判定改为 `BashRead::{Blocked, Allowed { requires_protection, unresolved }}`，两个标记各自
+保留。`unresolved_read` 只看 `unresolved`，`bash_protection_requirement` 只看
+`requires_protection`。
+
+回归 `plan284_literal_body_protection_keeps_the_unresolved_read_for_rules`（macOS）：有无
+正文两种形状都命中 deny（bypass）并触发 ask（manual，批准后仍在沙箱内），正文那条另断言
+`Protection::Required`；修复前带正文的一条通过了 deny。验证：`permissions::` 209 项通过
+（1 ignored）、`tools::bash` 81 项、`tools::scheduler` 4 项、fmt、
+`clippy -p kloop-core --all-targets -D warnings`；未跑全量 `make check`、parity。

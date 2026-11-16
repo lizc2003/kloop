@@ -46,8 +46,9 @@ pub(crate) struct CallFacts {
     pub(super) path: Option<PathFacts>,
     pub(super) path_key: Option<&'static str>,
     pub(super) sensitive_read: bool,
-    /// Bash 有读取目标含未知值、但没被硬拒（[`ReadVerdict::Unresolved`]）。plan 284 前
-    /// 这类调用整条硬拒，deny/ask 不必看未知词；现在它们按“可能命中”保守匹配。
+    /// Bash 有读取目标含未知值、但没被硬拒（[`BashRead::Allowed`] 的 `unresolved`，与正文
+    /// 保护无关）。plan 284 前这类调用整条硬拒，deny/ask 不必看未知词；现在它们按
+    /// “可能命中”保守匹配。
     pub(super) unresolved_read: bool,
     pub(super) sensitive_write: bool,
     pub(super) risk_commands: Vec<CommandFact>,
@@ -223,8 +224,14 @@ impl CallFacts {
             && path
                 .as_ref()
                 .is_some_and(|path| path.sensitivity(Access::Read).is_some()))
-            || bash_read.is_some_and(ReadVerdict::blocked);
-        let unresolved_read = bash_read == Some(ReadVerdict::Unresolved);
+            || bash_read == Some(BashRead::Blocked);
+        let unresolved_read = matches!(
+            bash_read,
+            Some(BashRead::Allowed {
+                unresolved: true,
+                ..
+            })
+        );
         let powershell_sensitive =
             name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
         let opaque_script = match (&shell, shell_command) {
@@ -361,20 +368,29 @@ impl CallFacts {
     }
 }
 
+/// 单条 argv 或读重定向的读取判定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReadVerdict {
     Clear,
     Sensitive,
-    /// 读取目标含变量/命令替换，静态定不下来；命令名与包装器都已定位。不硬拒：
-    /// 沙箱运行时仍挡凭据目录与 `~/.kloop`，其余照普通命令走审批。
+    /// 读取目标含变量/命令替换，静态定不下来；是否硬拒由整条命令决定，见
+    /// [`bash_reads_sensitive_path`]。
     Unresolved,
-    RequiresProtection,
 }
 
-impl ReadVerdict {
-    fn blocked(self) -> bool {
-        self == Self::Sensitive
-    }
+/// 整条 Bash 命令的读取判定。正文保护与未决读取互相独立，可以同时成立：
+/// 前者决定能否离开沙箱，后者决定 deny/ask 是否按可能命中匹配，不能互相覆盖。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BashRead {
+    /// 明确的敏感读取，或执行体未知、同命令写出凭据文件名时的未决读取。
+    Blocked,
+    Allowed {
+        /// 字面正文点名了凭据路径，只有沙箱本身能保护它。
+        requires_protection: bool,
+        /// 有读取目标含未知值，且命令名与包装器都已定位。不硬拒：沙箱运行时
+        /// 仍挡凭据目录与 `~/.kloop`，其余照普通命令走审批。
+        unresolved: bool,
+    },
 }
 
 /// 访问方向。只影响 `.kloop`：写入不分位置，只豁免 worktree；读取时，落点可信、
@@ -559,7 +575,7 @@ fn bash_reads_sensitive_path(
     facts: &BashFacts,
     root: PathRoot<'_>,
     execution: ExecutionContext<'_>,
-) -> ReadVerdict {
+) -> BashRead {
     let home = execution.shell_home();
     let mut masked = command.to_string();
     if facts.reliable {
@@ -581,7 +597,7 @@ fn bash_reads_sensitive_path(
         }
     }
     if raw_mentions_sensitive_path(&masked) {
-        return ReadVerdict::Sensitive;
+        return BashRead::Blocked;
     }
     // 未决读取不能提前返回：后面的命令或重定向可能是明确的敏感读取。
     let mut unresolved = false;
@@ -596,7 +612,7 @@ fn bash_reads_sensitive_path(
         match argv_sensitive_access(&placeholder_argv(&words), root, placement) {
             ReadVerdict::Clear => {}
             ReadVerdict::Unresolved => unresolved = true,
-            verdict @ (ReadVerdict::Sensitive | ReadVerdict::RequiresProtection) => return verdict,
+            ReadVerdict::Sensitive => return BashRead::Blocked,
         }
     }
     for redirect in &facts.redirects {
@@ -607,7 +623,7 @@ fn bash_reads_sensitive_path(
         let target = redirect.syntax.evaluate(home);
         let placement = Placement::of_shell(&redirect.context);
         if evaluation_is_sensitive(&target, root, false, |spelling| placement.access(spelling)) {
-            return ReadVerdict::Sensitive;
+            return BashRead::Blocked;
         }
         if matches!(&target, WordEvaluation::Unknown)
             || matches!(&target, WordEvaluation::Partial(value) if value.contains('\0'))
@@ -620,14 +636,11 @@ fn bash_reads_sensitive_path(
     // 沙箱运行时不挡 `.env*` 与 rc 文件；同一条命令里写出了这些名字，未知目标
     // 很可能就是它（`F=.envrc; cat "$F"`），这时也硬拒。
     if unresolved && (!facts.reliable || names_secret_file(command)) {
-        return ReadVerdict::Sensitive;
+        return BashRead::Blocked;
     }
-    if requires_protection {
-        ReadVerdict::RequiresProtection
-    } else if unresolved {
-        ReadVerdict::Unresolved
-    } else {
-        ReadVerdict::Clear
+    BashRead::Allowed {
+        requires_protection,
+        unresolved,
     }
 }
 
@@ -693,9 +706,11 @@ pub(crate) fn bash_protection_requirement(
         },
         execution,
     ) {
-        ReadVerdict::RequiresProtection => Ok(true),
-        ReadVerdict::Clear | ReadVerdict::Unresolved => Ok(false),
-        ReadVerdict::Sensitive => Err(crate::sandbox::PROTECTION_REQUIRED.into()),
+        BashRead::Allowed {
+            requires_protection,
+            ..
+        } => Ok(requires_protection),
+        BashRead::Blocked => Err(crate::sandbox::PROTECTION_REQUIRED.into()),
     }
 }
 

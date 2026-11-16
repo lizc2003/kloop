@@ -17,6 +17,10 @@ push` 曾靠它挡住 `bash(git push *)`：现在对含未决读取的调用按�
 `.env*`/rc，变量运行时展开成它们不再静态拦截。验证：kloop-core `permissions::` 208 项、
 `tools::bash` 81 项（含 29 项真实 seatbelt，未跳过）、fmt、`clippy -p kloop-core
 --all-targets -D warnings`；未跑全量 `make check`、parity，Linux/Windows 未实测。教训 390。
+同日复审修复：正文凭据保护与未决读取曾压在一个返回值里，同时成立时只剩前者，deny/ask 的
+可能命中被跳过（加一段 `~/.ssh` heredoc 就让 `make "$TARGET"` 躲过 `bash(make clean)`）；
+改为 `BashRead::Allowed { requires_protection, unresolved }` 各自保留，补共存回归，
+`permissions::` 209 项通过。教训 392。
 
 **Plan 262 ✅：TUI 正确性（2026-11-16）**：八条复核全部成立，开工问题定为 Tab 展开 4 个空格。
 选择器:新增 `PickerIo` trait(注入 fake 终端)与 `PickerSession`,raw mode 和 hand-back 一起在
@@ -5121,3 +5125,11 @@ hook”这种看似最稳妥的写法,恰好把一次可恢复的 panic 升级�
 在 `flush` 的 `inspect` 里做的“记录最后改动格”就根本不执行,两个缓存永远一致,测试恒绿;
 写替身时要把测试依赖的副作用所在的那条链跑完(这里就是 drain 迭代器),否则测的是替身自己
 的空转。
+
+392. **几个独立事实不能按优先级压进一个枚举返回，尤其是后来又给其中一个加了消费者时。**
+`ReadVerdict` 原本只给“拒不拒、要不要沙箱保护”一个消费者用，`RequiresProtection` 盖过
+`Unresolved` 无妨；plan 284 让 deny/ask 也读“有没有未决读取”，同一个返回值就丢了信息：
+两者同时成立时只剩前者，规则的保守匹配被一段无关的 heredoc 关掉。判据：给一个判定新增
+消费者时，检查它要的事实会不会被别的状态按优先级覆盖；会的话把返回值拆成独立字段
+（硬拒仍可做成单独变体，放行时的各标记互不覆盖），回归覆盖“两个状态同时成立”的组合，
+不只测各自单独成立。

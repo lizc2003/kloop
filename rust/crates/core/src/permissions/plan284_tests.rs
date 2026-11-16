@@ -117,3 +117,49 @@ async fn plan284_unknown_words_cannot_slip_past_deny_but_add_no_new_denials() {
     assert_eq!(verdict, allowed_verdict(true));
     assert_eq!(approver.ask_count(), 0);
 }
+
+/// 正文保护与未决读取可以同时成立：前者不能吞掉后者，否则 deny/ask 的保守匹配
+/// 被跳过——单独的 `make "$TARGET"` 命中 `bash(make clean)`，加一段凭据探针正文就不命中。
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn plan284_literal_body_protection_keeps_the_unresolved_read_for_rules() {
+    let home = std::env::temp_dir().join(crate::resource_id::fresh("plan284-rules-").unwrap());
+    std::fs::create_dir_all(&home).unwrap();
+    let shell_home = home.to_str().unwrap();
+    let policy = SandboxPolicy::workspace(&home, &[], false).with_credential_roots(&home);
+    let execution =
+        || ExecutionContext::sandboxed(Some(&policy)).with_shell_home(Some(shell_home));
+    let body = "cat > probe.txt <<'EOF'\n~/.ssh/id_rsa\nEOF\n";
+    for command in [
+        "TARGET=clean\nmake \"$TARGET\"".to_string(),
+        format!("TARGET=clean\n{body}make \"$TARGET\""),
+    ] {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash(make clean)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p
+            .check_call_with_execution("bash", &bash(&command), 0, execution(), None)
+            .await
+            .expect_err(&command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &["bash(make clean)"]), approver.clone());
+        let verdict = p
+            .check_call_with_execution("bash", &bash(&command), 0, execution(), None)
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        assert_eq!(approver.ask_count(), 1, "{command}");
+        assert_eq!(verdict.sandbox, SandboxPlan::Contained, "{command}");
+        let protection = if command.contains("<<") {
+            Protection::Required
+        } else {
+            Protection::Clear
+        };
+        assert_eq!(verdict.protection, protection, "{command}");
+    }
+
+    let _ = std::fs::remove_dir_all(home);
+}
