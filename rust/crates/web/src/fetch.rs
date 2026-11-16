@@ -2,13 +2,23 @@
 //! cap, HTML→text conversion. There is deliberately no model-text cap — see
 //! `read_body`.
 
+use std::future::Future;
+use std::io;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use encoding_rs::Encoding;
 use reqwest::Url;
+use reqwest::dns::Addrs;
+use reqwest::dns::Name;
+use reqwest::dns::Resolve;
+use reqwest::dns::Resolving;
 
 use crate::limits;
 
@@ -98,6 +108,13 @@ pub(crate) async fn fetch_url(
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        // Refuse a body this tool cannot read before paying for the transfer:
+        // a link to a PDF or an archive used to download the full 20 MiB first.
+        if !is_text_content_type(&content_type) {
+            bail!(
+                "web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)"
+            );
+        }
         let mut text = read_body(resp, &content_type, &url).await?;
         // A same-site redirect is followed silently, so without this the body
         // of a login or interstitial page arrives looking like the document
@@ -244,29 +261,27 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
             break;
         }
     }
-    let raw = String::from_utf8_lossy(&bytes);
     let is_html = content_type.contains("text/html")
         || content_type.contains("application/xhtml")
-        || (content_type.is_empty() && raw.trim_start().starts_with('<'));
-    let is_text = is_text_content_type(content_type);
-    if !is_html && !is_text {
-        bail!(
-            "web_fetch: unsupported content type '{content_type}' at {url} (text-like content only)"
-        );
-    }
-    // Sampled before `raw` can be moved by the non-HTML branch below.
-    let html_bytes = if is_html { raw.len() } else { 0 };
-    let html_has_script = is_html && raw.contains("<script");
+        || (content_type.is_empty() && looks_like_html(&bytes));
+    let decoded = decode_body(&bytes, content_type, is_html);
+    // Sampled before `decoded.text` can be moved by the non-HTML branch below.
+    let html_bytes = if is_html { decoded.text.len() } else { 0 };
+    let html_has_script = is_html && decoded.text.contains("<script");
     let mut text = if is_html {
-        crate::html::html_to_text(&raw)
+        crate::html::html_to_text(&decoded.text)
     } else {
-        raw.into_owned()
+        decoded.text
     };
     if text.is_empty() {
         text = "(empty response body)".into();
     }
     if is_html && is_client_rendered(html_bytes, html_has_script, &text) {
         text.push_str(CLIENT_RENDERED_NOTE);
+    }
+    if let Some(note) = decoded.note {
+        text.push_str("\n\n");
+        text.push_str(&note);
     }
     // No model-text clip here. It used to cut at 50k chars and drop the rest,
     // which duplicated the offload seam while destroying what that seam exists
@@ -281,6 +296,140 @@ async fn read_body(mut resp: reqwest::Response, content_type: &str, url: &Url) -
         text.push_str(&truncation_marker());
     }
     Ok(text)
+}
+
+fn looks_like_html(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == b'<')
+}
+
+struct Decoded {
+    text: String,
+    /// Set when the declaration could not be honoured, so a lossy decode is
+    /// never passed off as the page's own text.
+    note: Option<String>,
+}
+
+/// Header charset first, then the HTML `<meta>` declaration; `encoding_rs` also
+/// honours a BOM, which outranks both as it does in browsers. An unrecognised
+/// label falls back to UTF-8 lossily and says so — the old unconditional
+/// `from_utf8_lossy` turned a GBK or Shift_JIS page into U+FFFD noise that still
+/// looked like a successful fetch.
+fn decode_body(bytes: &[u8], content_type: &str, is_html: bool) -> Decoded {
+    let declared = charset_from_content_type(content_type).or_else(|| {
+        if is_html {
+            html_meta_charset(bytes)
+        } else {
+            None
+        }
+    });
+    let Some(label) = declared else {
+        return Decoded {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            note: None,
+        };
+    };
+    let Some(encoding) = Encoding::for_label(label.as_bytes()) else {
+        return Decoded {
+            text: String::from_utf8_lossy(bytes).into_owned(),
+            note: Some(format!(
+                "[declared charset '{label}' is not recognised: decoded as UTF-8 with \
+                 replacement characters]"
+            )),
+        };
+    };
+    let (text, actual, had_errors) = encoding.decode(bytes);
+    Decoded {
+        text: text.into_owned(),
+        note: had_errors.then(|| {
+            format!(
+                "[body contains bytes that are not valid '{}': decoded with replacement \
+                 characters]",
+                actual.name()
+            )
+        }),
+    }
+}
+
+fn charset_from_content_type(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+/// The `<meta>` encoding declaration inside the first 1024 bytes — the prescan
+/// window browsers use, so a declaration further down is not consulted.
+fn html_meta_charset(bytes: &[u8]) -> Option<&str> {
+    let head = &bytes[..bytes.len().min(1024)];
+    let mut from = 0;
+    while let Some(offset) = find_ascii_ci(&head[from..], b"<meta") {
+        let start = from + offset;
+        // `<metadata>` is not `<meta>`.
+        if !head
+            .get(start + b"<meta".len())
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+        {
+            from = start + b"<meta".len();
+            continue;
+        }
+        let end = head[start..].iter().position(|&byte| byte == b'>')? + start;
+        if let Some(label) = charset_attribute(&head[start..end]) {
+            return Some(label);
+        }
+        from = end + 1;
+    }
+    None
+}
+
+fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Both spellings in the wild: `<meta charset=…>` and the `http-equiv`
+/// `content="text/html; charset=…"`. The slice has already been narrowed to a
+/// `<meta>` tag.
+fn charset_attribute(tag: &[u8]) -> Option<&str> {
+    let mut cursor = find_ascii_ci(tag, b"charset")? + b"charset".len();
+    while tag
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        cursor += 1;
+    }
+    if tag.get(cursor) != Some(&b'=') {
+        return None;
+    }
+    cursor += 1;
+    while tag
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        cursor += 1;
+    }
+    if tag
+        .get(cursor)
+        .is_some_and(|byte| *byte == b'"' || *byte == b'\'')
+    {
+        cursor += 1;
+    }
+    let start = cursor;
+    while tag.get(cursor).is_some_and(|byte| {
+        !byte.is_ascii_whitespace() && !matches!(*byte, b'"' | b'\'' | b'>' | b';' | b'/')
+    }) {
+        cursor += 1;
+    }
+    std::str::from_utf8(&tag[start..cursor])
+        .ok()
+        .filter(|label| !label.is_empty())
 }
 
 /// What a fetch that hit the download bound appends. Derived from the bound so
@@ -310,9 +459,13 @@ fn is_client_rendered(html_bytes: usize, has_script: bool, text: &str) -> bool {
     has_script && html_bytes > 1000 && text.trim().chars().count() < 200
 }
 
-/// Scheme and address policy. Every redirect hop passes through here; DNS
-/// names are resolved and all addresses must be public (best-effort — the
-/// actual connection re-resolves, accepted TOCTOU).
+/// Scheme and address policy for every redirect hop. Literal addresses are
+/// judged directly. DNS names get two checks: this one, and the authoritative
+/// one in [`PublicResolver`] on the addresses the connection actually uses.
+/// The resolver alone is not enough — with an HTTP proxy configured reqwest
+/// resolves only the proxy, so a name that resolves privately would never be
+/// seen at all. A lookup failure here is left to the connection stage, which
+/// (or whose proxy) may still resolve the name and reports its own failure.
 async fn guard(url: &Url, allow_private: bool) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
@@ -321,35 +474,90 @@ async fn guard(url: &Url, allow_private: bool) -> Result<()> {
     if allow_private {
         return Ok(());
     }
-    let refuse = |what: &dyn std::fmt::Display| {
-        format!("web_fetch: {what} is a private/internal address; refusing (SSRF guard)")
-    };
     match url.host() {
         None => bail!("web_fetch: URL has no host"),
-        Some(url::Host::Ipv4(ip)) if !ip_is_public(IpAddr::V4(ip)) => bail!(refuse(&ip)),
-        Some(url::Host::Ipv6(ip)) if !ip_is_public(IpAddr::V6(ip)) => bail!(refuse(&ip)),
+        Some(url::Host::Ipv4(ip)) if !ip_is_public(IpAddr::V4(ip)) => bail!(refuse_private(&ip)),
+        Some(url::Host::Ipv6(ip)) if !ip_is_public(IpAddr::V6(ip)) => bail!(refuse_private(&ip)),
         Some(url::Host::Domain(name)) => {
-            if name.eq_ignore_ascii_case("localhost")
-                || name.to_ascii_lowercase().ends_with(".localhost")
-            {
-                bail!(refuse(&name));
+            if is_localhost_name(name) {
+                bail!(refuse_private(&name));
             }
             let port = url.port_or_known_default().unwrap_or(443);
-            let addrs: Vec<IpAddr> = tokio::net::lookup_host((name, port))
-                .await
-                .with_context(|| format!("web_fetch: cannot resolve host '{name}'"))?
-                .map(|sa| sa.ip())
-                .collect();
-            if addrs.is_empty() {
-                bail!("web_fetch: host '{name}' resolves to no addresses");
-            }
-            if addrs.iter().any(|ip| !ip_is_public(*ip)) {
-                bail!(refuse(&name));
+            if let Ok(addrs) = tokio::net::lookup_host((name, port)).await
+                && addrs.into_iter().any(|addr| !ip_is_public(addr.ip()))
+            {
+                bail!(refuse_private(&name));
             }
         }
         Some(_) => {}
     }
     Ok(())
+}
+
+fn refuse_private(what: &dyn std::fmt::Display) -> String {
+    format!("web_fetch: {what} is a private/internal address; refusing (SSRF guard)")
+}
+
+fn is_localhost_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("localhost") || name.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// DNS resolution for the HTTP client. Filtering here rather than before the
+/// request closes the rebinding window: reqwest connects to exactly these
+/// addresses, and every redirect hop is another request through this client.
+pub(crate) struct PublicResolver {
+    lookup: Arc<dyn Lookup>,
+}
+
+impl PublicResolver {
+    pub(crate) fn system() -> Self {
+        Self {
+            lookup: Arc::new(SystemLookup),
+        }
+    }
+}
+
+/// The DNS source, split out so tests can answer without real DNS.
+trait Lookup: Send + Sync {
+    fn lookup(&self, host: String) -> LookupFuture;
+}
+
+type LookupFuture = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
+
+struct SystemLookup;
+
+impl Lookup for SystemLookup {
+    fn lookup(&self, host: String) -> LookupFuture {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host.as_str(), 0)).await?.collect()) })
+    }
+}
+
+impl Resolve for PublicResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        let lookup = Arc::clone(&self.lookup);
+        Box::pin(async move {
+            if is_localhost_name(&host) {
+                return Err(io::Error::other(refuse_private(&host)).into());
+            }
+            let addrs = lookup.lookup(host.clone()).await.map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("web_fetch: cannot resolve host '{host}': {err}"),
+                )
+            })?;
+            if addrs.is_empty() {
+                return Err(io::Error::other(format!(
+                    "web_fetch: host '{host}' resolves to no addresses"
+                ))
+                .into());
+            }
+            if addrs.iter().any(|addr| !ip_is_public(addr.ip())) {
+                return Err(io::Error::other(refuse_private(&host)).into());
+            }
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
 }
 
 fn ip_is_public(ip: IpAddr) -> bool {
@@ -495,11 +703,52 @@ mod tests {
     }
     use super::*;
     use crate::testutil::fetch_private;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
     use wiremock::matchers::path;
+
+    struct StaticLookup(Vec<(String, Vec<SocketAddr>)>);
+
+    impl Lookup for StaticLookup {
+        fn lookup(&self, host: String) -> LookupFuture {
+            let addrs = self
+                .0
+                .iter()
+                .find(|(name, _)| *name == host)
+                .map(|(_, addrs)| addrs.clone())
+                .unwrap_or_default();
+            Box::pin(async move { Ok(addrs) })
+        }
+    }
+
+    fn resolver_answering(answers: &[(&str, &str)]) -> PublicResolver {
+        PublicResolver {
+            lookup: Arc::new(StaticLookup(
+                answers
+                    .iter()
+                    .map(|(host, ip)| {
+                        (
+                            (*host).to_owned(),
+                            vec![SocketAddr::new(ip.parse().unwrap(), 0)],
+                        )
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
 
     #[test]
     fn ip_publicness_table() {
@@ -554,6 +803,223 @@ mod tests {
                 "{url} → {msg}"
             );
         }
+    }
+
+    /// The filter runs on the addresses the connection will use, and it rejects
+    /// every non-public class rather than only loopback.
+    #[tokio::test]
+    async fn the_resolver_refuses_non_public_answers() {
+        for (host, ip) in [
+            ("loop.test", "127.0.0.1"),
+            ("private.test", "10.1.2.3"),
+            ("metadata.test", "169.254.169.254"),
+            ("cgnat.test", "100.64.0.1"),
+            ("v6loop.test", "::1"),
+            ("v6link.test", "fe80::1"),
+        ] {
+            let resolver = resolver_answering(&[(host, ip)]);
+            let Err(err) = resolver.resolve(host.parse().unwrap()).await else {
+                panic!("{host} -> {ip} should have been refused");
+            };
+            assert!(err.to_string().contains("SSRF guard"), "{host}: {err}");
+        }
+
+        let resolver = resolver_answering(&[("public.test", "93.184.216.34")]);
+        let addrs: Vec<SocketAddr> = resolver
+            .resolve("public.test".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, vec![SocketAddr::from(([93, 184, 216, 34], 0))]);
+    }
+
+    /// The fetch client really goes through that resolver: a name whose answer
+    /// is loopback fails before any connection is attempted. This is the
+    /// regression for the old two-lookup window (guard, then connect).
+    #[tokio::test]
+    async fn the_fetch_client_checks_the_answer_it_connects_to() {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(resolver_answering(&[("rebind.test", "127.0.0.1")]))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let err = fetch_url(
+            &client,
+            "http://rebind.test/x",
+            /*allow_private*/ false,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("SSRF guard"), "{message}");
+        assert!(message.contains("rebind.test"), "{message}");
+    }
+
+    /// The Content-Type is refused before the body is read. The fixture promises
+    /// a body it never sends, so an implementation that reads first blocks until
+    /// the client timeout instead of reporting the unsupported type.
+    #[tokio::test]
+    async fn a_binary_content_type_is_refused_before_the_body_is_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                      Content-Length: 1048576\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            // EOF here means the client dropped the response without waiting
+            // for the body.
+            let mut byte = [0u8; 1];
+            let closed = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte)).await;
+            let _ = closed_tx.send(matches!(closed, Ok(Ok(0))));
+        });
+
+        let err = fetch_url(
+            &test_client(),
+            &format!("http://{addr}/blob"),
+            /*allow_private*/ true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported content type"),
+            "{err:#}"
+        );
+        assert!(
+            closed_rx.await.unwrap(),
+            "the response body must not be read"
+        );
+    }
+
+    #[test]
+    fn charset_parameters_and_meta_declarations_are_parsed() {
+        assert_eq!(
+            charset_from_content_type("text/html; charset=gbk"),
+            Some("gbk")
+        );
+        assert_eq!(
+            charset_from_content_type("text/html; charset=\"shift_jis\"; x=y"),
+            Some("shift_jis")
+        );
+        assert_eq!(charset_from_content_type("text/html"), None);
+
+        assert_eq!(
+            html_meta_charset(b"<html><head><meta charset=\"gbk\">"),
+            Some("gbk")
+        );
+        assert_eq!(
+            html_meta_charset(
+                b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=shift_jis\">"
+            ),
+            Some("shift_jis")
+        );
+        assert_eq!(
+            html_meta_charset(b"<meta name=\"x\"><metadata charset=gbk>"),
+            None
+        );
+        // Only the prescan window counts, as in browsers.
+        let mut late = vec![b' '; 1024];
+        late.extend_from_slice(b"<meta charset=gbk>");
+        assert_eq!(html_meta_charset(&late), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_charsets_in_the_header_are_decoded() {
+        let server = MockServer::start().await;
+        for (route, content_type, encoding, text) in [
+            (
+                "/gbk",
+                "text/html; charset=gbk",
+                encoding_rs::GBK,
+                "中文标题",
+            ),
+            (
+                "/sjis",
+                "text/plain; charset=shift_jis",
+                encoding_rs::SHIFT_JIS,
+                "日本語の見出し",
+            ),
+        ] {
+            let page = format!("<html><body>{text}</body></html>");
+            let (bytes, _, _) = encoding.encode(&page);
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(bytes.into_owned(), content_type),
+                )
+                .mount(&server)
+                .await;
+            let out = fetch_private(&format!("{}{route}", server.uri()))
+                .await
+                .unwrap();
+            assert!(out.contains(text), "{content_type}: {out}");
+            assert!(!out.contains('\u{FFFD}'), "{content_type}: {out}");
+        }
+    }
+
+    /// With no charset in the header, the HTML declaration is the next source;
+    /// the bytes of the declaration itself are ASCII, so the prescan reads the
+    /// same bytes the browser would.
+    #[tokio::test]
+    async fn an_html_meta_charset_is_honoured_without_a_header_charset() {
+        let server = MockServer::start().await;
+        let text = "中文标题";
+        for (route, meta) in [
+            ("/meta", "<meta charset=\"gbk\">"),
+            (
+                "/http-equiv",
+                "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=gbk\">",
+            ),
+        ] {
+            let page = format!("<html><head>{meta}</head><body>{text}</body></html>");
+            let (bytes, _, _) = encoding_rs::GBK.encode(&page);
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(bytes.into_owned(), "text/html"),
+                )
+                .mount(&server)
+                .await;
+            let out = fetch_private(&format!("{}{route}", server.uri()))
+                .await
+                .unwrap();
+            assert!(out.contains(text), "{meta}: {out}");
+        }
+    }
+
+    /// An unknown label still yields text, but the result says the decode was
+    /// lossy instead of letting replacement characters look like the page.
+    #[tokio::test]
+    async fn an_unknown_charset_is_reported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/odd"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "hello".as_bytes().to_vec(),
+                "text/plain; charset=x-nonesuch",
+            ))
+            .mount(&server)
+            .await;
+        let out = fetch_private(&format!("{}/odd", server.uri()))
+            .await
+            .unwrap();
+        assert!(out.starts_with("hello"), "{out}");
+        assert!(out.contains("'x-nonesuch' is not recognised"), "{out}");
     }
 
     #[test]

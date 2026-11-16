@@ -1,7 +1,8 @@
 # Plan 261 — web_fetch:解析固定、字符集与早拒
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量。
+> 状态：✅ 已实现（2026-11-16）。行号是 2026-10-28 的读数；实际路径已迁到
+> `rust/crates/web/`，开工按函数定位。
 
 ## 问题
 
@@ -35,3 +36,21 @@
 - 单测(旧代码先红):解析器对私网/回环/链路本地地址返回错误(不起真实 DNS,用可注入的解析源);
   GBK 与 Shift_JIS 页面解码正确;`application/octet-stream` 在读 body 前被拒(夹具记录读取字节数)。
 - DESIGN 的 web_fetch 一节补字符集与解析固定;外层执行沙箱之外 `make check`;HANDOFF 记进展。
+
+## 完成记录（2026-11-16）
+
+- **解析固定**：`PublicResolver` 实现 `reqwest::dns::Resolve`，在 `WebTools` 的 client 上经
+  `dns_resolver` 接入；不在公网范围内的答案在连接实际使用的那次解析里被拒，每跳重定向经同一
+  client 与解析器，`accepted TOCTOU` 注释已删。每跳的静态检查与目标名预检保留：http 代理下
+  reqwest 只解析代理，目标若本地解析为私网地址只有这一步能看见；预检查询失败不再提前终止，
+  交给连接阶段报错。测试用可注入的 `Lookup`，不起真实 DNS。
+- **字符集**：直接依赖 `encoding_rs`（用户 2026-11-16 同意）。Content-Type 的 `charset` 优先，
+  HTML 再看头部 1024 字节内的 `<meta charset>` / `http-equiv`，BOM 由解码库优先于两者；未声明
+  编码仍按 UTF-8 有损解码；未知标签或字节不合声明编码时退回有损解码并在正文尾部注明。
+- **早拒**：非文本 Content-Type 在 `read_body` 之前拒绝，空类型仍按正文开头嗅探；夹具只发
+  响应头、不承诺正文，断言客户端未等正文就关闭连接。
+- **验证**：`cargo test -p kloop-web --locked --offline`（39 passed，1 ignored 的 20 MiB
+  capped 用例未跑）、`cargo clippy -p kloop-web --all-targets -- -D warnings`、
+  `cargo fmt -p kloop-web -- --check`。按 2026-11-06 验证约定未跑 `make check`：改动只落在
+  `kloop-web` 及其依赖声明，局部用例覆盖了三条行为；`WebTools` 的其它调用方只有本 crate 的
+  search 集成测试，也已一起跑过。

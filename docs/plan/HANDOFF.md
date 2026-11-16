@@ -1682,7 +1682,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **258** ✅ CLI 前端 | headless stdout 污染(含 plan 241 那条);plain 两个 stdin 读者;`--plain` 信任前连 MCP;启动期 panic | 中 | — |
 | **259** server 输入与 worker | 唤醒信号被吞 steer 卡住;一行非 UTF-8 让 server 退出;`/provider` 残留 in_progress turn;delta O(n²) | 中 | — |
 | **260** ✅ MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
-| **261** web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
+| **261** ✅ web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
 | **262** TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
 | **263** TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
 | **264** 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
@@ -1701,7 +1701,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
   不依赖立项那次会话的上下文。收尾：plan 文件状态改 ✅、补完成记录与提交号;本节表格该行 plan 号后
   加 ✅;「待复核」条目不成立的，在 plan 里划掉并写明原因，表格的一句话同步改。
 - **多数条目有「开工先问用户」**,照全局规矩一次问一个点。几条要拍板的依赖：267 是否引入 schemars、
-  261 是否直接依赖 `encoding_rs`、256 的非覆盖 rename 是否允许直接用 libc。
+  261 是否直接依赖 `encoding_rs`(已定 2026-11-16：用)、256 的非覆盖 rename 是否允许直接用 libc。
 
 ## 〇′、批外五条:plan 200–204(2026-09-23 立,来自 `refs/chord` 调研)
 
@@ -5033,3 +5033,6 @@ plan 245 那类洞。把沙箱计划与保护要求收进 `Verdict`、让执行�
 386. **把一个内部模块搬进共用 crate，等于把它原来“只有一个调用方”的隐含前提变成公开契约——先把调用方的用法差异列出来。** `process_tree` 在 core 里只有 shell 用，所以 Windows 实现可以写死 `stdin` 必须为 null；MCP stdio 一搬进去就需要可写的 stdin 管道，而 Windows 那条路径是 `CreateProcessW` 手写的，得自己补 `CreatePipe`（读端可继承、父端清继承位，并把它带进 handle list）。第二处差异更隐蔽：`CreateProcessW` 拿到显式 `lpApplicationName` 后既不查 `PATH` 也不补 `.exe`，而原来 `tokio::process::Command` 会——共用后 `command = ["npx", …]` 在 Windows 上会从“可能能跑”变成“一定跑不起来”，所以搬的时候顺手补了 `resolve_program`（cwd → PATH → `.exe`）并把差异写在函数注释里。判据：搬迁前逐项对比新旧两边的**输入形状**（stdio 三种、env、cwd、可执行文件解析）和**生命周期语义**（谁负责杀、杀多深），差异要么在共用实现里补齐，要么在调用方显式转换。另外两条：跨 crate 的测试辅助访问器不要用 `#[cfg(all(test, windows))]`，依赖方编译自己的测试时看不到这个方法，用 `#[cfg(windows)]`；整仓 `make check-windows` 当时被 core 测试目标里既有的、只在 unix/macOS 测试里使用的 helper（dead code）挡住——先确认那是旧账，再作为独立的小修一起处理（给 helper 补 `cfg`），别把它静音成 `allow(dead_code)`，也别误当成本次改动的问题。
 
 387. **“写超时就当没写”是错的，管道不是消息边界；搬共用启动器时，std 的“隐藏语义”要逐条对齐。** tokio 的 `write_all` 是一串 `poll_write`，`timeout` 取消它时已经写出去的字节留在管道里；读循环的拒绝写如果超时后返回 `Ok(())`，下一条 JSON-RPC 消息就会接在半帧后面，协议从此失步且没有任何一方报错。判据：**取消一个写入 future 之后，那条流只能用“关闭”来兜底，不能继续用**；同一条纪律也适用于请求路径（超时后本来就会 `close_local`）。Windows 那边的教训是另一类：`ProcessSpec` 直接调用 `CreateProcessW`，而 `std::process::Command` 在 Windows 上不是它的薄包装——`.bat`/`.cmd` 会被隐式转成 `cmd.exe /c`，cmd 有第二遍解析（`%VAR%` 展开、`^` 转义、引号加倍），std 为此在 `make_bat_command_line` 里专门转义；`PATH` 里只找 `.exe`、相对路径按 cwd 补全、显式 `lpApplicationName` 不查 PATH，也都是 std 在替调用方做的事。共用/自建启动器时，把这些“Command 帮你做了但你没意识到”的行为列一遍：批处理解释器、参数转义、PATH 来源（配置 env 覆盖继承值时要跟着换）、相对路径基准、扩展名补全。跨平台可测的做法是把规则写成纯函数（u16 命令行、路径解析），Windows 胶水只负责取 `SystemRoot`、`encode_wide` 和传参数，这样 CI 之外的本机也能跑回归。还有三个容易漏的输入边界：verbatim 路径（`\\?\`）cmd 不认识，std 会在交给它之前转换，自己拼命令行时要照做；但删前缀不是字符串操作——Win32 会去掉路径组件末尾的点和空格，`\\?\C:\tools.\server.cmd` 删前缀后指向的是另一份文件，所以要先让 `GetFullPathNameW` 规范化候选并逐字节比较，不一致就保留原路径让 cmd 明确失败（判定逻辑接可注入的规范化函数，本机就能测）；OsString 可以含 NUL，而命令行是 NUL 结尾的字符串，脚本路径里的 NUL 会截断整条命令——凡是拼 UTF-16 命令行的地方，NUL 必须像引号/`%` 一样进拒绝名单。
+
+
+388. **“校验过的地址”只有放进实际连接用的解析器里才算数；有个代理时，本地解析的甚至不是目标。** 在请求前另做一次 `lookup_host`，无论把结果保存得多好，连接阶段都会重新解析，rebinding 窗口就还在；reqwest 的 `dns_resolver` 收到的只是主机名、返回的 `SocketAddr` 端口填 0 由客户端替换成 scheme 默认端口，所以在那里按 `ip_is_public` 过滤才是连接真正用的答案，把解析源抽成可注入的 trait 就能不碰真实 DNS 地测私网/回环/链路本地。但这层单独不够：配了 HTTP 代理时 reqwest 只解析代理主机，目标名根本不会进这个解析器，私网目标会直接放行——每跳的目标名预检要保留，且查询失败不再当作结论，交给连接阶段（或代理）报它自己的错。同一条计划里的另一半是“解码成功”不等于“拿到了原文”：`from_utf8_lossy` 对 GBK/Shift_JIS 页面产出满屏 U+FFFD 却仍像成功抓取，声明编码是数据不是事实，HTML 还要看 1024 字节预扫描窗口内的 `<meta charset>`/`http-equiv`（两种拼写），BOM 优先于声明，未知标签或字节不符必须退回有损解码并在结果里写明。反面同理：不能解码的 `application/octet-stream` 要在读 body 前拒绝，夹具只发响应头、不承诺正文，靠“客户端是否等正文”就能证明早拒真的生效。

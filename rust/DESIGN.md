@@ -3484,10 +3484,15 @@ network-free, reqwest lives only in provider and web):
 
 - **web_fetch** `{url}` (strict; unknown fields rejected) — HTTP upgraded to
   HTTPS, embedded credentials and 2000-char URLs rejected, SSRF guard
-  (loopback/private/link-local/CGNAT/metadata ranges refused, DNS names resolved
-  and checked on every hop), same-site redirects followed (max 5), cross-host
-  redirects reported for an explicit re-fetch, 20 MiB download cap (paired with
-  the 90s whole-request timeout), HTML→text.
+  (loopback/private/link-local/CGNAT/metadata ranges refused; literal addresses
+  are judged directly and DNS names twice — once per hop, and again in a custom
+  `reqwest::dns::Resolve` that filters the addresses the connection actually
+  uses, so a rebinding answer cannot slip between check and connect; the per-hop
+  lookup stays because with an HTTP proxy reqwest resolves only the proxy, and a
+  privately-resolving target would otherwise go unseen),
+  same-site redirects followed (max 5), cross-host redirects reported for an
+  explicit re-fetch, 20 MiB download cap (paired with the 90s whole-request
+  timeout), HTML→text.
   非成功 HTTP 响应保持工具失败，保留状态码和请求地址，按状态补充原因与下一步：
   401 / 403 指向已有认证或授权渠道，404 保留“缺失或对匿名访问隐藏”的不确定性；
   只有可识别的 PR 形状地址（`<owner>/<repo>/pull|pulls/<number>`，含自托管路径前缀与
@@ -3508,6 +3513,14 @@ network-free, reqwest lives only in provider and web):
   `application/x-sqlite3`、`x-sh` 出现在 `application/x-sharedlib` 与
   `application/x-shockwave-flash`，这三种都曾被当作文本送进模型。名单之外的类型仍拒绝；
   参数先剥掉，所以也不能靠参数夹带标记。二进制一律拒绝，不用有损解码冒充文本。
+  类型判断发生在读 body 之前（plan 261）：指向 PDF 或压缩包的 URL 不再先下满
+  20 MiB 才报 unsupported；空 Content-Type 仍按正文开头的 `<` 嗅探。
+  正文编码取自 Content-Type 的 `charset` 参数；HTML 在没有该参数时再看头部
+  1024 字节内的 `<meta charset>` 与 `http-equiv` 的 content，BOM 由
+  `encoding_rs` 优先于两者。已知编码（GBK、Shift_JIS 等）按声明解码；未声明
+  编码仍按 UTF-8 有损解码。声明了无法识别的编码、或字节不符合声明编码时，退回
+  有损解码并在正文尾部注明——旧的无条件 `from_utf8_lossy` 会把 GBK 页面变成
+  满屏 U+FFFD 却仍像一次成功抓取（plan 261）。
   跟随同站跳转后，正文尾部标注最终落地的地址——跳转是静默的，登录页或中间页
   否则会以“就是被请求的文档”的样子送达（假成功，比它掩盖的 404 更危险，plan 231）。
   Download truncation is reported. There is **no model-text cap**: the body is a

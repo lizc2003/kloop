@@ -73,6 +73,9 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 # (CLI-only) pieces — we only drive the pull parser. Syntax highlighting
 # (syntect) is deliberately deferred to a later slice (plan 38 关键决定 2).
 pulldown-cmark = { version = "0.13", default-features = false }
+# web_fetch charset decoding (plan 261): Content-Type charset and <meta charset>,
+# legacy encodings included. Already compiled through grep-searcher.
+encoding_rs = "0.8"
 # 0.13 made `form`/`query` opt-in (mcp OAuth posts forms, web search sends a
 # query). `rustls` = aws-lc-rs + the OS trust store; `system-proxy` stays off, so
 # proxies still come from the environment only, as they did on 0.12.

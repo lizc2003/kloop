@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
+encoding_rs = { workspace = true }
 kloop-protocol = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

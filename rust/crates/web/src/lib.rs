@@ -52,6 +52,9 @@ impl WebTools {
             // Redirects are followed manually so every hop passes the SSRF
             // guard (a public host can 302 to an internal address).
             .redirect(reqwest::redirect::Policy::none())
+            // The guard checks the resolution the connection will use, so a
+            // rebinding answer cannot differ from the checked one.
+            .dns_resolver(fetch::PublicResolver::system())
             .timeout(timeout)
             .user_agent("kloop/0.1")
             .build()

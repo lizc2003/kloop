@@ -1920,6 +1920,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "encoding_rs",
  "kloop-protocol",
  "reqwest",
  "serde",
