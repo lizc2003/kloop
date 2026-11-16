@@ -1518,6 +1518,7 @@ mod tests {
     include!("permissions/plan266_tests.rs");
     include!("permissions/plan271_tests.rs");
     include!("permissions/plan283_tests.rs");
+    include!("permissions/plan284_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;
@@ -1845,8 +1846,9 @@ mod tests {
             "command exec sh -c 'cat .env'",
             "command -- exec sh -c 'cat .env'",
             "exec env -S 'cat .env'",
-            "exec -l bash -c 'cat \"$HOME/public.txt\"'",
-            "exec -a -bash bash -c 'cat \"$HOME/public.txt\"'",
+            // plan 284：HOME 未知的普通目标不再硬拒；正文里的凭据名照旧。
+            "exec -l bash -c 'cat \"$HOME/.bashrc\"'",
+            "exec -a -bash bash -c 'cat \"$HOME/.bashrc\"'",
         ] {
             for mode in [Mode::Bypass, Mode::Manual] {
                 let p = gate(mode, rules(&[], &[], &[]), ScriptedApprover::new(vec![]));
@@ -1944,14 +1946,21 @@ mod tests {
             ("bash -O extglob -c 'cat notes.txt'", true),
             ("zsh -c -oshwordsplit 'cat .env' unused", true),
             ("bash -euo pipefail -c 'cat notes.txt'", false),
-            // 只有登录、交互 shell 让回放的 HOME 不可信；普通选项不影响。
+            // 登录、交互 shell 让回放的 HOME 不可信（env -a 把 argv[0] 改成 `-bash` 同样是
+            // 登录 shell，plan 272）。plan 284 起未知目标只是未决读取，正文已分析就不硬拒。
             ("bash -euo pipefail -c 'cat \"$HOME/public.txt\"'", false),
-            ("bash -l -c 'cat \"$HOME/public.txt\"'", true),
-            // env -a 把 argv[0] 改成 `-bash` 同样是登录 shell（plan 272）。
+            ("bash -l -c 'cat \"$HOME/public.txt\"'", false),
             ("env bash -c 'cat \"$HOME/public.txt\"'", false),
-            ("env -a -bash bash -c 'cat \"$HOME/public.txt\"'", true),
-            ("env --argv0=-bash bash -c 'cat \"$HOME/public.txt\"'", true),
-            ("env --argv0 -bash bash -c 'cat \"$HOME/public.txt\"'", true),
+            ("env -a -bash bash -c 'cat \"$HOME/public.txt\"'", false),
+            (
+                "env --argv0=-bash bash -c 'cat \"$HOME/public.txt\"'",
+                false,
+            ),
+            (
+                "env --argv0 -bash bash -c 'cat \"$HOME/public.txt\"'",
+                false,
+            ),
+            ("bash -l -c 'cat \"$HOME/.ssh/id_rsa\"'", true),
         ] {
             let p = gate(
                 Mode::Bypass,
@@ -1971,33 +1980,21 @@ mod tests {
         }
     }
 
+    /// 循环变量被改写或取值不定时目标仍未知。plan 284 起，命令名已定位的未知目标
+    /// 不再硬拒；同一条命令写出凭据文件名、或命令名本身未知时照旧硬拒。
     #[tokio::test]
     async fn mutable_or_dynamic_for_loops_still_have_unknown_targets() {
         for command in [
-            "cargo test -- \"$t\"",
-            "for t in $TESTS; do cargo test -- \"$t\"; done",
             "for t in first --manifest-path=.env; do cargo test \"$t\"; done",
             "for t in first .env; do cargo test --manifest-path=\"$t\"; done",
-            "for t in first second; do cat $t; done",
             "for _ in first second; do : .env; cat \"$_\"; done",
-            "for RANDOM in 1 2; do cat \"$RANDOM\"; done",
-            "for SECONDS in 1 2; do cat \"$SECONDS\"; done",
-            "for status in 1 2; do false; cat \"$status\"; done",
-            "for pipestatus in 1 2; do false; cat \"$pipestatus\"; done",
-            "for t in *.txt; do cat \"$t\"; done",
             "for t in first second; do t=.env; cat \"$t\"; done",
-            "for t in first second; do read t; cat \"$t\"; done",
-            "for t in first second; do vared t; cat \"$t\"; done",
-            "for t in first second; do zstyle -s :target name t; cat \"$t\"; done",
-            "for t in first second; do stat -A t notes.txt; cat \"$t\"; done",
             "for t in first second; do printf -v t .env; cat \"$t\"; done",
             "for t in first second; do printf \"$format\" t .env; cat \"$t\"; done",
             "for t in first second; do eval 't=.env'; cat \"$t\"; done",
-            "for t in first second; do source setup.sh; cat \"$t\"; done",
             "for t in first second; do \"$mutator\"; cat \"$t\"; done",
             "for t in first second; do : \"${t:=.env}\"; cat \"$t\"; done",
             "for t in first second; do for t in .env; do :; done; cat \"$t\"; done",
-            "select t in first second; do cat \"$t\"; done",
         ] {
             let p = gate(
                 Mode::Bypass,
@@ -2012,6 +2009,30 @@ mod tests {
                 error.contains("reading this sensitive path"),
                 "{command}: {error}"
             );
+        }
+        for command in [
+            "cargo test -- \"$t\"",
+            "for t in $TESTS; do cargo test -- \"$t\"; done",
+            "for t in first second; do cat $t; done",
+            "for RANDOM in 1 2; do cat \"$RANDOM\"; done",
+            "for SECONDS in 1 2; do cat \"$SECONDS\"; done",
+            "for status in 1 2; do false; cat \"$status\"; done",
+            "for pipestatus in 1 2; do false; cat \"$pipestatus\"; done",
+            "for t in *.txt; do cat \"$t\"; done",
+            "for t in first second; do read t; cat \"$t\"; done",
+            "for t in first second; do vared t; cat \"$t\"; done",
+            "for t in first second; do zstyle -s :target name t; cat \"$t\"; done",
+            "for t in first second; do stat -A t notes.txt; cat \"$t\"; done",
+            "for t in first second; do source setup.sh; cat \"$t\"; done",
+            "select t in first second; do cat \"$t\"; done",
+        ] {
+            let p = gate(
+                Mode::Bypass,
+                rules(&[], &[], &[]),
+                ScriptedApprover::new(vec![]),
+            );
+            let verdict = p.check_call("bash", &bash(command), 0, true).await;
+            assert_eq!(verdict, allowed_verdict(true), "{command}");
         }
     }
 
@@ -3050,8 +3071,8 @@ mod tests {
         );
         assert_eq!(
             approver.ask_count(),
-            3,
-            "未知参数的访问风险先于 allow 硬拒绝"
+            4,
+            "未知参数不能匹配 allow，走审批（plan 284 前是硬拒）"
         );
     }
 

@@ -46,6 +46,9 @@ pub(crate) struct CallFacts {
     pub(super) path: Option<PathFacts>,
     pub(super) path_key: Option<&'static str>,
     pub(super) sensitive_read: bool,
+    /// Bash 有读取目标含未知值、但没被硬拒（[`ReadVerdict::Unresolved`]）。plan 284 前
+    /// 这类调用整条硬拒，deny/ask 不必看未知词；现在它们按“可能命中”保守匹配。
+    pub(super) unresolved_read: bool,
     pub(super) sensitive_write: bool,
     pub(super) risk_commands: Vec<CommandFact>,
     pub(super) risk_writes: Vec<WriteTarget>,
@@ -207,25 +210,21 @@ impl CallFacts {
         let path = path_key
             .and_then(|key| input[key].as_str())
             .map(|raw| PathFacts::gather_in(Path::new(raw), root, resolved_path));
+        let bash_read = match (name, shell_command, &shell) {
+            ("bash", Some(command), Some(ShellFacts::Bash(_))) => Some(bash_reads_sensitive_path(
+                command,
+                bash_facts.as_ref().unwrap(),
+                root,
+                execution,
+            )),
+            _ => None,
+        };
         let sensitive_read = (name == "read_file"
             && path
                 .as_ref()
                 .is_some_and(|path| path.sensitivity(Access::Read).is_some()))
-            || (name == "bash"
-                && shell_command
-                    .zip(shell.as_ref())
-                    .is_some_and(|(command, facts)| {
-                        let ShellFacts::Bash(_) = facts else {
-                            return false;
-                        };
-                        bash_reads_sensitive_path(
-                            command,
-                            bash_facts.as_ref().unwrap(),
-                            root,
-                            execution,
-                        )
-                        .blocked()
-                    }));
+            || bash_read.is_some_and(ReadVerdict::blocked);
+        let unresolved_read = bash_read == Some(ReadVerdict::Unresolved);
         let powershell_sensitive =
             name == "powershell" && shell_command.is_some_and(powershell_mentions_sensitive_path);
         let opaque_script = match (&shell, shell_command) {
@@ -254,6 +253,7 @@ impl CallFacts {
             path,
             path_key,
             sensitive_read,
+            unresolved_read,
             sensitive_write,
             risk_commands: bash_facts
                 .as_ref()
@@ -365,13 +365,15 @@ impl CallFacts {
 enum ReadVerdict {
     Clear,
     Sensitive,
+    /// 读取目标含变量/命令替换，静态定不下来；命令名与包装器都已定位。不硬拒：
+    /// 沙箱运行时仍挡凭据目录与 `~/.kloop`，其余照普通命令走审批。
     Unresolved,
     RequiresProtection,
 }
 
 impl ReadVerdict {
     fn blocked(self) -> bool {
-        matches!(self, Self::Sensitive | Self::Unresolved)
+        self == Self::Sensitive
     }
 }
 
@@ -496,7 +498,7 @@ fn argv_sensitive_access(argv: &[String], root: PathRoot<'_>, placement: Placeme
     if sensitive || recursive_search_covers_sensitive_path(argv, root.cwd) {
         ReadVerdict::Sensitive
     } else if argv_roles::unknown_effects(argv).unresolved_access {
-        // 单值边界只证明 argv 位置；变量、命令替换和 xargs 的未知目标使用同一硬限制。
+        // 单值边界只证明 argv 位置；变量、命令替换和 xargs 的未知目标同样未决。
         ReadVerdict::Unresolved
     } else {
         ReadVerdict::Clear
@@ -579,45 +581,61 @@ fn bash_reads_sensitive_path(
         }
     }
     if raw_mentions_sensitive_path(&masked) {
-        return ReadVerdict::Unresolved;
+        return ReadVerdict::Sensitive;
     }
-    {
-        for command in &facts.commands {
-            let home = home.as_deref().filter(|_| !command.context.home_unknown);
-            let words: Vec<_> = command
-                .words
-                .iter()
-                .map(|word| word.syntax.evaluate(home))
-                .collect();
-            let placement = Placement::of_command(&placeholder_argv(&words), &command.context);
-            match argv_sensitive_access(&placeholder_argv(&words), root, placement) {
-                ReadVerdict::Clear => {}
-                verdict => return verdict,
-            }
+    // 未决读取不能提前返回：后面的命令或重定向可能是明确的敏感读取。
+    let mut unresolved = false;
+    for command in &facts.commands {
+        let home = home.as_deref().filter(|_| !command.context.home_unknown);
+        let words: Vec<_> = command
+            .words
+            .iter()
+            .map(|word| word.syntax.evaluate(home))
+            .collect();
+        let placement = Placement::of_command(&placeholder_argv(&words), &command.context);
+        match argv_sensitive_access(&placeholder_argv(&words), root, placement) {
+            ReadVerdict::Clear => {}
+            ReadVerdict::Unresolved => unresolved = true,
+            verdict @ (ReadVerdict::Sensitive | ReadVerdict::RequiresProtection) => return verdict,
         }
-        for redirect in &facts.redirects {
-            if redirect.direction != Direction::Read {
-                continue;
-            }
-            let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
-            let target = redirect.syntax.evaluate(home);
-            let placement = Placement::of_shell(&redirect.context);
-            if evaluation_is_sensitive(&target, root, false, |spelling| placement.access(spelling))
-            {
-                return ReadVerdict::Sensitive;
-            }
-            if matches!(&target, WordEvaluation::Unknown)
-                || matches!(&target, WordEvaluation::Partial(value) if value.contains('\0'))
-            {
-                return ReadVerdict::Unresolved;
-            }
+    }
+    for redirect in &facts.redirects {
+        if redirect.direction != Direction::Read {
+            continue;
         }
+        let home = home.as_deref().filter(|_| !redirect.context.home_unknown);
+        let target = redirect.syntax.evaluate(home);
+        let placement = Placement::of_shell(&redirect.context);
+        if evaluation_is_sensitive(&target, root, false, |spelling| placement.access(spelling)) {
+            return ReadVerdict::Sensitive;
+        }
+        if matches!(&target, WordEvaluation::Unknown)
+            || matches!(&target, WordEvaluation::Partial(value) if value.contains('\0'))
+        {
+            unresolved = true;
+        }
+    }
+    // 只有每个命令名与包装器都已定位（`reliable`），未决才只是参数值，可以放行；
+    // 未知命令名、未支持的包装器、动态 `-c` 正文、xargs 替换仍是未知执行体，硬拒。
+    // 沙箱运行时不挡 `.env*` 与 rc 文件；同一条命令里写出了这些名字，未知目标
+    // 很可能就是它（`F=.envrc; cat "$F"`），这时也硬拒。
+    if unresolved && (!facts.reliable || names_secret_file(command)) {
+        return ReadVerdict::Sensitive;
     }
     if requires_protection {
         ReadVerdict::RequiresProtection
+    } else if unresolved {
+        ReadVerdict::Unresolved
     } else {
         ReadVerdict::Clear
     }
+}
+
+/// 命令原文里是否有一个词（按 shell 分隔符与 `/` 切开）是凭据文件名。
+fn names_secret_file(command: &str) -> bool {
+    command
+        .split(|ch: char| ch.is_whitespace() || "\"'`(){}[];,|<>=&$/\\".contains(ch))
+        .any(sensitive::file_name_is_secret)
 }
 
 /// `echo`/`printf` 的参数只是文本。参数角色表在 argv 完整时才给出这条豁免；
@@ -676,10 +694,8 @@ pub(crate) fn bash_protection_requirement(
         execution,
     ) {
         ReadVerdict::RequiresProtection => Ok(true),
-        ReadVerdict::Clear => Ok(false),
-        ReadVerdict::Sensitive | ReadVerdict::Unresolved => {
-            Err(crate::sandbox::PROTECTION_REQUIRED.into())
-        }
+        ReadVerdict::Clear | ReadVerdict::Unresolved => Ok(false),
+        ReadVerdict::Sensitive => Err(crate::sandbox::PROTECTION_REQUIRED.into()),
     }
 }
 

@@ -191,6 +191,14 @@ fn argv_has_prefix(tokens: &[String], wildcard: bool, argv: &[String]) -> bool {
     length_matches && argv.iter().zip(tokens).all(|(a, t)| a == t)
 }
 
+/// deny/ask 方向：`prefix` 之后跟着未知词，未加引号时可能展开成任意个词（含零个），
+/// 所以只要已知前缀与规则在公共长度上一致，规则就可能命中。`git $X push` 对
+/// `git push *` 算命中；`git status "$X"` 不算。只用于有未决读取的调用（plan 284 前
+/// 它们整条硬拒）；`rm "$f"` 这类原本就放行的调用沿用原匹配，不因此新增拒绝。
+fn prefix_may_match(tokens: &[String], wildcard: bool, prefix: &[String]) -> bool {
+    (wildcard || prefix.len() <= tokens.len()) && prefix.iter().zip(tokens).all(|(a, t)| a == t)
+}
+
 /// `<tokens…>` or `<tokens…> *` — the pattern both argv-prefix rules are
 /// written in. `tool` only names the rule in the error.
 fn parse_prefix_pattern(tool: &str, inner: &str) -> Result<(Vec<String>, bool)> {
@@ -371,7 +379,6 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
             });
         }
         let argv = command.risk_argv();
-        let prefix = command.literal_prefix();
         // 循环绑定的词在 value 视图里是未知词，包装器却按 syntax 剥离：
         // `for w in rm; do env "$w" -rf x; done` 只在 syntax 视图里是 `rm`。deny/ask 两个视图都看。
         let bound = command.bound_risk_argv();
@@ -381,11 +388,13 @@ pub(super) fn rules_hit(rules: &[Rule], name: &str, call: &CallFacts) -> bool {
                     || risk_wrapper_views(argv)
                         .iter()
                         .any(|view| rule.matches_argv(view))
-            }) || matches!(rule, Rule::BashPrefix { tokens, wildcard: true }
-                    if argv_has_prefix(tokens, true, &prefix)
-                        || risk_wrapper_views(&prefix)
-                            .iter()
-                            .any(|view| argv_has_prefix(tokens, true, view)))
+            }) || matches!(rule, Rule::BashPrefix { tokens, wildcard }
+            if call.unresolved_read && std::iter::once(bound.clone())
+                .chain(risk_wrapper_views(&bound))
+                .any(|view| {
+                    let known = view.iter().take_while(|word| !word.contains('\0')).count();
+                    known < view.len() && prefix_may_match(tokens, *wildcard, &view[..known])
+                }))
         })
     }) {
         return true;

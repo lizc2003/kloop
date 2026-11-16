@@ -62,11 +62,15 @@ async fn plan239_unknown_arguments_cannot_be_deleted_to_match_rules() {
         rules(&[], &["bash(git push *)"], &[]),
         approver,
     );
-    assert!(
-        p.check_call("bash", &bash("git $ACTION push origin"), 0, true)
-            .await
-            .unwrap_err().contains("sensitive path")
-    );
+    // 未知词可能展开成任意个词：已知前缀与 deny 规则一致就按命中处理（plan 284 前
+    // 由未决读取的硬拒兜底）。
+    for command in ["git $ACTION push origin", "git \"$ACTION\" push origin"] {
+        let error = p.check_call("bash", &bash(command), 0, true).await.unwrap_err();
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+    }
+    p.check_call("bash", &bash("git status \"$PATHSPEC\""), 0, true)
+        .await
+        .expect("a known prefix that disagrees with the rule cannot match");
     let approver = ScriptedApprover::new(vec![Decision::Deny]);
     let p = gate(
         Mode::Manual,
@@ -78,7 +82,8 @@ async fn plan239_unknown_arguments_cannot_be_deleted_to_match_rules() {
             .await
             .is_err()
     );
-    assert_eq!(approver.ask_count(), 0, "未知访问不能由普通审批解除");
+    // 未知参数不能被删掉去匹配 allow：照普通命令问人（plan 284 前是硬拒）。
+    assert_eq!(approver.ask_count(), 1);
 }
 
 #[cfg(target_os = "macos")]

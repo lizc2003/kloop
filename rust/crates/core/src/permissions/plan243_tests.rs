@@ -606,14 +606,46 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
         }
     }
 
+    // plan 284：命令名与包装器都已定位时，未知目标只是未决读取，不再硬拒。
+    for command in [
+        "cat $F",
+        "sudo cat $F",
+        "env FOO=1 grep -n $P file",
+        "nice -n 10 cat $F",
+        "timeout 5 sudo cat $F",
+        "env bash -c 'cat file' \"$ARG\"",
+        "env bash -c 'cat file' name \"$ARG\"",
+    ] {
+        for (mode, ruleset) in [
+            (Mode::Bypass, rules(&[], &["bash_write(/etc/**)"], &[])),
+            (Mode::Manual, rules(&[], &[], &["bash_write(/etc/**)"])),
+        ] {
+            let approver = ScriptedApprover::new(vec![]);
+            let p = gate(mode, ruleset, approver.clone());
+            let verdict = p.check_call("bash", &bash(command), 0, true).await;
+            assert_eq!(verdict, allowed_verdict(true), "{mode:?}: {command}");
+            assert_eq!(approver.ask_count(), 0, "{command}");
+        }
+    }
+    // 写入目标已知时，deny/ask 规则照旧生效；未决的读取不再抢先硬拒。
+    for command in [
+        "sudo cat $F > /etc/locked.txt",
+        "env bash -c 'printf x > /etc/locked.txt' name \"$ARG\"",
+    ] {
+        let p = gate(
+            Mode::Bypass,
+            rules(&[], &["bash_write(/etc/**)"], &[]),
+            ScriptedApprover::new(vec![]),
+        );
+        let error = p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
+        assert!(error.contains("deny permission rule"), "{command}: {error}");
+        let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Once)]);
+        let p = gate(Mode::Manual, rules(&[], &[], &["bash_write(/etc/**)"]), approver.clone());
+        p.check_call("bash", &bash(command), 0, true).await.expect(command);
+        assert_eq!(approver.ask_count(), 1, "{command}");
+    }
+
     for (command, expected_error) in [
-        ("cat $F", "sensitive path"),
-        ("sudo cat $F", "sensitive path"),
-        ("env FOO=1 grep -n $P file", "sensitive path"),
-        ("nice -n 10 cat $F", "sensitive path"),
-        ("timeout 5 sudo cat $F", "sensitive path"),
-        ("env bash -c 'cat file' \"$ARG\"", "sensitive path"),
-        ("env bash -c 'cat file' name \"$ARG\"", "sensitive path"),
         ("$CMD file", "deny permission rule"),
         ("env $CMD file", "deny permission rule"),
         ("env FOO=1 $CMD file", "deny permission rule"),
@@ -622,8 +654,6 @@ async fn plan243_dynamic_wrapper_arguments_keep_known_command_facts() {
         ("timeout $SECONDS cat file", "deny permission rule"),
         ("bash -c \"$SCRIPT\"", "deny permission rule"),
         ("env bash -c \"$SCRIPT\"", "deny permission rule"),
-        ("env bash -c 'printf x > /etc/locked.txt' name \"$ARG\"", "deny permission rule"),
-        ("sudo cat $F > /etc/locked.txt", "deny permission rule"),
     ] {
         let p = gate(
             Mode::Bypass,
@@ -677,6 +707,8 @@ async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
         "sudo cat file",
         "env FOO=1 grep -n -e \"$P\" file",
         "nice -n 10 cat file",
+        // plan 284：命令名已定位的未知目标不再硬拒，正文照旧在沙箱里受保护。
+        "cat $F", "sudo cat $F", "env FOO=1 grep -n $P file", "nice -n 10 cat $F",
     ] {
         let command = format!("{prefix}\ncat > /tmp/probe <<'EOF'\n~/.ssh/id_rsa\nEOF");
         let p = gate(
@@ -695,7 +727,6 @@ async fn plan243_dynamic_wrapper_arguments_keep_protected_heredoc_body() {
         .unwrap_or_else(|error| panic!("{command}: {error}"));
     }
     for prefix in [
-        "cat $F", "sudo cat $F", "env FOO=1 grep -n $P file", "nice -n 10 cat $F",
         "env $CMD file",
         "sudo -u $USER cat file",
         "cat ~/.ssh/id_rsa",

@@ -714,18 +714,26 @@ async fn plan244_dynamic_reads_fail_closed_after_data_and_scalar_assignments() {
         ] {
             p.check_call("bash", &bash(command), 0, true).await.expect(command);
         }
+        // plan 284 起只剩两类未决读取硬拒：同一条命令写出凭据文件名，或执行体本身
+        // 未知（xargs 替换）。
         for command in [
-            "env FOO=\"$(cat list)\" sh -c 'cat \"$FOO\"'",
             "echo .env > list; env FOO=\"$(cat list)\" sh -c 'cat \"$FOO\"'",
-            "FOO=$(cat list); cat \"$FOO\"", "cat \"$(cat list)\"",
-            "cat \"$FOO\"", "cat \"$DIR/notes.txt\"", "sudo cat \"$FOO\"",
-            "cat < \"$FOO\"", "xargs -I marker cat marker",
+            "xargs -I marker cat marker",
         ] {
             for sandbox_auto_allow in [false, true] {
                 let error = p.check_call("bash", &bash(command), 0, sandbox_auto_allow)
                     .await.expect_err(command);
                 assert!(error.contains("sensitive path"), "{command}: {error}");
             }
+        }
+        for command in [
+            "env FOO=\"$(cat list)\" sh -c 'cat \"$FOO\"'",
+            "FOO=$(cat list); cat \"$FOO\"", "cat \"$(cat list)\"",
+            "cat \"$FOO\"", "cat \"$DIR/notes.txt\"", "sudo cat \"$FOO\"",
+            "cat < \"$FOO\"",
+        ] {
+            let verdict = p.check_call("bash", &bash(command), 0, true).await;
+            assert_eq!(verdict, allowed_verdict(true), "{mode:?}: {command}");
         }
         assert_eq!(approver.ask_count(), 0);
     }
