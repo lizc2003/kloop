@@ -73,6 +73,18 @@
 - 第 8 条没有加单测:panic hook 是进程全局,并行测试里换 hook 会和别处的
   panic/`should_panic` 抢;guard 只做「装 hook + Drop 时装回」,人工复核。
 
+### 复审修正(2026-11-16)
+
+- **P1**:`drop(panic_hook)` 在栈展开里调 `set_hook`,std 直接 panic
+  (`cannot modify the panic hook from a panicking thread`),析构里的二次 panic 让进程
+  abort,终端恢复也一起没了。`Drop` 现在先看 `std::thread::panicking()`，展开时保留 hook。
+  两个测试(2026-11-16 补):守卫正常析构会把原 hook 装回;展开中析构不换 hook(回归会让
+  测试进程 SIGABRT,这正是要暴露的行为)。
+- **P2**:选择器只画 `Paragraph`，从不设光标;ratatui 的 resize 锚定读
+  `last_known_cursor_pos`(帧内最后改动格)，`PinnedBackend` 的缓存读构造探针的行,两者
+  不一致时 resize 把视口锚到第 0 行并清掉上方 shell 输出。每帧画完把光标停到视口顶行
+  (光标仍隐藏),resize 回归测试用共享尺寸的假终端在帧间撑大屏幕,断言视口仍停在第 5 行。
+
 ## 验收
 
 - 单测(旧代码先红):选择器的 draw/read 出错路径恢复 raw mode(用可注入的 backend);`.git` 下

@@ -374,6 +374,15 @@ impl PanicHookGuard {
 
 impl Drop for PanicHookGuard {
     fn drop(&mut self) {
+        // `set_hook` itself panics with "cannot modify the panic hook from a
+        // panicking thread", and a panic in a destructor during cleanup aborts
+        // the process — which would take the terminal guard's restore down with
+        // it. Unwinding therefore keeps our hook installed; a normal exit is
+        // the only time putting the previous one back is both possible and
+        // useful.
+        if std::thread::panicking() {
+            return;
+        }
         let previous = self.previous.lock().ok().and_then(|mut slot| slot.take());
         if let Some(hook) = previous {
             std::panic::set_hook(hook);
@@ -1617,6 +1626,56 @@ mod tests {
                 "{code:?} with {modifiers:?}"
             );
         }
+    }
+
+    /// The panic hook is process-global, so the two tests that install one take
+    /// this lock: they must not see each other's hook (or restore over it).
+    static PANIC_HOOK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dropping_the_guard_puts_the_previous_hook_back() {
+        let _serial = PANIC_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (events, mut quit) = mpsc::unbounded_channel();
+        drop(PanicHookGuard::install(events));
+        // A parallel panic while the hook was installed is not this test's; the
+        // point is that nothing new arrives once the guard has dropped.
+        while quit.try_recv().is_ok() {}
+        let _ = std::panic::catch_unwind(|| panic!("hook probe"));
+        assert!(
+            quit.try_recv().is_err(),
+            "the session hook was still installed after the guard dropped"
+        );
+    }
+
+    /// Dropping the guard while unwinding must not call `set_hook`: std panics
+    /// ("cannot modify the panic hook from a panicking thread") and a panic in a
+    /// destructor during cleanup aborts, taking the terminal restore with it. A
+    /// regression aborts this test binary, which is exactly the report.
+    #[test]
+    fn a_guard_dropped_while_unwinding_leaves_the_hook_alone() {
+        let _serial = PANIC_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (events, mut quit) = mpsc::unbounded_channel();
+        let guard = PanicHookGuard::install(events);
+        let slot = std::sync::Arc::clone(&guard.previous);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("hook probe");
+        }));
+        assert!(result.is_err());
+        // The session hook ran for the probe (and chained the previous hook).
+        assert!(quit.try_recv().is_ok(), "the session hook did not run");
+        // Restore by hand what the guard skips during unwinding, so the rest of
+        // the suite keeps its own hook.
+        let previous = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the previous hook survived the probe");
+        std::panic::set_hook(previous);
     }
 
     /// Leaving a worktree emits `branch: None`, but the footer's always-on

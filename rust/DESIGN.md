@@ -865,7 +865,12 @@ prints where the picker began. Raw mode and that hand-back are owned by one
 guard and undone in `Drop`, so a failed draw or read — an autoresize while the
 picker is up is the easy one — cannot leave the shell raw; the picker's backend
 is the same `PinnedBackend` as the main TUI's, so a resize answers from the last
-cursor position instead of a CPR the terminal may not reply to. Off a terminal (a pipe, a harness, a terminal
+cursor position instead of a CPR the terminal may not reply to. Because a
+`Paragraph`-only frame never sets a cursor, each picker frame then parks the
+cursor on the viewport's top row: both ratatui's resize anchoring and
+`PinnedBackend`'s cached answer read the last known position, and without one
+the two disagree (last changed cell vs construction probe), so a resize
+re-anchored the viewport at row 0 and cleared the shell output above it. Off a terminal (a pipe, a harness, a terminal
 that refuses raw mode) it falls back to the numbered stdout list it used to be.
 Rows are built from `session_digest`, which reads each file only up to its first
 user line: replaying dozens of megabyte-sized transcripts just to label them is

@@ -467,6 +467,15 @@ impl<'a, I: PickerIo> PickerSession<'a, I> {
                 let lines = picker.lines(area.width as usize, area.height as usize);
                 frame.render_widget(Paragraph::new(lines), area);
             })?;
+            // A paragraph-only frame never sets a cursor, and both ratatui's
+            // inline resize anchoring and `PinnedBackend`'s cached answer read
+            // the last known position. Park it on the viewport's top row — the
+            // row a resize re-anchors from — so neither is left holding the
+            // frame's last changed cell against the probe's row. The cursor
+            // stays hidden: this only moves it.
+            let top = self.terminal.get_frame().area().y;
+            self.terminal
+                .set_cursor_position(ratatui::layout::Position::new(0, top))?;
             if let Event::Key(key) = self.io.io().read_event()?
                 && key.kind == crossterm::event::KeyEventKind::Press
             {
@@ -695,18 +704,25 @@ mod tests {
 
     /// A terminal that never touches the process's real modes: the picker's
     /// enter/leave and hand-back counts are the whole assertion surface.
-    struct FakeIo<B> {
-        backend: Option<B>,
+    struct FakeIo {
+        backend: Option<FakeBackend>,
+        /// Shared with the backend: a test grows the screen between frames the
+        /// way a terminal resize does, through `resize_on_next_event`.
+        size: std::rc::Rc<std::cell::Cell<(u16, u16)>>,
+        resize_on_next_event: Option<(u16, u16)>,
         events: std::collections::VecDeque<Result<Event>>,
         enabled: usize,
         disabled: usize,
         hand_backs: Vec<u16>,
     }
 
-    impl<B: Backend> FakeIo<B> {
-        fn new(backend: B) -> Self {
+    impl FakeIo {
+        fn new() -> Self {
+            let backend = FakeBackend::new();
             Self {
+                size: std::rc::Rc::clone(&backend.size),
                 backend: Some(backend),
+                resize_on_next_event: None,
                 events: std::collections::VecDeque::new(),
                 enabled: 0,
                 disabled: 0,
@@ -720,11 +736,11 @@ mod tests {
         }
     }
 
-    impl<B: Backend<Error = std::io::Error>> PickerIo for FakeIo<B> {
-        type Backend = B;
+    impl PickerIo for FakeIo {
+        type Backend = FakeBackend;
 
         fn size(&mut self) -> (u16, u16) {
-            (80, 24)
+            self.size.get()
         }
 
         fn enable_raw(&mut self) -> Result<()> {
@@ -737,6 +753,9 @@ mod tests {
         }
 
         fn read_event(&mut self) -> Result<Event> {
+            if let Some(size) = self.resize_on_next_event.take() {
+                self.size.set(size);
+            }
             self.events
                 .pop_front()
                 .unwrap_or_else(|| Ok(Event::Resize(80, 24)))
@@ -752,10 +771,23 @@ mod tests {
     }
 
     /// A backend that draws nothing and can be told to fail, standing in for
-    /// the autoresize error the old code returned straight through `?`.
+    /// the autoresize error the old code returned straight through `?`. Its
+    /// size is shared with the fake io so a test can grow the screen between
+    /// frames, the way a terminal resize does.
     struct FakeBackend {
         fail_draw: bool,
         cursor: ratatui::layout::Position,
+        size: std::rc::Rc<std::cell::Cell<(u16, u16)>>,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                fail_draw: false,
+                cursor: ratatui::layout::Position::new(0, 0),
+                size: std::rc::Rc::new(std::cell::Cell::new((80, 24))),
+            }
+        }
     }
 
     impl Backend for FakeBackend {
@@ -803,12 +835,13 @@ mod tests {
         }
 
         fn size(&self) -> std::io::Result<ratatui::layout::Size> {
-            Ok(ratatui::layout::Size::new(80, 24))
+            let (width, height) = self.size.get();
+            Ok(ratatui::layout::Size::new(width, height))
         }
 
         fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
             Ok(ratatui::backend::WindowSize {
-                columns_rows: ratatui::layout::Size::new(80, 24),
+                columns_rows: self.size()?,
                 pixels: ratatui::layout::Size::new(0, 0),
             })
         }
@@ -820,11 +853,7 @@ mod tests {
 
     #[test]
     fn a_failed_read_leaves_raw_mode() {
-        let mut io = FakeIo::new(FakeBackend {
-            fail_draw: false,
-            cursor: ratatui::layout::Position::new(0, 0),
-        })
-        .event(Err(anyhow::anyhow!("the tty went away")));
+        let mut io = FakeIo::new().event(Err(anyhow::anyhow!("the tty went away")));
         let mut picker = Picker::new(sample(), "kloop");
         assert!(pick_with(&mut picker, &mut io).is_err());
         assert_eq!(io.enabled, 1);
@@ -835,10 +864,8 @@ mod tests {
 
     #[test]
     fn a_failed_draw_leaves_raw_mode() {
-        let mut io = FakeIo::new(FakeBackend {
-            fail_draw: true,
-            cursor: ratatui::layout::Position::new(0, 0),
-        });
+        let mut io = FakeIo::new();
+        io.backend.as_mut().unwrap().fail_draw = true;
         let mut picker = Picker::new(sample(), "kloop");
         let result = pick_with(&mut picker, &mut io);
         assert!(result.is_err());
@@ -848,11 +875,7 @@ mod tests {
 
     #[test]
     fn a_clean_cancel_hands_the_screen_back() {
-        let mut io = FakeIo::new(FakeBackend {
-            fail_draw: false,
-            cursor: ratatui::layout::Position::new(0, 0),
-        })
-        .event(Ok(Event::Key(KeyEvent::new(
+        let mut io = FakeIo::new().event(Ok(Event::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
         ))));
@@ -861,5 +884,32 @@ mod tests {
         assert_eq!(io.enabled, 1);
         assert_eq!(io.disabled, 1);
         assert_eq!(io.hand_backs.len(), 1);
+    }
+
+    /// A frame that renders only a `Paragraph` sets no cursor, so both ratatui's
+    /// resize anchoring and `PinnedBackend`'s cached answer would read the last
+    /// changed cell against the construction probe's row. Growing the screen
+    /// after the first frame then computed the wrong top and cleared the shell
+    /// output above the picker.
+    #[test]
+    fn a_resize_keeps_the_viewport_where_it_started() {
+        let mut io = FakeIo::new();
+        // The shell's prompt sat on row 5. The screen grows after the first
+        // frame, and the queued resize makes the loop redraw and autoresize.
+        io.backend.as_mut().unwrap().cursor = ratatui::layout::Position::new(0, 5);
+        io.resize_on_next_event = Some((80, 30));
+        io.events.push_back(Ok(Event::Resize(80, 30)));
+        io.events.push_back(Ok(Event::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))));
+        let mut picker = Picker::new(sample(), "kloop");
+        let mut session = PickerSession::open(&mut io, 12).unwrap();
+        session.run(&mut picker).unwrap();
+        assert_eq!(
+            session.terminal.get_frame().area().y,
+            5,
+            "the picker re-anchored away from the row it started on"
+        );
     }
 }
