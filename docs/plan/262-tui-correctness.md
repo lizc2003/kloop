@@ -84,6 +84,9 @@
   `last_known_cursor_pos`(帧内最后改动格)，`PinnedBackend` 的缓存读构造探针的行,两者
   不一致时 resize 把视口锚到第 0 行并清掉上方 shell 输出。每帧画完把光标停到视口顶行
   (光标仍隐藏),resize 回归测试用共享尺寸的假终端在帧间撑大屏幕,断言视口仍停在第 5 行。
+  该测试的 fake backend 必须真的消费 `draw` 的迭代器:ratatui 在 `flush` 的 `inspect` 里记录
+  最后改动格,丢掉惰性迭代器就永远停在探针行,测试会变成永绿(复核实测:删掉修复后断言
+  `left: 0, right: 5` 才失败)。
 
 ## 验收
 

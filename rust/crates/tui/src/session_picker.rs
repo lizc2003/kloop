@@ -793,10 +793,15 @@ mod tests {
     impl Backend for FakeBackend {
         type Error = std::io::Error;
 
-        fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
         where
             I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
         {
+            // Drain the diff like a real backend does: ratatui records the last
+            // drawn cell from `Terminal::flush`'s `inspect`, so a backend that
+            // drops the lazy iterator leaves the resize anchoring reading the
+            // construction probe and the test would not reproduce anything.
+            for _ in content {}
             if self.fail_draw {
                 return Err(std::io::Error::other("draw failed"));
             }
