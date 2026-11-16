@@ -118,7 +118,10 @@ clippy 现在全绿（仍未在 Windows 实跑）。
 
 第二轮复审两条：批处理脚本路径先按 std 的规则把 `\\?\C:\…` 与 `\\?\UNC\…` 转成
 cmd 能懂的写法（`to_user_script_path`，其余形式原样保留），并在拼接前拒绝脚本路径里的 NUL
-（否则命令在 NUL 处截断、参数一起丢失）；两条都有单测。
+（否则命令在 NUL 处截断、参数一起丢失）；两条都有单测。第三轮补上转前缀前的等价检查：
+候选路径先过 `GetFullPathNameW`，规范化结果与候选项不一致（例如 `\\?\C:\tools.\server.cmd`
+里的 `tools.` 会被 Win32 去掉末尾点）就保留原 verbatim 路径、让 cmd 明确失败，而不是执行
+另一份脚本；判定逻辑接一个可注入的规范化函数，本机用模拟 Win32 规则的假函数钉住。
 
 验证：`cargo test -p kloop-mcp`（43 lib + 14 集成）、`cargo test -p kloop-process-spawn`
 （15 项，含 piped stdin、孙进程收尾、批处理转义与路径解析）、`cargo test -p kloop-core --lib`、`cargo test -p kloop --bin kloop mcp_auth`

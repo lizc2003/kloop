@@ -43,23 +43,86 @@ pub(crate) fn is_batch_script(path: &Path) -> bool {
         })
 }
 
-/// `cmd.exe` does not understand verbatim (`\\?\`) paths. Convert the two forms
-/// the standard library converts (`\\?\C:\…` and `\\?\UNC\…`) and leave
-/// anything else untouched, as it does.
-pub(crate) fn to_user_script_path(script: &[u16]) -> Vec<u16> {
+/// `cmd.exe` does not understand verbatim (`\\?\`) paths. Strip the prefix only
+/// when the result means the same file: Win32 path normalisation drops trailing
+/// dots and spaces from components, so `\\?\C:\tools.\server.cmd` must not
+/// become `C:\tools\server.cmd`. `normalize` is the platform's own
+/// normalisation (`GetFullPathNameW`); a changed result keeps the original
+/// verbatim path, which makes cmd fail instead of running a different script.
+pub(crate) fn to_user_script_path(
+    script: &[u16],
+    normalize: impl Fn(&[u16]) -> Option<Vec<u16>>,
+) -> Vec<u16> {
     const SEP: u16 = b'\\' as u16;
     const QUERY: u16 = b'?' as u16;
     const COLON: u16 = b':' as u16;
     const UNC: [u16; 3] = [b'U' as u16, b'N' as u16, b'C' as u16];
+    // The standard library skips the check for paths above the legacy limit.
+    const LEGACY_MAX_PATH: usize = 260;
+    if script.len() >= LEGACY_MAX_PATH {
+        return script.to_vec();
+    }
     match script {
         [SEP, SEP, QUERY, SEP, u, n, c, SEP, rest @ ..] if [*u, *n, *c] == UNC => {
-            let mut out = vec![SEP, SEP];
-            out.extend_from_slice(rest);
-            out
+            let mut candidate = vec![SEP, SEP];
+            candidate.extend_from_slice(rest);
+            if normalize(&candidate).as_deref() == Some(candidate.as_slice()) {
+                candidate
+            } else {
+                script.to_vec()
+            }
         }
-        [SEP, SEP, QUERY, SEP, _, COLON, SEP, ..] => script[4..].to_vec(),
+        [SEP, SEP, QUERY, SEP, _, COLON, SEP, ..] => {
+            let candidate = &script[4..];
+            if normalize(candidate).as_deref() == Some(candidate) {
+                candidate.to_vec()
+            } else {
+                script.to_vec()
+            }
+        }
         _ => script.to_vec(),
     }
+}
+
+/// `GetFullPathNameW` on a path without its NUL terminator, or `None` if the
+/// path cannot be normalised.
+#[cfg(windows)]
+pub(crate) fn win32_normalize(path: &[u16]) -> Option<Vec<u16>> {
+    use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
+
+    let mut input = path.to_vec();
+    input.push(0);
+    let mut buffer = vec![0u16; path.len().max(260)];
+    let required = unsafe {
+        GetFullPathNameW(
+            input.as_ptr(),
+            buffer.len() as u32,
+            buffer.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if required == 0 {
+        return None;
+    }
+    let required = required as usize;
+    if required >= buffer.len() {
+        buffer = vec![0u16; required];
+        let second = unsafe {
+            GetFullPathNameW(
+                input.as_ptr(),
+                buffer.len() as u32,
+                buffer.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if second == 0 || second as usize >= buffer.len() {
+            return None;
+        }
+        buffer.truncate(second as usize);
+    } else {
+        buffer.truncate(required);
+    }
+    Some(buffer)
 }
 
 /// The full command line (NUL terminated) that runs `script` through `cmd.exe`
@@ -224,20 +287,53 @@ mod tests {
         );
     }
 
+    /// A stand-in for `GetFullPathNameW` that applies the one Win32 rule the
+    /// conversion must not silently undo: trailing dots/spaces in a component
+    /// are dropped.
+    fn normalize_dropping_component_dots(path: &[u16]) -> Option<Vec<u16>> {
+        let text = String::from_utf16(path).unwrap();
+        let mut out = String::new();
+        for (index, component) in text.split('\\').enumerate() {
+            if index > 0 {
+                out.push('\\');
+            }
+            out.push_str(component.trim_end_matches(['.', ' ']));
+        }
+        Some(out.encode_utf16().collect())
+    }
+
     #[test]
-    fn verbatim_script_paths_are_converted_for_cmd() {
+    fn verbatim_script_paths_are_converted_only_when_they_mean_the_same_file() {
         let units = |text: &str| -> Vec<u16> { text.encode_utf16().collect() };
+        // Lossless: the normaliser returns the candidate unchanged.
         assert_eq!(
-            to_user_script_path(&units(r"\\?\C:\tools\server.cmd")),
+            to_user_script_path(&units(r"\\?\C:\tools\server.cmd"), |path| Some(
+                path.to_vec()
+            )),
             units(r"C:\tools\server.cmd")
         );
         assert_eq!(
-            to_user_script_path(&units(r"\\?\UNC\srv\share\a.cmd")),
+            to_user_script_path(&units(r"\\?\UNC\srv\share\a.cmd"), |path| {
+                Some(path.to_vec())
+            }),
             units(r"\\srv\share\a.cmd")
         );
+
+        // `tools.` means a different directory once the prefix is gone, so the
+        // verbatim path is kept and cmd fails loudly instead of running
+        // `C:\tools\server.cmd`.
+        let dotted = units(r"\\?\C:\tools.\server.cmd");
+        assert_eq!(
+            to_user_script_path(&dotted, normalize_dropping_component_dots),
+            dotted
+        );
+
         // Anything that is not one of those two forms stays as it is.
         for path in [r"C:\tools\server.cmd", r"\\?\Volume{2}\a.cmd", r"a.cmd"] {
-            assert_eq!(to_user_script_path(&units(path)), units(path));
+            assert_eq!(
+                to_user_script_path(&units(path), |candidate| Some(candidate.to_vec())),
+                units(path)
+            );
         }
     }
 

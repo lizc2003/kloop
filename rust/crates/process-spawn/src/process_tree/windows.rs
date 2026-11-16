@@ -1048,7 +1048,10 @@ fn application_and_command_line(
     args: &[OsString],
 ) -> io::Result<(PathBuf, Vec<u16>)> {
     if batch::is_batch_script(executable) {
-        let script = batch::to_user_script_path(&batch::wide_units(executable.as_os_str()));
+        let script = batch::to_user_script_path(
+            &batch::wide_units(executable.as_os_str()),
+            batch::win32_normalize,
+        );
         let args = batch::wide_args(args);
         Ok((
             batch::command_prompt()?,
