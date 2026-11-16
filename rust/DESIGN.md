@@ -1906,9 +1906,9 @@ and clips what does not fit, so whatever overflows is frozen — exactly that mu
 so a tall final message (the last turn on `-c` resume, trailed by a one-line
 note) is never stranded behind a full-screen blank pad (plan 99). Freezing goes
 by line. Each cell says how tall it is on screen, how many of its leading lines
-are settled, and whether it may leave whole (`render::shown_cells`, which the
-draw uses too, so the lines written to scrollback are the lines that were on
-screen); one pure `freeze_target` lets cells leave whole while they fit in the
+are settled, and whether it may leave whole (`render::FramePlan`, whose one plan
+per frame both the draw and the commit read, so the lines written to scrollback
+are the lines that were on screen); one pure `freeze_target` lets cells leave whole while they fit in the
 overflow, then freezes the settled prefix of the next one down to exactly the
 overflow, and the viewport picks that cell up one line below the seam. A finished
 cell is settled throughout and may leave. A streaming answer is settled as far
@@ -1980,6 +1980,26 @@ cursor projection, visible height, and ↑/↓ navigation likewise come from one
 canonical visual-row layout.
 Streaming deltas are drained in batches so a burst of tokens redraws once, not
 per token.
+
+A frame derives its expensive parts **once** (plan 263). `render::FramePlan`
+holds the rendered tail cells, the mutable chrome above the composer, and the
+composer's own wrapped rows; the draw and the overflow commit read that one
+plan, where the commit used to render the whole tail again, and the repaint
+after a commit plans again because the tail it draws is a different one. Cells
+that cannot change are memoized across frames in `render::ShownCache`, keyed by
+the cell itself (content, width, liveness) rather than by a revision the App
+would have to maintain: a sealed answer above a streaming one is parsed on the
+frame it enters the cache and never again, and the open last cell — the one
+whose text is arriving — is the only one re-parsed every frame. A frame
+therefore costs a bounded number of markdown parses that does not grow with the
+length of the answer or the number of consumers (a test counts parser runs
+through the real draw path); the transcript builder also clones only the lines
+that can still fit the viewport. Work that blocks — an `@` completion walk over
+the whole tree, an OS clipboard read with PNG encoding, a dropped image file's
+read, a `git` branch lookup after a cwd change — runs on the blocking pool and
+reports back over a task channel; the loop drops a result whose query or
+directory it has already moved past, and file searches are debounced so a burst
+of keystrokes starts one walk rather than one per key.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
 (see below); **Esc** is about the composer first: while it holds anything (text

@@ -71,9 +71,25 @@ const TAB_WIDTH: usize = 4;
 /// builder accumulates these, then wraps them into [`Line`]s at width.
 type Chars = Vec<(char, Style)>;
 
+// Parser runs on this thread. A frame must not parse the same tail more than
+// once (plan 263), and a test asserts that by counting them; thread-local so
+// parallel tests cannot see each other's parses.
+#[cfg(test)]
+thread_local! {
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Take and reset this thread's markdown parser count.
+#[cfg(test)]
+pub(crate) fn take_parse_count() -> usize {
+    PARSES.with(|count| count.replace(0))
+}
+
 /// Render a complete (finalized) markdown string to styled lines. Used for a
 /// sealed assistant cell — everything is stable, so the whole text is parsed.
 pub fn markdown_lines(md: &str, width: usize) -> Vec<Line<'static>> {
+    #[cfg(test)]
+    PARSES.with(|count| count.set(count.get() + 1));
     let normalized = normalize_nested_fences(md);
     let mut r = Renderer::new(width.max(1));
     for (ev, range) in Parser::new_ext(&normalized, parser_options()).into_offset_iter() {

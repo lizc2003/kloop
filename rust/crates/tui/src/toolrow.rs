@@ -19,6 +19,7 @@ use ratatui::text::Span;
 use serde_json::Value;
 
 use crate::app::ToolStatus;
+use crate::render::mark_span;
 use crate::text_layout::display_width;
 use crate::text_layout::truncate;
 
@@ -70,7 +71,7 @@ fn header_line(name: &str, input: &str, status: ToolStatus, width: usize) -> Lin
     let (mark, color) = tool_mark(status);
     let (verb, detail) = tool_label(name, input);
     let mut spans = vec![
-        Span::styled(format!("{mark} "), Style::new().fg(color)),
+        mark_span(mark, color),
         Span::styled(verb.clone(), Style::new().add_modifier(Modifier::BOLD)),
     ];
     if !detail.is_empty() {

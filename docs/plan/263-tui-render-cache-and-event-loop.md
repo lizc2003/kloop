@@ -1,8 +1,7 @@
 # Plan 263 — TUI 渲染缓存、事件循环与面板去重
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量。**先做 plan 262**(宽度算法
-> 统一会改到这里要缓存的 markdown 行)。
+> 状态：✅ 2026-11-16 完成(plan 262 已完成)。行号是 2026-10-28 的读数，实际按函数定位。
 
 ## 问题
 
@@ -56,3 +55,24 @@
   线性而非与全文相乘;PTY 快照不变。
 - 事件循环：用慢速搜索夹具断言 tick 与 agent 事件在搜索期间仍被处理。
 - 外层执行沙箱之外 `make check`;DESIGN 的 TUI 渲染一节先读再改;HANDOFF 记进展与教训。
+
+## 完成记录(2026-11-16)
+
+- **渲染**：新增 `render::FramePlan`(尾部 cells + chrome + composer 视图),`draw` 与
+  `commit_overflow` 读同一份;`render::ShownCache` 跨帧缓存不可变 cell;`FramePlan::transcript`
+  只克隆可能进视口的那几行。提交后重画按新状态另算一份 plan(旧路径本来也要重画)。
+- **缓存键**：(`cell` 内容, width, live),不是(下标, 修订号, width)——见 HANDOFF 教训 395。
+  开放的最后 cell 每帧重算(文本在增长、thinking 时钟在走)。
+- **事件循环**：`@` 搜索(60ms 防抖 + 序号作废)、Ctrl+V 剪贴板、拖入图片路径读取、cwd 变化后
+  的 `git` 分支查询,全部 `spawn_blocking` + `UiTask` 回送,过期结果丢弃;`on_input`/`on_command`
+  改回同步。图片路径读取失败仍把原文按普通粘贴处理(与原行为一致,只是晚一拍)。
+- **字素边界**：`GraphemeCursor::new(offset, len, true).is_boundary(text, 0)`,整串当一个 chunk。
+- **去重**：`list_key`/`ListKey`、`shift_indices`、`mark_span`/`status_header`、`finish_turn`、
+  `teardown(cfg, ui, worker)`。setup 失败与正常退出共用 teardown,worker abort 仍夹在后台
+  关闭与 worktree 收尾之间(顺序未变)。
+- **验证**：kloop-tui 332 项 lib 测试(新增 7 项:`list_key` 表、字素边界逐字节等价、图片路径
+  识别、搜索防抖/作废、`ShownCache` 每帧解析次数(10k 行回答)、真实 `draw_frame` 路径解析
+  次数、plan transcript 与旧展平结果一致);`cargo test -p kloop --test tui_pty` 25 项(快照
+  未变);`clippy -p kloop-tui --all-targets -D warnings`、`cargo fmt --check`、
+  `cargo check --workspace`。未跑全量 `make check`、parity、真实 API。
+- **教训**：HANDOFF 394(合并绘制路径时丢掉帧交接,PTY 才看得出来)、395(内容相等当缓存键)。

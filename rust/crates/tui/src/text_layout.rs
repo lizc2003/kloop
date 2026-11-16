@@ -1,5 +1,6 @@
 use std::fmt;
 
+use unicode_segmentation::GraphemeCursor;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -79,10 +80,13 @@ pub(crate) fn is_grapheme_boundary(text: &str, offset: ByteOffset) -> bool {
     if offset > text.len() || !text.is_char_boundary(offset) {
         return false;
     }
-    offset == text.len()
-        || text
-            .grapheme_indices(true)
-            .any(|(index, _)| index == offset)
+    // The whole string is one chunk (chunk start 0), so the cursor never asks
+    // for context outside it and every lookup is answered locally — a scanner
+    // from byte 0 here costs an edit O(n²) across the composer's boundary
+    // checks.
+    GraphemeCursor::new(offset, text.len(), true)
+        .is_boundary(text, 0)
+        .unwrap_or(false)
 }
 
 pub(crate) fn previous_grapheme_boundary(text: &str, offset: ByteOffset) -> ByteOffset {
@@ -228,6 +232,32 @@ mod tests {
                 assert!(!is_grapheme_boundary(&text, ByteOffset::new(byte)));
             }
         }
+    }
+
+    #[test]
+    fn boundaries_match_the_grapheme_walk_at_every_byte() {
+        // Long enough that a from-zero scan would be the wrong shape, and mixed
+        // families so the cursor's context logic (not just char boundaries) is
+        // what is under test.
+        let text = format!("{}e\u{301}🇨🇳👨‍👩‍👧‍👦z", "ab你".repeat(200));
+        let boundaries: Vec<bool> = (0..=text.len())
+            .map(|offset| is_grapheme_boundary(&text, ByteOffset::new(offset)))
+            .collect();
+        for (start, _) in text.grapheme_indices(true) {
+            assert!(boundaries[start], "grapheme start {start} rejected");
+        }
+        let starts: std::collections::HashSet<usize> = text
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .chain(std::iter::once(text.len()))
+            .collect();
+        for (offset, boundary) in boundaries.iter().enumerate() {
+            assert_eq!(*boundary, starts.contains(&offset), "byte {offset}");
+        }
+        assert!(!is_grapheme_boundary(
+            &text,
+            ByteOffset::new(text.len() + 1)
+        ));
     }
 
     #[test]

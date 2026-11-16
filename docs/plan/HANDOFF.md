@@ -33,6 +33,26 @@ push` 曾靠它挡住 `bash(git push *)`：现在对含未决读取的调用按�
 改为 `BashRead::Allowed { requires_protection, unresolved }` 各自保留，补共存回归，
 `permissions::` 209 项通过。教训 392。
 
+**Plan 263 ✅：TUI 渲染缓存、事件循环与面板去重（2026-11-16）**：四条全部成立。
+渲染：新增 `render::FramePlan`（一道帧里算一次尾部 cells、chrome、composer 视图），`draw`
+与 `commit_overflow` 读同一份 plan——原来提交会把整段流式回答再解析一遍，重画又来一遍；
+`ShownCache` 跨帧缓存不可变 cell（见教训 394），开放的最后 cell 每帧重算；`transcript`
+只克隆可能进视口的那几行，底部锚定的裁剪、`freeze_target` 的输入都没变。
+事件循环：`@` 补全、Ctrl+V 剪贴板、拖入图片路径、cwd 变化的 `git` 分支查询都改成
+`spawn_blocking` + `UiTask` 回送，过期结果丢弃（搜索按序号、图片路径按原文本回落、分支按
+cwd 比对）；`@` 搜索加 60ms 防抖并被新查询作废，`on_input`/`on_command` 随之改回同步。
+字素边界改用 `GraphemeCursor::new(offset, len, true).is_boundary(text, 0)`，不再每次从头扫。
+去重：`list_key`（四个面板共用 ↑↓/j/k、数字选行、PgUp/PgDn）、`shift_indices`、
+`mark_span`/`status_header`（toolrow 与三类状态行）、`finish_turn`、`teardown(cfg, ui,
+worker)`（正常退出与 setup 失败共用，worker abort 仍夹在后台关闭与 worktree 收尾之间）。
+与计划的两处差异：缓存键是 (`cell` 内容, width, live) 而不是（下标, 修订号, width）——见教训
+395；面板数字键统一走 `list_key` 后，审批面板越界数字仍是惰性，问题面板的越界数字也从“提前
+返回”变成落到同一条惰性路径，行为等价。验证：kloop-tui 332 项 lib 测试（新增 7 项，含
+`markdown::take_parse_count` 的解析次数回归：封口 cell 首帧后不再解析、10k 行流式回答每帧
+至多 2 次解析、真实 `draw_frame` 路径每帧 ≤2）、`clippy -p kloop-tui --all-targets -D warnings`、
+`cargo fmt --check`、`cargo check --workspace`、`cargo test -p kloop --test tui_pty` 25 项
+（PTY 快照未变）。未跑全量 `make check`、parity、真实 API。
+
 **Plan 262 ✅：TUI 正确性（2026-11-16）**：八条复核全部成立，开工问题定为 Tab 展开 4 个空格。
 选择器:新增 `PickerIo` trait(注入 fake 终端)与 `PickerSession`,raw mode 和 hand-back 一起在
 `Drop` 里撤,draw/read 失败也恢复;backend 换成 `PinnedBackend`,resize 的 inline 重排不再发
@@ -1736,7 +1756,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **260** ✅ MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
 | **261** ✅ web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
 | **262** ✅ TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
-| **263** TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
+| **263** ✅ TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
 | **264** 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
 | **265** 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
 | **266** ✅ 权限判定一次产出 | `Verdict` 贯穿到执行;同一命令解析 5–7 次;两套 glob 语义;tree 选项两份 | 大 | 243、244、245 |
@@ -5153,3 +5173,20 @@ hook”这种看似最稳妥的写法,恰好把一次可恢复的 panic 升级�
 实际剩下的约束，问用户要不要的是这些约束；静态硬限制（deny、明确的凭据拼写）和“需要沙箱
 本身作保护”的调用单独保留，别让它们跟着运行时容器一起去留。另外，模型的自查结论要回到
 代码核对：报告里“DNS 被沙箱禁”的一半是探测脚本吞了异常、以 0 退出造成的。
+
+394. **把“两条路径各算一遍”合成一处时，要逐条搬走旧路径的副作用，尤其是帧的交接。** plan 263
+把 draw 与 commit 合并到一个 `FramePlan`，重画函数改成了“计划 + 画”，却漏掉原来那句
+`commit_frame`：帧留在 `FrameWriter` 里，要等下一个事件顺手 flush，平时看不出来——PTY 测试
+报的是“第一次 Ctrl+C 没有出现退出提示”，因为按键那帧恰好触发了 overflow 提交，重画被扣住。
+判据：合并绘制段落时，对照旧实现的**非绘制副作用**（release/flush、清屏、光标、尺寸栅栏、
+drain 顺序）逐项确认还在；单测用内存 backend（直接 flush）测不出来，这类改动要跑真实 PTY
+路径。另一个好用的定位法：临时在循环里记一行“事件 → 绘制 → 提交”的 trace，先分清是
+状态没更新、还是字节没出去。
+
+395. **跨帧缓存按“内容相等”当键，比给每个修改点挂修订号更省心也更难错。** App 里改 `cells`
+的路径有三十来处（delta、ToolEnd、plan 盖章、drain、truncate…），每处加一次 `rev += 1` 迟早
+漏一处，漏了就是画错而不是画慢；而 `Cell` 本身已经 `Clone + Eq`，缓存条目存一份 cell 并按
+`(内容, width, live)` 命中，任何遗漏都会被内容比较兜住，代价只是每帧一次 memcmp（封口 cell
+不在流式热路径上）。判据：要 memo 的值完全由某个 `Eq` 值决定时，优先按那个值做键，把
+“修订号”留给真的很大、比较很贵又确实有单一写入口的对象。顺带：这类缓存只该吃掉“不可能
+变”的部分，正在流式的那一格必须每帧重算，否则时钟、光标和未闭合的 markdown 都会僵住。

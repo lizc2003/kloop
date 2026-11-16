@@ -73,6 +73,40 @@ fn canonicalize_paste(text: &str) -> String {
     canonical
 }
 
+/// Rows a PgUp/PgDn moves the panel body. The option list keeps the same page
+/// size as the preview it sits next to.
+const PANEL_PAGE_ROWS: usize = 10;
+
+/// What one key does to a numbered list panel — the approvals, questions,
+/// provider picker and rewind picker all navigate the same way, and the details
+/// had started to drift. `rows` is how many rows the cursor may occupy; a
+/// pressed digit is the 1-based row number the panel prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListKey {
+    /// ↑/↓ (or k/j): the cursor's new row.
+    Moved(usize),
+    /// A printed row number: move there, then do what Enter does on that panel.
+    Pick(usize),
+    /// PgUp/PgDn: scroll the panel body by this many rows.
+    Page(isize),
+}
+
+fn list_key(code: KeyCode, cursor: usize, rows: usize) -> Option<ListKey> {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => Some(ListKey::Moved(cursor.saturating_sub(1))),
+        KeyCode::Down | KeyCode::Char('j') => {
+            Some(ListKey::Moved((cursor + 1).min(rows.saturating_sub(1))))
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let row = c.to_digit(10).expect("ascii digit") as usize - 1;
+            (row < rows).then_some(ListKey::Pick(row))
+        }
+        KeyCode::PageUp => Some(ListKey::Page(-(PANEL_PAGE_ROWS as isize))),
+        KeyCode::PageDown => Some(ListKey::Page(PANEL_PAGE_ROWS as isize)),
+        _ => None,
+    }
+}
+
 fn is_composer_newline_key(key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1371,6 +1405,29 @@ impl App {
         self.head_frozen = Some((width, lines));
     }
 
+    /// Land the branch for `cwd` that the loop resolved off-thread. The
+    /// `CwdChanged` event itself may carry none (the worktree tool leaving a
+    /// tree), and the `git` read that fills it cannot block the event loop — so
+    /// it arrives here later. Ignored once the session moved on, and the note
+    /// written when the cwd changed is updated in place if it is still the last
+    /// cell: it is the one place the transcript names the branch.
+    pub fn fill_branch(&mut self, cwd: &str, branch: Option<String>) {
+        if self.cwd != cwd {
+            return;
+        }
+        let plain = format!("working directory → {cwd}");
+        let with_branch = branch
+            .as_ref()
+            .map(|branch| format!("working directory → {cwd} (branch {branch})"));
+        if let Some(Cell::Note(note)) = self.cells.last_mut()
+            && *note == plain
+            && let Some(with_branch) = with_branch
+        {
+            *note = with_branch;
+        }
+        self.branch = branch;
+    }
+
     pub(crate) fn display_cell_live(&self, index: usize) -> bool {
         self.assistant_cells.values().any(|value| *value == index)
             || self.reasoning_cells.values().any(|value| *value == index)
@@ -1504,30 +1561,15 @@ impl App {
             }
         }
         self.cells.drain(0..n);
-        self.tool_cells.retain(|_, i| {
-            *i = i.wrapping_sub(n);
-            *i < self.cells.len()
-        });
-        self.agent_cells.retain(|_, i| {
-            *i = i.wrapping_sub(n);
-            *i < self.cells.len()
-        });
-        self.background_task_cells.retain(|_, i| {
-            *i = i.wrapping_sub(n);
-            *i < self.cells.len()
-        });
-        self.agent_message_cells.retain(|_, i| {
-            *i = i.wrapping_sub(n);
-            *i < self.cells.len()
-        });
-        self.assistant_cells.retain(|_, i| {
-            *i = i.wrapping_sub(n);
-            *i < self.cells.len()
-        });
-        self.reasoning_cells.retain(|_, i| {
-            *i = i.wrapping_sub(n);
-            *i < self.cells.len()
-        });
+        // Every map from a key to a `cells` index shifts down by the committed
+        // prefix; entries that pointed into it are dropped.
+        let len = self.cells.len();
+        shift_indices(&mut self.tool_cells, n, len);
+        shift_indices(&mut self.agent_cells, n, len);
+        shift_indices(&mut self.background_task_cells, n, len);
+        shift_indices(&mut self.agent_message_cells, n, len);
+        shift_indices(&mut self.assistant_cells, n, len);
+        shift_indices(&mut self.reasoning_cells, n, len);
     }
 
     pub fn on_key(&mut self, composer_width: usize, key: KeyEvent) -> Command {
@@ -1934,48 +1976,35 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Command::None;
         }
-        // Paging scrolls the panel body (a tall diff); the arrows belong
-        // to the option list now, so a long preview is read with PgUp/PgDn.
-        match key.code {
-            KeyCode::PageUp => {
-                self.panel_scroll = self.panel_scroll.saturating_sub(10);
-                return Command::None;
-            }
-            KeyCode::PageDown => {
-                self.panel_scroll += 10;
-                return Command::None;
-            }
-            _ => {}
-        }
         let Some(PendingInteraction::Confirm { req, cursor, .. }) = self.interactions.front_mut()
         else {
             return Command::None;
         };
         let choices = confirm_choices(req);
         let last = choices.len() - 1;
-        let decision = match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                *cursor = cursor.saturating_sub(1);
+        let decision = match list_key(key.code, *cursor, choices.len()) {
+            // Paging scrolls the panel body (a tall diff); the arrows belong
+            // to the option list now, so a long preview is read with PgUp/PgDn.
+            Some(ListKey::Page(by)) => {
+                self.panel_scroll = self.panel_scroll.saturating_add_signed(by);
                 None
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                *cursor = (*cursor + 1).min(last);
+            Some(ListKey::Moved(at)) => {
+                *cursor = at;
                 None
             }
-            KeyCode::Enter => Some(choices[(*cursor).min(last)].decision),
-            // Esc is the deny row, which is always last.
-            KeyCode::Esc => Some(choices[last].decision),
-            // The row numbers the panel prints, and the y/a/p/n letters a
-            // returning user's fingers already know.
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
-                choices.get(row).map(|choice| choice.decision)
-            }
-            KeyCode::Char(c) => choices
-                .iter()
-                .find(|choice| choice.key == c.to_ascii_lowercase())
-                .map(|choice| choice.decision),
-            _ => None,
+            Some(ListKey::Pick(row)) => Some(choices[row].decision),
+            None => match key.code {
+                KeyCode::Enter => Some(choices[(*cursor).min(last)].decision),
+                // Esc is the deny row, which is always last.
+                KeyCode::Esc => Some(choices[last].decision),
+                // The y/a/p/n letters a returning user's fingers already know.
+                KeyCode::Char(c) => choices
+                    .iter()
+                    .find(|choice| choice.key == c.to_ascii_lowercase())
+                    .map(|choice| choice.decision),
+                _ => None,
+            },
         };
         let Some(decision) = decision else {
             return Command::None;
@@ -2008,49 +2037,37 @@ impl App {
         let Some(PendingInteraction::Question(question)) = self.interactions.front_mut() else {
             return Command::None;
         };
-        // A row number acts as "move there, then confirm" — or, on a
-        // multi-select's own options, as "tick that row".
-        let key = match key.code {
-            KeyCode::Char(c)
-                if question.phase == QuestionPhase::Select && c.is_ascii_digit() && c != '0' =>
-            {
-                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
-                let options = question.current().options.len();
-                // The two rows past the options are Other and Chat about this.
-                if row > options + 1 {
-                    return Command::None;
-                }
-                let tick = question.current().multi_select && row < options;
-                question.cursor = row;
-                KeyEvent::new(
-                    if tick {
-                        KeyCode::Char(' ')
-                    } else {
-                        KeyCode::Enter
-                    },
-                    key.modifiers,
-                )
-            }
-            _ => key,
-        };
         let mut outcome = None;
         match question.phase {
             QuestionPhase::Select => {
                 let option_count = question.current().options.len();
+                // The two rows past the options are Other and Chat about this.
+                let key = match list_key(key.code, question.cursor, option_count + 2) {
+                    Some(ListKey::Moved(at)) => {
+                        question.cursor = at;
+                        return Command::None;
+                    }
+                    Some(ListKey::Page(by)) => {
+                        self.panel_scroll = self.panel_scroll.saturating_add_signed(by);
+                        return Command::None;
+                    }
+                    // A row number acts as "move there, then confirm" — or, on
+                    // a multi-select's own options, as "tick that row".
+                    Some(ListKey::Pick(row)) => {
+                        let tick = question.current().multi_select && row < option_count;
+                        question.cursor = row;
+                        KeyEvent::new(
+                            if tick {
+                                KeyCode::Char(' ')
+                            } else {
+                                KeyCode::Enter
+                            },
+                            key.modifiers,
+                        )
+                    }
+                    None => key,
+                };
                 match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        question.cursor = question.cursor.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        // Two rows live past the options: Other, then Chat.
-                        question.cursor = (question.cursor + 1).min(option_count + 1);
-                    }
-                    KeyCode::PageUp => {
-                        self.panel_scroll = self.panel_scroll.saturating_sub(10);
-                    }
-                    KeyCode::PageDown => {
-                        self.panel_scroll += 10;
-                    }
                     KeyCode::Char(' ') if question.current().multi_select => {
                         if question.cursor < option_count {
                             if let Some(position) = question
@@ -2126,27 +2143,18 @@ impl App {
         }
         // A row number acts as "move there, then Enter": the panel prints those
         // numbers, so they have to answer.
-        let key = match key.code {
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
-                if row >= picker.rows() {
-                    return Command::None;
-                }
+        let key = match list_key(key.code, *picker.cursor(), picker.rows()) {
+            Some(ListKey::Moved(at)) => {
+                *picker.cursor() = at;
+                return Command::None;
+            }
+            Some(ListKey::Pick(row)) => {
                 *picker.cursor() = row;
                 KeyEvent::new(KeyCode::Enter, key.modifiers)
             }
             _ => key,
         };
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                let cursor = picker.cursor();
-                *cursor = cursor.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let last = picker.rows() - 1;
-                let cursor = picker.cursor();
-                *cursor = (*cursor + 1).min(last);
-            }
             KeyCode::Enter if picker.stage == RoutePickerStage::Effort => {
                 let command = picker.command();
                 self.provider_picker = None;
@@ -2182,24 +2190,18 @@ impl App {
             return Command::None;
         }
         // Same as everywhere else: the printed row numbers pick directly.
-        let key = match key.code {
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let row = c.to_digit(10).expect("ascii digit") as usize - 1;
-                if row >= picker.points.len() {
-                    return Command::None;
-                }
+        let key = match list_key(key.code, picker.cursor, picker.points.len()) {
+            Some(ListKey::Moved(at)) => {
+                picker.cursor = at;
+                return Command::None;
+            }
+            Some(ListKey::Pick(row)) => {
                 picker.cursor = row;
                 KeyEvent::new(KeyCode::Enter, key.modifiers)
             }
             _ => key,
         };
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                picker.cursor = picker.cursor.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.cursor = (picker.cursor + 1).min(picker.points.len() - 1);
-            }
             KeyCode::Enter => {
                 // The picker is only opened with a non-empty list, so the cursor
                 // always indexes a real point.
@@ -2230,6 +2232,16 @@ impl App {
         }
         Command::None
     }
+}
+
+/// Rebase one key→`cells`-index map after `n` leading cells left for native
+/// scrollback: surviving entries shift down by `n`, entries into the committed
+/// prefix drop. A late event for a dropped row is then a harmless no-op.
+fn shift_indices(map: &mut HashMap<String, usize>, n: usize, cells: usize) {
+    map.retain(|_, index| {
+        *index = index.wrapping_sub(n);
+        *index < cells
+    });
 }
 
 fn finish_question(
@@ -4523,6 +4535,32 @@ mod tests {
             0,
             "and opens on its own safe default"
         );
+    }
+
+    /// Every numbered list panel navigates through one helper, so the row
+    /// arithmetic (clamping, 1-based numbers, page size) is stated once here.
+    #[test]
+    fn list_navigation_is_the_same_in_every_panel() {
+        use KeyCode::Char;
+        use KeyCode::Down;
+        use KeyCode::Enter;
+        use KeyCode::PageDown;
+        use KeyCode::PageUp;
+        use KeyCode::Up;
+
+        assert_eq!(list_key(Up, 2, 5), Some(ListKey::Moved(1)));
+        assert_eq!(list_key(Char('k'), 0, 5), Some(ListKey::Moved(0)));
+        assert_eq!(list_key(Down, 1, 5), Some(ListKey::Moved(2)));
+        assert_eq!(list_key(Char('j'), 4, 5), Some(ListKey::Moved(4)));
+        assert_eq!(list_key(Down, 0, 0), Some(ListKey::Moved(0)));
+        // Row numbers are the 1-based ones the panel prints.
+        assert_eq!(list_key(Char('1'), 3, 5), Some(ListKey::Pick(0)));
+        assert_eq!(list_key(Char('5'), 0, 5), Some(ListKey::Pick(4)));
+        assert_eq!(list_key(Char('6'), 0, 5), None);
+        assert_eq!(list_key(Char('0'), 0, 5), None);
+        assert_eq!(list_key(PageDown, 0, 5), Some(ListKey::Page(10)));
+        assert_eq!(list_key(PageUp, 0, 5), Some(ListKey::Page(-10)));
+        assert_eq!(list_key(Enter, 0, 5), None);
     }
 
     /// The panel's row numbers, Enter on the cursor row, and Esc all answer;

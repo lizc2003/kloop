@@ -162,6 +162,26 @@ enum WorkerMsg {
     },
 }
 
+/// Tear the session down after the terminal is restored (or was never set up):
+/// background work first, then the worker — it holds the session rollout, and
+/// aborting mid-write is equivalent to a killed session, which resume already
+/// repairs — and last the session worktree (dirty kept on its branch, clean
+/// removed; the terminal is restored by now, so a kept-tree note reaches
+/// stderr). The setup-failure exit and the normal one both go through here;
+/// only the worker differs, and it does not exist yet when setup failed.
+async fn teardown(cfg: &Config, ui: &Arc<dyn Ui>, worker: Option<&tokio::task::JoinHandle<()>>) {
+    let remaining = cfg.shutdown_background_work(ui).await;
+    if remaining > 0 {
+        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+    }
+    if let Some(worker) = worker {
+        worker.abort();
+    }
+    if let Some(note) = kloop_core::worktree::finish_active(cfg).await {
+        eprintln!("{}", note.trim());
+    }
+}
+
 /// Run the TUI until the user quits. `make_config` is called once with the
 /// TUI's approver (the y/a/p/n popup) and note sink, so the caller can wire
 /// them into `Permissions` without this crate knowing about rule loading.
@@ -260,14 +280,7 @@ pub async fn run(
     let mut terminal = match setup_terminal() {
         Ok(t) => t,
         Err(e) => {
-            let cfg = current_cfg();
-            let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
-            if remaining > 0 {
-                eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
-            }
-            if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
-                eprintln!("{}", note.trim());
-            }
+            teardown(&current_cfg(), &shutdown_ui, None).await;
             return Err(e);
         }
     };
@@ -321,19 +334,7 @@ pub async fn run(
         task.abort();
     }
     terminal.restore();
-    let cfg = current_cfg();
-    let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
-    if remaining > 0 {
-        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
-    }
-    // The worker holds the session rollout; aborting mid-write is equivalent
-    // to a killed session, which resume already repairs.
-    worker.abort();
-    // Tear down the session worktree (dirty kept on its branch, clean removed);
-    // the terminal is restored, so the kept-tree note prints to stderr.
-    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
-        eprintln!("{}", note.trim());
-    }
+    teardown(&current_cfg(), &shutdown_ui, Some(&worker)).await;
     // Nothing below this line panics into the TUI's own hook, and a host that
     // runs `run` twice (or installs its own hook afterwards) should not find
     // ours still in front, holding an `event_tx` clone.
@@ -412,6 +413,24 @@ fn slash_catalog(cfg: &Config) -> Vec<menu::CommandInfo> {
         description: s.description.clone(),
     }));
     out
+}
+
+/// Close out a turn for the UI loop: the context gauge first (those events are
+/// only sent around turns, so `/compact` and the end of a turn must refresh
+/// it), then the reason that clears the busy state. Returns `false` when the
+/// loop is gone.
+fn finish_turn(
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    cfg: &Arc<Config>,
+    history: &History,
+    reason: EndReason,
+) -> bool {
+    let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
+        kloop_core::agent::context_estimate(cfg, history),
+    )));
+    events
+        .send(AgentEvent::Core(CoreEvent::TurnEnded(reason)))
+        .is_ok()
 }
 
 fn send_command_result_events(
@@ -515,13 +534,7 @@ async fn agent_worker(
                     let (text, images) = split_user_input(input);
                     let _ = events.send(AgentEvent::InputReturned { text, images });
                 }
-                let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
-                    kloop_core::agent::context_estimate(&cfg, &history),
-                )));
-                if events
-                    .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
-                    .is_err()
-                {
+                if !finish_turn(&events, &cfg, &history, outcome.reason) {
                     return;
                 }
             }
@@ -543,13 +556,7 @@ async fn agent_worker(
                     continue;
                 }
                 let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-                let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
-                    kloop_core::agent::context_estimate(&cfg, &history),
-                )));
-                if events
-                    .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
-                    .is_err()
-                {
+                if !finish_turn(&events, &cfg, &history, outcome.reason) {
                     return;
                 }
             }
@@ -628,13 +635,7 @@ async fn agent_worker(
                 if let Some(prompt) = result.run_turn {
                     history.record(Message::user_text(prompt));
                     let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-                    let _ = events.send(AgentEvent::Core(CoreEvent::Usage(
-                        kloop_core::agent::context_estimate(&cfg, &history),
-                    )));
-                    if events
-                        .send(AgentEvent::Core(CoreEvent::TurnEnded(outcome.reason)))
-                        .is_err()
-                    {
+                    if !finish_turn(&events, &cfg, &history, outcome.reason) {
                         return;
                     }
                     continue;
@@ -934,50 +935,37 @@ fn spawn_input_thread(
     })
 }
 
-/// The transcript rows a draw at `viewport` leaves for the live tail: the
-/// viewport minus the composer, its rules, the footer and any mutable chrome.
-/// Draw and commit share this one calculation — activity plus the revisioned
-/// Todo panel must both stay out of native scrollback.
-fn overflow_active_h(app: &App, viewport: Rect) -> usize {
-    let width = usize::from(viewport.width).max(1);
-    let height = usize::from(viewport.height);
-    let chrome = render::live_chrome_layout(app, viewport);
-    let reserve = 2 + render::composer_height(app, width) + 1 + chrome.reserved_rows();
-    height.saturating_sub(reserve).max(1)
-}
-
 /// Freeze whatever of the live tail overflows the last successfully drawn live
 /// region into native scrollback, then drop the cells that left whole from the
-/// app's tail. The caller must pass the viewport from that draw; committing from
-/// a pre-draw size probe would race Ratatui's own autoresize and could
-/// irreversibly freeze the wrong prefix.
+/// app's tail. `plan` is the frame that draw produced and `viewport` its
+/// geometry; committing from a pre-draw size probe would race Ratatui's own
+/// autoresize and could irreversibly freeze the wrong prefix.
 ///
 /// Cells leave whole where they may; the new head then freezes its settled
 /// lines down to exactly the overflow ([`render::freeze_target`]). The lines
-/// written are the ones the viewport shows ([`render::shown_cells`]), so the
+/// written are the ones the viewport shows ([`render::FramePlan`]), so the
 /// scrollback continues seamlessly into the screen.
 fn commit_overflow<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
+    plan: &render::FramePlan,
     viewport: Rect,
 ) -> std::result::Result<bool, B::Error>
 where
     B: ratatui::backend::Backend,
 {
-    let width = usize::from(viewport.width).max(1);
-    let shown = render::shown_cells(app, width, 0);
+    let width = plan.width;
     let frozen = app.head_skip(width);
-    let (n, head) = overflow_freeze_target(app, &shown, viewport);
-    // Everything to write is taken from `shown` before `drain_committed`,
+    let (n, head) = overflow_freeze_target(app, plan, viewport);
+    // Everything to write is taken from the plan before `drain_committed`,
     // which forgets the head's frozen prefix.
     let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
     let mut already = frozen;
-    let mut cells = shown.into_iter();
-    for cell in cells.by_ref().take(n) {
-        blocks.push(cell.lines.into_iter().skip(already).collect());
+    for cell in plan.shown.iter().take(n) {
+        blocks.push(cell.lines.iter().skip(already).cloned().collect());
         already = 0;
     }
-    if let Some(cell) = cells.next()
+    if let Some(cell) = plan.shown.get(n)
         && head > already
     {
         blocks.push(cell.lines[already..head].to_vec());
@@ -993,18 +981,13 @@ where
     Ok(true)
 }
 
-fn overflow_freeze_target(
-    app: &App,
-    shown: &[render::ShownCell],
-    viewport: Rect,
-) -> (usize, usize) {
-    let width = usize::from(viewport.width).max(1);
-    let cells: Vec<render::Freezable> = shown.iter().map(render::ShownCell::freezable).collect();
-    render::freeze_target(
-        &cells,
-        app.head_skip(width),
-        overflow_active_h(app, viewport),
-    )
+fn overflow_freeze_target(app: &App, plan: &render::FramePlan, viewport: Rect) -> (usize, usize) {
+    let cells: Vec<render::Freezable> = plan
+        .shown
+        .iter()
+        .map(render::ShownCell::freezable)
+        .collect();
+    render::freeze_target(&cells, app.head_skip(plan.width), plan.active_h(viewport))
 }
 
 /// Draw one frame and hand it to the terminal as a single synchronized write.
@@ -1016,13 +999,39 @@ fn draw_and_hand_over<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
     hud: &render::Hud,
+    cache: &mut render::ShownCache,
 ) -> std::result::Result<Rect, B::Error>
 where
     B: ratatui::backend::Backend,
 {
-    terminal.draw(|frame| render::draw(frame, app, hud))?;
+    let (area, _plan) = draw_with_plan(terminal, app, hud, cache)?;
     terminal.backend_mut().commit_frame()?;
-    Ok(terminal.get_frame().area())
+    Ok(area)
+}
+
+/// Draw one frame through a freshly computed [`render::FramePlan`]. The plan is
+/// built from the frame's own area, so it can never wrap for a geometry the
+/// terminal did not give this draw.
+fn draw_with_plan<B>(
+    terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
+    app: &mut App,
+    hud: &render::Hud,
+    cache: &mut render::ShownCache,
+) -> std::result::Result<(Rect, render::FramePlan), B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    let mut plan = None;
+    terminal.draw(|frame| {
+        let planned = render::FramePlan::new(app, frame.area(), hud, cache);
+        render::draw(frame, app, hud, &planned);
+        plan = Some(planned);
+    })?;
+    let area = terminal.get_frame().area();
+    Ok((
+        area,
+        plan.expect("the draw closure plans the frame it draws"),
+    ))
 }
 
 /// Draw once so Ratatui's internal autoresize establishes the authoritative
@@ -1034,6 +1043,7 @@ fn draw_frame<B>(
     terminal: &mut ratatui::Terminal<PinnedBackend<B>>,
     app: &mut App,
     hud: &render::Hud,
+    cache: &mut render::ShownCache,
 ) -> std::result::Result<Rect, B::Error>
 where
     B: ratatui::backend::Backend,
@@ -1044,8 +1054,7 @@ where
         // it reaches the terminal together with that commit and its repaint,
         // as one frame — handed over alone, it would show the tail for a moment
         // with its top on no screen and in no scrollback (plan 215).
-        terminal.draw(|frame| render::draw(frame, app, hud))?;
-        let drawn_viewport = terminal.get_frame().area();
+        let (drawn_viewport, plan) = draw_with_plan(terminal, app, hud, cache)?;
         // Only the completion menu holds the commit: it floats over the
         // transcript, outside the height budget. The panels — approvals,
         // questions, pickers — are in that budget (plan 104), so what they
@@ -1065,8 +1074,8 @@ where
             }
             // The commit tears the viewport down and the repaint puts it back
             // inside one handover, so the screen never shows the gap (plan 103).
-            if commit_overflow(terminal, app, confirmed_viewport)? {
-                draw_and_hand_over(terminal, app, hud)?;
+            if commit_overflow(terminal, app, &plan, confirmed_viewport)? {
+                draw_and_hand_over(terminal, app, hud, cache)?;
             } else {
                 terminal.backend_mut().commit_frame()?;
             }
@@ -1077,7 +1086,7 @@ where
         match attempt? {
             Some(viewport) => return Ok(viewport),
             None if retry == 0 => continue,
-            None => return draw_and_hand_over(terminal, app, hud),
+            None => return draw_and_hand_over(terminal, app, hud, cache),
         }
     }
     unreachable!("bounded geometry retry loop always returns")
@@ -1099,32 +1108,51 @@ fn split_user_input(input: Message) -> (String, Vec<ImageSource>) {
     (text, images)
 }
 
-/// Recognize a pasted/dragged image-file path and load it into an Image block
-/// (plan 38 slice 3). Terminals paste a dropped file as its (often quoted) path;
-/// a single-line path with an image extension that reads and validates becomes
-/// an attachment, otherwise the paste is plain text.
-fn load_image_paste(s: &str) -> Option<ImageSource> {
+/// The image file a bracketed paste names, when it names one. Terminals paste a
+/// dropped file as its (often quoted) path. The check is cheap — no I/O — so the
+/// loop can decide before scheduling the read.
+fn image_paste_path(s: &str) -> Option<std::path::PathBuf> {
     let path = s.trim().trim_matches(['\'', '"']).trim();
     if path.is_empty() || path.contains('\n') {
         return None;
     }
     let p = std::path::Path::new(path);
     let ext = p.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-        return None;
-    }
-    let bytes = std::fs::read(p).ok()?;
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp").then(|| p.to_path_buf())
+}
+
+/// Read and validate an image file for a pasted path (blocking; the loop runs
+/// it on the blocking pool).
+fn load_image_paste(path: &std::path::Path) -> Option<ImageSource> {
+    let bytes = std::fs::read(path).ok()?;
     clipboard::image_source_from_bytes(&bytes).ok()
 }
 
-async fn search_files(cwd: &std::path::Path, target: &menu::CompletionTarget) -> Vec<String> {
-    let root = cwd.to_path_buf();
+/// Schedule one `@` completion walk for `target` and send its result to
+/// `tasks`. The debounce coalesces a burst of keystrokes into one walk, and a
+/// query superseded before the walk starts skips it entirely; either way the
+/// event loop never awaits the walk (a full tree read for every key used to
+/// stall the spinner and whatever was streaming in).
+fn spawn_file_search(
+    cwd: std::path::PathBuf,
+    target: menu::CompletionTarget,
+    seq: u64,
+    latest: Arc<std::sync::atomic::AtomicU64>,
+    tasks: mpsc::UnboundedSender<UiTask>,
+) {
     let query = target.query.clone();
-    tokio::task::spawn_blocking(move || {
-        kloop_core::fs_complete::complete_files(&root, &query, menu::FILE_MENU_MAX)
-    })
-    .await
-    .unwrap_or_default()
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(FILE_SEARCH_DEBOUNCE_MS)).await;
+        if latest.load(Ordering::Relaxed) != seq {
+            return;
+        }
+        let paths = tokio::task::spawn_blocking(move || {
+            kloop_core::fs_complete::complete_files(&cwd, &query, menu::FILE_MENU_MAX)
+        })
+        .await
+        .unwrap_or_default();
+        let _ = tasks.send(UiTask::FileSearch { seq, target, paths });
+    });
 }
 
 /// Autowake (plan 26) fires only when the agent is idle AND a reinjection is
@@ -1165,17 +1193,40 @@ fn event_cwd(event: &AgentEvent) -> Option<std::path::PathBuf> {
 
 /// The worktree tool reports `branch: None` when the session leaves it, but the
 /// footer shows the session's branch and must keep showing the original
-/// checkout's. Re-read it at the new cwd here rather than changing the core
-/// event shape, which the worktree parity report pins.
-fn resolve_cwd_branch(event: AgentEvent) -> AgentEvent {
-    match event {
-        AgentEvent::Core(CoreEvent::CwdChanged { cwd, branch: None }) => {
-            let branch = git_branch(std::path::Path::new(&cwd));
-            AgentEvent::Core(CoreEvent::CwdChanged { cwd, branch })
-        }
-        other => other,
-    }
+/// checkout's. Re-read it at the new cwd rather than changing the core event
+/// shape, which the worktree parity report pins. A `git` process is blocking, so
+/// this runs on the blocking pool and its result lands as [`UiTask::Branch`].
+fn resolve_cwd_branch(cwd: &std::path::Path) -> Option<String> {
+    git_branch(cwd)
 }
+
+/// Work the UI loop used to do inline. A full tree walk (`@` completion), an OS
+/// clipboard read with PNG encoding, a dropped image file's read, and a `git`
+/// branch lookup are all blocking calls; run on the loop they stalled the
+/// spinner and anything streaming in. Each result comes back here and is applied
+/// only if it still matches the state that asked for it.
+enum UiTask {
+    /// `@` completion results; `seq` is the newest search the loop asked for.
+    FileSearch {
+        seq: u64,
+        target: menu::CompletionTarget,
+        paths: Vec<String>,
+    },
+    /// Ctrl+V: an image, or why there was none.
+    Clipboard(std::result::Result<ImageSource, String>),
+    /// A pasted path: the attachment, or None when it did not read — then the
+    /// paste goes into the composer as text.
+    ImagePaste {
+        text: String,
+        source: Option<ImageSource>,
+    },
+    /// A cwd change that arrived without its branch.
+    Branch { cwd: String, branch: Option<String> },
+}
+
+/// How long `@` typing settles before a tree walk starts: one walk per burst of
+/// keystrokes instead of one per key.
+const FILE_SEARCH_DEBOUNCE_MS: u64 = 60;
 
 /// What the loop starts with: the seeded [`App`] and the startup task's line
 /// channel (whose sender dropping means the task finished).
@@ -1203,6 +1254,12 @@ struct UiState {
     current_cancel: Option<CancellationToken>,
     turn_started: Option<Instant>,
     thinking_started: Option<Instant>,
+    /// Results of work started off the loop (see [`UiTask`]).
+    tasks: mpsc::UnboundedSender<UiTask>,
+    /// The newest `@` query the loop asked for; an older walk that lands is
+    /// dropped, and one still sleeping when a key moves the query on skips its
+    /// walk entirely.
+    file_search_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl UiState {
@@ -1237,8 +1294,82 @@ impl UiState {
         }
     }
 
+    /// Start an `@` completion walk off the loop. Only the newest query walks: a
+    /// burst of keystrokes gets one walk after the debounce, and a walk already
+    /// running is never awaited by the loop — its result arrives as a
+    /// [`UiTask`] and is dropped if the query moved on.
+    fn search_files(&mut self, target: menu::CompletionTarget) {
+        let seq = self.file_search_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        spawn_file_search(
+            self.cwd.clone(),
+            target,
+            seq,
+            Arc::clone(&self.file_search_seq),
+            self.tasks.clone(),
+        );
+    }
+
+    /// Ctrl+V: reading the OS clipboard (arboard) and PNG-encoding a screenshot
+    /// are both blocking.
+    fn read_clipboard(&self) {
+        let tasks = self.tasks.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tasks.send(UiTask::Clipboard(clipboard::clipboard_image()));
+        });
+    }
+
+    /// A pasted path may name an image: read it off the loop, and if it does not
+    /// read, paste the text as ordinary input.
+    fn read_image_paste(&self, text: String, path: std::path::PathBuf) {
+        let tasks = self.tasks.clone();
+        tokio::task::spawn_blocking(move || {
+            let source = load_image_paste(&path);
+            let _ = tasks.send(UiTask::ImagePaste { text, source });
+        });
+    }
+
+    /// A cwd change arrived without its branch (the worktree tool leaving a
+    /// tree): ask `git` off the loop.
+    fn resolve_branch(&self, cwd: String) {
+        let tasks = self.tasks.clone();
+        tokio::task::spawn_blocking(move || {
+            let branch = resolve_cwd_branch(std::path::Path::new(&cwd));
+            let _ = tasks.send(UiTask::Branch { cwd, branch });
+        });
+    }
+
+    /// Paste text into the composer — or, when its tail opens an `@` token,
+    /// start the completion search.
+    fn paste(&mut self, text: &str) {
+        if let Command::SearchFiles(target) = self.app.paste_text(text) {
+            self.search_files(target);
+        }
+    }
+
+    /// Deliver one off-loop result. A stale one — a moved-on `@` query, a branch
+    /// for a directory the session already left — is dropped.
+    fn on_task(&mut self, task: UiTask) -> ControlFlow<()> {
+        match task {
+            UiTask::FileSearch { seq, target, paths } => {
+                if seq == self.file_search_seq.load(Ordering::Relaxed) {
+                    self.app.set_file_results(target, paths);
+                }
+            }
+            UiTask::Clipboard(Ok(source)) => self.app.attach_image(source),
+            UiTask::Clipboard(Err(error)) => {
+                self.app.apply(AgentEvent::Core(CoreEvent::Note(error)));
+            }
+            UiTask::ImagePaste { text, source } => match source {
+                Some(source) => self.app.attach_image(source),
+                None => self.paste(&text),
+            },
+            UiTask::Branch { cwd, branch } => self.app.fill_branch(&cwd, branch),
+        }
+        ControlFlow::Continue(())
+    }
+
     /// One terminal input event. `Break` ends the loop (the input channel died).
-    async fn on_input(&mut self, input: Option<Event>, viewport_width: usize) -> ControlFlow<()> {
+    fn on_input(&mut self, input: Option<Event>, viewport_width: usize) -> ControlFlow<()> {
         // A startup task (MCP handshakes) owns the keyboard until it settles:
         // no turn and no slash command may run against a half-known tool
         // catalog. The quit chords stay live so a hung server is escapable.
@@ -1249,7 +1380,7 @@ impl UiState {
                     if k.kind != KeyEventKind::Release && startup_allows_key(&k) =>
                 {
                     let command = self.app.on_key(viewport_width, k);
-                    self.on_command(command).await
+                    self.on_command(command)
                 }
                 _ => ControlFlow::Continue(()),
             };
@@ -1257,7 +1388,7 @@ impl UiState {
         match input {
             Some(Event::Key(k)) if k.kind != KeyEventKind::Release => {
                 let command = self.app.on_key(viewport_width, k);
-                self.on_command(command).await
+                self.on_command(command)
             }
             // Bracketed paste (plan 38 slice 3): a dragged/pasted image-file
             // path attaches as an image, anything else goes to the composer
@@ -1267,14 +1398,9 @@ impl UiState {
                 ControlFlow::Continue(())
             }
             Some(Event::Paste(s)) => {
-                match load_image_paste(&s) {
-                    Some(source) => self.app.attach_image(source),
-                    None => {
-                        if let Command::SearchFiles(target) = self.app.paste_text(&s) {
-                            let paths = search_files(&self.cwd, &target).await;
-                            self.app.set_file_results(target, paths);
-                        }
-                    }
+                match image_paste_path(&s) {
+                    Some(path) => self.read_image_paste(s, path),
+                    None => self.paste(&s),
                 }
                 ControlFlow::Continue(())
             }
@@ -1286,7 +1412,7 @@ impl UiState {
     }
 
     /// One command the key handler produced. `Break` ends the loop.
-    async fn on_command(&mut self, command: Command) -> ControlFlow<()> {
+    fn on_command(&mut self, command: Command) -> ControlFlow<()> {
         match command {
             Command::Submit(text) => {
                 let cancel = CancellationToken::new();
@@ -1344,16 +1470,12 @@ impl UiState {
                 }
             }
             Command::PasteClipboardImage => {
-                // Read the OS clipboard here (a side effect); attach an image,
-                // or note why there was none.
-                match clipboard::clipboard_image() {
-                    Ok(source) => self.app.attach_image(source),
-                    Err(e) => self.app.apply(AgentEvent::Core(CoreEvent::Note(e))),
-                }
+                // Read the OS clipboard off the loop (a side effect); the
+                // result attaches an image or notes why there was none.
+                self.read_clipboard();
             }
             Command::SearchFiles(target) => {
-                let paths = search_files(&self.cwd, &target).await;
-                self.app.set_file_results(target, paths);
+                self.search_files(target);
             }
             Command::Quit => return ControlFlow::Break(()),
             Command::None => {}
@@ -1402,9 +1524,13 @@ impl UiState {
     /// the terminal.
     fn absorb(&mut self, event: AgentEvent) -> bool {
         // A cwd change is the one event whose branch may arrive missing (the
-        // worktree tool means "left the worktree"); fill it before any consumer
-        // sees it so the footer never drops the branch.
-        let event = resolve_cwd_branch(event);
+        // worktree tool means "left the worktree"). Filling it needs a `git`
+        // process, which would stall the loop here, so the footer picks it up
+        // when the off-loop read answers (`App::fill_branch` drops it if the
+        // session has moved on).
+        if let AgentEvent::Core(CoreEvent::CwdChanged { cwd, branch: None }) = &event {
+            self.resolve_branch(cwd.clone());
+        }
         match &event {
             AgentEvent::Quit => return true,
             AgentEvent::Cleared { .. } => {
@@ -1492,6 +1618,11 @@ async fn ui_loop(
     let input_thread = spawn_input_thread(input_tx, stop.clone());
 
     let mut inbox_activity = inbox.subscribe_activity();
+    // Rendered cells carried across frames, so a sealed answer above the
+    // streaming one is not parsed again for every frame (plan 263).
+    let mut render_cache = render::ShownCache::default();
+    // Work that used to run inline (see `UiTask`) reports back here.
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel::<UiTask>();
     // Wall-clock timing for the animated HUD (plan 38 slice 5).
     let reduced_motion = anim::reduced_motion();
     let mut state = UiState {
@@ -1506,6 +1637,8 @@ async fn ui_loop(
         current_cancel: None,
         turn_started: None,
         thinking_started: None,
+        tasks: task_tx,
+        file_search_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let outcome = loop {
         if std::mem::take(&mut state.clear_terminal)
@@ -1517,7 +1650,7 @@ async fn ui_loop(
         // Ratatui's draw owns autoresize. Commit only from the viewport of that
         // completed frame; if a commit clears it, `draw_frame` immediately
         // repaints and returns the final geometry used by key navigation.
-        let viewport = match draw_frame(terminal, &mut state.app, &hud) {
+        let viewport = match draw_frame(terminal, &mut state.app, &hud, &mut render_cache) {
             Ok(viewport) => viewport,
             Err(error) => break Err(error),
         };
@@ -1531,7 +1664,12 @@ async fn ui_loop(
             && state.app.popup.is_none();
         let tick_ms = if reduced_motion { 1000 } else { anim::STEP_MS };
         let flow = tokio::select! {
-            input = input_rx.recv() => state.on_input(input, usize::from(viewport.width)).await,
+            input = input_rx.recv() => state.on_input(input, usize::from(viewport.width)),
+            task = task_rx.recv() => match task {
+                Some(task) => state.on_task(task),
+                // The sender lives on `state`, so this never closes.
+                None => ControlFlow::Continue(()),
+            },
             activity = inbox_activity.changed() => {
                 if activity.is_err() {
                     ControlFlow::Break(())
@@ -1596,6 +1734,70 @@ mod tests {
     use ratatui::layout::Size;
 
     use super::*;
+
+    /// Draw one frame the way the event loop does — with a plan of its own and a
+    /// cold render cache — for tests that only care where the frame landed.
+    fn draw_frame_once<B>(terminal: &mut ratatui::Terminal<PinnedBackend<B>>, app: &mut App) -> Rect
+    where
+        B: Backend,
+    {
+        draw_frame(
+            terminal,
+            app,
+            &render::Hud::default(),
+            &mut render::ShownCache::default(),
+        )
+        .unwrap()
+    }
+
+    /// A drawn frame plans once: the draw and the overflow commit read the same
+    /// cells, so a streaming answer is parsed a bounded number of times per
+    /// frame instead of once per consumer (draw, commit, repaint) — and never
+    /// proportional to its length (plan 263).
+    #[test]
+    fn a_drawn_frame_parses_the_streaming_answer_once() {
+        use kloop_core::event::Delta;
+
+        let backend = PinnedBackend::new(StagedSizeBackend::new(80, 24));
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(24),
+            },
+        )
+        .unwrap();
+        let mut app = App::new("parse-count".into());
+        let answer = (0..1000)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.apply(AgentEvent::Core(CoreEvent::ItemDelta {
+            id: "m".into(),
+            delta: Delta::Text(answer),
+        }));
+        let hud = render::Hud::default();
+        // The answer overflows, so each frame draws, commits and repaints: two
+        // plans, one parse each. The old path parsed it per consumer.
+        let mut cache = render::ShownCache::default();
+        crate::markdown::take_parse_count();
+        draw_frame(&mut terminal, &mut app, &hud, &mut cache).unwrap();
+        let first = crate::markdown::take_parse_count();
+        draw_frame(&mut terminal, &mut app, &hud, &mut cache).unwrap();
+        let second = crate::markdown::take_parse_count();
+        assert!(first <= 2, "first frame parsed {first} times");
+        assert!(second <= 2, "later frame parsed {second} times");
+    }
+
+    /// The rows a draw at `viewport` leaves for the live tail.
+    fn tail_rows(app: &App, viewport: Rect) -> usize {
+        render::FramePlan::new(
+            app,
+            viewport,
+            &render::Hud::default(),
+            &mut render::ShownCache::default(),
+        )
+        .active_h(viewport)
+    }
 
     #[test]
     fn banner_contracts_the_process_home() {
@@ -1734,29 +1936,119 @@ mod tests {
         git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
         git(&["commit", "--allow-empty", "-qm", "base"]);
         let expected = git_branch(&root).expect("temp repo has a branch");
-        let event = AgentEvent::Core(CoreEvent::CwdChanged {
+        assert_eq!(
+            resolve_cwd_branch(&root).as_deref(),
+            Some(expected.as_str()),
+            "the off-loop lookup reads the branch the footer needs"
+        );
+        let mut app = App::new("branch-refill".into());
+        app.apply(AgentEvent::Core(CoreEvent::CwdChanged {
             cwd: root.display().to_string(),
             branch: None,
-        });
-        match resolve_cwd_branch(event) {
-            AgentEvent::Core(CoreEvent::CwdChanged { branch, .. }) => {
-                assert_eq!(branch.as_deref(), Some(expected.as_str()));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        }));
+        assert_eq!(app.branch, None, "the event itself carried no branch");
+        // The lookup lands later: the footer gets the original branch back, and
+        // the note the cwd change wrote is completed rather than duplicated.
+        app.fill_branch(&root.display().to_string(), resolve_cwd_branch(&root));
+        assert_eq!(app.branch.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            app.cells.last(),
+            Some(&Cell::Note(format!(
+                "working directory → {} (branch {expected})",
+                root.display()
+            )))
+        );
 
-        // An event that already carries a branch is left alone.
-        let event = AgentEvent::Core(CoreEvent::CwdChanged {
-            cwd: "/repo/.kloop/worktrees/x".into(),
-            branch: Some("kloop-worktree-x".into()),
-        });
-        match resolve_cwd_branch(event) {
-            AgentEvent::Core(CoreEvent::CwdChanged { branch, .. }) => {
-                assert_eq!(branch.as_deref(), Some("kloop-worktree-x"));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        // A result for a directory the session has already left is dropped.
+        app.fill_branch("/repo/.kloop/worktrees/x", Some("kloop-worktree-x".into()));
+        assert_eq!(app.branch.as_deref(), Some(expected.as_str()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a single-line path with an image extension is worth a read; the
+    /// check itself must not touch the disk (it runs on the event loop).
+    #[test]
+    fn image_paste_paths_are_recognized_without_reading() {
+        for (paste, expected) in [
+            ("/tmp/shot.png", Some("/tmp/shot.png")),
+            ("  '/tmp/shot.PNG'  ", Some("/tmp/shot.PNG")),
+            ("/tmp/shot.gif", Some("/tmp/shot.gif")),
+            ("/tmp/notes.txt", None),
+            ("/tmp/shot.png\nsecond line", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                image_paste_path(paste),
+                expected.map(std::path::PathBuf::from),
+                "{paste:?}"
+            );
+        }
+    }
+
+    /// `@` typing used to await a full tree walk per key. Now the walk is
+    /// debounced and superseded queries never start one; the loop is free to
+    /// process keys, ticks and agent events while it runs.
+    #[tokio::test(start_paused = true)]
+    async fn file_search_is_debounced_and_superseded_queries_are_dropped() {
+        use std::sync::atomic::AtomicU64;
+
+        let root = std::env::temp_dir().join(format!("kloop-tui-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["alpha.txt", "beta.txt", "unrelated.md"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        let target = |query: &str| menu::CompletionTarget {
+            kind: menu::PopupKind::File,
+            query: query.to_string(),
+            range: crate::text_layout::TextRange::empty(crate::text_layout::ByteOffset::ZERO),
+            cursor: crate::text_layout::ByteOffset::ZERO,
+        };
+
+        let latest = Arc::new(AtomicU64::new(1));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Query 1 is superseded before its debounce elapses, so it never walks.
+        spawn_file_search(
+            root.clone(),
+            target("alpha"),
+            1,
+            Arc::clone(&latest),
+            tx.clone(),
+        );
+        latest.store(2, Ordering::Relaxed);
+        spawn_file_search(
+            root.clone(),
+            target("beta"),
+            2,
+            Arc::clone(&latest),
+            tx.clone(),
+        );
+
+        // The paused clock lets the debounce elapse without real sleeping; the
+        // loop would meanwhile run its select arms (keys, ticks, agent events).
+        let task = rx.recv().await.expect("the newest query answers");
+        match task {
+            UiTask::FileSearch { seq, paths, .. } => {
+                assert_eq!(seq, 2);
+                assert_eq!(paths, vec!["beta.txt".to_string()]);
+            }
+            other => panic!("unexpected task: {:?}", task_name(&other)),
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the superseded query must not deliver a result"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn task_name(task: &UiTask) -> &'static str {
+        match task {
+            UiTask::FileSearch { .. } => "file search",
+            UiTask::Clipboard(_) => "clipboard",
+            UiTask::ImagePaste { .. } => "image paste",
+            UiTask::Branch { .. } => "branch",
+        }
     }
 
     struct StagedSizeBackend {
@@ -1951,7 +2243,7 @@ mod tests {
         app.cells = (1..=12)
             .map(|index| Cell::Assistant(format!("history {index}")))
             .collect();
-        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let viewport = draw_frame_once(&mut terminal, &mut app);
 
         let events = terminal.backend().inner.events.borrow();
         assert!(events.contains(&"draw"));
@@ -1981,7 +2273,7 @@ mod tests {
         app.cells = (1..=12)
             .map(|index| Cell::Assistant(format!("history {index}")))
             .collect();
-        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let viewport = draw_frame_once(&mut terminal, &mut app);
 
         let events = terminal.backend().inner.events.borrow();
         assert!(events.contains(&"draw"), "frame was drawn: {events:?}");
@@ -1991,7 +2283,7 @@ mod tests {
         assert!(app.cells.len() < 12);
         drop(events);
 
-        let grown = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let grown = draw_frame_once(&mut terminal, &mut app);
         assert_eq!((grown.width, grown.height), (80, 24));
     }
 
@@ -2023,10 +2315,10 @@ mod tests {
             ),
             Cell::Note("resumed session — 32 message(s)".into()),
         ];
-        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let viewport = draw_frame_once(&mut terminal, &mut app);
 
         let width = usize::from(viewport.width);
-        let active_h = overflow_active_h(&app, viewport);
+        let active_h = tail_rows(&app, viewport);
         let frozen = app.head_skip(width);
         let visible: Vec<String> = render::visible_transcript(&app, &render::Hud::default(), width)
             .iter()
@@ -2091,7 +2383,7 @@ mod tests {
             },
             reply,
         });
-        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let viewport = draw_frame_once(&mut terminal, &mut app);
 
         let width = usize::from(viewport.width);
         let text = |line: &Line<'_>| -> String {
@@ -2128,7 +2420,7 @@ mod tests {
             }],
             "the plan took its row's place and everything above it is in scrollback"
         );
-        assert_eq!(shown.len(), overflow_active_h(&app, viewport));
+        assert_eq!(shown.len(), tail_rows(&app, viewport));
         assert_eq!(
             [&plan_lines[..frozen], &shown[..]].concat(),
             plan_lines,
@@ -2162,7 +2454,7 @@ mod tests {
             width,
             crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter),
         );
-        let viewport = draw_frame(&mut terminal, &mut app, &render::Hud::default()).unwrap();
+        let viewport = draw_frame_once(&mut terminal, &mut app);
         let width = usize::from(viewport.width);
         let shown = visible(&app);
         assert_eq!(app.head_skip(width), frozen, "the seam did not move");
@@ -2220,14 +2512,14 @@ mod tests {
         whole: &[String],
         context: &str,
     ) {
-        let viewport = draw_frame(terminal, app, &render::Hud::default()).unwrap();
+        let viewport = draw_frame_once(terminal, app);
         let width = usize::from(viewport.width);
         let visible = rows(&render::visible_transcript(
             app,
             &render::Hud::default(),
             width,
         ));
-        let active_h = overflow_active_h(app, viewport);
+        let active_h = tail_rows(app, viewport);
         assert!(
             visible.len() <= active_h,
             "{context}: {} live rows for {active_h}, the top is clipped",
@@ -2488,8 +2780,13 @@ mod tests {
 
     /// How many whole cells a commit at `viewport` would move to scrollback.
     fn cells_leaving(app: &App, viewport: Rect) -> usize {
-        let shown = render::shown_cells(app, usize::from(viewport.width), 0);
-        overflow_freeze_target(app, &shown, viewport).0
+        let plan = render::FramePlan::new(
+            app,
+            viewport,
+            &render::Hud::default(),
+            &mut render::ShownCache::default(),
+        );
+        overflow_freeze_target(app, &plan, viewport).0
     }
 
     #[test]

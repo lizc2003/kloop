@@ -111,9 +111,18 @@ fn todo_panel_allowed(app: &App) -> bool {
 }
 
 /// Compute all mutable chrome that lives between transcript cells and the
-/// composer. Draw and native-scrollback commit use this exact helper so a todo
-/// row can never be counted on screen but omitted from the frozen-height budget.
+/// composer, for callers that have no composer layout in hand (tests); a frame
+/// goes through [`FramePlan`], which reuses the composer rows it already
+/// wrapped.
+#[cfg(test)]
 pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
+    let width = usize::from(viewport.width).max(1);
+    live_chrome_layout_with(app, viewport, composer_height(app, width))
+}
+
+/// The same layout over a composer height the caller already has, so a frame
+/// that renders the composer does not wrap it a second time (plan 263).
+fn live_chrome_layout_with(app: &App, viewport: Rect, composer_rows: usize) -> LiveChromeLayout {
     let width = usize::from(viewport.width).max(1);
     let terminal_height = usize::from(viewport.height);
     let activity_visible = has_activity_line(app);
@@ -122,7 +131,7 @@ pub fn live_chrome_layout(app: &App, viewport: Rect) -> LiveChromeLayout {
     let activity_rows = usize::from(activity_visible)
         + usize::from(activity_spacer)
         + usize::from(held_command_visible);
-    let fixed_bottom = 2 + composer_height(app, width) + 1;
+    let fixed_bottom = 2 + composer_rows + 1;
     let transcript_capacity = terminal_height.saturating_sub(fixed_bottom).max(1);
     // The panel is the user's whole job while it is up, so it is served before
     // the todo list — but never all the way to the top: two rows are held back
@@ -320,6 +329,28 @@ fn background_status(status: BackgroundTaskStatus) -> &'static str {
     }
 }
 
+/// The status mark that opens a transcript row: `{mark} ` in the colour its
+/// status carries. Every status row leads with this, so a `●` running, a `✓`
+/// done and a `✗` failed read the same way wherever they appear.
+pub(crate) fn mark_span(mark: &str, color: Color) -> Span<'static> {
+    Span::styled(format!("{mark} "), Style::new().fg(color))
+}
+
+/// One status-marked row: the mark, then `title` in `style`, truncated to the
+/// two columns the mark occupies.
+pub(crate) fn status_header(
+    mark: &str,
+    color: Color,
+    title: &str,
+    style: Style,
+    width: usize,
+) -> Line<'static> {
+    Line::from(vec![
+        mark_span(mark, color),
+        Span::styled(truncate(title, width.saturating_sub(2)), style),
+    ])
+}
+
 /// The display lines for one cell at `width` columns. Both paths that put a
 /// cell on screen go through this — rendering the live tail in the viewport and
 /// freezing a finalized cell into native scrollback (`insert_before`) — so a
@@ -385,10 +416,7 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             } else {
                 format!("{agent} {task} ({tools} tool uses)")
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::new().fg(color)),
-                Span::styled(truncate(&body, width.saturating_sub(2)), DIM),
-            ]));
+            lines.push(status_header(mark, color, &body, DIM, width));
         }
         Cell::BackgroundTask(task) => {
             let (mark, color) = background_status_mark(task.status);
@@ -403,13 +431,13 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
                 title.push(' ');
                 title.push_str(&task.description);
             }
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::new().fg(color)),
-                Span::styled(
-                    truncate(&title, width.saturating_sub(2)),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            lines.push(status_header(
+                mark,
+                color,
+                &title,
+                Style::new().add_modifier(Modifier::BOLD),
+                width,
+            ));
             // A shell's command gets a full-width row of its own, exactly as the
             // transcript row for the same tool does: sharing the title truncated
             // it precisely when it was longest.
@@ -447,13 +475,13 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
         Cell::AgentMessage(message) => {
             let (mark, status, color) = agent_message_status(message.status);
             let title = format!("Message from Agent · {}", message.from);
-            lines.push(Line::from(vec![
-                Span::styled(format!("{mark} "), Style::new().fg(color)),
-                Span::styled(
-                    truncate(&title, width.saturating_sub(2)),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            lines.push(status_header(
+                mark,
+                color,
+                &title,
+                Style::new().add_modifier(Modifier::BOLD),
+                width,
+            ));
             lines.push(Line::from(Span::styled(
                 truncate(
                     &format!("  {status} to {} · {}", message.to, message.id),
@@ -679,8 +707,9 @@ pub struct Freezable {
 }
 
 /// One cell as the viewport draws it. The draw and the freeze both take cells
-/// from [`shown_cells`], so the lines written to scrollback are the lines that
+/// from one [`FramePlan`], so the lines written to scrollback are the lines that
 /// were on screen (plan 74: what is drawn and what is committed have one source).
+#[derive(Clone, Debug)]
 pub struct ShownCell {
     pub lines: Vec<Line<'static>>,
     pub settled: usize,
@@ -712,84 +741,207 @@ impl ShownCell {
 /// clock (`thinking_secs`). Only the last cell streams (any other event seals
 /// it), but an answer the model has not closed yet can still grow or be
 /// replaced wherever it stands, so it only ever freezes what is settled.
+///
+/// The event loop goes through [`ShownCache`] instead, which memoizes the cells
+/// that cannot change; this is the uncached form for tests and one-off callers.
+#[cfg(test)]
 pub fn shown_cells(app: &App, width: usize, thinking_secs: u64) -> Vec<ShownCell> {
+    let mut cache = ShownCache::default();
+    cache.shown_cells(app, width, thinking_secs)
+}
+
+/// Render one cell as the viewport shows it.
+fn shown_cell(app: &App, i: usize, cell: &Cell, width: usize, thinking_secs: u64) -> ShownCell {
     let last = app.cells.len().saturating_sub(1);
-    app.cells
-        .iter()
-        .enumerate()
-        .map(|(i, cell)| match cell {
-            Cell::Assistant(text) if app.display_cell_live(i) => {
-                let (streamed, settled) = crate::markdown::assistant_stream(text, width);
-                let lines = if i == last && app.streaming_assistant() {
-                    streamed
-                } else {
-                    cell_lines(cell, width)
-                };
-                ShownCell {
-                    lines,
-                    settled,
-                    leave: Leave::Never,
-                }
+    match cell {
+        Cell::Assistant(text) if app.display_cell_live(i) => {
+            let (streamed, settled) = crate::markdown::assistant_stream(text, width);
+            let lines = if i == last && app.streaming_assistant() {
+                streamed
+            } else {
+                cell_lines(cell, width)
+            };
+            ShownCell {
+                lines,
+                settled,
+                leave: Leave::Never,
             }
-            Cell::Thinking { .. } if app.display_cell_live(i) => {
-                let lines = if i == last && app.streaming_thinking() {
-                    vec![thinking_line(None, Some(thinking_secs), width)]
-                } else {
-                    cell_lines(cell, width)
-                };
-                ShownCell {
-                    lines,
-                    settled: 0,
-                    leave: Leave::Never,
-                }
+        }
+        Cell::Thinking { .. } if app.display_cell_live(i) => {
+            let lines = if i == last && app.streaming_thinking() {
+                vec![thinking_line(None, Some(thinking_secs), width)]
+            } else {
+                cell_lines(cell, width)
+            };
+            ShownCell {
+                lines,
+                settled: 0,
+                leave: Leave::Never,
             }
-            Cell::Tool { status, .. } | Cell::Agent { status, .. }
-                if *status == ToolStatus::Running =>
-            {
-                ShownCell {
-                    lines: cell_lines(cell, width),
-                    settled: 0,
-                    leave: Leave::AtCap,
-                }
+        }
+        Cell::Tool { status, .. } | Cell::Agent { status, .. }
+            if *status == ToolStatus::Running =>
+        {
+            ShownCell {
+                lines: cell_lines(cell, width),
+                settled: 0,
+                leave: Leave::AtCap,
             }
-            // Replaced in place while live, so none of it is settled — but
-            // once frozen its terminal update is appended as a row of its own,
-            // so it may go whenever the tail needs the room.
-            Cell::BackgroundTask(task) if task.status == BackgroundTaskStatus::Running => {
-                ShownCell {
-                    lines: cell_lines(cell, width),
-                    settled: 0,
-                    leave: Leave::Whole,
-                }
+        }
+        // Replaced in place while live, so none of it is settled — but
+        // once frozen its terminal update is appended as a row of its own,
+        // so it may go whenever the tail needs the room.
+        Cell::BackgroundTask(task) if task.status == BackgroundTaskStatus::Running => ShownCell {
+            lines: cell_lines(cell, width),
+            settled: 0,
+            leave: Leave::Whole,
+        },
+        Cell::AgentMessage(message) if message.status == AgentMessageStatus::Queued => ShownCell {
+            lines: cell_lines(cell, width),
+            settled: 0,
+            leave: Leave::Whole,
+        },
+        // The text is fixed on arrival; the answer only appends its mark
+        // below it, and that has to land on this cell.
+        Cell::Plan {
+            status: PlanStatus::Pending,
+            ..
+        } => {
+            let lines = cell_lines(cell, width);
+            ShownCell {
+                settled: lines.len(),
+                lines,
+                leave: Leave::Never,
             }
-            Cell::AgentMessage(message) if message.status == AgentMessageStatus::Queued => {
-                ShownCell {
-                    lines: cell_lines(cell, width),
-                    settled: 0,
-                    leave: Leave::Whole,
+        }
+        _ => ShownCell::done(cell_lines(cell, width)),
+    }
+}
+
+/// Cross-frame memo for rendered cells (plan 263). A cell that cannot change
+/// renders from the same text on every frame it stays in the tail, so while a
+/// long answer streams below it, re-parsing the text above it each frame is pure
+/// waste. Entries are keyed by the cell itself — content, width and liveness —
+/// so every mutation path in the `App` invalidates them without a revision to
+/// maintain; the index only keeps the cache bounded to the current tail.
+#[derive(Debug, Default)]
+pub struct ShownCache {
+    entries: Vec<CachedCell>,
+}
+
+#[derive(Debug)]
+struct CachedCell {
+    index: usize,
+    width: usize,
+    live: bool,
+    cell: Cell,
+    shown: ShownCell,
+}
+
+impl ShownCache {
+    /// The tail cell by cell, reusing every cell whose rendering is still valid.
+    /// The open last cell is always rendered: its text is arriving, and a
+    /// thinking block's clock line changes with `thinking_secs`.
+    pub fn shown_cells(&mut self, app: &App, width: usize, thinking_secs: u64) -> Vec<ShownCell> {
+        let width = width.max(1);
+        let last = app.cells.len().saturating_sub(1);
+        self.entries.retain(|entry| entry.index < app.cells.len());
+        app.cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let live = app.display_cell_live(index);
+                let streaming = index == last
+                    && ((app.streaming_assistant() && matches!(cell, Cell::Assistant(_)))
+                        || (app.streaming_thinking() && matches!(cell, Cell::Thinking { .. })));
+                if streaming {
+                    return shown_cell(app, index, cell, width, thinking_secs);
                 }
-            }
-            // The text is fixed on arrival; the answer only appends its mark
-            // below it, and that has to land on this cell.
-            Cell::Plan {
-                status: PlanStatus::Pending,
-                ..
-            } => {
-                let lines = cell_lines(cell, width);
-                ShownCell {
-                    settled: lines.len(),
-                    lines,
-                    leave: Leave::Never,
+                if let Some(entry) = self.entries.iter().find(|entry| {
+                    entry.index == index
+                        && entry.width == width
+                        && entry.live == live
+                        && entry.cell == *cell
+                }) {
+                    return entry.shown.clone();
                 }
-            }
-            _ => ShownCell::done(cell_lines(cell, width)),
-        })
-        .collect()
+                let shown = shown_cell(app, index, cell, width, thinking_secs);
+                self.entries.retain(|entry| entry.index != index);
+                self.entries.push(CachedCell {
+                    index,
+                    width,
+                    live,
+                    cell: cell.clone(),
+                    shown: shown.clone(),
+                });
+                shown
+            })
+            .collect()
+    }
+}
+
+/// One frame's expensive derivations, computed once and shared by the draw, the
+/// overflow commit and the repaint decision (plan 263): the rendered tail cells,
+/// the chrome that sits between them and composer, and the composer's own
+/// wrapped rows. Every consumer used to derive these again for itself — the
+/// streaming answer was parsed four to six times per frame.
+pub struct FramePlan {
+    pub width: usize,
+    pub shown: Vec<ShownCell>,
+    chrome: LiveChromeLayout,
+    composer: crate::composer::View,
+}
+
+impl FramePlan {
+    /// Plan one frame at `viewport`. `cache` carries the cells that did not
+    /// change since the previous frame.
+    pub fn new(app: &App, viewport: Rect, hud: &Hud, cache: &mut ShownCache) -> Self {
+        let width = usize::from(viewport.width).max(1);
+        let composer = app.composer.view(width);
+        let chrome = live_chrome_layout_with(app, viewport, composer.rows.len().max(1));
+        let secs = hud.thinking.map(|d| d.as_secs()).unwrap_or(0);
+        let shown = cache.shown_cells(app, width, secs);
+        Self {
+            width,
+            shown,
+            chrome,
+            composer,
+        }
+    }
+
+    /// The rows a draw at `viewport` leaves for the live tail: the viewport
+    /// minus the composer, its rules, the footer and any mutable chrome.
+    pub fn active_h(&self, viewport: Rect) -> usize {
+        let reserve = 2 + self.composer.rows.len().max(1) + 1 + self.chrome.reserved_rows();
+        usize::from(viewport.height).saturating_sub(reserve).max(1)
+    }
+
+    /// The tail lines the viewport shows: every cell after the head's frozen
+    /// prefix, bottom-anchored to at most `rows`. Only the lines that can still
+    /// be on screen are cloned — a long answer in the tail must not be copied
+    /// wholesale on every frame.
+    fn transcript(&self, skip: usize, rows: usize) -> Vec<Line<'static>> {
+        let total = self
+            .shown
+            .iter()
+            .map(|cell| cell.lines.len())
+            .sum::<usize>()
+            .saturating_sub(skip);
+        let mut skip = skip + total.saturating_sub(rows);
+        let mut lines = Vec::with_capacity(total.min(rows));
+        for cell in &self.shown {
+            let from = skip.min(cell.lines.len());
+            lines.extend(cell.lines[from..].iter().cloned());
+            skip -= from;
+        }
+        lines
+    }
 }
 
 /// The uncommitted tail for the on-screen viewport, flattened from
 /// [`shown_cells`]. The head cell resumes one line below whatever of it is
 /// already in scrollback.
+#[cfg(test)]
 pub fn visible_transcript(app: &App, hud: &Hud, width: usize) -> Vec<Line<'static>> {
     let secs = hud.thinking.map(|d| d.as_secs()).unwrap_or(0);
     let mut skip = app.head_skip(width);
@@ -853,8 +1005,9 @@ pub fn freeze_target(cells: &[Freezable], frozen: usize, active_h: usize) -> (us
 }
 
 /// The on-screen height of the composer at `width`: its wrapped rows (already
-/// capped inside the composer). Both [`draw`] and the event loop's
-/// overflow-commit size the bottom chrome from this.
+/// capped inside the composer). A frame sizes the bottom chrome from the rows
+/// [`FramePlan`] already wrapped.
+#[cfg(test)]
 pub fn composer_height(app: &App, width: usize) -> usize {
     app.composer.view(width).rows.len().max(1)
 }
@@ -1046,17 +1199,19 @@ fn system_status(app: &App) -> String {
     }
 }
 
-pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
+pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud, plan: &FramePlan) {
     // Bottom-up: a stable footer (mode + hints), the multi-line composer fenced
     // by a rule above and below, and the transcript — whose last line carries
     // the live activity status (CC's information architecture: the dynamic
     // "what's happening" sits by the composer where it is seen, the footer stays
     // still). The composer's height is dynamic (it grows with the input).
+    // Everything expensive was derived once for this frame in `plan`, which the
+    // overflow commit reads too (plan 263).
     let full = f.area();
     let width = full.width as usize;
-    let view = app.composer.view(width.max(1));
+    let view = &plan.composer;
     let composer_h = (view.rows.len() as u16).max(1);
-    let chrome = live_chrome_layout(app, full);
+    let chrome = &plan.chrome;
     let [
         transcript_area,
         rule_top,
@@ -1072,7 +1227,8 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     ])
     .areas(full);
 
-    let mut lines = visible_transcript(app, hud, width.max(1));
+    let height = transcript_area.height as usize;
+    let mut lines = plan.transcript(app.head_skip(plan.width), height);
     // Activity and todos are mutable live chrome, never transcript Cells. The
     // shared layout helper above also supplies commit_overflow's reserve.
     if chrome.activity_visible {
@@ -1083,10 +1239,10 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
             lines.push(activity);
         }
     }
-    if let Some(held) = held_command_line(app, width.max(1)) {
+    if let Some(held) = held_command_line(app, plan.width) {
         lines.push(held);
     }
-    lines.extend(chrome.todo_lines);
+    lines.extend(chrome.todo_lines.iter().cloned());
     // The choice panel closes the transcript: a blank row, then its own rows, so
     // it sits directly on the composer's top rule — the eye is already there.
     let panel_rows = chrome.panel.as_ref().map_or(0, |panel| panel.lines.len());
@@ -1096,7 +1252,6 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     }
     // Write the clamped body offset back, so over-scrolling self-corrects.
     app.panel_scroll = chrome.panel.as_ref().map_or(0, |panel| panel.scroll);
-    let height = transcript_area.height as usize;
     // Bottom-anchor the uncommitted tail just above the composer. The event loop
     // has already frozen anything that overflowed into native scrollback, so
     // clipping the top here only bites transiently (e.g. a long answer still
@@ -1117,7 +1272,7 @@ pub fn draw(f: &mut Frame, app: &mut App, hud: &Hud) {
     // Stable footer at the very bottom (mode + hints left, system status right).
     f.render_widget(Paragraph::new(footer_line(app, width)), footer_area);
 
-    f.render_widget(Paragraph::new(view.rows), input_area);
+    f.render_widget(Paragraph::new(view.rows.clone()), input_area);
 
     // The panel takes the cursor only while it is taking text (a question's
     // Other phase). A list panel leaves it hidden: the composer is not
@@ -1509,6 +1664,13 @@ fn diff_preview_lines(preview: &str, width: usize) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
 
+    /// Draw one frame the way the event loop does: plan for the frame's own
+    /// area, then render from that plan.
+    fn draw_planned(frame: &mut Frame, app: &mut App, hud: &Hud) {
+        let plan = FramePlan::new(app, frame.area(), hud, &mut ShownCache::default());
+        draw(frame, app, hud, &plan);
+    }
+
     fn completion_target(kind: menu::PopupKind, query: &str) -> menu::CompletionTarget {
         let cursor = crate::text_layout::ByteOffset::new(query.len() + 1);
         menu::CompletionTarget {
@@ -1827,7 +1989,7 @@ mod tests {
         ]));
         let mut terminal = Terminal::new(TestBackend::new(50, 18)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .draw(|frame| draw_planned(frame, &mut app, &Hud::default()))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows = (0..buffer.area.height)
@@ -1900,7 +2062,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
 
         terminal
-            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .draw(|frame| draw_planned(frame, &mut app, &Hud::default()))
             .unwrap();
         let visible = screen(&terminal);
         assert!(visible.contains("⎿ ◻ Toggle me"), "{visible}");
@@ -1908,7 +2070,7 @@ mod tests {
 
         app.on_key(80, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         terminal
-            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .draw(|frame| draw_planned(frame, &mut app, &Hud::default()))
             .unwrap();
         let hidden = screen(&terminal);
         assert!(!hidden.contains("Toggle me"), "{hidden}");
@@ -1916,7 +2078,7 @@ mod tests {
 
         app.on_key(80, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         terminal
-            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .draw(|frame| draw_planned(frame, &mut app, &Hud::default()))
             .unwrap();
         assert!(screen(&terminal).contains("⎿ ◻ Toggle me"));
     }
@@ -2277,7 +2439,8 @@ mod tests {
         });
 
         let mut term = Terminal::new(TestBackend::new(64, 20)).unwrap();
-        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        term.draw(|f| draw_planned(f, &mut app, &Hud::default()))
+            .unwrap();
         let rendered = rows(&term);
         let screen = rendered.join("\n");
 
@@ -2312,7 +2475,8 @@ mod tests {
 
         // Over-scroll self-corrects to the last window; the options stay put.
         app.panel_scroll = 999;
-        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        term.draw(|f| draw_planned(f, &mut app, &Hud::default()))
+            .unwrap();
         let rendered = rows(&term);
         let screen = rendered.join("\n");
         assert!(app.panel_scroll < 999, "offset clamped to a valid range");
@@ -2367,7 +2531,8 @@ mod tests {
         });
 
         let mut term = Terminal::new(TestBackend::new(64, 60)).unwrap();
-        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        term.draw(|f| draw_planned(f, &mut app, &Hud::default()))
+            .unwrap();
         let rendered = rows(&term);
         let screen = rendered.join("\n");
 
@@ -2614,7 +2779,8 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        term.draw(|f| draw_planned(f, &mut app, &Hud::default()))
+            .unwrap();
         let buf = term.backend().buffer();
         let rows: Vec<String> = (0..buf.area.height)
             .map(|y| {
@@ -2741,7 +2907,8 @@ mod tests {
             },
         );
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        term.draw(|f| draw(f, &mut app, &Hud::default())).unwrap();
+        term.draw(|f| draw_planned(f, &mut app, &Hud::default()))
+            .unwrap();
         let buf = term.backend().buffer();
         let screen: String = (0..buf.area.height)
             .map(|y| {
@@ -2766,7 +2933,7 @@ mod tests {
         let mut app = App::new("cursor".into());
         app.composer.paste("abcd");
         terminal
-            .draw(|frame| draw(frame, &mut app, &Hud::default()))
+            .draw(|frame| draw_planned(frame, &mut app, &Hud::default()))
             .unwrap();
 
         let cursor = terminal.backend_mut().get_cursor_position().unwrap();
@@ -2783,7 +2950,7 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             let mut app = App::new(format!("width-{width}"));
             terminal
-                .draw(|frame| draw(frame, &mut app, &Hud::default()))
+                .draw(|frame| draw_planned(frame, &mut app, &Hud::default()))
                 .unwrap();
 
             let cursor = terminal.backend_mut().get_cursor_position().unwrap();
@@ -3300,6 +3467,81 @@ mod tests {
             .map(|(name, _, _, _, want)| (*name, *want))
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// A frame parses the streaming answer once, and a sealed answer above it is
+    /// parsed at most once ever: the count per frame does not grow with the tail
+    /// and does not multiply per consumer (plan 263).
+    #[test]
+    fn a_frame_parses_the_streaming_answer_once_per_frame() {
+        use kloop_core::event::Delta;
+        use kloop_core::event::Event;
+
+        let sealed = (0..20)
+            .map(|i| format!("earlier paragraph {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let streaming = (0..10_000)
+            .map(|i| format!("answered line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut app = App::new("parse-count".into());
+        app.cells = vec![Cell::Assistant(sealed)];
+        app.apply(crate::events::AgentEvent::Core(Event::ItemDelta {
+            id: "m".into(),
+            delta: Delta::Text(streaming),
+        }));
+
+        let viewport = Rect::new(0, 0, 60, 24);
+        let mut cache = ShownCache::default();
+        crate::markdown::take_parse_count();
+        let mut counts = Vec::new();
+        for _ in 0..5 {
+            let _plan = FramePlan::new(&app, viewport, &Hud::default(), &mut cache);
+            counts.push(crate::markdown::take_parse_count());
+        }
+        // The first frame renders both cells; later frames only the streaming
+        // one (its text keeps arriving, so its settled prefix is measured every
+        // frame). Nothing here is line-proportional.
+        assert!(counts[0] <= 3, "{counts:?}");
+        assert_eq!(
+            &counts[1..],
+            &vec![counts[1]; counts.len() - 1][..],
+            "a sealed answer must not re-parse on later frames: {counts:?}"
+        );
+        assert!(counts[1] <= 2, "{counts:?}");
+    }
+
+    /// The plan's `transcript` is the same tail `visible_transcript` builds —
+    /// the draw now takes only the lines that fit, but it must pick the same
+    /// ones (head seam and bottom anchoring included).
+    #[test]
+    fn the_plan_transcript_matches_the_flattened_tail() {
+        let mut app = App::new("s".into());
+        app.cells = vec![tall_cell(6), Cell::Note("resumed session".into())];
+        app.freeze_head_lines(40, 2);
+        let hud = Hud::default();
+        let full = visible_transcript(&app, &hud, 40);
+        let plan = FramePlan::new(
+            &app,
+            Rect::new(0, 0, 40, 24),
+            &hud,
+            &mut ShownCache::default(),
+        );
+        let all = plan.transcript(app.head_skip(40), usize::MAX);
+        assert_eq!(
+            all.iter().map(line_text).collect::<Vec<_>>(),
+            full.iter().map(line_text).collect::<Vec<_>>()
+        );
+        // A short window is the bottom of that same list.
+        let last_two = plan.transcript(app.head_skip(40), 2);
+        assert_eq!(
+            last_two.iter().map(line_text).collect::<Vec<_>>(),
+            full[full.len() - 2..]
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// What each kind of cell claims (plan 215 §4.3): its on-screen height,
