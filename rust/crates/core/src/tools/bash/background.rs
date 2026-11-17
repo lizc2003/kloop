@@ -416,17 +416,21 @@ impl BackgroundShells {
         ))
     }
 
-    /// Shells whose command exited but whose result has not been delivered yet.
-    /// They stay in [`Self::running_count`] on purpose; the count is what a
-    /// waiter must not read as zero before the delivery exists.
-    pub(crate) fn finishing_count(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap()
+    /// Outstanding shells in one lock: every active one, and how many of those
+    /// already exited and are only waiting for delivery. Read together so a
+    /// waiter cannot be told about more deliveries than active shells.
+    pub(crate) fn active_count(&self) -> crate::tools::background_registry::ActiveCount {
+        let registry = self.state.lock().unwrap();
+        registry
             .shells
             .values()
-            .filter(|shell| matches!(shell.status, BgStatus::Finishing))
-            .count()
+            .fold(Default::default(), |count, shell| {
+                crate::tools::background_registry::ActiveCount {
+                    active: count.active + usize::from(shell.status.is_active()),
+                    delivering: count.delivering
+                        + usize::from(matches!(shell.status, BgStatus::Finishing)),
+                }
+            })
     }
 
     pub fn running_count(&self) -> usize {

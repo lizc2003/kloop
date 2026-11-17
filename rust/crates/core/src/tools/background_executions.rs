@@ -449,17 +449,21 @@ impl BackgroundExecutions {
         Some(terminal)
     }
 
-    /// Executions whose work is done but whose result has not been delivered
-    /// yet. They stay in [`Self::running_count`] on purpose; this count exists
-    /// so a report can say "delivering" instead of "running".
-    pub(crate) fn finishing_count(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap()
+    /// Outstanding executions in one lock: every active one, and how many of
+    /// those already finished and are only waiting for delivery. A waiter must
+    /// not read zero before the delivery exists, so both live in the same read.
+    pub(crate) fn active_count(&self) -> super::background_registry::ActiveCount {
+        let registry = self.state.lock().unwrap();
+        registry
             .executions
             .values()
-            .filter(|entry| matches!(entry.state, ExecutionState::Finishing(_)))
-            .count()
+            .fold(Default::default(), |count, entry| {
+                super::background_registry::ActiveCount {
+                    active: count.active + usize::from(entry.state.is_active()),
+                    delivering: count.delivering
+                        + usize::from(matches!(entry.state, ExecutionState::Finishing(_))),
+                }
+            })
     }
 
     pub fn running_count(&self) -> usize {
@@ -672,13 +676,17 @@ struct ActiveWork {
 }
 
 impl ActiveWork {
+    /// Both halves of each registry come from one lock there, so `delivering`
+    /// never exceeds `total` here — the counts move together.
     fn read(ctx: &ToolCtx) -> Self {
         let executions = &ctx.cfg.background_executions;
         let shells = &ctx.cfg.background_shells;
+        let executions = executions.active_count();
+        let shells = shells.active_count();
         Self {
-            executions: executions.running_count(),
-            shells: shells.running_count(),
-            delivering: executions.finishing_count() + shells.finishing_count(),
+            executions: executions.active,
+            shells: shells.active,
+            delivering: executions.delivering + shells.delivering,
         }
     }
 
@@ -692,6 +700,10 @@ fn status_report(head: &str, work: &ActiveWork) -> String {
     if total == 0 {
         return format!("{head} No background work is still running.");
     }
+    debug_assert!(
+        work.delivering <= total,
+        "delivering cannot exceed the active work it belongs to"
+    );
     let running = total - work.delivering;
     let mut state = match running {
         0 => "No background work is still running".to_string(),
@@ -1178,8 +1190,11 @@ mod tests {
                 "Finishing must remain active until delivery exists"
             );
             assert_eq!(
-                registry.finishing_count(),
-                1,
+                registry.active_count(),
+                super::super::background_registry::ActiveCount {
+                    active: MAX_BACKGROUND_EXECUTIONS,
+                    delivering: 1,
+                },
                 "the one mid-delivery row is what the wait report calls delivering"
             );
             published.store(1, Ordering::SeqCst);

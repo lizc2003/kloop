@@ -25,6 +25,17 @@ use crate::event::Event;
 /// before shutdown reports it as still running.
 const FORCE_GRACE: Duration = Duration::from_secs(1);
 
+/// What one registry still owes, read in a single pass under its lock.
+/// `active` counts everything a waiter must not see as zero — running,
+/// stopping, and finished-but-undelivered — while `delivering` is the finished
+/// part of it. One read, one lock: two separate counts could report more
+/// deliveries than active items after an item finished in between.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ActiveCount {
+    pub(crate) active: usize,
+    pub(crate) delivering: usize,
+}
+
 /// Wait until `probe` reports done, re-reading it on every activity bump and
 /// returning the last reading.
 ///

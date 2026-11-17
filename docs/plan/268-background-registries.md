@@ -69,11 +69,14 @@ registry。
   MaxRounds 仍是 `stopped at round limit`（状态显示为 Completed），Aborted 仍是 `stopped`
   （保留的 worktree 位置拼在它后面）。
 - **第 5 条文案**：`wait_for_activity` 的报告把「还在跑」与「已跑完、结果在投递」分开
-  （`ActiveWork::read` 用两个 registry 新增的 `finishing_count`），全都在投递时写
+  （`ActiveWork::read` 用两个 registry 新增的 `active_count`），全都在投递时写
   `No background work is still running; 1 item already finished and its result is being
   delivered`；`bash_output` 在阻塞等待超时且状态是 `Finishing` 时写
   `the command finished; its result is still being delivered after Nms`，不再写
-  `still finishing after Nms`（此时命令确已结束，只有投递未完成）。
+  `still finishing after Nms`（此时命令确已结束，只有投递未完成）。活跃数与投递数在**同一次
+  持锁**里读出（`ActiveCount`，两个 registry 各实现一份），`total - delivering` 因此不会下溢：
+  子 agent 共享父会话的 registry，分两次加锁读取时，中途变 `Finishing` 的条目会让投递数大于
+  先读到的活跃数，debug 下直接 panic。
 
 提交分两次：先纯结构、行为零变更，再单独提交文案变更（第 3 条的 detail 与第 5 条的两处措辞），
 符合验收要求。

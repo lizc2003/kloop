@@ -16,6 +16,8 @@ Windows 的 `spawn_impl` 与 `create_debugged_root` 合成 `create_suspended_roo
 detail 只说状态说不出的（Completed/Failed 不再给 detail，MaxRounds 与 Aborted 保留）；第 5 条：
 `wait_for_activity` 用两个 registry 新增的 `finishing_count` 分开「还在跑」与「已跑完在投递」，
 `bash_output` 的 `Finishing` 行改写为「命令已结束、结果仍在投递」。文案变更单独一个提交。
+复审补一条：活跃数与投递数原先分两次加锁读，子 agent 共享 registry 时可能读到投递数大于活跃数
+（debug 减法 panic），改成每个 registry 一次持锁返回 `ActiveCount`。
 验证：core lib 1453 通过、1 ignored，tui 353、server 27、process-spawn 17；`cargo check
 --workspace`；core/process-spawn clippy；fmt；`cargo xwin clippy` 交叉 Windows 通过（**未在 Windows
 执行**）；未跑全量 `make check`、parity、真实 API。教训 409、410。
