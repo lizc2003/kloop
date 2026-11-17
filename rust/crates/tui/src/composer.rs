@@ -233,7 +233,19 @@ impl ComposerDocument {
     fn replace(&mut self, range: TextRange, replacement: &str) -> ByteOffset {
         self.assert_range(range);
         let range = self.materialize_intersections(range);
-        let mut cursor = self.replace_raw(range, replacement);
+        let cursor = self.replace_raw(range, replacement);
+        let cursor = self.repair_boundaries(cursor);
+        self.assert_invariants();
+        cursor
+    }
+
+    /// Repair what the last splice glued together. A neighbour can attach to an
+    /// image label (a combining mark after it, a Prepend character before it),
+    /// which would leave the label's range off a grapheme boundary; a space
+    /// goes on the glued side. The cursor comes back on a boundary. Every raw
+    /// splice ends here — a replacement that skips it leaves a document that
+    /// panics on the next layout.
+    fn repair_boundaries(&mut self, mut cursor: ByteOffset) -> ByteOffset {
         // 先隔开图片再对齐光标：否则光标会被对齐进与标签粘成一体的字素里。
         while let Some(index) = self.atoms.iter().position(|atom| {
             matches!(
@@ -264,7 +276,6 @@ impl ComposerDocument {
                 }
             };
         }
-        self.assert_invariants();
         cursor
     }
 
@@ -327,6 +338,9 @@ impl ComposerDocument {
     fn replace_pending_with_text(&mut self, index: usize, text: &str) -> ByteOffset {
         let atom = self.atoms.remove(index);
         let cursor = self.replace_raw(atom.range, text);
+        // The text can glue itself to a neighbouring label (a leading combining
+        // mark, say), so the repair `replace` runs applies here too.
+        let cursor = self.repair_boundaries(cursor);
         self.assert_invariants();
         cursor
     }
@@ -919,20 +933,19 @@ impl Composer {
     /// put the text into the wrong input (or nowhere, past its end).
     pub fn paste_text_at_reservation(&mut self, token: u64, text: &str) -> ReservationPaste {
         if let Some(index) = self.document.pending_index(token) {
-            let atom = &self.document.atoms[index];
-            let (at, end) = (atom.range.start(), atom.range.end());
+            let end = self.document.atoms[index].range.end();
             // The caret follows the replacement when it rested after the label
             // and stays put before it. Computed against the pre-splice text:
             // once the label is gone the sides can join into one grapheme and
             // the old offsets no longer name positions an edit can use.
-            let mapped = if self.cursor >= end {
-                ByteOffset::new(self.cursor.get() - (end.get() - at.get()) + text.len())
-            } else {
-                self.cursor
-            };
+            let follows = self.cursor >= end;
+            let before = self.cursor;
             self.begin_edit();
-            self.document.replace_pending_with_text(index, text);
-            self.cursor = snap_grapheme_boundary(self.text(), mapped);
+            // The repair may add a separating space on either side of the
+            // replacement, so the caret that follows it is the position the
+            // splice reports, not the old offset plus a length.
+            let after = self.document.replace_pending_with_text(index, text);
+            self.cursor = snap_grapheme_boundary(self.text(), if follows { after } else { before });
             self.goal_column = None;
             return ReservationPaste::Visible;
         }
@@ -1839,6 +1852,31 @@ mod tests {
                 "a[Image #1][Image #2]b".into(),
                 vec!["one".into(), "two".into()]
             )
+        );
+    }
+
+    /// A fallback can start with a combining mark: it would glue itself to the
+    /// label before it and take that image's end off a grapheme boundary. The
+    /// splice keeps the label as the separator but must run the same repair a
+    /// normal edit does (a separating space on the glued side).
+    #[test]
+    fn a_combining_mark_fallback_is_separated_from_the_label_before_it() {
+        let mut composer = Composer::new();
+        composer.attach_image(image("one"));
+        let token = composer.reserve_image();
+        assert_eq!(composer.text(), "[Image #1][Image #2]");
+
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "\u{0301}.png"),
+            ReservationPaste::Visible
+        );
+        assert_eq!(composer.text(), "[Image #1] \u{0301}.png");
+        // The surviving image still ends on a boundary (the debug invariant
+        // assert inside the splice would have fired otherwise).
+        let _ = ComposerLayout::new(composer.text(), composer.cursor(), 80);
+        assert_eq!(
+            submitted(&mut composer),
+            ("[Image #1] \u{0301}.png".into(), vec!["one".into()])
         );
     }
 

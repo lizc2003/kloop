@@ -151,3 +151,14 @@
   原文——删除与插入之间不再存在“两侧已合并”的中间态；光标按 splice 前的文本一次算好，再按新
   文本 snap。新增回归覆盖可见与暂存两条路径。
 - **验证**：kloop-tui 351 项；clippy、fmt；PTY 24/25（同上）。
+
+### 第四轮复审补修之二
+
+- **P2：整体替换绕过了相邻原子的字素边界修复**。`replace` 的收尾会把“粘到图片标签上的组合符/
+  Prepend 字符”用空格隔开；`replace_pending_with_text` 只做 `replace_raw`，于是以 U+0301 开头
+  的回退文本会粘到前一个标签的 `]` 上，debug 构建在 `assert_invariants` 立刻失败，release 里
+  后续布局才炸。把 `replace` 的后处理抽成 `repair_boundaries`（隔离 → 光标对齐 → 再处理剩余
+  破损 atom），`replace` 与 `replace_pending_with_text` 共用；光标改用 splice 返回的位置（可能
+  因隔开空格而平移），而不是“旧偏移 + 文本长度”。
+- **验证**：kloop-tui 352 项（新增：`[Image #1]` 后回退 `\u{0301}.png` 会被隔开且原图仍可提交、
+  布局可构造）；clippy、fmt；PTY 24/25（同上）。

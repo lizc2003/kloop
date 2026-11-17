@@ -2006,7 +2006,9 @@ keystrokes starts one walk rather than one per key. A paste reserves its
 content from that moment, so edits carry it along, a second paste lands after
 the first, and the bytes fill that exact label when they arrive (a read that
 produces no image replaces the label with the paste's text in one splice, in
-whichever draft holds the label, with the cursor mapped over the span and
+whichever draft holds the label, running the same post-edit boundary repair a
+normal edit does (a fallback that starts with a combining mark would otherwise
+glue itself to the label before it), with the cursor mapped over the span and
 snapped to a grapheme boundary — the two sides can join into one, so deleting
 the label and inserting at its old start is not the same edit; a label deleted,
 or a draft sent or cleared meanwhile, is refused — with a note when the draft
