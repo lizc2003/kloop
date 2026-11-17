@@ -1,8 +1,8 @@
 # Plan 264 — 每轮与每次工具调用的重复计算
 
 > 2026-10-28 立。来源：全仓只读审查(HANDOFF「〇⁵」节)。
-> 状态：待实现。行号是 2026-10-28 的读数，开工先自己量;标「待复核」的条目开工第一步
-> 先读代码确认，不成立就在本文件划掉并写明原因。权限一侧"同一命令解析 5–7 次"在 plan 266。
+> 状态：✅ 2026-11-17 完成。行号是 2026-10-28 的读数，实际按函数定位;第 3–6 条开工复核
+> 均成立。权限一侧"同一命令解析 5–7 次"在 plan 266。
 
 ## 问题
 
@@ -48,3 +48,25 @@
   历史 clone 次数),断言每次内置调用不再重建 schema、每轮 injected context 只算一次。
 - 第 6 条单测先红后绿。
 - 外层执行沙箱之外 `make check`;HANDOFF 记进展。
+
+## 完成记录(2026-11-17)
+
+- **请求视图**：`sample_with_retry` 改为接收 `Vec<Message>`(调用方从 `request_view` 交出所有权)，
+  合成首条消息用 `insert(0, ..)` 移动，不再 `Vec::with_capacity + extend_from_slice` 深拷贝整段
+  历史。重试仍复用同一份字节。
+- **每轮一次**：`Turn` 增加 `injected: Option<String>`，在回合边界(刷新工具与提醒之后)构建一次；
+  预测估算、溢出上限估算、请求本体和每轮 Usage 都读这一份。`sample_with_retry` 不再收 `depth`。
+- **按名字判定 defer**：新增 `source_tool_deferral`(先判阈值、按 merge 顺序找单个名字，不克隆
+  ToolDef)与 `builtin_count`/`merged_source_count`;`classify_source` 对 `Builtin::from_name`
+  直接返回不 defer，内置调用不再走两次完整分区。`tool_search::is_deferred` 复用前者。
+- **`select:` 不建定义**：新增 `tool_name_is_inline`，与已算出的 `deferred` 配合只比名字
+  (内置走 `in_catalog`/`in_surface`,`tool_search`/`call_tool` 看 defer 期)，不再为比较字符串
+  重建 run_program 的整份 TypeScript API。
+- **合并共用**：`merge_source_defs` 同时返回定义与冲突消息，`tool_merge_warnings` 不再手写一遍
+  合并;`all_tool_defs` 在 depth 0 开 program 时复用已构建的 catalog，`partition_source_defs`
+  用 `builtin_count` 计数。
+- **第 6 条**：单独提交，回归 `a_required_term_matches_across_the_name_separator` 先红后绿。
+- **验证**：kloop-core lib 1440 通过、1 ignored(含新增：每轮 injected context 只构建一次、
+  内置调用/`select:` 不重建内置 catalog、按名字判定不建定义);`tools::` 503 项、
+  `clippy -p kloop-core --all-targets -D warnings`、`cargo fmt --all`。未跑全量 `make check`、
+  parity、真实 API。

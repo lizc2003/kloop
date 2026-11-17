@@ -613,14 +613,9 @@ pub fn all_tool_defs(
     surface: crate::config::SurfaceCapabilities,
     shell_programs: &ShellPrograms,
 ) -> Vec<ToolDef> {
-    let mut defs = builtin_defs(depth, shell_programs);
+    let catalog = builtin_defs(depth, shell_programs);
     let (inline_sources, deferred) =
         partition_source_defs(sources, defer_threshold, shell_programs);
-    if !deferred.is_empty() {
-        defs.push(tool_search::tool_search_def());
-        defs.push(tool_search::call_tool_def());
-    }
-    defs.extend(inline_sources.iter().cloned());
     // The surface-gated block is depth-0 only (like run_agent) and rides on
     // what the front-end enables. It is appended after the source defs because
     // run_program's generated TypeScript API lists them: full declarations for
@@ -631,27 +626,36 @@ pub fn all_tool_defs(
     // this honest: a new surface-gated tool is offered because it declared a
     // gate, not because someone remembered to add a `push` here. The walk order
     // is `ALL`'s order, which is the wire order — see [`builtin::ALL`].
-    if depth == 0 {
+    let surface_defs = if depth == 0 {
         // Only run_program's definition reads the catalogs, and that surface is
         // off by default — rebuilding three dozen schemas for a request that
-        // does not offer it would be pure waste.
-        let program_builtins = if surface.program {
-            builtin_defs(0, shell_programs)
-        } else {
-            Vec::new()
-        };
+        // does not offer it would be pure waste. When it is on, `catalog` is
+        // already exactly the depth-0 built-ins the Program API lists.
+        let no_builtins: Vec<ToolDef> = Vec::new();
         let cx = builtin::DefCx {
-            builtins: &program_builtins,
+            builtins: if surface.program {
+                &catalog
+            } else {
+                &no_builtins
+            },
             inline_sources: &inline_sources,
             deferred_sources: &deferred,
         };
-        defs.extend(
-            builtin::ALL
-                .iter()
-                .filter(|tool| tool.in_surface(surface))
-                .map(|tool| tool.def(&cx)),
-        );
+        builtin::ALL
+            .iter()
+            .filter(|tool| tool.in_surface(surface))
+            .map(|tool| tool.def(&cx))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut defs = catalog;
+    if !deferred.is_empty() {
+        defs.push(tool_search::tool_search_def());
+        defs.push(tool_search::call_tool_def());
     }
+    defs.extend(inline_sources);
+    defs.extend(surface_defs);
     defs
 }
 
@@ -677,6 +681,71 @@ pub fn deferred_tool_defs(
     partition_source_defs(sources, defer_threshold, shell_programs).1
 }
 
+/// Whether an external source offers `name` and the merge withholds it behind
+/// tool_search. `None` means no source offers it; a built-in name is reserved
+/// away before the sources are consulted and therefore also answers `None`.
+///
+/// One name, not the whole split: the dispatch gate asks this for every call,
+/// and building both halves used to clone every source's ToolDef — full JSON
+/// schemas included — to answer a single lookup.
+fn source_tool_deferral(
+    sources: &[Arc<dyn ToolSource>],
+    defer_threshold: usize,
+    shell_programs: &ShellPrograms,
+    name: &str,
+) -> Option<bool> {
+    if reserved_names().contains(name) {
+        return None;
+    }
+    // First source claiming the name wins, mirroring the merge.
+    for source in sources {
+        let source_defs = source.defs();
+        if let Some(def) = source_defs.iter().find(|def| def.name == name) {
+            // Past the threshold every merged source tool is deferred, so the
+            // per-tool answer is not needed — and the count is what keeps this
+            // path from cloning the catalog.
+            let over =
+                builtin_count(0, shell_programs) + merged_source_count(sources) > defer_threshold;
+            return Some(over || source.should_defer(&def.name));
+        }
+    }
+    None
+}
+
+/// Whether the request built now carries `name` outside the deferred set, used
+/// by `select:` to tell "already loaded" from "unknown".
+///
+/// The caller has already ruled out the deferred catalog, so any source match
+/// here is inline by construction. Built-ins and the deferred-era
+/// `tool_search`/`call_tool` pair are decided by name: materializing the defs
+/// rebuilt run_program's whole TypeScript API just to compare strings.
+fn tool_name_is_inline(
+    name: &str,
+    depth: u8,
+    sources: &[Arc<dyn ToolSource>],
+    surface: crate::config::SurfaceCapabilities,
+    shell_programs: &ShellPrograms,
+    deferred_regime: bool,
+) -> bool {
+    if deferred_regime
+        && (name.eq_ignore_ascii_case("tool_search") || name.eq_ignore_ascii_case("call_tool"))
+    {
+        return true;
+    }
+    if builtin::ALL.iter().any(|tool| {
+        tool.name().eq_ignore_ascii_case(name)
+            && (tool.in_catalog(depth, shell_programs) || (depth == 0 && tool.in_surface(surface)))
+    }) {
+        return true;
+    }
+    sources.iter().any(|source| {
+        source
+            .defs()
+            .iter()
+            .any(|def| def.name.eq_ignore_ascii_case(name) && !reserved_names().contains(&def.name))
+    })
+}
+
 /// The merged source catalog split into `(inline, deferred)`, in merge order.
 /// One walk: `all_tool_defs` needs both halves, and computing them as two
 /// independent calls merged the whole catalog twice and then subtracted one
@@ -687,7 +756,7 @@ fn partition_source_defs(
     shell_programs: &ShellPrograms,
 ) -> (Vec<ToolDef>, Vec<ToolDef>) {
     let merged = merged_source_defs(sources);
-    if tool_defs(0, shell_programs).len() + merged.len() > defer_threshold {
+    if builtin_count(0, shell_programs) + merged.len() > defer_threshold {
         return (Vec::new(), merged);
     }
     merged.into_iter().partition(|def| {
@@ -730,17 +799,46 @@ fn reserved_names() -> &'static std::collections::HashSet<String> {
 }
 
 fn merged_source_defs(sources: &[Arc<dyn ToolSource>]) -> Vec<ToolDef> {
+    merge_source_defs(sources).0
+}
+
+/// The merged catalog plus one message per dropped definition. Startup
+/// diagnostics and the request builder have to agree on what "merged" means,
+/// so both come from here.
+fn merge_source_defs(sources: &[Arc<dyn ToolSource>]) -> (Vec<ToolDef>, Vec<String>) {
     let mut seen = reserved_names().clone();
     let mut defs = Vec::new();
+    let mut collisions = Vec::new();
     for source in sources {
         let source_defs = source.defs();
         for def in source_defs.iter() {
             if seen.insert(def.name.clone()) {
                 defs.push(def.clone());
+            } else {
+                collisions.push(format!(
+                    "tool name collision: '{}' is already registered; the later definition is skipped",
+                    def.name
+                ));
             }
         }
     }
-    defs
+    (defs, collisions)
+}
+
+/// How many definitions the merge would produce, without cloning any of them.
+/// The defer threshold only needs the count.
+fn merged_source_count(sources: &[Arc<dyn ToolSource>]) -> usize {
+    let mut seen = reserved_names().clone();
+    let mut count = 0;
+    for source in sources {
+        let source_defs = source.defs();
+        for def in source_defs.iter() {
+            if seen.insert(def.name.clone()) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Startup diagnostics for the merged tool set: name collisions (the later
@@ -751,20 +849,8 @@ pub fn tool_merge_warnings(
     defer_threshold: usize,
     shell_programs: &ShellPrograms,
 ) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let mut seen = reserved_names().clone();
-    for source in sources {
-        let source_defs = source.defs();
-        for def in source_defs.iter() {
-            if !seen.insert(def.name.clone()) {
-                warnings.push(format!(
-                    "tool name collision: '{}' is already registered; the later definition is skipped",
-                    def.name
-                ));
-            }
-        }
-    }
-    let total = tool_defs(0, shell_programs).len() + merged_source_defs(sources).len();
+    let (merged, mut warnings) = merge_source_defs(sources);
+    let total = builtin_count(0, shell_programs) + merged.len();
     if total > defer_threshold {
         warnings.push(format!(
             "{total} tools registered (> {defer_threshold}); MCP tool definitions are deferred — the model loads them on demand via tool_search"
@@ -882,12 +968,35 @@ fn source_route_state(sources: &[Arc<dyn ToolSource>], name: &str) -> SourceRout
 /// self-reference, and no throwaway description regeneration when only counting
 /// is needed.
 fn builtin_defs(depth: u8, shell_programs: &ShellPrograms) -> Vec<ToolDef> {
+    #[cfg(test)]
+    BUILTIN_DEFS_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let cx = builtin::DefCx::default();
     builtin::ALL
         .iter()
         .filter(|tool| tool.in_catalog(depth, shell_programs))
         .map(|tool| tool.def(&cx))
         .collect()
+}
+
+/// How many built-ins a request at `depth` carries in its catalog. Counting
+/// walks the same gate as [`builtin_defs`] but builds no schemas.
+fn builtin_count(depth: u8, shell_programs: &ShellPrograms) -> usize {
+    builtin::ALL
+        .iter()
+        .filter(|tool| tool.in_catalog(depth, shell_programs))
+        .count()
+}
+
+// Thread-local: tests in one binary run in parallel, and a shared counter
+// would count another test's catalog build.
+#[cfg(test)]
+thread_local! {
+    static BUILTIN_DEFS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn builtin_defs_builds() -> usize {
+    BUILTIN_DEFS_BUILDS.with(std::cell::Cell::get)
 }
 
 /// What tool-counting (`defer_active`, `tool_merge_warnings`) sees: the built-ins
@@ -1245,6 +1354,16 @@ fn classify_source(
         return Ok(SourceGate {
             discovery_gated: false,
             expected: expected_program_source,
+            before,
+        });
+    }
+    // A source can never claim a built-in name (`reserved_names`), so neither
+    // defer sample below can be true for one. Answering here also keeps a
+    // built-in call from walking the source catalog twice.
+    if Builtin::from_name(name).is_some() {
+        return Ok(SourceGate {
+            discovery_gated: false,
+            expected: before,
             before,
         });
     }

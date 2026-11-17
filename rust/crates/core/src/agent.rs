@@ -509,6 +509,11 @@ struct Turn<'a> {
     stream_text: bool,
     tools: Vec<kloop_protocol::ToolDef>,
     program_tool_manifest: Arc<crate::tools::ProgramToolManifest>,
+    /// This round's synthetic first user message. Built once at the round
+    /// boundary and read by every estimate and by the request itself: the same
+    /// instructions describe the same request, and a depth-0 build walks the
+    /// skills catalog and the deferred-tool list.
+    injected: Option<String>,
     /// Overflow is recovered at most once per turn: compact, then retry. A
     /// second overflow after a successful compaction surfaces as an error.
     overflow_compact_attempted: bool,
@@ -587,11 +592,7 @@ impl Turn<'_> {
     fn next_request_estimate(&self) -> u64 {
         let workspace = self.cfg.effective_workspace();
         estimate_request(self.history, || {
-            request_overhead_tokens(
-                &workspace.system,
-                &self.tools,
-                injected_context(self.cfg, &workspace, self.depth).as_deref(),
-            )
+            request_overhead_tokens(&workspace.system, &self.tools, self.injected.as_deref())
         })
     }
 
@@ -1156,6 +1157,7 @@ async fn turn_rounds(
         stream_text: depth == 0,
         tools,
         program_tool_manifest,
+        injected: None,
         overflow_compact_attempted: false,
         truncation_recoveries: 0,
         stream_resumes: 0,
@@ -1209,6 +1211,9 @@ async fn turn_rounds(
         // injected context are estimated here; a dynamic MCP refresh may have
         // replaced the tools or the deferred-tool notice since last round.
         let workspace = cfg.effective_workspace();
+        // One build for the whole round: the predictive estimate, the ceiling
+        // estimate, the request and the usage line all describe this request.
+        turn.injected = injected_context(cfg, &workspace, depth);
         let predicted = turn.next_request_estimate();
         if let Some(ending) = turn.compact_predictively(predicted, round).await {
             break 'turn ending;
@@ -1232,12 +1237,12 @@ async fn turn_rounds(
                 sample_with_retry(
                     cfg,
                     &turn.active_attempt,
-                    &view,
+                    view,
+                    turn.injected.as_deref(),
                     &turn.tools,
                     ui,
                     cancel,
                     turn.stream_text,
-                    depth,
                     &workspace,
                     &mut turn.item_seq,
                 )
@@ -1672,6 +1677,18 @@ fn plan_mode_reminder(depth: u8, questions: bool) -> String {
     )
 }
 
+// Thread-local: tests in one binary run in parallel, and a shared counter
+// would count another test's turn.
+#[cfg(test)]
+thread_local! {
+    static INJECTED_CONTEXT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn injected_context_builds() -> usize {
+    INJECTED_CONTEXT_BUILDS.with(std::cell::Cell::get)
+}
+
 /// The synthetic first user message: the plan-mode reminder (when in plan mode),
 /// project instructions, the skills catalog, and the deferred-tools notice, in
 /// that order. Project instructions and the skills catalog are session-stable;
@@ -1684,6 +1701,8 @@ fn injected_context(
     workspace: &crate::config::EffectiveWorkspace,
     depth: u8,
 ) -> Option<String> {
+    #[cfg(test)]
+    INJECTED_CONTEXT_BUILDS.with(|builds| builds.set(builds.get() + 1));
     let parts: Vec<String> = injected_segments(cfg, workspace, depth)
         .into_iter()
         .map(|(_, text)| text)

@@ -194,9 +194,13 @@ pub fn deferred_notice(cfg: &Config) -> Option<String> {
 }
 
 pub(super) fn is_deferred(name: &str, cfg: &Config) -> bool {
-    deferred_tool_defs(&cfg.tool_sources, cfg.defer_threshold, &cfg.shell_programs)
-        .iter()
-        .any(|definition| definition.name == name)
+    super::source_tool_deferral(
+        &cfg.tool_sources,
+        cfg.defer_threshold,
+        &cfg.shell_programs,
+        name,
+    )
+    .unwrap_or(false)
 }
 
 fn receipt_for_capability(
@@ -278,13 +282,7 @@ pub(super) async fn tool_search_tool(
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select:"))
     {
         let rest = &query["select:".len()..];
-        let loaded = super::all_tool_defs(
-            ctx.depth,
-            &ctx.cfg.tool_sources,
-            ctx.cfg.defer_threshold,
-            ctx.cfg.surface,
-            &ctx.cfg.shell_programs,
-        );
+        let deferred_regime = !deferred.is_empty();
         let mut selected = std::collections::HashSet::new();
         let mut selected_any = false;
         for name in rest
@@ -300,7 +298,14 @@ pub(super) async fn tool_search_tool(
                 if selected.insert(def.name.clone()) {
                     found.push(def.clone());
                 }
-            } else if loaded.iter().any(|def| def.name.eq_ignore_ascii_case(name)) {
+            } else if super::tool_name_is_inline(
+                name,
+                ctx.depth,
+                &ctx.cfg.tool_sources,
+                ctx.cfg.surface,
+                &ctx.cfg.shell_programs,
+                deferred_regime,
+            ) {
                 notes.push(format!("'{name}' is already loaded; call it directly"));
             } else if let Some(reason) = unavailable_source_reason(name, &ctx.cfg) {
                 notes.push(reason);
@@ -1193,6 +1198,31 @@ mod tests {
         .await;
         assert!(!is_error, "{out}");
         assert!(out.contains("## srv__page_fetch"), "{out}");
+    }
+
+    /// The dispatch gate and `select:` compare names. Neither may rebuild the
+    /// built-in catalog — that used to regenerate run_program's whole
+    /// TypeScript API just to answer a string question.
+    #[test]
+    fn defer_and_loaded_checks_answer_by_name_not_by_building_the_catalog() {
+        let ctx = deferred_ctx("name-only-checks");
+        let before = crate::tools::builtin_defs_builds();
+        assert!(!is_deferred("bash", &ctx.cfg));
+        assert!(is_deferred("srv__web_search", &ctx.cfg));
+        assert!(!is_deferred("nope", &ctx.cfg));
+        assert_eq!(crate::tools::builtin_defs_builds(), before);
+    }
+
+    #[tokio::test]
+    async fn builtin_dispatch_and_select_do_not_rebuild_the_builtin_catalog() {
+        let ctx = deferred_ctx("no-rebuild");
+        let before = crate::tools::builtin_defs_builds();
+        let (out, is_error) = run_tool("list_agents", json!({}), &ctx).await;
+        assert!(!is_error, "{out}");
+        let (out, is_error) = run_tool("tool_search", json!({"query": "select:bash"}), &ctx).await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("'bash' is already loaded"), "{out}");
+        assert_eq!(crate::tools::builtin_defs_builds(), before);
     }
 
     #[tokio::test]

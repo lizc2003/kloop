@@ -5,6 +5,19 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 264 ✅：每轮与每次工具调用的重复计算（2026-11-17）**：六条复核全部成立。请求视图交给采样层
+所有权，合成首条消息用 `insert(0, ..)` 移动，不再为插一条消息深拷贝整段历史；`Turn` 在回合边界
+构建一次 injected context，预测估算、溢出上限、请求与每轮 Usage 都读这一份。工具侧改成按名字
+回答：`classify_source` 对内建直接判不 defer，`source_tool_deferral` 先看阈值再按 merge 顺序找
+单个名字，`builtin_count`/`merged_source_count` 只计数不建 schema；`select:` 用
+`tool_name_is_inline` 与已算出的 deferred 集合比名字，不再为比较字符串重建 run_program 的
+TypeScript API；`all_tool_defs` 在 depth 0 开 program 时复用已构建的 catalog，
+`merge_source_defs` 同时产出定义与冲突消息供 `tool_merge_warnings` 共用。第 6 条（`+term` 必选
+判断漏了 `name.contains`）按计划单独提交，回归先红后绿。验证：kloop-core lib 1440 通过、1
+ignored（新增每轮只构建一次 injected context、内置调用/`select:` 不重建内置 catalog、按名字
+判定不建定义），`tools::` 503 项、`clippy -p kloop-core --all-targets -D warnings`、fmt；
+未跑全量 `make check`、parity、真实 API。教训 401、402。
+
 **Plan 285 ✅：bypass 下 bash 不进沙箱（2026-11-16）**：用户转来 bypass 会话的自查：Keychain
 里的 Jenkins/SLS 凭据取不到、git over SSH 拿不到身份、内网 DNS 失败。查实 bypass 只免审批，
 命令仍先进沙箱、被拒后免审批重跑，但凭据读被拒从不升级（ssh 永远拿不到身份），Keychain 的
@@ -5267,3 +5280,17 @@ Enter 提交，图片就落到下一条消息；读取失败退回的文本同�
 只等于“一次原始 splice”：正常编辑路径上挂在 splice 之后的那套修复（这里是把粘到标签上的组合符
 隔开）同样是编辑语义的一部分，绕过包装函数自己调底层函数时要把它们一起带走，或者干脆把两者
 抽成同一条通道。
+
+401. **共享的派生输入应当属于“它描述的那个请求”的作用域，在边界构建一次，而不是让每个消费者各自
+重算。** plan 264 里同一轮有四处需要 injected first message（预测估算、溢出上限估算、实际请求、
+每轮 Usage），深度 0 还要走技能目录与 deferred 名单。把 `injected_context` 缓存进 `Turn` 时有个
+容易漏的点：`estimate_request` 的 overhead 闭包只在没有 usage anchor 时才调用，所以“缓存了字段”
+不等于“每轮一定构建一次”——构建必须无条件放在回合边界，否则采样路径仍会自己再算。判据：当几个
+值描述的其实是同一份请求/同一帧/同一次解析时，共享输入按该作用域（回合、帧）缓存，别按消费者的
+调用条件缓存。
+
+402. **并行测试里的计数钩子要按线程隔离，否则断言的是整个测试二进制。** 给 `injected_context`
+加全局 `AtomicUsize` 后，单轮测试看到 9 次而不是 1 次：同一进程里别的测试在并行跑回合。改用
+`thread_local! + Cell`，`#[tokio::test]` 默认的 current-thread runtime 会整轮跑在测试线程上。
+判据：计数断言只有在计数器的生命周期与被测单元重合时才有意义——共享全局计数器会随测试并行度
+漂移，看似“优化失效”，实际是测错了范围。

@@ -372,10 +372,15 @@ fork:
   history's estimate covers history alone, so the system prompt, this round's
   tools and the injected context are estimated and added. Adding them on top of
   an anchor counted them twice (the injected context was, until 2026-09-23);
-  leaving them out before one missed ~10k tokens in this repository. The same
-  function feeds the in-turn gauge, and `context_estimate` gives every front
-  end's between-turn gauge and `/cost` the same number. The text estimate is
-  one function (`history::estimate_text_tokens` and its message/tool siblings):
+  leaving them out before one missed ~10k tokens in this repository. One round
+  builds that injected first message once, at the round boundary, and the
+  predictive estimate, the ceiling estimate, the request and the gauge all read
+  that build. The request view is handed to sampling by value, so the synthetic
+  message is inserted at the head by moving pointers instead of copying the
+  history a second time. The same function feeds the in-turn gauge, and
+  `context_estimate` gives every front end's between-turn gauge and `/cost` the
+  same number. The text estimate is one function
+  (`history::estimate_text_tokens` and its message/tool siblings):
   an ASCII byte is a quarter token and any other character one token, so ASCII
   (code, English, JSON, base64) estimates exactly as bytes/4 did while a CJK
   character, three UTF-8 bytes, is no longer three quarters of a token. This
@@ -2663,6 +2668,14 @@ the synthetic context message lists the deferred names:
   permissions, hooks, concurrency and the UI all judge the real tool name;
   direct calls remain a compatibility optimization for providers that permit
   undeclared names.
+
+The per-call gate answers by name. A built-in is recognized from the catalog
+table without building schemas; a source tool is looked up in the merged names
+(after the threshold check, then its own `should_defer`), and `select:`
+compares names against the already-computed deferred set. None of these
+materializes the tool definitions — dispatch must not regenerate run_program's
+TypeScript API or clone source schemas just to ask whether one name is
+deferred.
 
 `tool_search` is an ordering barrier rather than a read-only concurrent call: in
 one assistant response, `tool_search` followed by a deferred source call

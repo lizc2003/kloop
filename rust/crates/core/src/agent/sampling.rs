@@ -13,7 +13,6 @@ use std::time::UNIX_EPOCH;
 use tokio_util::sync::CancellationToken;
 
 use super::Ui;
-use super::injected_context;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
 use crate::event::Delta;
@@ -95,32 +94,27 @@ pub(crate) fn retry_delay(attempt: u32, error: &ProviderFailure) -> Duration {
 pub(super) async fn sample_with_retry(
     cfg: &Arc<Config>,
     provider_attempt: &FrozenProviderAttempt,
-    projected: &[Message],
+    mut projected: Vec<Message>,
+    injected: Option<&str>,
     tools: &[ToolDef],
     ui: &Arc<dyn Ui>,
     cancel: &CancellationToken,
     stream_text: bool,
-    depth: u8,
     workspace: &EffectiveWorkspace,
     item_seq: &mut u64,
 ) -> Sampled {
     // `projected` is the request view, reduced once by the caller: every retry
-    // below sends these exact bytes.
-    let messages = projected;
+    // below sends these exact bytes. The caller hands over ownership so the
+    // synthetic first message can be inserted with a pointer move instead of
+    // copying the whole history a second time.
+    //
     // Project instructions, the (depth-0) skills catalog, and the deferred-tools
     // notice ride every request as a synthetic first user message. Never
     // recorded: resume rereads fresh files, and compaction cannot swallow it.
-    let injected;
-    let messages = match injected_context(cfg, workspace, depth) {
-        Some(context) => {
-            let mut with_context = Vec::with_capacity(messages.len() + 1);
-            with_context.push(Message::user_text(context));
-            with_context.extend_from_slice(messages);
-            injected = with_context;
-            &injected[..]
-        }
-        None => messages,
-    };
+    if let Some(context) = injected {
+        projected.insert(0, Message::user_text(context));
+    }
+    let messages = projected.as_slice();
     for attempt in 0..MAX_ATTEMPTS {
         // Reborrow: a retry within this turn keeps counting up from the same
         // sequence, so a message that only lands on the second attempt still

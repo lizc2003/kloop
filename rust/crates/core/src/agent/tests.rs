@@ -1576,6 +1576,26 @@ fn the_request_overhead_is_added_only_without_an_anchor() {
     );
 }
 
+/// The synthetic first user message describes this round's request, so the
+/// predictive estimate, the ceiling estimate, the request itself and the
+/// usage line must all read one build of it. Without the anchor each of them
+/// used to build it again.
+#[tokio::test]
+async fn a_round_builds_the_injected_context_once() {
+    let provider = Provider::mock(vec![vec![AssistantBlock::Text {
+        text: "final answer".into(),
+    }]]);
+    let cfg = compaction_cfg(provider, 200_000, "injected-once");
+    let mut history = short_history(&cfg);
+    let ui: Arc<dyn Ui> = Arc::new(NullUi);
+    let before = crate::agent::injected_context_builds();
+
+    let outcome = run_turn(&cfg, &mut history, &ui, &CancellationToken::new(), 0).await;
+
+    assert_eq!(outcome.final_text, "final answer");
+    assert_eq!(crate::agent::injected_context_builds() - before, 1);
+}
+
 /// Before any response, the system prompt and the tool array are part of the
 /// request and nobody has measured them yet: history alone fits the window
 /// here, history plus the tools does not, and the turn must compact.
