@@ -5,6 +5,22 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 267 ✅：工具契约单一来源（2026-11-17）**：六条全部成立。按用户定案不引入 schemars，
+保留手写 schema，用 `every_schema_matches_its_parsers_accepted_keys` 逐工具比对
+`schema.properties` 与解析键集合；`workflow` 的 `name` 是解析器会读、schema 漏掉的字段，
+补进 schema 并标明 registry 未实现；七个 schema 补 `additionalProperties: false`。新增
+`tools/args.rs` 统一 object/strict/null/整数/诊断，显式 `null` 一律当省略；未知字段、类型
+错误、缺失参数统一措辞并限长去控制字符；原先不设防线的 bash_output、powershell、grep/glob、
+文件工具、plan mode、skill、tool_search 改为拒绝未知字段。两个 `call_agent` 收成
+`AgentCallGate`，取消检查仍在 journal hit 之前；structured 输入改 `deny_unknown_fields`
+serde，四条重复的注册→spawn→supervisor→worktree 收尾抽成 `run_supervised_child` +
+`ChildTurn` 与结果映射。`send_message` 直接调 mailbox 的 `validate_payload`，
+`is_unicode_line_separator` 只留一份；`AgentOptions` 从 `run_agent` schema 生成。模型可见
+错误措辞有变化（未知字段统一为 `unknown field`，powershell 去掉 foreground-only 解释，
+send_message 去前缀等），plan 58/56/53 的 parity 断言已同步。验证：kloop-core lib 1451 通过、
+1 ignored，clippy(core all-targets `-D warnings`)、fmt、`cargo check --workspace`；未跑全量
+`make check`、外部 parity 语料、真实 API。教训 405、406。
+
 **Plan 265 ✅：同步/异步边界的约定（2026-11-17）**：三条全部成立，但两处措辞要修。后台 bash 的
 `create_dir_all`/`create_file` 本来就在锁外，持锁的只有 `process_tree::spawn`；选「锁外 spawn、
 加锁复查 closed」，closed 时先放锁再 terminate 新树——整段挪进 `spawn_blocking` 仍会把注册表序列化。
@@ -1816,7 +1832,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **264** 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
 | **265** ✅ 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
 | **266** ✅ 权限判定一次产出 | `Verdict` 贯穿到执行;同一命令解析 5–7 次;两套 glob 语义;tree 选项两份 | 大 | 243、244、245 |
-| **267** 工具契约单一来源 | schema/解析/TS 声明三处分头演化;参数 helper 四份分叉;两个 `call_agent` bridge | 大 | 257 |
+| **267** ✅ 工具契约单一来源 | schema/解析/TS 声明三处分头演化;参数 helper 四份分叉;两个 `call_agent` bridge | 大 | 257 |
 | **268** 后台执行 registry 统一 | 三套关闭流程、三份轮询、supervisor 样板;Windows 进程创建 80 行重复 | 中 | 255、257 |
 | **269** 会话驱动器 | 四个前端各写 turn 生命周期，造成 250/258/259 里的三个 P1;开工先出设计稿 | 大 | 250、258、259 |
 | **270** 模块切分与测试整理 | `tools/mod.rs` 按职责拆;计划编号测试文件;测试临时目录八份 | 中 | 264、267 之后 |
@@ -5329,3 +5345,17 @@ future 局部变量里。判据：阻塞开销落在哪个执行体上，就要�
 什么时候释放、失败时谁清理、预算在哪一步生效”，并让清理守卫跟工作一起走、只在新所有者接手
 后 disarm；快速预检负责“根本不要开始”，加锁复查只负责中途竞态；流式读取的预算要按实际读到的
 字节数计，metadata 只是提示。
+405. **“单一来源”用测试钉住时，测试里的键表仍然是第二份声明，不是来源本身。** plan 267 按
+用户定案不引 schemars，用一条遍历 `Builtin::ALL` 的测试比较 schema 键与解析器键。它立刻抓到了
+`workflow.name` 这种“解析器读、schema 漏”的字段，但解析器与测试里的表仍是两份：以后给 parser
+加字段而不同步测试，测试照样绿。判据：手写 schema 的仓库里，这条测试是**漂移报警器**而不是
+真单一来源；serde 工具靠 `deny_unknown_fields` 保住“拒绝未知键”的一致性，手写工具则必须把
+允许键表的维护和 parser 改动放在同一个提交里看。要真正消掉第二份声明，才轮到从结构体生成
+schema（schemars）那条路。
+
+406. **“统一语义”会改模型看到的错误文本，parity 断言就是第一批消费者。** plan 267 把三种
+未知字段措辞并成一种、把显式 `null` 统一当省略后，plan 58/56/53 的 parity 测试按旧文本失败；
+这不是回归，而是行为变更必须显式记账的地方。判据：改公共输入校验的措辞或 null 语义时，先
+`grep` 这些文本在测试和语料里的钉点，逐条决定“新语义下应该是什么”，再把差异写进完成记录；
+不要为了让旧断言通过而在工具里保留两套措辞。另一个实现细节：把取消检查放在 journal hit
+之前——重放缓存不是“停止后仍可启动子 agent”的例外。

@@ -86,7 +86,8 @@ struct ProgramManifest {
 }
 
 pub(super) mod journal;
-use journal::Claim;
+use super::agent_gate::Admission;
+use super::agent_gate::AgentCallGate;
 use journal::Journal;
 
 /// Tools NOT exposed to a program: recursive runners and model-loop background
@@ -558,16 +559,9 @@ struct CoreBridge {
     // Exact callable names, source owner/generation and readonly verdict captured
     // with the provider request that exposed this Program API.
     program_tools: Arc<ProgramToolManifest>,
-    // Total agent() calls so far and the hard ceiling; the (max_agents+1)th is
-    // refused. A separate semaphore below paces finite concurrent fan-out.
-    agent_count: AtomicU64,
-    max_agents: u64,
-    // Per-run live child bound. Unlike max_agents this paces, rather than
-    // rejects, a finite fan-out; waiting observes the run cancellation token.
-    agent_slots: Arc<tokio::sync::Semaphore>,
-    // agent() call journal for resume (plan 24): a hit returns the cached result
-    // and skips the spawn (and the cap charge). None when resume is off.
-    journal: Option<Arc<Journal>>,
+    // Journal claim, total cap and live fan-out bound in one place; the
+    // journal is None when resume is off.
+    agent_gate: Arc<AgentCallGate>,
 }
 
 impl CoreBridge {
@@ -590,10 +584,11 @@ impl CoreBridge {
             seq: AtomicU64::new(0),
             gate: Arc::new(tokio::sync::RwLock::new(())),
             program_tools,
-            agent_count: AtomicU64::new(0),
-            max_agents: limits.max_agents,
-            agent_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency)),
-            journal,
+            agent_gate: Arc::new(AgentCallGate::new(
+                journal,
+                limits.max_agents,
+                limits.max_concurrency,
+            )),
         }
     }
 }
@@ -659,51 +654,22 @@ impl HostBridge for CoreBridge {
         opts: Value,
     ) -> BoxFuture<Result<Value, String>> {
         let ctx = self.ctx.clone();
-        // Journal replay is a synchronous decision keyed by a stable topology
-        // identity plus the complete structured input. A hit skips both spawn and
-        // cap charge.
-        let journal = self.journal.clone();
-        let claim = journal
-            .as_ref()
-            .map(|journal| journal.claim(&call_id, &prompt, &opts));
-        let hit = matches!(claim, Some(Claim::Hit(_)));
-        // Only a live (missed) call claims a cap slot; concurrent misses get
-        // distinct counts from the sync fetch_add.
-        let n = if hit {
-            0
-        } else {
-            self.agent_count.fetch_add(1, Ordering::Relaxed)
-        };
-        let max = self.max_agents;
-        let agent_slots = self.agent_slots.clone();
-        let cancel = ctx.cancel.clone();
+        let gate = self.agent_gate.clone();
         Box::pin(async move {
-            // A stopped program must not start new children: the journal hit path
-            // and the slot wait below would otherwise both let one through.
-            if cancel.is_cancelled() {
-                return Err("program interrupted".into());
-            }
-            if let Some(Claim::Hit(cached)) = claim {
-                return Ok(cached);
-            }
-            if n >= max {
-                return Err(format!(
-                    "program exceeds the agent cap ({max} agent() calls); it likely fans out \
-                     sub-agents without bound — narrow the work or process items in batches"
-                ));
-            }
-            let _permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    return Err("program interrupted while waiting for an agent slot".into());
-                }
-                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
-                    "program agent concurrency limiter closed unexpectedly".to_string()
-                })?,
+            let call = gate.begin(&call_id, &prompt, &opts);
+            let _permit = match gate
+                .admit(call, &ctx.cancel, "program interrupted", |max| {
+                    format!(
+                        "program exceeds the agent cap ({max} agent() calls); it likely fans out \
+                         sub-agents without bound — narrow the work or process items in batches"
+                    )
+                })
+                .await
+            {
+                Ok(Admission::Hit(value)) => return Ok(value),
+                Ok(Admission::Live(permit)) => permit,
+                Err(error) => return Err(error),
             };
-            if cancel.is_cancelled() {
-                return Err("program interrupted".into());
-            }
             let mut agent_input = json!({ "prompt": prompt.clone() });
             for k in ["agent_type", "model"] {
                 if let Some(v) = opts.get(k) {
@@ -714,9 +680,8 @@ impl HostBridge for CoreBridge {
             match super::subagent::run_agent_admitted(&agent_input, &ctx, &workspace).await {
                 Ok(admitted) => {
                     let output = Value::String(admitted.value);
-                    if let Some(journal) = &journal
-                        && let Some(warning) =
-                            journal.record(call_id, prompt, opts, output.clone(), &admitted.receipt)
+                    if let Some(warning) =
+                        gate.record(call_id, prompt, opts, output.clone(), &admitted.receipt)
                     {
                         ctx.ui.emit(&crate::event::Event::Note(warning));
                     }
@@ -794,8 +759,10 @@ pub(super) fn run_program_def(
         ));
     }
     decls.push_str("};\n");
+    decls.push_str("type AgentOptions = ");
+    decls.push_str(&agent_options_type(builtins));
     decls.push_str(
-        "type AgentOptions = { agent_type?: string; model?: string };\n\
+        ";\n\
          type OrchestrationScope = {\n\
            agent(prompt: string, opts?: AgentOptions): Promise<string>;\n\
            parallel<T>(thunks: Array<(scope: OrchestrationScope) => Promise<T> | T>): Promise<Array<T | null>>;\n\
@@ -908,11 +875,48 @@ fn builtin_output_type(name: &str) -> &'static str {
     }
 }
 
+/// The `agent()` options type, generated from `run_agent`'s schema so the
+/// Program API cannot drift from the tool it actually calls. Only the fields
+/// the bridge forwards are projected; `prompt` is the positional argument and
+/// `background` has no meaning inside a program.
+fn agent_options_type(builtins: &[ToolDef]) -> String {
+    let fields: Vec<String> = builtins
+        .iter()
+        .find(|def| def.name == "run_agent")
+        .and_then(|def| def.schema.get("properties"))
+        .map(|properties| {
+            ["agent_type", "model"]
+                .into_iter()
+                .filter_map(|key| {
+                    properties
+                        .get(key)
+                        .map(|field| format!("{key}?: {}", ts_type(field)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fields.is_empty() {
+        "{}".into()
+    } else {
+        format!("{{ {} }}", fields.join("; "))
+    }
+}
+
 /// Minimal JSON-Schema → TypeScript type. Covers the shapes the built-in tool
 /// schemas actually use (object/array/string+enum/number/boolean); anything
 /// unrecognized degrades to `unknown` rather than lying about the type.
 fn ts_type(schema: &Value) -> String {
-    match schema.get("type").and_then(Value::as_str) {
+    // A nullable union (`["string", "null"]`) is still a string field: the
+    // schemas mark the field optional separately with `required`.
+    let kind = match schema.get("type") {
+        Some(Value::String(kind)) => Some(kind.as_str()),
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|kind| *kind != "null"),
+        _ => None,
+    };
+    match kind {
         Some("string") => match schema.get("enum").and_then(Value::as_array) {
             Some(variants) => variants
                 .iter()

@@ -5,16 +5,15 @@ use anyhow::anyhow;
 use anyhow::bail;
 use kloop_protocol::ToolDef;
 use serde::Serialize;
-use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 
 use super::ToolCtx;
+use super::args;
 use crate::event::Event;
 
 const MAX_TODOS: usize = 256;
 const MAX_SUBJECT_CHARS: usize = 200;
-const MAX_DIAGNOSTIC_CHARS: usize = 80;
 
 /// Depth-0 round boundaries the list must stand still before the model is
 /// reminded it exists (plan 190). The reminder is a low-frequency backstop,
@@ -37,7 +36,10 @@ impl TodoStatus {
             Some("pending") => Ok(Self::Pending),
             Some("in_progress") => Ok(Self::InProgress),
             Some("completed") => Ok(Self::Completed),
-            Some(other) => bail!("todo_write: unknown status `{}`", bounded_diagnostic(other)),
+            Some(other) => bail!(
+                "todo_write: unknown status `{}`",
+                args::bounded_diagnostic(other, args::MAX_DIAGNOSTIC_CHARS)
+            ),
             None => bail!("todo_write: every todo needs a 'status' string"),
         }
     }
@@ -210,7 +212,7 @@ fn validate_subject(subject: &str) -> Result<()> {
     }
     if subject
         .chars()
-        .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
+        .any(|ch| ch.is_control() || args::is_unicode_line_separator(ch))
     {
         bail!("todo_write: subject must be a single line without control characters");
     }
@@ -252,7 +254,7 @@ pub(super) fn todo_write_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 }
 
 fn parse_write(input: &Value) -> Result<Vec<TodoItem>> {
-    let object = strict_object(input, &["todos"], "input")?;
+    let object = args::strict_object(input, &["todos"], "todo_write")?;
     object
         .get("todos")
         .and_then(Value::as_array)
@@ -263,7 +265,7 @@ fn parse_write(input: &Value) -> Result<Vec<TodoItem>> {
 }
 
 fn parse_todo(row: &Value) -> Result<TodoItem> {
-    let object = strict_object(row, &["subject", "status"], "each todo")?;
+    let object = args::strict_object(row, &["subject", "status"], "todo_write")?;
     let subject = object
         .get("subject")
         .and_then(Value::as_str)
@@ -272,42 +274,6 @@ fn parse_todo(row: &Value) -> Result<TodoItem> {
         subject: subject.to_string(),
         status: TodoStatus::parse(object.get("status"))?,
     })
-}
-
-fn strict_object<'a>(
-    value: &'a Value,
-    allowed: &[&str],
-    what: &str,
-) -> Result<&'a Map<String, Value>> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("todo_write: {what} must be an object"))?;
-    if let Some(unexpected) = object
-        .keys()
-        .find(|candidate| !allowed.contains(&candidate.as_str()))
-    {
-        bail!(
-            "todo_write: unknown field `{}` in {what}",
-            bounded_diagnostic(unexpected)
-        );
-    }
-    Ok(object)
-}
-
-fn bounded_diagnostic(value: &str) -> String {
-    let mut output = String::new();
-    for ch in value.chars().take(MAX_DIAGNOSTIC_CHARS) {
-        let ch = if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
-            ' '
-        } else {
-            ch
-        };
-        output.push(ch);
-    }
-    if value.chars().count() > MAX_DIAGNOSTIC_CHARS {
-        output.push('…');
-    }
-    output
 }
 
 #[cfg(test)]

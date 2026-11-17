@@ -248,15 +248,12 @@ pub(super) fn unlocked_source_for_dispatch(
 }
 
 fn max_results(input: &Value) -> Result<usize> {
-    match input.get("max_results") {
-        None => Ok(DEFAULT_MAX_RESULTS),
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .ok_or_else(|| anyhow::anyhow!("tool_search: max_results must be a positive integer")),
-        Some(_) => bail!("tool_search: max_results must be a positive integer"),
+    let max_results = super::args::integer_arg(input, "max_results", "tool_search")?
+        .unwrap_or(DEFAULT_MAX_RESULTS);
+    if max_results == 0 {
+        bail!("tool_search: max_results must be a positive integer");
     }
+    Ok(max_results)
 }
 
 pub(super) async fn tool_search_tool(
@@ -264,6 +261,7 @@ pub(super) async fn tool_search_tool(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
+    super::args::strict_object(input, &["query", "max_results"], "tool_search")?;
     let query = str_arg(input, "query", "tool_search")?.trim().to_string();
     if query.is_empty() {
         bail!("tool_search: query must not be empty");
@@ -1312,7 +1310,7 @@ mod tests {
             "{out}"
         );
 
-        for invalid in [json!(-1), json!("1"), json!(1.5), Value::Null, json!([])] {
+        for invalid in [json!(-1), json!(1.5), json!([]), json!(true)] {
             let (out, is_error) = run_tool(
                 "tool_search",
                 json!({"query": "search", "max_results": invalid}),
@@ -1320,10 +1318,15 @@ mod tests {
             )
             .await;
             assert!(is_error, "{out}");
-            assert!(
-                out.contains("max_results must be a positive integer"),
-                "{out}"
-            );
+            assert!(out.contains("max_results must be"), "{out}");
+        }
+        // Explicit null and a numeric string mean "not filled in" / "1".
+        for input in [
+            json!({"query": "search", "max_results": null}),
+            json!({"query": "search", "max_results": "1"}),
+        ] {
+            let (out, is_error) = run_tool("tool_search", input, &ctx).await;
+            assert!(!is_error, "{out}");
         }
 
         let (out, is_error) = run_tool("tool_search", json!({"query": "select: , "}), &ctx).await;

@@ -33,6 +33,7 @@ use platform::*;
 pub(super) use platform::has_multiple_hard_links;
 
 use super::ToolCtx;
+use super::args;
 use super::notebook;
 use super::resolve_path;
 use super::str_arg;
@@ -297,6 +298,7 @@ pub(super) async fn prepare_read(
     input: &Value,
     workspace: &EffectiveWorkspace,
 ) -> Result<PreparedRead> {
+    args::strict_object(input, &["path", "offset", "limit"], "read_file")?;
     let path = str_arg(input, "path", "read_file")?.to_string();
     let requested = resolve_path(&workspace.cwd, &path);
     let path_for_worker = path.clone();
@@ -397,8 +399,8 @@ pub(super) async fn read_file_tool(
         .extension()
         .is_some_and(|extension| extension == "ipynb")
     {
-        let offset = integer_arg(input, "offset", "read_file")?;
-        let limit = integer_arg(input, "limit", "read_file")?;
+        let offset = args::integer_arg(input, "offset", "read_file")?;
+        let limit = args::integer_arg(input, "limit", "read_file")?;
         if !matches!(offset, None | Some(0 | 1)) || !matches!(limit, None | Some(0)) {
             bail!("read_file: offset/limit paging is not supported for Jupyter notebooks");
         }
@@ -466,8 +468,8 @@ pub(super) async fn read_file_tool(
             "read_file: {path} is not UTF-8 text or a supported image (png/jpeg/gif/webp)"
         )
     })?;
-    let offset = integer_arg(input, "offset", "read_file")?.unwrap_or(1);
-    let limit = integer_arg(input, "limit", "read_file")?;
+    let offset = args::integer_arg(input, "offset", "read_file")?.unwrap_or(1);
+    let limit = args::integer_arg(input, "limit", "read_file")?;
     let total_lines = content.split('\n').count();
     let start = if offset == 0 { 0 } else { offset - 1 };
     let requested_end = match limit {
@@ -506,35 +508,6 @@ pub(super) async fn read_file_tool(
             observation,
         },
     })
-}
-
-fn integer_arg(input: &Value, key: &str, tool: &str) -> Result<Option<usize>> {
-    let value = &input[key];
-    if value.is_null() {
-        return Ok(None);
-    }
-    let parsed = if let Some(value) = value.as_u64() {
-        value
-    } else if let Some(value) = value.as_i64() {
-        if value < 0 {
-            bail!("{tool}: {key} must be a whole number of 0 or more, got {value}");
-        }
-        value as u64
-    } else if let Some(value) = value.as_f64() {
-        if value < 0.0 || value.fract() != 0.0 {
-            bail!("{tool}: {key} must be a whole number of 0 or more, got {value}");
-        }
-        value as u64
-    } else if let Some(value) = value.as_str() {
-        value.trim().parse::<u64>().with_context(|| {
-            format!("{tool}: {key} must be a whole number of 0 or more, got {value:?}")
-        })?
-    } else {
-        bail!("{tool}: {key} must be a whole number of 0 or more");
-    };
-    usize::try_from(parsed)
-        .map(Some)
-        .with_context(|| format!("{tool}: {key} is too large"))
 }
 
 fn numbered_text_page(
@@ -635,6 +608,26 @@ async fn prepare_mutation_input_with_key(
     path_key: &str,
     workspace: &EffectiveWorkspace,
 ) -> Result<PreparedMutation> {
+    let allowed: Option<&[&str]> = match tool {
+        "write_file" => Some(&["path", "content"]),
+        "edit_file" => Some(&["path", "old_string", "new_string", "replace_all"]),
+        "notebook_edit" => Some(&[
+            "notebook_path",
+            "cell_id",
+            "new_source",
+            "cell_type",
+            "edit_mode",
+        ]),
+        _ => None,
+    };
+    match allowed {
+        Some(allowed) => {
+            args::strict_object(input, allowed, tool)?;
+        }
+        None => {
+            args::object(input, tool)?;
+        }
+    }
     let path = str_arg(input, path_key, tool)?.to_string();
     if tool == "notebook_edit" && !Path::new(&path).is_absolute() {
         bail!("notebook_edit: notebook_path must be an absolute path");
@@ -681,7 +674,7 @@ pub(super) async fn edit_file_tool(
     let path = str_arg(input, "path", "edit_file")?;
     let old = str_arg(input, "old_string", "edit_file")?;
     let new = str_arg(input, "new_string", "edit_file")?;
-    let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+    let replace_all = args::bool_or(input, "replace_all", false, "edit_file")?;
     if old.is_empty() {
         bail!("edit_file: old_string must not be empty");
     }
@@ -2996,10 +2989,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// A name that is nobody's spelling is still a refusal, and it names both the
-    /// argument the tool wanted and the keys the call did carry: these three tools
-    /// take no allow-list, so an unknown key is dropped in silence and no other
-    /// message would mention it.
+    /// A key that is nobody's spelling is refused by name now that the file
+    /// tools declare a closed key set; the missing-argument path below still
+    /// lists what the call did carry when a required key is absent.
     #[tokio::test]
     async fn an_unknown_argument_name_names_itself() {
         let path = temp_file("edit-wrong-arg", "alpha\n");
@@ -3017,12 +3009,7 @@ mod tests {
         .await;
         assert_eq!(
             (out, is_error),
-            (
-                "edit_file: missing required string argument 'path' \
-                 (got: filepath, new_string, old_string)"
-                    .to_string(),
-                true
-            )
+            ("edit_file: unknown field `filepath`".to_string(), true)
         );
 
         // An argument that is present but not a string has nothing to point at,
@@ -3039,13 +3026,10 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// The mirror of the missing-argument refusal: an allow-list already names the
-    /// key it refused, which left the model to guess the one it should have used.
-    /// `path` never reaches here any more — the synonym rename turns it into
-    /// `notebook_path` first — so what does reach it is a name nobody uses, and
-    /// that is exactly when the accepted set is worth printing.
+    /// A notebook call that names a field nobody accepts is refused before the
+    /// file is touched, with the same unknown-field shape as every other tool.
     #[tokio::test]
-    async fn an_unexpected_notebook_field_names_what_is_accepted() {
+    async fn an_unknown_notebook_field_names_itself() {
         let notebook = r#"{"cells":[{"cell_type":"code","id":"c1","source":["x = 1"],"metadata":{},"outputs":[],"execution_count":null}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
         let path = temp_file("notebook-field.ipynb", notebook);
         let target = path.to_str().unwrap();
@@ -3061,12 +3045,7 @@ mod tests {
 
         assert_eq!(
             (out, is_error),
-            (
-                "notebook_edit: unexpected input field \"source\"; accepted: \
-                 notebook_path, cell_id, new_source, cell_type, edit_mode"
-                    .to_string(),
-                true
-            )
+            ("notebook_edit: unknown field `source`".to_string(), true)
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), notebook);
         let _ = std::fs::remove_file(path);

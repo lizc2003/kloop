@@ -51,6 +51,7 @@ use crate::sandbox;
 use crate::sandbox::SandboxPolicy;
 use crate::shell_programs::ShellProgram;
 use crate::tools::ToolCtx;
+use crate::tools::args;
 use crate::tools::str_arg;
 use crate::tools::strict_str_arg;
 use kloop_process_spawn::ProcessStdio;
@@ -74,11 +75,13 @@ const BLOCK_TIMEOUT_MAX_MS: u64 = 600_000;
 const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
+    args::strict_object(input, &["bash_id", "block", "timeout_ms"], "bash_output")?;
     let id = str_arg(input, "bash_id", "bash_output")?;
-    let block = input["block"].as_bool().unwrap_or(true);
-    let timeout_ms = input["timeout_ms"]
-        .as_u64()
-        .unwrap_or(BLOCK_TIMEOUT_DEFAULT_MS)
+    let block = args::bool_or(input, "block", true, "bash_output")?;
+    let timeout_ms = args::integer_arg(input, "timeout_ms", "bash_output")?
+        .map_or(BLOCK_TIMEOUT_DEFAULT_MS, |value| {
+            u64::try_from(value).unwrap_or(u64::MAX)
+        })
         .min(BLOCK_TIMEOUT_MAX_MS);
     let shells = &ctx.cfg.background_shells;
     // The registry bumps `activity` on every terminal transition, so the wait

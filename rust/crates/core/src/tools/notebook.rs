@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::args;
 use crate::image::image_block_from_bytes;
 
 pub(crate) const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
@@ -229,47 +230,32 @@ fn bound_text_blocks(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, bool) {
     (visible, truncated)
 }
 
-/// How much of a refused field name the message echoes back.
-const MAX_FIELD_DIAGNOSTIC_BYTES: usize = 40;
-
 pub(super) fn request_from_input(input: &Value) -> Result<NotebookEditRequest> {
-    let object = input
-        .as_object()
-        .context("notebook_edit: input must be an object")?;
-    let allowed = [
-        "notebook_path",
-        "cell_id",
-        "new_source",
-        "cell_type",
-        "edit_mode",
-    ];
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        // Name what is accepted, not just what was refused. An allow-list already
-        // points at the offending key, which leaves the model to guess the one it
-        // should have used — the mirror image of the gap a missing-argument
-        // refusal had, where the wanted name was there and the sent one was not.
-        // Keys are model-supplied, so the echo is sanitized and capped.
-        let key = super::agent_message::bounded_diagnostic(key, MAX_FIELD_DIAGNOSTIC_BYTES);
-        let accepted = allowed.join(", ");
-        bail!("notebook_edit: unexpected input field \"{key}\"; accepted: {accepted}");
-    }
-    let new_source = input["new_source"]
-        .as_str()
-        .context("notebook_edit: missing required string argument 'new_source'")?
-        .to_string();
-    let cell_id = optional_string(input, "cell_id", "notebook_edit")?;
-    let cell_type = optional_string(input, "cell_type", "notebook_edit")?;
+    args::strict_object(
+        input,
+        &[
+            "notebook_path",
+            "cell_id",
+            "new_source",
+            "cell_type",
+            "edit_mode",
+        ],
+        "notebook_edit",
+    )?;
+    let new_source = args::required_str(input, "new_source", "notebook_edit")?.to_string();
+    let cell_id = args::optional_str(input, "cell_id", "notebook_edit")?.map(str::to_string);
+    let cell_type = args::optional_str(input, "cell_type", "notebook_edit")?.map(str::to_string);
     if cell_type
         .as_deref()
         .is_some_and(|value| !matches!(value, "code" | "markdown"))
     {
         bail!("notebook_edit: cell_type must be code or markdown");
     }
-    let mode = match input["edit_mode"].as_str().unwrap_or("replace") {
-        "replace" => EditMode::Replace,
-        "insert" => EditMode::Insert,
-        "delete" => EditMode::Delete,
-        other => bail!("notebook_edit: unsupported edit_mode {other:?}"),
+    let mode = match args::optional_str(input, "edit_mode", "notebook_edit")? {
+        None | Some("replace") => EditMode::Replace,
+        Some("insert") => EditMode::Insert,
+        Some("delete") => EditMode::Delete,
+        Some(other) => bail!("notebook_edit: unsupported edit_mode {other:?}"),
     };
     match mode {
         EditMode::Insert if cell_type.is_none() => {
@@ -626,14 +612,6 @@ fn generated_cell_id() -> Result<String> {
     getrandom::fill(&mut bytes)
         .map_err(|error| anyhow!("notebook_edit: could not generate a cell id: {error}"))?;
     Ok(kloop_protocol::hex_lower(&bytes))
-}
-
-fn optional_string(input: &Value, key: &str, tool: &str) -> Result<Option<String>> {
-    match &input[key] {
-        Value::Null => Ok(None),
-        Value::String(value) => Ok(Some(value.clone())),
-        _ => bail!("{tool}: {key} must be a string"),
-    }
 }
 
 fn result_source(source: &str) -> String {

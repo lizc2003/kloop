@@ -1218,7 +1218,16 @@ fn run_program_def_renders_a_typescript_api() {
         ToolDef {
             name: "run_agent".into(),
             description: "spawn".into(),
-            schema: json!({"type": "object"}),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "agent_type": {"type": ["string", "null"]},
+                    "model": {"type": ["string", "null"]},
+                    "background": {"type": "boolean"}
+                },
+                "required": ["prompt"]
+            }),
         },
     ];
     let def = run_program_def(&defs, &[], &[]);
@@ -1846,5 +1855,33 @@ fn run_program_def_declares_glob_as_string_array() {
             .contains("glob(args: Record<string, unknown>): Promise<string[]>;"),
         "{}",
         def.description
+    );
+}
+
+#[test]
+fn agent_options_are_projected_from_the_run_agent_schema() {
+    let defs = vec![
+        ToolDef {
+            name: "run_agent".into(),
+            description: "spawn".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "agent_type": {"type": "string", "enum": ["reviewer", "coder"]},
+                    "model": {"type": ["string", "null"]},
+                    "background": {"type": "boolean"}
+                }
+            }),
+        },
+        ToolDef {
+            name: "read_file".into(),
+            description: "read".into(),
+            schema: json!({"type": "object"}),
+        },
+    ];
+    assert_eq!(
+        agent_options_type(&defs),
+        r#"{ agent_type?: "reviewer" | "coder"; model?: string }"#
     );
 }

@@ -376,7 +376,8 @@ async fn plan_control_report() -> Value {
     assert!(!repeat_error && repeat.contains("Already in plan mode"));
     let (unknown, unknown_error) =
         run_tool("enter_plan_mode", json!({"unexpected": true}), &context).await;
-    assert!(!unknown_error && unknown.contains("Already in plan mode"));
+    assert!(unknown_error && unknown.contains("unknown field `unexpected`"));
+    assert_eq!(context.cfg.permissions.mode(), Mode::Plan);
     let plan = "1. inspect\n2. implement";
     let (exited, exited_error) = run_tool("exit_plan_mode", json!({"plan": plan}), &context).await;
     assert!(!exited_error && exited.contains("approved"));

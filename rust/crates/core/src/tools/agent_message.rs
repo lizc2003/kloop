@@ -6,11 +6,14 @@ use serde_json::Value;
 use serde_json::json;
 
 use super::ToolCtx;
+use super::args;
+use super::args::bounded_diagnostic;
+use super::args::is_unicode_line_separator;
+use super::args::strict_object;
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::ToolDef;
 
 const MAX_TARGET_BYTES: usize = 64;
-const MAX_DIAGNOSTIC_CHARS: usize = 80;
 
 pub(super) fn send_message_def() -> ToolDef {
     ToolDef {
@@ -108,49 +111,17 @@ struct SendMessageInput {
 }
 
 fn parse_send_message(input: &Value) -> Result<SendMessageInput> {
-    let object = strict_object(input, &["to", "summary", "message"], "send_message")?;
-    let to = required_string(object, "to", "send_message")?;
-    let message = required_string(object, "message", "send_message")?;
-    if message.trim().is_empty() {
-        bail!("send_message: message must not be empty");
-    }
-    if message.len() > crate::agent_mailbox::MAX_MESSAGE_BYTES {
-        bail!(
-            "send_message: message exceeds the {}-byte limit",
-            crate::agent_mailbox::MAX_MESSAGE_BYTES
-        );
-    }
-    if message
-        .chars()
-        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-    {
-        bail!("send_message: message contains an unsupported control character");
-    }
-    let summary = match object.get("summary") {
+    args::strict_object(input, &["to", "summary", "message"], "send_message")?;
+    let to = args::required_str(input, "to", "send_message")?;
+    let message = args::required_str(input, "message", "send_message")?;
+    let summary = match args::optional_str(input, "summary", "send_message")? {
+        Some(summary) => summary.to_string(),
         None => summary_from_message(message),
-        Some(Value::String(summary)) => {
-            if summary.trim().is_empty() {
-                bail!("send_message: summary must not be empty when provided");
-            }
-            if summary
-                .chars()
-                .any(|ch| ch.is_control() || is_unicode_line_separator(ch))
-            {
-                bail!("send_message: summary must be a single line without control characters");
-            }
-            if summary.chars().count() > crate::agent_mailbox::MAX_SUMMARY_CHARS
-                || summary.len() > crate::agent_mailbox::MAX_SUMMARY_BYTES
-            {
-                bail!(
-                    "send_message: summary exceeds {} characters or {} bytes",
-                    crate::agent_mailbox::MAX_SUMMARY_CHARS,
-                    crate::agent_mailbox::MAX_SUMMARY_BYTES
-                );
-            }
-            summary.clone()
-        }
-        Some(_) => bail!("send_message: summary must be a string when provided"),
     };
+    // The mailbox owns the payload contract; the tool only prefixes its name so
+    // the model can tell which call was refused.
+    crate::agent_mailbox::validate_payload(&summary, message)
+        .map_err(|error| anyhow!("send_message: {error}"))?;
     let to = parse_target(to)?;
     Ok(SendMessageInput {
         to,
@@ -183,31 +154,6 @@ fn parse_target(value: &str) -> Result<LocalAgentId> {
         .map_err(|error: String| anyhow!("send_message: invalid target `{value}`: {error}"))
 }
 
-fn strict_object<'a>(
-    input: &'a Value,
-    allowed: &[&str],
-    tool: &str,
-) -> Result<&'a Map<String, Value>> {
-    let object = input
-        .as_object()
-        .ok_or_else(|| anyhow!("{tool}: input must be an object"))?;
-    if let Some(unexpected) = object
-        .keys()
-        .find(|candidate| !allowed.contains(&candidate.as_str()))
-    {
-        let unexpected = bounded_diagnostic(unexpected, MAX_DIAGNOSTIC_CHARS);
-        bail!("{tool}: unknown field `{unexpected}`");
-    }
-    Ok(object)
-}
-
-fn required_string<'a>(object: &'a Map<String, Value>, key: &str, tool: &str) -> Result<&'a str> {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{tool}: missing required string argument '{key}'"))
-}
-
 fn summary_from_message(message: &str) -> String {
     let line = message
         .lines()
@@ -215,31 +161,6 @@ fn summary_from_message(message: &str) -> String {
         .unwrap_or("Agent message")
         .trim();
     bounded_preview(line)
-}
-
-fn is_unicode_line_separator(ch: char) -> bool {
-    matches!(ch, '\u{2028}' | '\u{2029}')
-}
-
-pub(super) fn bounded_diagnostic(value: &str, max_bytes: usize) -> String {
-    let mut output = String::new();
-    let mut truncated = false;
-    for ch in value.chars() {
-        let ch = if ch.is_control() || is_unicode_line_separator(ch) {
-            ' '
-        } else {
-            ch
-        };
-        if output.len() + ch.len_utf8() > max_bytes {
-            truncated = true;
-            break;
-        }
-        output.push(ch);
-    }
-    if truncated {
-        output.push('…');
-    }
-    output
 }
 
 fn bounded_preview(value: &str) -> String {
@@ -302,6 +223,13 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.to.as_str(), "agent-2");
         assert_eq!(parsed.summary, "review the close race");
+        let null_summary = parse_send_message(&json!({
+            "to": "agent-2",
+            "message": "body",
+            "summary": null,
+        }))
+        .unwrap();
+        assert_eq!(null_summary.summary, "body");
         let exact = parse_send_message(&json!({
             "to":"agent-2",
             "message":"x".repeat(crate::agent_mailbox::MAX_MESSAGE_BYTES),
@@ -317,7 +245,6 @@ mod tests {
             json!({"to":"agent-2","message":"x","from":"main"}),
             json!({"to":"agent-2","message":null}),
             json!({"to":"agent-2","message":" "}),
-            json!({"to":"agent-2","message":"x","summary":null}),
             json!({"to":"agent-2","message":"x","summary":"bad\nline"}),
             json!({"to":"agent-2","message":"x","summary":"bad\u{2028}line"}),
             json!({"to":"agent-2","message":"x\u{0000}"}),

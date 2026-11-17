@@ -30,6 +30,7 @@ use serde_json::Value;
 
 use std::sync::Arc;
 
+use super::args;
 use crate::permissions::Permissions;
 
 /// cc caps matched lines at 500 columns (`rg --max-columns 500`) so
@@ -74,8 +75,28 @@ struct GrepArgs {
 
 impl GrepArgs {
     fn parse(input: &Value, cwd: &Path) -> Result<Self> {
+        args::strict_object(
+            input,
+            &[
+                "pattern",
+                "path",
+                "glob",
+                "type",
+                "output_mode",
+                "-i",
+                "-n",
+                "-A",
+                "-B",
+                "-C",
+                "-o",
+                "head_limit",
+                "offset",
+                "multiline",
+            ],
+            "grep",
+        )?;
         let pattern = crate::tools::str_arg(input, "pattern", "grep")?.to_string();
-        let mode = match optional_string(input, "output_mode", "grep")?
+        let mode = match args::optional_str(input, "output_mode", "grep")?
             .unwrap_or("files_with_matches")
         {
             "files_with_matches" => OutputMode::FilesWithMatches,
@@ -85,84 +106,37 @@ impl GrepArgs {
                 "grep: unknown output_mode '{other}' (expected files_with_matches, content or count)"
             ),
         };
-        let supplied_path = optional_string(input, "path", "grep")?;
+        let supplied_path = args::optional_str(input, "path", "grep")?;
         let root = supplied_path
             .map(|path| crate::tools::resolve_path(cwd, path))
             .unwrap_or_else(|| cwd.to_path_buf());
-        let around = integer_arg(input, "-C", "grep")?;
+        let around = args::integer_arg(input, "-C", "grep")?;
         Ok(GrepArgs {
             pattern,
             root,
             display_base: cwd.to_path_buf(),
             absolute_paths: supplied_path.is_some_and(|path| Path::new(path).is_absolute()),
-            glob: optional_string(input, "glob", "grep")?
+            glob: args::optional_str(input, "glob", "grep")?
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            file_type: optional_string(input, "type", "grep")?
+            file_type: args::optional_str(input, "type", "grep")?
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
             mode,
-            case_insensitive: optional_bool(input, "-i", "grep")?.unwrap_or(false),
-            line_numbers: optional_bool(input, "-n", "grep")?.unwrap_or(true),
-            only_matching: optional_bool(input, "-o", "grep")?.unwrap_or(false),
-            before: around.or(integer_arg(input, "-B", "grep")?).unwrap_or(0),
-            after: around.or(integer_arg(input, "-A", "grep")?).unwrap_or(0),
-            limit: integer_arg(input, "head_limit", "grep")?.unwrap_or(GREP_DEFAULT_LIMIT),
-            offset: integer_arg(input, "offset", "grep")?.unwrap_or(0),
-            multiline: optional_bool(input, "multiline", "grep")?.unwrap_or(false),
+            case_insensitive: args::optional_bool(input, "-i", "grep")?.unwrap_or(false),
+            line_numbers: args::optional_bool(input, "-n", "grep")?.unwrap_or(true),
+            only_matching: args::optional_bool(input, "-o", "grep")?.unwrap_or(false),
+            before: around
+                .or(args::integer_arg(input, "-B", "grep")?)
+                .unwrap_or(0),
+            after: around
+                .or(args::integer_arg(input, "-A", "grep")?)
+                .unwrap_or(0),
+            limit: args::integer_arg(input, "head_limit", "grep")?.unwrap_or(GREP_DEFAULT_LIMIT),
+            offset: args::integer_arg(input, "offset", "grep")?.unwrap_or(0),
+            multiline: args::optional_bool(input, "multiline", "grep")?.unwrap_or(false),
         })
     }
-}
-
-fn optional_string<'a>(input: &'a Value, key: &str, tool: &str) -> Result<Option<&'a str>> {
-    let value = &input[key];
-    if value.is_null() {
-        return Ok(None);
-    }
-    value
-        .as_str()
-        .map(Some)
-        .with_context(|| format!("{tool}: {key} must be a string"))
-}
-
-fn optional_bool(input: &Value, key: &str, tool: &str) -> Result<Option<bool>> {
-    let value = &input[key];
-    if value.is_null() {
-        return Ok(None);
-    }
-    value
-        .as_bool()
-        .map(Some)
-        .with_context(|| format!("{tool}: {key} must be a boolean"))
-}
-
-fn integer_arg(input: &Value, key: &str, tool: &str) -> Result<Option<usize>> {
-    let value = &input[key];
-    if value.is_null() {
-        return Ok(None);
-    }
-    let parsed = if let Some(value) = value.as_u64() {
-        value
-    } else if let Some(value) = value.as_i64() {
-        if value < 0 {
-            bail!("{tool}: {key} must be a whole number of 0 or more, got {value}");
-        }
-        value as u64
-    } else if let Some(value) = value.as_f64() {
-        if value < 0.0 || value.fract() != 0.0 {
-            bail!("{tool}: {key} must be a whole number of 0 or more, got {value}");
-        }
-        value as u64
-    } else if let Some(value) = value.as_str() {
-        value.trim().parse::<u64>().with_context(|| {
-            format!("{tool}: {key} must be a whole number of 0 or more, got {value:?}")
-        })?
-    } else {
-        bail!("{tool}: {key} must be a whole number of 0 or more");
-    };
-    usize::try_from(parsed)
-        .map(Some)
-        .with_context(|| format!("{tool}: {key} is too large"))
 }
 
 pub async fn grep_tool(input: &Value, cwd: &Path, perms: Arc<Permissions>) -> Result<String> {
@@ -178,8 +152,9 @@ pub async fn glob_tool(
     program_result: Option<&crate::tools::ProgramResultSink>,
     perms: Arc<Permissions>,
 ) -> Result<String> {
+    args::strict_object(input, &["pattern", "path"], "glob")?;
     let pattern = crate::tools::str_arg(input, "pattern", "glob")?.to_string();
-    let supplied_path = optional_string(input, "path", "glob")?;
+    let supplied_path = args::optional_str(input, "path", "glob")?;
     let root = supplied_path
         .map(|path| crate::tools::resolve_path(cwd, path))
         .unwrap_or_else(|| cwd.to_path_buf());

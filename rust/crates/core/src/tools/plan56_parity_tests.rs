@@ -193,8 +193,6 @@ async fn parser_report() -> Value {
     let context = git_ctx(test_ctx(0, "plan56-parser"), &repository, true);
     let mut cases = Vec::new();
     for (label, tool, input) in [
-        ("enter_name_null", "enter_worktree", json!({"name": null})),
-        ("enter_path_null", "enter_worktree", json!({"path": null})),
         ("enter_name_type", "enter_worktree", json!({"name": 56})),
         ("enter_path_type", "enter_worktree", json!({"path": 56})),
         (
@@ -205,11 +203,6 @@ async fn parser_report() -> Value {
         ("enter_unknown", "enter_worktree", json!({"unknown": true})),
         ("exit_missing", "exit_worktree", json!({})),
         ("exit_action", "exit_worktree", json!({"action": "discard"})),
-        (
-            "exit_discard_null",
-            "exit_worktree",
-            json!({"action": "remove", "discard_changes": null}),
-        ),
         (
             "exit_discard_type",
             "exit_worktree",
@@ -250,6 +243,20 @@ async fn parser_report() -> Value {
     let (_, is_error) = run_tool("exit_worktree", json!({"action": "remove"}), &context).await;
     assert!(!is_error);
 
+    // Explicit null is omission: name/path generate a name like `{}`, and
+    // discard_changes is false.
+    for input in [json!({"name": null}), json!({"path": null})] {
+        let (created, is_error) = run_tool("enter_worktree", input.clone(), &context).await;
+        assert!(!is_error, "{input}: {created}");
+        let (removed, is_error) = run_tool(
+            "exit_worktree",
+            json!({"action": "remove", "discard_changes": null}),
+            &context,
+        )
+        .await;
+        assert!(!is_error, "{input}: {removed}");
+    }
+
     let _ = std::fs::remove_dir_all(&repository);
     json!({
         "invalid": cases,
@@ -259,6 +266,7 @@ async fn parser_report() -> Value {
             "path": "<REPO>/.kloop/worktrees/feature+plan56",
         },
         "default_generated": true,
+        "null_is_omitted": true,
     })
 }
 

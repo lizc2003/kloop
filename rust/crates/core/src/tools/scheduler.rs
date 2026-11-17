@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use kloop_protocol::ToolDef;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
+use super::args;
 use crate::config::Config;
 use crate::scheduler::{CheckOutcome, CheckRunner};
 
@@ -75,19 +76,16 @@ pub fn schedule_wakeup_def() -> ToolDef {
 
 pub async fn cron_create_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "cron_create")?;
-    strict_object(
+    args::strict_object(
         input,
         &["cron", "prompt", "recurring", "durable", "check"],
         "cron_create",
     )?;
-    let cron = required_string(input, "cron", "cron_create")?;
-    let prompt = required_string(input, "prompt", "cron_create")?;
-    let recurring = optional_bool(input, "recurring", true, "cron_create")?;
-    let durable = optional_bool(input, "durable", false, "cron_create")?;
-    let check = match input.get("check") {
-        None => None,
-        Some(_) => Some(required_string(input, "check", "cron_create")?),
-    };
+    let cron = args::required_str(input, "cron", "cron_create")?;
+    let prompt = args::required_str(input, "prompt", "cron_create")?;
+    let recurring = args::bool_or(input, "recurring", true, "cron_create")?;
+    let durable = args::bool_or(input, "durable", false, "cron_create")?;
+    let check = args::optional_str(input, "check", "cron_create")?;
     bind(ctx)?;
     let job = ctx
         .cfg
@@ -128,8 +126,8 @@ pub async fn cron_create_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub async fn cron_delete_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "cron_delete")?;
-    strict_object(input, &["id"], "cron_delete")?;
-    let id = required_string(input, "id", "cron_delete")?;
+    args::strict_object(input, &["id"], "cron_delete")?;
+    let id = args::required_str(input, "id", "cron_delete")?;
     bind(ctx)?;
     ctx.cfg.scheduler.delete(id)?;
     ctx.ui.emit(&crate::event::Event::ScheduledTaskUpdated(
@@ -147,7 +145,7 @@ pub async fn cron_delete_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub async fn cron_list_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "cron_list")?;
-    strict_object(input, &[], "cron_list")?;
+    args::strict_object(input, &[], "cron_list")?;
     bind(ctx)?;
     let jobs = ctx.cfg.scheduler.list()?;
     if jobs.is_empty() {
@@ -183,12 +181,12 @@ pub async fn cron_list_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub async fn schedule_wakeup_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "schedule_wakeup")?;
-    let object = strict_object(
+    let object = args::strict_object(
         input,
         &["delay_seconds", "reason", "prompt", "stop"],
         "schedule_wakeup",
     )?;
-    let stop = optional_bool(input, "stop", false, "schedule_wakeup")?;
+    let stop = args::bool_or(input, "stop", false, "schedule_wakeup")?;
     bind(ctx)?;
     if stop {
         let result = ctx.cfg.scheduler.stop_wakeup()?;
@@ -331,36 +329,6 @@ fn require_top_level(ctx: &ToolCtx, tool: &str) -> Result<()> {
         bail!("{tool} is unavailable on this frontend surface");
     }
     Ok(())
-}
-
-fn strict_object<'a>(
-    input: &'a Value,
-    allowed: &[&str],
-    tool: &str,
-) -> Result<&'a Map<String, Value>> {
-    let object = input
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("{tool}: input must be an object"))?;
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        bail!("{tool}: unexpected parameter '{key}'");
-    }
-    Ok(object)
-}
-
-fn required_string<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
-    input
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("{tool}: missing required string argument '{key}'"))
-}
-
-fn optional_bool(input: &Value, key: &str, default: bool, tool: &str) -> Result<bool> {
-    match input.get(key) {
-        None => Ok(default),
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("{tool}: '{key}' must be a boolean")),
-    }
 }
 
 #[cfg(test)]

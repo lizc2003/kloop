@@ -29,7 +29,8 @@ pub(crate) fn skill_tool_def() -> ToolDef {
                 "name": {"type": "string", "description": "Name of the skill to activate, exactly as listed in the context"},
                 "arguments": {"type": "string", "description": "Optional arguments/context to pass to the skill"}
             },
-            "required": ["name"]
+            "required": ["name"],
+            "additionalProperties": false
         }),
     }
 }
@@ -55,8 +56,9 @@ pub(super) async fn skill_tool(
     if ctx.depth > 0 {
         anyhow::bail!("{}", super::builtin::Unoffered::RootOnly.message("skill"));
     }
+    super::args::strict_object(input, &["name", "arguments"], "skill")?;
     let name = str_arg(input, "name", "skill")?;
-    let args = input.get("arguments").and_then(Value::as_str).unwrap_or("");
+    let args = super::args::optional_str(input, "arguments", "skill")?.unwrap_or("");
     // Only model-invocable skills: a user command (`.kloop/commands/*.md`) is
     // `/name`-only and must not be reachable here even if the model guesses it.
     let candidates = ctx.cfg.skills.iter().filter(|s| s.source.model_invocable());

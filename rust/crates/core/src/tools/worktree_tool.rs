@@ -9,11 +9,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 
 use super::ToolCtx;
+use super::args;
 use crate::worktree;
 use crate::worktree::ExitAction;
 use kloop_protocol::ToolDef;
@@ -113,32 +113,10 @@ enum EnterInput {
     Existing(PathBuf),
 }
 
-fn strict_object<'a>(input: &'a Value, tool: &str) -> Result<&'a Map<String, Value>> {
-    input
-        .as_object()
-        .ok_or_else(|| anyhow!("{tool}: input must be an object"))
-}
-
-fn reject_unknown(object: &Map<String, Value>, allowed: &[&str], tool: &str) -> Result<()> {
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        bail!("{tool}: unexpected parameter `{key}`");
-    }
-    Ok(())
-}
-
-fn optional_string(object: &Map<String, Value>, key: &str, tool: &str) -> Result<Option<String>> {
-    match object.get(key) {
-        None => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(_) => bail!("{tool}: `{key}` must be a string"),
-    }
-}
-
 fn parse_enter(input: &Value) -> Result<EnterInput> {
-    let object = strict_object(input, "enter_worktree")?;
-    reject_unknown(object, &["name", "path"], "enter_worktree")?;
-    let name = optional_string(object, "name", "enter_worktree")?;
-    let path = optional_string(object, "path", "enter_worktree")?;
+    args::strict_object(input, &["name", "path"], "enter_worktree")?;
+    let name = args::optional_str(input, "name", "enter_worktree")?.map(str::to_string);
+    let path = args::optional_str(input, "path", "enter_worktree")?.map(str::to_string);
     match (name, path) {
         (Some(_), Some(_)) => bail!("Provide at most one of `name` or `path`, not both."),
         (Some(name), None) => {
@@ -151,21 +129,15 @@ fn parse_enter(input: &Value) -> Result<EnterInput> {
 }
 
 fn parse_exit(input: &Value) -> Result<(ExitAction, bool)> {
-    let object = strict_object(input, "exit_worktree")?;
-    reject_unknown(object, &["action", "discard_changes"], "exit_worktree")?;
-    let action = match object.get("action") {
-        Some(Value::String(action)) if action == "keep" => ExitAction::Keep,
-        Some(Value::String(action)) if action == "remove" => ExitAction::Remove,
-        Some(Value::String(_)) | None => {
+    args::strict_object(input, &["action", "discard_changes"], "exit_worktree")?;
+    let action = match args::optional_str(input, "action", "exit_worktree")? {
+        Some("keep") => ExitAction::Keep,
+        Some("remove") => ExitAction::Remove,
+        Some(_) | None => {
             bail!("exit_worktree: `action` must be one of \"keep\" or \"remove\"")
         }
-        Some(_) => bail!("exit_worktree: `action` must be a string"),
     };
-    let discard_changes = match object.get("discard_changes") {
-        None => false,
-        Some(Value::Bool(value)) => *value,
-        Some(_) => bail!("exit_worktree: `discard_changes` must be a boolean"),
-    };
+    let discard_changes = args::bool_or(input, "discard_changes", false, "exit_worktree")?;
     Ok((action, discard_changes))
 }
 

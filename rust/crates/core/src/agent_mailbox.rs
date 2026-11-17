@@ -17,6 +17,7 @@ use crate::event::Event;
 use crate::inbox::AgentMessageFailure;
 use crate::inbox::Inbox;
 use crate::inbox::InboxItem;
+use crate::tools::args;
 
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_SUMMARY_CHARS: usize = 200;
@@ -626,14 +627,10 @@ impl LiveAgentDirectory {
     }
 }
 
-fn is_unicode_line_separator(ch: char) -> bool {
-    matches!(ch, '\u{2028}' | '\u{2029}')
-}
-
 fn bounded_roster_text(value: &str, fallback: &str) -> String {
     let mut output = String::new();
     for ch in value.chars() {
-        let ch = if ch.is_control() || is_unicode_line_separator(ch) {
+        let ch = if ch.is_control() || args::is_unicode_line_separator(ch) {
             ' '
         } else {
             ch
@@ -653,35 +650,33 @@ fn bounded_roster_text(value: &str, fallback: &str) -> String {
     }
 }
 
-fn validate_payload(summary: &str, body: &str) -> Result<(), String> {
+pub(crate) fn validate_payload(summary: &str, body: &str) -> Result<(), String> {
     if body.trim().is_empty() {
-        return Err("local Agent message must not be empty".into());
+        return Err("message must not be empty".into());
     }
     if body.len() > MAX_MESSAGE_BYTES {
         return Err(format!(
-            "local Agent message exceeds the {MAX_MESSAGE_BYTES}-byte limit"
+            "message exceeds the {MAX_MESSAGE_BYTES}-byte limit"
         ));
     }
     if body
         .chars()
         .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
     {
-        return Err("local Agent message contains an unsupported control character".into());
+        return Err("message contains an unsupported control character".into());
     }
     if summary.trim().is_empty() {
-        return Err("local Agent message summary must not be empty".into());
+        return Err("summary must not be empty".into());
     }
     if summary
         .chars()
-        .any(|ch| ch.is_control() || is_unicode_line_separator(ch))
+        .any(|ch| ch.is_control() || args::is_unicode_line_separator(ch))
     {
-        return Err(
-            "local Agent message summary must be a single line without control characters".into(),
-        );
+        return Err("summary must be a single line without control characters".into());
     }
     if summary.chars().count() > MAX_SUMMARY_CHARS || summary.len() > MAX_SUMMARY_BYTES {
         return Err(format!(
-            "local Agent message summary exceeds {MAX_SUMMARY_CHARS} characters or {MAX_SUMMARY_BYTES} bytes"
+            "summary exceeds {MAX_SUMMARY_CHARS} characters or {MAX_SUMMARY_BYTES} bytes"
         ));
     }
     Ok(())

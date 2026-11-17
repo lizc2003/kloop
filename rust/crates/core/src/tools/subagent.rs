@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
 use super::background_executions::ExecutionStatus;
-use super::str_arg;
 use crate::agent::EndReason;
 use crate::agent::TurnOutcome;
 use crate::agent::run_structured_turn_in_execution;
@@ -69,6 +68,25 @@ struct RunAgentInput {
     background: bool,
     #[serde(default)]
     isolation: Option<String>,
+}
+
+/// The Workflow `agent(prompt, opts)` payload after the bridge copied its
+/// options: no `description`/`background` (the bridge never sends them) and no
+/// `schema` (it is a positional argument to the structured launcher). Serde
+/// makes a wrong-typed option an error instead of silently degrading it — the
+/// hand-written reader used to treat `isolation: 1` as `shared`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredAgentInput {
+    prompt: String,
+    #[serde(default)]
+    agent_type: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    isolation: Option<String>,
+    #[serde(default)]
+    max_rounds: Option<u64>,
 }
 
 /// The sub-agent round cap. Not a knob the model gets: it has no basis for the
@@ -247,37 +265,34 @@ pub(crate) async fn structured_agent_admitted(
         bail!("workflow agent: nested sub-agents are unavailable");
     }
     crate::structured_output::validate_schema(&schema)?;
-    let prompt = str_arg(input, "prompt", "workflow agent")?.to_string();
-    let explicit_rounds = match input.get("max_rounds") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(
-            value
-                .as_u64()
-                .filter(|rounds| *rounds > 0)
-                .ok_or_else(|| anyhow!("workflow agent: max_rounds must be a positive integer"))?,
-        ),
-    };
-    let max_rounds = child_round_cap(explicit_rounds);
-    let agent_type = match input.get("agent_type") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(name)) if !name.trim().is_empty() => Some(
+    let parsed: StructuredAgentInput =
+        serde_json::from_value(input.clone()).context("workflow agent: invalid input")?;
+    if parsed.max_rounds == Some(0) {
+        bail!("workflow agent: max_rounds must be a positive integer");
+    }
+    let max_rounds = child_round_cap(parsed.max_rounds);
+    let agent_type = match parsed.agent_type.as_deref() {
+        Some(name) if !name.trim().is_empty() => Some(
             AgentType::lookup(&ctx.cfg.agent_types, name)
                 .map_err(|error| anyhow!("workflow agent: {error}"))?,
         ),
         Some(_) => bail!("workflow agent: agent_type must be a non-blank string"),
+        None => None,
     };
-    let isolate = match input["isolation"].as_str() {
+    let agent_type_name = agent_type
+        .as_ref()
+        .map(|agent_type| agent_type.name.clone());
+    let isolate = match parsed.isolation.as_deref() {
         None | Some("shared") => false,
         Some("worktree") => true,
         Some(other) => bail!("workflow agent: unknown isolation '{other}' (expected \"worktree\")"),
     };
-    let model = match input.get("model") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(model)) => Some(
+    let model = match parsed.model.as_deref() {
+        Some(model) => Some(
             InheritedProviderModelOverride::parse(model)
                 .map_err(|error| anyhow!("workflow agent: {error}"))?,
         ),
-        Some(_) => bail!("workflow agent: model must be a non-blank string"),
+        None => None,
     };
     let agent = crate::resource_id::fresh("agent-")?;
     let workspace = ctx.cfg.effective_workspace();
@@ -288,9 +303,9 @@ pub(crate) async fn structured_agent_admitted(
             .child_route(Some(model))
             .map_err(|error| anyhow!("workflow agent: {error}"))?;
     }
-    let preview = match agent_type {
-        Some(agent_type) => format!("[{}] {}", agent_type.name, agent_preview(&prompt)),
-        None => agent_preview(&prompt),
+    let preview = match agent_type_name.as_deref() {
+        Some(name) => format!("[{name}] {}", agent_preview(&parsed.prompt)),
+        None => agent_preview(&parsed.prompt),
     };
     let worktree = if isolate {
         let worktree = worktree::create(&workspace.cwd, &agent, &ctx.cfg.cleanup_tasks)
@@ -319,98 +334,22 @@ pub(crate) async fn structured_agent_admitted(
             DeliveryRoute::DirectToolResult,
         ),
     )?;
-    let sub_cfg = Arc::new(sub);
-    let ui = ctx.ui.clone();
-    let cancel = ctx.cancel.clone();
-    let stop = ctx.stop.clone();
-    let depth = ctx.depth + 1;
-    let subagent_of = ctx.parent_rollout_id.clone();
-    let (lease, worktree) = register_child_with_cleanup(
-        &sub_cfg,
-        agent_type.map(|agent_type| agent_type.name.as_str()),
-        &preview,
-        &ui,
-        &agent,
+    run_supervised_child(
+        ctx,
+        Arc::new(sub),
+        agent,
+        preview,
+        agent_type_name,
+        parsed.prompt,
+        ctx.depth + 1,
         "workflow agent",
         worktree,
+        receipt,
+        ChildTurn::Structured(schema),
+        finish_structured,
+        |_, _| {},
     )
-    .await?;
-    emit_agent_start(&ui, &agent, &preview);
-    let execution = receipt.as_execution_ref();
-    let handle = tokio::spawn({
-        let ui = ui.clone();
-        async move {
-            let _lease = lease;
-            let mut history = match child_history(&sub_cfg, subagent_of.as_deref(), prompt) {
-                Ok(history) => history,
-                Err(outcome) => return outcome,
-            };
-
-            run_structured_turn_in_execution(
-                &sub_cfg,
-                &mut history,
-                &ui,
-                &cancel,
-                &stop,
-                depth,
-                schema,
-                execution,
-            )
-            .await
-        }
-    });
-    // Same contract as the foreground `run_agent` supervisor: the worktree is
-    // owned here so a dropped tool future cannot take it down unfinished.
-    let supervisor = ctx.cfg.cleanup_tasks.spawn({
-        let ui = ui.clone();
-        let agent = agent.clone();
-        async move {
-            let mut result = match handle.await {
-                Ok(outcome) => match outcome.reason {
-                    EndReason::Completed => outcome.structured_output.ok_or_else(|| {
-                        anyhow!("workflow agent: child completed without valid structured_output")
-                    }),
-                    EndReason::MaxRounds => Err(anyhow!(
-                        "workflow agent: child stopped at its round limit without valid structured_output"
-                    )),
-                    EndReason::Aborted => Err(anyhow!("workflow agent: child was interrupted")),
-                    // The No may have come from a sibling: a workflow starts children after
-                    // the stop too, and those end before their first round.
-                    EndReason::Stopped => Err(anyhow!(
-                        "workflow agent: the user declined an approval and stopped the turn"
-                    )),
-                    EndReason::Error(error) => {
-                        Err(anyhow!("workflow agent: child failed: {error}"))
-                    }
-                },
-                Err(error) => Err(anyhow!("workflow agent: sub-agent panicked: {error}")),
-            };
-            if let Some(worktree) = worktree {
-                match worktree::finish(worktree).await {
-                    Ok(Some(note)) => ui.emit(&Event::Note(note.trim().to_string())),
-                    Ok(None) => {}
-                    Err(error) => {
-                        let note = format!(
-                            "workflow agent: worktree cleanup failed: {error:#}"
-                        );
-                        ui.emit(&Event::Note(note.clone()));
-                        result = Err(anyhow!(note));
-                    }
-                }
-            }
-            emit_agent_end(&ui, &agent, result.is_ok());
-            result
-        }
-    });
-    match supervisor.await {
-        Ok(result) => result.map(|value| Admitted { value, receipt }),
-        Err(error) => {
-            emit_agent_end(&ui, &agent, false);
-            Err(anyhow!(
-                "workflow agent: sub-agent supervisor panicked: {error}"
-            ))
-        }
-    }
+    .await
 }
 
 /// Point a sub-agent's cwd anchors at its worktree: cwd, the permission gate
@@ -600,6 +539,93 @@ async fn run_sub_agent_sync(
     worktree: Option<worktree::Worktree>,
     receipt: Arc<ExecutionProvenanceReceipt>,
 ) -> Result<Admitted<String>> {
+    run_supervised_child(
+        ctx,
+        sub_cfg,
+        agent,
+        preview,
+        agent_type,
+        prompt,
+        depth,
+        who,
+        worktree,
+        receipt,
+        ChildTurn::Plain,
+        finish_plain,
+        |text, note| text.push_str(note),
+    )
+    .await
+}
+
+/// What the child's worker is asked to run. The two turn variants have the
+/// same history setup, registration, supervisor, worktree teardown and
+/// lifecycle events; only the turn function and the shape of its result
+/// differ.
+enum ChildTurn {
+    Plain,
+    Structured(Value),
+}
+
+type FinishChild<T> = fn(TurnOutcome, &str) -> Result<T>;
+type AppendNote<T> = fn(&mut T, &str);
+
+fn finish_plain(outcome: TurnOutcome, who: &str) -> Result<String> {
+    match outcome.reason {
+        EndReason::Completed => Ok(outcome.final_text),
+        EndReason::MaxRounds => Ok(format!(
+            "[sub-agent stopped at its round limit]\n{}",
+            outcome.final_text
+        )),
+        EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
+        // Not an error the model should work around: the parent's turn ends with
+        // this batch, and the user's next message says what to do instead.
+        EndReason::Stopped => Ok(format!(
+            "[the user declined an approval in this sub-agent and stopped the turn to tell you what to do instead]\n{}",
+            outcome.final_text
+        )),
+        EndReason::Error(error) => Err(anyhow!("{who}: sub-agent failed: {error}")),
+    }
+}
+
+fn finish_structured(outcome: TurnOutcome, who: &str) -> Result<Value> {
+    match outcome.reason {
+        EndReason::Completed => outcome
+            .structured_output
+            .ok_or_else(|| anyhow!("{who}: child completed without valid structured_output")),
+        EndReason::MaxRounds => Err(anyhow!(
+            "{who}: child stopped at its round limit without valid structured_output"
+        )),
+        EndReason::Aborted => Err(anyhow!("{who}: child was interrupted")),
+        // The No may have come from a sibling: a workflow starts children after
+        // the stop too, and those end before their first round.
+        EndReason::Stopped => Err(anyhow!(
+            "{who}: the user declined an approval and stopped the turn"
+        )),
+        EndReason::Error(error) => Err(anyhow!("{who}: child failed: {error}")),
+    }
+}
+
+/// Register, run and tear down one foreground child. The worktree belongs to
+/// the supervisor, not to the tool future: a cancelled turn drops that future
+/// where it awaits the supervisor, and a worktree dropped with it would never
+/// be finished. Tracking the supervisor keeps session shutdown from ending
+/// before the teardown does.
+#[allow(clippy::too_many_arguments)]
+async fn run_supervised_child<T: Send + 'static>(
+    ctx: &ToolCtx,
+    sub_cfg: Arc<Config>,
+    agent: String,
+    preview: String,
+    agent_type: Option<String>,
+    prompt: String,
+    depth: u8,
+    who: &str,
+    worktree: Option<worktree::Worktree>,
+    receipt: Arc<ExecutionProvenanceReceipt>,
+    turn: ChildTurn,
+    finish: FinishChild<T>,
+    append_note: AppendNote<T>,
+) -> Result<Admitted<T>> {
     let ui = ctx.ui.clone();
     let cancel = ctx.cancel.clone();
     // The parent's own stop: a No inside this child ends the parent's turn too.
@@ -626,22 +652,35 @@ async fn run_sub_agent_sync(
                 Err(outcome) => return outcome,
             };
 
-            run_turn_in_execution(
-                &sub_cfg,
-                &mut history,
-                &ui,
-                &cancel,
-                &stop,
-                depth,
-                execution,
-            )
-            .await
+            match turn {
+                ChildTurn::Plain => {
+                    run_turn_in_execution(
+                        &sub_cfg,
+                        &mut history,
+                        &ui,
+                        &cancel,
+                        &stop,
+                        depth,
+                        execution,
+                    )
+                    .await
+                }
+                ChildTurn::Structured(schema) => {
+                    run_structured_turn_in_execution(
+                        &sub_cfg,
+                        &mut history,
+                        &ui,
+                        &cancel,
+                        &stop,
+                        depth,
+                        schema,
+                        execution,
+                    )
+                    .await
+                }
+            }
         }
     });
-    // The worktree belongs to this supervisor, not to the tool future: a
-    // cancelled turn drops that future where it awaits the supervisor, and a
-    // worktree dropped with it would never be finished. Tracking the
-    // supervisor keeps session shutdown from ending before the teardown does.
     let who_label = who.to_string();
     let supervisor = ctx.cfg.cleanup_tasks.spawn({
         let ui = ui.clone();
@@ -649,37 +688,19 @@ async fn run_sub_agent_sync(
         let who = who_label.clone();
         async move {
             let mut result = match worker.await {
-                Ok(outcome) => match outcome.reason {
-                    EndReason::Completed => Ok(outcome.final_text),
-                    EndReason::MaxRounds => Ok(format!(
-                        "[sub-agent stopped at its round limit]\n{}",
-                        outcome.final_text
-                    )),
-                    EndReason::Aborted => Err(anyhow!("{who}: sub-agent interrupted")),
-                    // Not an error the model should work around: the parent's turn ends with
-                    // this batch, and the user's next message says what to do instead.
-                    EndReason::Stopped => Ok(format!(
-                        "[the user declined an approval in this sub-agent and stopped the turn to tell you what to do instead]\n{}",
-                        outcome.final_text
-                    )),
-                    EndReason::Error(e) => Err(anyhow!("{who}: sub-agent failed: {e}")),
-                },
-                Err(e) => Err(anyhow!("{who}: sub-agent panicked: {e}")),
+                Ok(outcome) => finish(outcome, &who),
+                Err(error) => Err(anyhow!("{who}: sub-agent panicked: {error}")),
             };
-            // A retained tree keeps its branch for the user; a removed tree can still
-            // carry a note naming the ignored build output it discarded. On a
-            // success the model hears about it in the tool result; after a
-            // cancellation or another error there is no result left to read, so
-            // publish the note as a session message instead.
+            // A retained tree keeps its branch for the user; a removed tree can
+            // still carry a note naming the ignored build output it discarded.
+            // Publish it as a session message either way: the caller may already
+            // be gone (a cancelled turn drops the tool future).
             if let Some(wt) = worktree {
                 match worktree::finish(wt).await {
                     Ok(Some(note)) => {
-                        // Always publish: the caller may already be gone (a
-                        // cancelled turn drops the tool future), in which case
-                        // appending to the result would lose the location.
                         ui.emit(&Event::Note(note.trim().to_string()));
-                        if let Ok(text) = &mut result {
-                            text.push_str(&note);
+                        if let Ok(value) = &mut result {
+                            append_note(value, &note);
                         }
                     }
                     Ok(None) => {}
@@ -1908,6 +1929,40 @@ mod tests {
         .await;
         assert!(is_error);
         assert!(out.contains("unknown isolation 'sandbox'"), "{out}");
+    }
+
+    /// The structured Workflow path reads the same options through serde, so a
+    /// wrong-typed or misspelled option is refused instead of degrading to the
+    /// default (the hand-written reader treated `isolation: 1` as shared).
+    #[tokio::test]
+    async fn structured_agent_input_is_strict() {
+        let ctx = test_ctx(0, "structured-strict");
+        let schema = json!({"type": "object", "properties": {}});
+        for (input, message) in [
+            (json!({"prompt": "x", "isolation": 1}), "invalid type"),
+            (
+                json!({"prompt": "x", "isolation": "sandbox"}),
+                "unknown isolation",
+            ),
+            (
+                json!({"prompt": "x", "max_rounds": 0}),
+                "max_rounds must be a positive integer",
+            ),
+            (
+                json!({"prompt": "x", "run_in_background": true}),
+                "unknown field `run_in_background`",
+            ),
+        ] {
+            let error = format!(
+                "{:#}",
+                structured_agent_admitted(&input, schema.clone(), &ctx)
+                    .await
+                    .err()
+                    .unwrap()
+            );
+            assert!(error.contains(message), "{input}: {error}");
+        }
+        assert_eq!(ctx.cfg.background_executions.running_count(), 0);
     }
 
     /// Requesting isolation outside a git repository is an error (fail-closed),

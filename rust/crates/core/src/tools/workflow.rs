@@ -1,8 +1,6 @@
 //! Standalone, always-background Workflow orchestration.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use anyhow::Result;
@@ -14,8 +12,9 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
+use super::agent_gate::Admission;
+use super::agent_gate::AgentCallGate;
 use super::background_executions::ExecutionStatus;
-use super::codemode::journal::Claim;
 use super::codemode::journal::Journal;
 use super::run_store::RunDir;
 use super::run_store::RunId;
@@ -79,6 +78,7 @@ pub(super) fn workflow_def() -> ToolDef {
                 "args": {},
                 "script_path": {"type": ["string", "null"], "minLength": 1, "description": "Managed script path returned by a previous workflow launch; use with resume_from_run_id."},
                 "resume_from_run_id": {"type": ["string", "null"], "pattern": "^wf_[A-Za-z0-9_-]+$"},
+                "name": {"type": ["string", "null"], "description": "Rejected: the named workflow registry is not implemented; pass script instead."},
                 "description": {"type": "string", "description": "Ignored; set meta.description in the script."},
                 "title": {"type": "string", "description": "Ignored; set meta.name in the script."}
             },
@@ -413,10 +413,7 @@ fn emit_workflow(
 
 struct WorkflowBridge {
     ctx: ToolCtx,
-    agent_count: AtomicU64,
-    max_agents: u64,
-    agent_slots: Arc<tokio::sync::Semaphore>,
-    journal: Arc<Journal>,
+    agent_gate: Arc<AgentCallGate>,
     workflow_id: String,
     run_id: String,
     description: String,
@@ -433,10 +430,11 @@ impl WorkflowBridge {
     ) -> Self {
         Self {
             ctx,
-            agent_count: AtomicU64::new(0),
-            max_agents: limits.max_agents,
-            agent_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrency)),
-            journal,
+            agent_gate: Arc::new(AgentCallGate::new(
+                Some(journal),
+                limits.max_agents,
+                limits.max_concurrency,
+            )),
             workflow_id,
             run_id,
             description,
@@ -455,37 +453,20 @@ impl HostBridge for WorkflowBridge {
         prompt: String,
         opts: Value,
     ) -> BoxFuture<Result<Value, String>> {
-        let claim = self.journal.claim(&call_id, &prompt, &opts);
-        let live = matches!(claim, Claim::Miss);
-        let count = live.then(|| self.agent_count.fetch_add(1, Ordering::Relaxed));
-        let max = self.max_agents;
-        let agent_slots = self.agent_slots.clone();
         let ctx = self.ctx.clone();
-        let cancel = ctx.cancel.clone();
-        let journal = self.journal.clone();
+        let gate = self.agent_gate.clone();
         Box::pin(async move {
-            // A stopped workflow must not start new children; see CoreBridge.
-            if cancel.is_cancelled() {
-                return Err("workflow interrupted".into());
-            }
-            if let Claim::Hit(value) = claim {
-                return Ok(value);
-            }
-            if count.is_some_and(|count| count >= max) {
-                return Err(format!("workflow exceeds the agent cap of {max}"));
-            }
-            let _permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    return Err("workflow interrupted while waiting for an agent slot".into());
-                }
-                permit = agent_slots.acquire_owned() => permit.map_err(|_| {
-                    "workflow agent concurrency limiter closed unexpectedly".to_string()
-                })?,
+            let call = gate.begin(&call_id, &prompt, &opts);
+            let _permit = match gate
+                .admit(call, &ctx.cancel, "workflow interrupted", |max| {
+                    format!("workflow exceeds the agent cap of {max}")
+                })
+                .await
+            {
+                Ok(Admission::Hit(value)) => return Ok(value),
+                Ok(Admission::Live(permit)) => permit,
+                Err(error) => return Err(error),
             };
-            if cancel.is_cancelled() {
-                return Err("workflow interrupted".into());
-            }
             let schema = opts.get("schema").cloned();
             // A plain workflow agent has the same fixed round cap as run_agent, so
             // it does not take one; a structured agent does, and may only tighten it.
@@ -515,7 +496,7 @@ impl HostBridge for WorkflowBridge {
             };
             match admitted {
                 Ok(admitted) => {
-                    if let Some(warning) = journal.record(
+                    if let Some(warning) = gate.record(
                         call_id,
                         prompt,
                         opts,
@@ -658,7 +639,10 @@ mod tests {
             def.schema["properties"]["resume_from_run_id"]["type"],
             json!(["string", "null"])
         );
-        assert!(def.schema["properties"].get("name").is_none());
+        assert_eq!(
+            def.schema["properties"]["name"]["description"],
+            "Rejected: the named workflow registry is not implemented; pass script instead."
+        );
         assert!(!def.description.contains("tools."));
         assert!(def.description.contains("journal-v3"));
         assert!(

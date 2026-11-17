@@ -1,7 +1,7 @@
 # Plan 267 — 工具契约单一来源
 
 > 2026-10-28 立。来源：全仓只读审查与随后的架构讨论(HANDOFF「〇⁵」节)。
-> 状态：待实现。**先做 plan 257**(它修掉 `max_rounds` 这个具体 bug,这里消除它的成因)。
+> 状态：✅ 已完成(2026-11-17)。plan 257 已完成,依赖满足。
 > 行号是 2026-10-28 的读数，开工先自己量。
 
 ## 问题
@@ -35,13 +35,8 @@
 
 ## 开工先问用户
 
-- 要不要引入 schemars(新增直接依赖，按仓库惯例要在 workspace `Cargo.toml` 写明理由)?
-  (a) 引入：每个工具一个 `#[derive(Deserialize, JsonSchema)] #[serde(deny_unknown_fields)]` 输入
-  结构，schema 由它生成;生成的 schema 与现有手写 schema 逐字对比(措辞、`description`、
-  `pattern`、上下限),不一致的逐条决定。(b) 不引入：保留手写 schema,但每个工具加一条测试，
-  断言 schema 的 `properties` 键集合 == 解析结构体接受的键集合。推荐 (b) 起步，代价小、立刻
-  堵住漂移;(a) 留作后续。
-- 显式 `null` 统一当省略还是统一报错?推荐当省略(模型常发 `null` 表示"不填")。
+- ~~要不要引入 schemars?~~ 用户定:**不引入**,按 (b) 起步:保留手写 schema,用一致性测试堵漂移;schemars 留作后续。
+- ~~显式 `null` 统一当省略还是统一报错?~~ 用户定:**统一当省略**;必填字段仍报缺失。
 
 ## 做法
 
@@ -61,3 +56,49 @@
 - 措辞变化会影响模型看到的错误文本：逐条列进完成记录，现有 parity 语料若钉了旧措辞要说明。
 - `isolation: 1` 在 structured 路径报错;两个 bridge 的现有测试不变。
 - 外层执行沙箱之外 `make check`;DESIGN 的工具参数校验一节先读再改;HANDOFF 记进展与教训。
+
+## 完成记录（2026-11-17）
+
+六条全部成立并按 (b) 落地。
+
+1. **一致性测试**：`builtin.rs` 新增 `every_schema_matches_its_parsers_accepted_keys`，
+   走 `Builtin::ALL`，逐工具断言 `schema.properties` 键集合 == 解析接受的键集合；
+   `workflow` 的 `name` 是解析器会读、schema 漏掉的字段，补进 schema 并说明
+   “named workflow registry 未实现”。`read_file`/`write_file`/`edit_file`/`grep`/`glob`/
+   `exit_plan_mode`/`skill` 的 schema 补 `additionalProperties: false`。
+2. **`tools/args.rs`**：`object`/`strict_object`/`required_str`/`optional_str`/
+   `optional_bool`/`bool_or`/`integer_arg`/`bounded_diagnostic` 一份；显式 `null`
+   统一当省略，回显按字符限长去控制字符；缺失参数仍列出调用实际携带的其它 key。
+   各工具删掉本地 helper 并改用它；原先未设防线的工具（bash_output、powershell、
+   grep/glob、read/write/edit、plan mode、skill、tool_search）改为拒绝未知字段。
+3. **`tools/agent_gate.rs`**：`AgentCallGate` 统一 journal claim、总数上限、
+   live 槽位与取消复查；两个 bridge 只保留各自的选项映射和错误措辞。取消检查仍在
+   journal hit 之前，保持“停止后不再起新子 agent”。
+4. **structured 路径**：`StructuredAgentInput` 用 `deny_unknown_fields` serde；
+   `isolation: 1`、拼错字段、`max_rounds: 0` 均报错。注册→spawn→supervisor→
+   worktree finish→emit_end 抽成 `run_supervised_child`，`ChildTurn::{Plain,Structured}`
+   选择 turn 变体，`finish_plain`/`finish_structured` 映射结果。
+5. **`send_message`**：`parse_send_message` 只派生 summary 和目标，payload 规则调用
+   `agent_mailbox::validate_payload` 后再加 `send_message:` 前缀；mailbox 内错误文案
+   去掉 “local Agent message” 前缀。`is_unicode_line_separator` 只在 `args.rs` 定义。
+6. **注释**：`provided_keys` 的 “kloop translates no synonyms” 改成只承认
+   `ARGUMENT_SYNONYMS` 的精确无歧义重命名；`concurrency_safe` 的文档从 `timeout` 移回。
+
+**AgentOptions**：`codemode::agent_options_type` 从 `builtins` 里的 `run_agent` schema
+投影 `agent_type`/`model` 生成；`ts_type` 支持 `["string","null"]`。编排类型仍手写。
+
+**模型可见措辞变化**（原有断言同步更新）：
+- 未知字段：`unexpected parameter 'x'` / `unexpected input field "x"; accepted: …` /
+  `unsupported field 'x'` / `unknown field 'x' in each todo` → 统一 `<tool>: unknown field 'x'`。
+- 类型错误：`'key' must be a string` / `when provided` → `<tool>: key must be a string` 等。
+- `send_message` 的 payload 错误去掉了 “local Agent message” 前缀，由工具加
+  `send_message:`；`summary: null` 改为派生 summary。
+- powershell 未知字段不再附 “foreground-only” 解释。
+- `tool_search.max_results: null` 与数字字符串改为省略/接受；负数/小数报
+  “whole number of 0 or more”，0 仍是 “positive integer”。
+- plan 58/56/53 的 parity 断言按新措辞更新；本机未跑外部 parity 语料。
+
+**验证**：`cargo test -p kloop-core --lib` 1451 通过、1 ignored（含新增
+schema/parser 一致性、`args` null/限长、structured 严格输入）；`cargo clippy -p
+kloop-core --all-targets -- -D warnings`；`cargo fmt --all -- --check`；
+`cargo check --workspace`。未跑 `make check`、外部 parity 语料、真实 API。

@@ -236,7 +236,7 @@ async fn lifecycle_report() -> Value {
         run_tool("cron_create", json!({"cron": "1 12 * * *"}), &context).await;
     assert!(missing_error && missing.contains("missing required string argument 'prompt'"));
     let (unknown, unknown_error) = run_tool("cron_list", json!({"extra": true}), &context).await;
-    assert!(unknown_error && unknown.contains("unexpected parameter 'extra'"));
+    assert!(unknown_error && unknown.contains("unknown field `extra`"));
     let (wrong_type, wrong_type_error) = run_tool(
         "cron_create",
         json!({"cron": "1 12 * * *", "prompt": "x", "recurring": "yes"}),
@@ -260,9 +260,7 @@ async fn lifecycle_report() -> Value {
         &context,
     )
     .await;
-    assert!(
-        unknown_delete_field_error && unknown_delete_field.contains("unexpected parameter 'extra'")
-    );
+    assert!(unknown_delete_field_error && unknown_delete_field.contains("unknown field `extra`"));
 
     let (created, create_error) = run_tool(
         "cron_create",

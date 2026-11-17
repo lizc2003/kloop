@@ -34,10 +34,11 @@ pub(super) fn enter_plan_mode_def() -> ToolDef {
 }
 
 pub(super) async fn enter_plan_mode_tool(
-    _input: &Value,
+    input: &Value,
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
+    super::args::strict_object(input, &[], "enter_plan_mode")?;
     if ctx.depth >= 1 {
         bail!("enter_plan_mode: only the top-level agent can enter plan mode");
     }
@@ -71,7 +72,8 @@ pub(super) fn exit_plan_mode_def() -> ToolDef {
             "properties": {
                 "plan": {"type": "string", "description": "The full implementation plan to show the user for approval (markdown)"}
             },
-            "required": ["plan"]
+            "required": ["plan"],
+            "additionalProperties": false
         }),
     }
 }
@@ -86,6 +88,7 @@ pub(super) async fn exit_plan_mode_tool(
     if ctx.depth >= 1 {
         bail!("exit_plan_mode: only the top-level agent can leave plan mode");
     }
+    super::args::strict_object(input, &["plan"], "exit_plan_mode")?;
     let perms = &workspace.permissions;
     if perms.mode() != Mode::Plan {
         bail!("exit_plan_mode: the session is not in plan mode, so there is nothing to exit");

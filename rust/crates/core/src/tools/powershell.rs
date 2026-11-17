@@ -78,17 +78,12 @@ fn timeout_ms(input: &Value) -> Result<u64> {
 }
 
 fn validate_input(input: &Value) -> Result<()> {
-    let object = input
-        .as_object()
-        .context("powershell: input must be an object")?;
+    super::args::strict_object(
+        input,
+        &["command", "description", "timeout_ms"],
+        "powershell",
+    )?;
     super::optional_display_description(input, "powershell")?;
-    for key in object.keys() {
-        if !matches!(key.as_str(), "command" | "description" | "timeout_ms") {
-            bail!(
-                "powershell: unsupported field '{key}'; PowerShell v1 is foreground-only and does not support background, sandbox, stdin, PTY, session or executable overrides"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -224,7 +219,7 @@ mod tests {
             input[field] = serde_json::json!(true);
             let error = validate_input(&input).unwrap_err().to_string();
             assert!(error.contains(field), "{error}");
-            assert!(error.contains("foreground-only"), "{error}");
+            assert!(error.contains("unknown field"), "{error}");
         }
     }
 

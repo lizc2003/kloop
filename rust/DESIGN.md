@@ -3081,6 +3081,41 @@ The period is measured, not chosen: replaying 1 691 real `read_file` calls,
 `grep` has no equivalent rule — the same pattern against a different path is a
 new result, not a reread — and deliberately gets none.
 
+### Tool argument contracts (Plan 267)
+
+Each built-in still publishes a hand-written JSON schema, but the parser is
+the authority for what a call means, and the two are pinned to the same key set:
+`every_schema_matches_its_parsers_accepted_keys` walks `Builtin::ALL` and
+compares `schema.properties` against the keys that tool's parser accepts. A
+field removed from a parser but left in the schema — the `max_rounds` drift that
+survived across `run_agent`, its TypeScript declaration and two bridges — fails
+that test instead of surviving as a call the model is invited to make and the
+runtime always refuses. Schemas are closed (`additionalProperties: false`) and
+every parser rejects an unknown key.
+
+The shared helpers live in `tools/args.rs` rather than in each tool:
+
+- explicit `null` is omission for optional fields (the model uses it for "not
+  filled in"); a required field still reports that it is missing;
+- unknown keys, wrong types and required-field failures use one shape per tool
+  (`<tool>: unknown field 'x'` / `<tool>: key must be a string`), and an echoed
+  model-supplied key is control-character-sanitized and character-bounded;
+- a missing required argument still lists the other keys the call carried, so a
+  model that used another harness's spelling can see that its key went nowhere.
+
+`run_agent`'s structured Workflow variant reads the same options through a
+`deny_unknown_fields` serde struct, so `isolation: 1` and misspelled options are
+errors rather than silently degrading to the default. Both `call_agent` bridges
+(`run_program` and `workflow`) share one `AgentCallGate` for the journal claim,
+the total-call cap, the live slot and cancellation re-checks; each keeps only
+its option mapping and error wording. `send_message` and the mailbox share one
+payload validator, and `is_unicode_line_separator` has one definition.
+
+`run_program`'s generated TypeScript `AgentOptions` is derived from `run_agent`'s
+schema (`agent_type`/`model`) instead of being a second hand-written copy;
+`OrchestrationScope` and the helper signatures remain hand-written because they
+describe the orchestration API, not a tool input.
+
 ### Per-call tool budgets (Plan 151)
 
 Every tool call runs under a budget declared by the tool itself — a `Builtin`

@@ -436,11 +436,6 @@ impl Builtin {
 }
 
 impl Builtin {
-    /// Whether this call may run in the same concurrent batch as its
-    /// neighbours. Read-only tools always may; `bash` may only when every
-    /// parsed argv is a known read-only command — the same decomposition the
-    /// permission gate uses, because safe-to-parallelize and safe-to-run are
-    /// two verdicts over one analysis.
     /// The wall-clock budget for one call, or `None` for a tool that has no
     /// useful bound.
     ///
@@ -505,6 +500,11 @@ impl Builtin {
         }
     }
 
+    /// Whether this call may run in the same concurrent batch as its
+    /// neighbours. Read-only tools always may; `bash` may only when every
+    /// parsed argv is a known read-only command — the same decomposition the
+    /// permission gate uses, because safe-to-parallelize and safe-to-run are
+    /// two verdicts over one analysis.
     #[cfg(all(test, unix))]
     pub(crate) fn concurrency_safe(self, input: &Value) -> bool {
         self.concurrency_safe_with(input, None)
@@ -758,7 +758,8 @@ fn read_file_def() -> ToolDef {
                 "offset": {"type": "integer", "minimum": 0, "description": "Line number to start from (default 1; 0 is accepted for compatibility)"},
                 "limit": {"type": "integer", "minimum": 0, "description": "Max lines to return (omit or pass 0 for all lines within the character budget)"}
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         }),
     }
 }
@@ -773,7 +774,8 @@ fn write_file_def() -> ToolDef {
                 "path": {"type": "string"},
                 "content": {"type": "string"}
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
+            "additionalProperties": false
         }),
     }
 }
@@ -790,7 +792,8 @@ fn edit_file_def() -> ToolDef {
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
         }),
     }
 }
@@ -853,7 +856,8 @@ fn grep_def() -> ToolDef {
                 "offset": {"type": "integer", "minimum": 0, "description": "Skip this many results before head_limit applies (default 0)"},
                 "multiline": {"type": "boolean", "description": "Patterns may span lines and . matches newlines (default false)"}
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "additionalProperties": false
         }),
     }
 }
@@ -868,7 +872,8 @@ fn glob_def() -> ToolDef {
                 "pattern": {"type": "string", "description": "Glob pattern to match file paths against"},
                 "path": {"type": "string", "description": "Directory to search in (default: current directory)"}
             },
-            "required": ["pattern"]
+            "required": ["pattern"],
+            "additionalProperties": false
         }),
     }
 }
@@ -990,6 +995,132 @@ mod tests {
             assert!(definition.description.contains("maximum wait"));
             assert!(definition.description.contains("Do not use sleep"));
             assert!(definition.description.contains("block=false"));
+        }
+    }
+
+    /// The published schema and the parser are two declarations of one
+    /// contract; this is the tripwire that keeps them the same set of keys.
+    /// A key added to one side only, or a field removed from a parser but left
+    /// in the schema (the `max_rounds` drift of plan 257), fails here.
+    #[test]
+    fn every_schema_matches_its_parsers_accepted_keys() {
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "bash",
+                &["command", "description", "timeout_ms", "background"],
+            ),
+            ("bash_output", &["bash_id", "block", "timeout_ms"]),
+            ("stop_bash", &["bash_id"]),
+            ("powershell", &["command", "description", "timeout_ms"]),
+            ("read_file", &["path", "offset", "limit"]),
+            ("write_file", &["path", "content"]),
+            (
+                "edit_file",
+                &["path", "old_string", "new_string", "replace_all"],
+            ),
+            (
+                "notebook_edit",
+                &[
+                    "notebook_path",
+                    "cell_id",
+                    "new_source",
+                    "cell_type",
+                    "edit_mode",
+                ],
+            ),
+            (
+                "grep",
+                &[
+                    "pattern",
+                    "path",
+                    "glob",
+                    "type",
+                    "output_mode",
+                    "-i",
+                    "-n",
+                    "-A",
+                    "-B",
+                    "-C",
+                    "-o",
+                    "head_limit",
+                    "offset",
+                    "multiline",
+                ],
+            ),
+            ("glob", &["pattern", "path"]),
+            ("todo_write", &["todos"]),
+            ("send_message", &["to", "summary", "message"]),
+            ("list_agents", &[]),
+            (
+                "run_agent",
+                &[
+                    "description",
+                    "prompt",
+                    "agent_type",
+                    "model",
+                    "background",
+                    "isolation",
+                ],
+            ),
+            ("wait_for_activity", &["timeout_ms"]),
+            ("stop_agent", &["agent_id"]),
+            ("tool_search", &["query", "max_results"]),
+            ("call_tool", &["tool_name", "params"]),
+            (
+                "run_program",
+                &["description", "source", "background", "resume_from_run_id"],
+            ),
+            ("stop_program", &["program_id"]),
+            (
+                "cron_create",
+                &["cron", "prompt", "recurring", "durable", "check"],
+            ),
+            ("cron_delete", &["id"]),
+            ("cron_list", &[]),
+            (
+                "schedule_wakeup",
+                &["delay_seconds", "reason", "prompt", "stop"],
+            ),
+            (
+                "ask_user_question",
+                &["questions", "answers", "annotations", "metadata"],
+            ),
+            ("enter_plan_mode", &[]),
+            ("exit_plan_mode", &["plan"]),
+            (
+                "workflow",
+                &[
+                    "script",
+                    "args",
+                    "script_path",
+                    "resume_from_run_id",
+                    "name",
+                    "description",
+                    "title",
+                ],
+            ),
+            ("stop_workflow", &["workflow_id"]),
+            ("enter_worktree", &["name", "path"]),
+            ("exit_worktree", &["action", "discard_changes"]),
+            ("skill", &["name", "arguments"]),
+        ];
+        assert_eq!(expected.len(), ALL.len());
+        let cx = DefCx::default();
+        for builtin in ALL {
+            let (_, accepted) = expected
+                .iter()
+                .find(|(name, _)| *name == builtin.name())
+                .unwrap_or_else(|| panic!("{} has no contract entry", builtin.name()));
+            let mut declared: Vec<String> = builtin.def(&cx).schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} schema has no properties", builtin.name()))
+                .keys()
+                .cloned()
+                .collect();
+            let mut accepted: Vec<String> = accepted.iter().map(|key| (*key).to_string()).collect();
+            declared.sort_unstable();
+            accepted.sort_unstable();
+            assert_eq!(declared, accepted, "{}", builtin.name());
         }
     }
 
