@@ -4375,6 +4375,8 @@ async fn a_failed_fork_build_removes_the_new_session_file() {
         .request("turn/start", json!({"thread_id": src, "input": "q"}))
         .await;
     client.recv_until(|m| m["method"] == "turn/completed").await;
+    let sessions_before = session_jsonl(&dirs.sessions);
+    assert_eq!(sessions_before.len(), 1, "one source session");
 
     let fork_id = client
         .request("thread/fork", json!({"thread_id": src}))
@@ -4387,9 +4389,11 @@ async fn a_failed_fork_build_removes_the_new_session_file() {
             .is_some_and(|message| message.contains("injected factory failure")),
         "{response}"
     );
+    // Session files only: Windows keeps a per-session `.lock` beside each
+    // transcript, and the cleanup guard removes only the `.jsonl` it created.
     assert_eq!(
-        std::fs::read_dir(&dirs.sessions).unwrap().count(),
-        1,
+        session_jsonl(&dirs.sessions),
+        sessions_before,
         "the failed fork left its session file behind"
     );
 
