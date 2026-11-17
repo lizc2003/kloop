@@ -934,18 +934,28 @@ impl Composer {
     pub fn paste_text_at_reservation(&mut self, token: u64, text: &str) -> ReservationPaste {
         if let Some(index) = self.document.pending_index(token) {
             let end = self.document.atoms[index].range.end();
-            // The caret follows the replacement when it rested after the label
-            // and stays put before it. Computed against the pre-splice text:
-            // once the label is gone the sides can join into one grapheme and
-            // the old offsets no longer name positions an edit can use.
+            // The caret keeps its distance past the label: standing after it,
+            // it stays that far past the replacement (text typed while the read
+            // ran must stay behind the caret); standing before it, it stays
+            // put. Measured against the pre-splice text: once the label is gone
+            // the sides can join into one grapheme and the old offsets no
+            // longer name positions an edit can use.
             let follows = self.cursor >= end;
+            let tail = self.cursor.get().saturating_sub(end.get());
             let before = self.cursor;
             self.begin_edit();
-            // The repair may add a separating space on either side of the
-            // replacement, so the caret that follows it is the position the
-            // splice reports, not the old offset plus a length.
+            // The repair may add a separating space beside the replacement, so
+            // its start is taken from the position the splice reports, not from
+            // the old offset plus a length.
             let after = self.document.replace_pending_with_text(index, text);
-            self.cursor = snap_grapheme_boundary(self.text(), if follows { after } else { before });
+            // `after` is the end of the replacement (already shifted by any
+            // separating space the repair added); the tail follows it.
+            let caret = if follows {
+                ByteOffset::new(after.get() + tail)
+            } else {
+                before
+            };
+            self.cursor = snap_grapheme_boundary(self.text(), caret);
             self.goal_column = None;
             return ReservationPaste::Visible;
         }
@@ -1853,6 +1863,27 @@ mod tests {
                 vec!["one".into(), "two".into()]
             )
         );
+    }
+
+    /// Text typed after the label while the read ran stays behind the caret
+    /// when the fallback replaces it: the caret keeps its distance past the
+    /// label instead of jumping to the end of the replacement.
+    #[test]
+    fn a_text_fallback_keeps_the_caret_past_the_text_typed_meanwhile() {
+        let mut composer = Composer::new();
+        let token = composer.reserve_image();
+        composer.insert_text("ab");
+        assert_eq!(composer.text(), "[Image #1]ab");
+        assert_eq!(composer.cursor(), ByteOffset::new(12));
+
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "bad.png"),
+            ReservationPaste::Visible
+        );
+        assert_eq!(composer.text(), "bad.pngab");
+        assert_eq!(composer.cursor(), ByteOffset::new(9));
+        composer.insert_char('c');
+        assert_eq!(composer.text(), "bad.pngabc");
     }
 
     /// A fallback can start with a combining mark: it would glue itself to the
