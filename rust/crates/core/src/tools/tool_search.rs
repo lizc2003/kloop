@@ -403,12 +403,15 @@ fn keyword_score(def: &ToolDef, terms: &[SearchTerm]) -> Option<u32> {
             .any(|token| token.contains(term.value.as_str()));
         let description_hit = description.contains(term.value.as_str());
         let schema_hit = schema.contains(term.value.as_str());
-        if term.required && !(name_substring || description_hit || schema_hit) {
+        // The same name test the scorer uses, so a required term cannot filter
+        // out a tool that would otherwise have scored on its name.
+        let name_hit = name_substring || name.contains(term.value.as_str());
+        if term.required && !(name_hit || description_hit || schema_hit) {
             return None;
         }
         score += if name_exact {
             10
-        } else if name_substring || name.contains(term.value.as_str()) {
+        } else if name_hit {
             5
         } else if description_hit {
             2
@@ -1204,6 +1207,24 @@ mod tests {
         );
         assert!(out.contains("no deferred tool named 'nope'"), "{out}");
         assert_eq!(unlocked(&ctx.cfg), Vec::<String>::new());
+    }
+
+    /// A required term is a filter, so it has to accept everything the scorer
+    /// accepts. `b_s` matches `srv__web_search` only across the separator: no
+    /// space-split token contains it, which the required gate used to miss.
+    #[tokio::test]
+    async fn a_required_term_matches_across_the_name_separator() {
+        let ctx = deferred_ctx("keyword-required-separator");
+        let (out, is_error) = run_tool(
+            "tool_search",
+            json!({"query": "+b_s", "max_results": 5}),
+            &ctx,
+        )
+        .await;
+        assert!(!is_error, "{out}");
+        assert!(out.contains("## srv__web_search"), "{out}");
+        assert!(!out.contains("## srv__page_fetch"), "{out}");
+        assert_eq!(unlocked(&ctx.cfg), vec!["srv__web_search"]);
     }
 
     #[tokio::test]
