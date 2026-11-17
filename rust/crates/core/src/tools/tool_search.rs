@@ -135,9 +135,27 @@ pub(super) fn tool_search_def() -> ToolDef {
     }
 }
 
+/// The one parser for a `call_tool` envelope, shared by dispatch's unwrap step,
+/// the executed-error path and the contract test. Unknown envelope keys are
+/// refused here rather than silently dropped before the inner call runs.
+pub(super) fn parse_call_tool(input: &Value) -> Result<(String, Value)> {
+    super::contract::strict(input, "call_tool")?;
+    let Some(tool_name) = input["tool_name"].as_str() else {
+        bail!(
+            "call_tool: missing required string argument 'tool_name' \
+             (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
+        );
+    };
+    let params = match &input["params"] {
+        Value::Null => json!({}),
+        params => params.clone(),
+    };
+    Ok((tool_name.to_string(), params))
+}
+
 #[cfg(test)]
 pub(super) fn contract_parse(input: &Value) -> Result<()> {
-    super::contract::strict(input, "call_tool").map(|_| ())
+    parse_call_tool(input).map(|_| ())
 }
 
 /// Escape hatch for models that refuse to emit tool calls for names absent
@@ -163,21 +181,17 @@ pub(super) fn call_tool_def() -> ToolDef {
 
 /// Rewrite a `call_tool` envelope into the inner call it wraps; every other
 /// call passes through untouched. Runs at the top of dispatch, before
-/// concurrency batching. A malformed envelope (missing tool_name) is left
-/// as-is so the call_tool arm of execute_tool can report usage.
+/// concurrency batching. A malformed envelope is left as-is so the call_tool
+/// arm of execute_tool can report the shared parser's error.
 pub(super) fn unwrap_call_tool(name: String, input: Value) -> (String, Value) {
     if name != "call_tool" {
         return (name, input);
     }
-    match input["tool_name"].as_str() {
-        Some(inner) => {
-            let params = match &input["params"] {
-                Value::Null => json!({}),
-                params => params.clone(),
-            };
-            (inner.to_string(), params)
-        }
-        None => (name, input),
+    match parse_call_tool(&input) {
+        Ok(unwrapped) => unwrapped,
+        // Leave the envelope for the call_tool arm, which reports the same
+        // parser's error instead of dispatching a half-understood call.
+        Err(_) => (name, input),
     }
 }
 
@@ -1992,6 +2006,21 @@ mod tests {
             out.contains("missing required string argument 'tool_name'"),
             "{out}"
         );
+    }
+
+    /// An envelope field the schema does not declare is refused before the
+    /// inner call runs; it used to be dropped silently by the unwrap step.
+    #[tokio::test]
+    async fn call_tool_rejects_an_unknown_envelope_field() {
+        let ctx = deferred_ctx("call-tool-unknown");
+        let (out, is_error) = run_tool(
+            "call_tool",
+            json!({"tool_name": "list_agents", "params": {}, "__unknown__": true}),
+            &ctx,
+        )
+        .await;
+        assert!(is_error, "{out}");
+        assert!(out.contains("unknown field `__unknown__`"), "{out}");
     }
 
     /// Unwrapping happens before concurrency classification: a call_tool

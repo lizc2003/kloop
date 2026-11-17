@@ -111,8 +111,11 @@
 - 一致性测试原先只比较 schema 与另一份手写表，删掉 `RunAgentInput.model` 仍会通过；
   改为 `contract.rs` 供手写解析器与测试共用键表，并对 serde 工具逐键调用真实解析器，
   再用未知字段确认拒绝。
+- `call_tool` 的契约探测原先只在测试里调 `contract::strict`，运行时
+  `unwrap_call_tool` 走另一条路径并丢弃未知封套字段；现在
+  `parse_call_tool` 同时供 unwrap、dispatch 错误路径和测试使用，未知字段在展开前拒绝。
 
-**验证**：`cargo test -p kloop-core --lib` 1451 通过、1 ignored（含新增
+**验证**：`cargo test -p kloop-core --lib` 1452 通过、1 ignored（含新增
 schema/parser 一致性与真实解析器探测、`args` null/限长、structured 严格输入、完整联合
 类型）；`cargo clippy -p kloop-core --all-targets -- -D warnings`；
 `cargo fmt --all -- --check`；`cargo check --workspace`。未跑 `make check`、外部

@@ -18,12 +18,14 @@ serde，四条重复的注册→spawn→supervisor→worktree 收尾抽成 `run_
 `ChildTurn` 与结果映射。`send_message` 直接调 mailbox 的 `validate_payload`，
 `is_unicode_line_separator` 只留一份；`AgentOptions` 从 `run_agent` schema 生成，`ts_type`
 对联合类型生成完整联合。模型可见错误措辞有变化（未知字段统一为 `unknown field`，powershell 去掉 foreground-only 解释，
-send_message 去前缀等），plan 58/56/53 的 parity 断言已同步。验证：kloop-core lib 1451 通过、
+send_message 去前缀等），plan 58/56/53 的 parity 断言已同步。验证：kloop-core lib 1452 通过、
 1 ignored，clippy(core all-targets `-D warnings`)、fmt、`cargo check --workspace`；未跑全量
-`make check`、外部 parity 语料、真实 API。提交后复审修两条：`ts_type` 不再把
+`make check`、外部 parity 语料、真实 API。提交后复审修三条：`ts_type` 不再把
 `["string","number"]` 收窄成 `string`、nullable 字段保留 `| null`；一致性测试不再只比对
 另一份手写表，改为共用键表并逐键探测真实解析器（serde 工具直接调用其
-`deny_unknown_fields` 解析）。教训 405、406、407。
+`deny_unknown_fields` 解析）；`call_tool` 的封套解析抽成 `parse_call_tool`，由 unwrap、
+dispatch 错误路径和契约测试共用，未知封套字段不再被静默丢弃。验证更新为 1452 通过。
+教训 405、406、407、408。
 
 **Plan 265 ✅：同步/异步边界的约定（2026-11-17）**：三条全部成立，但两处措辞要修。后台 bash 的
 `create_dir_all`/`create_file` 本来就在锁外，持锁的只有 `process_tree::spawn`；选「锁外 spawn、
@@ -5368,3 +5370,10 @@ schema 键与测试里的一张表比对，删掉 `RunAgentInput.model` 后测�
 `["string","number"]` 被宣布成 `string`，必填 nullable 字段也丢掉 `null`——模型会照着
 错误的 Program API 写代码。正确做法是保留完整联合（含 `null`），只对无法准确映射的类型
 关键字整体退化成 `unknown`；`?` 只表达“可省略”，不表达“可为 null”，两者不能互相吞掉。
+
+408. **兼容封套的“契约测试”必须调用运行时展开用的那个解析入口。** plan 267 复审第三轮：
+`call_tool` 的探测函数在测试里调 `contract::strict`，运行时却走 `unwrap_call_tool` 的
+手工分支；测试声称未知字段会被拒绝，运行时其实把它丢掉后照常执行内层工具。判据：封套、
+wrapper、synonym 这类“先变形再分发”的入口，校验和变形必须是同一个函数；测试调用另一个
+近似函数，只会测到一个运行时不存在的契约。修法是让 `parse_call_tool` 同时供
+`unwrap_call_tool`、dispatch 错误路径和测试使用。

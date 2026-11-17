@@ -2080,10 +2080,14 @@ fn execute_tool<'a>(
             Builtin::Skill => skill::skill_tool(input, ctx, workspace).await,
             Builtin::ToolSearch => tool_search::tool_search_tool(input, ctx, workspace).await,
             // Only malformed envelopes reach this arm — well-formed ones were
-            // rewritten to the inner call at dispatch entry.
-            Builtin::CallTool => Err(anyhow!(
-                "call_tool: missing required string argument 'tool_name' (usage: {{\"tool_name\": \"<name>\", \"params\": {{...}}}})"
-            )),
+            // rewritten to the inner call at dispatch entry. Re-run the shared
+            // envelope parser so the error is exactly the one unwrapping saw.
+            Builtin::CallTool => match tool_search::parse_call_tool(input) {
+                Ok(_) => Err(anyhow!(
+                    "call_tool: envelope reached execution without being unwrapped"
+                )),
+                Err(error) => Err(error),
+            },
             Builtin::RunAgent => subagent::run_agent_tool(input, ctx, workspace).await,
             Builtin::SendMessage => {
                 let result = agent_message::send_message_tool(input, ctx);
