@@ -11,6 +11,11 @@ const DEFAULT_MAX_OBSERVATIONS: usize = 1024;
 const DEFAULT_MAX_MEMORY_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_RANGES: usize = 32;
 const ENTRY_OVERHEAD_BYTES: usize = 256;
+/// A path whose metadata moved is hashed only up to this size. Past it the path
+/// is called rewritten without being read: a read that grew to gigabytes (a
+/// log, a build product) is not worth hashing at every round boundary, and the
+/// reminder's point is "read it again", not proof that the bytes differ.
+pub(crate) const CHANGED_READS_MAX_HASH_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Session-local knowledge established by model-visible file reads. This state
 /// is deliberately absent from rollout persistence: resumed sessions, child
@@ -328,12 +333,15 @@ impl FileState {
     /// Content is the whole criterion, through the same
     /// [`FileVersion::same_content`] `edit_file`'s note uses, so a `touch` or a
     /// `chmod` stays silent here exactly as it does there. A stat per path is
-    /// the common cost; the file is hashed only when its metadata moved, and a
-    /// path already named is not even stat'ed until a read or write re-arms it.
+    /// the common cost; the file is hashed only when its metadata moved, a path
+    /// already named is not even stat'ed until a read or write re-arms it, and a
+    /// file past [`CHANGED_READS_MAX_HASH_BYTES`] is called rewritten without
+    /// being read.
     ///
-    /// The IO runs outside the lock. A path whose observation was replaced in
-    /// the meantime is left alone — the replacement is the newer impression and
-    /// was never checked.
+    /// Blocking: stats and hashes run here, so an async caller owes us
+    /// `spawn_blocking` (plan 265). The IO runs outside the lock. A path whose
+    /// observation was replaced in the meantime is left alone — the replacement
+    /// is the newer impression and was never checked.
     pub(crate) fn changed_since_read(&self) -> Vec<ChangedRead> {
         let candidates: Vec<(PathBuf, FileObservation, DiskCheck)> = self
             .inner
@@ -447,12 +455,51 @@ fn check_disk(
     if unmoved {
         return None;
     }
-    let mut file = std::fs::File::open(path).ok()?;
+    // A path that stopped being a regular file — deleted and remade as a FIFO,
+    // a socket, a directory — holds none of the bytes that were read, and must
+    // not be opened here: a FIFO open would wait for a writer forever.
+    if !metadata.is_file() {
+        return Some((DiskCheck::Named, Some(ReadDrift::Rewritten)));
+    }
+    if metadata.len() > CHANGED_READS_MAX_HASH_BYTES {
+        return Some((DiskCheck::Named, Some(ReadDrift::Rewritten)));
+    }
+    let mut file = open_regular_read(path).ok()?;
     let current = crate::file_io::fingerprint_file(&mut file).ok()?.version;
     Some(match observation.version.same_content(&current) {
         true => (DiskCheck::SameContent(current), None),
         false => (DiskCheck::Named, Some(ReadDrift::Rewritten)),
     })
+}
+
+/// Open a path for the boundary hash without letting the open itself wait.
+///
+/// The metadata check above can be raced by a replacement; `NONBLOCK` is what
+/// keeps that race from turning into a hung turn when the replacement is a
+/// FIFO. The handle is then re-checked for regular-file shape, because the
+/// descriptor is what the read below will actually use.
+fn open_regular_read(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+        std::fs::File::from(fd)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 impl FileObservation {
@@ -803,6 +850,78 @@ mod tests {
         });
 
         assert!(!state.observation(&path).unwrap().is_complete());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_path_replaced_by_a_fifo_is_named_without_being_opened() {
+        let (path, metadata) = temp_file("fifo", b"alpha\n");
+        let state = Arc::new(FileState::default());
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: FileObservation::from_read(b"alpha\n", &metadata, 1, 0..1, false),
+        });
+        std::fs::remove_file(&path).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // A blocking open on the FIFO would never return here; the timeout is
+        // the assertion that the boundary check does not wait for a writer.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _ = sender.send(state.changed_since_read());
+            })
+        };
+        let changed = receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a FIFO at a read path must not block the boundary check");
+        worker.join().unwrap();
+        assert_eq!(
+            changed,
+            vec![ChangedRead {
+                path: path.clone(),
+                drift: ReadDrift::Rewritten,
+            }]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_file_past_the_hash_budget_is_named_without_reading_it() {
+        let (path, metadata) = temp_file("huge", b"alpha\n");
+        let state = FileState::default();
+        state.apply(FileStateUpdate::Observe {
+            path: path.clone(),
+            observation: FileObservation::from_read(b"alpha\n", &metadata, 1, 0..1, false),
+        });
+        // Sparse: the size alone is what crosses the budget.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(CHANGED_READS_MAX_HASH_BYTES + 1)
+            .unwrap();
+        // Unreadable once it is big: an implementation that opens and hashes
+        // anyway finds nothing to name, while the budget path never opens it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        assert_eq!(
+            state.changed_since_read(),
+            vec![ChangedRead {
+                path: path.clone(),
+                drift: ReadDrift::Rewritten,
+            }]
+        );
         let _ = std::fs::remove_file(path);
     }
 

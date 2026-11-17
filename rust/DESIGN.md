@@ -242,6 +242,35 @@ with the complete message. Public `thread/read` and event snapshots remove the
 private provenance, signatures, encrypted content, and redacted blobs; only the
 same display reasoning text already emitted by live `reasoning` items remains.
 
+## Blocking IO and the async runtime (plan 265)
+
+Core's filesystem and git helpers are synchronous functions. Async callers
+reach them through `tokio::task::spawn_blocking` (or a thin wrapper such as
+`tools::changed_reads_reminder_async`), never by calling `std::fs::*` or
+`std::process::Command` directly inside an async fn. A runtime worker is shared
+with every other future on its thread, so one slow stat, hash, or child process
+there is a stalled approval or `turn/interrupt` elsewhere. The same rule governs
+locks: no IO and no process spawn while a std `Mutex` is held. A process is
+created first and the lock only publishes it; losing the shutdown race reaps the
+child instead of leaving it untracked (background bash). Async locks are for
+awaiting a turn, not for covering filesystem work.
+
+A round boundary's changed-read check is the concrete case that set the rule: it
+stats every re-armable read path and hashes the ones whose metadata moved, so it
+runs on the blocking pool. Its open is non-blocking and its handle is re-checked
+for regular-file shape — a read path replaced by a FIFO must not park a worker —
+and a file past 16 MiB is called rewritten without being read. Thread creation
+follows the same split in the server: the per-thread Config build (project
+context, sandbox, skills, git probes) runs on the blocking pool, the read loop
+receives the finished handle, registers the thread, and answers the request. The
+read loop `select!`s between the next frame and such a build; the frame reader
+keeps its partial frame on the reader so losing that race cannot drop bytes.
+
+`make async-io` lists `std::fs::` / `std::process::Command` calls inside async
+fn bodies. It is a manual review aid, not part of `make check`: calls under
+`spawn_blocking`, tests, and lines marked `// async-io-ok: <why>` are skipped,
+and every remaining hit is a question for the reviewer.
+
 ## One door onto the code engine
 
 The QuickJS engine (`kloop-codemode`) has two possible model-facing doors:
@@ -2256,7 +2285,12 @@ deadlock a turn or its cancellation. Read-only methods that may touch whole
 transcripts (`thread/list`, `thread/read`, `config/read`, `skills/list`) run on
 the blocking pool, so a large page or a dormant-session replay cannot hold up
 approvals or `turn/interrupt`; JSON-RPC responses may therefore arrive out of
-order, and clients match them by id. After a non-model operation (`/provider`,
+order, and clients match them by id. Thread creation (`thread/start`,
+`thread/resume`, `thread/fork`) uses the same pool for its per-thread Config
+build: the read loop starts the build, keeps reading, and registers the thread
+and answers the request when the finished handle comes back — so a slow context
+gather, sandbox, or skills scan on one thread cannot delay another thread's
+interrupt. After a non-model operation (`/provider`,
 `thread/provider/switch`, a slash command) releases the thread's single-flight
 gate, the worker re-announces a non-empty inbox: a steer or scheduled delivery
 that arrived while `running` was already set would otherwise sit there until an

@@ -5,6 +5,20 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 265 ✅：同步/异步边界的约定（2026-11-17）**：三条全部成立，但两处措辞要修。后台 bash 的
+`create_dir_all`/`create_file` 本来就在锁外，持锁的只有 `process_tree::spawn`；选「锁外 spawn、
+加锁复查 closed」，closed 时先放锁再 terminate 新树——整段挪进 `spawn_blocking` 仍会把注册表序列化。
+serve 的线程方法其实是同步方法、单线程读循环顺序调用，不是 async 方法；只把工厂包进
+`spawn_blocking` 再原地 await 仍然不读下一行，所以改成「build 提交给阻塞池，完成的 handle 经
+channel 回读循环注册并发响应」，读循环 `select!` 下一帧与 build，`FrameReader` 把半帧留在 reader
+上保持取消安全，`pending_threads` 挡重复 resume。回合边界的已读检查整段进 `spawn_blocking`；
+`check_disk` 先拒非普通文件，unix open 带 `O_NONBLOCK` 并在句柄上复查 `is_file`，超过 16 MiB
+直接按 `Rewritten`。约定写进 DESIGN（新节 + Transport 一节扩到线程创建），
+`scripts/check-async-io.py` / `make async-io` 做手动审查（跳过 `spawn_blocking`、测试和
+`async-io-ok` 注释），不进 `check`。验证：core lib 1443 通过、1 ignored；server 契约 51 通过、
+2 ignored；clippy(core/server all-targets)、fmt、`make async-io`；未跑全量 `make check`、parity。
+遗留：resume/fork 读整份 transcript 仍在读循环上。教训 403。
+
 **Plan 264 ✅：每轮与每次工具调用的重复计算（2026-11-17）**：六条复核全部成立。请求视图交给采样层
 所有权，合成首条消息用 `insert(0, ..)` 移动，不再为插一条消息深拷贝整段历史；`Turn` 在回合边界
 构建一次 injected context，预测估算、溢出上限、请求与每轮 Usage 都读这一份。工具侧改成按名字
@@ -1797,7 +1811,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **262** ✅ TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
 | **263** ✅ TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
 | **264** 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
-| **265** 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
+| **265** ✅ 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
 | **266** ✅ 权限判定一次产出 | `Verdict` 贯穿到执行;同一命令解析 5–7 次;两套 glob 语义;tree 选项两份 | 大 | 243、244、245 |
 | **267** 工具契约单一来源 | schema/解析/TS 声明三处分头演化;参数 helper 四份分叉;两个 `call_agent` bridge | 大 | 257 |
 | **268** 后台执行 registry 统一 | 三套关闭流程、三份轮询、supervisor 样板;Windows 进程创建 80 行重复 | 中 | 255、257 |
@@ -5294,3 +5308,12 @@ Enter 提交，图片就落到下一条消息；读取失败退回的文本同�
 `thread_local! + Cell`，`#[tokio::test]` 默认的 current-thread runtime 会整轮跑在测试线程上。
 判据：计数断言只有在计数器的生命周期与被测单元重合时才有意义——共享全局计数器会随测试并行度
 漂移，看似“优化失效”，实际是测错了范围。
+
+403. **“把阻塞调用挪走”要先确认挡的是谁，再决定把它挪到哪。** plan 265 的 serve 条目写着“async
+方法里同步执行工厂”，实际方法早已是同步方法、由单线程读循环顺序调用：只在工厂外包一层
+`spawn_blocking` 再原地 await，runtime worker 是放开了，读循环仍然停在原地读不到下一行，
+`turn/interrupt` 照样迟到。真正的修法是把“完成”送回循环（阻塞池 → channel → `select!`），
+并且让读循环的读取在 `select!` 里保持取消安全——半帧必须存在 reader 上，不能放在会被丢弃的
+future 局部变量里。判据：阻塞开销落在哪个执行体上，就要看那个执行体是不是唯一负责接新请求的
+循环；是的话，“挪到别的线程”不解决问题，“把结果异步送回循环”才解决。同理，退出锁之前先想
+清楚锁保护的是哪一段：后台 bash 的目录创建本来就在锁外，真正该缩短的是 spawn 本身。

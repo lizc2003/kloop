@@ -26,9 +26,13 @@ use kloop_core::session_store::SessionDirs;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::clip_chars;
 
+use crate::ConfigFactory;
+use crate::PendingInteractions;
 use crate::RequestId;
 use crate::Server;
+use crate::ThreadBuild;
 use crate::ThreadHandle;
+use crate::ThreadReply;
 use crate::ThreadStartOptions;
 use crate::ThreadWorkerState;
 use crate::events;
@@ -43,11 +47,14 @@ use crate::params::public_route_from_record;
 use crate::params::resume_options;
 use crate::params::runtime_from_options;
 use crate::params::str_param;
-use crate::params::thread_runtime_json;
 use crate::thread_ui::ThreadUi;
 use crate::wire;
 use crate::wire::Outgoing;
 use crate::worker::thread_worker;
+
+/// `Ok(None)` means the thread's config build moved to the blocking pool; the
+/// read loop answers when it lands (see [`crate::ThreadBuild`]).
+pub(crate) type DeferredResult = std::result::Result<Option<Value>, (i64, String)>;
 
 impl Server {
     /// Locate a thread's transcript and the partition holding it. A thread
@@ -61,7 +68,7 @@ impl Server {
         locate_thread_in(thread_id, &self.default_dirs, &self.paths.store)
     }
 
-    pub(crate) fn thread_start(&mut self, params: &Value) -> MethodResult {
+    pub(crate) fn thread_start(&mut self, request_id: RequestId, params: &Value) -> DeferredResult {
         let options = parse_thread_start_options(params, &self.default_cwd)?;
         let dirs = self.paths.store.ensure(&options.cwd).map_err(|e| {
             (
@@ -98,26 +105,24 @@ impl Server {
         // returning, so the writer removes its own empty file. No second
         // unlink here (see the claim comment above).
         self.spawn_thread(
-            thread_id.clone(),
+            request_id,
+            thread_id,
             history,
             options,
             RecoverySource::Fresh,
             seed,
-        )?;
-        let route = self
-            .threads
-            .get(&thread_id)
-            .expect("spawned thread is registered")
-            .active_route
-            .lock()
-            .unwrap()
-            .clone();
-        Ok(json!({"thread": {"id": thread_id, "route": route}}))
+            ThreadReply::Started,
+        );
+        Ok(None)
     }
 
-    pub(crate) fn thread_resume(&mut self, params: &Value) -> MethodResult {
+    pub(crate) fn thread_resume(
+        &mut self,
+        request_id: RequestId,
+        params: &Value,
+    ) -> DeferredResult {
         let thread_id = str_param(params, "thread_id")?;
-        if self.threads.contains_key(thread_id) {
+        if self.threads.contains_key(thread_id) || self.pending_threads.contains(thread_id) {
             return Err((
                 wire::SERVER_ERROR,
                 format!("thread '{thread_id}' is already active"),
@@ -134,24 +139,17 @@ impl Server {
         let seed = resumed.snapshot.clone();
         let history = History::resume(dirs.offload.clone(), resumed);
         self.spawn_thread(
+            request_id,
             thread_id.to_string(),
             history,
-            options.clone(),
+            options,
             RecoverySource::Resumed,
             seed,
-        )?;
-        let route = self
-            .threads
-            .get(thread_id)
-            .expect("spawned thread is registered")
-            .active_route
-            .lock()
-            .unwrap()
-            .clone();
-        Ok(json!({
-            "thread": thread_runtime_json(thread_id, &options, &route),
-            "message_count": count,
-        }))
+            ThreadReply::Live {
+                message_count: count,
+            },
+        );
+        Ok(None)
     }
 
     /// Fork a session at a cut point into a fresh thread, then spawn it live
@@ -159,7 +157,7 @@ impl Server {
     /// `cut` is optional — omit it to fork at the end. A dormant source is
     /// read directly from disk; an active source is rejected so its in-flight
     /// turn cannot be copied before the terminal record makes the prefix complete.
-    pub(crate) fn thread_fork(&mut self, params: &Value) -> MethodResult {
+    pub(crate) fn thread_fork(&mut self, request_id: RequestId, params: &Value) -> DeferredResult {
         let src_id = str_param(params, "thread_id")?;
         if self
             .threads
@@ -202,25 +200,18 @@ impl Server {
         let seed = resumed.snapshot.clone();
         let history = History::resume(dirs.offload.clone(), resumed);
         self.spawn_thread(
-            new_id.clone(),
+            request_id,
+            new_id,
             history,
-            options.clone(),
+            options,
             RecoverySource::Resumed,
             seed,
-        )?;
+            ThreadReply::Live {
+                message_count: count,
+            },
+        );
         fork_guard.disarm();
-        let route = self
-            .threads
-            .get(&new_id)
-            .expect("spawned fork is registered")
-            .active_route
-            .lock()
-            .unwrap()
-            .clone();
-        Ok(json!({
-            "thread": thread_runtime_json(&new_id, &options, &route),
-            "message_count": count,
-        }))
+        Ok(None)
     }
 
     /// `thread/list` is a disk read that can touch hundreds of transcripts, so
@@ -295,14 +286,82 @@ impl Server {
         })
     }
 
+    /// Move one thread's config build to the blocking pool (plan 265), then
+    /// return to the read loop immediately. The finished handle comes back
+    /// through `builds`; `Server::finish_thread_build` registers it and answers
+    /// the request.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_thread(
         &mut self,
+        request_id: RequestId,
         thread_id: String,
-        mut history: History,
+        history: History,
         options: ThreadStartOptions,
         recovery_source: RecoverySource,
-        mut seed: SessionSnapshot,
-    ) -> Result<(), (i64, String)> {
+        seed: SessionSnapshot,
+        reply: ThreadReply,
+    ) {
+        let build = PendingThreadBuild {
+            thread_id: thread_id.clone(),
+            options: options.clone(),
+            recovery_source,
+            seed,
+            history,
+            factory: Arc::clone(&self.factory),
+            catalog: Arc::clone(&self.provider_catalog),
+            out: self.out.clone(),
+            pending: self.pending.clone(),
+            reverse_request_seq: self.reverse_request_seq.clone(),
+            client_questions: self.client_questions,
+        };
+        let builds = self.builds.clone();
+        self.pending_threads.insert(thread_id.clone());
+        tokio::task::spawn_blocking(move || {
+            let outcome = build.build();
+            let _ = builds.send(ThreadBuild {
+                request_id,
+                thread_id,
+                options,
+                reply,
+                outcome,
+            });
+        });
+    }
+}
+
+/// Everything one thread needs before it can exist, moved wholesale to the
+/// blocking pool. A whole Config build — project context, sandbox, skills, git
+/// probes — is synchronous filesystem work, and keeping it off the read loop is
+/// what lets another thread's `turn/interrupt` still be answered (plan 265).
+struct PendingThreadBuild {
+    thread_id: String,
+    options: ThreadStartOptions,
+    recovery_source: RecoverySource,
+    seed: SessionSnapshot,
+    history: History,
+    factory: ConfigFactory,
+    catalog: Arc<ProviderCatalog>,
+    out: mpsc::UnboundedSender<Vec<u8>>,
+    pending: PendingInteractions,
+    reverse_request_seq: Arc<AtomicU64>,
+    client_questions: bool,
+}
+
+impl PendingThreadBuild {
+    fn build(self) -> Result<ThreadHandle, (i64, String)> {
+        let PendingThreadBuild {
+            thread_id,
+            options,
+            recovery_source,
+            mut seed,
+            mut history,
+            factory,
+            catalog,
+            out,
+            pending,
+            reverse_request_seq,
+            client_questions,
+        } = self;
         let projection = Arc::new(
             ThreadProjection::new(
                 thread_id.clone(),
@@ -335,19 +394,18 @@ impl Server {
         let turn = Arc::new(Mutex::new(None));
         let ui = Arc::new(ThreadUi {
             thread_id: thread_id.clone(),
-            out: self.out.clone(),
-            pending: self.pending.clone(),
-            reverse_request_seq: self.reverse_request_seq.clone(),
+            out: out.clone(),
+            pending: pending.clone(),
+            reverse_request_seq: reverse_request_seq.clone(),
             turn: turn.clone(),
             projection: projection.clone(),
         });
-        let questioner: Option<Arc<dyn Questioner>> = self
-            .client_questions
-            .then(|| ui.clone() as Arc<dyn Questioner>);
+        let questioner: Option<Arc<dyn Questioner>> =
+            client_questions.then(|| ui.clone() as Arc<dyn Questioner>);
         let note_ui = ui.clone();
-        let mut cfg = (self.factory)(
+        let mut cfg = (factory)(
             options,
-            Arc::clone(&self.provider_catalog),
+            Arc::clone(&catalog),
             ui.clone(),
             questioner,
             Arc::new(move |s: &str| note_ui.emit(&Event::Note(s.to_string()))),
@@ -409,23 +467,21 @@ impl Server {
             active_route: active_route.clone(),
             provider_state: provider_state.clone(),
         };
+        // A blocking-pool thread still carries the runtime context, so the
+        // worker is spawned here and the handle is what travels back.
         tokio::spawn(thread_worker(cfg, history, ui, turn_rx, worker_state));
-        self.threads.insert(
-            thread_id,
-            ThreadHandle {
-                turn_tx,
-                running,
-                current_cancel,
-                inbox,
-                turn_seq,
-                turn,
-                cwd: handle_cwd,
-                active_route,
-                provider_state,
-                projection,
-            },
-        );
-        Ok(())
+        Ok(ThreadHandle {
+            turn_tx,
+            running,
+            current_cancel,
+            inbox,
+            turn_seq,
+            turn,
+            cwd: handle_cwd,
+            active_route,
+            provider_state,
+            projection,
+        })
     }
 }
 

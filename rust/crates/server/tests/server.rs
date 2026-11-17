@@ -307,6 +307,18 @@ fn factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> Co
     })
 }
 
+/// [`factory`] with a real delay in front: what the CLI's factory does
+/// (project context, sandbox, skills, git probes) is synchronous filesystem
+/// work worth hundreds of milliseconds in a slow workspace, and a test needs
+/// to know the read loop keeps working while it happens.
+fn slow_factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) -> ConfigFactory {
+    let inner = factory(turns, offload, gated);
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        std::thread::sleep(Duration::from_millis(400));
+        inner(options, catalog, approver, questioner, notify)
+    })
+}
+
 /// The shell a hook test can rely on, matching the core hook tests: native
 /// Windows resolves its validated Git for Windows Bash (with forward-slash
 /// paths in the script), other platforms use `sh -c`.
@@ -4211,6 +4223,57 @@ async fn thread_list_does_not_block_turn_interrupt() {
     assert!(
         interrupt_at < list_at,
         "the list answered before the interrupt: {messages:?}"
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A thread's config build runs on the blocking pool (plan 265): while it is in
+/// flight, the read loop still answers another thread's `turn/interrupt` — the
+/// build did not park the loop, and the response arrives after the interrupt's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_start_does_not_block_turn_interrupt() {
+    let dirs = test_dirs("start-blocking");
+    let target = dirs.root.join("start-blocking.txt");
+    let script = vec![vec![tool_use(
+        "t1",
+        "write_file",
+        json!({"path": target.to_str().unwrap(), "content": "x"}),
+    )]];
+    let mut client = start_server(slow_factory(script, dirs.offload.clone(), true), &dirs);
+    let thread_id = client.init_and_start().await;
+
+    // A running turn parked at its approval gate, so `turn/interrupt` has
+    // something to answer.
+    client
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "write it"}),
+        )
+        .await;
+    client
+        .recv_until(|m| m["method"] == "approval/request")
+        .await;
+
+    // The factory sleeps 400ms. The interrupt is sent right behind the start;
+    // an implementation that builds the config on the read loop answers the
+    // start first and only then reads the interrupt.
+    let start_id = client.request("thread/start", json!({})).await;
+    let interrupt_id = client
+        .request("turn/interrupt", json!({"thread_id": thread_id}))
+        .await;
+    let messages = client.recv_until(|m| m["id"] == start_id).await;
+    let interrupt_at = messages
+        .iter()
+        .position(|m| m["id"] == interrupt_id)
+        .unwrap_or_else(|| {
+            panic!("turn/interrupt was not answered until the thread was built: {messages:?}")
+        });
+    let start_at = messages.iter().position(|m| m["id"] == start_id).unwrap();
+    assert!(
+        interrupt_at < start_at,
+        "the thread build answered before the interrupt: {messages:?}"
     );
 
     client.shutdown().await;

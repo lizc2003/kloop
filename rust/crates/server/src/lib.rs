@@ -44,6 +44,7 @@ pub use wire::turn_completed_params;
 pub use wire::turn_started_params;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -103,6 +104,8 @@ where
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_loop(output, out_rx));
 
+    // async-io-ok: one canonicalize at startup, before the read loop or any
+    // thread exists; there is no other work on this runtime to starve.
     let default_cwd =
         std::fs::canonicalize(std::env::current_dir().context("cannot determine server cwd")?)
             .context("cannot canonicalize server cwd")?;
@@ -110,9 +113,12 @@ where
         .store
         .ensure(&default_cwd)
         .context("cannot create the session directory")?;
+    let (builds_tx, mut builds_rx) = mpsc::unbounded_channel::<ThreadBuild>();
     let mut server = Server {
         out: out_tx,
         threads: HashMap::new(),
+        builds: builds_tx,
+        pending_threads: HashSet::new(),
         pending: Arc::new(Mutex::new(HashMap::new())),
         reverse_request_seq: Arc::new(AtomicU64::new(1)),
         factory,
@@ -126,10 +132,19 @@ where
         initialized: false,
         client_questions: false,
     };
-    let mut reader = BufReader::new(input);
+    let mut frames = FrameReader::new(BufReader::new(input));
     let mut read_error = None;
     loop {
-        let line = match read_bounded_line(&mut reader, MAX_INPUT_LINE_BYTES).await {
+        // A thread config build that finishes while no line is arriving still
+        // has to make it back to the loop, so the read competes with it.
+        let frame = tokio::select! {
+            frame = frames.next_frame(MAX_INPUT_LINE_BYTES) => frame,
+            Some(build) = builds_rx.recv() => {
+                server.finish_thread_build(build);
+                continue;
+            }
+        };
+        let line = match frame {
             Ok(Some(line)) => line,
             Ok(None) => break,
             // A line over the wire limit is a client error, not a reason to
@@ -186,56 +201,82 @@ where
 /// drained to its newline and answered with `PARSE_ERROR`, not deserialized.
 const MAX_INPUT_LINE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Read one newline-delimited frame without ever holding more than `limit`
-/// bytes. On overflow the rest of the line is consumed so the next frame is
-/// still read from a line boundary.
-async fn read_bounded_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    limit: usize,
-) -> std::io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
-    let mut oversized = false;
-    loop {
-        let (consumed, ended) = {
-            let buffer = reader.fill_buf().await?;
-            if buffer.is_empty() {
-                if oversized {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("input line exceeds the {limit}-byte wire limit"),
-                    ));
-                }
-                return if line.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(line))
-                };
-            }
-            let newline = buffer.iter().position(|byte| *byte == b'\n');
-            let take = newline.unwrap_or(buffer.len());
-            if !oversized {
-                if line.len().saturating_add(take) > limit {
-                    oversized = true;
-                } else {
-                    line.extend_from_slice(&buffer[..take]);
-                }
-            }
-            (take + usize::from(newline.is_some()), newline.is_some())
-        };
-        reader.consume(consumed);
-        if ended {
-            if oversized {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("input line exceeds the {limit}-byte wire limit"),
-                ));
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            return Ok(Some(line));
+/// Read newline-delimited frames without ever holding more than `limit` bytes.
+/// On overflow the rest of the line is consumed so the next frame is still read
+/// from a line boundary.
+///
+/// The partial frame lives on `self`, not in the future, which is what makes
+/// [`Self::next_frame`] cancel-safe: the read loop `select!`s between the next
+/// frame and a deferred thread build, and dropping a `next_frame` future must
+/// not lose bytes already consumed from the buffered reader.
+struct FrameReader<R> {
+    reader: R,
+    line: Vec<u8>,
+    oversized: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> FrameReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            line: Vec::new(),
+            oversized: false,
         }
     }
+
+    async fn next_frame(&mut self, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            let (consumed, ended) = {
+                let buffer = self.reader.fill_buf().await?;
+                if buffer.is_empty() {
+                    if self.oversized {
+                        self.oversized = false;
+                        return Err(oversized_frame(limit));
+                    }
+                    return if self.line.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(trim_carriage_return(std::mem::take(&mut self.line))))
+                    };
+                }
+                let newline = buffer.iter().position(|byte| *byte == b'\n');
+                let take = newline.unwrap_or(buffer.len());
+                if !self.oversized {
+                    if self.line.len().saturating_add(take) > limit {
+                        self.oversized = true;
+                        // Nothing of an oversized frame is worth keeping; the
+                        // line is drained and only the refusal goes out.
+                        self.line.clear();
+                    } else {
+                        self.line.extend_from_slice(&buffer[..take]);
+                    }
+                }
+                (take + usize::from(newline.is_some()), newline.is_some())
+            };
+            self.reader.consume(consumed);
+            if ended {
+                if self.oversized {
+                    self.oversized = false;
+                    return Err(oversized_frame(limit));
+                }
+                return Ok(Some(trim_carriage_return(std::mem::take(&mut self.line))));
+            }
+        }
+    }
+}
+
+fn oversized_frame(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("input line exceeds the {limit}-byte wire limit"),
+    )
+}
+
+fn trim_carriage_return(mut line: Vec<u8>) -> Vec<u8> {
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    line
 }
 
 async fn write_loop<W: AsyncWrite + Unpin>(
@@ -314,6 +355,27 @@ struct ThreadHandle {
     projection: Arc<ThreadProjection>,
 }
 
+/// A thread whose config build finished on the blocking pool (plan 265). The
+/// read loop registers it and answers the request that asked for it; a build
+/// must not hold up approvals or `turn/interrupt` on other threads.
+struct ThreadBuild {
+    request_id: RequestId,
+    thread_id: String,
+    /// Kept for the resumed/forked response, which names the thread's runtime.
+    options: ThreadStartOptions,
+    reply: ThreadReply,
+    outcome: std::result::Result<ThreadHandle, (i64, String)>,
+}
+
+/// The success response shape the method would have produced synchronously.
+enum ThreadReply {
+    Started,
+    /// `thread/resume` and `thread/fork`: a live thread plus its message count.
+    Live {
+        message_count: usize,
+    },
+}
+
 enum PendingInteraction {
     Approval(oneshot::Sender<Decision>),
     Question {
@@ -338,6 +400,12 @@ impl Drop for PendingGuard {
 struct Server {
     out: mpsc::UnboundedSender<Vec<u8>>,
     threads: HashMap<String, ThreadHandle>,
+    /// Where a thread whose config is being built on the blocking pool comes
+    /// back to the read loop for registration and its response (plan 265).
+    builds: mpsc::UnboundedSender<ThreadBuild>,
+    /// Thread ids with a build in flight. `threads` cannot answer "already
+    /// active" for them yet, so a pipelined resume would otherwise build twice.
+    pending_threads: HashSet<String>,
     pending: PendingInteractions,
     reverse_request_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
@@ -387,6 +455,42 @@ impl Server {
             };
             let _ = out.send(outgoing.into_bytes());
         });
+    }
+
+    /// Register a thread whose config build just finished (plan 265) and answer
+    /// the request that asked for it. Registration precedes the response, so a
+    /// client that turns on the id it just received always finds the thread.
+    fn finish_thread_build(&mut self, build: ThreadBuild) {
+        self.pending_threads.remove(&build.thread_id);
+        match build.outcome {
+            Ok(handle) => {
+                let route = handle.active_route.lock().unwrap().clone();
+                let result = match build.reply {
+                    ThreadReply::Started => {
+                        json!({"thread": {"id": build.thread_id, "route": route}})
+                    }
+                    ThreadReply::Live { message_count } => json!({
+                        "thread": crate::params::thread_runtime_json(
+                            &build.thread_id,
+                            &build.options,
+                            &route,
+                        ),
+                        "message_count": message_count,
+                    }),
+                };
+                self.threads.insert(build.thread_id, handle);
+                self.send(Outgoing::Response {
+                    id: build.request_id,
+                    result,
+                });
+            }
+            Err((code, message)) => self.send(Outgoing::Error {
+                id: Some(build.request_id),
+                code,
+                message,
+                data: None,
+            }),
+        }
     }
 
     fn handle_line(&mut self, line: &str) {
@@ -474,11 +578,31 @@ impl Server {
             self.start_skills_list(id, &params);
             return;
         }
+        // Thread lifecycle builds a whole Config per thread; the build runs on
+        // the blocking pool (plan 265), and its response is sent from here when
+        // it lands. Nothing below the checks in these methods needs the read
+        // loop, so approvals and `turn/interrupt` keep flowing meanwhile.
+        if matches!(method, "thread/start" | "thread/resume" | "thread/fork") {
+            let result = match method {
+                "thread/start" => self.thread_start(id.clone(), &params),
+                "thread/resume" => self.thread_resume(id.clone(), &params),
+                _ => self.thread_fork(id.clone(), &params),
+            };
+            match result {
+                Ok(Some(result)) => self.send(Outgoing::Response { id, result }),
+                // The build answers later, like the read methods above.
+                Ok(None) => {}
+                Err((code, message)) => self.send(Outgoing::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                    data: None,
+                }),
+            }
+            return;
+        }
         let result = match method {
             "initialize" => self.initialize(&params),
-            "thread/start" => self.thread_start(&params),
-            "thread/resume" => self.thread_resume(&params),
-            "thread/fork" => self.thread_fork(&params),
             "thread/events/sync" => self.thread_events_sync(&params),
             "provider/catalog/read" => self.provider_catalog_read(&params),
             "mcp_server_status/list" => self.mcp_server_status_list(&params),

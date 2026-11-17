@@ -23,7 +23,7 @@ CONFIG := $(KLOOP_DIR)/config.toml
 CONFIG_DEMO := config/config-demo.toml
 
 .DEFAULT_GOAL := all
-.PHONY: all build debug test test-release seatbelt-nesting fmt fmt-check clippy clippy-release check check-release check-windows parity mock install install-config uninstall clean help
+.PHONY: all build debug test test-release seatbelt-nesting fmt fmt-check clippy clippy-release check check-release check-windows parity async-io mock install install-config uninstall clean help
 
 all: build
 
@@ -98,6 +98,12 @@ parity:
 mock:
 	cd $(RUST_DIR) && $(CARGO) run --locked -p $(BIN) -- --mock
 
+# plan 265 的手动审查:async fn 体内不应直接做 std::fs / std::process::Command
+# 的阻塞调用(应当走 spawn_blocking)。只是审查辅助,不进 check 门禁;命中时逐条
+# 判断,确实要留在原地的调用在注释里写 `async-io-ok: <原因>`。
+async-io:
+	python3 -B scripts/check-async-io.py
+
 install: build install-config
 	install -d "$(BINDIR)"
 	install -m 755 "$(RELEASE_BIN)" "$(BINDIR)/$(BIN).new"
@@ -145,6 +151,7 @@ help:
 	@echo "  check-release    fmt-check + clippy-release + test-release + parity(手动运行)"
 	@echo "  check-windows    Windows 目标 clippy -D warnings(手动运行,需 cargo-xwin + LLVM)"
 	@echo "  parity           Claude Code 语料校验(只在有语料的机器上)"
+	@echo "  async-io         async fn 体内阻塞 IO 的手动审查(plan 265,不进 check)"
 	@echo "  mock             cargo run -- --mock,无 key 冒烟"
 	@echo "  install          装到 $(BINDIR)/$(BIN);缺配置时铺一份 $(CONFIG)"
 	@echo "  uninstall        删掉 $(BINDIR)/$(BIN),不动 $(KLOOP_DIR)"

@@ -333,19 +333,27 @@ impl BackgroundShells {
         spec.stdin = ProcessStdio::Null;
         spec.stdout = ProcessStdio::File(stdout);
         spec.stderr = ProcessStdio::File(stderr);
-        let (child, killer, kill) = {
-            // Hold the registry lock across spawn+insert so shutdown cannot close
-            // the table between the process becoming real and its controller
-            // being tracked.
+        #[cfg(test)]
+        test_hook::before_spawn(command);
+        // Spawn outside the registry lock: creating a process tree can block
+        // (the Windows debug path waits for a startup report), and `running_count`,
+        // `snapshot`, and `wait_reminder` must not wait behind it (plan 265).
+        let child =
+            kloop_process_spawn::spawn_process_tree(spec).context("bash: failed to spawn sh")?;
+        let killer = child.killer();
+        let kill = CancellationToken::new();
+        let stop_reason = Arc::new(Mutex::new(None));
+        {
             let mut registry = self.state.lock().unwrap();
             if registry.closed {
+                // Shutdown closed the table while the tree was being created.
+                // Nothing will ever track this child, so drop it before it can
+                // run untracked — `ProcessTreeChild`'s `Drop` kills the tree —
+                // and answer the same refusal as before the race.
+                drop(registry);
+                let _ = killer.terminate();
                 bail!("bash: the session is closing; no new background commands may start");
             }
-            let child = kloop_process_spawn::spawn_process_tree(spec)
-                .context("bash: failed to spawn sh")?;
-            let killer = child.killer();
-            let kill = CancellationToken::new();
-            let stop_reason = Arc::new(Mutex::new(None));
             registry.shells.insert(
                 id.clone(),
                 BgShell {
@@ -364,7 +372,6 @@ impl BackgroundShells {
                     }),
                 },
             );
-            (child, killer, kill)
         };
         // The monitor owns the output file from here; a later failure cannot
         // leave an unowned file behind.
@@ -715,7 +722,11 @@ async fn monitor(monitor: BackgroundMonitor) {
                     terminate_error = kill_tree(&killer);
                 }
                 if !output_cap_hit {
-                    let size = std::fs::metadata(&output_path).map_or(0, |metadata| metadata.len());
+                    // The watchdog runs on a runtime worker for the life of the
+                    // shell; the stat goes to the blocking pool with it.
+                    let size = tokio::fs::metadata(&output_path)
+                        .await
+                        .map_or(0, |metadata| metadata.len());
                     if size > OUTPUT_FILE_CAP {
                         output_cap_hit = true;
                         failure_reason = Some(format!("output file exceeded {OUTPUT_FILE_CAP} bytes"));
@@ -841,6 +852,76 @@ async fn read_tail(path: &Path) -> String {
         Ok(text) if text.is_empty() => "(no output yet)".into(),
         Ok(text) => text,
         Err(e) => format!("(cannot read output file: {e})"),
+    }
+}
+
+/// Test-only gate that makes process creation observably slow, so a test can ask
+/// what the registry answers while a spawn is still in flight.
+#[cfg(test)]
+mod test_hook {
+    use std::sync::Arc;
+    use std::sync::Condvar;
+    use std::sync::Mutex;
+
+    pub(super) struct SpawnGate {
+        command: String,
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        entered: bool,
+        released: bool,
+    }
+
+    impl SpawnGate {
+        pub(super) fn install(command: &str) -> Arc<Self> {
+            let gate = Arc::new(Self {
+                command: command.to_string(),
+                state: Mutex::new(GateState::default()),
+                changed: Condvar::new(),
+            });
+            *GATE.lock().unwrap() = Some(Arc::clone(&gate));
+            gate
+        }
+
+        pub(super) fn wait_until_spawning(&self) {
+            let mut state = self.state.lock().unwrap();
+            while !state.entered {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        pub(super) fn release(self: &Arc<Self>) {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.released = true;
+                self.changed.notify_all();
+            }
+            let mut slot = GATE.lock().unwrap();
+            if slot.as_ref().is_some_and(|gate| Arc::ptr_eq(gate, self)) {
+                *slot = None;
+            }
+        }
+    }
+
+    static GATE: Mutex<Option<Arc<SpawnGate>>> = Mutex::new(None);
+
+    pub(super) fn before_spawn(command: &str) {
+        let gate = GATE.lock().unwrap().clone();
+        let Some(gate) = gate else {
+            return;
+        };
+        if gate.command != command {
+            return;
+        }
+        let mut state = gate.state.lock().unwrap();
+        state.entered = true;
+        gate.changed.notify_all();
+        while !state.released {
+            state = gate.changed.wait(state).unwrap();
+        }
     }
 }
 
@@ -1475,5 +1556,45 @@ mod tests {
             out.contains("missing required string argument 'bash_id'"),
             "{out}"
         );
+    }
+
+    /// Plan 265: process creation happens outside the registry lock. A spawn
+    /// parked on the gate (the old code parked it while holding the lock) must
+    /// leave `running_count` answerable; the timeout is the assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_spawn_does_not_hold_the_registry_lock() {
+        let ctx = test_ctx(0, "bg-slow-spawn");
+        let command = "printf slow-spawn";
+        let gate = super::test_hook::SpawnGate::install(command);
+
+        let running = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                run_tool(
+                    "bash",
+                    json!({"command": command, "background": true}),
+                    &ctx,
+                )
+                .await
+            }
+        });
+        gate.wait_until_spawning();
+
+        let shells = Arc::clone(&ctx.cfg.background_shells);
+        let count = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || shells.running_count()),
+        )
+        .await
+        .expect("running_count waited for a spawn that was still in flight")
+        .unwrap();
+        assert_eq!(count, 0, "the shell is not registered yet");
+
+        gate.release();
+        let (output, is_error) = running.await.unwrap();
+        assert!(!is_error, "{output}");
+        let id = bg_id(&output);
+        let _ = run_tool("stop_bash", json!({"bash_id": id}), &ctx).await;
+        assert_eq!(ctx.cfg.shutdown_background_work(&ctx.ui).await, 0);
     }
 }

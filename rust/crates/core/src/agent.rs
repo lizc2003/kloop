@@ -1205,7 +1205,7 @@ async fn turn_rounds(
         drain_inbox(&cfg.inbox, turn.history, ui);
         drain_local_mailbox(cfg, turn.history, ui);
         remind_todos(cfg, turn.history, depth);
-        remind_changed_reads(cfg, turn.history);
+        remind_changed_reads(cfg, turn.history).await;
         remind_background_shells(cfg, turn.history);
         // Without an anchor the system prompt, this round's tools and the
         // injected context are estimated here; a dynamic MCP refresh may have
@@ -1606,10 +1606,17 @@ fn remind_todos(cfg: &Config, history: &mut History, depth: u8) -> bool {
 /// the rollout so a replay or resume shows it where the model saw it.
 ///
 /// Every depth: a sub-agent reads files too, into a `FileState` of its own.
-fn remind_changed_reads(cfg: &Config, history: &mut History) -> bool {
+///
+/// The disk check is synchronous IO over every re-armable path, so it runs on
+/// the blocking pool (plan 265); this round boundary waits for its answer but
+/// not on a runtime worker.
+async fn remind_changed_reads(cfg: &Config, history: &mut History) -> bool {
     let workspace = cfg.effective_workspace();
-    let Some(reminder) =
-        crate::tools::changed_reads_reminder(&workspace.file_state, &workspace.cwd)
+    let Some(reminder) = crate::tools::changed_reads_reminder_async(
+        Arc::clone(&workspace.file_state),
+        workspace.cwd.clone(),
+    )
+    .await
     else {
         return false;
     };

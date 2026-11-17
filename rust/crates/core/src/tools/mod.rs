@@ -61,8 +61,12 @@ pub(crate) use inject::expand_slash_injections;
 // Registered on the run_agent peer set only at depth 0 with skills loaded
 // (see `turn_rounds`); the pure skill logic it drives lives in `crate::skills`.
 pub(crate) use skill::skill_tool_def;
-// Recorded at the round boundary by `agent.rs` (plan 197), not on a tool result.
+// Recorded at the round boundary by `agent.rs` (plan 197), not on a tool result;
+// the async entry point is what that round boundary calls (plan 265). The
+// synchronous one stays for the tests that exercise the judgement on its own.
+#[cfg(test)]
 pub(crate) use fs::changed_reads_reminder;
+pub(crate) use fs::changed_reads_reminder_async;
 pub use tool_search::deferred_notice;
 // The skills module (`crate::skills`) dispatches a `context: fork` skill here,
 // reusing the run_agent sub-agent machinery.

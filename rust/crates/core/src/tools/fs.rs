@@ -142,6 +142,19 @@ pub(crate) fn changed_reads_reminder(state: &FileState, cwd: &Path) -> Option<St
     Some(out)
 }
 
+/// [`changed_reads_reminder`] off the async worker (plan 265). The stats and
+/// hashes it performs are synchronous file IO, and a read path that has become
+/// a FIFO must not be able to park a runtime worker at a round boundary.
+pub(crate) async fn changed_reads_reminder_async(
+    state: Arc<FileState>,
+    cwd: PathBuf,
+) -> Option<String> {
+    tokio::task::spawn_blocking(move || changed_reads_reminder(&state, &cwd))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// A path relative to the workspace when it lies under it. Observation keys are
 /// canonical, so the cwd is tried canonicalized too (`/tmp` vs `/private/tmp`).
 fn display_under(cwd: &Path, path: &Path) -> String {
