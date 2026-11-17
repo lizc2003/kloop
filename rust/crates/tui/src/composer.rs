@@ -546,6 +546,16 @@ struct HistoryEntry {
 #[derive(Clone, Debug)]
 pub struct Draft(ComposerDocument);
 
+/// Where a paste's text went when its reservation turned out not to be an
+/// image: into the visible draft, into the draft history recall stashed, or
+/// nowhere (the label is gone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservationPaste {
+    Visible,
+    Stashed,
+    Gone,
+}
+
 impl Draft {
     /// The text that was sent for this draft.
     pub fn text(&self) -> String {
@@ -869,43 +879,68 @@ impl Composer {
         true
     }
 
-    /// A reservation whose read produced no image: drop the label and say where
-    /// it stood, so the paste's text can take that place. `None` when the label
-    /// is already gone. The cursor is mapped over the deleted label; changing
-    /// the text while leaving it pointing past the end is how a layout panics.
-    pub fn abandon_image(&mut self, token: u64) -> Option<ByteOffset> {
-        if self.document.pending_atom(token).is_some() {
-            let index = self.document.pending_index(token)?;
+    /// A reservation whose read produced no image: drop the label. `false` when
+    /// it is already gone. The cursor is mapped over the deleted label and then
+    /// snapped to a grapheme boundary: the text on either side can join into
+    /// one grapheme (two regional indicators, a base and a combining mark), and
+    /// a cursor resting inside it is what the next layout asserts on.
+    pub fn abandon_image(&mut self, token: u64) -> bool {
+        if let Some(index) = self.document.pending_index(token) {
+            let atom = &self.document.atoms[index];
+            let (at, end) = (atom.range.start(), atom.range.end());
+            self.document.delete_atom(index);
+            self.cursor = self.remap_cursor(at, end);
+            self.goal_column = None;
+            return true;
+        }
+        let Some(index) = self.draft.pending_index(token) else {
+            return false;
+        };
+        self.draft.delete_atom(index);
+        true
+    }
+
+    /// A reservation whose read produced no image: in the document that holds
+    /// it, replace the label with the paste's text. Doing both here is what
+    /// keeps a recalled draft in place — the label may live in the draft the
+    /// user navigated away from, and inserting into the visible document would
+    /// put the text into the wrong input (or nowhere, past its end).
+    pub fn paste_text_at_reservation(&mut self, token: u64, text: &str) -> ReservationPaste {
+        if let Some(index) = self.document.pending_index(token) {
             let atom = &self.document.atoms[index];
             let at = atom.range.start();
             let end = atom.range.end();
             self.document.delete_atom(index);
-            // The cursor rests before the label or after it, never inside
-            // (labels are indivisible), so shifting by the label is exact.
-            if self.cursor >= end {
-                self.cursor = ByteOffset::new(self.cursor.get() - (end.get() - at.get()));
-            } else if self.cursor > at {
-                self.cursor = at;
-            }
+            let after = self.remap_cursor(at, end);
+            let inserted = self.document.replace(TextRange::empty(at), text);
+            // The caret follows the text it was standing after; standing before
+            // the label, it stays before the replacement.
+            self.cursor =
+                snap_grapheme_boundary(self.text(), if after >= at { inserted } else { after });
             self.goal_column = None;
-            return Some(at);
+            return ReservationPaste::Visible;
         }
-        let index = self.draft.pending_index(token)?;
+        let Some(index) = self.draft.pending_index(token) else {
+            return ReservationPaste::Gone;
+        };
         let at = self.draft.atoms[index].range.start();
         self.draft.delete_atom(index);
-        Some(at)
+        self.draft.replace(TextRange::empty(at), text);
+        ReservationPaste::Stashed
     }
 
-    /// Insert text at `at` (the spot a reservation just gave up) and leave the
-    /// cursor after it, as a paste does.
-    pub fn insert_text_at(&mut self, at: ByteOffset, text: &str) -> bool {
-        if at > ByteOffset::new(self.text().len()) || !is_grapheme_boundary(self.text(), at) {
-            return false;
-        }
-        self.begin_edit();
-        self.cursor = self.document.replace(TextRange::empty(at), text);
-        self.goal_column = None;
-        true
+    /// Where the cursor goes when `[at, end)` leaves the text: shifted by the
+    /// removed span when it rested after it, kept when it rested before, and
+    /// snapped to a boundary because the two sides may now form one grapheme.
+    fn remap_cursor(&self, at: ByteOffset, end: ByteOffset) -> ByteOffset {
+        let mapped = if self.cursor >= end {
+            ByteOffset::new(self.cursor.get() - (end.get() - at.get()))
+        } else if self.cursor > at {
+            at
+        } else {
+            self.cursor
+        };
+        snap_grapheme_boundary(self.text(), mapped)
     }
 
     fn insert_image(&mut self, number: usize, source: Arc<ImageSource>) {
@@ -1793,9 +1828,9 @@ mod tests {
         );
     }
 
-    /// A reservation whose read produced no image gives its spot back, and the
-    /// caller's text takes exactly that place; a result for a label that is
-    /// already gone is refused.
+    /// A reservation whose read produced no image has its label replaced by the
+    /// paste's text, in place; a result for a label that is already gone is
+    /// refused.
     #[test]
     fn an_abandoned_reservation_leaves_its_text_in_place() {
         let mut composer = Composer::new();
@@ -1805,12 +1840,69 @@ mod tests {
         let token = composer.reserve_image();
         assert_eq!(composer.text(), "a [Image #1] b");
 
-        let at = composer.abandon_image(token).expect("the label is there");
-        assert!(composer.insert_text_at(at, "note"));
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "note"),
+            ReservationPaste::Visible
+        );
         assert_eq!(composer.text(), "a note b");
+        assert_eq!(composer.cursor(), ByteOffset::new(6));
 
         assert!(!composer.resolve_image(token, image("late")));
-        assert!(composer.abandon_image(token).is_none());
+        assert!(!composer.abandon_image(token));
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "late"),
+            ReservationPaste::Gone
+        );
+    }
+
+    /// The label can be in the draft history recall stashed. The replacement
+    /// text must go there, not into the entry currently on screen — and the
+    /// draft must be intact when the user comes back to it.
+    #[test]
+    fn a_text_fallback_lands_in_the_recalled_draft() {
+        let mut composer = Composer::new();
+        composer.insert_text("old");
+        submitted(&mut composer);
+
+        composer.insert_text("a  b");
+        composer.left();
+        composer.left();
+        let token = composer.reserve_image();
+        composer.up(WIDTH);
+        assert_eq!(composer.text(), "old");
+
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "note"),
+            ReservationPaste::Stashed
+        );
+        assert_eq!(composer.text(), "old", "the recalled entry is untouched");
+        composer.down(WIDTH);
+        assert_eq!(composer.text(), "a note b");
+    }
+
+    /// Deleting the label can join the text on either side into one grapheme;
+    /// the cursor must be snapped out of it, or the next layout asserts.
+    #[test]
+    fn a_deleted_label_never_leaves_the_cursor_inside_a_grapheme() {
+        let mut composer = Composer::new();
+        // A regional-indicator pair with the label between its halves.
+        composer.insert_text("\u{1F1E8}");
+        let token = composer.reserve_image();
+        composer.insert_text("\u{1F1F3}");
+        // Rest the caret at the label's end (after the label, before the second
+        // indicator).
+        composer.left();
+        assert_eq!(composer.text(), "\u{1F1E8}[Image #1]\u{1F1F3}");
+
+        assert!(composer.abandon_image(token));
+        assert_eq!(composer.text(), "\u{1F1E8}\u{1F1F3}");
+        assert!(
+            is_grapheme_boundary(composer.text(), composer.cursor()),
+            "cursor at {} inside {:?}",
+            composer.cursor().get(),
+            composer.text()
+        );
+        let _ = ComposerLayout::new(composer.text(), composer.cursor(), 80);
     }
 
     /// Dropping a reservation must move the cursor over the label it removes,
@@ -1822,7 +1914,7 @@ mod tests {
         let token = composer.reserve_image();
         assert_eq!(composer.text(), "hello[Image #1]");
 
-        assert_eq!(composer.abandon_image(token), Some(ByteOffset::new(5)));
+        assert!(composer.abandon_image(token));
         assert_eq!(composer.text(), "hello");
         assert_eq!(composer.cursor(), ByteOffset::new(5));
         // What the next frame does: a cursor past the end would assert here.

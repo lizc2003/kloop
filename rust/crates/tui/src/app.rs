@@ -41,6 +41,7 @@ use crate::choice::QUESTION_PREFIX;
 use crate::composer::Composer;
 use crate::composer::ComposerAction;
 use crate::composer::Draft;
+use crate::composer::ReservationPaste;
 use crate::events::AgentEvent;
 use crate::menu;
 
@@ -2021,20 +2022,20 @@ impl App {
     /// Drop a reservation with no image behind it. `false` when its label is
     /// already gone.
     pub fn abandon_image(&mut self, token: u64) -> bool {
-        self.composer.abandon_image(token).is_some()
+        self.composer.abandon_image(token)
     }
 
-    /// The pasted path did not read as an image: drop its reservation and put
-    /// the paste's text where the label stood — never at the cursor of whatever
-    /// draft is current by then. Returns the same completion command a text
-    /// paste would.
+    /// The pasted path did not read as an image: replace its label with the
+    /// paste's text, in whichever document holds the label (history recall can
+    /// have stashed it). Never at the cursor of whatever draft is current by
+    /// then. Returns the completion command a text paste in the visible draft
+    /// would; a replacement inside the stashed draft changes nothing on screen.
     pub fn paste_text_at_reservation(&mut self, token: u64, text: &str) -> Command {
-        let Some(at) = self.composer.abandon_image(token) else {
-            return Command::None;
-        };
         let text = canonicalize_paste(text);
-        self.composer.insert_text_at(at, &text);
-        self.after_edit()
+        match self.composer.paste_text_at_reservation(token, &text) {
+            ReservationPaste::Visible => self.after_edit(),
+            ReservationPaste::Stashed | ReservationPaste::Gone => Command::None,
+        }
     }
 
     /// Which draft the composer holds. The composer advances it whenever the

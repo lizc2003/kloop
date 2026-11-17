@@ -2005,9 +2005,11 @@ keystrokes starts one walk rather than one per key. A paste reserves its
 `[Image #N]` in the draft when the key is pressed: the label is ordinary draft
 content from that moment, so edits carry it along, a second paste lands after
 the first, and the bytes fill that exact label when they arrive (a read that
-produces no image leaves the paste's text in the label's place, with the cursor
-mapped over the removed label; a label deleted, or a draft sent or cleared
-meanwhile, is refused — with a note when the draft itself went). History recall
+produces no image replaces the label with the paste's text in whichever draft
+holds the label, with the cursor mapped over the removed span and snapped to a
+grapheme boundary — the two sides can join into one; a label deleted, or a
+draft sent or cleared meanwhile, is refused — with a note when the draft itself
+went). History recall
 swaps documents, so the reserved draft is looked up alongside the visible one:
 the image lands in the input it was pasted into and is waiting when the user
 returns, and the swap advances the document generation a held submit is bound
