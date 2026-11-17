@@ -653,10 +653,6 @@ pub struct App {
     /// event loop; this is how its result learns the user dismissed the menu
     /// meanwhile instead of reopening it (plan 263 review).
     popup_generation: u64,
-    /// Which draft the composer holds. A paste read off the event loop was asked
-    /// for against one draft; this tells its result when that draft is gone
-    /// (submitted or cleared) rather than merely edited.
-    draft_generation: u64,
     /// The slash-command catalog (built-ins + skills/commands), used to filter
     /// the `/` menu. Seeded once at startup via [`App::with_commands`].
     commands: Vec<menu::CommandInfo>,
@@ -718,7 +714,6 @@ impl App {
             esc_clear_armed: false,
             popup: None,
             popup_generation: 0,
-            draft_generation: 0,
             commands: Vec::new(),
             cwd: String::new(),
             branch: None,
@@ -1656,7 +1651,6 @@ impl App {
                         return Command::None;
                     }
                     self.composer.clear();
-                    self.draft_generation += 1;
                 } else if self.running {
                     return Command::Interrupt;
                 }
@@ -1846,7 +1840,6 @@ impl App {
                 .trim()
                 .to_string();
             self.cells.push(Cell::User(display.clone()));
-            self.draft_generation += 1;
             self.running = true;
             self.freeze_selected_route();
             return Command::Slash(command);
@@ -1866,13 +1859,11 @@ impl App {
             // (absorbed at its next round boundary). No new turn starts. The echo
             // is the text alone, as a resumed steer replays.
             let sub = self.composer.submit().expect("checked not blank");
-            self.draft_generation += 1;
             self.cells.push(Cell::User(sub.text.trim().to_string()));
             self.submit_images = sub.images;
             return Command::Steer(sub.text);
         }
         let sub = self.composer.submit().expect("checked not blank");
-        self.draft_generation += 1;
         let echo = sub.text.trim().to_string();
         if !echo.is_empty() {
             self.cells.push(Cell::User(echo));
@@ -2021,11 +2012,10 @@ impl App {
     /// Fill a reservation; `false` when its label is gone (deleted, or the
     /// draft was sent or cleared).
     pub fn resolve_image(&mut self, token: u64, source: ImageSource) -> bool {
-        let filled = self.composer.resolve_image(token, source);
-        if filled {
-            self.close_popup();
-        }
-        filled
+        // Filling a label that is already in the text changes neither the text
+        // nor the cursor, so a menu opened while the bytes were loading stays
+        // where it is — and keeps owning Enter, which is what should answer it.
+        self.composer.resolve_image(token, source)
     }
 
     /// Drop a reservation with no image behind it. `false` when its label is
@@ -2047,11 +2037,12 @@ impl App {
         self.after_edit()
     }
 
-    /// Which draft the composer holds. A paste carries this from the moment it
-    /// was asked for, so a result for a draft that was since submitted or
-    /// cleared is not spliced into the next one.
+    /// Which draft the composer holds. The composer advances it whenever the
+    /// visible document is swapped — a submit, a clear, history recall — so
+    /// work started against one document (a paste still loading, a submit held
+    /// for it) can tell it is no longer looking at that one.
     pub fn draft_generation(&self) -> u64 {
-        self.draft_generation
+        self.composer.document_generation()
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Command {
@@ -4651,6 +4642,56 @@ mod tests {
         let submitted = app.submit_draft();
         assert_eq!(app.take_submit_images(), vec![png("one"), png("two")]);
         assert!(matches!(submitted, Command::Submit(_)));
+    }
+
+    /// Recalling an earlier input is a different draft: a submit held for the
+    /// one that was in front must not send the recalled text, and a paste still
+    /// loading still belongs to the draft it was asked for.
+    #[test]
+    fn history_recall_is_a_new_draft_for_held_work() {
+        let mut app = App::new("recall-generation".into());
+        app.composer.paste("old");
+        assert!(matches!(app.submit_draft(), Command::Submit(_)));
+        app.composer.paste("hello");
+        let generation = app.draft_generation();
+        let token = app.reserve_image();
+        assert_eq!(app.composer.text(), "hello[Image #1]");
+
+        app.on_key(80, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "old");
+        assert!(
+            app.draft_generation() > generation,
+            "the recalled document is not the held draft"
+        );
+        // The image still lands in the draft it was pasted into...
+        assert!(app.resolve_image(token, png("one")));
+        app.on_key(80, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "hello[Image #1]");
+        // ...and the next submit carries it (a steer, while the first turn is
+        // still marked running).
+        assert!(matches!(
+            app.submit_draft(),
+            Command::Submit(_) | Command::Steer(_)
+        ));
+        assert_eq!(app.take_submit_images(), vec![png("one")]);
+    }
+
+    /// Filling a reservation moves no text and no cursor, so a completion menu
+    /// opened while the bytes loaded stays open — and keeps owning Enter.
+    #[test]
+    fn filling_an_image_keeps_a_menu_opened_meanwhile() {
+        let mut app = App::new("paste-menu".into());
+        let token = app.reserve_image();
+        // The trigger token has to start after whitespace, as a typed one does.
+        app.composer.paste(" @mai");
+        let target = app.detect_trigger().expect("@ token");
+        let generation = app.popup_generation();
+        app.set_file_results(target, vec!["main.rs".into()]);
+        assert!(app.popup.is_some());
+
+        assert!(app.resolve_image(token, png("one")));
+        assert!(app.popup.is_some(), "the menu did not change with the fill");
+        assert_eq!(app.popup_generation(), generation);
     }
 
     /// A label whose read produced no image is dropped, and the paste's text

@@ -114,3 +114,19 @@
   `a_shell_command_gets_a_row_of_its_own`，它跑真实 `bash` 工具调用，而当前测试进程自身在
   kloop 的 seatbelt 里(`sandbox-exec: Operation not permitted`)，同一环境在上一提交(第一个
   修复前)也以同样方式失败，需要在沙箱外终端跑(plan 283 的既有约束)；clippy、fmt。
+
+## 第三轮复审(2026-11-16)
+
+- **P1：无图时删预占位留下越界光标**。`abandon_image` 现在把光标映射过被删标签(标签在光标
+  前就减长度，在后就落到标签起点；正文中光标不可能在标签内)，并把测试跑一次
+  `ComposerLayout::new` 证明不再越界。
+- **P2：历史召回偷走异步粘贴与提交意图**。文档代际下沉到 `Composer`：`take_text`、`clear`、
+  `restore`、`history_prev/next/load` 每次换文档都 bump；`App::draft_generation` 直接返回它，
+  因此召回后旧的延迟提交自然作废。`resolve_image`/`abandon_image` 同时查找当前文档与召回时
+  暂存的 `draft`，图片落在粘贴时的输入上，按 ↓ 回来即可见；失败文本同理。
+- **P2：填充图片会关掉期间新开的补全菜单**。填充只换 atom 的 payload，文本和光标都没动，所以
+  `App::resolve_image` 不再 `close_popup()`；菜单保留，也继续占着 Enter(延迟提交因此按“界面
+  已被占”丢弃，而不是绕过检查提交)。
+- **验证**：kloop-tui 348 项(新增 4 项：废弃预占后光标仍在文本内并可继续布局、预占跨历史召回
+  存活、召回是新的文档代际、填充不关闭期间的菜单；按住提交的用例补了“弹窗占键盘”一格)；
+  clippy、fmt；PTY 24/25(唯一失败项仍是需要沙箱外终端的真实 bash 用例)。

@@ -2283,6 +2283,16 @@ mod tests {
         });
         assert!(!deferred_submit_still_applies(generation, &app));
 
+        // A completion menu owns Enter too (it accepts the highlighted entry).
+        let mut app = App::new("held-submit-popup".into());
+        app.composer.paste("hi ");
+        let generation = app.draft_generation();
+        app.composer.paste("@mai");
+        let target = app.detect_trigger().expect("@ token");
+        app.set_file_results(target, vec!["main.rs".into()]);
+        assert!(app.popup.is_some());
+        assert!(!deferred_submit_still_applies(generation, &app));
+
         // So does a draft that was cleared (two-Esc) and replaced.
         let mut app = App::new("held-submit-clear".into());
         app.composer.paste("hi");

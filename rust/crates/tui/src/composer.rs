@@ -303,6 +303,22 @@ impl ComposerDocument {
         cursor
     }
 
+    /// Where the reservation named `token` sits in this document, if it does.
+    fn pending_index(&self, token: u64) -> Option<usize> {
+        self.atoms.iter().position(
+            |atom| matches!(atom.payload, AtomPayload::PendingImage { token: held, .. } if held == token),
+        )
+    }
+
+    fn pending_atom(&self, token: u64) -> Option<&Atom> {
+        self.atoms.get(self.pending_index(token)?)
+    }
+
+    fn pending_atom_mut(&mut self, token: u64) -> Option<&mut Atom> {
+        let index = self.pending_index(token)?;
+        self.atoms.get_mut(index)
+    }
+
     fn materialize_intersections(&mut self, mut range: TextRange) -> TextRange {
         if range.is_empty() {
             return range;
@@ -680,6 +696,11 @@ pub struct Composer {
     /// Names the reservations of reads still in flight, so a result fills the
     /// label it was asked for and nothing else.
     next_image_token: u64,
+    /// Advances whenever the visible document is swapped — a submit, a clear,
+    /// history recall. Work started against one document (a paste still
+    /// loading, a submit held for it) compares this to learn it is looking at
+    /// a different one now.
+    document_generation: u64,
 }
 
 impl Composer {
@@ -693,6 +714,7 @@ impl Composer {
             goal_column: None,
             next_paste_id: 1,
             next_image_token: 1,
+            document_generation: 0,
         }
     }
 
@@ -706,6 +728,11 @@ impl Composer {
 
     pub fn cursor(&self) -> ByteOffset {
         self.cursor
+    }
+
+    /// Which document the composer is showing; see the field's note.
+    pub fn document_generation(&self) -> u64 {
+        self.document_generation
     }
 
     /// Whether `range` overlaps a paste atom. A token that falls inside a label
@@ -805,12 +832,31 @@ impl Composer {
         token
     }
 
-    /// Fill a reservation with the bytes that arrived. `false` when the label
-    /// is gone (deleted, materialized, or the draft was sent or cleared).
+    /// The visible document or the one recall stashed; a reservation lives in
+    /// whichever held it when the paste was asked for.
+    fn document_holding(&mut self, token: u64) -> Option<&mut ComposerDocument> {
+        if self.document.pending_atom(token).is_some() {
+            return Some(&mut self.document);
+        }
+        if self.draft.pending_atom(token).is_some() {
+            return Some(&mut self.draft);
+        }
+        None
+    }
+
+    /// Fill a reservation with the bytes that arrived. The label is already in
+    /// the text, so nothing here moves the cursor or the completion menu; only
+    /// the pending payload becomes an image. `false` when the label is gone
+    /// (deleted, materialized, or the draft was sent or cleared).
+    ///
+    /// Recall can stash the document that holds the label while the read runs,
+    /// so the reserved draft is searched too: the image belongs to that input,
+    /// and it is waiting there when the user comes back to it.
     pub fn resolve_image(&mut self, token: u64, source: ImageSource) -> bool {
-        let Some(atom) = self.document.atoms.iter_mut().find(
-            |atom| matches!(atom.payload, AtomPayload::PendingImage { token: held, .. } if held == token),
-        ) else {
+        let Some(document) = self.document_holding(token) else {
+            return false;
+        };
+        let Some(atom) = document.pending_atom_mut(token) else {
             return false;
         };
         let AtomPayload::PendingImage { number, .. } = atom.payload else {
@@ -825,13 +871,28 @@ impl Composer {
 
     /// A reservation whose read produced no image: drop the label and say where
     /// it stood, so the paste's text can take that place. `None` when the label
-    /// is already gone.
+    /// is already gone. The cursor is mapped over the deleted label; changing
+    /// the text while leaving it pointing past the end is how a layout panics.
     pub fn abandon_image(&mut self, token: u64) -> Option<ByteOffset> {
-        let index = self.document.atoms.iter().position(
-            |atom| matches!(atom.payload, AtomPayload::PendingImage { token: held, .. } if held == token),
-        )?;
-        let at = self.document.atoms[index].range.start();
-        self.document.delete_atom(index);
+        if self.document.pending_atom(token).is_some() {
+            let index = self.document.pending_index(token)?;
+            let atom = &self.document.atoms[index];
+            let at = atom.range.start();
+            let end = atom.range.end();
+            self.document.delete_atom(index);
+            // The cursor rests before the label or after it, never inside
+            // (labels are indivisible), so shifting by the label is exact.
+            if self.cursor >= end {
+                self.cursor = ByteOffset::new(self.cursor.get() - (end.get() - at.get()));
+            } else if self.cursor > at {
+                self.cursor = at;
+            }
+            self.goal_column = None;
+            return Some(at);
+        }
+        let index = self.draft.pending_index(token)?;
+        let at = self.draft.atoms[index].range.start();
+        self.draft.delete_atom(index);
         Some(at)
     }
 
@@ -1058,6 +1119,7 @@ impl Composer {
                 self.document = std::mem::take(&mut self.draft);
                 self.cursor = ByteOffset::new(self.text().len());
                 self.goal_column = None;
+                self.document_generation += 1;
             }
         }
     }
@@ -1067,6 +1129,7 @@ impl Composer {
         self.document = self.history[index].document.clone();
         self.cursor = ByteOffset::new(self.text().len());
         self.goal_column = None;
+        self.document_generation += 1;
     }
 
     fn begin_edit(&mut self) {
@@ -1126,6 +1189,7 @@ impl Composer {
         self.cursor = ByteOffset::new(self.text().len());
         self.hist = None;
         self.goal_column = None;
+        self.document_generation += 1;
     }
 
     fn take_text(&mut self) -> String {
@@ -1140,6 +1204,7 @@ impl Composer {
         self.hist = None;
         self.draft = ComposerDocument::default();
         self.goal_column = None;
+        self.document_generation += 1;
         text
     }
 
@@ -1149,6 +1214,7 @@ impl Composer {
         self.hist = None;
         self.draft = ComposerDocument::default();
         self.goal_column = None;
+        self.document_generation += 1;
     }
 
     pub fn view(&self, width: usize) -> View {
@@ -1745,6 +1811,48 @@ mod tests {
 
         assert!(!composer.resolve_image(token, image("late")));
         assert!(composer.abandon_image(token).is_none());
+    }
+
+    /// Dropping a reservation must move the cursor over the label it removes,
+    /// or the next layout asks for a byte that no longer exists.
+    #[test]
+    fn abandoning_a_reservation_keeps_the_cursor_inside_the_text() {
+        let mut composer = Composer::new();
+        composer.insert_text("hello");
+        let token = composer.reserve_image();
+        assert_eq!(composer.text(), "hello[Image #1]");
+
+        assert_eq!(composer.abandon_image(token), Some(ByteOffset::new(5)));
+        assert_eq!(composer.text(), "hello");
+        assert_eq!(composer.cursor(), ByteOffset::new(5));
+        // What the next frame does: a cursor past the end would assert here.
+        let _ = ComposerLayout::new(composer.text(), composer.cursor(), 80);
+        composer.insert_char('!');
+        assert_eq!(composer.text(), "hello!");
+    }
+
+    /// Recall stashes the draft the reservation belongs to. The image must land
+    /// there — not be dropped — and be waiting when the user comes back.
+    #[test]
+    fn a_reservation_survives_history_recall() {
+        let mut composer = Composer::new();
+        composer.insert_text("old");
+        submitted(&mut composer);
+
+        composer.insert_text("hello");
+        let token = composer.reserve_image();
+        assert_eq!(composer.text(), "hello[Image #1]");
+        composer.up(WIDTH);
+        assert_eq!(composer.text(), "old");
+
+        // Filling while another entry is on screen still fills the draft.
+        assert!(composer.resolve_image(token, image("one")));
+        composer.down(WIDTH);
+        assert_eq!(composer.text(), "hello[Image #1]");
+        assert_eq!(
+            submitted(&mut composer),
+            ("hello[Image #1]".into(), vec!["one".into()])
+        );
     }
 
     /// Backspacing the label is a request to drop the image; the read that

@@ -2005,13 +2005,19 @@ keystrokes starts one walk rather than one per key. A paste reserves its
 `[Image #N]` in the draft when the key is pressed: the label is ordinary draft
 content from that moment, so edits carry it along, a second paste lands after
 the first, and the bytes fill that exact label when they arrive (a read that
-produces no image leaves the paste's text in the label's place; a label deleted,
-or a draft sent or cleared meanwhile, is refused — with a note when the draft
-itself went). Enter is held while a paste is loading and, once it lands,
-submits the draft directly rather than replaying the key: same draft and no
-panel or popup on the keyboard, or not at all. An image can therefore never ride
-the next message instead of the one the user sent, and a held Enter can never
-answer an approval that appeared while the bytes were loading.
+produces no image leaves the paste's text in the label's place, with the cursor
+mapped over the removed label; a label deleted, or a draft sent or cleared
+meanwhile, is refused — with a note when the draft itself went). History recall
+swaps documents, so the reserved draft is looked up alongside the visible one:
+the image lands in the input it was pasted into and is waiting when the user
+returns, and the swap advances the document generation a held submit is bound
+to. Filling a label changes no text and no cursor, so a completion menu opened
+while the bytes loaded stays open. Enter is held while a paste is loading and,
+once it lands, submits the draft directly rather than replaying the key: same
+document and no panel or popup on the keyboard, or not at all. An image can
+therefore never ride the next message instead of the one the user sent, and a
+held Enter can never answer an approval that appeared while the bytes were
+loading.
 
 Keys follow Claude Code: Enter sends when idle, or **steers** while a turn runs
 (see below); **Esc** is about the composer first: while it holds anything (text
