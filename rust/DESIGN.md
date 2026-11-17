@@ -259,7 +259,10 @@ A round boundary's changed-read check is the concrete case that set the rule: it
 stats every re-armable read path and hashes the ones whose metadata moved, so it
 runs on the blocking pool. Its open is non-blocking and its handle is re-checked
 for regular-file shape — a read path replaced by a FIFO must not park a worker —
-and a file past 16 MiB is called rewritten without being read. Thread creation
+and a file past 16 MiB is called rewritten without being read. The hash itself is
+budgeted by the bytes actually read, not only by the size the path reported, so a
+file that grows or is swapped for a larger one after that check still cannot make
+the scan unbounded. Thread creation
 follows the same split in the server: the per-thread Config build (project
 context, sandbox, skills, git probes) runs on the blocking pool, the read loop
 receives the finished handle, registers the thread, and answers the request. The

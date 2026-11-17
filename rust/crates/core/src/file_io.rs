@@ -110,14 +110,52 @@ pub(crate) fn read_bounded(
 pub(crate) fn fingerprint_file(
     file: &mut std::fs::File,
 ) -> Result<FingerprintedFile, FileReadError> {
+    fingerprint_stream(file, None)
+}
+
+/// [`fingerprint_file`] with a read budget.
+///
+/// The metadata check alone cannot bound the work: a file can grow — or be
+/// replaced by a larger one — between that check and the read. The loop counts
+/// what it actually read and stops at `limit + 1`, so this answers `TooLarge`
+/// instead of hashing an unbounded stream.
+pub(crate) fn fingerprint_file_bounded(
+    file: &mut std::fs::File,
+    limit: u64,
+) -> Result<FingerprintedFile, FileReadError> {
+    fingerprint_stream(file, Some(limit))
+}
+
+fn fingerprint_stream(
+    file: &mut std::fs::File,
+    limit: Option<u64>,
+) -> Result<FingerprintedFile, FileReadError> {
     file.seek(SeekFrom::Start(0))?;
     let before = file.metadata()?;
+    if let Some(limit) = limit
+        && before.len() > limit
+    {
+        return Err(FileReadError::TooLarge {
+            actual: before.len(),
+            limit: limit as usize,
+        });
+    }
     let mut hasher = sha2::Sha256::new();
     let mut buffer = [0u8; STREAM_BUFFER_BYTES];
+    let mut total = 0u64;
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
+        }
+        total += read as u64;
+        if let Some(limit) = limit
+            && total > limit
+        {
+            return Err(FileReadError::TooLarge {
+                actual: total,
+                limit: limit as usize,
+            });
         }
         hasher.update(&buffer[..read]);
     }
@@ -187,6 +225,19 @@ mod tests {
         assert_eq!(read_bounded(&mut file, 5).unwrap().bytes, b"12345");
         let error = read_bounded(&mut file, 4).unwrap_err();
         assert_eq!(error.too_large(), Some((5, 4)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_fingerprint_stops_at_its_budget() {
+        let (path, mut file) = temp_file("bounded-fingerprint", b"1234567890");
+        let error = match fingerprint_file_bounded(&mut file, 9) {
+            Ok(_) => panic!("a file over the budget must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.too_large(), Some((10, 9)));
+        let snapshot = fingerprint_file_bounded(&mut file, 10).unwrap();
+        assert!(snapshot.version.matches(b"1234567890", &snapshot.metadata));
         let _ = std::fs::remove_file(path);
     }
 

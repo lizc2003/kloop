@@ -112,6 +112,7 @@ impl Server {
             RecoverySource::Fresh,
             seed,
             ThreadReply::Started,
+            None,
         );
         Ok(None)
     }
@@ -148,6 +149,7 @@ impl Server {
             ThreadReply::Live {
                 message_count: count,
             },
+            None,
         );
         Ok(None)
     }
@@ -186,7 +188,7 @@ impl Server {
         // Until `spawn_thread` takes the history, every failure must remove the
         // fork: it is `preexisting` to its writer, so nothing else will, and
         // each retry would add another orphan to `thread/list`.
-        let mut fork_guard = kloop_core::cleanup::RemoveFileOnDrop::new(new_path.clone());
+        let fork_guard = kloop_core::cleanup::RemoveFileOnDrop::new(new_path.clone());
         let resumed = match rollout::inspect_session_for_writing(&new_path)
             .and_then(|read| read.recover_for_writing())
         {
@@ -209,8 +211,8 @@ impl Server {
             ThreadReply::Live {
                 message_count: count,
             },
+            Some(fork_guard),
         );
-        fork_guard.disarm();
         Ok(None)
     }
 
@@ -300,6 +302,10 @@ impl Server {
         recovery_source: RecoverySource,
         seed: SessionSnapshot,
         reply: ThreadReply,
+        // A fork owns a fresh file the writer treats as preexisting, so its
+        // removal has to travel with the build and be disarmed only once the
+        // worker has taken the history.
+        guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
     ) {
         let build = PendingThreadBuild {
             thread_id: thread_id.clone(),
@@ -307,6 +313,7 @@ impl Server {
             recovery_source,
             seed,
             history,
+            guard,
             factory: Arc::clone(&self.factory),
             catalog: Arc::clone(&self.provider_catalog),
             out: self.out.clone(),
@@ -339,6 +346,7 @@ struct PendingThreadBuild {
     recovery_source: RecoverySource,
     seed: SessionSnapshot,
     history: History,
+    guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
     factory: ConfigFactory,
     catalog: Arc<ProviderCatalog>,
     out: mpsc::UnboundedSender<Vec<u8>>,
@@ -355,6 +363,7 @@ impl PendingThreadBuild {
             recovery_source,
             mut seed,
             mut history,
+            mut guard,
             factory,
             catalog,
             out,
@@ -470,6 +479,11 @@ impl PendingThreadBuild {
         // A blocking-pool thread still carries the runtime context, so the
         // worker is spawned here and the handle is what travels back.
         tokio::spawn(thread_worker(cfg, history, ui, turn_rx, worker_state));
+        // The worker owns the history (and a fork's file) from here. On any
+        // earlier failure the guard drops and removes it.
+        if let Some(guard) = guard.as_mut() {
+            guard.disarm();
+        }
         Ok(ThreadHandle {
             turn_tx,
             running,

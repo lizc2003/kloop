@@ -73,8 +73,25 @@ git 次数(247)。这一条做两件事：**定一条全仓约定**,并修剩下
   竞争，`FrameReader` 把半帧保存在 reader 上以保持取消安全；`pending_threads` 挡住
   并发的重复 resume。回归：400ms 的慢工厂下，`thread/start` 与 `turn/interrupt`
   背靠背发出，interrupt 的响应先到。
-- **验证**:`cargo test -p kloop-core --lib` 1443 通过、1 ignored(含新增回归)；
-  `cargo test -p kloop-server --test server` 51 通过、2 ignored；
+- **验证**:`cargo test -p kloop-core --lib` 1444 通过、1 ignored(含新增回归)；
+  `cargo test -p kloop-server` 53 通过、2 ignored(另有 27 项另一测试二进制)；
   `cargo clippy -p kloop-core -p kloop-server --all-targets -- -D warnings`、`cargo fmt --all`、
   `make async-io` 通过。未跑全量 `make check`、parity、真实 API(按 2026-11-06 约定)。
   遗留：`thread_resume`/`thread_fork` 读整份 transcript 仍在读循环上(本 plan 只认领配置工厂)。
+
+### 提交后复审修复(2026-11-17)
+
+延后执行把原本同一栈帧里的三个不变量拆开了，各补一条回归：
+
+- **P1 退出死锁**:build 完成前 EOF 时读循环退出，但 `builds_rx` 还活着，成功构建的 handle
+  留在队列里持有 `turn_tx` 和输出 sender，`writer.await` 永不返回。退出路径先 `drop(builds_rx)`；
+  回归 `shutdown_during_a_thread_build_still_exits`(已实测旧代码 10 秒超时失败)。
+- **P2 关闭后仍启动**:closed 检查补回 spawn 之前(快速拒绝)，锁内复查保留给 spawn 期间的竞态。
+  回归把命令换成写 marker，并断言 closed 会话连 offload 目录都没有碰过
+  (旧代码会先 `create_dir_all`，已实测红)。
+- **P2 fork 孤儿**:清理守卫改为随 `PendingThreadBuild` 进阻塞池、worker 接手 history 后才
+  `disarm()`；工厂/绑定失败时守卫 drop 删除新会话文件。回归让第二次工厂调用失败，断言
+  `sessions` 目录只剩源会话(已实测红)。
+- **P2 hash 读取无上限**:open 前的大小检查挡不住读取期间增长或被换大。新增
+  `file_io::fingerprint_file_bounded`，按实际读取字节数在预算处停止并报 `TooLarge`
+  (按 `Rewritten` 处理)，`check_disk` 改用它。

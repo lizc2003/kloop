@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -4280,6 +4282,21 @@ async fn thread_start_does_not_block_turn_interrupt() {
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
+/// Closing input while a config build is still in flight must still end the
+/// server: the finished handle has no read loop left to register it, so the
+/// exit path has to drop it (and with it the worker and its output sender)
+/// instead of leaving it queued behind `writer.await`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_a_thread_build_still_exits() {
+    let dirs = test_dirs("start-shutdown");
+    let mut client = start_server(slow_factory(Vec::new(), dirs.offload.clone(), false), &dirs);
+    client.initialize().await;
+    // Sent, not awaited: input closes while the factory is still sleeping.
+    client.request("thread/start", json!({})).await;
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
 /// `thread/fork` copies a session prefix into a fresh thread and spawns it
 /// live: the client can turn/start on the fork immediately, the fork's lineage
 /// points back into the source at the cut, and the source file is untouched.
@@ -4331,6 +4348,52 @@ async fn thread_fork_branches_a_session_into_a_live_thread() {
     );
     let fork_msgs = kloop_core::rollout::load_session(&fork_path).unwrap();
     assert_eq!(fork_msgs.len(), 4);
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A fork owns a session file it just created and the writer treats as
+/// preexisting. If its config build fails, nothing else removes that file, so
+/// the cleanup guard travels with the build; without it every retry would add
+/// another orphan to `thread/list`.
+#[tokio::test]
+async fn a_failed_fork_build_removes_the_new_session_file() {
+    let dirs = test_dirs("fork-build-failure");
+    let inner = factory(vec![vec![text("answer")]], dirs.offload.clone(), false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let failing: ConfigFactory = {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |options, catalog, approver, questioner, notify| {
+            if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                anyhow::bail!("injected factory failure");
+            }
+            inner(options, catalog, approver, questioner, notify)
+        })
+    };
+    let mut client = start_server(failing, &dirs);
+    let src = client.init_and_start().await;
+    client
+        .request("turn/start", json!({"thread_id": src, "input": "q"}))
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    let fork_id = client
+        .request("thread/fork", json!({"thread_id": src}))
+        .await;
+    let log = client.recv_until(|m| m["id"] == fork_id).await;
+    let response = log.iter().find(|m| m["id"] == fork_id).unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("injected factory failure")),
+        "{response}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&dirs.sessions).unwrap().count(),
+        1,
+        "the failed fork left its session file behind"
+    );
+
+    client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

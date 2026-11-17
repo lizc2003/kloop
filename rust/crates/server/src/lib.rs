@@ -180,6 +180,13 @@ where
     }
     // Input closed or failed: cancel in-flight turns so workers wind down, then
     // drop our sender so the writer drains and exits once every worker is gone.
+    //
+    // The build receiver goes first. A thread whose config build finishes after
+    // this point has no read loop to register it: closing the receiver drops
+    // that handle (and with it the worker's turn sender) instead of leaving an
+    // unread message whose worker — and output sender — keep the writer alive
+    // forever.
+    drop(builds_rx);
     for handle in server.threads.values() {
         let mut current_cancel = handle.current_cancel.lock().unwrap();
         if let Some(cancel) = current_cancel.take() {

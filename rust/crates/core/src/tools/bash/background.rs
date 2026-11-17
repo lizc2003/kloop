@@ -288,6 +288,14 @@ impl BackgroundShells {
         if verdict.protection == crate::permissions::Protection::Required && sandbox.is_none() {
             bail!(sandbox::PROTECTION_REQUIRED);
         }
+        // Fast refusal before anything is created: a closed session must not
+        // start a command at all, not start it and kill it after the fact. The
+        // same check runs again under the lock after the spawn for the race
+        // with a shutdown that lands in between.
+        let closed = self.state.lock().unwrap().closed;
+        if closed {
+            bail!("bash: the session is closing; no new background commands may start");
+        }
         let _ = facts;
         let description = input.description.as_deref().unwrap_or("");
         let offload_dir = &ctx.cfg.offload_dir;
@@ -1263,10 +1271,32 @@ mod tests {
             0
         );
 
-        let (out, is_error) =
-            run_tool("bash", json!({"command": "true", "background": true}), &ctx).await;
+        // A command that would leave a side effect: a closed session must refuse
+        // it before the spawn, so the marker can never appear.
+        let marker = offload.with_file_name("closed-registry-side-effect");
+        let _ = std::fs::remove_file(&marker);
+        let (out, is_error) = run_tool(
+            "bash",
+            json!({
+                "command": format!("printf ran > {}", marker.display()),
+                "background": true
+            }),
+            &ctx,
+        )
+        .await;
         assert!(is_error, "{out}");
         assert!(out.contains("session is closing"), "{out}");
+        assert!(
+            !marker.exists(),
+            "a closed registry started the command before refusing it"
+        );
+        // Nothing was created either: the offload directory is recreated by the
+        // first line of the spawn path, so its absence proves the refusal came
+        // before any work.
+        assert!(
+            !offload.exists(),
+            "a closed registry touched the offload directory before refusing"
+        );
 
         let outputs: Vec<_> = std::fs::read_dir(&offload)
             .map(|dir| {

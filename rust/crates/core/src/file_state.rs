@@ -465,7 +465,17 @@ fn check_disk(
         return Some((DiskCheck::Named, Some(ReadDrift::Rewritten)));
     }
     let mut file = open_regular_read(path).ok()?;
-    let current = crate::file_io::fingerprint_file(&mut file).ok()?.version;
+    // The size above is what the path said a moment ago. The bounded hash also
+    // caps what is actually read, so a file that grew after that check (or was
+    // swapped for a bigger one) still cannot make this scan unbounded.
+    let current =
+        match crate::file_io::fingerprint_file_bounded(&mut file, CHANGED_READS_MAX_HASH_BYTES) {
+            Ok(snapshot) => snapshot.version,
+            Err(crate::file_io::FileReadError::TooLarge { .. }) => {
+                return Some((DiskCheck::Named, Some(ReadDrift::Rewritten)));
+            }
+            Err(_) => return None,
+        };
     Some(match observation.version.same_content(&current) {
         true => (DiskCheck::SameContent(current), None),
         false => (DiskCheck::Named, Some(ReadDrift::Rewritten)),
