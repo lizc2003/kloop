@@ -287,15 +287,6 @@ struct DebugSpawned {
     stderr: Option<File>,
 }
 
-struct DebugThreadRoot {
-    process: OwnedHandle,
-    jobs: Arc<JobSet>,
-    root_pid: u32,
-    stdin: Option<File>,
-    stdout: Option<File>,
-    stderr: Option<File>,
-}
-
 struct AttributeList {
     storage: Vec<usize>,
     handles: Box<[HANDLE]>,
@@ -384,136 +375,22 @@ fn spawn_impl(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
     if spec.windows_debug_descendants {
         return spawn_debugged(spec, fault);
     }
-    let ProcessSpec {
-        executable,
-        args,
-        cwd,
-        env_add,
-        env_remove,
-        stdin,
-        stdout,
-        stderr,
-        windows_debug_descendants: _,
-    } = spec;
-    if !executable.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Windows process executable must be absolute",
-        ));
-    }
-
-    let jobs = Arc::new(create_job_set()?);
-    #[cfg(test)]
-    let _full_job_member = if fault == SpawnFault::RealAssignFailure {
-        Some(
-            fill_job_to_active_process_limit(&jobs.root, &cwd).map_err(|error| {
-                io::Error::other(format!(
-                    "cannot prepare real Job assignment failure: {error}"
-                ))
-            })?,
-        )
-    } else {
-        None
-    };
-    let creation_guard = crate::lock();
-    let stdio = prepare_stdio(stdin, stdout, stderr)?;
-    let attributes =
-        AttributeList::for_handles(&[stdio.stdin.raw(), stdio.stdout.raw(), stdio.stderr.raw()])?;
-    let (application, mut command_line) = application_and_command_line(&executable, &args)?;
-    let executable_wide = wide_nul(application.as_os_str(), "executable")?;
-    let cwd_wide = wide_nul(cwd.as_os_str(), "working directory")?;
-    let environment = environment_block(env_add, env_remove)?;
-
-    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = stdio.stdin.raw();
-    startup.StartupInfo.hStdOutput = stdio.stdout.raw();
-    startup.StartupInfo.hStdError = stdio.stderr.raw();
-    startup.lpAttributeList = attributes.ptr;
-    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let created = unsafe {
-        CreateProcessW(
-            executable_wide.as_ptr(),
-            command_line.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            1,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-            environment.as_ptr().cast(),
-            cwd_wide.as_ptr(),
-            (&startup as *const STARTUPINFOEXW).cast(),
-            &mut info,
-        )
-    };
-    if created == 0 {
-        return Err(last_error());
-    }
-    let process = OwnedHandle::new(info.hProcess)?;
-    let thread = OwnedHandle::new(info.hThread)?;
-
-    #[cfg(test)]
-    if fault == SpawnFault::BeforeAssign {
-        unsafe {
-            TerminateProcess(process.raw(), 1);
-            WaitForSingleObject(process.raw(), INFINITE);
-        }
-        return Err(io::Error::other("injected failure before Job assignment"));
-    }
-
-    if unsafe { AssignProcessToJobObject(jobs.root.handle.raw(), process.raw()) } == 0 {
-        let error = last_error();
-        unsafe {
-            TerminateProcess(process.raw(), 1);
-            WaitForSingleObject(process.raw(), INFINITE);
-        }
-        return Err(error);
-    }
-    #[cfg(test)]
-    if fault == SpawnFault::RealAssignFailure {
-        unsafe {
-            TerminateJobObject(jobs.root.handle.raw(), 1);
-            WaitForSingleObject(process.raw(), INFINITE);
-        }
-        return Err(io::Error::other(
-            "expected active-process limit to reject Job assignment",
-        ));
-    }
-    #[cfg(test)]
-    if fault == SpawnFault::BeforeResume {
-        unsafe {
-            TerminateJobObject(jobs.root.handle.raw(), 1);
-            WaitForSingleObject(process.raw(), INFINITE);
-        }
-        return Err(io::Error::other("injected failure before root resume"));
-    }
-    if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
-        let error = last_error();
-        terminate_job_and_wait(&jobs.root, &process);
-        return Err(error);
-    }
-    drop(thread);
-    drop(attributes);
-    drop(stdio.stdin);
-    drop(stdio.stdout);
-    drop(stdio.stderr);
-    drop(creation_guard);
-
-    let stdin = stdio
-        .parent_stdin
+    let root = create_suspended_root(spec, CreationMode::Plain, fault)?;
+    let stdin = root
+        .stdin
         .map(tokio::fs::File::from_std)
         .map(|pipe| Box::pin(pipe) as ProcessWriter);
-    let stdout = stdio
-        .parent_stdout
+    let stdout = root
+        .stdout
         .map(tokio::fs::File::from_std)
         .map(|pipe| Box::pin(pipe) as ProcessPipe);
-    let stderr = stdio
-        .parent_stderr
+    let stderr = root
+        .stderr
         .map(tokio::fs::File::from_std)
         .map(|pipe| Box::pin(pipe) as ProcessPipe);
     Ok(Child {
-        process,
-        killer: Killer { jobs },
+        process: root.process,
+        killer: Killer { jobs: root.jobs },
         debugger: None,
         stdin,
         stdout,
@@ -529,35 +406,37 @@ fn spawn_debugged(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
         .name("kloop-job-debugger".into())
-        .spawn(move || match create_debugged_root(spec, fault) {
-            Ok(root) => {
-                let parent_process = match root.process.duplicate(false) {
-                    Ok(process) => process,
-                    Err(error) => {
-                        let _ = startup_tx.send(Err(error));
+        .spawn(
+            move || match create_suspended_root(spec, CreationMode::DebugDescendants, fault) {
+                Ok(root) => {
+                    let parent_process = match root.process.duplicate(false) {
+                        Ok(process) => process,
+                        Err(error) => {
+                            let _ = startup_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                    let spawned = DebugSpawned {
+                        process: parent_process,
+                        jobs: root.jobs.clone(),
+                        stdin: root.stdin,
+                        stdout: root.stdout,
+                        stderr: root.stderr,
+                    };
+                    if startup_tx.send(Ok(spawned)).is_err() {
+                        terminate_jobs(&root.jobs);
                         return;
                     }
-                };
-                let spawned = DebugSpawned {
-                    process: parent_process,
-                    jobs: root.jobs.clone(),
-                    stdin: root.stdin,
-                    stdout: root.stdout,
-                    stderr: root.stderr,
-                };
-                if startup_tx.send(Ok(spawned)).is_err() {
-                    terminate_jobs(&root.jobs);
-                    return;
+                    if let Err(error) = debug_descendants(root.pid, &root.jobs) {
+                        record_debug_failure(&thread_failure, &error);
+                        terminate_jobs(&root.jobs);
+                    }
                 }
-                if let Err(error) = debug_descendants(root.root_pid, &root.jobs) {
-                    record_debug_failure(&thread_failure, &error);
-                    terminate_jobs(&root.jobs);
+                Err(error) => {
+                    let _ = startup_tx.send(Err(error));
                 }
-            }
-            Err(error) => {
-                let _ = startup_tx.send(Err(error));
-            }
-        })
+            },
+        )
         .map_err(|error| {
             io::Error::other(format!("cannot start Windows descendant debugger: {error}"))
         })?;
@@ -602,7 +481,32 @@ fn spawn_debugged(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Child> {
     })
 }
 
-fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<DebugThreadRoot> {
+/// A root that has been created suspended, put in its Job Object, and resumed.
+/// The parent's ends of its stdio are already the only copies left open.
+struct SuspendedRoot {
+    process: OwnedHandle,
+    jobs: Arc<JobSet>,
+    pid: u32,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+}
+
+/// Which root is being created. The debug path adds `DEBUG_PROCESS` and makes
+/// the calling thread the debugger; everything below the flags — validation,
+/// Job Object, creation gate, attribute list, the suspended create, the Job
+/// assignment and the resume — is the same, so it has one implementation.
+#[derive(Clone, Copy)]
+enum CreationMode {
+    Plain,
+    DebugDescendants,
+}
+
+fn create_suspended_root(
+    spec: ProcessSpec,
+    mode: CreationMode,
+    fault: SpawnFault,
+) -> io::Result<SuspendedRoot> {
     #[cfg(not(test))]
     let _ = fault;
     let ProcessSpec {
@@ -622,9 +526,10 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
             "Windows process executable must be absolute",
         ));
     }
+    let debug = matches!(mode, CreationMode::DebugDescendants);
     let jobs = Arc::new(create_job_set()?);
     #[cfg(test)]
-    if fault == SpawnFault::DebugDescendantBreakaway {
+    if debug && fault == SpawnFault::DebugDescendantBreakaway {
         enable_silent_breakaway(&jobs.root)?;
     }
     #[cfg(test)]
@@ -655,6 +560,10 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
     startup.StartupInfo.hStdOutput = stdio.stdout.raw();
     startup.StartupInfo.hStdError = stdio.stderr.raw();
     startup.lpAttributeList = attributes.ptr;
+    let mut flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+    if debug {
+        flags |= DEBUG_PROCESS;
+    }
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe {
         CreateProcessW(
@@ -663,10 +572,7 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
             ptr::null(),
             ptr::null(),
             1,
-            DEBUG_PROCESS
-                | CREATE_SUSPENDED
-                | CREATE_UNICODE_ENVIRONMENT
-                | EXTENDED_STARTUPINFO_PRESENT,
+            flags,
             environment.as_ptr().cast(),
             cwd_wide.as_ptr(),
             (&startup as *const STARTUPINFOEXW).cast(),
@@ -678,7 +584,7 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
     }
     let process = OwnedHandle::new(info.hProcess)?;
     let thread = OwnedHandle::new(info.hThread)?;
-    if unsafe { DebugSetProcessKillOnExit(1) } == 0 {
+    if debug && unsafe { DebugSetProcessKillOnExit(1) } == 0 {
         let error = io::Error::other(format!(
             "cannot make Windows descendant debugger fail closed: {}",
             last_error()
@@ -691,69 +597,72 @@ fn create_debugged_root(spec: ProcessSpec, fault: SpawnFault) -> io::Result<Debu
 
     #[cfg(test)]
     if fault == SpawnFault::BeforeAssign {
-        unsafe {
-            TerminateProcess(process.raw(), 1);
-        }
+        kill_unassigned_root(&process);
         return Err(io::Error::other("injected failure before Job assignment"));
     }
     if unsafe { AssignProcessToJobObject(jobs.root.handle.raw(), process.raw()) } == 0 {
         let error = last_error();
-        unsafe {
-            TerminateProcess(process.raw(), 1);
-        }
+        kill_unassigned_root(&process);
         return Err(error);
     }
     #[cfg(test)]
     if fault == SpawnFault::RealAssignFailure {
-        terminate_jobs(&jobs);
+        terminate_job_and_wait(&jobs.root, &process);
         return Err(io::Error::other(
             "expected active-process limit to reject Job assignment",
         ));
     }
     #[cfg(test)]
     if fault == SpawnFault::BeforeResume {
-        terminate_jobs(&jobs);
+        terminate_job_and_wait(&jobs.root, &process);
         return Err(io::Error::other("injected failure before root resume"));
     }
     if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
         let error = last_error();
-        terminate_jobs(&jobs);
+        terminate_job_and_wait(&jobs.root, &process);
         return Err(error);
     }
     drop(thread);
     drop(attributes);
-    drop(stdio.stdin);
-    drop(stdio.stdout);
-    drop(stdio.stderr);
-    drop(creation_guard);
-
-    Ok(DebugThreadRoot {
+    let root = SuspendedRoot {
         process,
         jobs,
-        root_pid: info.dwProcessId,
+        pid: info.dwProcessId,
         stdin: stdio.parent_stdin.take(),
         stdout: stdio.parent_stdout.take(),
         stderr: stdio.parent_stderr.take(),
-    })
+    };
+    // The parent's copies of the child ends must not outlive creation, or the
+    // pipes never reach EOF when the child exits.
+    drop(stdio);
+    drop(creation_guard);
+
+    Ok(root)
+}
+
+/// Kill a root the Job Object does not own yet — the process would otherwise
+/// survive the failed creation, since no Job was assigned to reap it.
+fn kill_unassigned_root(process: &OwnedHandle) {
+    unsafe {
+        TerminateProcess(process.raw(), 1);
+        WaitForSingleObject(process.raw(), INFINITE);
+    }
 }
 
 impl Debugger {
     async fn finish(&mut self, deadline: tokio::time::Instant) -> io::Result<()> {
-        while self
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-        {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for Windows descendant debugger",
-                ));
-            }
-            tokio::time::sleep_until(
-                deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
-            )
-            .await;
+        let cleared = super::wait_until_clear(deadline, || {
+            Ok(self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished()))
+        })
+        .await?;
+        if !cleared {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for Windows descendant debugger",
+            ));
         }
         if let Some(thread) = self.thread.take() {
             thread
@@ -1498,17 +1407,11 @@ fn wait_process(handle: &OwnedHandle) -> io::Result<()> {
 }
 
 async fn wait_tree_empty(killer: &Killer, deadline: tokio::time::Instant) -> io::Result<()> {
-    while killer.is_alive()? {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Windows Job Object did not become empty",
-            ));
-        }
-        tokio::time::sleep_until(
-            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
-        )
-        .await;
+    if !super::wait_until_clear(deadline, || killer.is_alive()).await? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Windows Job Object did not become empty",
+        ));
     }
     Ok(())
 }

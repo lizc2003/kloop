@@ -7,6 +7,7 @@ mod agent_gate;
 mod agent_message;
 pub(crate) mod args;
 mod background_executions;
+mod background_registry;
 mod bash;
 mod builtin;
 mod codemode;
@@ -166,6 +167,16 @@ const BASH_TIMEOUT_GRACE: Duration = Duration::from_secs(30);
 /// its future is dropped. Capped at the budget itself, so a small budget is not
 /// dwarfed by its own settle window.
 const CANCEL_SETTLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Cap on a failure text reinjected into the model's context: room for a stack
+/// trace and the frames that matter, short enough not to buy a turn of context.
+const MAX_REINJECT_ERROR_CHARS: usize = 3600;
+
+/// Clip a reinjected failure to [`MAX_REINJECT_ERROR_CHARS`], keeping the head —
+/// the error class and first frames — and saying so when it cut.
+fn clip_error(text: &str) -> String {
+    kloop_protocol::clip_chars(text, MAX_REINJECT_ERROR_CHARS, "… (error truncated)").into_owned()
+}
 
 /// The budget for one call, from whoever owns the tool: the built-in table, or
 /// the source that advertised it. An unknown name gets none — it fails on the
@@ -5047,5 +5058,16 @@ mod stop_tests {
             .expect("the stop withdraws the wait instead of leaving it hanging");
         assert_eq!(settled.unwrap(), (NOT_RUN_STOPPED.to_string(), true));
         assert!(reply.is_closed(), "nobody is waiting for this answer now");
+    }
+
+    /// The sub-agent and the Program share one cap and one suffix, so a failure
+    /// reads the same whichever producer reinjected it.
+    #[test]
+    fn clip_error_caps_only_long_failures() {
+        assert_eq!(clip_error("short"), "short");
+        let long = "x".repeat(MAX_REINJECT_ERROR_CHARS + 500);
+        let out = clip_error(&long);
+        assert!(out.ends_with("… (error truncated)"));
+        assert!(out.chars().count() < long.chars().count());
     }
 }

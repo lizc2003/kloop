@@ -178,14 +178,11 @@ impl Killer {
 
 async fn wait_tree_empty(killer: &Killer, timeout: Duration) -> io::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
-    while killer.is_alive()? {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("process group {} did not exit", killer.tree.pid),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    if !super::wait_until_clear(deadline, || killer.is_alive()).await? {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("process group {} did not exit", killer.tree.pid),
+        ));
     }
     killer.tree.terminated.store(true, Ordering::Release);
     Ok(())

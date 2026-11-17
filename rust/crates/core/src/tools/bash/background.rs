@@ -88,20 +88,15 @@ pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> 
     // wakes on the one change that matters instead of polling the table.
     let mut activity = shells.activity();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-    let (status, path, sandboxed) = loop {
-        let Some((status, path, sandboxed)) = shells.snapshot(id) else {
-            bail!("bash_output: no background command with id {id}");
-        };
-        if !status.is_active() || !block || tokio::time::Instant::now() >= deadline {
-            break (status, path, sandboxed);
-        }
-        match tokio::time::timeout_at(deadline, activity.changed()).await {
-            // Any wake re-reads the table: the change may belong to another
-            // shell, and every read is cheap next to a 100ms poll cycle.
-            Ok(Ok(())) | Err(_) => {}
-            // The registry is gone; the session is tearing down.
-            Ok(Err(_)) => break (status, path, sandboxed),
-        }
+    let Some((status, path, sandboxed)) = crate::tools::background_registry::wait_until(
+        &mut activity,
+        deadline,
+        || shells.snapshot(id),
+        |(status, _, _)| !block || !status.is_active(),
+    )
+    .await
+    else {
+        bail!("bash_output: no background command with id {id}");
     };
     let status_line = wait_status_line(id, &status, block, timeout_ms);
     let mut tail = read_tail(&path).await;
@@ -142,21 +137,14 @@ pub(in crate::tools) async fn stop_bash_tool(input: &Value, ctx: &ToolCtx) -> Re
     // a tree that is still dying is how a later call gets a surprise.
     let mut activity = shells.activity();
     let deadline = tokio::time::Instant::now() + STOP_CONFIRM_TIMEOUT;
-    let status = loop {
-        match shells.snapshot(id) {
-            Some((status, _, _)) if status.is_active() => {
-                if tokio::time::Instant::now() >= deadline {
-                    break status;
-                }
-                match tokio::time::timeout_at(deadline, activity.changed()).await {
-                    Ok(Ok(())) | Err(_) => {}
-                    Ok(Err(_)) => break status,
-                }
-            }
-            Some((status, _, _)) => break status,
-            None => break BgStatus::Stopping,
-        }
-    };
+    let status = crate::tools::background_registry::wait_until(
+        &mut activity,
+        deadline,
+        || shells.snapshot(id).map(|(status, _, _)| status),
+        |status| !status.is_active(),
+    )
+    .await
+    .unwrap_or(BgStatus::Stopping);
     Ok(stop_report(id, &command, &status))
 }
 
@@ -572,84 +560,52 @@ impl BackgroundShells {
     /// monitors to reap their direct children. Returns the number still active
     /// after `timeout` (normally zero).
     pub(crate) async fn shutdown(&self, timeout: Duration) -> usize {
-        let kills = {
-            let mut registry = self.state.lock().unwrap();
-            registry.closed = true;
-            registry
-                .shells
-                .values_mut()
-                .filter_map(|shell| {
-                    if matches!(&shell.status, BgStatus::Running) {
-                        shell.status = BgStatus::Stopping;
-                        *shell.stop_reason.lock().unwrap() = Some("session shutdown".into());
-                        Some(shell.kill.clone())
-                    } else if matches!(&shell.status, BgStatus::Stopping) {
-                        Some(shell.kill.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-        for kill in kills {
-            kill.cancel();
-        }
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        let mut activity = self.activity.subscribe();
-        loop {
-            let active = self
-                .state
-                .lock()
-                .unwrap()
-                .shells
-                .values()
-                .filter(|shell| shell.status.is_active())
-                .count();
-            if active == 0 {
-                return 0;
-            }
-            if tokio::time::timeout_at(deadline, activity.changed())
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-
-        let killers = self
-            .state
-            .lock()
-            .unwrap()
-            .shells
-            .values()
-            .filter(|shell| shell.status.is_active())
-            .filter_map(|shell| shell.killer.clone())
-            .collect::<Vec<_>>();
-        for killer in killers {
-            let _ = killer.terminate();
-        }
-
-        let hard_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            let active = self
-                .state
-                .lock()
-                .unwrap()
-                .shells
-                .values()
-                .filter(|shell| shell.status.is_active())
-                .count();
-            if active == 0 {
-                return 0;
-            }
-            if tokio::time::timeout_at(hard_deadline, activity.changed())
-                .await
-                .is_err()
-            {
-                return active;
-            }
-        }
+        crate::tools::background_registry::shutdown(
+            &self.activity,
+            timeout,
+            || {
+                let kills = {
+                    let mut registry = self.state.lock().unwrap();
+                    registry.closed = true;
+                    registry
+                        .shells
+                        .values_mut()
+                        .filter_map(|shell| match shell.status {
+                            BgStatus::Running => {
+                                shell.status = BgStatus::Stopping;
+                                *shell.stop_reason.lock().unwrap() =
+                                    Some("session shutdown".into());
+                                Some(shell.kill.clone())
+                            }
+                            BgStatus::Stopping => Some(shell.kill.clone()),
+                            BgStatus::Finishing
+                            | BgStatus::Exited(_)
+                            | BgStatus::Killed(_)
+                            | BgStatus::Failed(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for kill in kills {
+                    kill.cancel();
+                }
+            },
+            || {
+                let killers = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .shells
+                    .values()
+                    .filter(|shell| shell.status.is_active())
+                    .filter_map(|shell| shell.killer.clone())
+                    .collect::<Vec<_>>();
+                for killer in killers {
+                    let _ = killer.terminate();
+                }
+            },
+            || self.running_count(),
+        )
+        .await
     }
 }
 

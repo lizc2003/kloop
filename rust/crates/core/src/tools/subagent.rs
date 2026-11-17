@@ -17,9 +17,7 @@ use crate::agent::run_turn_in_execution;
 use crate::agent_type::AgentType;
 use crate::config::Config;
 use crate::config::EffectiveWorkspace;
-use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
-use crate::event::BackgroundTaskStatus;
 use crate::event::Event;
 use crate::event::Item;
 use crate::event::ItemStatus;
@@ -43,11 +41,6 @@ use crate::rollout::session_path;
 use crate::skills::Skill;
 use crate::worktree;
 use kloop_protocol::Message;
-
-/// Cap on a background sub-agent's reinjected error text (~900 tokens, codex's
-/// error-branch limit). A successful result is passed through verbatim; only a
-/// failure is truncated, since its noise shouldn't crowd the parent's context.
-const MAX_REINJECT_ERROR_CHARS: usize = 3600;
 
 pub(crate) struct Admitted<T> {
     pub(crate) value: T,
@@ -500,33 +493,6 @@ pub(super) fn emit_agent_end(ui: &Arc<dyn crate::agent::Ui>, label: &str, ok: bo
     });
 }
 
-pub(super) fn emit_background_task(
-    ui: &Arc<dyn crate::agent::Ui>,
-    label: &str,
-    run_id: Option<&str>,
-    kind: BackgroundTaskKind,
-    description: &str,
-    status: ExecutionStatus,
-    detail: Option<String>,
-) {
-    let status = match status {
-        ExecutionStatus::Running => BackgroundTaskStatus::Running,
-        ExecutionStatus::Completed | ExecutionStatus::MaxRounds => BackgroundTaskStatus::Completed,
-        ExecutionStatus::Failed => BackgroundTaskStatus::Failed,
-        ExecutionStatus::Aborted => BackgroundTaskStatus::Cancelled,
-    };
-    ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
-        id: label.to_string(),
-        run_id: run_id.map(str::to_string),
-        kind,
-        description: description.to_string(),
-        command: None,
-        status,
-        output_path: None,
-        detail,
-    }));
-}
-
 /// Run a sub-agent synchronously and map its outcome to a tool result. The
 /// sub-agent runs as its OWN tokio task — besides matching the semantics, this
 /// breaks the recursion cycle (execute_tool -> run_turn -> dispatch_tools ->
@@ -884,13 +850,14 @@ async fn spawn_background(
     let subagent_of = ctx.parent_rollout_id.clone();
     let session_note = child_session_note(&sub_cfg, subagent_of.as_deref());
     let description = preview.to_string();
-    emit_background_task(
+    super::background_registry::emit(
         &ui,
         &agent,
         None,
         BackgroundTaskKind::Agent,
         &description,
         ExecutionStatus::Running,
+        None,
         None,
     );
 
@@ -987,13 +954,14 @@ async fn spawn_background(
                 },
             );
             if let Some(terminal) = terminal {
-                emit_background_task(
+                super::background_registry::emit(
                     &ui,
                     &label,
                     None,
                     BackgroundTaskKind::Agent,
                     &description,
                     terminal,
+                    None,
                     background_terminal_detail(terminal, cleanup_detail),
                 );
             }
@@ -1084,7 +1052,7 @@ fn classify_background(outcome: TurnOutcome) -> (ExecutionStatus, Option<String>
             ExecutionStatus::Failed,
             Some(format!(
                 "[sub-agent failed] {}\nYou may re-dispatch it or try another approach.",
-                truncate_error(&e.to_string())
+                super::clip_error(&e.to_string())
             )),
         ),
         EndReason::Aborted => (ExecutionStatus::Aborted, None),
@@ -1124,10 +1092,6 @@ fn background_terminal_detail(
         }
     }
     detail
-}
-
-fn truncate_error(e: &str) -> String {
-    kloop_protocol::clip_chars(e, MAX_REINJECT_ERROR_CHARS, "… (error truncated)").into_owned()
 }
 
 /// Build a child through Config's lifecycle constructor, freezing the one
@@ -1187,6 +1151,8 @@ fn agent_preview(prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::Ui;
+    use crate::event::BackgroundTask;
+    use crate::event::BackgroundTaskStatus;
     use crate::tools::dispatch_tools;
     use crate::tools::testutil::*;
     use kloop_protocol::AssistantBlock;
@@ -3211,15 +3177,6 @@ mod tests {
             None,
             "natural completion reports the location through its reinjected result"
         );
-    }
-
-    #[test]
-    fn truncate_error_caps_only_long_failures() {
-        assert_eq!(truncate_error("short"), "short");
-        let long = "x".repeat(MAX_REINJECT_ERROR_CHARS + 500);
-        let out = truncate_error(&long);
-        assert!(out.ends_with("… (error truncated)"));
-        assert!(out.chars().count() < long.chars().count());
     }
 
     #[test]

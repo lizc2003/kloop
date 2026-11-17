@@ -22,9 +22,7 @@ use super::run_store::RunLease;
 use super::run_store::RunNamespace;
 use super::run_store::RunStore;
 use crate::config::EffectiveWorkspace;
-use crate::event::BackgroundTask;
 use crate::event::BackgroundTaskKind;
-use crate::event::BackgroundTaskStatus;
 use crate::event::Event;
 use crate::execution_provenance::AdmissionAuthority;
 use crate::execution_provenance::AdmissionOrigin;
@@ -278,10 +276,11 @@ fn launch_workflow(
         run_id_text.clone(),
         description.clone(),
     ));
-    emit_workflow(
+    super::background_registry::emit(
         &ui,
         &execution_id,
-        &run_id_text,
+        Some(&run_id_text),
+        BackgroundTaskKind::Workflow,
         &description,
         ExecutionStatus::Running,
         None,
@@ -345,10 +344,11 @@ fn launch_workflow(
             },
         );
         if let Some(terminal) = terminal {
-            emit_workflow(
+            super::background_registry::emit(
                 &ui,
                 &execution_id_for_supervisor,
-                &supervisor_run_id,
+                Some(&supervisor_run_id),
+                BackgroundTaskKind::Workflow,
                 &supervisor_description,
                 terminal,
                 Some(output_path.to_string_lossy().to_string()),
@@ -389,33 +389,6 @@ fn execution_status_detail(status: ExecutionStatus) -> Option<String> {
         ExecutionStatus::MaxRounds => Some("stopped at round limit".into()),
         ExecutionStatus::Aborted => Some("stopped".into()),
     }
-}
-
-fn emit_workflow(
-    ui: &Arc<dyn crate::agent::Ui>,
-    id: &str,
-    run_id: &str,
-    description: &str,
-    status: ExecutionStatus,
-    output_path: Option<String>,
-    detail: Option<String>,
-) {
-    let status = match status {
-        ExecutionStatus::Running => BackgroundTaskStatus::Running,
-        ExecutionStatus::Completed | ExecutionStatus::MaxRounds => BackgroundTaskStatus::Completed,
-        ExecutionStatus::Failed => BackgroundTaskStatus::Failed,
-        ExecutionStatus::Aborted => BackgroundTaskStatus::Cancelled,
-    };
-    ui.emit(&Event::BackgroundTaskUpdated(BackgroundTask {
-        id: id.to_string(),
-        run_id: Some(run_id.to_string()),
-        kind: BackgroundTaskKind::Workflow,
-        description: description.to_string(),
-        command: None,
-        status,
-        output_path,
-        detail,
-    }));
 }
 
 struct WorkflowBridge {
@@ -524,10 +497,11 @@ impl HostBridge for WorkflowBridge {
     }
 
     fn phase(&self, title: String) {
-        emit_workflow(
+        super::background_registry::emit(
             &self.ctx.ui,
             &self.workflow_id,
-            &self.run_id,
+            Some(&self.run_id),
+            BackgroundTaskKind::Workflow,
             &self.description,
             ExecutionStatus::Running,
             None,
@@ -545,6 +519,8 @@ fn copy_option(opts: &Value, output: &mut Value, source: &str, target: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::BackgroundTask;
+    use crate::event::BackgroundTaskStatus;
     use crate::tools::testutil::*;
 
     fn enabled_ctx(tag: &str) -> ToolCtx {

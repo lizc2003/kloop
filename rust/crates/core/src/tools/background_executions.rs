@@ -525,57 +525,52 @@ impl BackgroundExecutions {
         Ok(description)
     }
 
-    async fn wait_idle_until(&self, deadline: tokio::time::Instant) -> bool {
-        let mut activity = self.activity.subscribe();
-        loop {
-            if self.running_count() == 0 {
-                return true;
-            }
-            if tokio::time::timeout_at(deadline, activity.changed())
-                .await
-                .is_err()
-            {
-                return false;
-            }
-        }
-    }
-
     /// Close the registry, cooperatively stop every active worker, and wait for
     /// their supervisors to publish terminal states. At the deadline abort the
     /// workers; supervisors still run and finish the lifecycle.
     pub(crate) async fn shutdown(&self, timeout: Duration) -> usize {
-        {
-            let mut registry = self.state.lock().unwrap();
-            registry.closed = true;
-            for entry in registry.executions.values_mut() {
-                if entry.state == ExecutionState::Running {
-                    entry.state = ExecutionState::CancelRequested;
-                    entry.cancel.cancel();
+        super::background_registry::shutdown(
+            &self.activity,
+            timeout,
+            || {
+                let cancels = {
+                    let mut registry = self.state.lock().unwrap();
+                    registry.closed = true;
+                    registry
+                        .executions
+                        .values_mut()
+                        .filter_map(|entry| match entry.state {
+                            ExecutionState::Running => {
+                                entry.state = ExecutionState::CancelRequested;
+                                Some(entry.cancel.clone())
+                            }
+                            ExecutionState::CancelRequested
+                            | ExecutionState::Finishing(_)
+                            | ExecutionState::Terminal(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for cancel in cancels {
+                    cancel.cancel();
                 }
-            }
-        }
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        if self.wait_idle_until(deadline).await {
-            return 0;
-        }
-
-        let aborts: Vec<AbortHandle> = self
-            .state
-            .lock()
-            .unwrap()
-            .executions
-            .values()
-            .filter(|entry| entry.state.is_active())
-            .filter_map(|entry| entry.abort.clone())
-            .collect();
-        for abort in aborts {
-            abort.abort();
-        }
-        let _ = self
-            .wait_idle_until(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await;
-        self.running_count()
+            },
+            || {
+                let aborts: Vec<AbortHandle> = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .executions
+                    .values()
+                    .filter(|entry| entry.state.is_active())
+                    .filter_map(|entry| entry.abort.clone())
+                    .collect();
+                for abort in aborts {
+                    abort.abort();
+                }
+            },
+            || self.running_count(),
+        )
+        .await
     }
 }
 

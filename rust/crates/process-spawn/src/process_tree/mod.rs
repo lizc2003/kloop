@@ -22,6 +22,27 @@ use windows as platform;
 pub type ProcessPipe = Pin<Box<dyn AsyncRead + Send>>;
 pub type ProcessWriter = Pin<Box<dyn AsyncWrite + Send>>;
 
+/// How often a tree that was told to die is re-checked. The wait is bounded by
+/// the caller's deadline, never by this cadence.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Poll `still_running` until it clears or `deadline` passes. `Ok(false)` means
+/// the deadline expired with the tree still alive; each platform names its own
+/// timeout error.
+pub(super) async fn wait_until_clear(
+    deadline: tokio::time::Instant,
+    mut still_running: impl FnMut() -> io::Result<bool>,
+) -> io::Result<bool> {
+    while still_running()? {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep_until(deadline.min(now + POLL_INTERVAL)).await;
+    }
+    Ok(true)
+}
+
 pub enum ProcessStdio {
     Null,
     Pipe,

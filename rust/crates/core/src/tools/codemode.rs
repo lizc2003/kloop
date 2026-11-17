@@ -54,11 +54,6 @@ use kloop_codemode::HostBridge;
 use kloop_protocol::ContentBlock;
 use kloop_protocol::ToolDef;
 
-/// Cap on a background program's reinjected error text, matching the sub-agent
-/// error cap (~900 tokens). A successful return value is passed through; only a
-/// failure is truncated so its noise can't crowd the parent's context.
-const MAX_PROGRAM_ERROR_CHARS: usize = 3600;
-
 /// Cap on a tool's label in the program manifest. Long enough to disambiguate a
 /// call, short enough that the manifest stops being a second copy of the tool
 /// catalog — see [`summary_line`].
@@ -444,13 +439,14 @@ fn spawn_background_program(
         Some(journal.clone()),
         program_tool_manifest,
     ));
-    super::subagent::emit_background_task(
+    super::background_registry::emit(
         &ui,
         &label,
         Some(&run_id),
         BackgroundTaskKind::Program,
         &description,
         ExecutionStatus::Running,
+        None,
         None,
     );
 
@@ -499,13 +495,14 @@ fn spawn_background_program(
                 },
             );
             if let Some(terminal) = terminal {
-                super::subagent::emit_background_task(
+                super::background_registry::emit(
                     &ui,
                     &label,
                     Some(&supervisor_run_id),
                     BackgroundTaskKind::Program,
                     &description,
                     terminal,
+                    None,
                     super::subagent::execution_status_detail(terminal),
                 );
             }
@@ -532,7 +529,7 @@ fn classify_program(
         Err(e) => {
             let mut msg = format!(
                 "[background program failed] {}",
-                truncate_program_error(&format!("{e:#}"))
+                super::clip_error(&format!("{e:#}"))
             );
             // Resumable iff it journaled completed agent() calls.
             if journal.is_active() {
@@ -546,10 +543,6 @@ fn classify_program(
             (ExecutionStatus::Failed, Some(msg))
         }
     }
-}
-
-fn truncate_program_error(e: &str) -> String {
-    kloop_protocol::clip_chars(e, MAX_PROGRAM_ERROR_CHARS, "… (error truncated)").into_owned()
 }
 
 /// The bridge core hands the engine: it owns a [`ToolCtx`] clone and turns each
