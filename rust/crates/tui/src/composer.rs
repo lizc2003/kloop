@@ -319,6 +319,18 @@ impl ComposerDocument {
         self.atoms.get_mut(index)
     }
 
+    /// Replace the label at `index` with `text` in one splice, while the label
+    /// still separates the text on both sides. Removing the label first and
+    /// inserting at its old start is not the same thing: without the label the
+    /// sides can form one grapheme (two regional indicators do), and that start
+    /// is then inside it — a position `replace` rightly refuses.
+    fn replace_pending_with_text(&mut self, index: usize, text: &str) -> ByteOffset {
+        let atom = self.atoms.remove(index);
+        let cursor = self.replace_raw(atom.range, text);
+        self.assert_invariants();
+        cursor
+    }
+
     fn materialize_intersections(&mut self, mut range: TextRange) -> TextRange {
         if range.is_empty() {
             return range;
@@ -908,24 +920,26 @@ impl Composer {
     pub fn paste_text_at_reservation(&mut self, token: u64, text: &str) -> ReservationPaste {
         if let Some(index) = self.document.pending_index(token) {
             let atom = &self.document.atoms[index];
-            let at = atom.range.start();
-            let end = atom.range.end();
-            self.document.delete_atom(index);
-            let after = self.remap_cursor(at, end);
-            let inserted = self.document.replace(TextRange::empty(at), text);
-            // The caret follows the text it was standing after; standing before
-            // the label, it stays before the replacement.
-            self.cursor =
-                snap_grapheme_boundary(self.text(), if after >= at { inserted } else { after });
+            let (at, end) = (atom.range.start(), atom.range.end());
+            // The caret follows the replacement when it rested after the label
+            // and stays put before it. Computed against the pre-splice text:
+            // once the label is gone the sides can join into one grapheme and
+            // the old offsets no longer name positions an edit can use.
+            let mapped = if self.cursor >= end {
+                ByteOffset::new(self.cursor.get() - (end.get() - at.get()) + text.len())
+            } else {
+                self.cursor
+            };
+            self.begin_edit();
+            self.document.replace_pending_with_text(index, text);
+            self.cursor = snap_grapheme_boundary(self.text(), mapped);
             self.goal_column = None;
             return ReservationPaste::Visible;
         }
         let Some(index) = self.draft.pending_index(token) else {
             return ReservationPaste::Gone;
         };
-        let at = self.draft.atoms[index].range.start();
-        self.draft.delete_atom(index);
-        self.draft.replace(TextRange::empty(at), text);
+        self.draft.replace_pending_with_text(index, text);
         ReservationPaste::Stashed
     }
 
@@ -1853,6 +1867,41 @@ mod tests {
             composer.paste_text_at_reservation(token, "late"),
             ReservationPaste::Gone
         );
+    }
+
+    /// The fallback replaces the label in one splice. Deleting it first would
+    /// leave its start inside the flag the two halves then form, and the insert
+    /// that follows has nowhere legal to go — the boundary assert would fire.
+    #[test]
+    fn a_text_fallback_splits_a_grapheme_the_label_was_holding_apart() {
+        let mut composer = Composer::new();
+        composer.insert_text("\u{1F1E8}");
+        let token = composer.reserve_image();
+        composer.insert_text("\u{1F1F3}");
+        composer.left();
+
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "note"),
+            ReservationPaste::Visible
+        );
+        assert_eq!(composer.text(), "\u{1F1E8}note\u{1F1F3}");
+        assert!(is_grapheme_boundary(composer.text(), composer.cursor()));
+        let _ = ComposerLayout::new(composer.text(), composer.cursor(), 80);
+
+        // The stashed draft takes the same path.
+        let mut composer = Composer::new();
+        composer.insert_text("old");
+        submitted(&mut composer);
+        composer.insert_text("\u{1F1E8}");
+        let token = composer.reserve_image();
+        composer.insert_text("\u{1F1F3}");
+        composer.up(WIDTH);
+        assert_eq!(
+            composer.paste_text_at_reservation(token, "note"),
+            ReservationPaste::Stashed
+        );
+        composer.down(WIDTH);
+        assert_eq!(composer.text(), "\u{1F1E8}note\u{1F1F3}");
     }
 
     /// The label can be in the draft history recall stashed. The replacement
