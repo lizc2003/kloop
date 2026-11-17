@@ -503,7 +503,7 @@ fn spawn_background_program(
                     &description,
                     terminal,
                     None,
-                    super::subagent::execution_status_detail(terminal),
+                    super::background_registry::status_detail(terminal),
                 );
             }
         }

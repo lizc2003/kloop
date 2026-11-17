@@ -449,6 +449,19 @@ impl BackgroundExecutions {
         Some(terminal)
     }
 
+    /// Executions whose work is done but whose result has not been delivered
+    /// yet. They stay in [`Self::running_count`] on purpose; this count exists
+    /// so a report can say "delivering" instead of "running".
+    pub(crate) fn finishing_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .executions
+            .values()
+            .filter(|entry| matches!(entry.state, ExecutionState::Finishing(_)))
+            .count()
+    }
+
     pub fn running_count(&self) -> usize {
         self.state
             .lock()
@@ -615,16 +628,13 @@ pub(super) async fn wait_for_activity_tool(input: &Value, ctx: &ToolCtx) -> Resu
         .unwrap_or(DEFAULT_WAIT_MS)
         .clamp(MIN_WAIT_MS, MAX_WAIT_MS);
     let inbox = &ctx.cfg.inbox;
-    let executions = &ctx.cfg.background_executions;
-    let shells = &ctx.cfg.background_shells;
     // Subscribe before checking all sources. Every producer publishes terminal
     // delivery through the inbox, so a completion racing these checks advances
     // this receiver instead of becoming a lost wakeup.
     let mut activity = inbox.subscribe_activity();
 
-    let execution_count = executions.running_count();
-    let shell_count = shells.running_count();
-    if execution_count == 0 && shell_count == 0 && inbox.is_empty() {
+    let work = ActiveWork::read(ctx);
+    if work.executions == 0 && work.shells == 0 && inbox.is_empty() {
         return Ok(
             "No background activity is running and nothing is pending. Start work with \
              run_agent {\"background\": true}, run_program {\"background\": true}, \
@@ -635,35 +645,70 @@ pub(super) async fn wait_for_activity_tool(input: &Value, ctx: &ToolCtx) -> Resu
     if !inbox.is_empty() {
         return Ok(status_report(
             "Background activity is ready and will be delivered on the next step.",
-            execution_count,
-            shell_count,
+            &work,
         ));
     }
     tokio::select! {
         _ = activity.changed() => Ok(status_report(
             "Background work finished or new input arrived. No result was consumed; pending results will be delivered automatically on the next step.",
-            executions.running_count(),
-            shells.running_count(),
+            &ActiveWork::read(ctx),
         )),
         _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => Ok(status_report(
             &format!("Timed out after {}s with no activity. This is not a background failure and consumed no result; pending results will still be delivered automatically. Do not call wait_for_activity again as a polling loop.", timeout_ms / 1000),
-            executions.running_count(),
-            shells.running_count(),
+            &ActiveWork::read(ctx),
         )),
         _ = ctx.cancel.cancelled() => Ok("Wait interrupted.".into()),
     }
 }
 
-fn status_report(head: &str, executions: usize, shells: usize) -> String {
-    let total = executions + shells;
-    match total {
-        0 => format!("{head} No background work is still running."),
-        1 => format!("{head} 1 background item is still running."),
-        _ => format!(
-            "{head} {total} background items are still running ({executions} \
-             agent/program/workflow, {shells} shell)."
-        ),
+/// What `wait_for_activity` counts as outstanding. Both registries keep a
+/// finished-but-undelivered item in their running count on purpose — a waiter
+/// must not read zero before the delivery exists — so the report keeps those
+/// apart instead of calling work that already finished "still running".
+struct ActiveWork {
+    executions: usize,
+    shells: usize,
+    delivering: usize,
+}
+
+impl ActiveWork {
+    fn read(ctx: &ToolCtx) -> Self {
+        let executions = &ctx.cfg.background_executions;
+        let shells = &ctx.cfg.background_shells;
+        Self {
+            executions: executions.running_count(),
+            shells: shells.running_count(),
+            delivering: executions.finishing_count() + shells.finishing_count(),
+        }
     }
+
+    fn total(&self) -> usize {
+        self.executions + self.shells
+    }
+}
+
+fn status_report(head: &str, work: &ActiveWork) -> String {
+    let total = work.total();
+    if total == 0 {
+        return format!("{head} No background work is still running.");
+    }
+    let running = total - work.delivering;
+    let mut state = match running {
+        0 => "No background work is still running".to_string(),
+        1 => "1 background item is still running".to_string(),
+        _ => format!("{running} background items are still running"),
+    };
+    match work.delivering {
+        0 => {}
+        1 => state.push_str("; 1 item already finished and its result is being delivered"),
+        n => state.push_str(&format!(
+            "; {n} items already finished and their results are being delivered"
+        )),
+    }
+    format!(
+        "{head} {state} ({} agent/program/workflow, {} shell).",
+        work.executions, work.shells
+    )
 }
 
 async fn stop_tool(
@@ -703,6 +748,47 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+
+    /// A timed-out wait must not call work that already finished "still
+    /// running": the model reads that as a reason to wait again.
+    #[test]
+    fn the_wait_report_names_finished_delivery_separately_from_running_work() {
+        assert_eq!(
+            status_report(
+                "Waiting.",
+                &ActiveWork {
+                    executions: 1,
+                    shells: 0,
+                    delivering: 1,
+                }
+            ),
+            "Waiting. No background work is still running; 1 item already finished and its \
+             result is being delivered (1 agent/program/workflow, 0 shell)."
+        );
+        assert_eq!(
+            status_report(
+                "Waiting.",
+                &ActiveWork {
+                    executions: 3,
+                    shells: 1,
+                    delivering: 2,
+                }
+            ),
+            "Waiting. 2 background items are still running; 2 items already finished and \
+             their results are being delivered (3 agent/program/workflow, 1 shell)."
+        );
+        assert_eq!(
+            status_report(
+                "Waiting.",
+                &ActiveWork {
+                    executions: 0,
+                    shells: 1,
+                    delivering: 0,
+                }
+            ),
+            "Waiting. 1 background item is still running (0 agent/program/workflow, 1 shell)."
+        );
+    }
 
     #[tokio::test]
     async fn wait_returns_immediately_when_nothing_is_running() {
@@ -1090,6 +1176,11 @@ mod tests {
                 registry.running_count(),
                 MAX_BACKGROUND_EXECUTIONS,
                 "Finishing must remain active until delivery exists"
+            );
+            assert_eq!(
+                registry.finishing_count(),
+                1,
+                "the one mid-delivery row is what the wait report calls delivering"
             );
             published.store(1, Ordering::SeqCst);
         });

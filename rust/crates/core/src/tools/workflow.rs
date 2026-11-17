@@ -352,7 +352,7 @@ fn launch_workflow(
                 &supervisor_description,
                 terminal,
                 Some(output_path.to_string_lossy().to_string()),
-                execution_status_detail(terminal),
+                super::background_registry::status_detail(terminal),
             );
         }
     });
@@ -379,16 +379,6 @@ fn persist_error(run_dir: &RunDir, error: String) -> (ExecutionStatus, String, s
 
 fn truncate(text: &str, max: usize) -> String {
     kloop_protocol::clip_chars(text, max, "… (truncated; see output file)").into_owned()
-}
-
-fn execution_status_detail(status: ExecutionStatus) -> Option<String> {
-    match status {
-        ExecutionStatus::Running => None,
-        ExecutionStatus::Completed => Some("completed".into()),
-        ExecutionStatus::Failed => Some("failed".into()),
-        ExecutionStatus::MaxRounds => Some("stopped at round limit".into()),
-        ExecutionStatus::Aborted => Some("stopped".into()),
-    }
 }
 
 struct WorkflowBridge {

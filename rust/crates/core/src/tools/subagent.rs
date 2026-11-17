@@ -1066,20 +1066,11 @@ fn classify_background(outcome: TurnOutcome) -> (ExecutionStatus, Option<String>
     }
 }
 
-pub(super) fn execution_status_detail(status: ExecutionStatus) -> Option<String> {
-    match status {
-        ExecutionStatus::Running | ExecutionStatus::Completed => None,
-        ExecutionStatus::Failed => Some("background agent failed".into()),
-        ExecutionStatus::MaxRounds => Some("stopped at round limit".into()),
-        ExecutionStatus::Aborted => Some("stopped".into()),
-    }
-}
-
 fn background_terminal_detail(
     status: ExecutionStatus,
     cleanup_detail: Option<String>,
 ) -> Option<String> {
-    let mut detail = execution_status_detail(status);
+    let mut detail = super::background_registry::status_detail(status);
     if status == ExecutionStatus::Aborted
         && let Some(cleanup) = cleanup_detail
     {

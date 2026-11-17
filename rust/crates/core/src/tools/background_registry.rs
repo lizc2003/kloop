@@ -118,3 +118,15 @@ pub(super) fn emit(
         detail,
     }));
 }
+
+/// The extra line a terminal row carries. The status itself already says
+/// completed, failed, or cancelled, so the detail only earns its place where the
+/// status cannot say what happened: a round-limited agent reports as completed,
+/// and a stop is what a preserved worktree location is appended to.
+pub(super) fn status_detail(status: ExecutionStatus) -> Option<String> {
+    match status {
+        ExecutionStatus::Running | ExecutionStatus::Completed | ExecutionStatus::Failed => None,
+        ExecutionStatus::MaxRounds => Some("stopped at round limit".into()),
+        ExecutionStatus::Aborted => Some("stopped".into()),
+    }
+}

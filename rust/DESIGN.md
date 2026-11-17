@@ -3392,10 +3392,14 @@ returns immediately with the ID and the output path. Companions:
   returns early. Both tool descriptions direct dependent steps here instead of
   `sleep` or shell polling, and the launch receipt includes a runnable example
   with the actual ID. Steps without that dependency can continue other work.
-  A wait that ran out of time says so — `still <state> after <timeout_ms>ms`,
-  for every active state including `Finishing` — while a peek or a finish
-  reports `running` / `completed (exit 0)` / `failed (exit N)` / `killed (reason)`,
-  plus the last 30k bytes of output (read the file with `read_file` for more).
+  A wait that ran out of time says so — `still <state> after <timeout_ms>ms` —
+  while a peek or a finish reports `running` / `completed (exit 0)` / `failed
+  (exit N)` / `killed (reason)`, plus the last 30k bytes of output (read the
+  file with `read_file` for more). A shell that finished but whose result is
+  still being delivered (`Finishing`) is the one active state that does not say
+  `still <state>`: it says `the command finished; its result is still being
+  delivered after <timeout_ms>ms`, because "still finishing" reads as work in
+  progress and sends the model back to wait for a job that is already over.
   That tail starts on a UTF-8 character boundary even when the byte offset would
   land inside a character. Read-only: skips the gate, joins concurrent batches.
   These are instructions to the model; unit tests of the text and early return
@@ -5010,7 +5014,11 @@ control remains resource specific:
   step truly needs to block for any shell, Agent, Program, Workflow, or Inbox
   activity. Results still arrive at the next step/final/idle delivery boundary if
   the tool is never called. A timeout is not a resource failure, consumes nothing,
-  and must not become a short-period polling loop.
+  and must not become a short-period polling loop. Its report separates work that
+  is still running from work that already finished and is delivering its result:
+  both registries count a finished-but-undelivered item as active on purpose (a
+  waiter must not read zero before the delivery exists), so the wording names
+  the delivery instead of calling that item running.
 - `stop_agent {agent_id}` accepts only `agent-*`.
 - `stop_program {program_id}` accepts only `program-*`.
 - `stop_workflow {workflow_id}` accepts only `workflow-*`, never durable `wf_*`.
@@ -5059,12 +5067,18 @@ only to locate the entry and provide wrong-tool diagnostics. It remains separate
 from the background-shell registry because shell output is file-backed; that
 registry stores its own typed shell receipt/registration. Both retain Plan 51's
 atomic stop-vs-completion arbitration, so panic/forced abort still publishes
-exactly one terminal state. Both registries project through the same session-
-scoped `BackgroundTaskUpdated` event; this shared DTO is the compatibility seam,
-not a forced internal merge. Agent, Program, and Workflow completion messages
-retain their canonical typed IDs as `[Agent agent-*]`, `[Program program-*] run
-run-*`, and `[Workflow workflow-*] run wf_*`; the private receipt is never placed
-in the message, and only the result body is eligible for offload.
+exactly one terminal state. The two registries keep separate state machines and
+separate tables, but what they do identically lives in
+`core/src/tools/background_registry.rs`: the activity watch and its `wait_until`,
+the close → cooperative cancel → wait → hard kill/abort → one more second →
+report-stragglers shutdown, and the emitter every supervisor calls — including
+the `ExecutionStatus` mapping and the only detail line a terminal row carries.
+The merge stops at the seam: a shell still kills a process tree and a detached
+execution still cancels and aborts a worker. Agent, Program, and Workflow
+completion messages retain their canonical typed IDs as `[Agent agent-*]`,
+`[Program program-*] run run-*`, and `[Workflow workflow-*] run wf_*`; the
+private receipt is never placed in the message, and only the result body is
+eligible for offload.
 
 The TUI renders this event as a session-owned lifecycle row, not as a turn-owned
 sub-agent row or an uncorrelated Note. Running/phase/terminal updates with the

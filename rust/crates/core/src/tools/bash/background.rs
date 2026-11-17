@@ -184,14 +184,19 @@ impl BgStatus {
 }
 
 /// The one line `bash_output` answers with. A wait that ran out of time says so
-/// and names how long it waited — for *every* active state, `Finishing`
-/// included: that one is not a finished job either, and reading it as a terminal
-/// report is exactly how a timed-out wait gets mistaken for a done one.
+/// and names how long it waited — for every active state. `Finishing` says what
+/// is actually outstanding: the command is over, only the delivery is not, and
+/// calling that "still running" sends the model back to wait for work that has
+/// already finished.
 fn wait_status_line(id: &str, status: &BgStatus, block: bool, timeout_ms: u64) -> String {
-    if block && status.is_active() {
-        format!("{id}: still {} after {timeout_ms}ms", status_text(status))
-    } else {
-        format!("{id}: {}", status_text(status))
+    match status {
+        BgStatus::Finishing if block => format!(
+            "{id}: the command finished; its result is still being delivered after {timeout_ms}ms"
+        ),
+        _ if block && status.is_active() => {
+            format!("{id}: still {} after {timeout_ms}ms", status_text(status))
+        }
+        _ => format!("{id}: {}", status_text(status)),
     }
 }
 
@@ -199,7 +204,7 @@ fn status_text(status: &BgStatus) -> String {
     match status {
         BgStatus::Running => "running".into(),
         BgStatus::Stopping => "stopping".into(),
-        BgStatus::Finishing => "finishing".into(),
+        BgStatus::Finishing => "finished; its result is being delivered".into(),
         BgStatus::Exited(Some(0)) => "completed (exit 0)".into(),
         BgStatus::Exited(Some(code)) => format!("failed (exit {code})"),
         BgStatus::Exited(None) => "failed (killed by signal)".into(),
@@ -409,6 +414,19 @@ impl BackgroundShells {
              without waiting; stop it with stop_bash.",
             path.display()
         ))
+    }
+
+    /// Shells whose command exited but whose result has not been delivered yet.
+    /// They stay in [`Self::running_count`] on purpose; the count is what a
+    /// waiter must not read as zero before the delivery exists.
+    pub(crate) fn finishing_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .shells
+            .values()
+            .filter(|shell| matches!(shell.status, BgStatus::Finishing))
+            .count()
     }
 
     pub fn running_count(&self) -> usize {
@@ -954,13 +972,18 @@ mod tests {
 
     /// A timed-out wait says so for every active state. `Finishing` is the one
     /// that used to fall through to the terminal shape, which made a wait that
-    /// gave up read like a job that finished — hit for real on a 600s wait.
+    /// gave up read like a job that finished — hit for real on a 600s wait. It
+    /// keeps saying the wait gave up, but names the delivery as what is
+    /// outstanding instead of implying the command is still running.
     #[test]
     fn a_timed_out_wait_is_reported_as_waiting_for_every_active_state() {
         for (status, line) in [
             (BgStatus::Running, "bg-1: still running after 30000ms"),
             (BgStatus::Stopping, "bg-1: still stopping after 30000ms"),
-            (BgStatus::Finishing, "bg-1: still finishing after 30000ms"),
+            (
+                BgStatus::Finishing,
+                "bg-1: the command finished; its result is still being delivered after 30000ms",
+            ),
             (BgStatus::Exited(Some(0)), "bg-1: completed (exit 0)"),
             (BgStatus::Exited(Some(2)), "bg-1: failed (exit 2)"),
             (BgStatus::Exited(None), "bg-1: failed (killed by signal)"),
