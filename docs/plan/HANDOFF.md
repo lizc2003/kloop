@@ -5,6 +5,21 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 268 ✅：后台执行 registry 统一（2026-11-17）**：用户定 (a)——只抽共享流程，不动三条生命周期。
+五条复核都成立，但第 1 条已经只剩两份：子 agent 的 supervisor 收尾在 plan 267 已抽成
+`run_supervised_child`。新增 `core/src/tools/background_registry.rs`，装 `wait_until`
+（订阅在读取之前，返回最后读数）、`shutdown`（关闭→协作取消→等 idle→硬杀/abort→再等 1 秒）
+与三处共用的 `emit`；shell 与 execution 各自保留表与状态机。`process_tree::wait_until_clear`
+收掉三份 10ms 轮询；`clip_error` 合并两份逐字相同的错误截断（workflow 的上限与后缀不同，不并）；
+Windows 的 `spawn_impl` 与 `create_debugged_root` 合成 `create_suspended_root`，`CreationMode`
+只决定 `DEBUG_PROCESS` 与 debugger 钩子，失败清理按「Job 是否已持有」分。第 3 条文案定案：
+detail 只说状态说不出的（Completed/Failed 不再给 detail，MaxRounds 与 Aborted 保留）；第 5 条：
+`wait_for_activity` 用两个 registry 新增的 `finishing_count` 分开「还在跑」与「已跑完在投递」，
+`bash_output` 的 `Finishing` 行改写为「命令已结束、结果仍在投递」。文案变更单独一个提交。
+验证：core lib 1453 通过、1 ignored，tui 353、server 27、process-spawn 17；`cargo check
+--workspace`；core/process-spawn clippy；fmt；`cargo xwin clippy` 交叉 Windows 通过（**未在 Windows
+执行**）；未跑全量 `make check`、parity、真实 API。教训 409、410。
+
 **Plan 267 ✅：工具契约单一来源（2026-11-17）**：六条全部成立。按用户定案不引入 schemars，
 保留手写 schema，新增 `tools/contract.rs` 供手写解析器与测试共用允许键表，并用
 `every_schema_matches_its_parsers_accepted_keys` 逐工具比对 `schema.properties`、逐键
@@ -1839,7 +1854,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **265** ✅ 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
 | **266** ✅ 权限判定一次产出 | `Verdict` 贯穿到执行;同一命令解析 5–7 次;两套 glob 语义;tree 选项两份 | 大 | 243、244、245 |
 | **267** ✅ 工具契约单一来源 | schema/解析/TS 声明三处分头演化;参数 helper 四份分叉;两个 `call_agent` bridge | 大 | 257 |
-| **268** 后台执行 registry 统一 | 三套关闭流程、三份轮询、supervisor 样板;Windows 进程创建 80 行重复 | 中 | 255、257 |
+| **268** ✅ 后台执行 registry 统一 | 三套关闭流程、三份轮询、supervisor 样板;Windows 进程创建 80 行重复 | 中 | 255、257 |
 | **269** 会话驱动器 | 四个前端各写 turn 生命周期，造成 250/258/259 里的三个 P1;开工先出设计稿 | 大 | 250、258、259 |
 | **270** 模块切分与测试整理 | `tools/mod.rs` 按职责拆;计划编号测试文件;测试临时目录八份 | 中 | 264、267 之后 |
 
@@ -5377,3 +5392,16 @@ schema 键与测试里的一张表比对，删掉 `RunAgentInput.model` 后测�
 wrapper、synonym 这类“先变形再分发”的入口，校验和变形必须是同一个函数；测试调用另一个
 近似函数，只会测到一个运行时不存在的契约。修法是让 `parse_call_tool` 同时供
 `unwrap_call_tool`、dispatch 错误路径和测试使用。
+
+409. **两段“只差一个 flag”的代码，差的往往不是那个 flag。** plan 268 的 Windows 创建两条路径看起来
+只差 `DEBUG_PROCESS`，真正的差异在失败清理：一条在 Assign 前杀进程、Assign 后杀 Job 并等句柄，
+另一条只杀进程、不等待。抽公共函数时按**状态**分（Job 是否已经持有这个进程），不要按“调用者是谁”
+分，否则会把两套清理都搬进共享函数、等于没合并。另两条：`CREATE_SUSPENDED` 下“最晚关掉父进程手里
+的子端句柄”这条顺序必须原样保留（否则管道永远读不到 EOF）；这种改动本机只能交叉编译，审查时要
+逐行对旧代码，别把“编译过”当成“运行过”。
+
+410. **计数正确，措辞也可以错；改措辞前先问这个数在回答谁的问题。** plan 268 的 `Finishing` 在
+`running_count` 里是刻意的（送达前不能读到零），但同一个数被拿去写“still running”，模型会以为
+还有活要等。修法不是把数改成 0，而是让报告分开「还在跑」与「已跑完、结果在投递」两个数，
+并把阻塞等待超时的行写成“命令已结束、结果仍在投递”。判据：共享一个计数之前，先分开它服务的
+两个问题（投递屏障 vs 状态描述），各自措辞。
