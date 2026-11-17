@@ -1242,7 +1242,7 @@ fn run_program_def_renders_a_typescript_api() {
     assert!(d.contains(r#"output_mode?: "content" | "count""#), "{d}");
     assert!(d.contains("declare function agent("), "{d}");
     assert!(
-        d.contains("type AgentOptions = { agent_type?: string; model?: string }"),
+        d.contains("type AgentOptions = { agent_type?: string | null; model?: string | null }"),
         "{d}"
     );
     assert!(d.contains("declare function parallel<T>"), "{d}");
@@ -1287,8 +1287,28 @@ fn ts_type_covers_common_shapes() {
         })),
         "{ x: number; y?: string }"
     );
+    assert_eq!(
+        ts_type(&json!({"type": ["string", "number"]})),
+        "string | number"
+    );
+    assert_eq!(
+        ts_type(&json!({"type": ["string", "null"]})),
+        "string | null"
+    );
+    assert_eq!(
+        ts_type(&json!({
+            "type": "object",
+            "properties": {"x": {"type": ["string", "null"]}},
+            "required": ["x"]
+        })),
+        "{ x: string | null }"
+    );
     // Unknown shapes degrade rather than lie.
     assert_eq!(ts_type(&json!({})), "unknown");
+    assert_eq!(
+        ts_type(&json!({"type": ["string", "null", "weird"]})),
+        "unknown"
+    );
 }
 
 #[test]
@@ -1882,6 +1902,6 @@ fn agent_options_are_projected_from_the_run_agent_schema() {
     ];
     assert_eq!(
         agent_options_type(&defs),
-        r#"{ agent_type?: "reviewer" | "coder"; model?: string }"#
+        r#"{ agent_type?: "reviewer" | "coder"; model?: string | null }"#
     );
 }

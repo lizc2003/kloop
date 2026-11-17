@@ -107,6 +107,11 @@ pub(super) fn validate_input(input: &Value) -> Result<()> {
     parse_bash_input(input).map(drop)
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    parse_bash_input(input).map(|_| ())
+}
+
 fn parse_bash_input(input: &Value) -> Result<BashInput> {
     super::optional_display_description(input, "bash")?;
     let mut parsed: BashInput =

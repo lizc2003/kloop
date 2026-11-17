@@ -78,11 +78,7 @@ fn timeout_ms(input: &Value) -> Result<u64> {
 }
 
 fn validate_input(input: &Value) -> Result<()> {
-    super::args::strict_object(
-        input,
-        &["command", "description", "timeout_ms"],
-        "powershell",
-    )?;
+    super::contract::strict(input, "powershell")?;
     super::optional_display_description(input, "powershell")?;
     Ok(())
 }

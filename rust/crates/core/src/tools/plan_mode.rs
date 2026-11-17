@@ -38,7 +38,7 @@ pub(super) async fn enter_plan_mode_tool(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
-    super::args::strict_object(input, &[], "enter_plan_mode")?;
+    super::contract::strict(input, "enter_plan_mode")?;
     if ctx.depth >= 1 {
         bail!("enter_plan_mode: only the top-level agent can enter plan mode");
     }
@@ -88,7 +88,7 @@ pub(super) async fn exit_plan_mode_tool(
     if ctx.depth >= 1 {
         bail!("exit_plan_mode: only the top-level agent can leave plan mode");
     }
-    super::args::strict_object(input, &["plan"], "exit_plan_mode")?;
+    super::contract::strict(input, "exit_plan_mode")?;
     let perms = &workspace.permissions;
     if perms.mode() != Mode::Plan {
         bail!("exit_plan_mode: the session is not in plan mode, so there is nothing to exit");

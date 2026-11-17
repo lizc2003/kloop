@@ -119,6 +119,13 @@ struct QuestionToolInput {
     _annotations: Option<Value>,
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    serde_json::from_value::<QuestionToolInput>(input.clone())
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 pub(super) async fn ask_user_question_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     if ctx.depth >= 1 {
         bail!("ask_user_question: only the top-level agent can ask the user questions");

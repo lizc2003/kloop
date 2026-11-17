@@ -61,11 +61,14 @@
 
 六条全部成立并按 (b) 落地。
 
-1. **一致性测试**：`builtin.rs` 新增 `every_schema_matches_its_parsers_accepted_keys`，
-   走 `Builtin::ALL`，逐工具断言 `schema.properties` 键集合 == 解析接受的键集合；
-   `workflow` 的 `name` 是解析器会读、schema 漏掉的字段，补进 schema 并说明
-   “named workflow registry 未实现”。`read_file`/`write_file`/`edit_file`/`grep`/`glob`/
-   `exit_plan_mode`/`skill` 的 schema 补 `additionalProperties: false`。
+1. **一致性测试**：新增 `tools/contract.rs`，手写解析器统一经 `contract::strict` 使用
+   `CONTRACTS` 的允许键集合；`builtin.rs` 的
+   `every_schema_matches_its_parsers_accepted_keys` 走 `Builtin::ALL`，既比较
+   `schema.properties` 与这份共用键表，又逐键探测真实解析器（serde 工具直接反序列化，
+   其余走共用的 key gate），最后用未知字段确认解析器确实拒绝。`workflow` 的 `name`
+   是解析器会读、schema 漏掉的字段，补进 schema 并说明“named workflow registry 未实现”。
+   `read_file`/`write_file`/`edit_file`/`grep`/`glob`/`exit_plan_mode`/`skill` 的 schema
+   补 `additionalProperties: false`。
 2. **`tools/args.rs`**：`object`/`strict_object`/`required_str`/`optional_str`/
    `optional_bool`/`bool_or`/`integer_arg`/`bounded_diagnostic` 一份；显式 `null`
    统一当省略，回显按字符限长去控制字符；缺失参数仍列出调用实际携带的其它 key。
@@ -85,7 +88,9 @@
    `ARGUMENT_SYNONYMS` 的精确无歧义重命名；`concurrency_safe` 的文档从 `timeout` 移回。
 
 **AgentOptions**：`codemode::agent_options_type` 从 `builtins` 里的 `run_agent` schema
-投影 `agent_type`/`model` 生成；`ts_type` 支持 `["string","null"]`。编排类型仍手写。
+投影 `agent_type`/`model` 生成；`ts_type` 对联合类型生成完整 TypeScript 联合
+（`["string","number"]` → `string | number`，`["string","null"]` → `string | null`），
+无法准确转换的形状保留 `unknown`。编排类型仍手写。
 
 **模型可见措辞变化**（原有断言同步更新）：
 - 未知字段：`unexpected parameter 'x'` / `unexpected input field "x"; accepted: …` /
@@ -98,7 +103,17 @@
   “whole number of 0 or more”，0 仍是 “positive integer”。
 - plan 58/56/53 的 parity 断言按新措辞更新；本机未跑外部 parity 语料。
 
+**提交后复审修复（同日）**：
+- `ts_type` 原先把联合类型收窄成第一个非 `null` 类型，`["string","number"]` 被写成
+  `string`，必填 nullable 字段也丢掉 `null`，会向模型提供错误的 Program API；
+  改为生成完整联合，未知类型保留 `unknown`，并补 `["string","number"]` /
+  `["string","null"]` / 嵌套 nullable 的断言。
+- 一致性测试原先只比较 schema 与另一份手写表，删掉 `RunAgentInput.model` 仍会通过；
+  改为 `contract.rs` 供手写解析器与测试共用键表，并对 serde 工具逐键调用真实解析器，
+  再用未知字段确认拒绝。
+
 **验证**：`cargo test -p kloop-core --lib` 1451 通过、1 ignored（含新增
-schema/parser 一致性、`args` null/限长、structured 严格输入）；`cargo clippy -p
-kloop-core --all-targets -- -D warnings`；`cargo fmt --all -- --check`；
-`cargo check --workspace`。未跑 `make check`、外部 parity 语料、真实 API。
+schema/parser 一致性与真实解析器探测、`args` null/限长、structured 严格输入、完整联合
+类型）；`cargo clippy -p kloop-core --all-targets -- -D warnings`；
+`cargo fmt --all -- --check`；`cargo check --workspace`。未跑 `make check`、外部
+parity 语料、真实 API。

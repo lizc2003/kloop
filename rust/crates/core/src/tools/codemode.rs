@@ -76,6 +76,13 @@ struct RunProgramInput {
     resume_from_run_id: Option<String>,
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    serde_json::from_value::<RunProgramInput>(input.clone())
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 const PROGRAM_MANIFEST_VERSION: u8 = 1;
 
 #[derive(Deserialize, Serialize)]
@@ -903,21 +910,41 @@ fn agent_options_type(builtins: &[ToolDef]) -> String {
 }
 
 /// Minimal JSON-Schema → TypeScript type. Covers the shapes the built-in tool
-/// schemas actually use (object/array/string+enum/number/boolean); anything
-/// unrecognized degrades to `unknown` rather than lying about the type.
+/// schemas actually use (object/array/string+enum/number/boolean/null unions);
+/// anything unrecognized degrades to `unknown` rather than lying about the type.
 fn ts_type(schema: &Value) -> String {
-    // A nullable union (`["string", "null"]`) is still a string field: the
-    // schemas mark the field optional separately with `required`.
-    let kind = match schema.get("type") {
-        Some(Value::String(kind)) => Some(kind.as_str()),
-        Some(Value::Array(kinds)) => kinds
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|kind| *kind != "null"),
-        _ => None,
-    };
+    match schema.get("type") {
+        Some(Value::String(kind)) => ts_type_kind(schema, kind),
+        Some(Value::Array(kinds)) => {
+            let mut rendered = Vec::new();
+            for kind in kinds {
+                let Some(kind) = kind.as_str() else {
+                    return "unknown".into();
+                };
+                if !matches!(
+                    kind,
+                    "string" | "integer" | "number" | "boolean" | "null" | "array" | "object"
+                ) {
+                    return "unknown".into();
+                }
+                let kind = ts_type_kind(schema, kind);
+                if !rendered.contains(&kind) {
+                    rendered.push(kind);
+                }
+            }
+            if rendered.is_empty() {
+                "unknown".into()
+            } else {
+                rendered.join(" | ")
+            }
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn ts_type_kind(schema: &Value, kind: &str) -> String {
     match kind {
-        Some("string") => match schema.get("enum").and_then(Value::as_array) {
+        "string" => match schema.get("enum").and_then(Value::as_array) {
             Some(variants) => variants
                 .iter()
                 .filter_map(Value::as_str)
@@ -926,15 +953,16 @@ fn ts_type(schema: &Value) -> String {
                 .join(" | "),
             None => "string".into(),
         },
-        Some("integer") | Some("number") => "number".into(),
-        Some("boolean") => "boolean".into(),
-        Some("array") => {
+        "integer" | "number" => "number".into(),
+        "boolean" => "boolean".into(),
+        "null" => "null".into(),
+        "array" => {
             let item = schema
                 .get("items")
                 .map_or_else(|| "unknown".into(), ts_type);
             format!("Array<{item}>")
         }
-        Some("object") => ts_object(schema),
+        "object" => ts_object(schema),
         _ => "unknown".into(),
     }
 }

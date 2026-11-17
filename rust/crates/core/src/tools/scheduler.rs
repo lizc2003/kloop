@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
 use super::args;
+use super::contract;
 use crate::config::Config;
 use crate::scheduler::{CheckOutcome, CheckRunner};
 
@@ -76,11 +77,7 @@ pub fn schedule_wakeup_def() -> ToolDef {
 
 pub async fn cron_create_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "cron_create")?;
-    args::strict_object(
-        input,
-        &["cron", "prompt", "recurring", "durable", "check"],
-        "cron_create",
-    )?;
+    contract::strict(input, "cron_create")?;
     let cron = args::required_str(input, "cron", "cron_create")?;
     let prompt = args::required_str(input, "prompt", "cron_create")?;
     let recurring = args::bool_or(input, "recurring", true, "cron_create")?;
@@ -126,7 +123,7 @@ pub async fn cron_create_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub async fn cron_delete_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "cron_delete")?;
-    args::strict_object(input, &["id"], "cron_delete")?;
+    contract::strict(input, "cron_delete")?;
     let id = args::required_str(input, "id", "cron_delete")?;
     bind(ctx)?;
     ctx.cfg.scheduler.delete(id)?;
@@ -145,7 +142,7 @@ pub async fn cron_delete_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub async fn cron_list_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "cron_list")?;
-    args::strict_object(input, &[], "cron_list")?;
+    contract::strict(input, "cron_list")?;
     bind(ctx)?;
     let jobs = ctx.cfg.scheduler.list()?;
     if jobs.is_empty() {
@@ -181,11 +178,7 @@ pub async fn cron_list_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 
 pub async fn schedule_wakeup_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
     require_top_level(ctx, "schedule_wakeup")?;
-    let object = args::strict_object(
-        input,
-        &["delay_seconds", "reason", "prompt", "stop"],
-        "schedule_wakeup",
-    )?;
+    let object = contract::strict(input, "schedule_wakeup")?;
     let stop = args::bool_or(input, "stop", false, "schedule_wakeup")?;
     bind(ctx)?;
     if stop {

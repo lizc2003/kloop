@@ -31,6 +31,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use super::args;
+use super::contract;
 use crate::permissions::Permissions;
 
 /// cc caps matched lines at 500 columns (`rg --max-columns 500`) so
@@ -75,26 +76,7 @@ struct GrepArgs {
 
 impl GrepArgs {
     fn parse(input: &Value, cwd: &Path) -> Result<Self> {
-        args::strict_object(
-            input,
-            &[
-                "pattern",
-                "path",
-                "glob",
-                "type",
-                "output_mode",
-                "-i",
-                "-n",
-                "-A",
-                "-B",
-                "-C",
-                "-o",
-                "head_limit",
-                "offset",
-                "multiline",
-            ],
-            "grep",
-        )?;
+        contract::strict(input, "grep")?;
         let pattern = crate::tools::str_arg(input, "pattern", "grep")?.to_string();
         let mode = match args::optional_str(input, "output_mode", "grep")?
             .unwrap_or("files_with_matches")
@@ -152,7 +134,7 @@ pub async fn glob_tool(
     program_result: Option<&crate::tools::ProgramResultSink>,
     perms: Arc<Permissions>,
 ) -> Result<String> {
-    args::strict_object(input, &["pattern", "path"], "glob")?;
+    contract::strict(input, "glob")?;
     let pattern = crate::tools::str_arg(input, "pattern", "glob")?.to_string();
     let supplied_path = args::optional_str(input, "path", "glob")?;
     let root = supplied_path

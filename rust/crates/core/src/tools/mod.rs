@@ -10,6 +10,7 @@ mod background_executions;
 mod bash;
 mod builtin;
 mod codemode;
+mod contract;
 mod fs;
 mod inject;
 pub(crate) mod notebook;
@@ -2137,7 +2138,6 @@ pub(crate) fn optional_display_description(input: &Value, tool: &str) -> Result<
 }
 
 pub(crate) use args::required_str as str_arg;
-pub(crate) use args::strict_str_arg;
 
 /// Anchor a tool's path argument at the agent's cwd: an absolute path is used
 /// as-is, a relative one resolves against `cwd`. For the main agent `cwd` is

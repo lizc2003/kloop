@@ -14,6 +14,7 @@ use serde_json::json;
 
 use super::ToolCtx;
 use super::args;
+use super::contract;
 use crate::worktree;
 use crate::worktree::ExitAction;
 use kloop_protocol::ToolDef;
@@ -114,7 +115,7 @@ enum EnterInput {
 }
 
 fn parse_enter(input: &Value) -> Result<EnterInput> {
-    args::strict_object(input, &["name", "path"], "enter_worktree")?;
+    contract::strict(input, "enter_worktree")?;
     let name = args::optional_str(input, "name", "enter_worktree")?.map(str::to_string);
     let path = args::optional_str(input, "path", "enter_worktree")?.map(str::to_string);
     match (name, path) {
@@ -129,7 +130,7 @@ fn parse_enter(input: &Value) -> Result<EnterInput> {
 }
 
 fn parse_exit(input: &Value) -> Result<(ExitAction, bool)> {
-    args::strict_object(input, &["action", "discard_changes"], "exit_worktree")?;
+    contract::strict(input, "exit_worktree")?;
     let action = match args::optional_str(input, "action", "exit_worktree")? {
         Some("keep") => ExitAction::Keep,
         Some("remove") => ExitAction::Remove,

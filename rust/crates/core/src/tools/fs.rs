@@ -34,6 +34,7 @@ pub(super) use platform::has_multiple_hard_links;
 
 use super::ToolCtx;
 use super::args;
+use super::contract;
 use super::notebook;
 use super::resolve_path;
 use super::str_arg;
@@ -298,7 +299,7 @@ pub(super) async fn prepare_read(
     input: &Value,
     workspace: &EffectiveWorkspace,
 ) -> Result<PreparedRead> {
-    args::strict_object(input, &["path", "offset", "limit"], "read_file")?;
+    contract::strict(input, "read_file")?;
     let path = str_arg(input, "path", "read_file")?.to_string();
     let requested = resolve_path(&workspace.cwd, &path);
     let path_for_worker = path.clone();
@@ -608,26 +609,7 @@ async fn prepare_mutation_input_with_key(
     path_key: &str,
     workspace: &EffectiveWorkspace,
 ) -> Result<PreparedMutation> {
-    let allowed: Option<&[&str]> = match tool {
-        "write_file" => Some(&["path", "content"]),
-        "edit_file" => Some(&["path", "old_string", "new_string", "replace_all"]),
-        "notebook_edit" => Some(&[
-            "notebook_path",
-            "cell_id",
-            "new_source",
-            "cell_type",
-            "edit_mode",
-        ]),
-        _ => None,
-    };
-    match allowed {
-        Some(allowed) => {
-            args::strict_object(input, allowed, tool)?;
-        }
-        None => {
-            args::object(input, tool)?;
-        }
-    }
+    contract::strict(input, tool)?;
     let path = str_arg(input, path_key, tool)?.to_string();
     if tool == "notebook_edit" && !Path::new(&path).is_absolute() {
         bail!("notebook_edit: notebook_path must be an absolute path");

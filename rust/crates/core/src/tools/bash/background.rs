@@ -52,8 +52,8 @@ use crate::sandbox::SandboxPolicy;
 use crate::shell_programs::ShellProgram;
 use crate::tools::ToolCtx;
 use crate::tools::args;
+use crate::tools::contract;
 use crate::tools::str_arg;
-use crate::tools::strict_str_arg;
 use kloop_process_spawn::ProcessStdio;
 use kloop_process_spawn::ProcessTreeChild;
 use kloop_process_spawn::ProcessTreeKiller;
@@ -75,7 +75,7 @@ const BLOCK_TIMEOUT_MAX_MS: u64 = 600_000;
 const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    args::strict_object(input, &["bash_id", "block", "timeout_ms"], "bash_output")?;
+    contract::strict(input, "bash_output")?;
     let id = str_arg(input, "bash_id", "bash_output")?;
     let block = args::bool_or(input, "block", true, "bash_output")?;
     let timeout_ms = args::integer_arg(input, "timeout_ms", "bash_output")?
@@ -127,7 +127,8 @@ pub(in crate::tools) async fn bash_output_tool(input: &Value, ctx: &ToolCtx) -> 
 }
 
 pub(in crate::tools) async fn stop_bash_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    let id = strict_str_arg(input, "bash_id", "stop_bash")?;
+    contract::strict(input, "stop_bash")?;
+    let id = args::required_str(input, "bash_id", "stop_bash")?;
     if let Some(hint) = crate::tools::background_executions::execution_stop_hint(id) {
         bail!(hint);
     }

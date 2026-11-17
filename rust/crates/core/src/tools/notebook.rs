@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::args;
+use super::contract;
 use crate::image::image_block_from_bytes;
 
 pub(crate) const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
@@ -231,17 +232,7 @@ fn bound_text_blocks(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, bool) {
 }
 
 pub(super) fn request_from_input(input: &Value) -> Result<NotebookEditRequest> {
-    args::strict_object(
-        input,
-        &[
-            "notebook_path",
-            "cell_id",
-            "new_source",
-            "cell_type",
-            "edit_mode",
-        ],
-        "notebook_edit",
-    )?;
+    contract::strict(input, "notebook_edit")?;
     let new_source = args::required_str(input, "new_source", "notebook_edit")?.to_string();
     let cell_id = args::optional_str(input, "cell_id", "notebook_edit")?.map(str::to_string);
     let cell_type = args::optional_str(input, "cell_type", "notebook_edit")?.map(str::to_string);

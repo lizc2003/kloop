@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::ToolCtx;
 use super::args;
+use super::contract;
 use crate::event::Event;
 
 const MAX_TODOS: usize = 256;
@@ -254,7 +255,7 @@ pub(super) fn todo_write_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
 }
 
 fn parse_write(input: &Value) -> Result<Vec<TodoItem>> {
-    let object = args::strict_object(input, &["todos"], "todo_write")?;
+    let object = contract::strict(input, "todo_write")?;
     object
         .get("todos")
         .and_then(Value::as_array)

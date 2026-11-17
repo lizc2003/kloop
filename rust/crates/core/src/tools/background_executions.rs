@@ -24,7 +24,8 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::ToolCtx;
-use super::strict_str_arg;
+use super::args;
+use super::contract;
 use crate::execution_provenance::DeliveryRoute;
 use crate::execution_provenance::ExecutionKind as ProvenanceExecutionKind;
 use crate::execution_provenance::ExecutionProvenanceReceipt;
@@ -601,6 +602,13 @@ struct WaitForActivityInput {
     timeout_ms: Option<u64>,
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    serde_json::from_value::<WaitForActivityInput>(input.clone())
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 /// Block until a background execution finishes, a shell reaches terminal state,
 /// new inbox input arrives, or the deadline passes. This deliberately does NOT
 /// drain: results are delivered at the next round boundary.
@@ -669,7 +677,8 @@ async fn stop_tool(
     kind: ExecutionKind,
     tool: &str,
 ) -> Result<String> {
-    let id = strict_str_arg(input, kind.id_arg(), tool)?;
+    contract::strict(input, tool)?;
+    let id = args::required_str(input, kind.id_arg(), tool)?;
     match ctx.cfg.background_executions.request_stop(kind, id) {
         Ok(description) => Ok(format!(
             "Stopping background {} {id} ({description}). It will not report a result.",

@@ -89,6 +89,13 @@ struct StructuredAgentInput {
     max_rounds: Option<u64>,
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    serde_json::from_value::<RunAgentInput>(input.clone())
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 /// The sub-agent round cap. Not a knob the model gets: it has no basis for the
 /// number — asked to pick one it chose 12 and 10 for an 11-file review and ran
 /// out — and a wrong guess used to cost everything the child had produced.

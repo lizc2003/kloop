@@ -135,6 +135,11 @@ pub(super) fn tool_search_def() -> ToolDef {
     }
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    super::contract::strict(input, "call_tool").map(|_| ())
+}
+
 /// Escape hatch for models that refuse to emit tool calls for names absent
 /// from their declared tool list (observed: gpt-5.4-mini will search and
 /// unlock but never direct-call). Dispatch unwraps the envelope up front, so
@@ -261,7 +266,7 @@ pub(super) async fn tool_search_tool(
     ctx: &ToolCtx,
     workspace: &EffectiveWorkspace,
 ) -> Result<String> {
-    super::args::strict_object(input, &["query", "max_results"], "tool_search")?;
+    super::contract::strict(input, "tool_search")?;
     let query = str_arg(input, "query", "tool_search")?.trim().to_string();
     if query.is_empty() {
         bail!("tool_search: query must not be empty");

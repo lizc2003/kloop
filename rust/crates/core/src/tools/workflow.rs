@@ -67,6 +67,13 @@ struct WorkflowInput {
     title: Option<String>,
 }
 
+#[cfg(test)]
+pub(super) fn contract_parse(input: &Value) -> Result<()> {
+    serde_json::from_value::<WorkflowInput>(input.clone())
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
 pub(super) fn workflow_def() -> ToolDef {
     ToolDef {
         name: "workflow".into(),

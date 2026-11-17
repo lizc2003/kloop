@@ -999,128 +999,66 @@ mod tests {
     }
 
     /// The published schema and the parser are two declarations of one
-    /// contract; this is the tripwire that keeps them the same set of keys.
-    /// A key added to one side only, or a field removed from a parser but left
-    /// in the schema (the `max_rounds` drift of plan 257), fails here.
+    /// contract. Manual parsers share [`super::contract`]'s key list; serde
+    /// parsers are probed here key by key, because `deny_unknown_fields` is
+    /// what makes a field removed from the struct but left in the schema fail
+    /// (the `max_rounds` drift of plan 257).
     #[test]
     fn every_schema_matches_its_parsers_accepted_keys() {
-        let expected: &[(&str, &[&str])] = &[
-            (
-                "bash",
-                &["command", "description", "timeout_ms", "background"],
-            ),
-            ("bash_output", &["bash_id", "block", "timeout_ms"]),
-            ("stop_bash", &["bash_id"]),
-            ("powershell", &["command", "description", "timeout_ms"]),
-            ("read_file", &["path", "offset", "limit"]),
-            ("write_file", &["path", "content"]),
-            (
-                "edit_file",
-                &["path", "old_string", "new_string", "replace_all"],
-            ),
-            (
-                "notebook_edit",
-                &[
-                    "notebook_path",
-                    "cell_id",
-                    "new_source",
-                    "cell_type",
-                    "edit_mode",
-                ],
-            ),
-            (
-                "grep",
-                &[
-                    "pattern",
-                    "path",
-                    "glob",
-                    "type",
-                    "output_mode",
-                    "-i",
-                    "-n",
-                    "-A",
-                    "-B",
-                    "-C",
-                    "-o",
-                    "head_limit",
-                    "offset",
-                    "multiline",
-                ],
-            ),
-            ("glob", &["pattern", "path"]),
-            ("todo_write", &["todos"]),
-            ("send_message", &["to", "summary", "message"]),
-            ("list_agents", &[]),
-            (
-                "run_agent",
-                &[
-                    "description",
-                    "prompt",
-                    "agent_type",
-                    "model",
-                    "background",
-                    "isolation",
-                ],
-            ),
-            ("wait_for_activity", &["timeout_ms"]),
-            ("stop_agent", &["agent_id"]),
-            ("tool_search", &["query", "max_results"]),
-            ("call_tool", &["tool_name", "params"]),
-            (
-                "run_program",
-                &["description", "source", "background", "resume_from_run_id"],
-            ),
-            ("stop_program", &["program_id"]),
-            (
-                "cron_create",
-                &["cron", "prompt", "recurring", "durable", "check"],
-            ),
-            ("cron_delete", &["id"]),
-            ("cron_list", &[]),
-            (
-                "schedule_wakeup",
-                &["delay_seconds", "reason", "prompt", "stop"],
-            ),
-            (
-                "ask_user_question",
-                &["questions", "answers", "annotations", "metadata"],
-            ),
-            ("enter_plan_mode", &[]),
-            ("exit_plan_mode", &["plan"]),
-            (
-                "workflow",
-                &[
-                    "script",
-                    "args",
-                    "script_path",
-                    "resume_from_run_id",
-                    "name",
-                    "description",
-                    "title",
-                ],
-            ),
-            ("stop_workflow", &["workflow_id"]),
-            ("enter_worktree", &["name", "path"]),
-            ("exit_worktree", &["action", "discard_changes"]),
-            ("skill", &["name", "arguments"]),
-        ];
+        let expected = crate::tools::contract::CONTRACTS;
         assert_eq!(expected.len(), ALL.len());
         let cx = DefCx::default();
         for builtin in ALL {
-            let (_, accepted) = expected
-                .iter()
-                .find(|(name, _)| *name == builtin.name())
-                .unwrap_or_else(|| panic!("{} has no contract entry", builtin.name()));
+            let name = builtin.name();
+            let accepted = crate::tools::contract::keys(name);
             let mut declared: Vec<String> = builtin.def(&cx).schema["properties"]
                 .as_object()
-                .unwrap_or_else(|| panic!("{} schema has no properties", builtin.name()))
+                .unwrap_or_else(|| panic!("{name} schema has no properties"))
                 .keys()
                 .cloned()
                 .collect();
-            let mut accepted: Vec<String> = accepted.iter().map(|key| (*key).to_string()).collect();
             declared.sort_unstable();
-            accepted.sort_unstable();
-            assert_eq!(declared, accepted, "{}", builtin.name());
+            let mut accepted_keys: Vec<String> =
+                accepted.iter().map(|key| (*key).to_string()).collect();
+            accepted_keys.sort_unstable();
+            assert_eq!(declared, accepted_keys, "{name}");
+
+            // Every advertised key must be recognized by the real parser. A
+            // value of `null` is enough to reach that check: Option fields take
+            // it, required fields report a type/missing error, and a field the
+            // parser no longer knows reports `unknown field`.
+            for key in accepted {
+                let input = json!({(*key): null});
+                if let Err(error) = parser_accepts(name, &input) {
+                    let error = format!("{error:#}");
+                    assert!(
+                        !error.contains(&format!("unknown field `{key}`")),
+                        "{name} schema advertises `{key}` but its parser rejects it: {error}"
+                    );
+                }
+            }
+
+            let error = parser_accepts(name, &json!({"__unknown__": true}))
+                .expect_err(&format!("{name} accepted an unknown field"));
+            assert!(
+                format!("{error:#}").contains("unknown field `__unknown__`"),
+                "{name}: {error:#}"
+            );
+        }
+    }
+
+    /// The parser behind one built-in's argument contract. Serde parsers must
+    /// be called directly; everything else shares the manual key gate.
+    fn parser_accepts(name: &str, input: &Value) -> anyhow::Result<()> {
+        match name {
+            "bash" => crate::tools::bash::contract_parse(input),
+            "run_agent" => crate::tools::subagent::contract_parse(input),
+            "wait_for_activity" => crate::tools::background_executions::contract_parse(input),
+            "ask_user_question" => crate::tools::question::contract_parse(input),
+            "run_program" => crate::tools::codemode::contract_parse(input),
+            "workflow" => crate::tools::workflow::contract_parse(input),
+            "call_tool" => crate::tools::tool_search::contract_parse(input),
+            _ => crate::tools::contract::contract_parse(input, name),
         }
     }
 

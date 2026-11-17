@@ -56,7 +56,7 @@ pub(super) async fn skill_tool(
     if ctx.depth > 0 {
         anyhow::bail!("{}", super::builtin::Unoffered::RootOnly.message("skill"));
     }
-    super::args::strict_object(input, &["name", "arguments"], "skill")?;
+    super::contract::strict(input, "skill")?;
     let name = str_arg(input, "name", "skill")?;
     let args = super::args::optional_str(input, "arguments", "skill")?.unwrap_or("");
     // Only model-invocable skills: a user command (`.kloop/commands/*.md`) is

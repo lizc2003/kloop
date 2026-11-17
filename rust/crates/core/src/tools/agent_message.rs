@@ -9,7 +9,7 @@ use super::ToolCtx;
 use super::args;
 use super::args::bounded_diagnostic;
 use super::args::is_unicode_line_separator;
-use super::args::strict_object;
+use super::contract;
 use kloop_protocol::LocalAgentId;
 use kloop_protocol::ToolDef;
 
@@ -55,7 +55,7 @@ pub(super) fn send_message_tool(input: &Value, ctx: &ToolCtx) -> Result<String> 
 }
 
 pub(super) fn list_agents_tool(input: &Value, ctx: &ToolCtx) -> Result<String> {
-    strict_object(input, &[], "list_agents")?;
+    contract::strict(input, "list_agents")?;
     let roster = ctx
         .cfg
         .local_agent
@@ -111,7 +111,7 @@ struct SendMessageInput {
 }
 
 fn parse_send_message(input: &Value) -> Result<SendMessageInput> {
-    args::strict_object(input, &["to", "summary", "message"], "send_message")?;
+    contract::strict(input, "send_message")?;
     let to = args::required_str(input, "to", "send_message")?;
     let message = args::required_str(input, "message", "send_message")?;
     let summary = match args::optional_str(input, "summary", "send_message")? {

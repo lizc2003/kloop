@@ -116,12 +116,6 @@ pub(crate) fn required_str<'a>(input: &'a Value, key: &str, tool: &str) -> Resul
     })
 }
 
-/// A single-key tool: any other key is unknown, and the one key is required.
-pub(crate) fn strict_str_arg<'a>(input: &'a Value, key: &str, tool: &str) -> Result<&'a str> {
-    strict_object(input, &[key], tool)?;
-    required_str(input, key, tool)
-}
-
 /// Optional string with explicit `null` treated as omitted. A model uses
 /// `null` for "not filled in"; refusing it made the same call fail in one tool
 /// and succeed in another.
