@@ -297,12 +297,20 @@ fn main() -> Result<ExitCode> {
             unsafe { std::env::set_var(name, value) };
         }
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("cannot start the async runtime")?
-        .block_on(run(arguments))
+        .context("cannot start the async runtime")?;
+    let result = runtime.block_on(run(arguments));
+    // The process is done. A per-thread config build runs on the blocking pool,
+    // and a blocking task cannot be aborted; the runtime's default drop would
+    // wait for it. Give stragglers a bounded grace, then leave without them.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
 }
+
+/// How long process exit waits for blocking work that `run` left behind.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn run(arguments: Vec<std::ffi::OsString>) -> Result<ExitCode> {
     let mut raw = Vec::with_capacity(arguments.len());
@@ -855,5 +863,20 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A config build that is still inside its factory must not keep the
+    /// process alive after `run` returned: blocking tasks cannot be aborted,
+    /// so only the runtime shutdown deadline bounds them.
+    #[test]
+    fn a_stuck_blocking_task_does_not_hold_runtime_shutdown() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(30)));
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

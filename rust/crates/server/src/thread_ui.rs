@@ -10,6 +10,7 @@ use serde_json::Value;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use kloop_core::agent::Ui;
 use kloop_core::event::Event;
@@ -40,6 +41,8 @@ pub(super) struct ThreadUi {
     /// The running turn's id (shared with the handle), used to tag item events.
     pub(super) turn: Arc<Mutex<Option<u64>>>,
     pub(super) projection: Arc<ThreadProjection>,
+    /// Input is gone: a request this thread asks now has no answer coming.
+    pub(super) shutdown: CancellationToken,
 }
 
 impl ThreadUi {
@@ -147,13 +150,16 @@ impl Approver for ThreadUi {
         };
         // A client that is gone cannot answer, and one that never got the
         // question cannot either: both stop, like any reply it did not give.
+        let shutdown = self.shutdown.clone();
         Box::pin(async move {
             let _guard = guard;
             if !sent {
                 return Decision::Stop;
             }
-            let decision = rx.await;
-            decision.unwrap_or(Decision::Stop)
+            tokio::select! {
+                decision = rx => decision.unwrap_or(Decision::Stop),
+                _ = shutdown.cancelled() => Decision::Stop,
+            }
         })
     }
 }
@@ -163,6 +169,7 @@ impl Questioner for ThreadUi {
         &self,
         request: QuestionRequest,
     ) -> Pin<Box<dyn std::future::Future<Output = QuestionOutcome> + Send + '_>> {
+        let shutdown = self.shutdown.clone();
         Box::pin(async move {
             let mut answers = Vec::with_capacity(request.questions.len());
             for (question_index, question) in request.questions.iter().enumerate() {
@@ -207,9 +214,19 @@ impl Questioner for ThreadUi {
                         "server output channel closed while asking a question".into(),
                     );
                 }
-                let outcome = rx.await.unwrap_or_else(|_| {
-                    QuestionOutcome::Unavailable("question response channel was dropped".into())
-                });
+                let outcome = tokio::select! {
+                    outcome = rx => outcome.unwrap_or_else(|_| {
+                        QuestionOutcome::Unavailable(
+                            "question response channel was dropped".into(),
+                        )
+                    }),
+                    _ = shutdown.cancelled() => {
+                        return QuestionOutcome::Unavailable(
+                            "the server stopped reading before the question was answered"
+                                .into(),
+                        );
+                    }
+                };
                 drop(guard);
                 match outcome {
                     QuestionOutcome::Answered(mut one) if one.len() == 1 => {
@@ -239,6 +256,63 @@ impl Questioner for ThreadUi {
 #[cfg(test)]
 mod approval_response_tests {
     use super::*;
+
+    /// Input is gone. A client cannot answer an approval asked after that,
+    /// and waiting would hold the turn (and the process) open; the wait ends
+    /// as a Stop, the same answer as a dropped reply.
+    #[tokio::test]
+    async fn shutdown_releases_an_approval_without_a_client() {
+        use kloop_protocol::ActiveProviderRoute;
+        use kloop_protocol::ProviderApiFamily;
+        use kloop_protocol::ReasoningContinuity;
+
+        let (out, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        let projection = Arc::new(
+            ThreadProjection::new(
+                "shutdown".into(),
+                "/".into(),
+                ActiveProviderRoute {
+                    revision: 1,
+                    provider_id: "mock".into(),
+                    api_family: ProviderApiFamily::Mock,
+                    model: "mock".into(),
+                    continuity: ReasoningContinuity::Preserved,
+                    effort: None,
+                },
+                kloop_core::rollout::SessionSnapshot {
+                    messages: Vec::new(),
+                    runtime: None,
+                    terminals: Vec::new(),
+                    provider_routes: Vec::new(),
+                },
+                crate::events::RecoverySource::Fresh,
+            )
+            .unwrap(),
+        );
+        let shutdown = CancellationToken::new();
+        let ui = ThreadUi {
+            thread_id: "shutdown".into(),
+            out,
+            pending: Default::default(),
+            reverse_request_seq: Arc::new(AtomicU64::new(1)),
+            turn: Arc::new(Mutex::new(Some(1))),
+            projection,
+            shutdown: shutdown.clone(),
+        };
+        let pending = ui.confirm(ConfirmRequest {
+            description: "write the file".into(),
+            title: None,
+            detail: None,
+            notice: None,
+            approval_scopes: vec![ApprovalScope::Once],
+            remember_rules: None,
+            preview: None,
+        });
+        // The request went out; then the read loop ends.
+        let _ = lines.recv().await;
+        shutdown.cancel();
+        assert_eq!(pending.await, Decision::Stop);
+    }
 
     #[test]
     fn scoped_approval_tokens_map_exactly_and_legacy_fails_closed() {

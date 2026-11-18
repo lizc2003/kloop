@@ -188,6 +188,21 @@ impl History {
         }
     }
 
+    /// The conversation a rewind lands on, built without touching this one.
+    /// A rewind can still fail after its route is settled (the branch's route
+    /// may name a provider this process no longer has), and the live session
+    /// must be exactly as it was when it does.
+    pub fn branch(&self, resumed: crate::rollout::ResumedSession) -> Self {
+        let carried = self
+            .reduction
+            .unrecorded_for(&resumed.snapshot.messages, &resumed.request_stubs);
+        let mut branch = Self::resume(self.offload_dir.clone(), resumed);
+        for stub in carried {
+            branch.persist(|rollout| rollout.append_request_stub(&stub));
+        }
+        branch
+    }
+
     /// Hold this turn's input outside the conversation until the turn produces
     /// something. It rides every request from here on (see
     /// [`History::provider_request_view`]) and counts toward the context

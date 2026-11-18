@@ -118,6 +118,7 @@ where
         threads: HashMap::new(),
         builds: builds_tx,
         pending_threads: HashMap::new(),
+        shutdown: CancellationToken::new(),
         pending: Arc::new(Mutex::new(HashMap::new())),
         reverse_request_seq: Arc::new(AtomicU64::new(1)),
         factory,
@@ -177,8 +178,10 @@ where
         }
         server.handle_line(line);
     }
-    // Input closed or failed. Cancel running turns first: a config build a
-    // vanished client no longer waits for must not keep them alive.
+    // Input closed or failed. No worker may start another turn from here on:
+    // a scheduler delivery that becomes due during the drain would otherwise
+    // run for a client that is gone. Cancel the running turns too.
+    server.shutdown.cancel();
     for handle in server.threads.values() {
         let mut current_cancel = handle.current_cancel.lock().unwrap();
         if let Some(cancel) = current_cancel.take() {
@@ -381,6 +384,7 @@ struct ThreadWorkerState {
     turn_seq: Arc<AtomicU64>,
     inbox: Arc<Inbox>,
     active_route: Arc<Mutex<ActiveProviderRoute>>,
+    shutdown: CancellationToken,
 }
 
 struct ThreadHandle {
@@ -418,6 +422,8 @@ struct ThreadBuild {
     options: ThreadStartOptions,
     reply: ThreadReply,
     outcome: std::result::Result<ThreadHandle, (i64, String)>,
+    /// A fork's file, removed if this build is never registered.
+    guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
 }
 
 /// The success response shape the method would have produced synchronously.
@@ -460,6 +466,9 @@ struct Server {
     /// `threads` cannot answer "already active" for them yet, so a pipelined
     /// resume would otherwise build twice.
     pending_threads: HashMap<String, RequestId>,
+    /// Set when input ends: workers stop taking new turns, and approvals or
+    /// questions still waiting for a client that can no longer answer stop.
+    shutdown: CancellationToken,
     pending: PendingInteractions,
     reverse_request_seq: Arc<AtomicU64>,
     factory: ConfigFactory,
@@ -518,6 +527,11 @@ impl Server {
         self.pending_threads.remove(&build.thread_id);
         match build.outcome {
             Ok(handle) => {
+                // The branch is live now; only here is its file safe from the
+                // build guard (a build that never lands drops the guard).
+                if let Some(mut guard) = build.guard {
+                    guard.disarm();
+                }
                 let route = handle.active_route.lock().unwrap().clone();
                 let result = match build.reply {
                     ThreadReply::Started => {

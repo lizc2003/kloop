@@ -561,7 +561,12 @@ pub enum Command {
 /// expansion, so an interrupted skill turn restores the command the user typed.
 enum InFlight {
     Turn(Draft),
-    Command(Draft),
+    /// A slash command: `draft` is the command text with paste atoms and no
+    /// images (those stayed in the composer); `echo` is the text shown.
+    Command {
+        draft: Draft,
+        echo: String,
+    },
 }
 
 pub struct App {
@@ -1842,15 +1847,13 @@ impl App {
             // `[Pasted #1: n chars]` label. Detection and the echo stay on the
             // display text: a placeholder never starts with `/`, and an echo is
             // an acknowledgement, so the raw paste does not belong in scrollback.
-            let draft = self.composer.draft();
-            let command = self
-                .composer
-                .submit_command()
-                .expect("checked not blank")
-                .trim()
-                .to_string();
+            let (command, draft) = self.composer.submit_command().expect("checked not blank");
+            let command = command.trim().to_string();
             self.cells.push(Cell::User(display.clone()));
-            self.in_flight = Some(InFlight::Command(draft));
+            self.in_flight = Some(InFlight::Command {
+                draft,
+                echo: display.clone(),
+            });
             self.running = true;
             self.freeze_selected_route();
             return Command::Slash(command);
@@ -1906,10 +1909,7 @@ impl App {
         // the sent text itself. The draft is matched against the text the worker
         // handed back, so a stale draft cannot clobber what the user is typing.
         let (draft, echo, command) = match in_flight {
-            Some(InFlight::Command(draft)) => {
-                let echo = draft.display_text().to_string();
-                (Some(draft), echo, true)
-            }
+            Some(InFlight::Command { draft, echo }) => (Some(draft), echo, true),
             Some(InFlight::Turn(draft)) if draft.text() == text => {
                 (Some(draft), text.clone(), false)
             }
@@ -1919,8 +1919,13 @@ impl App {
         // it a two-tap clear), but the user can start typing in the gap between
         // the interrupt and the worker handing this back. Their new draft wins:
         // leave the transcript and the composer alone rather than splicing the
-        // old text into what they are now writing.
-        if !self.composer.is_blank() {
+        // old text into what they are now writing. A command left its images
+        // behind, and labels alone are not a draft.
+        if command {
+            if self.composer.has_text() {
+                return;
+            }
+        } else if !self.composer.is_blank() {
             return;
         }
         // The draft's images lead the returned ones and each was echoed; any
@@ -1934,7 +1939,16 @@ impl App {
         };
         self.drop_input_echo(&echo, echoed);
         match draft {
-            Some(draft) => self.composer.restore(draft),
+            Some(draft) => {
+                // Images that stayed in the composer while the command ran are
+                // the user's: clearing them must not be undone here, and keeping
+                // them must not lose them to the restore.
+                let kept = command.then(|| self.composer.image_sources());
+                self.composer.restore(draft);
+                for source in kept.into_iter().flatten() {
+                    self.composer.attach_image(source);
+                }
+            }
             None if !text.is_empty() => self.composer.paste(&text),
             None => {}
         }
@@ -3428,6 +3442,44 @@ mod tests {
                 .any(|cell| matches!(cell, Cell::User(line) if line == "/review the diff")),
             "the echo goes back with the input"
         );
+    }
+
+    /// The images left in the composer by a slash command are the user's. If
+    /// they clear them while the command runs, an interrupt must not bring them
+    /// back; if they keep them, the restored command line must not drop them.
+    #[test]
+    fn an_interrupted_skill_command_respects_the_composer_images() {
+        let image = ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "AA==".into(),
+        };
+        for clear in [false, true] {
+            let mut app = App::new(format!("restore-images-{clear}"));
+            type_str(&mut app, "/review ");
+            app.composer.attach_image(image.clone());
+            assert!(matches!(
+                app.on_key(80, key(KeyCode::Enter)),
+                Command::Slash(_)
+            ));
+            assert_eq!(app.composer.image_sources().len(), 1);
+            if clear {
+                app.composer.clear();
+            }
+            app.apply(AgentEvent::InputReturned {
+                text: "/review".into(),
+                images: Vec::new(),
+            });
+            assert!(
+                app.composer.text().trim().starts_with("/review"),
+                "clear={clear}: {}",
+                app.composer.text()
+            );
+            assert_eq!(
+                app.composer.image_sources().len(),
+                usize::from(!clear),
+                "clear={clear}"
+            );
+        }
     }
 
     /// A known command typed while a turn runs cannot run (it owns session

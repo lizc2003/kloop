@@ -35,6 +35,9 @@ pub enum AbandonedBranch {
 /// The session a rewind landed on.
 pub struct Rewound {
     pub cfg: Config,
+    /// The branch, ready to become the live History. The caller swaps it in
+    /// only after this whole outcome is in hand.
+    pub history: History,
     /// What retiring the old session did (see
     /// [`crate::commands::replace_session`]), one line each.
     pub report: Vec<String>,
@@ -90,21 +93,26 @@ pub async fn rewind(
             }
         }
     };
-    let (fresh, report) = crate::commands::replace_session(cfg, session_id, ui).await?;
-    history.rebase(resumed);
+    // Build the branch without touching the live History, and settle its route
+    // before retiring the old session: a branch whose route cannot be made
+    // runnable is not a rewind, and the live session must survive the refusal.
+    let mut branch = history.branch(resumed);
     // A rewind does not change who is using the session, so the route it is
     // running on right now — `/provider` included — carries onto the branch,
     // and the cut's own route is not restored. Adopting writes to the forked
-    // rollout, so it runs after the rebase.
-    let (cfg, route_notes) = adopt_branch_route(&fresh, history);
+    // rollout.
+    let (route, route_notes) = adopt_branch_route(cfg, &mut branch)?;
     notes.extend(route_notes);
+    let (fresh, report) = crate::commands::replace_session(cfg, session_id, ui).await?;
+    let cfg = fresh.clone_with_provider_route(route);
     if let Some(summary) = summary {
-        summary.record(history);
+        summary.record(&mut branch);
     }
     // The branch is the live session now: the guard must not remove it.
     fork_guard.disarm();
     Ok(RewindOutcome::Rewound(Box::new(Rewound {
         cfg,
+        history: branch,
         report,
         notes,
     })))
@@ -146,14 +154,17 @@ fn open_fork(
 /// revision as their provenance, and a revision the branch never recorded
 /// makes the whole branch fail `validate_provenance` on the next resume. The
 /// front-end's route is the old session's, so it is never the fallback.
-fn adopt_branch_route(fresh: &Config, history: &mut History) -> (Config, Vec<String>) {
-    match history.adopt_provider_route(&fresh.provider_route) {
-        Ok((route, reopened)) => (
-            fresh.clone_with_provider_route(route),
+fn adopt_branch_route(
+    cfg: &Config,
+    history: &mut History,
+) -> anyhow::Result<(crate::provider_route::FrozenProviderRoute, Vec<String>)> {
+    match history.adopt_provider_route(&cfg.provider_route) {
+        Ok((route, reopened)) => Ok((
+            route,
             reopened
                 .map(|reopened| vec![format!("rewind: {reopened}")])
                 .unwrap_or_default(),
-        ),
+        )),
         Err(error) => {
             let mut notes = vec![format!(
                 "rewind landed on the new branch but its provider route \
@@ -163,9 +174,9 @@ fn adopt_branch_route(fresh: &Config, history: &mut History) -> (Config, Vec<Str
                 // A branch with no timeline holds no user turn, so it has no
                 // rewind point; keep the caller's route rather than inventing
                 // a revision the file would reject.
-                return (fresh.clone(), notes);
+                return Ok((cfg.provider_route.clone(), notes));
             };
-            match fresh.provider_catalog.restore_route(receipt) {
+            match cfg.provider_catalog.restore_route(receipt) {
                 Ok(route) => {
                     notes.push(format!(
                         "rewind: continuing on the branch's last recorded route \
@@ -173,19 +184,17 @@ fn adopt_branch_route(fresh: &Config, history: &mut History) -> (Config, Vec<Str
                         route.provider_id(),
                         route.model()
                     ));
-                    (fresh.clone_with_provider_route(route), notes)
+                    Ok((route, notes))
                 }
-                // The receipt came from this catalog when it was written, so
-                // drift here means the catalog changed in-process; keeping the
-                // branch's timeline intact still beats stamping an unknown
-                // revision onto it.
-                Err(restore) => {
-                    notes.push(format!(
-                        "rewind: the branch's last route could not be restored \
-                         either ({restore}); restart kloop to reopen the branch"
-                    ));
-                    (fresh.clone(), notes)
-                }
+                // The branch's last route cannot be adopted *and* cannot be
+                // restored: the branch would open on a route its timeline does
+                // not match, so the first turn would fail before sampling.
+                // Refuse before retiring the live session.
+                Err(restore) => Err(anyhow::anyhow!(
+                    "rewind aborted: the branch's provider route could not be \
+                     restored ({restore}), and the current route could not be \
+                     written to the branch"
+                )),
             }
         }
     }
@@ -318,10 +327,10 @@ mod tests {
                 .unwrap(),
         );
         history.inject_append_failure();
-        let (adopted, notes) = adopt_branch_route(&live, &mut history);
+        let (adopted, notes) = adopt_branch_route(&live, &mut history).unwrap();
 
-        assert_eq!(adopted.provider_route.model(), "mock");
-        assert_eq!(adopted.provider_route.revision(), 1);
+        assert_eq!(adopted.model(), "mock");
+        assert_eq!(adopted.revision(), 1);
         assert!(
             notes
                 .iter()
@@ -342,6 +351,58 @@ mod tests {
         assert_eq!(reread.snapshot.provider_routes.len(), 1);
         assert_eq!(reread.snapshot.provider_routes[0].model, "mock");
         drop(reread);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The branch's route cannot be adopted *and* cannot be restored (its
+    /// provider is gone from this process's catalog). That must be an error,
+    /// not a rewind onto a branch whose first turn would fail route validation.
+    #[test]
+    fn an_unrunnable_branch_route_is_refused() {
+        let dir = temp_dir("route-lost");
+        let (provider, _seen) = Provider::mock_recording(Vec::new());
+        let mut cfg = TestConfig::new("rewind-route-lost")
+            .dirs(&dir)
+            .provider(provider)
+            .models("mock", &["mock", "other"])
+            .build()
+            .test_clone();
+        cfg.bind_session(LIVE_ID.into()).unwrap();
+        let mut history = History::new(dir.to_path_buf());
+        history.attach_rollout(
+            Rollout::new_with_initial_route(session_path(&dir, LIVE_ID), &cfg.provider_route)
+                .unwrap(),
+        );
+        for message in first_turn() {
+            history.record(message);
+        }
+        history.record(Message::user_text("make it iterative"));
+        history.record(text("done"));
+
+        let cut = fork_points(history.rollout_path().unwrap()).unwrap()[0].seq;
+        let fork_path = fork_session(history.rollout_path().unwrap(), Some(cut), &dir).unwrap();
+        let resumed = inspect_session_for_writing(&fork_path)
+            .unwrap()
+            .recover_for_writing()
+            .unwrap();
+        let mut branch = history.branch(resumed);
+
+        // The live route moves to `other`; the catalog no longer carries the
+        // branch's `mock`, so the fallback restore cannot succeed either.
+        let (provider, _seen) = Provider::mock_recording(Vec::new());
+        let (catalog, other_route) = crate::provider_route::ProviderCatalog::from_provider(
+            "other",
+            provider,
+            "other",
+            vec!["other".into()],
+        )
+        .unwrap();
+        let mut live = cfg.clone_with_provider_route(other_route);
+        live.provider_catalog = catalog;
+        branch.inject_append_failure();
+
+        let error = adopt_branch_route(&live, &mut branch).unwrap_err();
+        assert!(error.to_string().contains("rewind aborted"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -392,8 +453,11 @@ mod tests {
 
         assert_ne!(rewound.cfg.session_id, cfg.session_id);
         assert_eq!(rewound.notes, Vec::<String>::new());
-        let [first, answer, summary] = history.messages() else {
-            panic!("the first turn and the summary: {:?}", history.messages())
+        let [first, answer, summary] = rewound.history.messages() else {
+            panic!(
+                "the first turn and the summary: {:?}",
+                rewound.history.messages()
+            )
         };
         assert_eq!([first.clone(), answer.clone()], first_turn().as_slice());
         assert_eq!(summary.injected, Some(Injected::BranchSummary));
@@ -405,7 +469,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\n- src/parser.rs"), "{text}");
-        let branch_path = history.rollout_path().unwrap();
+        let branch_path = rewound.history.rollout_path().unwrap();
         assert_eq!(
             branch_path,
             session_path(&dir, &rewound.cfg.session_id).as_path()
@@ -414,7 +478,7 @@ mod tests {
             crate::rollout::load_session_snapshot(branch_path)
                 .unwrap()
                 .messages,
-            history.messages()
+            rewound.history.messages()
         );
         assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live_before);
         let _ = std::fs::remove_dir_all(&dir);
@@ -445,7 +509,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(history.messages(), first_turn());
+        assert_eq!(rewound.history.messages(), first_turn());
         assert_eq!(
             rewound.notes,
             [format!(
@@ -567,7 +631,7 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(history.messages(), first_turn());
+        assert_eq!(rewound.history.messages(), first_turn());
         assert_eq!(rewound.notes, Vec::<String>::new());
         assert!(seen.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

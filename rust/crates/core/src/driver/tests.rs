@@ -24,6 +24,8 @@ use crate::skills::Skill;
 use crate::skills::SkillContext;
 use crate::skills::SkillSource;
 use kloop_protocol::AssistantBlock;
+use kloop_protocol::ContentBlock;
+use kloop_protocol::ImageSource;
 use kloop_provider::MockTurn;
 use kloop_provider::Provider;
 
@@ -167,22 +169,32 @@ async fn an_interrupted_message_comes_back_and_leaves_no_trace() {
 async fn an_interrupted_skill_expansion_comes_back_staged() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let (provider, _seen) = Provider::mock_recording(vec![MockTurn::Gate {
-        started: started_tx,
-        release: release_rx,
-        blocks: vec![text_block("too late")],
-    }]);
+    let (provider, seen) = Provider::mock_recording(vec![
+        MockTurn::Gate {
+            started: started_tx,
+            release: release_rx,
+            blocks: vec![text_block("too late")],
+        },
+        MockTurn::Blocks(vec![text_block("answered")]),
+    ]);
     let mut cfg = mock_config(provider);
     cfg.skills = Arc::new(vec![test_skill("review", "review the diff")]);
     let cfg = Arc::new(cfg);
     let cancel = CancellationToken::new();
     let child_cancel = cancel.clone();
+    let image = ContentBlock::Image {
+        source: ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "AA==".into(),
+        },
+    };
+    let launch_image = image.clone();
     let handle = tokio::spawn(async move {
         let ui: Arc<dyn Ui> = Arc::new(NoUi);
         let mut driver = SessionDriver::new(
             Arc::clone(&cfg),
             History::new(cfg.offload_dir.clone()),
-            Vec::new(),
+            vec![launch_image],
         )
         .unwrap();
         let report = driver
@@ -201,7 +213,7 @@ async fn an_interrupted_skill_expansion_comes_back_staged() {
         .expect("sampling did not start")
         .expect("sampling gate dropped");
     cancel.cancel();
-    let (report, driver) = tokio::time::timeout(Duration::from_secs(2), handle)
+    let (report, mut driver) = tokio::time::timeout(Duration::from_secs(2), handle)
         .await
         .expect("the turn ignored cancellation")
         .expect("the turn panicked");
@@ -212,8 +224,40 @@ async fn an_interrupted_skill_expansion_comes_back_staged() {
     assert!(command.output.is_empty());
     let turn = command.turn.expect("the skill expanded into a turn");
     assert_eq!(turn.outcome.reason, EndReason::Aborted);
-    assert_eq!(turn.returned, Some(Message::user_text("/review")));
+    assert_eq!(
+        turn.returned,
+        Some(Message::user_text("/review")),
+        "the command line comes back, not the skill's expanded prompt"
+    );
     assert_eq!(driver.history().messages(), &[]);
+
+    // The `--image` blocks stayed with the driver: a retried command has no
+    // composer text to put them in, so whichever input comes next carries them.
+    let ui: Arc<dyn Ui> = Arc::new(NoUi);
+    let report = driver
+        .dispatch(
+            Input::Message {
+                text: "next".into(),
+                images: Vec::new(),
+            },
+            &ui,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        report,
+        Report::Turn(Some(turn)) if turn.outcome.reason == EndReason::Completed
+    ));
+    let requests = seen.lock().unwrap();
+    let next = requests.last().expect("the next message sampled");
+    assert!(
+        next.messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))),
+        "the launch image rides the next input: {:?}",
+        next.messages
+    );
 }
 
 /// An interrupt during a slow expansion cancels the turn the expansion would
@@ -246,7 +290,12 @@ async fn a_cancelled_expansion_does_not_start_its_turn() {
     let Report::Command(command) = report else {
         panic!("a command input must report a command");
     };
-    assert!(command.turn.is_none(), "the expansion must not run a turn");
+    let turn = command
+        .turn
+        .expect("the cancelled expansion reports an aborted turn");
+    assert_eq!(turn.outcome.reason, EndReason::Aborted);
+    assert_eq!(turn.outcome.rounds, 0);
+    assert_eq!(turn.returned, Some(Message::user_text("/review")));
     assert_eq!(driver.history().messages(), &[]);
 }
 

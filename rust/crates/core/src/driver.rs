@@ -74,6 +74,10 @@ pub struct TurnReport {
     /// whole turn back. The front-end owns where it goes (a composer, a
     /// discarded client turn, or nowhere at all).
     pub returned: Option<Message>,
+    /// Whether the agent loop ran. A cancelled command expansion reports an
+    /// aborted turn without entering it, so the inbox it did not drain still
+    /// owes a re-announcement.
+    pub entered_loop: bool,
 }
 
 #[derive(Debug)]
@@ -135,8 +139,9 @@ impl Report {
     /// drain the inbox. A command does not; a skill expansion does.
     pub fn drained_inbox(&self) -> bool {
         match self {
-            Self::Turn(turn) => turn.is_some(),
-            Self::Command(command) => command.turn.is_some(),
+            Self::Turn(Some(turn)) => turn.entered_loop,
+            Self::Turn(None) => false,
+            Self::Command(command) => command.turn.as_ref().is_some_and(|turn| turn.entered_loop),
         }
     }
 
@@ -234,6 +239,7 @@ impl SessionDriver {
                 Report::Turn(Some(TurnReport {
                     outcome,
                     returned: None,
+                    entered_loop: true,
                 }))
             }
         }
@@ -396,34 +402,26 @@ impl SessionDriver {
         };
         let crate::rewind::Rewound {
             cfg,
+            history,
             report,
-            mut notes,
+            notes,
         } = rewound;
         let cfg = Arc::new(cfg);
-        // The branch is the live session now (`rewind.rs` already swapped
-        // History), so a provider state that cannot be rebuilt must not leave
-        // the driver half moved. Fall back to the route the branch runs on —
-        // what a session with no usable timeline starts on — and say so.
-        let provider = match provider_state_for(&cfg, &self.history) {
-            Ok(provider) => provider,
-            Err(error) => {
-                notes.push(format!(
-                    "provider state reset to the current route: {error}"
-                ));
-                Arc::new(SessionProviderState::from_route(
-                    Arc::clone(&cfg.provider_catalog),
-                    cfg.provider_route.clone(),
-                ))
-            }
-        };
+        // The branch is settled (route and all) before anything is swapped;
+        // this is the only fallible step left, and it still sees the old
+        // session state.
+        let provider = provider_state_for(&cfg, &history).map_err(anyhow::Error::new)?;
+        let activity = cfg.inbox.subscribe_activity();
+        let messages = history.messages().to_vec();
+        self.history = history;
         self.cfg = cfg;
         self.provider = provider;
-        self.activity = self.cfg.inbox.subscribe_activity();
+        self.activity = activity;
         Ok(RewindReport::Rewound {
             session_id: self.cfg.session_id.clone(),
             report,
             notes,
-            messages: self.history.messages().to_vec(),
+            messages,
         })
     }
 
@@ -447,7 +445,11 @@ impl SessionDriver {
         };
         let (outcome, returned) =
             run_turn_with_input(&self.cfg, &mut self.history, ui, cancel, 0, message).await;
-        TurnReport { outcome, returned }
+        TurnReport {
+            outcome,
+            returned,
+            entered_loop: true,
+        }
     }
 
     async fn run_command(
@@ -470,16 +472,37 @@ impl SessionDriver {
         }
         let turn = match result.run_turn {
             // Ctrl+C during a slow expansion (an `!cmd` or `@file`) cancels the
-            // turn this command would have started. Running it anyway would fire
-            // the pre-turn hook after the interrupt, when the front-end is
-            // already leaving.
-            Some(_) if cancel.is_cancelled() => None,
+            // turn this command would have started. Report the interrupt without
+            // running it: entering the turn now would fire the pre-turn hook
+            // after the interrupt, and calling it a completed command would hide
+            // that nothing ran.
+            Some(_) if cancel.is_cancelled() => Some(TurnReport {
+                outcome: TurnOutcome {
+                    reason: EndReason::Aborted,
+                    final_text: String::new(),
+                    rounds: 0,
+                    structured_output: None,
+                },
+                returned: Some(Message::user_text(line)),
+                entered_loop: false,
+            }),
             Some(prompt) => {
                 let mut turn = self.run_message(prompt, Vec::new(), ui, cancel).await;
                 // The input that never happened is the user's command line, not
                 // the prompt the skill expanded to: a front-end that offers a
-                // retry has to get back what the user typed.
-                if turn.returned.is_some() {
+                // retry has to get back what the user typed. The `--image` blocks
+                // that rode this turn stay on it, so the retry still has them.
+                if let Some(returned) = turn.returned.take() {
+                    // The non-text blocks are `--image` blocks (a command never
+                    // carries composer images). Re-arm them for whichever input
+                    // comes next instead of handing them to the composer: a
+                    // retried command has no composer text they could ride.
+                    let mut images = returned
+                        .content
+                        .into_iter()
+                        .filter(|block| !matches!(block, ContentBlock::Text { .. }))
+                        .collect::<Vec<_>>();
+                    self.launch_images.append(&mut images);
                     turn.returned = Some(Message::user_text(line));
                 }
                 Some(turn)

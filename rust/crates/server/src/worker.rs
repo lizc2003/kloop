@@ -40,16 +40,18 @@ pub(super) async fn thread_worker(
         turn_seq,
         inbox,
         active_route,
+        shutdown,
     } = state;
     let mut inbox_activity = inbox.subscribe_activity();
     loop {
         let message = tokio::select! {
+            _ = shutdown.cancelled() => break,
             turn = turns.recv() => {
                 let Some(turn) = turn else { break };
                 turn
             }
             activity = inbox_activity.changed() => {
-                if activity.is_err() {
+                if activity.is_err() || shutdown.is_cancelled() {
                     break;
                 }
                 if inbox.is_empty()

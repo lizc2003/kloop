@@ -25,6 +25,7 @@ use kloop_core::rollout::SessionSnapshot;
 use kloop_core::session_store::SessionDirs;
 use kloop_protocol::ActiveProviderRoute;
 use kloop_protocol::clip_chars;
+use tokio_util::sync::CancellationToken;
 
 use crate::ConfigFactory;
 use crate::PendingInteractions;
@@ -320,18 +321,23 @@ impl Server {
             pending: self.pending.clone(),
             reverse_request_seq: self.reverse_request_seq.clone(),
             client_questions: self.client_questions,
+            shutdown: self.shutdown.clone(),
         };
         let builds = self.builds.clone();
         self.pending_threads
             .insert(thread_id.clone(), request_id.clone());
         tokio::task::spawn_blocking(move || {
-            let outcome = build.build();
+            let (outcome, guard) = match build.build() {
+                Ok((handle, guard)) => (Ok(handle), guard),
+                Err(error) => (Err(error), None),
+            };
             let _ = builds.send(ThreadBuild {
                 request_id,
                 thread_id,
                 options,
                 reply,
                 outcome,
+                guard,
             });
         });
     }
@@ -354,23 +360,27 @@ struct PendingThreadBuild {
     pending: PendingInteractions,
     reverse_request_seq: Arc<AtomicU64>,
     client_questions: bool,
+    shutdown: CancellationToken,
 }
 
 impl PendingThreadBuild {
-    fn build(self) -> Result<ThreadHandle, (i64, String)> {
+    fn build(
+        self,
+    ) -> Result<(ThreadHandle, Option<kloop_core::cleanup::RemoveFileOnDrop>), (i64, String)> {
         let PendingThreadBuild {
             thread_id,
             options,
             recovery_source,
             mut seed,
             mut history,
-            mut guard,
+            guard,
             factory,
             catalog,
             out,
             pending,
             reverse_request_seq,
             client_questions,
+            shutdown,
         } = self;
         let projection = Arc::new(
             ThreadProjection::new(
@@ -409,6 +419,7 @@ impl PendingThreadBuild {
             reverse_request_seq: reverse_request_seq.clone(),
             turn: turn.clone(),
             projection: projection.clone(),
+            shutdown: shutdown.clone(),
         });
         let questioner: Option<Arc<dyn Questioner>> =
             client_questions.then(|| ui.clone() as Arc<dyn Questioner>);
@@ -473,27 +484,29 @@ impl PendingThreadBuild {
             turn_seq: turn_seq.clone(),
             inbox: inbox.clone(),
             active_route: active_route.clone(),
+            shutdown,
         };
         // A blocking-pool thread still carries the runtime context, so the
         // worker is spawned here and the handle is what travels back.
         tokio::spawn(thread_worker(driver, ui, turn_rx, worker_state));
-        // The worker owns the history (and a fork's file) from here. On any
-        // earlier failure the guard drops and removes it.
-        if let Some(guard) = guard.as_mut() {
-            guard.disarm();
-        }
-        Ok(ThreadHandle {
-            turn_tx,
-            running,
-            current_cancel,
-            inbox,
-            turn_seq,
-            turn,
-            cwd: handle_cwd,
-            active_route,
-            provider_state,
-            projection,
-        })
+        // The worker owns the history from here. A fork's file is still the
+        // guard's until the read loop registers the handle: if the build lands
+        // after the client is gone, the branch must not stay visible.
+        Ok((
+            ThreadHandle {
+                turn_tx,
+                running,
+                current_cancel,
+                inbox,
+                turn_seq,
+                turn,
+                cwd: handle_cwd,
+                active_route,
+                provider_state,
+                projection,
+            },
+            guard,
+        ))
     }
 }
 

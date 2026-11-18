@@ -2297,11 +2297,17 @@ order, and clients match them by id. Thread creation (`thread/start`,
 build: the read loop starts the build, keeps reading, and registers the thread
 and answers the request when the finished handle comes back — so a slow context
 gather, sandbox, or skills scan on one thread cannot delay another thread's
-interrupt. When input ends, running turns are cancelled first, then accepted
-builds get a bounded grace to land and be answered; a build still inside its
-factory is answered with an error rather than silence, and the writer gets a
-bounded flush so that build's output sender cannot hold shutdown. After a
-non-model operation (`/provider`,
+interrupt. When input ends, a shutdown token stops workers from starting another
+turn (a scheduler delivery that becomes due during the drain would otherwise run
+for a client that is gone) and releases approvals or questions still waiting on
+that client; running turns are cancelled next. Accepted builds then get a bounded
+grace to land and be answered; one still inside its factory is answered with an
+error rather than silence, and the writer gets a bounded flush so that build's
+output sender cannot hold shutdown. A fork's file stays under the build's removal
+guard until the read loop registers the handle, so a fork that misses the grace
+leaves no visible branch. At the process level the CLI shuts the runtime down
+with a deadline: a blocking task cannot be aborted, and the default runtime drop
+would wait for it. After a non-model operation (`/provider`,
 `thread/provider/switch`, a slash command) releases the thread's single-flight
 gate, the worker re-announces a non-empty inbox: a steer or scheduled delivery
 that arrived while `running` was already set would otherwise sit there until an
@@ -4517,15 +4523,21 @@ skill turn that input is the command line the user typed, not the prompt the
 skill expanded to: retrying `/name args` must run the skill again, and a body
 that happens to start with `/` would otherwise run a different command.
 `CommandReport` carries the output, `quit`, `new_session`, `route_changed`, the
-picker stage and an expanded turn. A cancelled token skips the expanded turn
-entirely — starting it would run the pre-turn hook after the interrupt. The driver also owns the `/clear` swap
+picker stage and an expanded turn. A cancelled token reports that turn as
+`Aborted` without entering it — starting it would run the pre-turn hook after the
+interrupt — and its `entered_loop` flag stays false so the inbox it did not drain
+still owes a re-announcement. `--image` blocks that rode the turn are re-armed
+on the driver, so whichever input comes next carries them (a command has no
+composer text they could ride). The TUI's command draft itself has no images:
+the ones left behind in the composer are the user's, to keep or clear. The driver also owns the `/clear` swap
 (`start_fresh_session`), rewind, the two idle provider transactions
 (`switch_provider`, `provider_command`), the idle-inbox debt
 (`reannounce_if_owed`), and the end-of-session sequence (`shutdown_session`).
 Every fallible step is computed before the state it belongs to is replaced, so a
-failed `/clear` leaves the old session intact; a rewind whose branch route names
-a provider this process no longer has keeps the branch (the low level already
-switched History) and falls back to the route the branch runs on, with a note.
+failed `/clear` leaves the old session intact. Rewind builds the branch History
+without touching the live one: the route is settled first, and a branch whose
+route can be neither adopted nor restored is refused before the old session is
+retired — it would otherwise open on a timeline its first turn could not match.
 
 The front-end keeps its event loop, its cancellation token, and the shape of its
 turn bracket: the TUI's `TurnEnded`, the server's `turn/started` and

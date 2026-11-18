@@ -588,12 +588,6 @@ impl Draft {
         self.0.expand()
     }
 
-    /// The text the composer showed, paste/image labels intact. A slash
-    /// command's echo is this, while what went to the worker is `text()`.
-    pub fn display_text(&self) -> &str {
-        &self.0.display
-    }
-
     pub fn image_count(&self) -> usize {
         self.0.image_count()
     }
@@ -766,6 +760,23 @@ impl Composer {
 
     pub fn is_blank(&self) -> bool {
         self.text().trim().is_empty()
+    }
+
+    /// Whether the draft holds anything the user typed. Image labels do not
+    /// count: a slash command takes the text and leaves its images behind, so
+    /// a labels-only composer is not a new draft.
+    pub fn has_text(&self) -> bool {
+        let mut copied = 0;
+        for atom in &self.document.atoms {
+            if !self.document.display[copied..atom.range.start().get()]
+                .trim()
+                .is_empty()
+            {
+                return true;
+            }
+            copied = atom.range.end().get();
+        }
+        !self.document.display[copied..].trim().is_empty()
     }
 
     pub fn cursor(&self) -> ByteOffset {
@@ -1235,13 +1246,7 @@ impl Composer {
 
     /// A slash command's line. Commands take text only, so the images are left
     /// out of it and stay behind as the next draft.
-    /// A snapshot of the current draft, for a caller that consumes the text
-    /// but may have to put the same input back (an interrupted turn).
-    pub fn draft(&self) -> Draft {
-        Draft(self.document.clone())
-    }
-
-    pub fn submit_command(&mut self) -> Option<String> {
+    pub fn submit_command(&mut self) -> Option<(String, Draft)> {
         if self.is_blank() {
             return None;
         }
@@ -1255,6 +1260,11 @@ impl Composer {
         {
             command.delete_atom(index);
         }
+        // The command's own draft, for an interrupted skill turn that has to put
+        // it back: text and paste atoms only. The images stay in the composer
+        // (below) and are the user's to keep or clear while the command runs.
+        let draft = Draft(command.clone());
+        let line = command.expand();
         self.take_text();
         for (number, source) in images {
             self.insert_image(number, source);
@@ -1264,7 +1274,16 @@ impl Composer {
         if self.document.image_count() > 0 {
             self.document.image_high_water = high_water;
         }
-        Some(command.expand())
+        Some((line, draft))
+    }
+
+    /// The images currently attached, in their label order.
+    pub fn image_sources(&self) -> Vec<ImageSource> {
+        self.document
+            .images()
+            .into_iter()
+            .map(|(_, source)| ImageSource::clone(&source))
+            .collect()
     }
 
     /// Put a submitted draft back, cursor at its end.
@@ -2109,7 +2128,10 @@ mod tests {
         composer.attach_image(image("gone"));
         composer.backspace();
         composer.insert_text(" now");
-        assert_eq!(composer.submit_command().as_deref(), Some("/review  now"));
+        assert_eq!(
+            composer.submit_command().map(|(line, _)| line).as_deref(),
+            Some("/review  now")
+        );
         // 留下的图还属于这次输入：删掉的 #3 不复用。
         composer.attach_image(image("three"));
         assert_eq!(
@@ -2127,7 +2149,10 @@ mod tests {
         composer.attach_image(image("gone"));
         composer.backspace();
         composer.insert_text("/help");
-        assert_eq!(composer.submit_command().as_deref(), Some("/help"));
+        assert_eq!(
+            composer.submit_command().map(|(line, _)| line).as_deref(),
+            Some("/help")
+        );
         composer.attach_image(image("one"));
         assert_eq!(composer.text(), "[Image #1]");
     }

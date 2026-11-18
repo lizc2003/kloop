@@ -45,6 +45,18 @@
   全绿；TUI PTY 25 项在沙箱外全绿（沙箱内 24/25，`a_shell_command_gets_a_row_of_its_own`
   被嵌套 seatbelt 挡住，`sandbox_apply: Operation not permitted`）；
   四个受影响 crate 的 `cargo clippy --all-targets -- -D warnings` 干净。
+- **review 修正（第二轮）**：
+  - CLI 在 `run` 返回后用 `shutdown_timeout` 结束 runtime：卡在 factory 里的 blocking build
+    不能被 abort，默认的 runtime drop 会一直等它。
+  - server 在 EOF 时先发 `shutdown` 令牌，worker 不再启动新 turn；审批/提问的等待在令牌触发时
+    立即返回 Stop/Unavailable，不再等一个已经关闭的客户端。
+  - 超时 build 的请求回 JSON-RPC 错误；`thread/fork` 的删除守卫移到读循环注册处，未注册的
+    分支不会留在 `thread/list` 里。
+  - rewind 用 `History::branch` 构造独立分支，路由落定后才退役旧会话；路线既不能写、也不能从
+    目录恢复时直接拒绝，不再报告“成功但无法采样”。
+  - 展开期间取消按 `Aborted` 报告并带 `entered_loop=false`；`--image` 由驱动器重新挂回下一次输入
+    （命令没有 composer 文本可载图）。
+  - TUI 的命令草稿只含文本与 paste，图片留在输入框：保留的图片恢复时挂回，用户清掉的不复活。
 - **既有基线**：全仓 parity 的 `Plan 56 parser contract drift` 不通过——`refs` 语料期望
   `enter_name_null`/`enter_path_null`/`exit_discard_null` 判为 invalid，而 plan 267 的
   native report 明确 `null_is_omitted`。本次改动未触 `core/src/tools/`，不是这条 plan 引入的。

@@ -5424,3 +5424,11 @@ review 抓到两处顺序错误：rewind 先换 Config 再重建 provider state�
 什么”排，先取消 turn，再等内部账。同类的还有把取消检查放在“开始新一轮”的入口：展开命令
 完成后即使用户已按 Ctrl+C，也不能让已取消的 token 进入 `run_turn`，否则 `pre_turn` hook
 会在中断之后才执行。
+
+413. **“不可取消的工作”必须有显式期限；状态切换要先构造后赋值。** plan 269 的第二次 review：
+server 的 `serve` 能返回，但 CLI 的 runtime 默认 drop 仍会等 `spawn_blocking` 的 config build，
+所以要在 `main` 用 `shutdown_timeout`；`thread/start` 后立刻关 stdin 的请求要回错误而不是沉默，
+超时后卡住的 build 还会通过 `out` sender 拖住 writer，fork 的删除守卫也必须留到读循环注册时。
+rewind 的修法同理：不是事后回滚，而是先用 `History::branch` 建出分支、把路由落定，再一次性
+换入。判据：收尾路径上凡是无法 abort 的工作，都要写出期限和超时后的答复；一次操作改多份状态，
+先构造全部候选，再赋值。

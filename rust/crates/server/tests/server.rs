@@ -335,6 +335,19 @@ fn slow_factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) 
     })
 }
 
+/// The first build (the source thread) is fast; later builds are slow, so a
+/// fork lands after the server has stopped answering.
+fn slow_after_first_build(offload: PathBuf, delay: Duration) -> ConfigFactory {
+    let inner = factory(vec![vec![text("answer")]], offload, false);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            std::thread::sleep(delay);
+        }
+        inner(options, catalog, approver, questioner, notify)
+    })
+}
+
 /// A factory that outlives the server's shutdown grace: used to prove a stuck
 /// build is answered and cannot hold the writer.
 fn stuck_factory(offload: PathBuf, delay: Duration) -> ConfigFactory {
@@ -4398,6 +4411,48 @@ async fn a_stuck_thread_build_is_answered_and_does_not_hold_shutdown() {
         "the error must arrive within the shutdown grace"
     );
     client.wait_for_exit().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A fork whose build lands after the server stopped answering must not leave
+/// a visible branch: the client got an error, and the file the fork created
+/// before building is removed with the unregistered build.
+#[tokio::test]
+async fn a_fork_that_misses_the_shutdown_grace_leaves_no_branch() {
+    let dirs = test_dirs("fork-stuck");
+    let mut client = start_server(
+        slow_after_first_build(dirs.offload.clone(), Duration::from_secs(3)),
+        &dirs,
+    );
+    let src = client.init_and_start().await;
+    client
+        .request("turn/start", json!({"thread_id": src, "input": "q"}))
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+
+    let fork = client
+        .request("thread/fork", json!({"thread_id": src}))
+        .await;
+    client.close_input().await;
+    let response = client.recv_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(response["id"], fork);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish starting"),
+        "{response:?}"
+    );
+    client.wait_for_exit().await;
+    // The blocking build is still running; its ThreadBuild (and with it the
+    // fork's guard) lands a moment later.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let files: Vec<_> = std::fs::read_dir(&dirs.sessions)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert_eq!(files.len(), 1, "only the source session remains: {files:?}");
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
