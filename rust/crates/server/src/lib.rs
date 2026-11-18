@@ -178,14 +178,23 @@ where
         }
         server.handle_line(line);
     }
-    // Input closed or failed: cancel in-flight turns so workers wind down, then
-    // drop our sender so the writer drains and exits once every worker is gone.
-    //
-    // The build receiver goes first. A thread whose config build finishes after
-    // this point has no read loop to register it: closing the receiver drops
-    // that handle (and with it the worker's turn sender) instead of leaving an
-    // unread message whose worker — and output sender — keep the writer alive
-    // forever.
+    // Input closed or failed. A config build that already started still owes
+    // its request an answer: a client may close the pipe right after sending
+    // `thread/start`, and a missing response is indistinguishable from a
+    // rejected one. Drain what is already pending, bounded so a stuck build
+    // cannot hold the process open.
+    let pending = server.pending_threads.len();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        for _ in 0..pending {
+            let Some(build) = builds_rx.recv().await else {
+                break;
+            };
+            server.finish_thread_build(build);
+        }
+    })
+    .await;
+    // Whatever did not land in time is dropped with the receiver: a handle
+    // with no read loop to register it would keep the writer alive forever.
     drop(builds_rx);
     for handle in server.threads.values() {
         let mut current_cancel = handle.current_cancel.lock().unwrap();
@@ -308,13 +317,16 @@ struct Turn {
     /// `turn/completed`, and every item event of the turn.
     id: u64,
     cancel: CancellationToken,
-    /// Scheduler/background delivery turn: drain the typed inbox without
-    /// recording an empty ordinary user message.
-    delivery_only: bool,
 }
 
 enum ThreadWorkerMsg {
     Turn(Turn),
+    /// An idle delivery turn for the inbox: no client text, one turn bracket,
+    /// and the queued items are what it answers.
+    Wake {
+        id: u64,
+        cancel: CancellationToken,
+    },
     /// `/provider ...` on the idle-transaction path: no turn bracket and no
     /// turn in the event projection, just the command's bounded result.
     ProviderCommand {
@@ -334,7 +346,6 @@ struct ThreadWorkerState {
     turn_seq: Arc<AtomicU64>,
     inbox: Arc<Inbox>,
     active_route: Arc<Mutex<ActiveProviderRoute>>,
-    provider_state: Arc<kloop_core::provider_route::SessionProviderState>,
 }
 
 struct ThreadHandle {
