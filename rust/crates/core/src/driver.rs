@@ -363,10 +363,16 @@ impl SessionDriver {
         ui: &Arc<dyn Ui>,
     ) -> anyhow::Result<FreshSessionReport> {
         let fresh = commands::start_fresh_session(&self.cfg, ui).await?;
+        // Build everything that can fail before moving the session: a failure
+        // here leaves the driver on the old session rather than half-swapped.
+        // (`fresh` drops its own empty file if it never gets adopted.)
+        let cfg = Arc::new(fresh.cfg);
+        let provider = provider_state_for(&cfg, &fresh.history).map_err(anyhow::Error::new)?;
+        let activity = cfg.inbox.subscribe_activity();
         self.history = fresh.history;
-        self.cfg = Arc::new(fresh.cfg);
-        self.provider = provider_state_for(&self.cfg, &self.history).map_err(anyhow::Error::new)?;
-        self.activity = self.cfg.inbox.subscribe_activity();
+        self.cfg = cfg;
+        self.provider = provider;
+        self.activity = activity;
         Ok(FreshSessionReport {
             session_id: self.cfg.session_id.clone(),
             report: fresh.report,
@@ -388,13 +394,35 @@ impl SessionDriver {
             RewindOutcome::Cancelled => return Ok(RewindReport::Cancelled),
             RewindOutcome::Rewound(rewound) => *rewound,
         };
-        self.cfg = Arc::new(rewound.cfg);
-        self.provider = provider_state_for(&self.cfg, &self.history).map_err(anyhow::Error::new)?;
+        let crate::rewind::Rewound {
+            cfg,
+            report,
+            mut notes,
+        } = rewound;
+        let cfg = Arc::new(cfg);
+        // The branch is the live session now (`rewind.rs` already swapped
+        // History), so a provider state that cannot be rebuilt must not leave
+        // the driver half moved. Fall back to the route the branch runs on —
+        // what a session with no usable timeline starts on — and say so.
+        let provider = match provider_state_for(&cfg, &self.history) {
+            Ok(provider) => provider,
+            Err(error) => {
+                notes.push(format!(
+                    "provider state reset to the current route: {error}"
+                ));
+                Arc::new(SessionProviderState::from_route(
+                    Arc::clone(&cfg.provider_catalog),
+                    cfg.provider_route.clone(),
+                ))
+            }
+        };
+        self.cfg = cfg;
+        self.provider = provider;
         self.activity = self.cfg.inbox.subscribe_activity();
         Ok(RewindReport::Rewound {
             session_id: self.cfg.session_id.clone(),
-            report: rewound.report,
-            notes: rewound.notes,
+            report,
+            notes,
             messages: self.history.messages().to_vec(),
         })
     }
@@ -441,7 +469,21 @@ impl SessionDriver {
             self.cfg = Arc::new(self.cfg.clone_with_provider_route(self.provider.freeze()));
         }
         let turn = match result.run_turn {
-            Some(prompt) => Some(self.run_message(prompt, Vec::new(), ui, cancel).await),
+            // Ctrl+C during a slow expansion (an `!cmd` or `@file`) cancels the
+            // turn this command would have started. Running it anyway would fire
+            // the pre-turn hook after the interrupt, when the front-end is
+            // already leaving.
+            Some(_) if cancel.is_cancelled() => None,
+            Some(prompt) => {
+                let mut turn = self.run_message(prompt, Vec::new(), ui, cancel).await;
+                // The input that never happened is the user's command line, not
+                // the prompt the skill expanded to: a front-end that offers a
+                // retry has to get back what the user typed.
+                if turn.returned.is_some() {
+                    turn.returned = Some(Message::user_text(line));
+                }
+                Some(turn)
+            }
             None => None,
         };
         CommandReport {

@@ -44,7 +44,6 @@ pub use wire::turn_completed_params;
 pub use wire::turn_started_params;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -118,7 +117,7 @@ where
         out: out_tx,
         threads: HashMap::new(),
         builds: builds_tx,
-        pending_threads: HashSet::new(),
+        pending_threads: HashMap::new(),
         pending: Arc::new(Mutex::new(HashMap::new())),
         reverse_request_seq: Arc::new(AtomicU64::new(1)),
         factory,
@@ -178,13 +177,20 @@ where
         }
         server.handle_line(line);
     }
-    // Input closed or failed. A config build that already started still owes
-    // its request an answer: a client may close the pipe right after sending
-    // `thread/start`, and a missing response is indistinguishable from a
-    // rejected one. Drain what is already pending, bounded so a stuck build
-    // cannot hold the process open.
+    // Input closed or failed. Cancel running turns first: a config build a
+    // vanished client no longer waits for must not keep them alive.
+    for handle in server.threads.values() {
+        let mut current_cancel = handle.current_cancel.lock().unwrap();
+        if let Some(cancel) = current_cancel.take() {
+            cancel.cancel();
+        }
+    }
+    // A config build that already started still owes its request an answer: a
+    // client may close the pipe right after sending `thread/start`, and a
+    // missing response is indistinguishable from a rejected one. Wait for what
+    // was accepted, bounded so a slow build cannot hold the server.
     let pending = server.pending_threads.len();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let drained = tokio::time::timeout(SHUTDOWN_BUILD_GRACE, async {
         for _ in 0..pending {
             let Some(build) = builds_rx.recv().await else {
                 break;
@@ -192,25 +198,54 @@ where
             server.finish_thread_build(build);
         }
     })
-    .await;
-    // Whatever did not land in time is dropped with the receiver: a handle
-    // with no read loop to register it would keep the writer alive forever.
-    drop(builds_rx);
-    for handle in server.threads.values() {
-        let mut current_cancel = handle.current_cancel.lock().unwrap();
-        if let Some(cancel) = current_cancel.take() {
-            cancel.cancel();
-        }
+    .await
+    .is_ok();
+    // Whatever is still building cannot be registered now — its handle would
+    // have no read loop and would keep the writer alive — so answer it with an
+    // error instead of silence.
+    for (thread_id, request_id) in std::mem::take(&mut server.pending_threads) {
+        server.send(Outgoing::Error {
+            id: Some(request_id),
+            code: wire::SERVER_ERROR,
+            message: format!(
+                "thread '{thread_id}' did not finish starting before the server stopped reading"
+            ),
+            data: None,
+        });
     }
+    // A build that lands after this finds no receiver; its handle is dropped
+    // with the worker's turn sender.
+    drop(builds_rx);
     server.pending.lock().unwrap().clear();
     drop(server);
 
-    writer.await.context("writer task panicked")??;
+    // When every accepted build landed, waiting for the writer to see its
+    // senders drop is the normal teardown (workers flush their last notes).
+    // A build still inside its factory is the exception: it holds a clone of
+    // the output sender, so waiting would let it hold shutdown. Give the queue
+    // a bounded flush, then stop waiting for it.
+    let mut writer = writer;
+    if drained {
+        writer.await.context("writer task panicked")??;
+    } else {
+        match tokio::time::timeout(SHUTDOWN_WRITER_GRACE, &mut writer).await {
+            Ok(result) => result.context("writer task panicked")??,
+            Err(_) => writer.abort(),
+        }
+    }
     match read_error {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
 }
+
+/// How long shutdown lets accepted config builds land and be answered.
+const SHUTDOWN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the writer gets to flush once the read loop and server state are
+/// gone. A build still in its factory may outlive this; it must not hold the
+/// process through the output channel.
+const SHUTDOWN_WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The largest accepted inbound line. Matching the MCP wire cap keeps one
 /// client message from growing server memory without bound; a longer line is
@@ -421,9 +456,10 @@ struct Server {
     /// Where a thread whose config is being built on the blocking pool comes
     /// back to the read loop for registration and its response (plan 265).
     builds: mpsc::UnboundedSender<ThreadBuild>,
-    /// Thread ids with a build in flight. `threads` cannot answer "already
-    /// active" for them yet, so a pipelined resume would otherwise build twice.
-    pending_threads: HashSet<String>,
+    /// Thread ids with a build in flight, with the request each will answer.
+    /// `threads` cannot answer "already active" for them yet, so a pipelined
+    /// resume would otherwise build twice.
+    pending_threads: HashMap<String, RequestId>,
     pending: PendingInteractions,
     reverse_request_seq: Arc<AtomicU64>,
     factory: ConfigFactory,

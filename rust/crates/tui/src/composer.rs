@@ -588,6 +588,12 @@ impl Draft {
         self.0.expand()
     }
 
+    /// The text the composer showed, paste/image labels intact. A slash
+    /// command's echo is this, while what went to the worker is `text()`.
+    pub fn display_text(&self) -> &str {
+        &self.0.display
+    }
+
     pub fn image_count(&self) -> usize {
         self.0.image_count()
     }
@@ -1229,6 +1235,12 @@ impl Composer {
 
     /// A slash command's line. Commands take text only, so the images are left
     /// out of it and stay behind as the next draft.
+    /// A snapshot of the current draft, for a caller that consumes the text
+    /// but may have to put the same input back (an interrupted turn).
+    pub fn draft(&self) -> Draft {
+        Draft(self.document.clone())
+    }
+
     pub fn submit_command(&mut self) -> Option<String> {
         if self.is_blank() {
             return None;

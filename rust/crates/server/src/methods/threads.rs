@@ -123,7 +123,7 @@ impl Server {
         params: &Value,
     ) -> DeferredResult {
         let thread_id = str_param(params, "thread_id")?;
-        if self.threads.contains_key(thread_id) || self.pending_threads.contains(thread_id) {
+        if self.threads.contains_key(thread_id) || self.pending_threads.contains_key(thread_id) {
             return Err((
                 wire::SERVER_ERROR,
                 format!("thread '{thread_id}' is already active"),
@@ -322,7 +322,8 @@ impl Server {
             client_questions: self.client_questions,
         };
         let builds = self.builds.clone();
-        self.pending_threads.insert(thread_id.clone());
+        self.pending_threads
+            .insert(thread_id.clone(), request_id.clone());
         tokio::task::spawn_blocking(move || {
             let outcome = build.build();
             let _ = builds.send(ThreadBuild {

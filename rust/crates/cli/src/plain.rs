@@ -381,18 +381,17 @@ async fn plain_main(
                     Err(error) => println!("clear failed: {error:#}"),
                 }
             }
-            // `/exit` quits the REPL, like the bare `exit` word above.
-            if command.quit || exit_requested {
-                break;
-            }
             // A skill invoked as `/name` expands to a prompt, which the driver
-            // runs as a turn; report it like a typed message.
+            // runs as a turn; report it like a typed message. Ctrl+C during that
+            // turn still reports how it ended before the REPL exits.
             if let Some(turn) = command.turn {
                 println!();
                 report_turn_reason(&turn.outcome.reason, turn.returned.is_some(), driver.cfg());
-                if exit_requested {
-                    break;
-                }
+            }
+            // `/exit` quits the REPL, like the bare `exit` word above; so does
+            // a Ctrl+C that arrived while the command ran.
+            if command.quit || exit_requested {
+                break;
             }
             continue;
         }

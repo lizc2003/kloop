@@ -556,6 +556,14 @@ pub enum Command {
     Quit,
 }
 
+/// What put the session in flight. A turn's sent text is its draft's expansion;
+/// a slash command's echo is the display text while its worker line is the
+/// expansion, so an interrupted skill turn restores the command the user typed.
+enum InFlight {
+    Turn(Draft),
+    Command(Draft),
+}
+
 pub struct App {
     pub session_id: String,
     /// The uncommitted transcript tail: cells still mutating plus the recent
@@ -590,9 +598,9 @@ pub struct App {
     /// event loop to build the user message. Held here rather than on the
     /// Command so a Command stays a cheap value to compare.
     submit_images: Vec<ImageSource>,
-    /// The draft of the fresh turn in flight, for [`App::return_input`] to put
+    /// The draft of the operation in flight, for [`App::return_input`] to put
     /// back with its images where they were.
-    in_flight: Option<Draft>,
+    in_flight: Option<InFlight>,
     pub running: bool,
     /// A startup task still owns the keyboard; the footer shows this line
     /// instead of the idle hints, and input is ignored except for quitting.
@@ -1834,6 +1842,7 @@ impl App {
             // `[Pasted #1: n chars]` label. Detection and the echo stay on the
             // display text: a placeholder never starts with `/`, and an echo is
             // an acknowledgement, so the raw paste does not belong in scrollback.
+            let draft = self.composer.draft();
             let command = self
                 .composer
                 .submit_command()
@@ -1841,6 +1850,7 @@ impl App {
                 .trim()
                 .to_string();
             self.cells.push(Cell::User(display.clone()));
+            self.in_flight = Some(InFlight::Command(draft));
             self.running = true;
             self.freeze_selected_route();
             return Command::Slash(command);
@@ -1874,7 +1884,7 @@ impl App {
             self.cells.push(Cell::User(image_placeholder(source)));
         }
         self.submit_images = sub.images;
-        self.in_flight = Some(sub.draft);
+        self.in_flight = Some(InFlight::Turn(sub.draft));
         self.running = true;
         self.freeze_selected_route();
         Command::Submit(sub.text)
@@ -1890,7 +1900,21 @@ impl App {
     /// so it is in neither history nor the session file. Undo the echo and put
     /// the input back in the composer to be fixed and resent.
     fn return_input(&mut self, text: String, images: Vec<ImageSource>) {
-        let draft = self.in_flight.take().filter(|draft| draft.text() == text);
+        let in_flight = self.in_flight.take();
+        // A command's carried text is the expanded command line; its echo is the
+        // display text (a paste label never starts with `/`). A turn's echo is
+        // the sent text itself. The draft is matched against the text the worker
+        // handed back, so a stale draft cannot clobber what the user is typing.
+        let (draft, echo, command) = match in_flight {
+            Some(InFlight::Command(draft)) => {
+                let echo = draft.display_text().to_string();
+                (Some(draft), echo, true)
+            }
+            Some(InFlight::Turn(draft)) if draft.text() == text => {
+                (Some(draft), text.clone(), false)
+            }
+            Some(InFlight::Turn(_)) | None => (None, text.clone(), false),
+        };
         // Esc only reaches a running turn from an empty composer (a draft makes
         // it a two-tap clear), but the user can start typing in the gap between
         // the interrupt and the worker handing this back. Their new draft wins:
@@ -1901,11 +1925,14 @@ impl App {
         }
         // The draft's images lead the returned ones and each was echoed; any
         // after them are `--image` blocks that rode this turn and ride the next.
+        // A command echoed only its line; its images stayed in the composer and
+        // were never transcript placeholders.
         let (restored, echoed) = match &draft {
+            Some(draft) if command => (draft.image_count(), 0),
             Some(draft) => (draft.image_count(), draft.image_count()),
             None => (0, images.len()),
         };
-        self.drop_input_echo(&text, echoed);
+        self.drop_input_echo(&echo, echoed);
         match draft {
             Some(draft) => self.composer.restore(draft),
             None if !text.is_empty() => self.composer.paste(&text),
@@ -3374,6 +3401,32 @@ mod tests {
         assert_eq!(
             app.cells,
             vec![Cell::User("/help".into()), Cell::User("/cost".into())]
+        );
+    }
+
+    /// A skill's expanded prompt is not the user's input: interrupted before the
+    /// model replied, the composer gets back the line that was typed, so
+    /// retrying runs the skill again instead of submitting whatever its body
+    /// expanded to (a body that starts with `/` would run a different command).
+    #[test]
+    fn an_interrupted_skill_command_restores_the_typed_line() {
+        let mut app = App::new("restore-command".into());
+        type_str(&mut app, "/review the diff");
+        assert!(matches!(
+            app.on_key(80, key(KeyCode::Enter)),
+            Command::Slash(_)
+        ));
+        assert_eq!(app.composer.text(), "");
+        app.apply(AgentEvent::InputReturned {
+            text: "/review the diff".into(),
+            images: Vec::new(),
+        });
+        assert_eq!(app.composer.text(), "/review the diff");
+        assert!(
+            !app.cells
+                .iter()
+                .any(|cell| matches!(cell, Cell::User(line) if line == "/review the diff")),
+            "the echo goes back with the input"
         );
     }
 

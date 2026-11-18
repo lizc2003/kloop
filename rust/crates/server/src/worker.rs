@@ -95,7 +95,9 @@ pub(super) async fn thread_worker(
             ThreadWorkerMsg::ProviderCommand { text } => {
                 let args = provider_command_args(&text).unwrap_or_default();
                 let report = driver.provider_command(&args);
-                ui.notify("system", json!({"text": report.output}));
+                // The client may read config/events the moment it sees the
+                // success line, so the route it can read has to be the new one
+                // first — exactly as the queued switch transaction answers.
                 if let Some(route) = report.route {
                     *active_route.lock().unwrap() = route.clone();
                     ui.projection.update_provider_route(route.clone());
@@ -104,6 +106,7 @@ pub(super) async fn thread_worker(
                         json!({"route": route, "continuity": route.continuity}),
                     );
                 }
+                ui.notify("system", json!({"text": report.output}));
                 inbox.close_steer_window();
                 *current_cancel.lock().unwrap() = None;
                 running.store(false, Ordering::SeqCst);

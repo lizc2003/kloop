@@ -212,7 +212,41 @@ async fn an_interrupted_skill_expansion_comes_back_staged() {
     assert!(command.output.is_empty());
     let turn = command.turn.expect("the skill expanded into a turn");
     assert_eq!(turn.outcome.reason, EndReason::Aborted);
-    assert_eq!(turn.returned, Some(Message::user_text("review the diff")));
+    assert_eq!(turn.returned, Some(Message::user_text("/review")));
+    assert_eq!(driver.history().messages(), &[]);
+}
+
+/// An interrupt during a slow expansion cancels the turn the expansion would
+/// have started. Starting it with an already-cancelled token would still run the
+/// pre-turn hook, after the front-end has given up waiting.
+#[tokio::test]
+async fn a_cancelled_expansion_does_not_start_its_turn() {
+    let ui: Arc<dyn Ui> = Arc::new(NoUi);
+    let mut cfg = mock_config(Provider::mock(Vec::new()));
+    cfg.skills = Arc::new(vec![test_skill("review", "review the diff")]);
+    let cfg = Arc::new(cfg);
+    let mut driver = SessionDriver::new(
+        Arc::clone(&cfg),
+        History::new(cfg.offload_dir.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let report = driver
+        .dispatch(
+            Input::Command {
+                line: "/review".into(),
+            },
+            &ui,
+            &cancel,
+        )
+        .await;
+    let Report::Command(command) = report else {
+        panic!("a command input must report a command");
+    };
+    assert!(command.turn.is_none(), "the expansion must not run a turn");
     assert_eq!(driver.history().messages(), &[]);
 }
 

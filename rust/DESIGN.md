@@ -2297,7 +2297,11 @@ order, and clients match them by id. Thread creation (`thread/start`,
 build: the read loop starts the build, keeps reading, and registers the thread
 and answers the request when the finished handle comes back — so a slow context
 gather, sandbox, or skills scan on one thread cannot delay another thread's
-interrupt. After a non-model operation (`/provider`,
+interrupt. When input ends, running turns are cancelled first, then accepted
+builds get a bounded grace to land and be answered; a build still inside its
+factory is answered with an error rather than silence, and the writer gets a
+bounded flush so that build's output sender cannot hold shutdown. After a
+non-model operation (`/provider`,
 `thread/provider/switch`, a slash command) releases the thread's single-flight
 gate, the worker re-announces a non-empty inbox: a steer or scheduled delivery
 that arrived while `running` was already set would otherwise sit there until an
@@ -2305,7 +2309,7 @@ unrelated event. A model turn instead re-announces only activity that arrived
 during it: a turn blocked by a `pre_turn` hook exits without draining the queue,
 and waking that same batch again would run the hook forever.
 
-**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched. `model` and `provider_id` are trimmed before lookup, so `" m "` and `"m"` name the same allowlisted model; one parser serves `thread/start` and `thread/provider/switch`.
+**Provider catalog and session route.** `provider/catalog/read {}` returns only configured provider IDs, API families, ordered model allowlists, fallback models, and bounded availability codes. Credentials, endpoints, and private provenance never cross this boundary. `thread/start {cwd?, provider_id?, model?}` selects the initial route. `thread/provider/switch {thread_id, provider_id, model?, expected_route_revision}` is idle-only, shares the turn/compact single-flight gate, and appends a typed durable transition before publishing the new route and the sequenced `thread/provider/changed` event. A `/provider …` turn input on the idle path goes through the same transaction and publishes the route before its success text, so a client that reacts by reading `thread/read` or `thread/events/sync` sees the route it was just told about. The response, changed event, and route-aware snapshots carry the same bounded `continuity` (`preserved` or `filtered`) and the route's `effort` (absent when no effort field is sent; a route read off disk reports what a session there would start at, since effort is session-local — see **Reasoning effort** below). A switch creates no turn, message, terminal, or usage record; typed busy/CAS, unavailable targets, and persistence failures leave the old route untouched. `model` and `provider_id` are trimmed before lookup, so `" m "` and `"m"` name the same allowlisted model; one parser serves `thread/start` and `thread/provider/switch`.
 
 
 **Handshake.** `initialize {client_info, protocol_version, capabilities}` →
@@ -4508,12 +4512,20 @@ and the `--image` blocks that ride the first user turn. A front-end hands it one
 - `Wake` — a delivery turn with no new text; the inbox items are its input.
 
 `TurnReport` carries the outcome and, when an interrupt before the model
-produced anything took the whole turn back, the input itself. `CommandReport`
-carries the output, `quit`, `new_session`, `route_changed`, the picker stage and
-an expanded turn. The driver also owns the `/clear` swap
+produced anything took the whole turn back, the input itself. For an expanded
+skill turn that input is the command line the user typed, not the prompt the
+skill expanded to: retrying `/name args` must run the skill again, and a body
+that happens to start with `/` would otherwise run a different command.
+`CommandReport` carries the output, `quit`, `new_session`, `route_changed`, the
+picker stage and an expanded turn. A cancelled token skips the expanded turn
+entirely — starting it would run the pre-turn hook after the interrupt. The driver also owns the `/clear` swap
 (`start_fresh_session`), rewind, the two idle provider transactions
 (`switch_provider`, `provider_command`), the idle-inbox debt
 (`reannounce_if_owed`), and the end-of-session sequence (`shutdown_session`).
+Every fallible step is computed before the state it belongs to is replaced, so a
+failed `/clear` leaves the old session intact; a rewind whose branch route names
+a provider this process no longer has keeps the branch (the low level already
+switched History) and falls back to the route the branch runs on, with a note.
 
 The front-end keeps its event loop, its cancellation token, and the shape of its
 turn bracket: the TUI's `TurnEnded`, the server's `turn/started` and

@@ -28,6 +28,17 @@
   走驱动器通道”没有遗留工作。
 - **附带修复**：`thread/start` 的 config build 在阻塞池完成时，若客户端已关 stdin，
   响应会丢（`mock_hermetic` 可复现）。server 现在在 EOF 后限时排空已接受的 build。
+- **review 修正**（2026-11-18）：
+  - server 收尾改为先取消运行中的 turn，再限时排空已接受的 build；超时的 build 回 JSON-RPC
+    错误而不是沉默；writer 限时 flush 后 abort，卡在 factory 里的 build 不再通过持有
+    `out` sender 拖住 shutdown。
+  - 中断的 skill turn 退回**原命令行**而不是展开后的 prompt；TUI 的 slash 提交也保存
+    `in_flight` 草稿，普通输入和命令都按同一路径恢复。
+  - 展开期间已被取消的 token 不再进入 `run_message`（不会在中断后跑 `pre_turn`）；
+    plain 在技能采样被 Ctrl+C 时先打印中断原因再退出。
+  - `rewind` 与 `start_fresh_session` 先构造可失败状态再替换；rewind 的分支路由在当前
+    配置里已不可用时回退到分支自己的 route 并记一条 note，不再留下半切换。
+  - server 的 `/provider …` 先发布路由快照与 `thread/provider/changed`，再发成功文本。
 - **验证**：`cargo test -p kloop-core --lib`（1459）、`-p kloop-server`（53）、
   `-p kloop-tui --lib`（353）、`-p kloop --bins`（169）、
   `cargo test -p kloop --test session_rollout_parity --test plain_pty --test headless_contract --test mock_hermetic`

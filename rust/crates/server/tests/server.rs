@@ -163,6 +163,20 @@ impl TestClient {
             .unwrap()
             .unwrap();
     }
+
+    /// Close the input side but keep reading: the shutdown path answers what
+    /// was already accepted before the writer drains.
+    async fn close_input(&mut self) {
+        self.writer.shutdown().await.unwrap();
+    }
+
+    async fn wait_for_exit(self) {
+        tokio::time::timeout(Duration::from_secs(10), self.server)
+            .await
+            .expect("server did not exit after input closed")
+            .unwrap()
+            .unwrap();
+    }
 }
 
 fn start_server(factory: ConfigFactory, dirs: &TestDirs) -> TestClient {
@@ -317,6 +331,16 @@ fn slow_factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) 
     let inner = factory(turns, offload, gated);
     Arc::new(move |options, catalog, approver, questioner, notify| {
         std::thread::sleep(Duration::from_millis(400));
+        inner(options, catalog, approver, questioner, notify)
+    })
+}
+
+/// A factory that outlives the server's shutdown grace: used to prove a stuck
+/// build is answered and cannot hold the writer.
+fn stuck_factory(offload: PathBuf, delay: Duration) -> ConfigFactory {
+    let inner = factory(Vec::new(), offload, false);
+    Arc::new(move |options, catalog, approver, questioner, notify| {
+        std::thread::sleep(delay);
         inner(options, catalog, approver, questioner, notify)
     })
 }
@@ -1381,6 +1405,55 @@ async fn provider_switch_commits_revision_before_next_turn_and_emits_event() {
             "continuity": "preserved",
         })
     );
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A `/provider …` idle command publishes the route before its success line:
+/// a client that reacts to "provider switched" by reading the route must
+/// already see the new one.
+#[tokio::test]
+async fn a_provider_command_publishes_the_route_before_its_success_line() {
+    let dirs = test_dirs("provider-command-order");
+    let seen_a = Arc::new(Mutex::new(Vec::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::new()));
+    let mut client = start_server(
+        switch_factory(
+            dirs.offload.clone(),
+            Arc::clone(&seen_a),
+            Arc::clone(&seen_b),
+        ),
+        &dirs,
+    );
+    let thread_id = client.init_and_start().await;
+
+    client
+        .request(
+            "turn/start",
+            json!({"thread_id": thread_id, "input": "/provider b shared"}),
+        )
+        .await;
+    let log = client.recv_until(|m| m["method"] == "system").await;
+    let changed = log
+        .iter()
+        .position(|m| m["method"] == "thread/provider/changed")
+        .expect("the switch must announce the route");
+    let success = log
+        .iter()
+        .position(|m| m["method"] == "system")
+        .expect("the command still answers with text");
+    assert!(
+        changed < success,
+        "the route must be visible before the success line: {log:?}"
+    );
+    assert_eq!(log[changed]["params"]["route"]["provider_id"], "b");
+
+    client
+        .request("thread/read", json!({"thread_id": thread_id}))
+        .await;
+    let read = client.recv().await;
+    assert_eq!(read["result"]["thread"]["route"]["provider_id"], "b");
+
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
@@ -4294,6 +4367,37 @@ async fn shutdown_during_a_thread_build_still_exits() {
     // Sent, not awaited: input closes while the factory is still sleeping.
     client.request("thread/start", json!({})).await;
     client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+/// A build still inside its factory must not hold shutdown: the accepted
+/// request gets an error within the bounded drain, and the writer exits without
+/// waiting for the stuck build's output sender.
+#[tokio::test]
+async fn a_stuck_thread_build_is_answered_and_does_not_hold_shutdown() {
+    let dirs = test_dirs("start-stuck");
+    let mut client = start_server(
+        stuck_factory(dirs.offload.clone(), Duration::from_secs(3)),
+        &dirs,
+    );
+    client.initialize().await;
+    let start = client.request("thread/start", json!({})).await;
+    client.close_input().await;
+    let started = tokio::time::Instant::now();
+    let response = client.recv_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(response["id"], start);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("did not finish starting"),
+        "{response:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the error must arrive within the shutdown grace"
+    );
+    client.wait_for_exit().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 
