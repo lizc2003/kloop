@@ -984,11 +984,15 @@ That test is about the turn's *input*, not about whatever else the turn staged.
 A pre-turn hook's stdout is staged behind the input — the model sees it in the
 request, the timeline never sees it, and it is committed or dropped together
 with the turn. So "something is staged" alone does not mean "the turn never
-happened": an interrupt before the first token on a turn whose input the caller
-recorded itself (a scheduled delivery, a `/name` skill prompt) still gets its
-terminal, and the hook context staged for it is dropped with it. Left behind,
-that context would ride in front of the next turn's input and be handed back as
-that input when the next turn is interrupted.
+happened". Both inputs a front-end can send — the user's text and a `/name`
+skill's expanded prompt — go through the session driver, which stages them; a
+turn whose staged input produced nothing is the turn that did not happen. A
+delivery turn is the exception: a scheduled prompt or a background result is not
+the driver's staged input but the inbox item the turn drains into history, so it
+is recorded before the first request and an interrupt still gets the terminal
+that says what became of it. A hook context staged for an interrupted turn is
+dropped either way; left behind, it would ride in front of the next turn's input
+and be handed back as that input when the next turn is interrupted.
 
 The test is what reached the stream — `blocks`, accumulated text and
 accumulated reasoning all empty — not what survived into history. Unsigned
@@ -4483,11 +4487,48 @@ call; the server never retries. Without `expected_turn_id` the behavior is
 unchanged. The TUI and plain frontends never open a window — the Enter-while-
 running steer is not conditional — so the guard's close is a no-op for them,
 and a sub-agent's fresh inbox never has one. The plain REPL cannot accept a
-second stdin line while `run_turn` owns the foreground, so it still has no
+second stdin line while a turn owns the foreground, so it still has no
 mid-turn steering input; its idle loop does select inbox activity for background
 result/scheduler delivery. All three share the same boundary-safe drain path.
 This is the cc/codex convergence: steering is enqueue-not-interrupt, delivered
 only between steps (see `refs/README.md`).
+
+## Session driver (plan 269)
+
+One object owns the state a turn mutates: `core/src/driver.rs`'s
+`SessionDriver` holds the `Config`, the `History`, the session provider state,
+and the `--image` blocks that ride the first user turn. A front-end hands it one
+`Input` and projects the returned `Report`:
+
+- `Message { text, images }` — the user's text, staged and never recorded up
+  front;
+- `Command { line }` — a `/…` line. The command may answer, ask for a new
+  session, change the route, or expand a skill into a turn whose prompt is
+  staged exactly like a message;
+- `Wake` — a delivery turn with no new text; the inbox items are its input.
+
+`TurnReport` carries the outcome and, when an interrupt before the model
+produced anything took the whole turn back, the input itself. `CommandReport`
+carries the output, `quit`, `new_session`, `route_changed`, the picker stage and
+an expanded turn. The driver also owns the `/clear` swap
+(`start_fresh_session`), rewind, the two idle provider transactions
+(`switch_provider`, `provider_command`), the idle-inbox debt
+(`reannounce_if_owed`), and the end-of-session sequence (`shutdown_session`).
+
+The front-end keeps its event loop, its cancellation token, and the shape of its
+turn bracket: the TUI's `TurnEnded`, the server's `turn/started` and
+`turn/completed` notifications, headless's NDJSON lines. Those are wire
+contracts, not session state. The server still preflights an idle provider
+switch against `ThreadHandle.provider_state` before the worker sees the request;
+the handle and the driver share the same `Arc<SessionProviderState>`.
+
+`agent::run_turn` and `agent::run_turn_with_input` are crate-private for the
+same reason. Recording a message before running its turn is what left a
+pre-turn hook's context staged behind a turn that never happened (plan 250), and
+there is now one entry that stages. Everything the four front-ends can compare —
+the rollout a sequence of inputs leaves behind — goes through it, and
+`cli/tests/session_rollout_parity.rs` drives the same prompt through the TUI,
+plain, headless and the server and compares the model-visible messages.
 
 ## Slash commands (Phase 2, sixteenth slice)
 
@@ -4603,8 +4644,10 @@ rest — and neither tells the user the command did not take them.
   permission session layer — the mode stays, remembered approvals do not, and
   plan mode falls back to the mode it was entered from. The old session's
   background work is stopped (reported by count), and a worktree it entered is
-  kept on disk while the new session starts back in `cwd`. The server refuses
-  `/clear` (see the native protocol); there, `thread/start` is the new session.
+  kept on disk while the new session starts back in `cwd`. The swap itself is
+  `SessionDriver::start_fresh_session`, so no front-end owns the History being
+  replaced. The server refuses `/clear` (see the native protocol); there,
+  `thread/start` is the new session.
 - `/exit` — quit. The TUI and plain REPL exit (the TUI with the same clean
   teardown as a two-tap Ctrl+C; plain also exits on one Ctrl+C); in server mode
   it is inert — quitting one thread must not stop a multi-session process, so it
@@ -5098,8 +5141,15 @@ while the session is idle. The TUI dispatches a `Wake`; the plain REPL selects
 between stdin and inbox activity; the native server's thread worker selects
 between client turns and inbox activity and allocates a fresh monotonic turn ID.
 A *running* turn drains at its own round boundary, so autowake never races a
-second turn against it. Headless one-shot execution remains bounded and does not
-expose this idle session surface; its teardown nevertheless reuses the selected
+second turn against it. Whatever the front-end's select saw while it was busy is
+easy to lose, so the session driver owns the re-check rule
+(`reannounce_if_owed`): an operation that was not a model turn — a command
+drains nothing — always re-announces a non-empty inbox, while a model turn
+re-announces only what arrived *during* it. Re-announcing the batch a failed
+pre-turn turn started for would retry it forever. The TUI also re-checks at its
+own event boundary, which closes the same window for events queued behind
+`TurnEnded`. Headless one-shot execution remains bounded and does not expose
+this idle session surface; its teardown nevertheless reuses the selected
 text/NDJSON UI sink, so a queued mailbox event still receives its shutdown
 `undeliverable` terminal on the same stream.
 Sub-agents cannot spawn further sub-agents, so the whole background surface — `run_agent`, `wait_for_activity`, `stop_agent` — stays depth-0. One gate table answers for both halves of that: a child's catalog omits the tools, and the dispatcher refuses them before allowlists, hooks, permissions, or the handler, exactly as it does `todo_write` and the front-end surface block (`ask_user_question`, `cron_*`, `schedule_wakeup`, the plan-mode pair, `workflow`/`stop_workflow`, `run_program`/`stop_program`, the worktree pair), which a session whose front-end does not enable them is refused at depth 0 too.
@@ -6424,6 +6474,9 @@ crates/core/        kloop-core — the agent, network-free
   src/history.rs    append-only history, record-time offloading,
                     context estimation, provider usage ledger ownership
   src/usage.rs      canonical per-response records + checked aggregate
+  src/driver.rs     SessionDriver: one staged entry for messages, commands and
+                    idle wakes, plus /clear, rewind, provider transactions,
+                    the idle-inbox debt and session shutdown
   src/shell_env.rs   the user's login environment, captured once
   src/shell_programs.rs shell identities, `$SHELL`/override resolution, Windows trusted discovery
   src/tools/        the tool seam and the built-in tools
@@ -6488,6 +6541,7 @@ crates/tui/         kloop-tui — the ratatui frontend; owns the terminal
   src/clipboard.rs  typed OS clipboard image ingestion
   src/render.rs     pure cell→line/live-chrome layout and modal rendering
   src/lib.rs        terminal lifecycle, effective viewport, worker/event loop
+                    (the worker projects SessionDriver reports onto the TUI)
 
 crates/server/      kloop-server — native agent protocol frontend (JSON-RPC 2.0)
   src/wire.rs       envelopes + Event→notification projection (project_event)
@@ -6499,7 +6553,7 @@ crates/server/      kloop-server — native agent protocol frontend (JSON-RPC 2.
   src/methods/threads.rs 线程创建/恢复/fork、查询、事件同步与工作者启动
   src/methods/query.rs 配置/目录读取、作用域与 provider 切换入队
   src/methods/turn.rs turn 启动、条件 steering 与中断
-  src/worker.rs     每线程 History、操作串行化与 turn/命令执行
+  src/worker.rs     每线程 SessionDriver、操作串行化与 turn/命令/wake 投影
   src/thread_ui.rs  事件投影与审批/提问反向请求适配
 
 crates/mcp/         kloop-mcp — MCP wire client, stdio + streamable HTTP + OAuth (protocol + reqwest)

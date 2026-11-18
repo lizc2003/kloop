@@ -176,7 +176,7 @@ async fn run_structured_turn_in_context(
 /// a blocking pre_turn hook means the turn never starts; post_turn runs on
 /// every ending of a started turn (sub-agent turns included — they inherit
 /// the parent's hook set and session id).
-pub async fn run_turn(
+pub(crate) async fn run_turn(
     cfg: &Arc<Config>,
     history: &mut History,
     ui: &Arc<dyn Ui>,
@@ -205,7 +205,7 @@ pub async fn run_turn(
 /// Anything else — the model said a word, a tool ran, the provider failed, a
 /// hook blocked the turn — records the input on its way, and the second element
 /// is `None`.
-pub async fn run_turn_with_input(
+pub(crate) async fn run_turn_with_input(
     cfg: &Arc<Config>,
     history: &mut History,
     ui: &Arc<dyn Ui>,

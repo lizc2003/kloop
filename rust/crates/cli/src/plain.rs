@@ -8,16 +8,17 @@ use anyhow::Context;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use kloop_core::Config;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agent::run_turn;
-use kloop_core::agent::run_turn_with_input;
+use kloop_core::driver::Input;
+use kloop_core::driver::Report;
+use kloop_core::driver::SessionDriver;
 use kloop_core::history::History;
 use kloop_core::session_store::SessionDirs;
 use kloop_core::skills::Skill;
 use kloop_core::tools::ToolSource;
 use kloop_protocol::ContentBlock;
-use kloop_protocol::Message;
 
 use crate::ProcessState;
 use crate::SessionState;
@@ -189,13 +190,35 @@ where
     }
 }
 
+/// The human-facing ending of a turn, in the plain REPL's voice. `returned` is
+/// the turn's own input when an interrupt before the first reply took it back;
+/// there is no composer here, so the line is gone rather than handed back.
+fn report_turn_reason(reason: &EndReason, returned: bool, cfg: &Config) {
+    match reason {
+        EndReason::Completed => {}
+        EndReason::MaxRounds => {
+            println!(
+                "[stopped: hit max rounds ({})]",
+                cfg.max_rounds
+                    .expect("MaxRounds requires a configured limit")
+            )
+        }
+        EndReason::Aborted if returned => {
+            println!("[interrupted before the model replied — that message was not recorded]")
+        }
+        EndReason::Aborted => println!("[interrupted — history patched; exiting]"),
+        EndReason::Stopped => println!("[stopped — tell kloop what to do differently]"),
+        EndReason::Error(e) => println!("[error: {e}]"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn plain_main(
     args: CliArgs,
     provider: Arc<ResolvedProviderSettings>,
     session_route: kloop_core::provider_route::FrozenProviderRoute,
     runtime: Arc<RuntimeSettings>,
-    mut history: History,
+    history: History,
     session_id: String,
     tool_sources: Vec<Arc<dyn ToolSource>>,
     identity: kloop_core::project::WorkspaceIdentity,
@@ -227,30 +250,38 @@ async fn plain_main(
         &session_dirs,
     )?;
     finalize_session_config(&args, &mut cfg, &session_route, &session_id)?;
-    let mut cfg = Arc::new(cfg);
-    let mut provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
-        Arc::clone(&cfg.provider_catalog),
-        history.provider_routes(),
-    )
-    .map_err(anyhow::Error::new)?;
+    let cfg = Arc::new(cfg);
+    let mut driver = SessionDriver::new(Arc::clone(&cfg), history, pending_images)
+        .map_err(anyhow::Error::new)?;
     let ui: Arc<dyn Ui> = Arc::new(StdoutUi::default());
 
     if args.mock {
-        history.record(Message::user_text("run the demo"));
         let cancel = CancellationToken::new();
-        let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
+        let report = driver
+            .dispatch(
+                Input::Message {
+                    text: "run the demo".into(),
+                    images: Vec::new(),
+                },
+                &ui,
+                &cancel,
+            )
+            .await;
+        let Report::Turn(Some(turn)) = report else {
+            unreachable!("a message input always runs a turn");
+        };
         println!(
             "\n--- mock run: {:?} after {} round(s) ---",
-            outcome.reason, outcome.rounds
+            turn.outcome.reason, turn.outcome.rounds
         );
-        let _ = kloop_core::driver::shutdown_session(&cfg, &ui).await;
+        let _ = driver.shutdown(&ui).await;
         return Ok(());
     }
 
     // `--worktree`: enter an isolated tree for the session (plan 35 slice 2).
     // Fail-closed like the TUI path — abort if the tree can't be created.
     if let Some(name) = &args.worktree {
-        match kloop_core::worktree::enter(&cfg, name).await {
+        match kloop_core::worktree::enter(driver.cfg(), name).await {
             Ok(msg) => println!("{msg}"),
             Err(e) => return Err(e),
         }
@@ -258,12 +289,11 @@ async fn plain_main(
 
     let mut ctrl_c = PlainCtrlC::install().context("cannot install plain Ctrl+C handler")?;
     println!(
-        "kloop — session {session_id}; type a task, /help for commands, \
-         'exit' or Ctrl+C to quit"
+        "kloop — session {}; type a task, /help for commands, \
+         'exit' or Ctrl+C to quit",
+        driver.cfg().session_id
     );
-    // `--image` blocks ride the first user turn; taken once, then empty.
-    let mut pending_images = pending_images;
-    let mut inbox_activity = cfg.inbox.subscribe_activity();
+    let mut inbox_activity = driver.cfg().inbox.subscribe_activity();
     let mut input_error = None;
     loop {
         print!("> ");
@@ -277,18 +307,19 @@ async fn plain_main(
             break;
         }
         if matches!(input, PlainInput::Inbox) {
-            if cfg.inbox.is_empty() {
+            if driver.cfg().inbox.is_empty() {
                 continue;
             }
             let cancel = CancellationToken::new();
-            let (outcome, exit_requested) = run_plain_operation(
-                run_turn(&cfg, &mut history, &ui, &cancel, 0),
+            let (report, exit_requested) = run_plain_operation(
+                driver.dispatch(Input::Wake, &ui, &cancel),
                 &cancel,
                 &mut ctrl_c,
             )
             .await;
+            driver.reannounce_if_owed(report.drained_inbox());
             println!();
-            match outcome.reason {
+            match report.reason() {
                 EndReason::Completed => {}
                 EndReason::MaxRounds => println!("[scheduled delivery stopped: max rounds]"),
                 EndReason::Aborted => println!("[scheduled delivery interrupted]"),
@@ -313,50 +344,36 @@ async fn plain_main(
                 break;
             }
         };
-        let mut line = line.trim().to_string();
+        let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
         if line == "exit" {
             break;
         }
-        // Slash commands run inline: the REPL owns History directly, so no
-        // routing is needed (unlike the TUI). Ctrl+C cancels a slow one (e.g.
-        // /compact), waits for it to settle, then exits the plain REPL.
-        if kloop_core::commands::is_command_or_skill(&line, &cfg.skills) {
+        // Slash commands run inline: the REPL owns the driver, so a slow one
+        // (e.g. /compact) is cancelled by Ctrl+C, waited for, then the REPL
+        // exits.
+        if kloop_core::commands::is_command_or_skill(&line, &driver.cfg().skills) {
             let cancel = CancellationToken::new();
-            let (result, exit_requested) = run_plain_operation(
-                kloop_core::commands::run_with_provider_state(
-                    &line,
-                    &mut history,
-                    &cfg,
-                    &provider_state,
-                    ui.as_ref(),
-                    &cancel,
-                ),
+            let (report, exit_requested) = run_plain_operation(
+                driver.dispatch(Input::Command { line }, &ui, &cancel),
                 &cancel,
                 &mut ctrl_c,
             )
             .await;
-            if !result.output.is_empty() {
-                println!("{}", result.output);
+            driver.reannounce_if_owed(report.drained_inbox());
+            let Report::Command(command) = report else {
+                unreachable!("a command input always runs a command");
+            };
+            if !command.output.is_empty() {
+                println!("{}", command.output);
             }
-            if result.route_changed {
-                cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
-            }
-            if result.new_session {
-                match kloop_core::commands::start_fresh_session(&cfg, &ui).await {
+            if command.new_session {
+                match driver.start_fresh_session(&ui).await {
                     Ok(fresh) => {
-                        history = fresh.history;
-                        cfg = Arc::new(fresh.cfg);
-                        provider_state =
-                            kloop_core::provider_route::SessionProviderState::from_timeline(
-                                Arc::clone(&cfg.provider_catalog),
-                                history.provider_routes(),
-                            )
-                            .map_err(anyhow::Error::new)?;
-                        inbox_activity = cfg.inbox.subscribe_activity();
-                        println!("conversation cleared — new session {}", cfg.session_id);
+                        inbox_activity = driver.cfg().inbox.subscribe_activity();
+                        println!("conversation cleared — new session {}", fresh.session_id);
                         for line in fresh.report {
                             println!("{line}");
                         }
@@ -365,55 +382,50 @@ async fn plain_main(
                 }
             }
             // `/exit` quits the REPL, like the bare `exit` word above.
-            if result.quit || exit_requested {
+            if command.quit || exit_requested {
                 break;
             }
-            // A skill invoked as `/name` expands to a prompt; run it as a turn
-            // just like a typed message, falling through to the turn path below.
-            match result.run_turn {
-                Some(prompt) => line = prompt,
-                None => continue,
+            // A skill invoked as `/name` expands to a prompt, which the driver
+            // runs as a turn; report it like a typed message.
+            if let Some(turn) = command.turn {
+                println!();
+                report_turn_reason(&turn.outcome.reason, turn.returned.is_some(), driver.cfg());
+                if exit_requested {
+                    break;
+                }
             }
+            continue;
         }
 
-        let msg = if pending_images.is_empty() {
-            Message::user_text(line)
-        } else {
-            Message::user_with_blocks(line, std::mem::take(&mut pending_images))
-        };
         let cancel = CancellationToken::new();
         // Staged, not recorded: an interrupt before the model produces anything
         // leaves the session exactly as it was. There is no composer to hand
         // the text back to here, so the line is simply gone — which is why the
         // `Aborted` arm below says so.
-        let ((outcome, returned), exit_requested) = run_plain_operation(
-            run_turn_with_input(&cfg, &mut history, &ui, &cancel, 0, msg),
+        let (report, exit_requested) = run_plain_operation(
+            driver.dispatch(
+                Input::Message {
+                    text: line,
+                    images: Vec::new(),
+                },
+                &ui,
+                &cancel,
+            ),
             &cancel,
             &mut ctrl_c,
         )
         .await;
+        driver.reannounce_if_owed(report.drained_inbox());
         println!();
-        match outcome.reason {
-            EndReason::Completed => {}
-            EndReason::MaxRounds => {
-                println!(
-                    "[stopped: hit max rounds ({})]",
-                    cfg.max_rounds
-                        .expect("MaxRounds requires a configured limit")
-                )
-            }
-            EndReason::Aborted if returned.is_some() => {
-                println!("[interrupted before the model replied — that message was not recorded]")
-            }
-            EndReason::Aborted => println!("[interrupted — history patched; exiting]"),
-            EndReason::Stopped => println!("[stopped — tell kloop what to do differently]"),
-            EndReason::Error(e) => println!("[error: {e}]"),
-        }
+        let Report::Turn(Some(turn)) = report else {
+            unreachable!("a message input always runs a turn");
+        };
+        report_turn_reason(&turn.outcome.reason, turn.returned.is_some(), driver.cfg());
         if exit_requested {
             break;
         }
     }
-    let shutdown = kloop_core::driver::shutdown_session(&cfg, &ui).await;
+    let shutdown = driver.shutdown(&ui).await;
     let missed = shutdown.missed;
     if missed > 0 {
         eprintln!("warning: {missed} background task(s) missed the shutdown deadline");

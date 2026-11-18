@@ -554,12 +554,7 @@ async fn run_headless_turn(
         cwd,
         &session.session_dirs,
     )?;
-    finalize_session_config(
-        &args,
-        &mut cfg,
-        &session.session_route,
-        &session.session_id,
-    )?;
+    finalize_session_config(&args, &mut cfg, &session.session_route, &session.session_id)?;
     // An explicit headless runaway guardrail enables the otherwise-absent cap.
     if let Some(max_rounds) = args.max_rounds {
         cfg.set_max_rounds(Some(max_rounds));
@@ -575,19 +570,23 @@ async fn run_headless_turn(
     }
     let cancel = CancellationToken::new();
     let watcher = spawn_ctrl_c(cancel.clone());
-    let result = headless::run_headless(
-        cfg.clone(),
+    let mut driver = kloop_core::driver::SessionDriver::new(
+        Arc::clone(&cfg),
         session.history,
+        session.pending_images,
+    )
+    .map_err(|error| anyhow::anyhow!("cannot restore provider route state: {error}"))?;
+    let result = headless::run_headless(
+        &mut driver,
         session.session_id,
         prompt,
-        session.pending_images,
         args.json,
         Arc::new(Mutex::new(std::io::stdout())),
         cancel,
     )
     .await;
     watcher.abort();
-    let shutdown = kloop_core::driver::shutdown_session(&cfg, &result.ui).await;
+    let shutdown = driver.shutdown(&result.ui).await;
     let missed = shutdown.missed;
     if missed > 0 {
         eprintln!("warning: {missed} background task(s) missed the shutdown deadline");

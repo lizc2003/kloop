@@ -69,7 +69,6 @@ impl Server {
                     .collect(),
                 id: turn_id,
                 cancel,
-                delivery_only: false,
             }))
             .is_err()
         {

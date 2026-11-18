@@ -1,8 +1,44 @@
 # Plan 269 — 会话驱动器：前端只渲染，turn 生命周期归 core
 
 > 2026-10-28 立。来源：全仓只读审查与随后的架构讨论(HANDOFF「〇⁵」节)。
-> 状态：待实现。**改动面最大的一条，开工先出设计稿给用户看**。先做 250、258、259(它们
-> 修掉这个结构造成的具体 bug,这里消除成因)。行号是 2026-10-28 的读数，开工先自己量。
+> 状态：✅ 已完成（2026-11-18）。依赖的 250、258、259 均已先完成。
+> 行号是 2026-10-28 的读数，保留为当时的依据；实现以函数/顶层项定位。
+
+## 完成记录
+
+- **驱动器**：新增 `core/src/driver.rs` 的 `SessionDriver`，持有 `Config`、`History`、
+  `Arc<SessionProviderState>` 与 `--image`；前端只构造 `Input`（`Message` / `Command` /
+  `Wake`）并投影 `Report`（`Turn` / `Command`）。staging、skill 展开、`/clear` 的
+  `start_fresh_session`、rewind、两个 idle provider 事务、`reannounce_if_owed` 与
+  `shutdown_session` 都在这里。`agent::run_turn` / `run_turn_with_input` 改为
+  `pub(crate)`，前端不能再“先 record 再跑”。
+- **四个前端**：headless、plain、server thread worker、TUI agent worker 均改为
+  `dispatch` + 各自的事件投影；server 的 `run_turn_or_command`、`run_provider_command`、
+  `parse_effort_level` 删除，`ThreadWorkerMsg` 增加 `Wake` 并去掉 `Turn.delivery_only`；
+  TUI 的 rewind 搬到驱动器，`current` 在每次 dispatch 后同步。
+- **收尾与装配**（第 1 片）：六处收尾共用 `shutdown_session`（TUI 保留
+  “关后台 → abort worker → 关 worktree”的顺序）；`prepare_workspace` 收掉
+  `SessionState::open` 与 `serve_config_factory` 的重复；`finalize_session_config`
+  收掉 mock `at_revision` / `session_route` / `bind_session` 的三份拷贝。
+- **唤醒**：server 的两个 wake helper 由 `reannounce_if_owed` 取代（命令不排空、模型
+  turn 只重发期间到达的新活动）；plain 在每次 dispatch 后调用；TUI 的 `on_agent_events`
+  本来就在每个事件边界 `autowake`，未再改。
+- **第 4 片复核后不成立**：258 的 `PlainStdin` 已是唯一 stdin 读者，审批/提问经
+  Config 的 `Approver`/`Questioner` 进入同一队列；驱动器不碰 stdin，因此“plain 审批改
+  走驱动器通道”没有遗留工作。
+- **附带修复**：`thread/start` 的 config build 在阻塞池完成时，若客户端已关 stdin，
+  响应会丢（`mock_hermetic` 可复现）。server 现在在 EOF 后限时排空已接受的 build。
+- **验证**：`cargo test -p kloop-core --lib`（1459）、`-p kloop-server`（53）、
+  `-p kloop-tui --lib`（353）、`-p kloop --bins`（169）、
+  `cargo test -p kloop --test session_rollout_parity --test plain_pty --test headless_contract --test mock_hermetic`
+  全绿；TUI PTY 25 项在沙箱外全绿（沙箱内 24/25，`a_shell_command_gets_a_row_of_its_own`
+  被嵌套 seatbelt 挡住，`sandbox_apply: Operation not permitted`）；
+  四个受影响 crate 的 `cargo clippy --all-targets -- -D warnings` 干净。
+- **既有基线**：全仓 parity 的 `Plan 56 parser contract drift` 不通过——`refs` 语料期望
+  `enter_name_null`/`enter_path_null`/`exit_discard_null` 判为 invalid，而 plan 267 的
+  native report 明确 `null_is_omitted`。本次改动未触 `core/src/tools/`，不是这条 plan 引入的。
+- 全量 workspace 测试未在单次 10 分钟内跑完；以上按受影响 crate 分跑，未覆盖的 crate
+  本次没有改动。
 
 ## 问题
 

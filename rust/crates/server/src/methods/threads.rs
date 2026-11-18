@@ -449,36 +449,33 @@ impl PendingThreadBuild {
         );
         let handle_cwd = cfg.cwd.clone();
         let active_route = Arc::new(Mutex::new(cfg.provider_route.public_route()));
-        let provider_state = Arc::new(
-            kloop_core::provider_route::SessionProviderState::from_timeline(
-                Arc::clone(&cfg.provider_catalog),
-                history.provider_routes(),
-            )
-            .map_err(|error| {
-                (
-                    wire::SERVER_ERROR,
-                    format!("cannot restore provider route state: {error}"),
-                )
-            })?,
-        );
         let (turn_tx, turn_rx) = mpsc::unbounded_channel();
         let running = Arc::new(AtomicBool::new(false));
         let current_cancel = Arc::new(Mutex::new(None));
         let turn_seq = Arc::new(AtomicU64::new(1));
         let cfg = Arc::new(cfg);
-        // The steering/scheduler queue the worker's turns drain.
-        let inbox = cfg.inbox.clone();
+        // The driver owns the session from here; the handle keeps the provider
+        // snapshot its read-loop preflight reads, and the inbox its steers and
+        // scheduler deliveries share.
+        let driver =
+            kloop_core::driver::SessionDriver::new(cfg, history, Vec::new()).map_err(|error| {
+                (
+                    wire::SERVER_ERROR,
+                    format!("cannot restore provider route state: {error}"),
+                )
+            })?;
+        let inbox = driver.cfg().inbox.clone();
+        let provider_state = Arc::clone(driver.provider_state());
         let worker_state = ThreadWorkerState {
             running: running.clone(),
             current_cancel: current_cancel.clone(),
             turn_seq: turn_seq.clone(),
             inbox: inbox.clone(),
             active_route: active_route.clone(),
-            provider_state: provider_state.clone(),
         };
         // A blocking-pool thread still carries the runtime context, so the
         // worker is spawned here and the handle is what travels back.
-        tokio::spawn(thread_worker(cfg, history, ui, turn_rx, worker_state));
+        tokio::spawn(thread_worker(driver, ui, turn_rx, worker_state));
         // The worker owns the history (and a fork's file) from here. On any
         // earlier failure the guard drops and removes it.
         if let Some(guard) = guard.as_mut() {

@@ -42,15 +42,14 @@ mod skills;
 #[derive(Debug, PartialEq, Eq)]
 pub struct SlashResult {
     pub output: String,
-    /// `/clear`: the front-end ends this session and switches to the one
-    /// [`start_fresh_session`] builds. The front-end owns the Config and
-    /// History being replaced, so the command cannot do the swap itself; a
+    /// `/clear`: the session driver builds the session [`start_fresh_session`]
+    /// derives and swaps it in (`SessionDriver::start_fresh_session`). A
     /// front-end that has its own way to start sessions (the server's
     /// `thread/start`) refuses instead.
     pub new_session: bool,
-    /// When set, the front-end records this as a user message and runs a turn:
-    /// a skill invoked as `/name args` expands to a prompt to act on, unlike
-    /// the built-in commands which only produce `output` (`output` is empty).
+    /// When set, the driver stages this as a user message and runs a turn: a
+    /// skill invoked as `/name args` expands to a prompt to act on, unlike the
+    /// built-in commands which only produce `output` (`output` is empty).
     pub run_turn: Option<String>,
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.

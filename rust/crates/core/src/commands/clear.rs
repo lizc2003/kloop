@@ -4,7 +4,7 @@
 //! as it was, so `--resume` still returns to it.
 //!
 //! The command itself only asks for the switch ([`SlashResult::new_session`]):
-//! the front-end owns the Config and History being replaced, so it calls
+//! the session driver owns the Config and History being replaced, so it calls
 //! [`start_fresh_session`] and swaps them in.
 
 use std::sync::Arc;

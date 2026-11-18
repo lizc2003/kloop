@@ -23,19 +23,21 @@ use serde_json::Value;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use kloop_core::Config;
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agent::run_turn_with_input;
+use kloop_core::driver::Input;
+use kloop_core::driver::Report;
+use kloop_core::driver::SessionDriver;
 use kloop_core::event::Event;
+#[cfg(test)]
 use kloop_core::history::History;
 use kloop_core::permissions::Approver;
 use kloop_core::permissions::ConfirmRequest;
 use kloop_core::permissions::Decision;
 #[cfg(test)]
 use kloop_protocol::AssistantBlock;
-use kloop_protocol::ContentBlock;
-use kloop_protocol::Message;
 
 /// Combine the positional prompt and piped stdin into the turn's user message.
 /// Either source alone is fine; both present are joined with a newline (cc's
@@ -147,25 +149,22 @@ pub(crate) struct HeadlessResult {
 /// channel (stdout): in `--json` mode every event lands there; otherwise the
 /// final text does. Generic over the writer so the whole path is drivable
 /// in-process over a buffer, like the server's contract tests.
-#[allow(clippy::too_many_arguments)]
+///
+/// The prompt is staged, not recorded: interrupted before the model produces
+/// anything, it leaves no trace in the session file. Nothing to hand back here
+/// — headless has one prompt and no one to give it to.
 pub(crate) async fn run_headless<W: Write + Send + 'static>(
-    cfg: Arc<Config>,
-    mut history: History,
+    driver: &mut SessionDriver,
     session_id: String,
     prompt: String,
-    pending_images: Vec<ContentBlock>,
     json: bool,
     out: Arc<Mutex<W>>,
     cancel: CancellationToken,
 ) -> HeadlessResult {
-    let msg = if pending_images.is_empty() {
-        Message::user_text(prompt)
-    } else {
-        Message::user_with_blocks(prompt, pending_images)
+    let input = || Input::Message {
+        text: prompt.clone(),
+        images: Vec::new(),
     };
-    // Staged, not recorded: interrupted before the model produces anything, the
-    // prompt leaves no trace in the session file. Nothing to hand back here —
-    // headless has one prompt and no one to give it to.
     if json {
         let ui = Arc::new(JsonUi {
             thread_id: session_id,
@@ -176,24 +175,28 @@ pub(crate) async fn run_headless<W: Write + Send + 'static>(
             kloop_server::turn_started_params(HEADLESS_TURN_ID),
         );
         let dyn_ui: Arc<dyn Ui> = ui.clone();
-        let (outcome, _returned) =
-            run_turn_with_input(&cfg, &mut history, &dyn_ui, &cancel, 0, msg).await;
+        let report = driver.dispatch(input(), &dyn_ui, &cancel).await;
+        let reason = report.reason();
         // Report the post-turn context size, then close the bracket (server parity).
         ui.emit(&Event::Usage(kloop_core::agent::context_estimate(
-            &cfg, &history,
+            driver.cfg(),
+            driver.history(),
         )));
         ui.notify(
             "turn/completed",
-            kloop_server::turn_completed_params(HEADLESS_TURN_ID, &outcome.reason),
+            kloop_server::turn_completed_params(HEADLESS_TURN_ID, &reason),
         );
         HeadlessResult {
-            code: exit_code(&outcome.reason),
+            code: exit_code(&reason),
             ui: dyn_ui,
         }
     } else {
         let ui: Arc<dyn Ui> = Arc::new(HeadlessTextUi);
-        let (outcome, _returned) =
-            run_turn_with_input(&cfg, &mut history, &ui, &cancel, 0, msg).await;
+        let report = driver.dispatch(input(), &ui, &cancel).await;
+        let Report::Turn(Some(turn)) = report else {
+            unreachable!("a message input always runs a turn");
+        };
+        let outcome = turn.outcome;
         if !outcome.final_text.is_empty()
             && let Ok(mut w) = out.lock()
         {
@@ -379,22 +382,31 @@ mod tests {
         AssistantBlock::Text { text: t.into() }
     }
 
+    async fn run(
+        cfg: &Arc<Config>,
+        prompt: &str,
+        json: bool,
+        out: Arc<Mutex<Vec<u8>>>,
+    ) -> HeadlessResult {
+        let history = History::new(cfg.offload_dir.clone());
+        let mut driver =
+            SessionDriver::new(Arc::clone(cfg), history, Vec::new()).expect("test session state");
+        run_headless(
+            &mut driver,
+            "hl".into(),
+            prompt.into(),
+            json,
+            out,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn text_mode_prints_final_answer_and_exits_zero() {
         let cfg = Arc::new(mock_config(vec![vec![text_block("the answer is 4")]]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg,
-            history,
-            "hl".into(),
-            "what is 2+2".into(),
-            Vec::new(),
-            false,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "what is 2+2", false, out.clone()).await;
         assert_eq!(result.code, 0);
         assert_eq!(
             String::from_utf8(out.lock().unwrap().clone()).unwrap(),
@@ -408,19 +420,8 @@ mod tests {
             blocks: vec![text_block("partial refusal")],
             outcome: AssistantOutcome::Refused,
         }]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg,
-            history,
-            "hl".into(),
-            "request".into(),
-            Vec::new(),
-            false,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "request", false, out.clone()).await;
 
         assert_eq!(result.code, 1);
         assert_eq!(
@@ -438,19 +439,8 @@ mod tests {
             MockTurn::PartialError(vec![text_block("half answer")], "stream dropped".into()),
             MockTurn::Blocks(vec![text_block(" and the rest")]),
         ]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg,
-            history,
-            "hl".into(),
-            "request".into(),
-            Vec::new(),
-            false,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "request", false, out.clone()).await;
 
         assert_eq!(result.code, 0);
         assert_eq!(
@@ -467,19 +457,8 @@ mod tests {
             vec![text_block("half answer")],
             kloop_provider::ProviderFailure::protocol("malformed frame"),
         )]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg,
-            history,
-            "hl".into(),
-            "request".into(),
-            Vec::new(),
-            false,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "request", false, out.clone()).await;
 
         assert_eq!(result.code, 1);
         assert_eq!(
@@ -494,19 +473,8 @@ mod tests {
             blocks: Vec::new(),
             outcome: AssistantOutcome::EndTurn,
         }]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg,
-            history,
-            "hl".into(),
-            "request".into(),
-            Vec::new(),
-            false,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "request", false, out.clone()).await;
 
         assert_eq!(result.code, 0);
         assert!(out.lock().unwrap().is_empty());
@@ -515,19 +483,8 @@ mod tests {
     #[tokio::test]
     async fn json_shutdown_reuses_the_wire_sink_for_message_terminals() {
         let cfg = Arc::new(mock_config(vec![vec![text_block("done")]]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg.clone(),
-            history,
-            "hl".into(),
-            "hi".into(),
-            Vec::new(),
-            true,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "hi", true, out.clone()).await;
         let child = cfg.local_agent.child("agent-99".parse().unwrap());
         let _lease = child
             .register_child(
@@ -569,19 +526,8 @@ mod tests {
     #[tokio::test]
     async fn json_mode_brackets_the_turn_with_lifecycle_events() {
         let cfg = Arc::new(mock_config(vec![vec![text_block("hello there")]]));
-        let history = History::new(cfg.offload_dir.clone());
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let result = run_headless(
-            cfg,
-            history,
-            "hl".into(),
-            "hi".into(),
-            Vec::new(),
-            true,
-            out.clone(),
-            CancellationToken::new(),
-        )
-        .await;
+        let result = run(&cfg, "hi", true, out.clone()).await;
         assert_eq!(result.code, 0);
 
         let raw = String::from_utf8(out.lock().unwrap().clone()).unwrap();

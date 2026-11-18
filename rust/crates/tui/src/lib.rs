@@ -52,10 +52,12 @@ use tokio_util::sync::CancellationToken;
 
 use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agent::run_turn;
-use kloop_core::agent::run_turn_with_input;
 // Aliased: `Event` alone is crossterm's terminal event in this module.
 use kloop_core::Config;
+use kloop_core::driver::Input;
+use kloop_core::driver::Report;
+use kloop_core::driver::RewindReport;
+use kloop_core::driver::SessionDriver;
 use kloop_core::event::Event as CoreEvent;
 use kloop_core::git::branch as git_branch;
 use kloop_core::history::History;
@@ -64,7 +66,6 @@ use kloop_core::inbox::InboxItem;
 use kloop_core::interaction::Questioner;
 use kloop_core::permissions::Approver;
 use kloop_core::rewind::AbandonedBranch;
-use kloop_core::rewind::RewindOutcome;
 use kloop_core::rollout::fork_points;
 
 use kloop_protocol::ContentBlock;
@@ -290,17 +291,17 @@ pub async fn run(
     // the single UI owner to stop; TerminalSession then performs the only full
     // restore, rather than having a panic hook race normal drawing.
     let panic_hook = PanicHookGuard::install(event_tx.clone());
+    let driver = SessionDriver::new(cfg, history, pending_images)
+        .expect("TUI history route timeline was validated before worker start");
     let worker = tokio::spawn(agent_worker(
         Worker {
-            cfg,
             current: Arc::clone(&current),
             ui: channel_ui as Arc<dyn Ui>,
             events: event_tx,
             version: version.to_string(),
         },
-        history,
+        driver,
         msg_rx,
-        pending_images,
     ));
 
     // Startup gets a watch channel rather than an event: the loop only needs
@@ -435,14 +436,10 @@ fn finish_turn(
 
 fn send_command_result_events(
     events: &mpsc::UnboundedSender<AgentEvent>,
-    result: &kloop_core::commands::SlashResult,
+    output: &str,
     context_used: u64,
 ) -> bool {
-    if !result.output.is_empty()
-        && events
-            .send(AgentEvent::System(result.output.clone()))
-            .is_err()
-    {
+    if !output.is_empty() && events.send(AgentEvent::System(output.to_string())).is_err() {
         return false;
     }
     // The footer's context gauge only moves on a Usage event, and those are
@@ -456,7 +453,6 @@ fn send_command_result_events(
 
 /// The worker's session handles and the channels it talks through.
 struct Worker {
-    cfg: Arc<Config>,
     /// Where the worker publishes each new session's Config (see `run`).
     current: Arc<std::sync::Mutex<Arc<Config>>>,
     ui: Arc<dyn Ui>,
@@ -482,27 +478,19 @@ fn session_switch(cfg: &Config, report: Vec<String>) -> events::SessionSwitch {
     }
 }
 
-/// Owns History for its whole lifetime and runs turns strictly one at a time;
-/// the UI loop enforces single-flight by ignoring Enter while running.
+/// Owns the session for its whole lifetime and runs turns strictly one at a
+/// time; the UI loop enforces single-flight by ignoring Enter while running.
 async fn agent_worker(
     worker: Worker,
-    mut history: History,
+    mut driver: SessionDriver,
     mut msgs: mpsc::UnboundedReceiver<WorkerMsg>,
-    // `--image` blocks ride the first user turn; taken once, then empty.
-    mut pending_images: Vec<ContentBlock>,
 ) {
     let Worker {
-        mut cfg,
         current,
         ui,
         events,
         version,
     } = worker;
-    let mut provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
-        Arc::clone(&cfg.provider_catalog),
-        history.provider_routes(),
-    )
-    .expect("TUI history route timeline was validated before worker start");
     loop {
         let next = msgs.recv().await;
         let Some(msg) = next else {
@@ -511,94 +499,94 @@ async fn agent_worker(
         match msg {
             WorkerMsg::Turn(turn) => {
                 let _ = events.send(AgentEvent::RouteFrozen {
-                    route: cfg.provider_route.public_route(),
-                    context_window: cfg.context_window,
+                    route: driver.cfg().provider_route.public_route(),
+                    context_window: driver.cfg().context_window,
                 });
-                // The composer's images ride the turn they were sent with and
-                // lead, in the order their `[Image #N]`s appear in the text;
-                // `--image` blocks ride the first turn after them.
-                let mut images = turn.images;
-                images.append(&mut pending_images);
-                let msg = if images.is_empty() {
-                    Message::user_text(turn.text)
-                } else {
-                    Message::user_with_blocks(turn.text, images)
+                let report = driver
+                    .dispatch(
+                        Input::Message {
+                            text: turn.text,
+                            images: turn.images,
+                        },
+                        &ui,
+                        &turn.cancel,
+                    )
+                    .await;
+                let drained = report.drained_inbox();
+                let Report::Turn(Some(turn)) = report else {
+                    unreachable!("a message input always runs a turn");
                 };
-                let (outcome, returned) =
-                    run_turn_with_input(&cfg, &mut history, &ui, &turn.cancel, 0, msg).await;
                 // Interrupted before the model said anything: the turn is not in
                 // history and not in the session file, so the transcript must
                 // drop it too and the text goes back to the composer to be
                 // fixed. `--image` blocks that rode this turn ride the next one.
-                if let Some(input) = returned {
+                if let Some(input) = turn.returned {
                     let (text, images) = split_user_input(input);
                     let _ = events.send(AgentEvent::InputReturned { text, images });
                 }
-                if !finish_turn(&events, &cfg, &history, outcome.reason) {
+                if !finish_turn(&events, driver.cfg(), driver.history(), turn.outcome.reason) {
                     return;
                 }
+                driver.reannounce_if_owed(drained);
             }
             WorkerMsg::Wake { cancel } => {
                 let _ = events.send(AgentEvent::RouteFrozen {
-                    route: cfg.provider_route.public_route(),
-                    context_window: cfg.context_window,
+                    route: driver.cfg().provider_route.public_route(),
+                    context_window: driver.cfg().context_window,
                 });
-                // Raced: a still-running turn already drained the reinjection,
-                // or stop_agent left nothing. Nothing to sample — just clear the
-                // busy state the UI loop set when it dispatched the wake.
-                if cfg.inbox.is_empty() {
-                    if events
-                        .send(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)))
-                        .is_err()
-                    {
-                        return;
+                let report = driver.dispatch(Input::Wake, &ui, &cancel).await;
+                let drained = report.drained_inbox();
+                match report {
+                    Report::Turn(Some(turn)) => {
+                        if !finish_turn(
+                            &events,
+                            driver.cfg(),
+                            driver.history(),
+                            turn.outcome.reason,
+                        ) {
+                            return;
+                        }
                     }
-                    continue;
+                    // Raced: a still-running turn already drained the reinjection,
+                    // or stop_agent left nothing. Nothing to sample — just clear
+                    // the busy state the UI loop set when it dispatched the wake.
+                    Report::Turn(None) => {
+                        if events
+                            .send(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Report::Command(_) => unreachable!("a wake input never runs a command"),
                 }
-                let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-                if !finish_turn(&events, &cfg, &history, outcome.reason) {
-                    return;
-                }
+                driver.reannounce_if_owed(drained);
             }
             WorkerMsg::Command { line, cancel } => {
                 let _ = events.send(AgentEvent::RouteFrozen {
-                    route: cfg.provider_route.public_route(),
-                    context_window: cfg.context_window,
+                    route: driver.cfg().provider_route.public_route(),
+                    context_window: driver.cfg().context_window,
                 });
-                let result = kloop_core::commands::run_with_provider_state(
-                    &line,
-                    &mut history,
-                    &cfg,
-                    &provider_state,
-                    ui.as_ref(),
-                    &cancel,
-                )
-                .await;
-                if result.route_changed {
-                    let route = provider_state.active_route();
-                    cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
-                    *current.lock().unwrap() = Arc::clone(&cfg);
+                let report = driver.dispatch(Input::Command { line }, &ui, &cancel).await;
+                let drained = report.drained_inbox();
+                let Report::Command(command) = report else {
+                    unreachable!("a command input always runs a command");
+                };
+                *current.lock().unwrap() = Arc::clone(driver.cfg());
+                if command.route_changed {
                     let _ = events.send(AgentEvent::ProviderChanged {
-                        route,
-                        context_window: cfg.context_window,
+                        route: driver.cfg().provider_route.public_route(),
+                        context_window: driver.cfg().context_window,
                     });
                 }
-                if result.new_session {
-                    let event = match kloop_core::commands::start_fresh_session(&cfg, &ui).await {
+                if command.new_session {
+                    // The old History goes here; a session that never got past
+                    // its opening line removes its own file.
+                    let event = match driver.start_fresh_session(&ui).await {
                         Ok(fresh) => {
-                            // The old History goes here; a session that never
-                            // got past its opening line removes its own file.
-                            history = fresh.history;
-                            cfg = Arc::new(fresh.cfg);
-                            provider_state =
-                                kloop_core::provider_route::SessionProviderState::from_timeline(
-                                    Arc::clone(&cfg.provider_catalog),
-                                    history.provider_routes(),
-                                )
-                                .expect("a new session's route timeline is its current route");
-                            *current.lock().unwrap() = Arc::clone(&cfg);
+                            *current.lock().unwrap() = Arc::clone(driver.cfg());
                             AgentEvent::Cleared {
-                                session: session_switch(&cfg, fresh.report),
+                                session: session_switch(driver.cfg(), fresh.report),
                                 version: version.clone(),
                             }
                         }
@@ -608,17 +596,30 @@ async fn agent_worker(
                         return;
                     }
                 }
+                // A skill invoked as `/name` expands to a prompt, which the
+                // driver ran as a turn; report it exactly like WorkerMsg::Turn.
+                if let Some(turn) = command.turn {
+                    if let Some(input) = turn.returned {
+                        let (text, images) = split_user_input(input);
+                        let _ = events.send(AgentEvent::InputReturned { text, images });
+                    }
+                    if !finish_turn(&events, driver.cfg(), driver.history(), turn.outcome.reason) {
+                        return;
+                    }
+                    driver.reannounce_if_owed(drained);
+                    continue;
+                }
                 if !send_command_result_events(
                     &events,
-                    &result,
-                    kloop_core::agent::context_estimate(&cfg, &history),
+                    &command.output,
+                    kloop_core::agent::context_estimate(driver.cfg(), driver.history()),
                 ) {
                     return;
                 }
-                if let Some(stage) = result.open_picker
+                if let Some(stage) = command.open_picker
                     && events
                         .send(AgentEvent::ProviderPicker(
-                            provider_state.route_picker(stage),
+                            driver.provider_state().route_picker(stage),
                         ))
                         .is_err()
                 {
@@ -626,19 +627,9 @@ async fn agent_worker(
                 }
                 // `/exit`: tell the loop to quit (it tears the terminal down
                 // exactly like a two-tap Ctrl+C). No TurnEnded is needed.
-                if result.quit {
+                if command.quit {
                     let _ = events.send(AgentEvent::Quit);
                     return;
-                }
-                // A skill invoked as `/name` expands to a prompt: record it and
-                // run a turn, streaming through `ui` exactly like WorkerMsg::Turn.
-                if let Some(prompt) = result.run_turn {
-                    history.record(Message::user_text(prompt));
-                    let outcome = run_turn(&cfg, &mut history, &ui, &cancel, 0).await;
-                    if !finish_turn(&events, &cfg, &history, outcome.reason) {
-                        return;
-                    }
-                    continue;
                 }
                 // TurnEnded clears the busy state the key handler set on submit.
                 if events
@@ -647,10 +638,11 @@ async fn agent_worker(
                 {
                     return;
                 }
+                driver.reannounce_if_owed(drained);
             }
             WorkerMsg::ListForkPoints => {
                 // An in-memory-only history (no rollout) can't be rewound.
-                let points = match history.rollout_path() {
+                let points = match driver.history().rollout_path() {
                     Some(path) => fork_points(path).unwrap_or_default(),
                     None => Vec::new(),
                 };
@@ -663,26 +655,39 @@ async fn agent_worker(
                 abandoned,
                 cancel,
             } => {
-                if !rewind(
-                    seq,
-                    abandoned,
-                    &cancel,
-                    &mut cfg,
-                    &mut history,
-                    &mut provider_state,
-                    &current,
-                    &ui,
-                    &events,
-                )
-                .await
-                {
+                // Only a summarizing rewind made the UI busy.
+                let busy = matches!(abandoned, AbandonedBranch::Summarize);
+                let alive = match driver.rewind(seq, abandoned, &cancel, &ui).await {
+                    Ok(RewindReport::Cancelled) => events
+                        .send(AgentEvent::System(
+                            "rewind cancelled — still on the same session".into(),
+                        ))
+                        .is_ok(),
+                    Ok(RewindReport::Rewound {
+                        report,
+                        notes,
+                        messages,
+                        ..
+                    }) => {
+                        *current.lock().unwrap() = Arc::clone(driver.cfg());
+                        events
+                            .send(AgentEvent::Forked {
+                                session: session_switch(driver.cfg(), report),
+                                messages,
+                            })
+                            .is_ok()
+                            && notes
+                                .into_iter()
+                                .all(|note| events.send(AgentEvent::System(note)).is_ok())
+                    }
+                    Err(e) => events
+                        .send(AgentEvent::System(format!("rewind failed: {e:#}")))
+                        .is_ok(),
+                };
+                if !alive {
                     return;
                 }
-                // Only a summarizing rewind made the UI busy.
-                let busy = match abandoned {
-                    AbandonedBranch::Drop => false,
-                    AbandonedBranch::Summarize => true,
-                };
+                driver.reannounce_if_owed(false);
                 if busy
                     && events
                         .send(AgentEvent::Core(CoreEvent::TurnEnded(EndReason::Completed)))
@@ -693,59 +698,6 @@ async fn agent_worker(
             }
         }
     }
-}
-
-/// Rewind onto the fork cut at `seq`. The branch is a new session file, so it
-/// runs as a new session — new id, new session state — exactly like `/clear`,
-/// except that History keeps the branch's messages. `false` means the UI loop
-/// is gone.
-#[allow(clippy::too_many_arguments)]
-async fn rewind(
-    seq: u64,
-    abandoned: AbandonedBranch,
-    cancel: &CancellationToken,
-    cfg: &mut Arc<Config>,
-    history: &mut History,
-    provider_state: &mut kloop_core::provider_route::SessionProviderState,
-    current: &std::sync::Mutex<Arc<Config>>,
-    ui: &Arc<dyn Ui>,
-    events: &mpsc::UnboundedSender<AgentEvent>,
-) -> bool {
-    // A failed or cancelled rewind leaves History and the session untouched;
-    // report and carry on the original branch.
-    let rewound = match kloop_core::rewind::rewind(cfg, history, seq, abandoned, ui, cancel).await {
-        Ok(RewindOutcome::Rewound(rewound)) => rewound,
-        Ok(RewindOutcome::Cancelled) => {
-            return events
-                .send(AgentEvent::System(
-                    "rewind cancelled — still on the same session".into(),
-                ))
-                .is_ok();
-        }
-        Err(e) => {
-            return events
-                .send(AgentEvent::System(format!("rewind failed: {e:#}")))
-                .is_ok();
-        }
-    };
-    *cfg = Arc::new(rewound.cfg);
-    *provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
-        Arc::clone(&cfg.provider_catalog),
-        history.provider_routes(),
-    )
-    .expect("rewound provider timeline was validated on recovery");
-    *current.lock().unwrap() = Arc::clone(cfg);
-    let forked = AgentEvent::Forked {
-        session: session_switch(cfg, rewound.report),
-        messages: history.messages().to_vec(),
-    };
-    if events.send(forked).is_err() {
-        return false;
-    }
-    rewound
-        .notes
-        .into_iter()
-        .all(|note| events.send(AgentEvent::System(note)).is_ok())
 }
 
 type Terminal = ratatui::Terminal<
@@ -2436,15 +2388,7 @@ mod tests {
     #[test]
     fn command_events_show_the_output_then_move_the_gauge() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let result = kloop_core::commands::SlashResult {
-            output: "compacted".into(),
-            new_session: false,
-            run_turn: None,
-            quit: false,
-            route_changed: false,
-            open_picker: None,
-        };
-        assert!(send_command_result_events(&tx, &result, 40_000));
+        assert!(send_command_result_events(&tx, "compacted", 40_000));
         assert!(matches!(
             rx.try_recv().unwrap(),
             AgentEvent::System(output) if output == "compacted"

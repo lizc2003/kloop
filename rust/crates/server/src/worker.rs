@@ -1,38 +1,35 @@
-//! 每线程的 History 所有者、操作串行化与 turn/命令执行。
+//! 每线程的会话所有者、操作串行化与 turn/命令执行。
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use kloop_core::Config;
-use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
-use kloop_core::agent::run_turn;
-use kloop_core::agent::run_turn_with_input;
 use kloop_core::commands;
+use kloop_core::driver::Input;
+use kloop_core::driver::Report;
+use kloop_core::driver::SessionDriver;
 use kloop_core::event::Event;
-use kloop_core::history::History;
 use kloop_protocol::ActiveProviderRoute;
-use kloop_protocol::Message;
 
 use crate::ThreadWorkerMsg;
 use crate::ThreadWorkerState;
-use crate::Turn;
 use crate::params::switch_error_kind;
 use crate::thread_ui::ThreadUi;
 use crate::wire;
 use crate::wire::Outgoing;
 
-/// Owns this thread's History for its whole life. Client turns and idle
-/// scheduler deliveries share one single-flight bracket and one monotonic id
-/// allocator; a scheduled prompt never borrows the id of the turn that created it.
+/// Owns this thread's session for its whole life. Client turns, commands and
+/// idle scheduler deliveries share one single-flight bracket and one monotonic
+/// id allocator; a scheduled prompt never borrows the id of the turn that
+/// created it.
 pub(super) async fn thread_worker(
-    mut cfg: Arc<Config>,
-    mut history: History,
+    mut driver: SessionDriver,
     ui: Arc<ThreadUi>,
     mut turns: mpsc::UnboundedReceiver<ThreadWorkerMsg>,
     state: ThreadWorkerState,
@@ -43,7 +40,6 @@ pub(super) async fn thread_worker(
         turn_seq,
         inbox,
         active_route,
-        provider_state,
     } = state;
     let mut inbox_activity = inbox.subscribe_activity();
     loop {
@@ -68,13 +64,7 @@ pub(super) async fn thread_worker(
                 inbox.open_steer_window(id);
                 let cancel = CancellationToken::new();
                 *current_cancel.lock().unwrap() = Some(cancel.clone());
-                ThreadWorkerMsg::Turn(Turn {
-                    text: String::new(),
-                    images: Vec::new(),
-                    id,
-                    cancel,
-                    delivery_only: true,
-                })
+                ThreadWorkerMsg::Wake { id, cancel }
             }
         };
         // From here on, only activity that arrives *during* this operation is
@@ -82,23 +72,42 @@ pub(super) async fn thread_worker(
         // was set by the caller, or is the delivery this turn was started for;
         // both are the same batch and must not be re-announced on failure.
         let _ = inbox_activity.borrow_and_update();
-        let turn = match message {
-            ThreadWorkerMsg::Turn(turn) => turn,
+        let (turn_id, cancel, input) = match message {
+            ThreadWorkerMsg::Turn(turn) => {
+                // A command is recognized the same way every front-end
+                // recognizes one: a `/…` line with no images. Everything else
+                // is a model turn.
+                let input = if turn.images.is_empty()
+                    && commands::is_command_or_skill(&turn.text, &driver.cfg().skills)
+                {
+                    Input::Command { line: turn.text }
+                } else {
+                    Input::Message {
+                        text: turn.text,
+                        images: turn.images,
+                    }
+                };
+                (turn.id, turn.cancel, input)
+            }
+            // The queue is the input: nothing is recorded as a new user
+            // message, and the turn drains what is already there.
+            ThreadWorkerMsg::Wake { id, cancel } => (id, cancel, Input::Wake),
             ThreadWorkerMsg::ProviderCommand { text } => {
                 let args = provider_command_args(&text).unwrap_or_default();
-                let output = run_provider_command(
-                    &args,
-                    &mut cfg,
-                    &provider_state,
-                    &active_route,
-                    &mut history,
-                    &ui,
-                );
-                ui.notify("system", json!({"text": output}));
+                let report = driver.provider_command(&args);
+                ui.notify("system", json!({"text": report.output}));
+                if let Some(route) = report.route {
+                    *active_route.lock().unwrap() = route.clone();
+                    ui.projection.update_provider_route(route.clone());
+                    ui.notify(
+                        "thread/provider/changed",
+                        json!({"route": route, "continuity": route.continuity}),
+                    );
+                }
                 inbox.close_steer_window();
                 *current_cancel.lock().unwrap() = None;
                 running.store(false, Ordering::SeqCst);
-                wake_for_pending_inbox(&inbox);
+                driver.reannounce_if_owed(false);
                 continue;
             }
             ThreadWorkerMsg::SwitchProvider {
@@ -107,45 +116,29 @@ pub(super) async fn thread_worker(
                 expected_revision,
                 request_id,
             } => {
-                let result = history
-                    .switch_provider(
-                        &provider_state,
-                        expected_revision,
-                        &provider_id,
-                        model.as_deref(),
-                        kloop_core::provider_route::EffortRequest::Inherit,
-                    )
-                    .map(|outcome| {
-                        let (route, continuity) = match outcome {
-                            kloop_core::provider_route::SwitchOutcome::NoOp(route) => {
-                                let continuity = route.public_route().continuity;
-                                (route, continuity)
-                            }
-                            kloop_core::provider_route::SwitchOutcome::Changed {
-                                route,
-                                continuity,
-                            } => {
-                                ui.projection.update_provider_route(route.public_route());
-                                ui.notify(
-                                    "thread/provider/changed",
-                                    json!({
-                                        "route": route.public_route(),
-                                        "continuity": continuity,
-                                    }),
-                                );
-                                (route, continuity)
-                            }
-                        };
-                        cfg = Arc::new(cfg.clone_with_provider_route(route.clone()));
-                        let public_route = route.public_route();
-                        *active_route.lock().unwrap() = public_route.clone();
-                        (public_route, continuity)
-                    });
+                let result =
+                    driver.switch_provider(expected_revision, &provider_id, model.as_deref());
                 let outgoing = match result {
-                    Ok((route, continuity)) => Outgoing::Response {
-                        id: request_id,
-                        result: json!({"route": route, "continuity": continuity}),
-                    },
+                    Ok(report) => {
+                        if report.changed {
+                            *active_route.lock().unwrap() = report.route.clone();
+                            ui.projection.update_provider_route(report.route.clone());
+                            ui.notify(
+                                "thread/provider/changed",
+                                json!({
+                                    "route": report.route,
+                                    "continuity": report.continuity,
+                                }),
+                            );
+                        }
+                        Outgoing::Response {
+                            id: request_id,
+                            result: json!({
+                                "route": report.route,
+                                "continuity": report.continuity,
+                            }),
+                        }
+                    }
                     Err(error) => Outgoing::Error {
                         id: Some(request_id),
                         code: wire::SERVER_ERROR,
@@ -155,47 +148,25 @@ pub(super) async fn thread_worker(
                 };
                 running.store(false, Ordering::SeqCst);
                 let _ = ui.out.send(outgoing.into_bytes());
-                wake_for_pending_inbox(&inbox);
+                driver.reannounce_if_owed(false);
                 continue;
             }
         };
-        ui.notify("turn/started", wire::turn_started_params(turn.id));
-        let run = run_turn_or_command(
-            &mut cfg,
-            &provider_state,
-            &active_route,
-            &mut history,
+        ui.notify("turn/started", wire::turn_started_params(turn_id));
+        let dyn_ui: Arc<dyn Ui> = ui.clone();
+        let report = driver.dispatch(input, &dyn_ui, &cancel).await;
+        finish_operation(
+            &driver,
             &ui,
-            &turn,
-        )
-        .await;
-        ui.emit(&Event::Usage(kloop_core::agent::context_estimate(
-            &cfg, &history,
-        )));
-        ui.notify(
-            "turn/completed",
-            wire::turn_completed_params(turn.id, &run.reason),
+            turn_id,
+            &report,
+            &running,
+            &current_cancel,
+            &active_route,
         );
-        // Usually already closed by the final drain; this covers the endings
-        // that never reach it (error, max rounds, interrupt).
-        inbox.close_steer_window();
-        *current_cancel.lock().unwrap() = None;
-        running.store(false, Ordering::SeqCst);
-        *ui.turn.lock().unwrap() = None;
-        if run.model_turn {
-            // A model turn drains the queue at its round boundaries. If it
-            // failed before doing so (a blocked pre_turn hook is the common
-            // case), waking the same batch again would retry it forever. Only
-            // activity that arrived during the turn is new work.
-            wake_for_new_inbox_activity(&inbox, &inbox_activity);
-        } else {
-            // Slash commands never drain the inbox, so a steer queued behind
-            // one would otherwise wait for an unrelated event.
-            wake_for_pending_inbox(&inbox);
-        }
     }
     let shutdown_ui: Arc<dyn Ui> = ui.clone();
-    let shutdown = kloop_core::driver::shutdown_session(&cfg, &shutdown_ui).await;
+    let shutdown = driver.shutdown(&shutdown_ui).await;
     let missed = shutdown.missed;
     if missed > 0 {
         ui.emit(&Event::Note(format!(
@@ -207,24 +178,70 @@ pub(super) async fn thread_worker(
     }
 }
 
-fn wake_for_pending_inbox(inbox: &kloop_core::inbox::Inbox) {
-    if !inbox.is_empty() {
-        // `turn_start`/switch set `running` before the worker sees their
-        // message, so an activity notification that arrived in that window was
-        // consumed while the loop was still busy. Re-announce the queue once the
-        // operation releases the thread; otherwise a steer or scheduled
-        // delivery would sit there until some unrelated event happened.
-        inbox.notify_activity();
-    }
-}
-
-fn wake_for_new_inbox_activity(
-    inbox: &kloop_core::inbox::Inbox,
-    activity: &tokio::sync::watch::Receiver<u64>,
+/// Project one dispatched operation onto this thread's wire bracket. Command
+/// notices come first, where they were emitted from inside the run before.
+#[allow(clippy::too_many_arguments)]
+fn finish_operation(
+    driver: &SessionDriver,
+    ui: &Arc<ThreadUi>,
+    turn_id: u64,
+    report: &Report,
+    running: &AtomicBool,
+    current_cancel: &Mutex<Option<CancellationToken>>,
+    active_route: &Mutex<ActiveProviderRoute>,
 ) {
-    if !inbox.is_empty() && activity.has_changed().unwrap_or(false) {
-        inbox.notify_activity();
+    if let Report::Command(command) = report {
+        if command.route_changed {
+            let route = driver.cfg().provider_route.public_route();
+            *active_route.lock().unwrap() = route.clone();
+            ui.projection.update_provider_route(route);
+        }
+        if command.new_session {
+            ui.notify(
+                "system",
+                json!({"text": "/clear is not available on the server — start a new thread with thread/start"}),
+            );
+        }
+        if command.quit {
+            ui.notify(
+                "system",
+                json!({"text": "/exit is for interactive sessions; the server keeps running — close the connection to end this one"}),
+            );
+        }
+        if !command.output.is_empty() {
+            ui.notify("system", json!({"text": command.output}));
+        }
     }
+    let returned = match report {
+        Report::Turn(turn) => turn.as_ref().is_some_and(|turn| turn.returned.is_some()),
+        Report::Command(command) => command
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.returned.is_some()),
+    };
+    if returned {
+        // Interrupted before the model produced anything: the turn reached
+        // neither history nor the session file, so the thread snapshot must not
+        // keep its input either. The client still learns it aborted, from
+        // `turn/completed` like any other ending, and owns what it does with
+        // the text it sent.
+        ui.projection.discard_turn(turn_id);
+    }
+    ui.emit(&Event::Usage(kloop_core::agent::context_estimate(
+        driver.cfg(),
+        driver.history(),
+    )));
+    ui.notify(
+        "turn/completed",
+        wire::turn_completed_params(turn_id, &report.reason()),
+    );
+    // Usually already closed by the final drain; this covers the endings that
+    // never reach it (error, max rounds, interrupt).
+    driver.cfg().inbox.close_steer_window();
+    *current_cancel.lock().unwrap() = None;
+    running.store(false, Ordering::SeqCst);
+    *ui.turn.lock().unwrap() = None;
+    driver.reannounce_if_owed(report.drained_inbox());
 }
 
 pub(super) fn provider_command_args(text: &str) -> Option<Vec<&str>> {
@@ -237,192 +254,4 @@ pub(super) fn provider_command_args(text: &str) -> Option<Vec<&str>> {
         return None;
     }
     Some(rest.split_whitespace().collect())
-}
-
-const PROVIDER_USAGE: &str = "usage: /provider <provider> [model] [effort]";
-
-/// `unset` is kloop's word for "send no effort field at all" and is not a wire
-/// value, so it is matched before the level vocabulary (see the command's own
-/// `parse_level`, which this mirrors for the server's idle-transaction path).
-fn parse_effort_level(
-    raw: &str,
-) -> Result<Option<kloop_protocol::ReasoningEffort>, kloop_protocol::UnknownReasoningEffort> {
-    if raw.eq_ignore_ascii_case("unset") {
-        return Ok(None);
-    }
-    raw.parse::<kloop_protocol::ReasoningEffort>().map(Some)
-}
-
-fn run_provider_command(
-    args: &[&str],
-    cfg: &mut Arc<Config>,
-    provider_state: &kloop_core::provider_route::SessionProviderState,
-    active_route: &Arc<Mutex<ActiveProviderRoute>>,
-    history: &mut History,
-    ui: &Arc<ThreadUi>,
-) -> String {
-    let Some(provider_id) = args.first().copied() else {
-        let route = provider_state.active_route();
-        return format!(
-            "active: {} {} (revision {})",
-            route.provider_id, route.model, route.revision
-        );
-    };
-    if args.len() > 3 {
-        return PROVIDER_USAGE.into();
-    }
-    let model = args.get(1).copied();
-    let effort = match args.get(2).copied().map(parse_effort_level).transpose() {
-        Ok(level) => level.map_or(
-            kloop_core::provider_route::EffortRequest::Inherit,
-            kloop_core::provider_route::EffortRequest::Set,
-        ),
-        Err(error) => return format!("{error}\n{PROVIDER_USAGE}"),
-    };
-    let expected_revision = provider_state.active_route().revision;
-    match history.switch_provider(
-        provider_state,
-        expected_revision,
-        provider_id,
-        model,
-        effort,
-    ) {
-        Ok(kloop_core::provider_route::SwitchOutcome::NoOp(route)) => format!(
-            "provider unchanged: {} {} (revision {})",
-            route.provider_id(),
-            route.model(),
-            route.revision()
-        ),
-        Ok(kloop_core::provider_route::SwitchOutcome::Changed { route, continuity }) => {
-            let public_route = route.public_route();
-            let provider_name = route.provider_id().to_string();
-            let model_name = route.model().to_string();
-            let revision = route.revision();
-            let effort_label = kloop_protocol::ReasoningEffort::choice_str(route.effort());
-            *cfg = Arc::new(cfg.clone_with_provider_route(route));
-            *active_route.lock().unwrap() = public_route.clone();
-            ui.projection.update_provider_route(public_route.clone());
-            ui.notify(
-                "thread/provider/changed",
-                json!({"route": public_route, "continuity": continuity}),
-            );
-            format!(
-                "provider switched: {provider_name} {model_name} (revision {revision}, reasoning continuity: {continuity:?}, effort: {effort_label})",
-            )
-        }
-        Err(error) => format!("provider switch failed: {error}"),
-    }
-}
-
-struct TurnRun {
-    reason: EndReason,
-    /// Whether the turn entered `run_turn`/`run_turn_with_input`, and could
-    /// therefore have drained the inbox at its round boundaries.
-    model_turn: bool,
-}
-
-/// Run one turn's work and return its end reason, without touching the turn
-/// bracket (the caller owns that). A slash command line reads/rewrites History
-/// like a turn but is not a model turn: no user message is recorded and nothing
-/// is sampled — its output comes back as a `system` notification. `/clear` is
-/// refused: a thread is one session, and a new one is `thread/start`. Images (or
-/// any non-command text) take the model path.
-async fn run_turn_or_command(
-    cfg: &mut Arc<Config>,
-    provider_state: &kloop_core::provider_route::SessionProviderState,
-    active_route: &Arc<Mutex<ActiveProviderRoute>>,
-    history: &mut History,
-    ui: &Arc<ThreadUi>,
-    turn: &Turn,
-) -> TurnRun {
-    if turn.delivery_only {
-        let dyn_ui: Arc<dyn Ui> = ui.clone();
-        return TurnRun {
-            reason: run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
-                .await
-                .reason,
-            model_turn: true,
-        };
-    }
-    if turn.images.is_empty() && commands::is_command_or_skill(&turn.text, &cfg.skills) {
-        let result = commands::run_with_provider_state(
-            &turn.text,
-            history,
-            cfg,
-            provider_state,
-            ui.as_ref(),
-            &turn.cancel,
-        )
-        .await;
-        if result.route_changed {
-            let route = provider_state.active_route();
-            *cfg = Arc::new(cfg.clone_with_provider_route(provider_state.freeze()));
-            *active_route.lock().unwrap() = route.clone();
-            ui.projection.update_provider_route(route);
-        }
-        // `/exit` is a client-side concept: quitting one thread must never stop
-        // a multi-session server. Relay a note instead of acting on it.
-        if result.quit {
-            ui.notify(
-                "system",
-                json!({"text": "/exit is for interactive sessions; the server keeps running — close the connection to end this one"}),
-            );
-            return TurnRun {
-                reason: EndReason::Completed,
-                model_turn: false,
-            };
-        }
-        // `/clear` starts a new session, and here a session is a thread the
-        // client addressed by id: switching it underneath the client is what
-        // `thread/start` exists to avoid.
-        if result.new_session {
-            ui.notify(
-                "system",
-                json!({"text": "/clear is not available on the server — start a new thread with thread/start"}),
-            );
-            return TurnRun {
-                reason: EndReason::Completed,
-                model_turn: false,
-            };
-        }
-        if !result.output.is_empty() {
-            ui.notify("system", json!({"text": result.output}));
-        }
-        // A skill invoked as `/name` expands to a prompt: record it and run a
-        // turn (streaming via the same notifications as a normal turn).
-        if let Some(prompt) = result.run_turn {
-            history.record(Message::user_text(prompt));
-            let dyn_ui: Arc<dyn Ui> = ui.clone();
-            return TurnRun {
-                reason: run_turn(cfg, history, &dyn_ui, &turn.cancel, 0)
-                    .await
-                    .reason,
-                model_turn: true,
-            };
-        }
-        return TurnRun {
-            reason: EndReason::Completed,
-            model_turn: false,
-        };
-    }
-    let msg = if turn.images.is_empty() {
-        Message::user_text(turn.text.clone())
-    } else {
-        Message::user_with_blocks(turn.text.clone(), turn.images.clone())
-    };
-    let dyn_ui: Arc<dyn Ui> = ui.clone();
-    let (outcome, returned) =
-        run_turn_with_input(cfg, history, &dyn_ui, &turn.cancel, 0, msg).await;
-    if returned.is_some() {
-        // Interrupted before the model produced anything: the turn reached
-        // neither history nor the session file, so the thread snapshot must not
-        // keep its input either. The client still learns it aborted, from
-        // `turn/completed` like any other ending, and owns what it does with
-        // the text it sent.
-        ui.projection.discard_turn(turn.id);
-    }
-    TurnRun {
-        reason: outcome.reason,
-        model_turn: true,
-    }
 }

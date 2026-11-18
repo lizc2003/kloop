@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -597,6 +598,9 @@ pub struct PtyHarness {
     reader: Option<JoinHandle<()>>,
     exit_status: Option<ExitStatus>,
     emergency_kill: Arc<AtomicBool>,
+    /// The child's `$HOME`, for reading what it wrote outside the workspace
+    /// (its session partition).
+    home: PathBuf,
     _sandbox: TempDir,
 }
 
@@ -827,8 +831,13 @@ impl PtyHarness {
             reader: Some(reader_handle),
             exit_status: None,
             emergency_kill: Arc::new(AtomicBool::new(false)),
+            home,
             _sandbox: sandbox,
         })
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
     }
 
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
