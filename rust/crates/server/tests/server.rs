@@ -4606,8 +4606,7 @@ async fn thread_fork_branches_a_session_into_a_live_thread() {
 
 /// A fork owns a session file it just created and the writer treats as
 /// preexisting. If its config build fails, nothing else removes that file, so
-/// the cleanup guard travels with the build; without it every retry would add
-/// another orphan to `thread/list`.
+/// the read loop keeps its cleanup guard until registration.
 #[tokio::test]
 async fn a_failed_fork_build_removes_the_new_session_file() {
     let dirs = test_dirs("fork-build-failure");
@@ -4649,6 +4648,60 @@ async fn a_failed_fork_build_removes_the_new_session_file() {
         sessions_before,
         "the failed fork left its session file behind"
     );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn a_panicking_fork_build_is_answered_and_removed_before_shutdown() {
+    let dirs = test_dirs("fork-build-panic");
+    let inner = factory(vec![vec![text("answer")]], dirs.offload.clone(), false);
+    let calls = AtomicUsize::new(0);
+    let (unwind, gate) = tokio::sync::oneshot::channel();
+    let gate = Mutex::new(Some(gate));
+    let panicking: ConfigFactory =
+        Arc::new(move |options, catalog, approver, questioner, notify| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                let gate = gate.lock().unwrap().take().unwrap();
+                let _ = gate.blocking_recv();
+                panic!("injected factory panic");
+            }
+            inner(options, catalog, approver, questioner, notify)
+        });
+    let mut client = start_server(panicking, &dirs);
+    let src = client.init_and_start().await;
+    client
+        .request("turn/start", json!({"thread_id": src, "input": "q"}))
+        .await;
+    client.recv_until(|m| m["method"] == "turn/completed").await;
+    let source = format!("{src}.jsonl");
+
+    let fork_request = client
+        .request("thread/fork", json!({"thread_id": src}))
+        .await;
+    let list = client.request("thread/list", json!({})).await;
+    let response = client.recv_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(response["id"], list);
+    let fork_file = session_jsonl(&dirs.sessions)
+        .into_iter()
+        .find(|file| file != &source)
+        .expect("fork exists while its factory is blocked");
+    let fork = fork_file.strip_suffix(".jsonl").unwrap();
+    unwind.send(()).unwrap();
+
+    let response = client.recv_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(response["id"], fork_request);
+    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(response["error"]["message"], "config build panicked");
+    assert_eq!(session_jsonl(&dirs.sessions), vec![source]);
+
+    let resume = client
+        .request("thread/resume", json!({"thread_id": fork}))
+        .await;
+    let response = client.recv_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(response["id"], resume);
+    assert_eq!(response["error"]["message"], format!("no session '{fork}'"));
 
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&dirs.root);

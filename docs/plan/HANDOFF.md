@@ -5437,3 +5437,6 @@ rewind 的修法同理：不是事后回滚，而是先用 `History::branch` 建
 的输出 sender 交给有期限的异步等待者，把未注册 fork 的删除守卫交给读循环。阻塞池里卡住的工作
 无需先返回，退出路径就能回错误、删分支。worker 停收新投递时仍处理已入队的答复和 turn 终态。
 rewind 更换 History 前要落盘旧分支最后一批审批，分支已冻结的 stub 要同时进入内存与 rollout。
+
+415. **异步请求的失败回执也要覆盖工作任务的 panic。** plan 269 的 fork 清理守卫由读循环持有，
+等待构建 `JoinHandle` 的任务会把 panic 转成失败回执，由读循环释放 pending id、删除分支并答复。

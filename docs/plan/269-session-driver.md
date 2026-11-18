@@ -62,6 +62,8 @@
   终态。rewind 换入分支前准备 provider，停止旧后台后把审批补写到旧文件，分支从第一条请求起沿用
   已冻结的 stub。技能展开被取消时退回原命令，包括 `!cmd` 以错误退出的情况。TUI 保留用户刚贴的
   草稿，以及输入框里剩余的图片编号与在途读取。
+- **构建 panic 补修**：异步任务等待阻塞构建的 `JoinHandle`。factory panic 会回
+  `config build panicked`，读循环随即释放 pending id 并删除未注册的 fork。
 - **既有基线**：全仓 parity 的 `Plan 56 parser contract drift` 不通过——`refs` 语料期望
   `enter_name_null`/`enter_path_null`/`exit_discard_null` 判为 invalid，而 plan 267 的
   native report 明确 `null_is_omitted`。本次改动未触 `core/src/tools/`，不是这条 plan 引入的。

@@ -327,8 +327,17 @@ impl Server {
                 fork_guard,
             },
         );
-        tokio::task::spawn_blocking(move || {
-            let outcome = build.build();
+        let task = tokio::task::spawn_blocking(move || build.build());
+        tokio::spawn(async move {
+            // The read loop owns the pending entry and fork guard. It needs a
+            // completion even when the factory unwinds.
+            let outcome = match task.await {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_panic() => {
+                    Err((wire::SERVER_ERROR, "config build panicked".into()))
+                }
+                Err(_) => Err((wire::SERVER_ERROR, "config build was cancelled".into())),
+            };
             let _ = builds.send(ThreadBuild {
                 thread_id,
                 options,

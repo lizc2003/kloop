@@ -2302,10 +2302,11 @@ operations and emit `turn/completed` with `aborted` for accepted turns that have
 yet to start. Accepted builds and reads have a bounded grace for their responses.
 The asynchronous read task owns the output sender and can answer with an error
 while its blocking work is still running. The read loop owns each unregistered
-fork's removal guard and drops it before sending a build timeout error. When a
-build times out, the writer gets a bounded flush. The CLI shuts the runtime down
-with a deadline: a blocking task cannot be aborted, and the default runtime drop
-would wait for it. After a non-model operation (`/provider`,
+fork's removal guard and drops it before returning a build error. The async
+task awaiting the build sends a completion to the read loop even if the factory
+panics. When a build times out, the writer gets a bounded flush. The CLI shuts
+the runtime down with a deadline: a blocking task cannot be aborted, and the
+default runtime drop would wait for it. After a non-model operation (`/provider`,
 `thread/provider/switch`, a slash command) releases the thread's single-flight
 gate, the worker re-announces a non-empty inbox: a steer or scheduled delivery
 that arrived while `running` was already set would otherwise sit there until an
