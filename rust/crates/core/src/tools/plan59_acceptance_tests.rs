@@ -1,3 +1,11 @@
+//! End-to-end tool acceptance: one report per surface group — file/search/
+//! bash/worktree, background agents and the scheduler, MCP and web sources,
+//! questions/plan/workflow/headless, notebook/LSP/file tools.
+//!
+//! This is the cross-tool check the per-plan files cannot make on their own.
+//! Each report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::future::Future;

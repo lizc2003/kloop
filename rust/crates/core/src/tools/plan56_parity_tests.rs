@@ -1,3 +1,9 @@
+//! Worktree parity: the schema, enter/exit lifecycle, ownership, permissions,
+//! provenance and the effective-context and existing-path fallbacks.
+//!
+//! The report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::future::Future;

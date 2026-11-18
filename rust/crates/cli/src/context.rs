@@ -345,11 +345,11 @@ mod tests {
     use super::*;
 
     /// Unique per-test tree under the OS tempdir.
-    fn test_tree(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-ctx-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_tree(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("kloop-ctx-{tag}-"))
+            .tempdir()
+            .expect("create a temporary directory")
     }
 
     fn write(dir: &Path, name: &str, content: &str) {
@@ -361,8 +361,8 @@ mod tests {
     fn chain_runs_root_to_cwd_and_ignores_dirs_above_the_git_root() {
         let base = test_tree("chain");
         // base/ has a file that must NOT be picked up (above the git root).
-        write(&base, "AGENTS.md", "outside");
-        let root = base.join("repo");
+        write(base.path(), "AGENTS.md", "outside");
+        let root = base.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         write(&root, "AGENTS.md", "root rules");
         let cwd = root.join("crates").join("core");
@@ -378,8 +378,8 @@ mod tests {
     #[test]
     fn without_a_git_root_only_cwd_is_consulted() {
         let base = test_tree("no-root");
-        write(&base, "AGENTS.md", "parent rules");
-        let cwd = base.join("sub");
+        write(base.path(), "AGENTS.md", "parent rules");
+        let cwd = base.path().join("sub");
         write(&cwd, "AGENTS.md", "cwd rules");
         let files = discover_instruction_files(&cwd, None, None).files;
         let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
@@ -389,9 +389,9 @@ mod tests {
     #[test]
     fn global_layer_comes_first() {
         let base = test_tree("global");
-        let global = base.join("home-kloop");
+        let global = base.path().join("home-kloop");
         write(&global, "AGENTS.md", "global rules");
-        let root = base.join("repo");
+        let root = base.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         write(&root, "AGENTS.md", "root rules");
 
@@ -412,15 +412,20 @@ mod tests {
     #[test]
     fn missing_files_everywhere_is_fine() {
         let root = test_tree("empty");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        let files = discover_instruction_files(&root, Some(&root.join("nope")), Some(&root)).files;
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let files = discover_instruction_files(
+            root.path(),
+            Some(&root.path().join("nope")),
+            Some(root.path()),
+        )
+        .files;
         assert!(files.is_empty());
     }
 
     #[test]
     fn gather_takes_the_git_root_from_the_resolved_identity() {
         let base = test_tree("git-root");
-        let root = base.join("repo");
+        let root = base.path().join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let git = |args: &[&str]| {
             let status = kloop_core::git::hermetic_command(&root)
@@ -454,10 +459,10 @@ mod tests {
     #[test]
     fn import_expands_with_the_main_file_first() {
         let root = test_tree("import-basic");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "main rules\n@./extra.md");
-        write(&root, "extra.md", "extra rules");
-        let files = discover_instruction_files(&root, None, Some(&root)).files;
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "main rules\n@./extra.md");
+        write(root.path(), "extra.md", "extra rules");
+        let files = discover_instruction_files(root.path(), None, Some(root.path())).files;
         let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
         // Parent before child, matching cc's processMemoryFile order.
         assert_eq!(contents, vec!["main rules\n@./extra.md", "extra rules"]);
@@ -467,14 +472,14 @@ mod tests {
     #[test]
     fn import_depth_is_capped_at_five() {
         let root = test_tree("import-depth");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "level0\n@./a1.md");
-        write(&root, "a1.md", "level1\n@./a2.md");
-        write(&root, "a2.md", "level2\n@./a3.md");
-        write(&root, "a3.md", "level3\n@./a4.md");
-        write(&root, "a4.md", "level4\n@./a5.md");
-        write(&root, "a5.md", "level5");
-        let files = discover_instruction_files(&root, None, Some(&root)).files;
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "level0\n@./a1.md");
+        write(root.path(), "a1.md", "level1\n@./a2.md");
+        write(root.path(), "a2.md", "level2\n@./a3.md");
+        write(root.path(), "a3.md", "level3\n@./a4.md");
+        write(root.path(), "a4.md", "level4\n@./a5.md");
+        write(root.path(), "a5.md", "level5");
+        let files = discover_instruction_files(root.path(), None, Some(root.path())).files;
         let joined: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
         // Depths 0..=4 load; a5.md at depth 5 is dropped.
         assert!(joined.iter().any(|c| c.contains("level4")));
@@ -484,10 +489,10 @@ mod tests {
     #[test]
     fn import_cycle_terminates_without_duplicating() {
         let root = test_tree("import-cycle");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "a\n@./b.md");
-        write(&root, "b.md", "b\n@./AGENTS.md");
-        let files = discover_instruction_files(&root, None, Some(&root)).files;
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "a\n@./b.md");
+        write(root.path(), "b.md", "b\n@./AGENTS.md");
+        let files = discover_instruction_files(root.path(), None, Some(root.path())).files;
         let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
         // Each file loaded once; the cycle back to AGENTS.md is a no-op.
         assert_eq!(contents, vec!["a\n@./b.md", "b\n@./AGENTS.md"]);
@@ -496,9 +501,9 @@ mod tests {
     #[test]
     fn external_imports_are_skipped_for_project_but_allowed_for_global() {
         let base = test_tree("import-external");
-        let outside = base.join("outside");
+        let outside = base.path().join("outside");
         write(&outside, "shared.md", "shared");
-        let repo = base.join("repo");
+        let repo = base.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         write(
             &repo,
@@ -510,7 +515,7 @@ mod tests {
         assert!(d.warnings.iter().any(|w| w.contains("outside the project")));
 
         // A global file may import from anywhere.
-        let global = base.join("home-kloop");
+        let global = base.path().join("home-kloop");
         write(
             &global,
             "AGENTS.md",
@@ -527,11 +532,11 @@ mod tests {
     #[test]
     fn symlinks_that_resolve_outside_the_project_are_skipped() {
         let base = test_tree("symlink-outside");
-        let outside = base.join("outside");
+        let outside = base.path().join("outside");
         write(&outside, "AGENTS.md", "outside rules");
         write(&outside, "rule.md", "outside rule");
         write(&outside, "shared.md", "outside shared");
-        let root = base.join("repo");
+        let root = base.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::os::unix::fs::symlink(outside.join("AGENTS.md"), root.join("AGENTS.md")).unwrap();
         std::fs::create_dir_all(root.join(".kloop").join("rules")).unwrap();
@@ -563,12 +568,13 @@ mod tests {
     #[test]
     fn symlinks_that_stay_inside_the_project_load_normally() {
         let root = test_tree("symlink-inside");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "main\n@./link.md");
-        write(&root, "notes.md", "linked notes");
-        std::os::unix::fs::symlink(root.join("notes.md"), root.join("link.md")).unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "main\n@./link.md");
+        write(root.path(), "notes.md", "linked notes");
+        std::os::unix::fs::symlink(root.path().join("notes.md"), root.path().join("link.md"))
+            .unwrap();
 
-        let d = discover_instruction_files(&root, None, Some(&root));
+        let d = discover_instruction_files(root.path(), None, Some(root.path()));
         let contents: Vec<&str> = d.files.iter().map(|f| f.content.as_str()).collect();
         assert_eq!(contents, vec!["main\n@./link.md", "linked notes"]);
         assert!(d.warnings.is_empty(), "got: {:?}", d.warnings);
@@ -577,9 +583,9 @@ mod tests {
     #[test]
     fn missing_import_warns_but_does_not_crash() {
         let root = test_tree("import-missing");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "main\n@./nope.md");
-        let d = discover_instruction_files(&root, None, Some(&root));
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "main\n@./nope.md");
+        let d = discover_instruction_files(root.path(), None, Some(root.path()));
         assert_eq!(d.files.len(), 1);
         assert!(
             d.warnings
@@ -591,9 +597,9 @@ mod tests {
     #[test]
     fn prose_at_mention_does_not_warn() {
         let root = test_tree("import-prose");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "ping @someone before merging");
-        let d = discover_instruction_files(&root, None, Some(&root));
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "ping @someone before merging");
+        let d = discover_instruction_files(root.path(), None, Some(root.path()));
         assert_eq!(d.files.len(), 1);
         assert!(d.warnings.is_empty());
     }
@@ -601,10 +607,10 @@ mod tests {
     #[test]
     fn imports_inside_fenced_code_blocks_are_ignored() {
         let root = test_tree("import-fence");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "main\n```\n@./secret.md\n```\n");
-        write(&root, "secret.md", "secret");
-        let d = discover_instruction_files(&root, None, Some(&root));
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "main\n```\n@./secret.md\n```\n");
+        write(root.path(), "secret.md", "secret");
+        let d = discover_instruction_files(root.path(), None, Some(root.path()));
         assert!(!d.files.iter().any(|f| f.content == "secret"));
         assert!(d.warnings.is_empty());
     }
@@ -612,13 +618,13 @@ mod tests {
     #[test]
     fn rules_dir_files_are_loaded_sorted_after_the_main_file() {
         let root = test_tree("rules");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "main");
-        let rules = root.join(".kloop").join("rules");
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "main");
+        let rules = root.path().join(".kloop").join("rules");
         write(&rules, "20-style.md", "style");
         write(&rules, "10-testing.md", "testing");
         write(&rules, "notes.txt", "ignored");
-        let files = discover_instruction_files(&root, None, Some(&root)).files;
+        let files = discover_instruction_files(root.path(), None, Some(root.path())).files;
         let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
         assert_eq!(contents, vec!["main", "testing", "style"]);
     }
@@ -626,10 +632,10 @@ mod tests {
     #[test]
     fn local_override_is_loaded_last_and_scoped_local() {
         let root = test_tree("local");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root, "AGENTS.md", "shared");
-        write(&root, "AGENTS.local.md", "private");
-        let files = discover_instruction_files(&root, None, Some(&root)).files;
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        write(root.path(), "AGENTS.md", "shared");
+        write(root.path(), "AGENTS.local.md", "private");
+        let files = discover_instruction_files(root.path(), None, Some(root.path())).files;
         let scoped: Vec<(InstructionScope, &str)> = files
             .iter()
             .map(|f| (f.scope, f.content.as_str()))

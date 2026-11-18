@@ -1,3 +1,10 @@
+//! Agent and task parity: synchronous and background sub-agent batches,
+//! reinjection, stop/completion arbitration, the inbox boundary and the native
+//! tool surface.
+//!
+//! The report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;

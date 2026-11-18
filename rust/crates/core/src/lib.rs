@@ -48,6 +48,8 @@ pub mod shell_programs;
 pub mod skills;
 pub mod state_lock;
 mod structured_output;
+#[cfg(test)]
+mod test_support;
 mod text_edit;
 pub mod tools;
 pub mod usage;

@@ -5,6 +5,19 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 270 ✅：模块切分与测试整理（2026-11-18）**：开工问答定为测试文件不改名、只加“测什么”的头注释；
+扫描后 `tui/src/app.rs`、`core/src/permissions.rs`、`core/src/tools/fs.rs` 不切——三份的 60–75% 是测试，
+非测试部分分别是单个 `App` 状态机（46 字段、66 个方法互相调用）、已有 10 个子模块的权限门、读写共用
+观察与身份机制的单个文件工具实现，按方法组切只会把内部调用提成 `pub(super)`。`tools/mod.rs` 拆成
+`catalog.rs`（目录、延迟分区、合并警告、并发分类）、`dispatch.rs`（分批、门禁、hook、截止时间、
+`run_one`/`execute_tool`）、`paths.rs`（`resolve_path`）；`mod.rs` 留 `ToolCtx`、`ToolSource`、日志句柄、
+参数归一化与公开门面。内部 helper 用 `pub(super)` + `mod.rs` 私有 `use` 保持兄弟模块 `super::X` 不变，
+拆前拆后顶层条目集合一致。10 个计划编号测试文件补了说明注释。计划列的 8 处测试临时目录统一到
+`tempfile::TempDir`，core 新增 `#[cfg(test)] mod test_support`。验证：core lib 1462 通过、1 ignored
+（外层执行沙箱之外，真实 seatbelt 用例实际执行）、CLI bin 170 通过、两个 crate 的
+`clippy --all-targets -D warnings`、`cargo fmt --all --check`、`cargo check --all-targets`；
+未跑全量 `make check`、parity、真实 API。教训 416、417。
+
 **Plan 268 ✅：后台执行 registry 统一（2026-11-17）**：用户定 (a)——只抽共享流程，不动三条生命周期。
 五条复核都成立，但第 1 条已经只剩两份：子 agent 的 supervisor 收尾在 plan 267 已抽成
 `run_supervised_child`。新增 `core/src/tools/background_registry.rs`，装 `wait_until`
@@ -1858,7 +1871,7 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 | **267** ✅ 工具契约单一来源 | schema/解析/TS 声明三处分头演化;参数 helper 四份分叉;两个 `call_agent` bridge | 大 | 257 |
 | **268** ✅ 后台执行 registry 统一 | 三套关闭流程、三份轮询、supervisor 样板;Windows 进程创建 80 行重复 | 中 | 255、257 |
 | **269** ✅ 会话驱动器 | 四个前端各写 turn 生命周期，造成 250/258/259 里的三个 P1;`SessionDriver` 收归 core | 大 | 250、258、259 |
-| **270** 模块切分与测试整理 | `tools/mod.rs` 按职责拆;计划编号测试文件;测试临时目录八份 | 中 | 264、267 之后 |
+| **270** ✅ 模块切分与测试整理 | `tools/mod.rs` 按职责拆;计划编号测试文件;测试临时目录八份 | 中 | 264、267 之后 |
 
 - **建议顺序**:安全四条 243 → 244 → 245 → 246 先做(260 的 Windows `cmd` 那条也可提前单独修);
   然后 247、248、249 这三条便宜的基础层;再按需挑 250–262;最后 263–270。依赖列之外的条目互相独立。
@@ -5440,3 +5453,17 @@ rewind 更换 History 前要落盘旧分支最后一批审批，分支已冻结�
 
 415. **异步请求的失败回执也要覆盖工作任务的 panic。** plan 269 的 fork 清理守卫由读循环持有，
 等待构建 `JoinHandle` 的任务会把 panic 转成失败回执，由读循环释放 pending id、删除分支并答复。
+
+416. **移动实现时，父模块的私有 `use` 就是子模块的原路径。** plan 270 把 `tools/mod.rs` 的目录、
+分发与路径解析分别移进子模块后，兄弟模块仍写 `super::all_tool_defs` / `super::run_one`：项在子模块里
+声明 `pub(super)`，`mod.rs` 用私有 `use catalog::all_tool_defs;` 把它重新绑到 `tools` 作用域。私有
+`use` 对后代模块可见，所以调用点一行不改，可见性也不必放宽到 `pub(crate)`；只有真正跨出 `tools` 的
+名字（`resolve_path`、测试钩子）才需要 `pub(crate) use`。判据：先按“谁需要看”定可见性，再用父模块的
+私有 `use` 保持既有路径，别为了少改调用点把一切都提成 crate 可见。
+
+417. **`TempDir` 不能作为参数位置的临时值；换 helper 前先看测试是否依赖“目录本来不存在”。**
+plan 270 把测试的 `temp_dir(tag) -> PathBuf` 换成 `TempDir` 后，`History::new(temp_dir("x"))` 会在语句
+结束时 drop 掉刚建的目录，必须先 `let dir = temp_dir("x");` 再取 `dir.path()`；反过来，原本靠
+“temp_dir 不建目录”来断言 offload 目录保持不存在的用例，要先显式 `remove_dir_all(dir.path())`。
+判据：临时目录的所有权跟着句柄走，凡是语句结束就丢句柄的写法都是错的；替换时逐个用例看它是在
+清理还是在构造前提。

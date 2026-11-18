@@ -372,23 +372,8 @@ fn update_path_digest(hasher: &mut Sha256, path: &OsStr) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-
     use super::*;
-
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "kloop-project-{tag}-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::temp_dir;
 
     fn git(cwd: &Path, args: &[&str]) {
         let status = crate::git::hermetic_command(cwd)
@@ -398,13 +383,13 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    fn init_repository(tag: &str) -> PathBuf {
+    fn init_repository(tag: &str) -> tempfile::TempDir {
         let root = temp_dir(tag);
-        git(&root, &["init", "-q"]);
-        std::fs::write(root.join("seed"), "seed\n").unwrap();
-        git(&root, &["add", "seed"]);
+        git(root.path(), &["init", "-q"]);
+        std::fs::write(root.path().join("seed"), "seed\n").unwrap();
+        git(root.path(), &["add", "seed"]);
         git(
-            &root,
+            root.path(),
             &[
                 "-c",
                 "user.name=kloop",
@@ -421,16 +406,16 @@ mod tests {
     #[test]
     fn linked_worktrees_share_project_but_not_workspace() {
         let root = init_repository("linked");
-        let tree_a = root.with_file_name(format!(
+        let tree_a = root.path().with_file_name(format!(
             "{}-tree-a",
-            root.file_name().unwrap().to_string_lossy()
+            root.path().file_name().unwrap().to_string_lossy()
         ));
-        let tree_b = root.with_file_name(format!(
+        let tree_b = root.path().with_file_name(format!(
             "{}-tree-b",
-            root.file_name().unwrap().to_string_lossy()
+            root.path().file_name().unwrap().to_string_lossy()
         ));
         git(
-            &root,
+            root.path(),
             &[
                 "worktree",
                 "add",
@@ -441,7 +426,7 @@ mod tests {
             ],
         );
         git(
-            &root,
+            root.path(),
             &[
                 "worktree",
                 "add",
@@ -452,7 +437,7 @@ mod tests {
             ],
         );
 
-        let main = WorkspaceIdentity::resolve(&root);
+        let main = WorkspaceIdentity::resolve(root.path());
         let first = WorkspaceIdentity::resolve(&tree_a);
         let second = WorkspaceIdentity::resolve(&tree_b);
         assert_eq!(main.project_id(), first.project_id());
@@ -471,34 +456,32 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(tree_a);
         let _ = std::fs::remove_dir_all(tree_b);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn nested_cwd_keeps_checkout_identity_and_effective_cwd() {
         let root = init_repository("nested");
-        let nested = root.join("a/b");
+        let nested = root.path().join("a/b");
         std::fs::create_dir_all(&nested).unwrap();
-        let top = WorkspaceIdentity::resolve(&root);
+        let top = WorkspaceIdentity::resolve(root.path());
         let child = WorkspaceIdentity::resolve(&nested);
         assert_eq!(top.project_id(), child.project_id());
         assert_eq!(top.workspace_id(), child.workspace_id());
         assert_eq!(child.cwd(), std::fs::canonicalize(&nested).unwrap());
         assert_eq!(
             child.workspace_root(),
-            std::fs::canonicalize(&root).unwrap()
+            std::fs::canonicalize(root.path()).unwrap()
         );
         assert_eq!(
             child.git_root(),
-            Some(std::fs::canonicalize(&root).unwrap().as_path())
+            Some(std::fs::canonicalize(root.path()).unwrap().as_path())
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn non_git_identity_is_canonical_and_domain_separated() {
         let root = temp_dir("directory");
-        let identity = WorkspaceIdentity::resolve(&root);
+        let identity = WorkspaceIdentity::resolve(root.path());
         assert!(identity.project_available());
         assert_ne!(
             identity
@@ -508,7 +491,7 @@ mod tests {
                 .trim_start_matches("p1_"),
             identity.workspace_id().as_str().trim_start_matches("w1_")
         );
-        assert_eq!(identity.cwd(), std::fs::canonicalize(&root).unwrap());
+        assert_eq!(identity.cwd(), std::fs::canonicalize(root.path()).unwrap());
         assert_eq!(identity.git_root(), None);
         assert_eq!(
             identity.scheduler_key(),
@@ -518,15 +501,14 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            let alias = root.with_file_name(format!(
+            let alias = root.path().with_file_name(format!(
                 "{}-alias",
-                root.file_name().unwrap().to_string_lossy()
+                root.path().file_name().unwrap().to_string_lossy()
             ));
-            symlink(&root, &alias).unwrap();
+            symlink(root.path(), &alias).unwrap();
             assert_eq!(identity, WorkspaceIdentity::resolve(&alias));
             std::fs::remove_file(alias).unwrap();
         }
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -534,11 +516,15 @@ mod tests {
         let root = init_repository("core-worktree");
         let redirected = temp_dir("core-worktree-target");
         git(
-            &root,
-            &["config", "core.worktree", redirected.to_str().unwrap()],
+            root.path(),
+            &[
+                "config",
+                "core.worktree",
+                redirected.path().to_str().unwrap(),
+            ],
         );
 
-        let identity = WorkspaceIdentity::resolve(&root);
+        let identity = WorkspaceIdentity::resolve(root.path());
         assert_eq!(identity.project_id(), None);
         assert!(matches!(
             identity.status(),
@@ -548,28 +534,25 @@ mod tests {
                     | IdentityUnavailableReason::GitProbeFailed
             )
         ));
-
-        let _ = std::fs::remove_dir_all(redirected);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn broken_git_marker_disables_project_policy_instead_of_becoming_a_directory_project() {
         let root = temp_dir("broken-marker");
-        std::fs::write(root.join(".git"), "gitdir: missing-git-dir\n").unwrap();
-        let identity = WorkspaceIdentity::resolve(&root);
+        std::fs::write(root.path().join(".git"), "gitdir: missing-git-dir\n").unwrap();
+        let identity = WorkspaceIdentity::resolve(root.path());
         assert_eq!(identity.project_id(), None);
         assert_eq!(
             identity.status(),
             ProjectIdentityStatus::Unavailable(IdentityUnavailableReason::GitProbeFailed)
         );
         assert_eq!(identity.git_root(), None);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn unavailable_identity_still_names_a_scheduler_partition() {
-        let identity = WorkspaceIdentity::ephemeral(temp_dir("ephemeral"));
+        let dir = temp_dir("ephemeral");
+        let identity = WorkspaceIdentity::ephemeral(dir.path().to_path_buf());
         assert_eq!(
             identity.scheduler_key(),
             identity.session_partition().as_str()
@@ -580,8 +563,8 @@ mod tests {
     #[test]
     fn missing_cwd_disables_project_scope_without_exposing_path_in_id() {
         let root = temp_dir("missing");
-        std::fs::remove_dir_all(&root).unwrap();
-        let identity = WorkspaceIdentity::resolve(&root);
+        std::fs::remove_dir_all(root.path()).unwrap();
+        let identity = WorkspaceIdentity::resolve(root.path());
         assert_eq!(identity.project_id(), None);
         assert_eq!(
             identity.status(),

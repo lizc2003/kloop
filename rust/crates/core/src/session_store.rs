@@ -290,27 +290,12 @@ fn read_project_anchor(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-
     use super::*;
+    use crate::test_support::temp_dir;
 
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "kloop-session-store-{tag}-{}-{sequence}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn init_repository(tag: &str) -> PathBuf {
+    fn init_repository(tag: &str) -> tempfile::TempDir {
         let root = temp_dir(tag);
-        let status = crate::git::hermetic_command(&root)
+        let status = crate::git::hermetic_command(root.path())
             .args(["init", "-q"])
             .status()
             .unwrap();
@@ -329,24 +314,25 @@ mod tests {
     #[test]
     fn one_repository_is_one_partition_whatever_the_cwd() {
         let repo = init_repository("partition");
-        let nested = repo.join("crates/deep");
+        let nested = repo.path().join("crates/deep");
         std::fs::create_dir_all(&nested).unwrap();
         let other = init_repository("partition-other");
-        let store = SessionStore::global(temp_dir("partition-root"));
+        let store_root = temp_dir("partition-root");
+        let store = SessionStore::global(store_root.path().to_path_buf());
 
-        assert_eq!(store.dirs(&repo), store.dirs(&nested));
-        assert_ne!(store.dirs(&repo), store.dirs(&other));
+        assert_eq!(store.dirs(repo.path()), store.dirs(&nested));
+        assert_ne!(store.dirs(repo.path()), store.dirs(other.path()));
     }
 
     #[test]
     fn global_layout_puts_sessions_beside_the_project_policy() {
         let repo = init_repository("layout");
         let root = temp_dir("layout-root");
-        let store = SessionStore::global(root.clone());
-        let dirs = store.ensure(&repo).unwrap();
+        let store = SessionStore::global(root.path().to_path_buf());
+        let dirs = store.ensure(repo.path()).unwrap();
 
         let partition = dirs.sessions.parent().unwrap();
-        assert_eq!(partition.parent().unwrap(), root.join("projects/v1"));
+        assert_eq!(partition.parent().unwrap(), root.path().join("projects/v1"));
         assert_eq!(dirs.offload, partition.join("offload"));
         assert!(
             partition
@@ -362,13 +348,13 @@ mod tests {
     #[test]
     fn hermetic_store_stays_cwd_local_and_unpartitioned() {
         let cwd = temp_dir("hermetic");
-        let store = SessionStore::hermetic(&cwd);
+        let store = SessionStore::hermetic(cwd.path());
         let before = crate::git::test_git_command_count();
-        let dirs = store.ensure(&cwd).unwrap();
+        let dirs = store.ensure(cwd.path()).unwrap();
         let elsewhere = store.dirs(Path::new("/somewhere/else"));
 
-        assert_eq!(dirs.sessions, cwd.join(".kloop/sessions"));
-        assert_eq!(dirs.offload, cwd.join(".kloop/offload"));
+        assert_eq!(dirs.sessions, cwd.path().join(".kloop/sessions"));
+        assert_eq!(dirs.offload, cwd.path().join(".kloop/offload"));
         // A different cwd argument cannot move a hermetic store.
         assert_eq!(elsewhere, dirs);
         // `--mock` promises not to touch Git, so neither entry may probe.
@@ -386,11 +372,13 @@ mod tests {
     fn created_state_is_owner_only() {
         let repo = init_repository("mode");
         let root = temp_dir("mode-root");
-        let dirs = SessionStore::global(root.clone()).ensure(&repo).unwrap();
+        let dirs = SessionStore::global(root.path().to_path_buf())
+            .ensure(repo.path())
+            .unwrap();
 
         for path in [
-            root.join("projects"),
-            root.join("projects/v1"),
+            root.path().join("projects"),
+            root.path().join("projects/v1"),
             dirs.sessions.parent().unwrap().to_path_buf(),
             dirs.sessions.clone(),
             dirs.offload.clone(),
@@ -408,11 +396,13 @@ mod tests {
     fn existing_directories_keep_their_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
         let cwd = temp_dir("keep-mode");
-        let existing = cwd.join(".kloop");
+        let existing = cwd.path().join(".kloop");
         std::fs::create_dir_all(&existing).unwrap();
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        SessionStore::hermetic(&cwd).ensure(&cwd).unwrap();
+        SessionStore::hermetic(cwd.path())
+            .ensure(cwd.path())
+            .unwrap();
 
         assert_eq!(mode(&existing), 0o755);
     }
@@ -422,17 +412,17 @@ mod tests {
         let repo = init_repository("buckets");
         let plain = temp_dir("buckets-plain");
         let root = temp_dir("buckets-root");
-        let store = SessionStore::global(root);
-        let repo_dirs = store.ensure(&repo).unwrap();
-        let plain_dirs = store.ensure(&plain).unwrap();
+        let store = SessionStore::global(root.path().to_path_buf());
+        let repo_dirs = store.ensure(repo.path()).unwrap();
+        let plain_dirs = store.ensure(plain.path()).unwrap();
 
         let buckets = store.buckets();
         assert_eq!(buckets.len(), 2);
         let anchors: Vec<PathBuf> = buckets.iter().filter_map(|b| b.anchor.clone()).collect();
         // A repository is anchored on its Git common directory, a bare
         // directory on itself.
-        assert!(anchors.contains(&std::fs::canonicalize(repo.join(".git")).unwrap()));
-        assert!(anchors.contains(&std::fs::canonicalize(&plain).unwrap()));
+        assert!(anchors.contains(&std::fs::canonicalize(repo.path().join(".git")).unwrap()));
+        assert!(anchors.contains(&std::fs::canonicalize(plain.path()).unwrap()));
         let dirs: Vec<SessionDirs> = buckets.into_iter().map(|b| b.dirs).collect();
         assert!(dirs.contains(&repo_dirs));
         assert!(dirs.contains(&plain_dirs));
@@ -445,10 +435,10 @@ mod tests {
     fn a_label_that_already_names_the_project_is_left_alone() {
         let repo = init_repository("label-kept");
         let root = temp_dir("label-kept-root");
-        let store = SessionStore::global(root);
-        let dirs = store.ensure(&repo).unwrap();
+        let store = SessionStore::global(root.path().to_path_buf());
+        let dirs = store.ensure(repo.path()).unwrap();
         let partition = dirs.sessions.parent().unwrap().to_path_buf();
-        let identity = WorkspaceIdentity::resolve(&repo);
+        let identity = WorkspaceIdentity::resolve(repo.path());
         let granted = project_label_bytes(
             &identity.session_partition(),
             identity.partition_anchor(),
@@ -457,7 +447,7 @@ mod tests {
         .unwrap();
         std::fs::write(partition.join(PROJECT_LABEL), &granted).unwrap();
 
-        store.ensure(&repo).unwrap();
+        store.ensure(repo.path()).unwrap();
 
         assert_eq!(
             std::fs::read(partition.join(PROJECT_LABEL)).unwrap(),
@@ -473,10 +463,10 @@ mod tests {
     fn a_foreign_or_unreadable_label_is_repaired() {
         let repo = init_repository("label-repair");
         let root = temp_dir("label-repair-root");
-        let store = SessionStore::global(root);
-        let dirs = store.ensure(&repo).unwrap();
+        let store = SessionStore::global(root.path().to_path_buf());
+        let dirs = store.ensure(repo.path()).unwrap();
         let partition = dirs.sessions.parent().unwrap().to_path_buf();
-        let identity = WorkspaceIdentity::resolve(&repo);
+        let identity = WorkspaceIdentity::resolve(repo.path());
         let project_id = identity.session_partition();
         let repaired = |granted_at: Option<&str>| {
             project_label_bytes(&project_id, identity.partition_anchor(), granted_at).unwrap()
@@ -518,7 +508,7 @@ mod tests {
             ),
         ] {
             std::fs::write(partition.join(PROJECT_LABEL), &damaged).unwrap();
-            store.ensure(&repo).unwrap();
+            store.ensure(repo.path()).unwrap();
             assert_eq!(
                 std::fs::read(partition.join(PROJECT_LABEL)).unwrap(),
                 expected,
@@ -533,7 +523,8 @@ mod tests {
 
     #[test]
     fn an_empty_store_lists_nothing() {
-        let store = SessionStore::global(temp_dir("empty-root"));
+        let root = temp_dir("empty-root");
+        let store = SessionStore::global(root.path().to_path_buf());
         assert_eq!(store.buckets(), Vec::new());
     }
 }

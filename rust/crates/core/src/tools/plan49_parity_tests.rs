@@ -1,3 +1,9 @@
+//! File and search parity: `read_file`/`write_file`/`edit_file` and
+//! `grep`/`glob` shapes and results, plus the seriality of mutations.
+//!
+//! Each report is JSON so the local parity corpus can compare it with the
+//! reference capture; the assertions pin the parts that must not drift.
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;

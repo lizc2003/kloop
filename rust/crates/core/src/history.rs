@@ -1272,6 +1272,7 @@ fn count_block_tokens(counter: &mut TokenCounter, block: &ContentBlock, images: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_dir;
 
     fn signature_route(
         policy: kloop_provider::ThinkingSignaturePolicy,
@@ -1300,9 +1301,9 @@ mod tests {
         let (_, optional) = signature_route(Optional);
         let (required_catalog, required) = signature_route(Required);
         let dir = temp_dir("signature-policy-reopen");
-        std::fs::create_dir_all(&dir).unwrap();
-        let session = dir.join("session.jsonl");
-        let mut history = History::new(dir.clone());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let session = dir.path().join("session.jsonl");
+        let mut history = History::new(dir.path().to_path_buf());
         history
             .attach_rollout(Rollout::new_with_initial_route(session.clone(), &optional).unwrap());
         history.record(Message::user_text("question"));
@@ -1377,7 +1378,7 @@ mod tests {
         assert!(required_catalog.restore_route(&timeline[0]).is_err());
         let restored = required_catalog.restore_route(&timeline[1]).unwrap();
         assert_eq!(restored.revision(), 2);
-        let mut history = History::resume(dir.clone(), reread);
+        let mut history = History::resume(dir.path().to_path_buf(), reread);
         let (again, reopened) = history.adopt_provider_route(&required).unwrap();
         assert_eq!(reopened, None);
         assert_eq!(again.revision(), 2);
@@ -1398,7 +1399,7 @@ mod tests {
         );
         assert_eq!(history.messages(), canonical);
         drop(history);
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir.path()).unwrap();
     }
 
     #[test]
@@ -1413,9 +1414,9 @@ mod tests {
             let (_, old_route) = signature_route(Optional);
             let (_, opening) = signature_route(policy);
             let dir = temp_dir(&format!("signature-legacy-{policy:?}-{signature}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let session = dir.join("session.jsonl");
-            let mut history = History::new(dir.clone());
+            std::fs::create_dir_all(dir.path()).unwrap();
+            let session = dir.path().join("session.jsonl");
+            let mut history = History::new(dir.path().to_path_buf());
             history.attach_rollout(
                 Rollout::new_with_initial_route(session.clone(), &old_route).unwrap(),
             );
@@ -1445,7 +1446,7 @@ mod tests {
                 .collect::<String>();
             std::fs::write(&session, legacy).unwrap();
             let resumed = crate::rollout::resume_session(&session).unwrap();
-            let mut history = History::resume(dir.clone(), resumed);
+            let mut history = History::resume(dir.path().to_path_buf(), resumed);
             let (adopted, reopened) = history.adopt_provider_route(&opening).unwrap();
             assert_eq!(adopted.revision(), 2);
             assert_eq!(reopened.unwrap().continuity, continuity);
@@ -1466,13 +1467,14 @@ mod tests {
             assert_eq!(history.messages(), canonical);
             assert_eq!(history.adopt_provider_route(&opening).unwrap().1, None);
             drop(history);
-            std::fs::remove_dir_all(dir).unwrap();
+            std::fs::remove_dir_all(dir.path()).unwrap();
         }
     }
 
     #[test]
     fn background_wait_memo_tracks_changed_and_cleared_reminders() {
-        let mut history = History::new(temp_dir("background-wait-memo"));
+        let dir = temp_dir("background-wait-memo");
+        let mut history = History::new(dir.path().to_path_buf());
         let first =
             crate::tools::BackgroundShells::wait_reminder_for_ids(vec!["bg-1".into()]).unwrap();
         let second = crate::tools::BackgroundShells::wait_reminder_for_ids(vec![
@@ -1509,7 +1511,7 @@ mod tests {
     #[test]
     fn background_wait_memo_is_cleared_by_compaction_and_rebase() {
         let dir = temp_dir("background-wait-rewrite");
-        let mut history = History::new(dir.clone());
+        let mut history = History::new(dir.path().to_path_buf());
         let reminder =
             crate::tools::BackgroundShells::wait_reminder_for_ids(vec!["bg-1".into()]).unwrap();
         let injected = Message::injected(kloop_protocol::Injected::Harness, reminder.clone());
@@ -1520,8 +1522,8 @@ mod tests {
         assert!(history.record_background_wait_reminder(Some(reminder.clone())));
         assert_eq!(history.messages(), &[summary, injected.clone()]);
 
-        let session_path = dir.join("branch.jsonl");
-        let mut branch = History::new(dir.clone());
+        let session_path = dir.path().join("branch.jsonl");
+        let mut branch = History::new(dir.path().to_path_buf());
         branch.attach_rollout(Rollout::new(session_path.clone()));
         let input = Message::user_text("rewound work");
         branch.record(input.clone());
@@ -1535,7 +1537,7 @@ mod tests {
             crate::rollout::load_session(&session_path).unwrap(),
             history.messages()
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
@@ -1615,10 +1617,6 @@ mod tests {
     }
     use kloop_protocol::Role;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("kloop-test-{}-{tag}", std::process::id()))
-    }
-
     fn tool_result(content: String) -> Message {
         Message::tool_results(vec![ContentBlock::ToolResult {
             tool_use_id: "t1".into(),
@@ -1637,7 +1635,7 @@ mod tests {
     #[test]
     fn oversized_tool_result_is_offloaded_with_pointer() {
         let dir = temp_dir("spill");
-        let mut h = History::new(dir.clone());
+        let mut h = History::new(dir.path().to_path_buf());
         let big = "x".repeat(OFFLOAD_CAP_CHARS + 1_000);
         h.record(tool_result(big.clone()));
 
@@ -1649,9 +1647,9 @@ mod tests {
         assert!(content.contains("chars truncated]…"));
         assert!(content.contains("saved to"));
         let id = pointer_id(&content);
-        let on_disk = std::fs::read_to_string(dir.join(format!("{id}.txt"))).unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join(format!("{id}.txt"))).unwrap();
         assert_eq!(on_disk, big);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// cc's shape: the pointer names a path and the size, and points at querying
@@ -1660,7 +1658,7 @@ mod tests {
     #[test]
     fn the_offload_pointer_names_a_path_and_says_to_query_it_in_place() {
         let dir = temp_dir("spill-path");
-        let mut h = History::new(dir.clone());
+        let mut h = History::new(dir.path().to_path_buf());
         let big = "x".repeat(OFFLOAD_CAP_CHARS + 1_000);
         h.record(tool_result(big.clone()));
 
@@ -1668,7 +1666,7 @@ mod tests {
             panic!("expected tool result");
         };
         let content = content.as_text();
-        let path = dir.join(format!("{}.txt", pointer_id(&content)));
+        let path = dir.path().join(format!("{}.txt", pointer_id(&content)));
         // The scale leads: chars, the line count (what makes slicing in place
         // possible), and where the artifact is.
         assert!(
@@ -1689,7 +1687,7 @@ mod tests {
         assert!(!content.contains("read_offloaded"), "{content}");
         assert!(!content.contains("id=off-"), "{content}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A JSON artifact says what it is: head and tail alone cannot show how many
@@ -1749,7 +1747,7 @@ mod tests {
     #[test]
     fn a_spilled_result_stays_under_the_cap_that_triggered_it() {
         let dir = temp_dir("spill-shape-bound");
-        let mut h = History::new(dir.clone());
+        let mut h = History::new(dir.path().to_path_buf());
         let hostile = format!(r#"{{"{}":1}}"#, "k".repeat(40_000));
         assert!(hostile.chars().count() > OFFLOAD_CAP_CHARS);
         assert!(hostile.chars().count() < ROUND_OFFLOAD_CAP_CHARS);
@@ -1767,9 +1765,10 @@ mod tests {
         // And the pointer still names the *artifact*: a second spill under the
         // round budget would leave this file holding a pointer instead.
         let on_disk =
-            std::fs::read_to_string(dir.join(format!("{}.txt", pointer_id(&content)))).unwrap();
+            std::fs::read_to_string(dir.path().join(format!("{}.txt", pointer_id(&content))))
+                .unwrap();
         assert_eq!(on_disk, hostile);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// One round's tool results, in request order.
@@ -1799,7 +1798,7 @@ mod tests {
     #[test]
     fn a_wide_round_spills_its_largest_results_until_it_is_under_budget() {
         let dir = temp_dir("round-budget");
-        let mut h = History::new(dir.clone());
+        let mut h = History::new(dir.path().to_path_buf());
         let round: Vec<(&str, String)> = vec![
             ("c", "c".repeat(30_000)),
             ("s0", "0".repeat(5_000)),
@@ -1838,7 +1837,7 @@ mod tests {
         for (index, id) in [(2, "a"), (6, "b")] {
             let text = recorded_text(&h, index);
             assert!(text.contains("Query it in place"), "{id}: {text}");
-            let path = dir.join(format!("{}.txt", pointer_id(&text)));
+            let path = dir.path().join(format!("{}.txt", pointer_id(&text)));
             let original = &round.iter().find(|(name, _)| *name == id).unwrap().1;
             assert_eq!(&std::fs::read_to_string(&path).unwrap(), original);
         }
@@ -1857,7 +1856,7 @@ mod tests {
             .map(|index| recorded_text(&h, index).chars().count())
             .sum();
         assert!(total <= ROUND_OFFLOAD_CAP_CHARS, "{total}");
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Over budget purely by count: 80 results of 1 800 chars each. Every one
@@ -1867,8 +1866,8 @@ mod tests {
     #[test]
     fn a_round_of_results_too_small_to_shrink_is_left_alone() {
         let dir = temp_dir("round-budget-small");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut h = History::new(dir.clone());
+        let _ = std::fs::remove_dir_all(dir.path());
+        let mut h = History::new(dir.path().to_path_buf());
         let round: Vec<(String, String)> = (0..80)
             .map(|n| (format!("t{n}"), "s".repeat(1_800)))
             .collect();
@@ -1883,11 +1882,13 @@ mod tests {
         h.record(msg.clone());
         assert_eq!(h.messages(), [msg].as_slice());
         assert_eq!(
-            std::fs::read_dir(&dir).map(Iterator::count).unwrap_or(0),
+            std::fs::read_dir(dir.path())
+                .map(Iterator::count)
+                .unwrap_or(0),
             0,
             "a spill that could not help was left on disk"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A round under budget is recorded byte for byte, and nothing reaches the
@@ -1895,8 +1896,8 @@ mod tests {
     #[test]
     fn a_round_under_budget_is_recorded_verbatim() {
         let dir = temp_dir("round-budget-under");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut h = History::new(dir.clone());
+        let _ = std::fs::remove_dir_all(dir.path());
+        let mut h = History::new(dir.path().to_path_buf());
         let round = vec![
             ("t1", "a".repeat(31_000)),
             ("t2", "b".repeat(31_000)),
@@ -1907,7 +1908,7 @@ mod tests {
 
         assert_eq!(h.messages(), [msg].as_slice());
         assert!(
-            !dir.exists(),
+            !dir.path().exists(),
             "an under-budget round touched the offload store"
         );
     }
@@ -1919,12 +1920,12 @@ mod tests {
     #[test]
     fn a_spill_that_cannot_reach_disk_stays_inline_for_the_round_budget_only() {
         let dir = temp_dir("round-budget-no-disk");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.parent().expect("temp dir has a parent")).unwrap();
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path().parent().expect("temp dir has a parent")).unwrap();
         // A file where the offload directory should be: create_dir_all fails.
-        std::fs::write(&dir, "not a directory").unwrap();
+        std::fs::write(dir.path(), "not a directory").unwrap();
 
-        let mut h = History::new(dir.clone());
+        let mut h = History::new(dir.path().to_path_buf());
         let round = vec![
             ("t1", "a".repeat(31_000)),
             ("t2", "b".repeat(31_000)),
@@ -1944,13 +1945,13 @@ mod tests {
         assert!(truncated.contains("offload to disk failed"), "{truncated}");
         assert!(truncated.contains("output truncated"), "{truncated}");
         assert!(truncated.chars().count() < OFFLOAD_CAP_CHARS, "{truncated}");
-        let _ = std::fs::remove_file(dir);
+        let _ = std::fs::remove_file(dir.path());
     }
 
     #[test]
     fn machine_injected_text_reuses_the_offload_store() {
         let dir = temp_dir("inbox-spill");
-        let mut history = History::new(dir.clone());
+        let mut history = History::new(dir.path().to_path_buf());
         assert_eq!(history.offload_text("small".into()), "small");
 
         let big = "result".repeat(OFFLOAD_CAP_CHARS / 6 + 200);
@@ -1958,15 +1959,17 @@ mod tests {
         assert!(preview.contains("chars truncated]…"), "{preview}");
         assert!(preview.contains("saved to"), "{preview}");
         assert_eq!(
-            std::fs::read_to_string(dir.join(format!("{}.txt", pointer_id(&preview)))).unwrap(),
+            std::fs::read_to_string(dir.path().join(format!("{}.txt", pointer_id(&preview))))
+                .unwrap(),
             big
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn estimated_tokens_anchor_math() {
-        let mut h = History::new(temp_dir("anchor"));
+        let dir = temp_dir("anchor");
+        let mut h = History::new(dir.path().to_path_buf());
         h.record(Message::user_text("earlier message"));
         // Provider reports the real context size for everything so far.
         h.note_usage(1_000);
@@ -2011,8 +2014,8 @@ mod tests {
         // Parent and sub-agent share the offload dir; exclusive allocation
         // must keep their spill files from clobbering each other.
         let dir = temp_dir("shared");
-        let mut a = History::new(dir.clone());
-        let mut b = History::new(dir.clone());
+        let mut a = History::new(dir.path().to_path_buf());
+        let mut b = History::new(dir.path().to_path_buf());
         a.record(tool_result("a".repeat(OFFLOAD_CAP_CHARS + 1_000)));
         b.record(tool_result("b".repeat(OFFLOAD_CAP_CHARS + 1_000)));
         let id_of = |h: &History| {
@@ -2023,12 +2026,13 @@ mod tests {
             pointer_id(&content)
         };
         assert_ne!(id_of(&a), id_of(&b));
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn only_oversized_blocks_in_a_message_are_offloaded() {
-        let mut h = History::new(temp_dir("mixed"));
+        let dir = temp_dir("mixed");
+        let mut h = History::new(dir.path().to_path_buf());
         h.record(Message::tool_results(vec![
             ContentBlock::ToolResult {
                 tool_use_id: "small".into(),
@@ -2054,8 +2058,8 @@ mod tests {
     #[test]
     fn record_and_replace_all_write_through_to_rollout() {
         let dir = temp_dir("writethrough");
-        let session = dir.join("session.jsonl");
-        let mut h = History::new(dir.clone());
+        let session = dir.path().join("session.jsonl");
+        let mut h = History::new(dir.path().to_path_buf());
         h.attach_rollout(Rollout::new(session.clone()));
         h.record(Message::user_text("first"));
         h.record(Message::assistant(vec![ContentBlock::Text {
@@ -2067,14 +2071,14 @@ mod tests {
         // The file replays to exactly the in-memory history, compaction included.
         let loaded = crate::rollout::load_session(&session).unwrap();
         assert_eq!(loaded, h.messages());
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn provider_usage_writes_through_and_survives_compaction() {
         let dir = temp_dir("usage-writethrough");
-        let session = dir.join("session.jsonl");
-        let mut history = History::new(dir.clone());
+        let session = dir.path().join("session.jsonl");
+        let mut history = History::new(dir.path().to_path_buf());
         history.attach_rollout(Rollout::new(session.clone()));
         let record = ProviderUsageRecord {
             provider_id: "test".into(),
@@ -2104,13 +2108,13 @@ mod tests {
                 .records(),
             &[record]
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn resumed_history_installs_items_without_reappending() {
         let dir = temp_dir("resume");
-        let session = dir.join("session.jsonl");
+        let session = dir.path().join("session.jsonl");
         let mut rollout = Rollout::new(session.clone());
         rollout
             .append_message(&Message::user_text("earlier"))
@@ -2118,7 +2122,7 @@ mod tests {
         drop(rollout);
 
         let resumed = crate::rollout::resume_session(&session).unwrap();
-        let mut h = History::resume(dir.clone(), resumed);
+        let mut h = History::resume(dir.path().to_path_buf(), resumed);
         assert_eq!(h.messages(), &[Message::user_text("earlier")]);
         // New records append after the resumed content, once each.
         h.record(Message::user_text("later"));
@@ -2126,15 +2130,15 @@ mod tests {
             crate::rollout::load_session(&session).unwrap(),
             h.messages()
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn rebase_rewinds_onto_a_fork_and_redirects_writes() {
         use crate::rollout::fork_session;
         let dir = temp_dir("rebase");
-        let session = dir.join("session.jsonl");
-        let mut h = History::new(dir.clone());
+        let session = dir.path().join("session.jsonl");
+        let mut h = History::new(dir.path().to_path_buf());
         h.attach_rollout(Rollout::new(session.clone()));
         h.record(Message::user_text("one"));
         h.record(Message::assistant(vec![ContentBlock::Text {
@@ -2147,7 +2151,7 @@ mod tests {
 
         // Fork before the "two" turn (route receipt + two message lines) and
         // rewind the live history onto that branch.
-        let fork_path = fork_session(&session, Some(3), &dir).unwrap();
+        let fork_path = fork_session(&session, Some(3), dir.path()).unwrap();
         let resumed = crate::rollout::resume_session(&fork_path).unwrap();
         h.rebase(resumed);
         assert_eq!(
@@ -2171,7 +2175,7 @@ mod tests {
             4,
             "the original branch keeps its full history"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Plan 283 review: a question a background call asked before a rewind
@@ -2182,8 +2186,8 @@ mod tests {
     fn rebase_leaves_pending_questions_with_the_old_branch() {
         use crate::rollout::fork_session;
         let dir = temp_dir("rebase-backlog");
-        let session = dir.join("session.jsonl");
-        let mut h = History::new(dir.clone());
+        let session = dir.path().join("session.jsonl");
+        let mut h = History::new(dir.path().to_path_buf());
         h.attach_rollout(Rollout::new(session.clone()));
         h.record(Message::user_text("one"));
         h.record(Message::assistant(vec![ContentBlock::Text {
@@ -2205,7 +2209,7 @@ mod tests {
             .unwrap()
             .push(("before-rewind".into(), record.clone()));
 
-        let fork_path = fork_session(&session, Some(3), &dir).unwrap();
+        let fork_path = fork_session(&session, Some(3), dir.path()).unwrap();
         h.rebase(crate::rollout::resume_session(&fork_path).unwrap());
         old_backlog
             .lock()
@@ -2224,24 +2228,24 @@ mod tests {
         };
         assert_eq!(approvals(&session), vec!["before-rewind".to_string()]);
         assert_eq!(approvals(&fork_path), Vec::<String>::new());
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn new_history_never_clobbers_existing_offloads() {
         let dir = temp_dir("counter");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
         // A file left behind by the session being resumed.
-        std::fs::write(dir.join("off-0007.txt"), "old spill").unwrap();
+        std::fs::write(dir.path().join("off-0007.txt"), "old spill").unwrap();
 
-        let mut h = History::new(dir.clone());
+        let mut h = History::new(dir.path().to_path_buf());
         h.record(tool_result("n".repeat(OFFLOAD_CAP_CHARS + 1_000)));
         assert_eq!(
-            std::fs::read_to_string(dir.join("off-0007.txt")).unwrap(),
+            std::fs::read_to_string(dir.path().join("off-0007.txt")).unwrap(),
             "old spill",
             "the resumed session's spill file must survive new spills"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
@@ -2277,7 +2281,8 @@ mod tests {
         );
         let initial = catalog.initial_route("a", None).unwrap();
         let state = SessionProviderState::from_route(Arc::clone(&catalog), initial.clone());
-        let mut history = History::new(temp_dir("provider-switch-view"));
+        let dir = temp_dir("provider-switch-view");
+        let mut history = History::new(dir.path().to_path_buf());
         history.ensure_initial_provider_route(&initial).unwrap();
         history.record(Message::user_text("question"));
         history.record_provider_assistant(
@@ -2396,7 +2401,8 @@ mod tests {
         );
         let initial = catalog.initial_route("source", None).unwrap();
         let state = SessionProviderState::from_route(catalog, initial.clone());
-        let mut history = History::new(temp_dir("chat-request-view"));
+        let dir = temp_dir("chat-request-view");
+        let mut history = History::new(dir.path().to_path_buf());
         history.ensure_initial_provider_route(&initial).unwrap();
         history.record(Message::user_text("question"));
         history.record_provider_assistant(
@@ -2473,9 +2479,9 @@ mod tests {
         let initial = catalog.initial_route("chat", None).unwrap();
         let state = SessionProviderState::from_route(Arc::clone(&catalog), initial.clone());
         let dir = temp_dir("switch-foreign-tool-ids");
-        let _ = std::fs::remove_dir_all(&dir);
-        let session = dir.join("session.jsonl");
-        let mut history = History::new(dir.clone());
+        let _ = std::fs::remove_dir_all(dir.path());
+        let session = dir.path().join("session.jsonl");
+        let mut history = History::new(dir.path().to_path_buf());
         history.attach_rollout(Rollout::new_with_initial_route(session.clone(), &initial).unwrap());
         history.record(Message::user_text("read a"));
         history.record_provider_assistant(
@@ -2506,7 +2512,7 @@ mod tests {
         drop(history);
         let reread = crate::rollout::resume_session(&session).unwrap();
         assert_eq!(reread.messages(), canonical);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// The chat rail produces reasoning of its own — DeepSeek- and GLM-shaped
@@ -2530,7 +2536,8 @@ mod tests {
             vec!["chat-model".into()],
         )
         .unwrap();
-        let mut history = History::new(temp_dir("chat-self-reasoning"));
+        let dir = temp_dir("chat-self-reasoning");
+        let mut history = History::new(dir.path().to_path_buf());
         history.ensure_initial_provider_route(&route).unwrap();
         history.record(Message::user_text("question"));
         history.record_provider_assistant(
@@ -2621,7 +2628,8 @@ mod tests {
                 let state =
                     SessionProviderState::new(Arc::clone(&catalog), &source.id, None).unwrap();
                 let initial = state.freeze();
-                let mut history = History::new(temp_dir("rail-switch-matrix"));
+                let dir = temp_dir("rail-switch-matrix");
+                let mut history = History::new(dir.path().to_path_buf());
                 history.ensure_initial_provider_route(&initial).unwrap();
                 history.record(Message::user_text("question"));
                 let mut blocks = vec![ContentBlock::Thinking {
@@ -2805,8 +2813,8 @@ mod tests {
         let initial = catalog.initial_route("a", None).unwrap();
         let state = SessionProviderState::from_route(catalog, initial.clone());
         let root = temp_dir("route-persist-failure");
-        let session = root.join("session.jsonl");
-        let mut history = History::new(root.join("offload"));
+        let session = root.path().join("session.jsonl");
+        let mut history = History::new(root.path().join("offload"));
         history.attach_rollout(Rollout::new_with_initial_route(session, &initial).unwrap());
         history.inject_append_failure();
 
@@ -2818,7 +2826,7 @@ mod tests {
         assert_eq!(state.active_route().provider_id, "a");
         assert_eq!(state.remembered_models().get("b"), None);
         assert_eq!(history.provider_routes().len(), 1);
-        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root.path());
     }
 
     /// The dogfood failure of plan 132, and the rule it settled on: a session
@@ -2837,8 +2845,8 @@ mod tests {
         use kloop_provider::Provider;
 
         let dir = temp_dir("route-reopen");
-        let _ = std::fs::remove_dir_all(&dir);
-        let session = dir.join("session.jsonl");
+        let _ = std::fs::remove_dir_all(dir.path());
+        let session = dir.path().join("session.jsonl");
         let fingerprint = Provider::mock(Vec::new()).endpoint_fingerprint();
         let entry = |id: &str| ProviderCatalogEntry {
             id: id.into(),
@@ -2857,7 +2865,7 @@ mod tests {
         // the assistant reply carrying reasoning bound to that route.
         let old_catalog = Arc::new(ProviderCatalog::new(vec![entry("gone")]).unwrap());
         let old_route = old_catalog.initial_route("gone", None).unwrap();
-        let mut history = History::new(dir.clone());
+        let mut history = History::new(dir.path().to_path_buf());
         history
             .attach_rollout(Rollout::new_with_initial_route(session.clone(), &old_route).unwrap());
         history.record(Message::user_text("question"));
@@ -2924,7 +2932,7 @@ mod tests {
                 .provider_id,
             "kept"
         );
-        let mut resumed = History::resume(dir.clone(), reread);
+        let mut resumed = History::resume(dir.path().to_path_buf(), reread);
         let (again, reopened) = resumed.adopt_provider_route(&default_route).unwrap();
         assert_eq!(reopened, None);
         assert_eq!(again.revision(), 2);
@@ -2942,7 +2950,7 @@ mod tests {
             Some("other".to_string())
         );
         assert_eq!(moved.revision(), 3);
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A preamble-only session (a writer killed before its first turn) replays
@@ -2955,8 +2963,8 @@ mod tests {
         use kloop_provider::Provider;
 
         let dir = temp_dir("no-route-timeline");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("20260102-000002.jsonl");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let path = dir.path().join("20260102-000002.jsonl");
         std::fs::write(
             &path,
             concat!(
@@ -2972,8 +2980,10 @@ mod tests {
             vec!["mock".into()],
         )
         .unwrap();
-        let mut history =
-            History::resume(dir.clone(), crate::rollout::resume_session(&path).unwrap());
+        let mut history = History::resume(
+            dir.path().to_path_buf(),
+            crate::rollout::resume_session(&path).unwrap(),
+        );
         assert!(!history.has_provider_route());
 
         let (route, reopened) = history
@@ -2996,12 +3006,13 @@ mod tests {
         let reread = crate::rollout::inspect_session(&path).unwrap();
         assert_eq!(reread.snapshot().provider_routes.len(), 1);
         drop(reread);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[test]
     fn small_tool_result_kept_verbatim() {
-        let mut h = History::new(temp_dir("small"));
+        let dir = temp_dir("small");
+        let mut h = History::new(dir.path().to_path_buf());
         h.record(tool_result("hello".into()));
         assert_eq!(
             h.messages()[0],
@@ -3045,7 +3056,8 @@ mod tests {
             .unwrap(),
         );
         let route = catalog.initial_route("a", None).unwrap();
-        let mut h = History::new(temp_dir("staged-view"));
+        let dir = temp_dir("staged-view");
+        let mut h = History::new(dir.path().to_path_buf());
         h.ensure_initial_provider_route(&route).unwrap();
         h.record(Message::user_text("earlier"));
         let before = h.estimated_tokens();
@@ -3079,7 +3091,8 @@ mod tests {
     /// the newest thing in the conversation.
     #[test]
     fn compaction_does_not_swallow_the_staged_input() {
-        let mut h = History::new(temp_dir("staged-compaction"));
+        let dir = temp_dir("staged-compaction");
+        let mut h = History::new(dir.path().to_path_buf());
         h.record(Message::user_text("old turn"));
         h.stage(Message::user_text("the new question"));
 

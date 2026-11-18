@@ -1,3 +1,9 @@
+//! Scheduling parity: cron create/list/delete, scheduled wakeups, delivery,
+//! durability, guards, permissions and the loop wiring.
+//!
+//! The report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::future::Future;

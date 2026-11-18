@@ -1,3 +1,10 @@
+//! Notebook and LSP parity: `notebook_edit` schemas, notebook reads and
+//! mutations, the guard and seriality rules, permissions, and how the tool
+//! behaves inside a worktree.
+//!
+//! The report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::future::Future;

@@ -214,7 +214,6 @@ this point.",
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::path::PathBuf;
 
     use kloop_protocol::AssistantBlock;
     use kloop_protocol::AssistantOutcome;
@@ -230,16 +229,10 @@ mod tests {
     use crate::compact::transcript_pointer;
     use crate::rollout::Rollout;
     use crate::rollout::session_path;
+    use crate::test_support::temp_dir;
     use crate::tools::testutil::TestConfig;
 
     const LIVE_ID: &str = "20260101-000000";
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-branch-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// A saved live session whose summary requests `provider` answers.
     fn live_session(tag: &str, dir: &Path, provider: Provider) -> (Config, History) {
@@ -300,7 +293,7 @@ mod tests {
     async fn the_request_is_the_turns_past_the_branch() {
         let dir = temp_dir("request");
         let (provider, seen) = Provider::mock_recording(vec![summary_turn("S")]);
-        let (cfg, mut history) = live_session("request", &dir, provider);
+        let (cfg, mut history) = live_session("request", dir.path(), provider);
         for message in six_turns() {
             history.record(message);
         }
@@ -329,7 +322,6 @@ mod tests {
                 Message::user_text(BRANCH_INSTRUCTION),
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Compacted since the cut: the live history no longer has the cut's lines,
@@ -339,7 +331,7 @@ mod tests {
     async fn after_a_compaction_the_request_starts_at_the_first_difference() {
         let dir = temp_dir("compacted");
         let (provider, seen) = Provider::mock_recording(vec![summary_turn("S")]);
-        let (cfg, mut history) = live_session("compacted", &dir, provider);
+        let (cfg, mut history) = live_session("compacted", dir.path(), provider);
         let compacted = vec![
             Message::injected(Injected::UserAnchors, "u1 u2"),
             Message::injected(Injected::ContextSummary, "what u1 and u2 did"),
@@ -361,14 +353,13 @@ mod tests {
         let mut expected = compacted;
         expected.push(Message::user_text(BRANCH_INSTRUCTION));
         assert_eq!(seen.lock().unwrap()[0].messages, expected);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn nothing_abandoned_sends_nothing() {
         let dir = temp_dir("nothing");
         let (provider, seen) = Provider::mock_recording(Vec::new());
-        let (cfg, mut history) = live_session("nothing", &dir, provider);
+        let (cfg, mut history) = live_session("nothing", dir.path(), provider);
         for message in six_turns() {
             history.record(message);
         }
@@ -380,7 +371,6 @@ mod tests {
 
         assert_eq!(summary, None);
         assert!(seen.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The runtime writes everything but the summary: the framing, the files
@@ -403,7 +393,7 @@ mod tests {
             outcome: AssistantOutcome::EndTurn,
             usage,
         }]);
-        let (cfg, mut history) = live_session("message", &dir, provider);
+        let (cfg, mut history) = live_session("message", dir.path(), provider);
         let pointer = transcript_pointer(&cfg).unwrap();
         history.record(Message::user_text("u1"));
         history.record(text("a1"));
@@ -424,10 +414,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        let mut branch = History::new(dir.clone());
+        let mut branch = History::new(dir.path().to_path_buf());
         branch.attach_rollout(
             Rollout::new_with_initial_route(
-                session_path(&dir, "20260101-000001"),
+                session_path(dir.path(), "20260101-000001"),
                 &cfg.provider_route,
             )
             .unwrap(),
@@ -464,7 +454,6 @@ mod tests {
             branch.provider_usage().records()
         );
         assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live_before);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Only what a file tool wrote, once each: a read is not a change, and a
@@ -503,7 +492,7 @@ mod tests {
         let dir = temp_dir("shrink");
         let (provider, seen) =
             Provider::mock_recording(vec![MockTurn::Overflow, summary_turn("what fit")]);
-        let (cfg, mut history) = live_session("shrink", &dir, provider);
+        let (cfg, mut history) = live_session("shrink", dir.path(), provider);
         history.record(Message::user_text("u1"));
         history.record(text("a1"));
         for i in 0..8 {
@@ -536,7 +525,6 @@ mod tests {
             )),
             "{text}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -550,7 +538,7 @@ mod tests {
             )),
             summary_turn("after a retry"),
         ]);
-        let (cfg, mut history) = live_session("retry", &dir, provider);
+        let (cfg, mut history) = live_session("retry", dir.path(), provider);
         for message in six_turns() {
             history.record(message);
         }
@@ -568,7 +556,6 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].messages, seen[1].messages);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The user asked for this summary, as with `/compact`: its failure is
@@ -579,7 +566,7 @@ mod tests {
         let (provider, _seen) = Provider::mock_recording(vec![MockTurn::Failure(
             ProviderFailure::protocol("malformed"),
         )]);
-        let (cfg, mut history) = live_session("breaker", &dir, provider);
+        let (cfg, mut history) = live_session("breaker", dir.path(), provider);
         for message in six_turns() {
             history.record(message);
         }
@@ -598,6 +585,5 @@ mod tests {
         assert!(format!("{error:#}").contains("malformed"), "{error:#}");
         assert_eq!(*history.compaction_breaker(), breaker);
         assert_eq!(history.messages(), six_turns());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

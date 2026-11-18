@@ -1,3 +1,9 @@
+//! Foreground bash parity: batching groups, ordering, the streaming sections
+//! and cancellation, as the reference capture observes them.
+//!
+//! The report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;

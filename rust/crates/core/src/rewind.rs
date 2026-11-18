@@ -226,19 +226,13 @@ mod tests {
     use crate::rollout::Rollout;
     use crate::rollout::fork_points;
     use crate::rollout::session_path;
+    use crate::test_support::temp_dir;
     use crate::tools::testutil::SilentUi;
     use crate::tools::testutil::TestConfig;
 
     const LIVE_ID: &str = "20260101-000000";
 
     type Seen = Arc<std::sync::Mutex<Vec<MockRequest>>>;
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-rewind-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn text(text: &str) -> Message {
         Message::assistant(vec![ContentBlock::Text { text: text.into() }])
@@ -294,7 +288,7 @@ mod tests {
         use crate::permissions::{ApprovalAnswer, ApprovalDoor, ApprovalRecord, AskReason};
 
         let dir = temp_dir("pending-approvals");
-        let (cfg, mut history, cut, _) = live_session("pending-approvals", &dir, Vec::new());
+        let (cfg, mut history, cut, _) = live_session("pending-approvals", dir.path(), Vec::new());
         history.approval_backlog().lock().unwrap().push((
             "pending-before-rewind".into(),
             ApprovalRecord {
@@ -325,7 +319,7 @@ mod tests {
         assert!(read(&history).contains("pending-before-rewind"));
         assert!(!read(&branch.history).contains("pending-before-rewind"));
         drop((branch, history));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A rewind carries the live route onto the branch by appending a route
@@ -338,15 +332,15 @@ mod tests {
         let dir = temp_dir("route-fallback");
         let (provider, _seen) = Provider::mock_recording(Vec::new());
         let mut cfg = TestConfig::new("rewind-route-fallback")
-            .dirs(&dir)
+            .dirs(dir.path())
             .provider(provider)
             .models("mock", &["mock", "other"])
             .build()
             .test_clone();
         cfg.bind_session(LIVE_ID.into()).unwrap();
-        let mut history = History::new(dir.to_path_buf());
+        let mut history = History::new(dir.path().to_path_buf());
         history.attach_rollout(
-            Rollout::new_with_initial_route(session_path(&dir, LIVE_ID), &cfg.provider_route)
+            Rollout::new_with_initial_route(session_path(dir.path(), LIVE_ID), &cfg.provider_route)
                 .unwrap(),
         );
         for message in first_turn() {
@@ -357,7 +351,8 @@ mod tests {
 
         // Fork and rebase exactly as `rewind` does before it adopts the route.
         let cut = fork_points(history.rollout_path().unwrap()).unwrap()[0].seq;
-        let fork_path = fork_session(history.rollout_path().unwrap(), Some(cut), &dir).unwrap();
+        let fork_path =
+            fork_session(history.rollout_path().unwrap(), Some(cut), dir.path()).unwrap();
         let resumed = inspect_session_for_writing(&fork_path)
             .unwrap()
             .recover_for_writing()
@@ -396,7 +391,7 @@ mod tests {
         assert_eq!(reread.snapshot.provider_routes.len(), 1);
         assert_eq!(reread.snapshot.provider_routes[0].model, "mock");
         drop(reread);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// The branch's route cannot be adopted *and* cannot be restored (its
@@ -407,15 +402,15 @@ mod tests {
         let dir = temp_dir("route-lost");
         let (provider, _seen) = Provider::mock_recording(Vec::new());
         let mut cfg = TestConfig::new("rewind-route-lost")
-            .dirs(&dir)
+            .dirs(dir.path())
             .provider(provider)
             .models("mock", &["mock", "other"])
             .build()
             .test_clone();
         cfg.bind_session(LIVE_ID.into()).unwrap();
-        let mut history = History::new(dir.to_path_buf());
+        let mut history = History::new(dir.path().to_path_buf());
         history.attach_rollout(
-            Rollout::new_with_initial_route(session_path(&dir, LIVE_ID), &cfg.provider_route)
+            Rollout::new_with_initial_route(session_path(dir.path(), LIVE_ID), &cfg.provider_route)
                 .unwrap(),
         );
         for message in first_turn() {
@@ -425,7 +420,8 @@ mod tests {
         history.record(text("done"));
 
         let cut = fork_points(history.rollout_path().unwrap()).unwrap()[0].seq;
-        let fork_path = fork_session(history.rollout_path().unwrap(), Some(cut), &dir).unwrap();
+        let fork_path =
+            fork_session(history.rollout_path().unwrap(), Some(cut), dir.path()).unwrap();
         let resumed = inspect_session_for_writing(&fork_path)
             .unwrap()
             .recover_for_writing()
@@ -448,7 +444,7 @@ mod tests {
 
         let error = adopt_branch_route(&live, &mut branch).unwrap_err();
         assert!(error.to_string().contains("rewind aborted"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     fn session_files(dir: &Path) -> Vec<PathBuf> {
@@ -475,7 +471,7 @@ mod tests {
         let dir = temp_dir("summarize");
         let (cfg, mut history, cut, _seen) = live_session(
             "summarize",
-            &dir,
+            dir.path(),
             vec![MockTurn::Blocks(vec![AssistantBlock::Text {
                 text: "<summary>went iterative</summary>".into(),
             }])],
@@ -517,7 +513,7 @@ mod tests {
         let branch_path = rewound.history.rollout_path().unwrap();
         assert_eq!(
             branch_path,
-            session_path(&dir, &rewound.cfg.session_id).as_path()
+            session_path(dir.path(), &rewound.cfg.session_id).as_path()
         );
         assert_eq!(
             crate::rollout::load_session_snapshot(branch_path)
@@ -526,7 +522,7 @@ mod tests {
             rewound.history.messages()
         );
         assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live_before);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// The rewind is what the user asked for: a summary that fails does not
@@ -536,7 +532,7 @@ mod tests {
         let dir = temp_dir("failed");
         let (cfg, mut history, cut, _seen) = live_session(
             "failed",
-            &dir,
+            dir.path(),
             vec![MockTurn::Failure(ProviderFailure::protocol("refused"))],
         );
         let live_path = history.rollout_path().unwrap().to_path_buf();
@@ -563,7 +559,7 @@ mod tests {
                 live_path.display()
             )]
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Cancelling mid-summary takes the whole rewind back: same session, same
@@ -575,7 +571,7 @@ mod tests {
         let (_release, release) = tokio::sync::oneshot::channel();
         let (cfg, mut history, cut, _seen) = live_session(
             "cancel",
-            &dir,
+            dir.path(),
             vec![MockTurn::Gate {
                 started,
                 release,
@@ -584,7 +580,7 @@ mod tests {
         );
         let messages = history.messages().to_vec();
         let live_path = history.rollout_path().unwrap().to_path_buf();
-        let files = session_files(&dir);
+        let files = session_files(dir.path());
         let cancel = CancellationToken::new();
         let ui = ui();
 
@@ -606,9 +602,9 @@ mod tests {
         assert!(matches!(outcome.unwrap(), RewindOutcome::Cancelled));
         assert_eq!(history.messages(), messages);
         assert_eq!(history.rollout_path(), Some(live_path.as_path()));
-        assert_eq!(session_files(&dir), files);
+        assert_eq!(session_files(dir.path()), files);
         assert!(cfg.scheduler.list().is_ok(), "the live session still runs");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A fork that cannot be opened for writing is not a session: the guard
@@ -616,12 +612,12 @@ mod tests {
     #[test]
     fn a_fork_that_cannot_be_opened_is_removed() {
         let dir = temp_dir("open-failure");
-        let path = dir.join("20260101-000000.jsonl");
+        let path = dir.path().join("20260101-000000.jsonl");
         std::fs::write(&path, b"not a session\n").unwrap();
 
         assert!(open_fork(path.clone()).is_err());
         assert!(!path.exists(), "the unreadable fork was removed");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// `replace_session` failing after the fork succeeded is the other exit the
@@ -630,9 +626,10 @@ mod tests {
     #[tokio::test]
     async fn a_rewind_that_cannot_replace_the_session_leaves_no_branch() {
         let dir = temp_dir("replace-failure");
-        let (mut cfg, mut history, cut, _seen) = live_session("replace-failure", &dir, Vec::new());
-        let before = session_files(&dir);
-        let blocker = dir.join("not-a-directory");
+        let (mut cfg, mut history, cut, _seen) =
+            live_session("replace-failure", dir.path(), Vec::new());
+        let before = session_files(dir.path());
+        let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"x").unwrap();
         cfg.scheduler = crate::scheduler::Scheduler::persistent(
             Arc::new(crate::inbox::Inbox::default()),
@@ -653,15 +650,15 @@ mod tests {
         )
         .await;
         assert!(outcome.is_err(), "the successor scheduler cannot bind");
-        assert_eq!(session_files(&dir), before, "the fork file is gone");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(session_files(dir.path()), before, "the fork file is gone");
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Rewinding without a summary sends nothing and adds nothing.
     #[tokio::test]
     async fn a_plain_rewind_sends_no_request() {
         let dir = temp_dir("drop");
-        let (cfg, mut history, cut, seen) = live_session("drop", &dir, Vec::new());
+        let (cfg, mut history, cut, seen) = live_session("drop", dir.path(), Vec::new());
 
         let rewound = rewound(
             rewind(
@@ -679,7 +676,7 @@ mod tests {
         assert_eq!(rewound.history.messages(), first_turn());
         assert_eq!(rewound.notes, Vec::<String>::new());
         assert!(seen.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Fork the live session's file at a cut, derive the sessions dir from the
@@ -688,8 +685,8 @@ mod tests {
     #[test]
     fn fork_here_branches_the_live_session_at_a_cut() {
         let dir = temp_dir("forkhere");
-        let session = dir.join("session.jsonl");
-        let mut history = History::new(dir.clone());
+        let session = dir.path().join("session.jsonl");
+        let mut history = History::new(dir.path().to_path_buf());
         history.attach_rollout(Rollout::new(session.clone()));
         history.record(Message::user_text("one"));
         history.record(text("done"));
@@ -704,6 +701,5 @@ mod tests {
             resumed.messages(),
             vec![Message::user_text("one"), text("done")]
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

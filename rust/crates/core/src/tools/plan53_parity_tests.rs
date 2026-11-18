@@ -1,3 +1,9 @@
+//! Interaction and control parity: `ask_user_question`, plan mode, workflow
+//! and structured output.
+//!
+//! The report is JSON for the local parity corpus; the assertions pin the
+//! parts that must not drift.
+
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::future::Future;

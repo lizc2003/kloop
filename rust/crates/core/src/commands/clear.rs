@@ -94,19 +94,13 @@ mod tests {
 
     use super::*;
     use crate::rollout::session_path;
+    use crate::test_support::temp_dir;
     use crate::tools::testutil::SilentUi;
     use crate::tools::testutil::TestConfig;
     use crate::tools::testutil::run_tool;
     use crate::tools::testutil::test_ctx_with_cfg;
 
     const OLD_ID: &str = "20260101-000000";
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-clear-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// A saved session with one message in it.
     fn old_session(tag: &str, dir: &Path) -> (Config, History) {
@@ -131,7 +125,7 @@ mod tests {
     #[tokio::test]
     async fn the_old_file_is_left_as_it_was_and_the_new_one_starts_empty() {
         let dir = temp_dir("files");
-        let (cfg, history) = old_session("clear-files", &dir);
+        let (cfg, history) = old_session("clear-files", dir.path());
         let old_path = history.rollout_path().unwrap().to_path_buf();
         let before = std::fs::read_to_string(&old_path).unwrap();
 
@@ -161,7 +155,7 @@ mod tests {
         // Clearing again before saying anything leaves no empty session behind.
         drop(fresh);
         assert!(!new_path.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A file read before the clear is one the new conversation has never
@@ -169,8 +163,8 @@ mod tests {
     #[tokio::test]
     async fn a_file_read_before_the_clear_must_be_read_again() {
         let dir = temp_dir("file-state");
-        let (cfg, _history) = old_session("clear-file-state", &dir);
-        let file = dir.join("notes.txt");
+        let (cfg, _history) = old_session("clear-file-state", dir.path());
+        let file = dir.path().join("notes.txt");
         std::fs::write(&file, "alpha\n").unwrap();
         let path = file.to_str().unwrap();
         let old_ctx = test_ctx_with_cfg(0, Arc::new(cfg));
@@ -189,7 +183,7 @@ mod tests {
         assert!(!is_error, "{output}");
         let (output, is_error) = run_tool("edit_file", edit, &new_ctx).await;
         assert!(!is_error, "{output}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Background work of the old session is stopped, said so, and delivers
@@ -198,7 +192,7 @@ mod tests {
     #[tokio::test]
     async fn background_work_is_stopped_and_never_reaches_the_new_session() {
         let dir = temp_dir("background");
-        let (cfg, _history) = old_session("clear-background", &dir);
+        let (cfg, _history) = old_session("clear-background", dir.path());
         let old_ctx = test_ctx_with_cfg(0, Arc::new(cfg));
         let (output, is_error) = run_tool(
             "bash",
@@ -215,7 +209,7 @@ mod tests {
         assert_eq!(old_ctx.cfg.background_shells.running_count(), 0);
         assert!(fresh.cfg.inbox.is_empty());
         assert_eq!(fresh.cfg.background_shells.running_count(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// A rewind hands `replace_session` the branch's id. Everything that reads
@@ -224,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn a_replaced_session_answers_to_its_new_id_everywhere() {
         let dir = temp_dir("replace");
-        let (cfg, _history) = old_session("clear-replace", &dir);
+        let (cfg, _history) = old_session("clear-replace", dir.path());
         let branch = "20260101-000001";
 
         let (fresh, report) = replace_session(&cfg, branch.into(), &ui()).await.unwrap();
@@ -233,13 +227,13 @@ mod tests {
         assert_eq!(fresh.cache_key(), Some(branch));
         let pointer = crate::compact::transcript_pointer(&fresh).unwrap();
         assert!(
-            pointer.ends_with(&session_path(&dir, branch).display().to_string()),
+            pointer.ends_with(&session_path(dir.path(), branch).display().to_string()),
             "{pointer}"
         );
         // The new scheduler is bound (to the branch); the old one is closed.
         assert_eq!(fresh.scheduler.list().unwrap(), Vec::new());
         assert!(cfg.scheduler.list().is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     /// Without a sessions directory nothing was being saved, and the new

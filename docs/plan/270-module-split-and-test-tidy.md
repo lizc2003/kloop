@@ -1,7 +1,7 @@
 # Plan 270 — 模块切分与测试整理
 
 > 2026-10-28 立。来源：全仓只读审查与随后的架构讨论(HANDOFF「〇⁵」节)。
-> 状态：待实现。**排在最后**:267 会把参数 helper 移出 `tools/mod.rs`,264 会改 catalog 部分，
+> 状态：✅ 已完成（2026-11-18）。**排在最后**:267 会把参数 helper 移出 `tools/mod.rs`,264 会改 catalog 部分，
 > 先做它们再切。纪律照 plan 177–186(行为零变更、测试跟代码走、可见性只提到够用)。
 > 行号是 2026-10-28 的读数，开工先自己量。
 
@@ -39,3 +39,29 @@
 
 - diff 除 `use` 与可见性外接近零改动;全部测试不改断言即通过;对外符号表一个不少不多。
 - 外层执行沙箱之外 `make check`;HANDOFF 记进展。
+
+## 完成记录（2026-11-18）
+
+开工两个问答：(2) 测试文件**不改名**，只在每个文件头补“测什么”的模块注释；(3) `tui/src/app.rs`、
+`core/src/permissions.rs`、`core/src/tools/fs.rs` **不切**——扫描后三份的 60–75% 是测试，非测试部分
+分别是单个 `App` 状态机（46 字段、66 个方法互相调用）、已有 10 个子模块的权限门、读写共用观察与
+身份机制的单个文件工具实现；按方法组切只会把内部调用提成 `pub(super)`，diff 不再是“除 use 与
+可见性外接近零”。
+
+1. `tools/mod.rs` 拆成 `catalog.rs`（目录、延迟分区、合并警告、并发分类）、`dispatch.rs`（分批、
+   门禁、hook、截止时间、`run_one`/`execute_tool`）、`paths.rs`（`resolve_path`）；`mod.rs` 留
+   `ToolCtx`、`ToolSource`、日志句柄、参数归一化与公开门面。开工用 `rg` 列出的 `crate::tools::*`
+   外部引用在编译期逐个核对；拆前拆后顶层条目集合完全一致（脚本比对，无缺失、无新增）。内部
+   helper 用 `pub(super)` + `mod.rs` 私有 `use` 保持兄弟模块的 `super::X` 路径不变，可见性只在
+   跨出 `tools` 的 `resolve_path`/`builtin_defs_builds` 处放宽。
+2. 10 个计划编号测试文件加了头注释（`plan151`/`plan197` 原有）。
+3. 计划列的 8 处测试临时目录统一到 `tempfile::TempDir`：core 新增 `#[cfg(test)] mod test_support`
+   提供 `temp_dir(tag)`，CLI 的 `context.rs` 用本地 `tempfile::Builder`。清理交给 `TempDir` 的
+   `Drop`；原测试里“先删掉再断言不存在/写成文件”的用法保留，只是目标改成 `dir.path()`。
+
+验证：`cargo check -p kloop-core --all-targets`、`cargo check -p kloop --all-targets`；
+`cargo test -p kloop-core --lib` 1462 通过、1 ignored（外层执行沙箱之外，真实 seatbelt 用例
+实际执行）；`cargo test -p kloop --bin kloop` 170 通过；`cargo clippy -p kloop-core -p kloop
+--all-targets -- -D warnings`；`cargo fmt --all -- --check`。未跑全量 `make check`、parity 与真实 API。
+计划外的临时目录（`cli/src/{args,startup,user_config,project_store,private_store,mcp_auth}.rs`、
+`server/tests`、`process-spawn` 等）不在本次审查清单内，未动。

@@ -252,13 +252,8 @@ fn cap(mut lines: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_dir;
     use serde_json::json;
-
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kloop-diff-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn numbered_diff_shows_added_deleted_and_changed_lines_with_line_numbers() {
@@ -319,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_diffs_existing_and_previews_new() {
         let dir = temp_dir("write");
-        let existing = dir.join("existing.txt");
+        let existing = dir.path().join("existing.txt");
         std::fs::write(&existing, "old line\nkeep\n").unwrap();
 
         // Overwriting an existing file diffs old→new with line numbers.
@@ -332,7 +327,7 @@ mod tests {
         assert_eq!(preview, "-1  old line\n+1  new line\n 2  keep");
 
         // A path that does not exist yet is shown as a fresh, numbered file.
-        let fresh = dir.join("fresh.txt");
+        let fresh = dir.path().join("fresh.txt");
         let preview = file_change_preview(
             "write_file",
             &json!({"path": fresh.to_str().unwrap(), "content": "hello\nworld\n"}),
@@ -344,13 +339,11 @@ mod tests {
         // An empty new file is labelled, not left blank.
         let preview = file_change_preview(
             "write_file",
-            &json!({"path": dir.join("blank.txt").to_str().unwrap(), "content": ""}),
+            &json!({"path": dir.path().join("blank.txt").to_str().unwrap(), "content": ""}),
         )
         .await
         .unwrap();
         assert_eq!(preview, "(new file)\n(empty)");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Only a missing path is `(new file)`. A binary overwrite and a target
@@ -359,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_labels_binary_and_unpreviewable_targets() {
         let dir = temp_dir("write-labels");
-        let binary = dir.join("image.png");
+        let binary = dir.path().join("image.png");
         std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
         let preview = file_change_preview(
             "write_file",
@@ -371,7 +364,7 @@ mod tests {
 
         // A directory opens but cannot be read as a file, the same shape as an
         // unreadable existing target.
-        let directory = dir.join("target");
+        let directory = dir.path().join("target");
         std::fs::create_dir(&directory).unwrap();
         let preview = file_change_preview(
             "write_file",
@@ -380,16 +373,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(preview, "(existing file could not be previewed)");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn preview_reads_are_bounded_before_whole_file_diffing() {
         let dir = temp_dir("bounded");
-        let at_limit = dir.join("at-limit.txt");
-        let over_limit = dir.join("over-limit.txt");
-        let notebook_over_limit = dir.join("over-limit.ipynb");
+        let at_limit = dir.path().join("at-limit.txt");
+        let over_limit = dir.path().join("over-limit.txt");
+        let notebook_over_limit = dir.path().join("over-limit.ipynb");
         std::fs::write(&at_limit, "x".repeat(MAX_DIFF_INPUT)).unwrap();
         std::fs::write(&over_limit, "x".repeat(MAX_DIFF_INPUT + 1)).unwrap();
         std::fs::write(&notebook_over_limit, vec![b' '; MAX_DIFF_INPUT + 1]).unwrap();
@@ -442,14 +433,12 @@ mod tests {
                 MAX_DIFF_INPUT + 1
             )
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn edit_file_reads_the_file_and_falls_back_to_two_strings() {
         let dir = temp_dir("edit");
-        let path = dir.join("code.rs");
+        let path = dir.path().join("code.rs");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
 
         // The edit is applied to the real file and diffed with file line
@@ -486,7 +475,5 @@ mod tests {
                 .await
                 .is_none()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
