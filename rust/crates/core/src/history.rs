@@ -170,33 +170,25 @@ impl History {
         // being left: they go to its file, and the branch starts its own
         // backlog. A journal still holding the old one writes nowhere now.
         self.flush_approval_backlog();
-        self.approval_backlog = ApprovalBacklog::default();
-        let carried = self
-            .reduction
-            .unrecorded_for(&resumed.snapshot.messages, &resumed.request_stubs);
-        self.reduction.adopt(resumed.request_stubs);
-        self.items = resumed.snapshot.messages;
-        self.provider_usage = resumed.provider_usage;
-        self.provider_routes = resumed.snapshot.provider_routes.clone();
-        self.next_memory_boundary = resumed.rollout.next_boundary();
-        self.rollout = Some(resumed.rollout);
-        self.usage_anchor = None;
-        self.compaction_breaker = CompactionBreaker::default();
-        self.background_wait_reminder = None;
-        for stub in &carried {
-            self.persist(|rollout| rollout.append_request_stub(stub));
-        }
+        let mut branch = self.branch(resumed);
+        branch.staged = std::mem::take(&mut self.staged);
+        *self = branch;
     }
 
     /// The conversation a rewind lands on, built without touching this one.
     /// A rewind can still fail after its route is settled (the branch's route
     /// may name a provider this process no longer has), and the live session
     /// must be exactly as it was when it does.
-    pub fn branch(&self, resumed: crate::rollout::ResumedSession) -> Self {
+    pub fn branch(&self, mut resumed: ResumedSession) -> Self {
         let carried = self
             .reduction
             .unrecorded_for(&resumed.snapshot.messages, &resumed.request_stubs);
+        let mut reduction = self.reduction.clone();
+        reduction.adopt(std::mem::take(&mut resumed.request_stubs));
         let mut branch = Self::resume(self.offload_dir.clone(), resumed);
+        branch.reduction = reduction;
+        branch.cap = self.cap;
+        branch.observed_overflow_ceiling = self.observed_overflow_ceiling;
         for stub in carried {
             branch.persist(|rollout| rollout.append_request_stub(&stub));
         }
@@ -671,7 +663,7 @@ impl History {
         persist_into(&mut self.rollout, write);
     }
 
-    fn flush_approval_backlog(&mut self) {
+    pub(crate) fn flush_approval_backlog(&mut self) {
         let backlog = std::mem::take(&mut *self.approval_backlog.lock().unwrap());
         for (tool_use_id, record) in backlog {
             persist_into(&mut self.rollout, |rollout| {

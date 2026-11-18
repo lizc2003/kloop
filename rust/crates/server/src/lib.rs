@@ -182,18 +182,12 @@ where
     // a scheduler delivery that becomes due during the drain would otherwise
     // run for a client that is gone. Cancel the running turns too.
     server.shutdown.cancel();
-    for handle in server.threads.values() {
-        let mut current_cancel = handle.current_cancel.lock().unwrap();
-        if let Some(cancel) = current_cancel.take() {
-            cancel.cancel();
-        }
-    }
     // A config build that already started still owes its request an answer: a
     // client may close the pipe right after sending `thread/start`, and a
     // missing response is indistinguishable from a rejected one. Wait for what
     // was accepted, bounded so a slow build cannot hold the server.
     let pending = server.pending_threads.len();
-    let drained = tokio::time::timeout(SHUTDOWN_BUILD_GRACE, async {
+    let drained = tokio::time::timeout(SHUTDOWN_REQUEST_GRACE, async {
         for _ in 0..pending {
             let Some(build) = builds_rx.recv().await else {
                 break;
@@ -206,9 +200,10 @@ where
     // Whatever is still building cannot be registered now — its handle would
     // have no read loop and would keep the writer alive — so answer it with an
     // error instead of silence.
-    for (thread_id, request_id) in std::mem::take(&mut server.pending_threads) {
+    for (thread_id, pending) in std::mem::take(&mut server.pending_threads) {
+        drop(pending.fork_guard);
         server.send(Outgoing::Error {
-            id: Some(request_id),
+            id: Some(pending.request_id),
             code: wire::SERVER_ERROR,
             message: format!(
                 "thread '{thread_id}' did not finish starting before the server stopped reading"
@@ -242,8 +237,8 @@ where
     }
 }
 
-/// How long shutdown lets accepted config builds land and be answered.
-const SHUTDOWN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long shutdown lets accepted builds and reads finish and be answered.
+const SHUTDOWN_REQUEST_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the writer gets to flush once the read loop and server state are
 /// gone. A build still in its factory may outlive this; it must not hold the
@@ -416,14 +411,17 @@ struct ThreadHandle {
 /// read loop registers it and answers the request that asked for it; a build
 /// must not hold up approvals or `turn/interrupt` on other threads.
 struct ThreadBuild {
-    request_id: RequestId,
     thread_id: String,
     /// Kept for the resumed/forked response, which names the thread's runtime.
     options: ThreadStartOptions,
     reply: ThreadReply,
     outcome: std::result::Result<ThreadHandle, (i64, String)>,
-    /// A fork's file, removed if this build is never registered.
-    guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
+}
+
+struct PendingThread {
+    request_id: RequestId,
+    /// The read loop can remove an unregistered fork even if its factory is stuck.
+    fork_guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
 }
 
 /// The success response shape the method would have produced synchronously.
@@ -465,7 +463,7 @@ struct Server {
     /// Thread ids with a build in flight, with the request each will answer.
     /// `threads` cannot answer "already active" for them yet, so a pipelined
     /// resume would otherwise build twice.
-    pending_threads: HashMap<String, RequestId>,
+    pending_threads: HashMap<String, PendingThread>,
     /// Set when input ends: workers stop taking new turns, and approvals or
     /// questions still waiting for a client that can no longer answer stop.
     shutdown: CancellationToken,
@@ -506,8 +504,27 @@ impl Server {
         F: FnOnce() -> MethodResult + Send + 'static,
     {
         let out = self.out.clone();
-        tokio::task::spawn_blocking(move || {
-            let outgoing = match work() {
+        let shutdown = self.shutdown.clone();
+        let mut task = tokio::task::spawn_blocking(work);
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                result = &mut task => Some(result),
+                _ = shutdown.cancelled() => {
+                    tokio::time::timeout(SHUTDOWN_REQUEST_GRACE, &mut task).await.ok()
+                }
+            };
+            let result = match result {
+                Some(Ok(result)) => result,
+                Some(Err(error)) => Err((wire::SERVER_ERROR, format!("read failed: {error}"))),
+                None => {
+                    task.abort();
+                    Err((
+                        wire::SERVER_ERROR,
+                        "read did not finish before shutdown".into(),
+                    ))
+                }
+            };
+            let outgoing = match result {
                 Ok(result) => Outgoing::Response { id, result },
                 Err((code, message)) => Outgoing::Error {
                     id: Some(id),
@@ -524,14 +541,15 @@ impl Server {
     /// the request that asked for it. Registration precedes the response, so a
     /// client that turns on the id it just received always finds the thread.
     fn finish_thread_build(&mut self, build: ThreadBuild) {
-        self.pending_threads.remove(&build.thread_id);
+        let Some(PendingThread {
+            request_id,
+            fork_guard,
+        }) = self.pending_threads.remove(&build.thread_id)
+        else {
+            return;
+        };
         match build.outcome {
             Ok(handle) => {
-                // The branch is live now; only here is its file safe from the
-                // build guard (a build that never lands drops the guard).
-                if let Some(mut guard) = build.guard {
-                    guard.disarm();
-                }
                 let route = handle.active_route.lock().unwrap().clone();
                 let result = match build.reply {
                     ThreadReply::Started => {
@@ -547,17 +565,23 @@ impl Server {
                     }),
                 };
                 self.threads.insert(build.thread_id, handle);
+                if let Some(mut guard) = fork_guard {
+                    guard.disarm();
+                }
                 self.send(Outgoing::Response {
-                    id: build.request_id,
+                    id: request_id,
                     result,
                 });
             }
-            Err((code, message)) => self.send(Outgoing::Error {
-                id: Some(build.request_id),
-                code,
-                message,
-                data: None,
-            }),
+            Err((code, message)) => {
+                drop(fork_guard);
+                self.send(Outgoing::Error {
+                    id: Some(request_id),
+                    code,
+                    message,
+                    data: None,
+                });
+            }
         }
     }
 

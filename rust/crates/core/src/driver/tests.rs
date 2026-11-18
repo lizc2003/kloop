@@ -265,9 +265,15 @@ async fn an_interrupted_skill_expansion_comes_back_staged() {
 /// pre-turn hook, after the front-end has given up waiting.
 #[tokio::test]
 async fn a_cancelled_expansion_does_not_start_its_turn() {
+    for body in ["review the diff", "!`echo review`"] {
+        assert_cancelled_expansion(body).await;
+    }
+}
+
+async fn assert_cancelled_expansion(body: &str) {
     let ui: Arc<dyn Ui> = Arc::new(NoUi);
     let mut cfg = mock_config(Provider::mock(Vec::new()));
-    cfg.skills = Arc::new(vec![test_skill("review", "review the diff")]);
+    cfg.skills = Arc::new(vec![test_skill("review", body)]);
     let cfg = Arc::new(cfg);
     let mut driver = SessionDriver::new(
         Arc::clone(&cfg),
@@ -296,6 +302,8 @@ async fn a_cancelled_expansion_does_not_start_its_turn() {
     assert_eq!(turn.outcome.reason, EndReason::Aborted);
     assert_eq!(turn.outcome.rounds, 0);
     assert_eq!(turn.returned, Some(Message::user_text("/review")));
+    assert!(!turn.entered_loop);
+    assert!(command.output.is_empty());
     assert_eq!(driver.history().messages(), &[]);
 }
 

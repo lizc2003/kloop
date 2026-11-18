@@ -403,14 +403,11 @@ impl SessionDriver {
         let crate::rewind::Rewound {
             cfg,
             history,
+            provider,
             report,
             notes,
         } = rewound;
         let cfg = Arc::new(cfg);
-        // The branch is settled (route and all) before anything is swapped;
-        // this is the only fallible step left, and it still sees the old
-        // session state.
-        let provider = provider_state_for(&cfg, &history).map_err(anyhow::Error::new)?;
         let activity = cfg.inbox.subscribe_activity();
         let messages = history.messages().to_vec();
         self.history = history;
@@ -470,23 +467,25 @@ impl SessionDriver {
         if result.route_changed {
             self.cfg = Arc::new(self.cfg.clone_with_provider_route(self.provider.freeze()));
         }
-        let turn = match result.run_turn {
+        let turn = match (result.run_turn, result.expansion_cancelled) {
             // Ctrl+C during a slow expansion (an `!cmd` or `@file`) cancels the
             // turn this command would have started. Report the interrupt without
             // running it: entering the turn now would fire the pre-turn hook
             // after the interrupt, and calling it a completed command would hide
             // that nothing ran.
-            Some(_) if cancel.is_cancelled() => Some(TurnReport {
-                outcome: TurnOutcome {
-                    reason: EndReason::Aborted,
-                    final_text: String::new(),
-                    rounds: 0,
-                    structured_output: None,
-                },
-                returned: Some(Message::user_text(line)),
-                entered_loop: false,
-            }),
-            Some(prompt) => {
+            (prompt, cancelled) if cancelled || (prompt.is_some() && cancel.is_cancelled()) => {
+                Some(TurnReport {
+                    outcome: TurnOutcome {
+                        reason: EndReason::Aborted,
+                        final_text: String::new(),
+                        rounds: 0,
+                        structured_output: None,
+                    },
+                    returned: Some(Message::user_text(line)),
+                    entered_loop: false,
+                })
+            }
+            (Some(prompt), _) => {
                 let mut turn = self.run_message(prompt, Vec::new(), ui, cancel).await;
                 // The input that never happened is the user's command line, not
                 // the prompt the skill expanded to: a front-end that offers a
@@ -507,7 +506,7 @@ impl SessionDriver {
                 }
                 Some(turn)
             }
-            None => None,
+            (None, _) => None,
         };
         CommandReport {
             output: result.output,
@@ -520,7 +519,7 @@ impl SessionDriver {
     }
 }
 
-fn provider_state_for(
+pub(crate) fn provider_state_for(
     cfg: &Config,
     history: &History,
 ) -> Result<Arc<SessionProviderState>, SwitchError> {

@@ -768,9 +768,10 @@ impl Composer {
     pub fn has_text(&self) -> bool {
         let mut copied = 0;
         for atom in &self.document.atoms {
-            if !self.document.display[copied..atom.range.start().get()]
-                .trim()
-                .is_empty()
+            if matches!(atom.payload, AtomPayload::Paste { .. })
+                || !self.document.display[copied..atom.range.start().get()]
+                    .trim()
+                    .is_empty()
             {
                 return true;
             }
@@ -1277,12 +1278,39 @@ impl Composer {
         Some((line, draft))
     }
 
-    /// The images currently attached, in their label order.
+    /// Put the command text back alongside the current image atoms. Keep their
+    /// numbers and any unfinished read's reservation token.
+    pub fn restore_command(&mut self, Draft(mut command): Draft) {
+        debug_assert!(!self.has_text());
+        let ComposerDocument {
+            display,
+            atoms,
+            image_high_water,
+        } = std::mem::take(&mut self.document);
+        if command.display.ends_with(|c: char| !c.is_whitespace())
+            && display.starts_with(|c: char| !c.is_whitespace())
+        {
+            command.display.push(' ');
+        }
+        let offset = command.display.len();
+        command.display.push_str(&display);
+        command.atoms.extend(atoms.into_iter().map(|mut atom| {
+            atom.range = shift_range(atom.range, 0, offset);
+            atom
+        }));
+        command.image_high_water = image_high_water;
+        let end = ByteOffset::new(command.display.len());
+        command.repair_boundaries(end);
+        command.assert_invariants();
+        self.restore(Draft(command));
+    }
+
+    #[cfg(test)]
     pub fn image_sources(&self) -> Vec<ImageSource> {
         self.document
             .images()
             .into_iter()
-            .map(|(_, source)| ImageSource::clone(&source))
+            .map(|(_, source)| (*source).clone())
             .collect()
     }
 

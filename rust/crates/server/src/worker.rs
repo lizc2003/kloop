@@ -9,6 +9,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use kloop_core::agent::EndReason;
 use kloop_core::agent::Ui;
 use kloop_core::commands;
 use kloop_core::driver::Input;
@@ -45,14 +46,22 @@ pub(super) async fn thread_worker(
     let mut inbox_activity = inbox.subscribe_activity();
     loop {
         let message = tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => {
+                // The read loop sent every accepted operation before closing.
+                // Commands still owe their answers and turns their terminal.
+                let Ok(turn) = turns.try_recv() else { break };
+                turn
+            },
             turn = turns.recv() => {
                 let Some(turn) = turn else { break };
                 turn
             }
             activity = inbox_activity.changed() => {
-                if activity.is_err() || shutdown.is_cancelled() {
+                if activity.is_err() {
                     break;
+                }
+                if shutdown.is_cancelled() {
+                    continue;
                 }
                 if inbox.is_empty()
                     || running
@@ -64,7 +73,7 @@ pub(super) async fn thread_worker(
                 let id = turn_seq.fetch_add(1, Ordering::SeqCst);
                 *ui.turn.lock().unwrap() = Some(id);
                 inbox.open_steer_window(id);
-                let cancel = CancellationToken::new();
+                let cancel = shutdown.child_token();
                 *current_cancel.lock().unwrap() = Some(cancel.clone());
                 ThreadWorkerMsg::Wake { id, cancel }
             }
@@ -159,12 +168,16 @@ pub(super) async fn thread_worker(
         };
         ui.notify("turn/started", wire::turn_started_params(turn_id));
         let dyn_ui: Arc<dyn Ui> = ui.clone();
-        let report = driver.dispatch(input, &dyn_ui, &cancel).await;
+        let report = if shutdown.is_cancelled() {
+            None
+        } else {
+            Some(driver.dispatch(input, &dyn_ui, &cancel).await)
+        };
         finish_operation(
             &driver,
             &ui,
             turn_id,
-            &report,
+            report.as_ref(),
             &running,
             &current_cancel,
             &active_route,
@@ -190,12 +203,12 @@ fn finish_operation(
     driver: &SessionDriver,
     ui: &Arc<ThreadUi>,
     turn_id: u64,
-    report: &Report,
+    report: Option<&Report>,
     running: &AtomicBool,
     current_cancel: &Mutex<Option<CancellationToken>>,
     active_route: &Mutex<ActiveProviderRoute>,
 ) {
-    if let Report::Command(command) = report {
+    if let Some(Report::Command(command)) = report {
         if command.route_changed {
             let route = driver.cfg().provider_route.public_route();
             *active_route.lock().unwrap() = route.clone();
@@ -218,8 +231,9 @@ fn finish_operation(
         }
     }
     let returned = match report {
-        Report::Turn(turn) => turn.as_ref().is_some_and(|turn| turn.returned.is_some()),
-        Report::Command(command) => command
+        None => true,
+        Some(Report::Turn(turn)) => turn.as_ref().is_some_and(|turn| turn.returned.is_some()),
+        Some(Report::Command(command)) => command
             .turn
             .as_ref()
             .is_some_and(|turn| turn.returned.is_some()),
@@ -238,7 +252,7 @@ fn finish_operation(
     )));
     ui.notify(
         "turn/completed",
-        wire::turn_completed_params(turn_id, &report.reason()),
+        wire::turn_completed_params(turn_id, &report.map_or(EndReason::Aborted, Report::reason)),
     );
     // Usually already closed by the final drain; this covers the endings that
     // never reach it (error, max rounds, interrupt).
@@ -246,7 +260,9 @@ fn finish_operation(
     *current_cancel.lock().unwrap() = None;
     running.store(false, Ordering::SeqCst);
     *ui.turn.lock().unwrap() = None;
-    driver.reannounce_if_owed(report.drained_inbox());
+    if let Some(report) = report {
+        driver.reannounce_if_owed(report.drained_inbox());
+    }
 }
 
 pub(super) fn provider_command_args(text: &str) -> Option<Vec<&str>> {

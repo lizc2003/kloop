@@ -38,6 +38,7 @@ pub struct Rewound {
     /// The branch, ready to become the live History. The caller swaps it in
     /// only after this whole outcome is in hand.
     pub history: History,
+    pub provider: Arc<crate::provider_route::SessionProviderState>,
     /// What retiring the old session did (see
     /// [`crate::commands::replace_session`]), one line each.
     pub report: Vec<String>,
@@ -103,7 +104,11 @@ pub async fn rewind(
     // rollout.
     let (route, route_notes) = adopt_branch_route(cfg, &mut branch)?;
     notes.extend(route_notes);
+    let provider = crate::driver::provider_state_for(cfg, &branch)?;
     let (fresh, report) = crate::commands::replace_session(cfg, session_id, ui).await?;
+    // Background calls can still report approvals as they stop. Flush to the
+    // old file while its History still owns the writer.
+    history.flush_approval_backlog();
     let cfg = fresh.clone_with_provider_route(route);
     if let Some(summary) = summary {
         summary.record(&mut branch);
@@ -113,6 +118,7 @@ pub async fn rewind(
     Ok(RewindOutcome::Rewound(Box::new(Rewound {
         cfg,
         history: branch,
+        provider,
         report,
         notes,
     })))
@@ -281,6 +287,45 @@ mod tests {
 
     fn ui() -> Arc<dyn Ui> {
         Arc::new(SilentUi)
+    }
+
+    #[tokio::test]
+    async fn rewind_flushes_queued_approvals_to_the_old_rollout() {
+        use crate::permissions::{ApprovalAnswer, ApprovalDoor, ApprovalRecord, AskReason};
+
+        let dir = temp_dir("pending-approvals");
+        let (cfg, mut history, cut, _) = live_session("pending-approvals", &dir, Vec::new());
+        history.approval_backlog().lock().unwrap().push((
+            "pending-before-rewind".into(),
+            ApprovalRecord {
+                door: ApprovalDoor::Gate,
+                tool: "bash".into(),
+                reason: AskReason::Uncontained,
+                detail: "make install".into(),
+                keys: Vec::new(),
+                rules: Vec::new(),
+                offered: Vec::new(),
+                answer: ApprovalAnswer::Denied,
+            },
+        ));
+        let RewindOutcome::Rewound(branch) = rewind(
+            &cfg,
+            &mut history,
+            cut,
+            AbandonedBranch::Drop,
+            &ui(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected a rewind")
+        };
+        let read =
+            |history: &History| std::fs::read_to_string(history.rollout_path().unwrap()).unwrap();
+        assert!(read(&history).contains("pending-before-rewind"));
+        assert!(!read(&branch.history).contains("pending-before-rewind"));
+        drop((branch, history));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A rewind carries the live route onto the branch by appending a route

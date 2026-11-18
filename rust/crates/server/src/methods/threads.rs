@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ConfigFactory;
 use crate::PendingInteractions;
+use crate::PendingThread;
 use crate::RequestId;
 use crate::Server;
 use crate::ThreadBuild;
@@ -186,9 +187,8 @@ impl Server {
         let new_path = rollout::fork_session(&src, cut, &dirs.sessions)
             .map_err(|e| (wire::SERVER_ERROR, format!("cannot fork: {e}")))?;
         let new_id = rollout::session_id_of(&new_path);
-        // Until `spawn_thread` takes the history, every failure must remove the
-        // fork: it is `preexisting` to its writer, so nothing else will, and
-        // each retry would add another orphan to `thread/list`.
+        // The read loop keeps the guard until registration, including while a
+        // factory is stuck. The fork is `preexisting` to its writer.
         let fork_guard = kloop_core::cleanup::RemoveFileOnDrop::new(new_path.clone());
         let resumed = match rollout::inspect_session_for_writing(&new_path)
             .and_then(|read| read.recover_for_writing())
@@ -303,10 +303,7 @@ impl Server {
         recovery_source: RecoverySource,
         seed: SessionSnapshot,
         reply: ThreadReply,
-        // A fork owns a fresh file the writer treats as preexisting, so its
-        // removal has to travel with the build and be disarmed only once the
-        // worker has taken the history.
-        guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
+        fork_guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
     ) {
         let build = PendingThreadBuild {
             thread_id: thread_id.clone(),
@@ -314,7 +311,6 @@ impl Server {
             recovery_source,
             seed,
             history,
-            guard,
             factory: Arc::clone(&self.factory),
             catalog: Arc::clone(&self.provider_catalog),
             out: self.out.clone(),
@@ -324,20 +320,20 @@ impl Server {
             shutdown: self.shutdown.clone(),
         };
         let builds = self.builds.clone();
-        self.pending_threads
-            .insert(thread_id.clone(), request_id.clone());
-        tokio::task::spawn_blocking(move || {
-            let (outcome, guard) = match build.build() {
-                Ok((handle, guard)) => (Ok(handle), guard),
-                Err(error) => (Err(error), None),
-            };
-            let _ = builds.send(ThreadBuild {
+        self.pending_threads.insert(
+            thread_id.clone(),
+            PendingThread {
                 request_id,
+                fork_guard,
+            },
+        );
+        tokio::task::spawn_blocking(move || {
+            let outcome = build.build();
+            let _ = builds.send(ThreadBuild {
                 thread_id,
                 options,
                 reply,
                 outcome,
-                guard,
             });
         });
     }
@@ -353,7 +349,6 @@ struct PendingThreadBuild {
     recovery_source: RecoverySource,
     seed: SessionSnapshot,
     history: History,
-    guard: Option<kloop_core::cleanup::RemoveFileOnDrop>,
     factory: ConfigFactory,
     catalog: Arc<ProviderCatalog>,
     out: mpsc::UnboundedSender<Vec<u8>>,
@@ -364,16 +359,13 @@ struct PendingThreadBuild {
 }
 
 impl PendingThreadBuild {
-    fn build(
-        self,
-    ) -> Result<(ThreadHandle, Option<kloop_core::cleanup::RemoveFileOnDrop>), (i64, String)> {
+    fn build(self) -> Result<ThreadHandle, (i64, String)> {
         let PendingThreadBuild {
             thread_id,
             options,
             recovery_source,
             mut seed,
             mut history,
-            guard,
             factory,
             catalog,
             out,
@@ -489,24 +481,18 @@ impl PendingThreadBuild {
         // A blocking-pool thread still carries the runtime context, so the
         // worker is spawned here and the handle is what travels back.
         tokio::spawn(thread_worker(driver, ui, turn_rx, worker_state));
-        // The worker owns the history from here. A fork's file is still the
-        // guard's until the read loop registers the handle: if the build lands
-        // after the client is gone, the branch must not stay visible.
-        Ok((
-            ThreadHandle {
-                turn_tx,
-                running,
-                current_cancel,
-                inbox,
-                turn_seq,
-                turn,
-                cwd: handle_cwd,
-                active_route,
-                provider_state,
-                projection,
-            },
-            guard,
-        ))
+        Ok(ThreadHandle {
+            turn_tx,
+            running,
+            current_cancel,
+            inbox,
+            turn_seq,
+            turn,
+            cwd: handle_cwd,
+            active_route,
+            provider_state,
+            projection,
+        })
     }
 }
 

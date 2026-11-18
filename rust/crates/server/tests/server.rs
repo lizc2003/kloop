@@ -335,14 +335,20 @@ fn slow_factory(turns: Vec<Vec<AssistantBlock>>, offload: PathBuf, gated: bool) 
     })
 }
 
-/// The first build (the source thread) is fast; later builds are slow, so a
-/// fork lands after the server has stopped answering.
-fn slow_after_first_build(offload: PathBuf, delay: Duration) -> ConfigFactory {
+/// The source thread starts normally. The fork stays in its factory until
+/// the test has observed the server's response and the files on disk.
+fn gated_after_first_build(
+    offload: PathBuf,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> ConfigFactory {
     let inner = factory(vec![vec![text("answer")]], offload, false);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release = Mutex::new(Some(release));
     Arc::new(move |options, catalog, approver, questioner, notify| {
-        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
-            std::thread::sleep(delay);
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+            && let Some(release) = release.lock().unwrap().take()
+        {
+            let _ = release.blocking_recv();
         }
         inner(options, catalog, approver, questioner, notify)
     })
@@ -4420,10 +4426,8 @@ async fn a_stuck_thread_build_is_answered_and_does_not_hold_shutdown() {
 #[tokio::test]
 async fn a_fork_that_misses_the_shutdown_grace_leaves_no_branch() {
     let dirs = test_dirs("fork-stuck");
-    let mut client = start_server(
-        slow_after_first_build(dirs.offload.clone(), Duration::from_secs(3)),
-        &dirs,
-    );
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let mut client = start_server(gated_after_first_build(dirs.offload.clone(), gate), &dirs);
     let src = client.init_and_start().await;
     client
         .request("turn/start", json!({"thread_id": src, "input": "q"}))
@@ -4444,15 +4448,105 @@ async fn a_fork_that_misses_the_shutdown_grace_leaves_no_branch() {
         "{response:?}"
     );
     client.wait_for_exit().await;
-    // The blocking build is still running; its ThreadBuild (and with it the
-    // fork's guard) lands a moment later.
-    tokio::time::sleep(Duration::from_secs(2)).await;
     let files: Vec<_> = std::fs::read_dir(&dirs.sessions)
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
     assert_eq!(files.len(), 1, "only the source session remains: {files:?}");
+    let _ = release.send(());
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn a_stuck_config_read_is_answered_and_does_not_hold_shutdown() {
+    let dirs = test_dirs("config-read-stuck");
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let mut config = ServerConfig::new(
+        factory(Vec::new(), dirs.offload.clone(), false),
+        ServerPaths {
+            store: dirs.store.clone(),
+        },
+    );
+    let gate = Mutex::new(Some(gate));
+    config.config_reader = Arc::new(move |_| {
+        let _ = gate.lock().unwrap().take().unwrap().blocking_recv();
+        anyhow::bail!("reader released");
+    });
+    let mut client = start_server_with_config(config);
+    client.initialize().await;
+    let read = client.request("config/read", json!({})).await;
+    client.close_input().await;
+    let response = client.recv_with_timeout(Duration::from_secs(5)).await;
+    assert_eq!(response["id"], read);
+    assert_eq!(
+        response["error"]["message"],
+        "read did not finish before shutdown"
+    );
+    client.wait_for_exit().await;
+    let _ = release.send(());
+    let _ = std::fs::remove_dir_all(&dirs.root);
+}
+
+#[tokio::test]
+async fn shutdown_answers_a_queued_provider_switch_and_completes_a_queued_turn() {
+    let dirs = test_dirs("shutdown-queued-operations");
+    let seen_a = Arc::new(Mutex::new(Vec::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::new()));
+    let mut client = start_server(
+        switch_factory(
+            dirs.offload.clone(),
+            Arc::clone(&seen_a),
+            Arc::clone(&seen_b),
+        ),
+        &dirs,
+    );
+    let switch_thread = client.init_and_start().await;
+    let second = client.request("thread/start", json!({})).await;
+    let started = client.recv().await;
+    assert_eq!(started["id"], second);
+    let turn_thread = started["result"]["thread"]["id"].as_str().unwrap();
+    let switch = client.request("thread/provider/switch", json!({
+        "thread_id": switch_thread, "provider_id": "b", "model": "shared", "expected_route_revision": 1,
+    })).await;
+    let start = client
+        .request(
+            "turn/start",
+            json!({"thread_id": turn_thread, "input": "queued"}),
+        )
+        .await;
+    client.close_input().await;
+    let mut reply = None;
+    let mut accepted_turn = None;
+    let mut completed = None;
+    while let Some(line) = tokio::time::timeout(Duration::from_secs(5), client.lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["id"] == switch {
+            reply = Some(event);
+        } else if event["id"] == start {
+            accepted_turn = Some(event["result"]["turn"]["id"].clone());
+        } else if event["method"] == "turn/completed" && event["params"]["thread_id"] == turn_thread
+        {
+            completed = Some(event);
+        }
+    }
+    assert_eq!(
+        reply.expect("accepted switch gets a result")["result"]["route"]["provider_id"],
+        "b"
+    );
+    let completed = completed.expect("accepted turn gets a terminal event");
+    assert_eq!(
+        completed["params"]["turn"]["id"],
+        accepted_turn.expect("turn was accepted")
+    );
+    assert_eq!(completed["params"]["turn"]["status"], "aborted");
+    assert!(seen_a.lock().unwrap().is_empty());
+    assert!(seen_b.lock().unwrap().is_empty());
+    client.wait_for_exit().await;
     let _ = std::fs::remove_dir_all(&dirs.root);
 }
 

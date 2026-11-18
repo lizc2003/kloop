@@ -5965,7 +5965,10 @@ async fn a_resumed_session_stubs_only_once_its_cache_can_have_expired() {
 #[tokio::test]
 async fn a_rewound_branch_records_the_stubs_it_keeps_sending() {
     let mut script = big_output_turn();
-    script.push(MockTurn::Blocks(text("later")));
+    script.extend([
+        MockTurn::Blocks(text("later")),
+        MockTurn::Blocks(text("branch reply")),
+    ]);
     let (cfg, session, seen) = reduction_session("plan200-rebase", script);
     let ui: Arc<dyn Ui> = Arc::new(NullUi);
     let mut history = History::new(cfg.offload_dir.clone());
@@ -5991,9 +5994,12 @@ async fn a_rewound_branch_records_the_stubs_it_keeps_sending() {
             .request_stubs
             .is_empty()
     );
-    history.rebase(crate::rollout::resume_session(&fork).unwrap());
-
-    drop(history);
+    let mut branch = history.branch(crate::rollout::resume_session(&fork).unwrap());
+    branch.record(Message::user_text("continue the branch"));
+    let outcome = run_turn(&cfg, &mut branch, &ui, &CancellationToken::new(), 0).await;
+    assert_eq!(outcome.reason, EndReason::Completed);
+    assert_eq!(sent_result(&seen.lock().unwrap()[5].messages, "b1"), stub);
+    drop(branch);
     let branch = crate::rollout::resume_session(&fork).unwrap();
     assert_eq!(branch.request_stubs.len(), 1);
     assert_eq!(branch.request_stubs[0].stub, stub);

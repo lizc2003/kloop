@@ -57,6 +57,11 @@
   - 展开期间取消按 `Aborted` 报告并带 `entered_loop=false`；`--image` 由驱动器重新挂回下一次输入
     （命令没有 composer 文本可载图）。
   - TUI 的命令草稿只含文本与 paste，图片留在输入框：保留的图片恢复时挂回，用户清掉的不复活。
+- **review 修正（第三轮）**：只读 RPC 在 EOF 后也有答复期限，fork 删除守卫由读循环持有，
+  factory 卡住时也能在回错误前删掉分支。排队的 provider 事务有答复，排队的 turn 有 `aborted`
+  终态。rewind 换入分支前准备 provider，停止旧后台后把审批补写到旧文件，分支从第一条请求起沿用
+  已冻结的 stub。技能展开被取消时退回原命令，包括 `!cmd` 以错误退出的情况。TUI 保留用户刚贴的
+  草稿，以及输入框里剩余的图片编号与在途读取。
 - **既有基线**：全仓 parity 的 `Plan 56 parser contract drift` 不通过——`refs` 语料期望
   `enter_name_null`/`enter_path_null`/`exit_discard_null` 判为 invalid，而 plan 267 的
   native report 明确 `null_is_omitted`。本次改动未触 `core/src/tools/`，不是这条 plan 引入的。

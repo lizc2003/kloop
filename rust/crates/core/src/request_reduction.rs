@@ -119,7 +119,7 @@ pub(crate) struct Recall {
 
 /// What survives between requests. Lives as long as the history it reduces;
 /// the stubs are also in the session file, the rest is re-derived.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ReductionState {
     frozen: HashMap<String, FrozenStub>,
     /// Results never to stub: the model asked again for something a stub took.

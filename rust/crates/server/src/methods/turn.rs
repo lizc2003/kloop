@@ -6,7 +6,6 @@ use anyhow::Result;
 use kloop_protocol::ContentBlock;
 use serde_json::Value;
 use serde_json::json;
-use tokio_util::sync::CancellationToken;
 
 use crate::Server;
 use crate::ThreadWorkerMsg;
@@ -54,7 +53,7 @@ impl Server {
         // turn, so a `turn/steer` racing in sees the running turn's id.
         *handle.turn.lock().unwrap() = Some(turn_id);
         handle.inbox.open_steer_window(turn_id);
-        let cancel = CancellationToken::new();
+        let cancel = self.shutdown.child_token();
         *handle.current_cancel.lock().unwrap() = Some(cancel.clone());
         handle
             .projection

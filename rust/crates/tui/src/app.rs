@@ -1939,16 +1939,8 @@ impl App {
         };
         self.drop_input_echo(&echo, echoed);
         match draft {
-            Some(draft) => {
-                // Images that stayed in the composer while the command ran are
-                // the user's: clearing them must not be undone here, and keeping
-                // them must not lose them to the restore.
-                let kept = command.then(|| self.composer.image_sources());
-                self.composer.restore(draft);
-                for source in kept.into_iter().flatten() {
-                    self.composer.attach_image(source);
-                }
-            }
+            Some(draft) if command => self.composer.restore_command(draft),
+            Some(draft) => self.composer.restore(draft),
             None if !text.is_empty() => self.composer.paste(&text),
             None => {}
         }
@@ -3480,6 +3472,44 @@ mod tests {
                 "clear={clear}"
             );
         }
+    }
+
+    #[test]
+    fn an_interrupted_skill_command_does_not_replace_a_new_paste() {
+        let mut app = App::new("keep-new-paste".into());
+        type_str(&mut app, "/review");
+        assert!(matches!(app.submit_draft(), Command::Slash(_)));
+        app.composer
+            .paste(&"a line in the next draft\n".repeat(100));
+        let new_draft = app.composer.text().to_owned();
+        assert!(new_draft.starts_with("[Pasted #"));
+        app.apply(AgentEvent::InputReturned {
+            text: "/review".into(),
+            images: Vec::new(),
+        });
+        assert_eq!(app.composer.text(), new_draft);
+    }
+
+    #[test]
+    fn an_interrupted_skill_command_keeps_image_numbers_and_pending_reads() {
+        let mut app = App::new("keep-pending-image".into());
+        let image = ImageSource::Base64 {
+            media_type: "image/png".into(),
+            data: "AA==".into(),
+        };
+        type_str(&mut app, "/review");
+        app.composer.attach_image(image.clone());
+        app.composer.backspace();
+        app.composer.attach_image(image.clone());
+        assert!(matches!(app.submit_draft(), Command::Slash(_)));
+        let token = app.composer.reserve_image();
+        app.apply(AgentEvent::InputReturned {
+            text: "/review".into(),
+            images: Vec::new(),
+        });
+        assert!(app.composer.resolve_image(token, image.clone()));
+        assert_eq!(app.composer.image_sources(), vec![image.clone(), image]);
+        assert_eq!(app.composer.text(), "/review [Image #2][Image #3]");
     }
 
     /// A known command typed while a turn runs cannot run (it owns session

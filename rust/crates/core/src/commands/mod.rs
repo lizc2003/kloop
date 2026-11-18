@@ -51,6 +51,7 @@ pub struct SlashResult {
     /// skill invoked as `/name args` expands to a prompt to act on, unlike the
     /// built-in commands which only produce `output` (`output` is empty).
     pub run_turn: Option<String>,
+    pub(crate) expansion_cancelled: bool,
     /// `/exit`: the interactive front-ends (TUI, plain REPL) quit. The server
     /// ignores it — one client leaving must not stop a multi-session process.
     pub quit: bool,
@@ -74,6 +75,7 @@ impl SlashResult {
             output: output.into(),
             new_session: false,
             run_turn: None,
+            expansion_cancelled: false,
             quit: false,
             route_changed: false,
             open_picker: None,
@@ -91,12 +93,8 @@ impl SlashResult {
     /// A skill invoked as `/name`: the expanded prompt runs as a turn.
     fn turn(prompt: String) -> Self {
         Self {
-            output: String::new(),
-            new_session: false,
             run_turn: Some(prompt),
-            quit: false,
-            route_changed: false,
-            open_picker: None,
+            ..Self::message("")
         }
     }
 
@@ -106,24 +104,17 @@ impl SlashResult {
         open_picker: Option<kloop_protocol::RoutePickerStage>,
     ) -> Self {
         Self {
-            output: output.into(),
-            new_session: false,
-            run_turn: None,
-            quit: false,
             route_changed: changed,
             open_picker,
+            ..Self::message(output)
         }
     }
 
     /// `/exit`: interactive front-ends quit after showing `output`.
     fn quit(output: impl Into<String>) -> Self {
         Self {
-            output: output.into(),
-            new_session: false,
-            run_turn: None,
             quit: true,
-            route_changed: false,
-            open_picker: None,
+            ..Self::message(output)
         }
     }
 }
@@ -271,7 +262,14 @@ pub async fn run_with_provider_state(
                 // Then run any `!cmd` / `@file` injections (plan 36 slice 2),
                 // gated exactly like a bash/read call. A blocked or failed
                 // `!cmd` aborts: show the error, don't start a turn.
-                match crate::tools::expand_slash_injections(&body, cfg, cancel).await {
+                let expanded = crate::tools::expand_slash_injections(&body, cfg, cancel).await;
+                if cancel.is_cancelled() {
+                    return SlashResult {
+                        expansion_cancelled: true,
+                        ..SlashResult::message("")
+                    };
+                }
+                match expanded {
                     Ok(prompt) => SlashResult::turn(prompt),
                     Err(e) => SlashResult::message(format!("/{name}: {e:#}")),
                 }
