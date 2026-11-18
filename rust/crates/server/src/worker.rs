@@ -195,14 +195,14 @@ pub(super) async fn thread_worker(
         }
     }
     let shutdown_ui: Arc<dyn Ui> = ui.clone();
-    let remaining = cfg.shutdown_background_work(&shutdown_ui).await;
-    if remaining > 0 {
+    let shutdown = kloop_core::driver::shutdown_session(&cfg, &shutdown_ui).await;
+    let missed = shutdown.missed;
+    if missed > 0 {
         ui.emit(&Event::Note(format!(
-            "{remaining} background task(s) missed the shutdown deadline"
+            "{missed} background task(s) missed the shutdown deadline"
         )));
     }
-    let active_worktree = kloop_core::worktree::finish_active(&cfg).await;
-    if let Some(note) = active_worktree {
+    if let Some(note) = shutdown.worktree {
         ui.emit(&Event::Note(note.trim().to_string()));
     }
 }

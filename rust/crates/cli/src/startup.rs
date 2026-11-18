@@ -27,6 +27,7 @@ use kloop_core::permissions::ProjectPermissionPolicy;
 use kloop_core::permissions::ProjectPolicyRegistry;
 use kloop_core::project::WorkspaceIdentity;
 use kloop_core::session_store::SessionDirs;
+use kloop_core::session_store::SessionStore;
 use kloop_core::shell_env::ShellLoginEnv;
 use kloop_core::shell_programs::ShellOverrides;
 use kloop_core::shell_programs::ShellPrograms;
@@ -976,6 +977,76 @@ fn scheduler_for_session(
         store,
         kloop_core::scheduler::SchedulerTimeZone::from_environment(),
     ))
+}
+
+/// The cwd-bound pieces every session build needs before its `Config` can be
+/// assembled. Server mode builds one per thread and single-session front-ends
+/// build one at startup; both do the same four steps in the same order, and
+/// the order is load-bearing: the session partition is resolved before the
+/// sandbox because the policy carves its offload directory back out of the
+/// otherwise denied private-state root.
+pub(crate) struct WorkspaceSetup {
+    pub(crate) project: context::GatheredContext,
+    pub(crate) session_dirs: SessionDirs,
+    pub(crate) sandbox: Option<Arc<kloop_core::sandbox::SandboxPolicy>>,
+    pub(crate) skills: Arc<Vec<Skill>>,
+}
+
+pub(crate) fn prepare_workspace(
+    args: &CliArgs,
+    cwd: &Path,
+    runtime: &RuntimeSettings,
+    session_store: &SessionStore,
+    identity: &WorkspaceIdentity,
+    warn: &dyn Fn(&str),
+) -> Result<WorkspaceSetup> {
+    let project = if args.mock {
+        context::mock(cwd)
+    } else {
+        context::gather(cwd, runtime.base_system(), identity)
+    };
+    for warning in &project.warnings {
+        warn(warning);
+    }
+    let session_dirs = session_store
+        .ensure_with(identity)
+        .context("cannot create the session directory")?;
+    let sandbox = build_sandbox(args, cwd, runtime, &session_dirs.offload, warn)?;
+    let skills = Arc::new(if args.mock {
+        kloop_core::skills::builtin()
+    } else {
+        let (skills, warnings) = load_skills(cwd);
+        for warning in &warnings {
+            warn(warning);
+        }
+        skills
+    });
+    Ok(WorkspaceSetup {
+        project,
+        session_dirs,
+        sandbox,
+        skills,
+    })
+}
+
+/// Put a built `Config` on the route its session was opened on and bind it to
+/// the session id. `--mock` has no wall-clock provider to reopen on, so it
+/// keeps the configured route and only adopts the session's revision — the
+/// same file, reached without a provider call.
+pub(crate) fn finalize_session_config(
+    args: &CliArgs,
+    cfg: &mut Config,
+    session_route: &kloop_core::provider_route::FrozenProviderRoute,
+    session_id: &str,
+) -> Result<()> {
+    cfg.provider_route = if args.mock {
+        cfg.provider_route
+            .at_revision(session_route.revision())
+            .map_err(anyhow::Error::new)?
+    } else {
+        session_route.clone()
+    };
+    cfg.bind_session(session_id.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]

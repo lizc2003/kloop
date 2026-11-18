@@ -18,6 +18,7 @@ pub mod compact;
 pub mod config;
 pub mod context;
 pub mod diff;
+pub mod driver;
 pub mod event;
 mod execution_provenance;
 mod file_io;

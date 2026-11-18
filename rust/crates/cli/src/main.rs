@@ -44,9 +44,10 @@ use crate::args::parse_args;
 use crate::args::version_string;
 use crate::provider_config::ResolvedProviderSettings;
 use crate::startup::RuntimeSettings;
-use crate::startup::build_sandbox;
+use crate::startup::WorkspaceSetup;
 use crate::startup::config_from_settings;
-use crate::startup::load_skills;
+use crate::startup::finalize_session_config;
+use crate::startup::prepare_workspace;
 use crate::startup::server_config_snapshot;
 use crate::startup::server_skills_snapshot;
 use kloop_core::session_store::SessionDirs;
@@ -223,38 +224,17 @@ impl SessionState {
         session_store: &SessionStore,
         identity: WorkspaceIdentity,
     ) -> Result<Option<Self>> {
-        let project = if args.mock {
-            context::mock(cwd)
-        } else {
-            context::gather(cwd, process.runtime.base_system(), &identity)
-        };
-        for warning in &project.warnings {
-            eprintln!("\x1b[2m[{warning}]\x1b[0m");
-        }
-        // Ahead of the sandbox: the policy carves this project's offload directory
-        // back out of the otherwise denied private state root.
-        let session_dirs = session_store
-            .ensure_with(&identity)
-            .context("cannot create the session directory")?;
-        let sandbox = build_sandbox(
+        let workspace = prepare_workspace(
             args,
             cwd,
             &process.runtime,
-            &session_dirs.offload,
-            |warning| eprintln!("\x1b[2m[{warning}]\x1b[0m"),
+            session_store,
+            &identity,
+            &|warning| eprintln!("\x1b[2m[{warning}]\x1b[0m"),
         )?;
-        let skills = Arc::new(if args.mock {
-            kloop_core::skills::builtin()
-        } else {
-            let (skills, warnings) = load_skills(cwd);
-            for warning in &warnings {
-                eprintln!("\x1b[2m[{warning}]\x1b[0m");
-            }
-            skills
-        });
         let Some((mut history, session_id)) = open_history(
             session_store,
-            &session_dirs,
+            &workspace.session_dirs,
             &args.session,
             &process.provider.initial_route(),
         )?
@@ -286,13 +266,13 @@ impl SessionState {
         };
         Ok(Some(Self {
             identity,
-            project,
-            sandbox,
-            skills,
+            project: workspace.project,
+            sandbox: workspace.sandbox,
+            skills: workspace.skills,
             history,
             session_id,
             session_route,
-            session_dirs,
+            session_dirs: workspace.session_dirs,
             pending_images,
         }))
     }
@@ -466,37 +446,20 @@ fn serve_config_factory(
         } else {
             WorkspaceIdentity::resolve(&options.cwd)
         };
-        let project = if args.mock {
-            context::mock(&options.cwd)
-        } else {
-            context::gather(&options.cwd, runtime.base_system(), &identity)
-        };
-        for warning in &project.warnings {
-            notify(warning);
-        }
-        // Each thread pins its own cwd, so each resolves its own
-        // project partition rather than inheriting the process one.
-        // Resolved before the sandbox because the policy carves the
-        // partition's offload directory back out of the denied store.
-        let session_dirs = session_store.ensure_with(&identity)?;
-        let sandbox = build_sandbox(
+        let workspace = prepare_workspace(
             &args,
             &options.cwd,
             &runtime,
-            &session_dirs.offload,
-            |warning| notify(warning),
+            &session_store,
+            &identity,
+            &|warning| notify(warning),
         )?;
-        // `--mock` skips disk discovery (hermetic) but keeps the
-        // builtins, which are compiled in and touch no filesystem.
-        let skills = Arc::new(if args.mock {
-            kloop_core::skills::builtin()
-        } else {
-            let (skills, warnings) = load_skills(&options.cwd);
-            for warning in &warnings {
-                notify(warning);
-            }
-            skills
-        });
+        let WorkspaceSetup {
+            project,
+            session_dirs,
+            sandbox,
+            skills,
+        } = workspace;
         let mut cfg = config_from_settings(
             &args,
             &provider,
@@ -591,14 +554,12 @@ async fn run_headless_turn(
         cwd,
         &session.session_dirs,
     )?;
-    cfg.provider_route = if args.mock {
-        cfg.provider_route
-            .at_revision(session.session_route.revision())
-            .map_err(anyhow::Error::new)?
-    } else {
-        session.session_route.clone()
-    };
-    cfg.bind_session(session.session_id.clone())?;
+    finalize_session_config(
+        &args,
+        &mut cfg,
+        &session.session_route,
+        &session.session_id,
+    )?;
     // An explicit headless runaway guardrail enables the otherwise-absent cap.
     if let Some(max_rounds) = args.max_rounds {
         cfg.set_max_rounds(Some(max_rounds));
@@ -626,12 +587,13 @@ async fn run_headless_turn(
     )
     .await;
     watcher.abort();
-    let remaining = cfg.shutdown_background_work(&result.ui).await;
-    if remaining > 0 {
-        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+    let shutdown = kloop_core::driver::shutdown_session(&cfg, &result.ui).await;
+    let missed = shutdown.missed;
+    if missed > 0 {
+        eprintln!("warning: {missed} background task(s) missed the shutdown deadline");
     }
     // Tear down the worktree (dirty kept on its branch, clean removed).
-    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+    if let Some(note) = shutdown.worktree {
         eprintln!("{}", note.trim());
     }
     Ok(ExitCode::from(result.code as u8))
@@ -728,8 +690,7 @@ async fn run_tui(
                 &cwd,
                 &session_dirs,
             )?;
-            cfg.provider_route = session_route.clone();
-            cfg.bind_session(factory_session_id.clone())?;
+            finalize_session_config(&args, &mut cfg, &session_route, &factory_session_id)?;
             Ok(cfg)
         },
         startup,

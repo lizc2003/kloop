@@ -26,6 +26,7 @@ use crate::context;
 use crate::provider_config::ResolvedProviderSettings;
 use crate::startup::RuntimeSettings;
 use crate::startup::config_from_settings;
+use crate::startup::finalize_session_config;
 use crate::ui::CliApprover;
 use crate::ui::StdoutUi;
 
@@ -225,14 +226,7 @@ async fn plain_main(
         &cwd,
         &session_dirs,
     )?;
-    cfg.provider_route = if args.mock {
-        cfg.provider_route
-            .at_revision(session_route.revision())
-            .map_err(anyhow::Error::new)?
-    } else {
-        session_route
-    };
-    cfg.bind_session(session_id.clone())?;
+    finalize_session_config(&args, &mut cfg, &session_route, &session_id)?;
     let mut cfg = Arc::new(cfg);
     let mut provider_state = kloop_core::provider_route::SessionProviderState::from_timeline(
         Arc::clone(&cfg.provider_catalog),
@@ -249,7 +243,7 @@ async fn plain_main(
             "\n--- mock run: {:?} after {} round(s) ---",
             outcome.reason, outcome.rounds
         );
-        let _ = cfg.shutdown_background_work(&ui).await;
+        let _ = kloop_core::driver::shutdown_session(&cfg, &ui).await;
         return Ok(());
     }
 
@@ -419,13 +413,14 @@ async fn plain_main(
             break;
         }
     }
-    let remaining = cfg.shutdown_background_work(&ui).await;
-    if remaining > 0 {
-        eprintln!("warning: {remaining} background task(s) missed the shutdown deadline");
+    let shutdown = kloop_core::driver::shutdown_session(&cfg, &ui).await;
+    let missed = shutdown.missed;
+    if missed > 0 {
+        eprintln!("warning: {missed} background task(s) missed the shutdown deadline");
     }
     // Tear down the session worktree on exit (dirty kept on its branch, clean
     // removed); the kept-tree note tells the user where its changes live.
-    if let Some(note) = kloop_core::worktree::finish_active(&cfg).await {
+    if let Some(note) = shutdown.worktree {
         println!("{}", note.trim());
     }
     match input_error {

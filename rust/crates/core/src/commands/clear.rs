@@ -66,9 +66,10 @@ pub async fn replace_session(
     ui: &Arc<dyn Ui>,
 ) -> anyhow::Result<(Config, Vec<String>)> {
     let fresh = old.fresh_session(session_id)?;
-    let running = old.background_executions.running_count() + old.background_shells.running_count();
-    let missed = old.shutdown_background_work(ui).await;
+    let shutdown = crate::driver::shutdown_session(old, ui).await;
     let mut report = Vec::new();
+    let running = shutdown.running;
+    let missed = shutdown.missed;
     if running > 0 {
         report.push(format!("stopped {running} background task(s)"));
     }
@@ -77,7 +78,7 @@ pub async fn replace_session(
             "{missed} background task(s) missed the shutdown deadline"
         ));
     }
-    if let Some(note) = crate::worktree::finish_active(old).await {
+    if let Some(note) = shutdown.worktree {
         report.push(note);
     }
     Ok((fresh, report))
