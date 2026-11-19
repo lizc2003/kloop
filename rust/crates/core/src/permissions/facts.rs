@@ -1211,10 +1211,7 @@ fn is_stream_device(path: &Path) -> bool {
     )
 }
 
-/// 一个临时根：`canonical` 是删除落点要严格落在其内的规范路径；`entries` 是通向它的目录项的
-/// 各种拼写（词法归一的原拼写、原拼写的父目录物理解析后接上自己的名字、规范路径）。`$TMPDIR` 本身
-/// 可能是符号链接，只留规范路径时，删掉链接所在的上级目录就认不出是在删会话正用着的临时目录入口
-/// （第二、三轮复审 P3）。
+/// `canonical` 是临时根的真实落点，`entries` 记录解析时必须存在的目录项。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ScratchRoot {
     pub(super) canonical: PathBuf,
@@ -1245,13 +1242,9 @@ pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) ->
         if too_wide {
             continue;
         }
-        let spelled = crate::paths::lexically_normalize(Path::new("/"), candidate);
-        // 目录项的真实位置按原拼写的父目录物理解析：先经过符号链接再走 `..`。先词法折叠 `..` 会把
-        // `/tmp/a/link/../T` 算成 `/tmp/a/T`，漏掉链接后面真正的上级目录（第三轮复审 P3）。
-        let through_parent = candidate
-            .parent()
-            .zip(candidate.file_name())
-            .and_then(|(parent, name)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
+        let Some(entries) = scratch_path_entries(candidate) else {
+            return Vec::new();
+        };
         let index = match roots.iter().position(|root| root.canonical == canonical) {
             Some(index) => index,
             None => {
@@ -1262,13 +1255,44 @@ pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) ->
                 roots.len() - 1
             }
         };
-        for entry in std::iter::once(spelled).chain(through_parent) {
+        for entry in entries {
             if !roots[index].entries.contains(&entry) {
                 roots[index].entries.push(entry);
             }
         }
     }
     roots
+}
+
+/// 按原路径逐个查找前缀，再查找链接目标的前缀。先物理解析父目录才能定位链接本身，
+/// 包括后面还会经过 `..` 或继续走另一个链接的目录项。
+fn scratch_path_entries(path: &Path) -> Option<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    let mut pending = vec![std::path::absolute(path).ok()?];
+    while let Some(path) = pending.pop() {
+        for prefix in path
+            .ancestors()
+            .filter(|prefix| prefix.file_name().is_some())
+        {
+            let entry = physical_entry(prefix)?;
+            if entries.contains(&entry) {
+                continue;
+            }
+            if std::fs::symlink_metadata(&entry).ok()?.is_symlink() {
+                pending.push(entry.parent()?.join(std::fs::read_link(&entry).ok()?));
+            }
+            entries.push(entry);
+        }
+    }
+    Some(entries)
+}
+
+fn physical_entry(path: &Path) -> Option<PathBuf> {
+    Some(
+        std::fs::canonicalize(path.parent()?)
+            .ok()?
+            .join(path.file_name()?),
+    )
 }
 
 /// 一个 `rm` 操作数是否只是临时目录里的东西：字面绝对路径（不含未知片段、glob 与花括号），
@@ -1282,10 +1306,17 @@ pub(super) fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[Scratch
     let facts = PathFacts::gather_in(Path::new(raw), root, None);
     let holds_workspace =
         root.canonical.starts_with(&facts.normalized) || root.cwd.starts_with(&facts.original);
+    let entry = physical_entry(Path::new(raw));
     let holds_scratch_root = roots
         .iter()
         .flat_map(|scratch| &scratch.entries)
-        .any(|entry| entry.starts_with(&facts.normalized) || entry.starts_with(&facts.original));
+        .any(|required| {
+            required.starts_with(&facts.normalized)
+                || required.starts_with(&facts.original)
+                || entry
+                    .as_ref()
+                    .is_some_and(|entry| required.starts_with(entry))
+        });
     facts.resolved
         && !facts.inside_cwd
         && !facts.original.starts_with(root.cwd)

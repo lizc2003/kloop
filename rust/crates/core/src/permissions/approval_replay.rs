@@ -256,16 +256,19 @@ fn denial_from_prefix(line: &str) -> Option<SandboxDenial> {
         _ => DenialKind::Unclassified,
     };
     let evidence = evidence.trim_end_matches(']').to_string();
-    let paths = match evidence.split_once(' ') {
+    let writes = match evidence.split_once(' ') {
         Some((operation, path)) if operation.starts_with("file-write") && path.starts_with('/') => {
-            vec![PathBuf::from(path)]
+            vec![crate::sandbox::WriteDenial {
+                operation: operation.into(),
+                path: path.into(),
+            }]
         }
         _ => Vec::new(),
     };
     Some(SandboxDenial {
         kind,
         evidence,
-        paths,
+        writes,
     })
 }
 
@@ -438,15 +441,15 @@ async fn replay_escalation(
                     .filter(|programs| !programs.is_empty()),
             })
         }
-        Some(denial) if denial.kind == DenialKind::Write && !denial.paths.is_empty() => {
+        Some(denial) if denial.kind == DenialKind::Write && !denial.writes.is_empty() => {
             let mut dirs: Vec<PathBuf> = Vec::new();
-            for dir in denial.paths.iter().filter_map(|path| {
+            for dir in denial.writes.iter().filter_map(|write| {
                 super::proposed_write_dir(
-                    path,
+                    &write.path,
                     home.as_deref(),
                     |name| std::env::var_os(name),
                     |dir| policy.already_decides_writes(dir),
-                    |path| policy.guards_rename(path),
+                    |path| write.is_unlink() && policy.guards_rename(path),
                 )
             }) {
                 if grants
@@ -641,7 +644,7 @@ async fn approval_replay() {
                         kind.map(|kind| SandboxDenial {
                             kind,
                             evidence: "assumed".into(),
-                            paths: Vec::new(),
+                            writes: Vec::new(),
                         })
                     };
                     let mut denials = call
@@ -818,11 +821,17 @@ fn recorded_denials_read_widenings_and_hints() {
     assert_eq!(
         recorded_denials(widened)
             .into_iter()
-            .map(|denial| denial.map(|denial| (denial.kind, denial.paths)))
+            .map(|denial| denial.map(|denial| (denial.kind, denial.writes)))
             .collect::<Vec<_>>(),
         vec![
             Some((DenialKind::Network, Vec::new())),
-            Some((DenialKind::Write, vec![PathBuf::from("/opt/out/a")])),
+            Some((
+                DenialKind::Write,
+                vec![crate::sandbox::WriteDenial {
+                    operation: "file-write-create".into(),
+                    path: "/opt/out/a".into(),
+                }]
+            )),
             Some((DenialKind::Nested, Vec::new())),
         ]
     );

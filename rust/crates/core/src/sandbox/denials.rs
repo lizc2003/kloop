@@ -17,6 +17,7 @@ use tokio::io::AsyncBufReadExt;
 
 use super::DenialKind;
 use super::SandboxDenial;
+use super::WriteDenial;
 
 /// How long `log stream` gets to print its first line before the call goes
 /// ahead without it (and falls back to reading its output).
@@ -84,17 +85,20 @@ pub(crate) fn classify_logged(denials: &[LoggedDenial]) -> Option<SandboxDenial>
         })
         .collect();
     if let Some(first) = writes.first() {
-        let mut paths: Vec<PathBuf> = Vec::new();
-        for denial in &writes {
-            let path = PathBuf::from(&denial.target);
-            if !denial.target.is_empty() && !paths.contains(&path) {
-                paths.push(path);
+        let mut targets = Vec::new();
+        for denial in writes.iter().filter(|denial| !denial.target.is_empty()) {
+            let write = WriteDenial {
+                operation: denial.operation.clone(),
+                path: PathBuf::from(&denial.target),
+            };
+            if !targets.contains(&write) {
+                targets.push(write);
             }
         }
         return Some(SandboxDenial {
             kind: DenialKind::Write,
             evidence: super::clip_evidence(&first.evidence()),
-            paths,
+            writes: targets,
         });
     }
     let first_of = |prefix: &str| {
@@ -106,13 +110,13 @@ pub(crate) fn classify_logged(denials: &[LoggedDenial]) -> Option<SandboxDenial>
         return Some(SandboxDenial {
             kind: DenialKind::Network,
             evidence: super::clip_evidence(&network.evidence()),
-            paths: Vec::new(),
+            writes: Vec::new(),
         });
     }
     first_of("file-read").map(|read| SandboxDenial {
         kind: DenialKind::Read,
         evidence: super::clip_evidence(&read.evidence()),
-        paths: Vec::new(),
+        writes: Vec::new(),
     })
 }
 
@@ -227,13 +231,16 @@ mod tests {
             Some(SandboxDenial {
                 kind: DenialKind::Network,
                 evidence: "network-outbound /private/var/run/mDNSResponder".into(),
-                paths: Vec::new(),
+                writes: Vec::new(),
             })
         );
         events.push(logged(
             "Sandbox: cp(3) deny(1) file-write-create /opt/out/a",
         ));
         events.push(logged("Sandbox: cp(3) deny(1) file-write-data /opt/out/b"));
+        events.push(logged(
+            "Sandbox: cp(3) deny(1) file-write-unlink /opt/out/b",
+        ));
         events.push(logged(
             "Sandbox: cp(3) deny(1) file-write-create /opt/out/a",
         ));
@@ -242,7 +249,20 @@ mod tests {
             Some(SandboxDenial {
                 kind: DenialKind::Write,
                 evidence: "file-write-create /opt/out/a".into(),
-                paths: vec![PathBuf::from("/opt/out/a"), PathBuf::from("/opt/out/b")],
+                writes: vec![
+                    WriteDenial {
+                        operation: "file-write-create".into(),
+                        path: "/opt/out/a".into()
+                    },
+                    WriteDenial {
+                        operation: "file-write-data".into(),
+                        path: "/opt/out/b".into()
+                    },
+                    WriteDenial {
+                        operation: "file-write-unlink".into(),
+                        path: "/opt/out/b".into()
+                    },
+                ],
             })
         );
         assert_eq!(

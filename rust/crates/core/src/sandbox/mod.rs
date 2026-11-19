@@ -281,15 +281,17 @@ impl SandboxPolicy {
         let mut policy = self.clone();
         policy.allow_network |= grants.network;
         for dir in &grants.writable {
-            push_root_aliases(&mut policy.writable_roots, dir, WritableRootOrigin::Granted);
+            if crate::permissions::usable_write_grant(dir) {
+                // 审批用的是物理落点。写入 profile 的仍是该路径，不再追加解析出的别名。
+                push_writable_root(&mut policy.writable_roots, dir, WritableRootOrigin::Granted);
+            }
         }
         policy
     }
 
     /// Whether the profile pins `path`'s directory entry against rename and
     /// unlink — an ancestor of a denied write path, or of a protected subpath
-    /// inside a writable root. A write refused there is that guard, and no
-    /// writable-root grant lifts it (plan 287, third review).
+    /// inside a writable root.
     pub(crate) fn guards_rename(&self, path: &Path) -> bool {
         rename_guards(self, &protected_subpaths_by_root(self))
             .iter()
@@ -507,17 +509,21 @@ fn push_root_aliases(roots: &mut Vec<WritableRoot>, path: &Path, origin: Writabl
         path.to_path_buf(),
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
     ] {
-        if let Some(existing) = roots.iter_mut().find(|root| root.root == candidate) {
-            if !existing.origins.contains(&origin) {
-                existing.origins.push(origin);
-            }
-        } else {
-            roots.push(WritableRoot {
-                read_only_subpaths: protected_subpaths(&candidate),
-                root: candidate,
-                origins: vec![origin],
-            });
+        push_writable_root(roots, &candidate, origin);
+    }
+}
+
+fn push_writable_root(roots: &mut Vec<WritableRoot>, path: &Path, origin: WritableRootOrigin) {
+    if let Some(existing) = roots.iter_mut().find(|root| root.root == path) {
+        if !existing.origins.contains(&origin) {
+            existing.origins.push(origin);
         }
+    } else {
+        roots.push(WritableRoot {
+            read_only_subpaths: protected_subpaths(path),
+            root: path.to_path_buf(),
+            origins: vec![origin],
+        });
     }
 }
 
@@ -846,9 +852,20 @@ impl DenialKind {
 pub struct SandboxDenial {
     pub kind: DenialKind,
     pub evidence: String,
-    /// The paths a write was refused on, when the system log says (plan 283
-    /// stage 2a); empty for a denial read off the output.
-    pub paths: Vec<PathBuf>,
+    /// The refused operations and their paths from the system log.
+    pub writes: Vec<WriteDenial>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteDenial {
+    pub operation: String,
+    pub path: PathBuf,
+}
+
+impl WriteDenial {
+    pub(crate) fn is_unlink(&self) -> bool {
+        self.operation == "file-write-unlink"
+    }
 }
 
 /// The command tried to start a sandbox of its own. That refusal is a built-in
@@ -861,7 +878,7 @@ pub fn nested_sandbox_denial(output: &str) -> Option<SandboxDenial> {
         .map(|line| SandboxDenial {
             kind: DenialKind::Nested,
             evidence: clip_evidence(line.trim()),
-            paths: Vec::new(),
+            writes: Vec::new(),
         })
 }
 
@@ -1019,7 +1036,7 @@ fn classify_lines(
         return Some(SandboxDenial {
             kind,
             evidence: clip_evidence(line.trim()),
-            paths: Vec::new(),
+            writes: Vec::new(),
         });
     }
     None
@@ -1189,7 +1206,7 @@ mod tests {
             Some(SandboxDenial {
                 kind: DenialKind::Write,
                 evidence: "mkdir: /x/y: Operation not permitted".into(),
-                paths: Vec::new(),
+                writes: Vec::new(),
             })
         );
         assert_eq!(
@@ -1508,7 +1525,7 @@ mod tests {
         let denial = SandboxDenial {
             kind: DenialKind::Network,
             evidence: "bind: operation not permitted".to_string(),
-            paths: Vec::new(),
+            writes: Vec::new(),
         };
         for (approval, source) in [
             (EscalationApproval::User, "after user approval"),

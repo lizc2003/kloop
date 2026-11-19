@@ -679,13 +679,13 @@ fn capability_request(
         sandbox::DenialKind::Write => {
             let home = std::env::home_dir();
             let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-            for path in &denial.paths {
+            for write in &denial.writes {
                 let Some(dir) = crate::permissions::proposed_write_dir(
-                    path,
+                    &write.path,
                     home.as_deref(),
                     |name| std::env::var_os(name),
                     |dir| policy.already_decides_writes(dir),
-                    |path| policy.guards_rename(path),
+                    |path| write.is_unlink() && policy.guards_rename(path),
                 ) else {
                     continue;
                 };
@@ -1117,6 +1117,40 @@ mod tests {
     use std::path::Path;
     #[cfg(unix)]
     use std::sync::Arc;
+
+    #[cfg(unix)]
+    #[test]
+    fn plan287_only_unlink_denials_hit_rename_guards() {
+        use crate::permissions::CapabilityRequest;
+        use crate::sandbox::{DenialKind, SandboxDenial, SandboxPolicy, WriteDenial};
+
+        let root = Path::new("/opt/kloop-plan287-cache");
+        let target = root.join("entry");
+        let policy = SandboxPolicy::workspace(Path::new("/workspace"), &[], false)
+            .with_denied_write_path(&target.join("locked"));
+        for (operation, expected) in [
+            ("file-write-unlink", None),
+            ("file-write-mode", Some(vec![root.to_path_buf()])),
+        ] {
+            let denial = SandboxDenial {
+                kind: DenialKind::Write,
+                evidence: format!("{operation} {}", target.display()),
+                writes: vec![WriteDenial {
+                    operation: operation.into(),
+                    path: target.clone(),
+                }],
+            };
+            let offered = super::capability_request(&denial, &policy, "chmod", None);
+            assert_eq!(
+                offered.map(|request| match request {
+                    CapabilityRequest::Write { dirs } => dirs,
+                    CapabilityRequest::Network { .. } => panic!("expected a write offer"),
+                }),
+                expected,
+                "{operation}"
+            );
+        }
+    }
 
     /// Plan 266: the executor's sandbox is the gate's plan, read verbatim. A
     /// `Contained` verdict always means the workspace policy; every other plan

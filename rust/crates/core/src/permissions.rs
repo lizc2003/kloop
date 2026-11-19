@@ -71,6 +71,7 @@ pub(crate) use capability::CapabilityRequest;
 #[cfg(test)]
 use capability::grantable_write_dir;
 pub(crate) use capability::proposed_write_dir;
+pub(crate) use capability::usable_write_grant;
 pub(crate) use describe::network_programs;
 mod describe;
 mod facts;
@@ -4393,7 +4394,7 @@ mod tests {
         let denial = crate::sandbox::SandboxDenial {
             kind: crate::sandbox::DenialKind::Network,
             evidence: "listen tcp6 [::1]:0: bind: operation not permitted".to_string(),
-            paths: Vec::new(),
+            writes: Vec::new(),
         };
         p.escalate_sandbox("go test ./pkg", Some(&denial), 0).await;
         let notice = approver.asked()[0]

@@ -257,7 +257,8 @@ fn plan286_a_tmpdir_spelled_through_a_link_and_dotdot_is_guarded() {
     let text = |path: &Path| path.to_str().unwrap().to_string();
     for (operand, scratch) in [
         (text(&base.join("other")), false),
-        (text(&base.join("a")), true),
+        (text(&base.join("a")), false),
+        (text(&base.join("sibling")), true),
         (text(&elsewhere.join("probe.log")), true),
     ] {
         assert_eq!(

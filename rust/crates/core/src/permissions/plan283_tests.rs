@@ -87,7 +87,7 @@ async fn plan283_the_escalation_records_questions_and_the_memories_that_answer_t
     let denial = crate::sandbox::SandboxDenial {
         kind: crate::sandbox::DenialKind::Nested,
         evidence: "sandbox-exec: sandbox_apply: Operation not permitted".into(),
-        paths: Vec::new(),
+        writes: Vec::new(),
     };
     let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::Project)]);
     let p = gate_with_writer(Mode::Manual, approver, ScriptedWriter::succeeding());
@@ -402,7 +402,7 @@ async fn plan283_the_gate_carries_remembered_capabilities_into_the_verdict() {
     let denial = crate::sandbox::SandboxDenial {
         kind: crate::sandbox::DenialKind::Network,
         evidence: "network-outbound /private/var/run/mDNSResponder".into(),
-        paths: Vec::new(),
+        writes: Vec::new(),
     };
     let request = CapabilityRequest::Network { programs: None };
     let escalation = p.escalate_capability("wget -q x", &denial, &request, 0).await;
@@ -428,7 +428,7 @@ async fn plan283_capability_questions_offer_their_scopes_and_write_their_rules()
     let denial = |kind| crate::sandbox::SandboxDenial {
         kind,
         evidence: "evidence".into(),
-        paths: Vec::new(),
+        writes: Vec::new(),
     };
     let approver = ScriptedApprover::new(vec![
         Decision::Allow(ApprovalScope::Project),
@@ -544,7 +544,7 @@ async fn plan283_a_capability_granted_meanwhile_is_not_asked_again() {
     let network_denial = crate::sandbox::SandboxDenial {
         kind: crate::sandbox::DenialKind::Network,
         evidence: "network-outbound /private/var/run/mDNSResponder".into(),
-        paths: Vec::new(),
+        writes: Vec::new(),
     };
     let approver = ScriptedApprover::new(vec![Decision::Allow(ApprovalScope::WorkspaceSession)]);
     let p = gate(Mode::Manual, rules(&["sandbox_write(/opt)"], &[], &[]), approver.clone());
@@ -566,7 +566,10 @@ async fn plan283_a_capability_granted_meanwhile_is_not_asked_again() {
     let write_denial = crate::sandbox::SandboxDenial {
         kind: crate::sandbox::DenialKind::Write,
         evidence: "file-write-create /opt/out/a".into(),
-        paths: vec![std::path::PathBuf::from("/opt/out/a")],
+        writes: vec![crate::sandbox::WriteDenial {
+            operation: "file-write-create".into(),
+            path: PathBuf::from("/opt/out/a"),
+        }],
     };
     let write = CapabilityRequest::Write {
         dirs: vec![std::path::PathBuf::from("/opt/out")],

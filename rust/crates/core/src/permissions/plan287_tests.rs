@@ -1,7 +1,8 @@
 // plan 287：写入被拒落在已知的工具缓存里时提议整个缓存根，其它情况照旧提议父目录。
 
 fn plan287_home(label: &str) -> PathBuf {
-    std::env::temp_dir()
+    std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
         .join(crate::resource_id::fresh(label).unwrap())
         .join("home")
 }
@@ -263,7 +264,7 @@ fn plan287_an_aliased_candidate_is_judged_where_it_lands() {
             |_| false,
             |_| false
         ),
-        Some(to_home.join("_cacache/tmp"))
+        Some(home.join("_cacache/tmp"))
     );
     assert!(!grantable_write_dir(&to_home, Some(&home)));
     // 落在 `/` 上的链接本身不能授权；被拒文件直接在它下面时什么都不提议。
@@ -301,10 +302,13 @@ fn plan287_an_unnameable_parent_still_lifts_to_the_cache_root() {
         proposed_write_dir(&home.join("out[1]/x.o"), Some(&home), plan287_vars(&[]), |_| false, |_| false),
         None
     );
+    assert_eq!(
+        proposed_write_dir(Path::new("relative/out"), Some(&home), plan287_vars(&[]), |_| false, |_| false),
+        None
+    );
 }
 
-/// 记住的 `sandbox_write(<dir>)` 每次生效时都会被重新解析：目录后来变成指向家目录的链接时，这条授权
-/// 不再进 `Verdict`，也不算“已记住”（第三轮复审 P2）。正常目录照旧生效。
+/// 已记住的目录不能改指任意新位置。沙箱应用 verdict 时还要处理在途的目录变化。
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn plan287_a_remembered_grant_that_now_leads_home_is_dropped() {
@@ -316,11 +320,15 @@ async fn plan287_a_remembered_grant_that_now_leads_home_is_dropped() {
     std::fs::create_dir_all(&kept).unwrap();
     let moved = base.join("moved-cache");
     std::os::unix::fs::symlink(&home, &moved).unwrap();
+    let redirected = base.join("redirected-cache");
+    let unrelated = base.join("ordinary-dir");
+    std::fs::create_dir(&unrelated).unwrap();
+    std::os::unix::fs::symlink(&unrelated, &redirected).unwrap();
     let rule = |dir: &Path| format!("sandbox_write({})", dir.display());
     let approver = ScriptedApprover::new(vec![]);
     let p = gate(
         Mode::Manual,
-        rules(&[&rule(&kept), &rule(&moved)], &[], &[]),
+        rules(&[&rule(&kept), &rule(&moved), &rule(&redirected)], &[], &[]),
         approver.clone(),
     );
     let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false);
@@ -335,11 +343,25 @@ async fn plan287_a_remembered_grant_that_now_leads_home_is_dropped() {
         .await
         .unwrap();
     assert_eq!(verdict.grants.writable, vec![kept.clone()]);
+    let refuses = |policy: &crate::sandbox::SandboxPolicy, path: &Path| {
+        !policy.already_decides_writes(path)
+    };
+    // 用独立的策略判断这次授权贡献的根，避免测试进程本来就能写临时目录。
+    let ungranted = crate::sandbox::SandboxPolicy {
+        writable_roots: Vec::new(),
+        ..policy
+    };
+    assert!(!refuses(&ungranted.with_grants(&verdict.grants), &kept));
+    std::fs::rename(&kept, base.join("old-cache")).unwrap();
+    std::os::unix::fs::symlink(&unrelated, &kept).unwrap();
+    let applied = ungranted.with_grants(&verdict.grants);
+    assert!(refuses(&applied, &kept));
+    assert!(refuses(&applied, &unrelated));
 
     let denial = crate::sandbox::SandboxDenial {
         kind: crate::sandbox::DenialKind::Write,
         evidence: "file-write-create".into(),
-        paths: Vec::new(),
+        writes: Vec::new(),
     };
     let covered_by_moved = CapabilityRequest::Write {
         dirs: vec![moved.join("sub")],

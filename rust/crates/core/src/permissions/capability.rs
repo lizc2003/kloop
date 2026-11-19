@@ -88,10 +88,11 @@ impl CapabilityRequest {
 }
 
 /// Whether bash may be offered writes to `dir`: a rule can name it (see
-/// [`nameable_dir`]) and granting it is safe (see [`safe_to_grant`]). The
+/// [`nameable_dir`]) and granting it is safe (see [`safe_write_target`]). The
 /// sandbox's own write denies still apply on top of any grant.
-pub(crate) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
-    nameable_dir(dir) && safe_to_grant(dir, home)
+#[cfg(test)]
+pub(super) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
+    nameable_dir(dir) && safe_write_target(dir, home).is_some_and(|target| nameable_dir(&target))
 }
 
 /// 能写成 `sandbox_write(<dir>)` 规则：UTF-8 的绝对路径，不含 glob 字符和换行。
@@ -102,36 +103,30 @@ fn nameable_dir(dir: &Path) -> bool {
             .is_some_and(|text| !text.contains(['*', '?', '[', ']', '{', '}', '\n', '\r']))
 }
 
-/// 授权它不会把不该放的放出去：原拼写和解析后的落点都要过，因为授权时 `with_grants` 两种都会加进
-/// 可写根（复审 P2：只解析家目录、不解析候选目录时，指向家目录或 `/` 的链接能混过去）。每种形式都
-/// 不是 `/`，不是家目录或其祖先（家目录同样按原拼写和解析后两种比，`$HOME` 可能经过符号链接），也
-/// 不碰权限层视为敏感的目录（`.git`、`.kloop`、凭据目录）。解析失败（断链、权限错误）不授权。
-fn safe_to_grant(dir: &Path, home: Option<&Path>) -> bool {
-    let Some(resolved) = resolve_nearest_existing(dir) else {
-        return false;
-    };
+/// 核对原拼写和真实落点的敏感性，交回之后用于审批和沙箱的同一个落点。
+fn safe_write_target(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if !dir.is_absolute() {
+        return None;
+    }
+    let resolved = resolve_nearest_existing(dir)?;
     let homes: Vec<PathBuf> = home
         .into_iter()
         .flat_map(|home| std::iter::once(home.to_path_buf()).chain(resolve_nearest_existing(home)))
         .collect();
-    [dir, resolved.as_path()].into_iter().all(|form| {
+    let safe = [dir, resolved.as_path()].into_iter().all(|form| {
+        let probe = form.join("kloop-grant-probe");
         form.parent().is_some()
             && !homes.iter().any(|home| home.starts_with(form))
-            && PathFacts::gather_with_resolved(
-                &form.join("kloop-grant-probe"),
-                Path::new("/"),
-                None,
-            )
-            .sensitivity(Access::Write)
-            .is_none()
-    })
+            && PathFacts::gather_with_resolved(&probe, Path::new("/"), Some(&probe))
+                .sensitivity(Access::Write)
+                .is_none()
+    });
+    safe.then_some(resolved)
 }
 
-/// 记在项目里的 `sandbox_write(<dir>)` 现在还能不能用：规则只存了路径，每次生效时 `with_grants`
-/// 都重新解析它，所以提议时做过的检查在使用时再做一遍。目录后来变成指向家目录、`/` 或敏感目录的
-/// 链接时，这条授权不再生效，也不算“已记住”（第三轮复审 P2）。
-pub(super) fn usable_write_grant(dir: &Path) -> bool {
-    safe_to_grant(dir, std::env::home_dir().as_deref())
+/// 已同意的路径需仍指向同一个落点。旧规则若记的是别名，重新触发审批时会提议真实落点。
+pub(crate) fn usable_write_grant(dir: &Path) -> bool {
+    safe_write_target(dir, std::env::home_dir().as_deref()).is_some_and(|target| target == dir)
 }
 
 /// 被拒写入要提议授权的目录（plan 287）：落在已知的工具缓存里时提议整个缓存根，下一个依赖、
@@ -140,8 +135,7 @@ pub(super) fn usable_write_grant(dir: &Path) -> bool {
 /// 已在可写根里）；被拒路径的目录条目被改名保护固定住（它是禁写路径或受保护子路径的祖先，拒绝的正是
 /// 改名）；父目录授权出去不安全（三轮复审 P2）。父目录只是写不成规则（名字里有 glob 字符）时仍可由
 /// 缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
-/// `decided` 是策略的 `already_decides_writes`，`rename_guarded` 是它的 `guards_rename`；`var` 读
-/// kloop 自己的环境（bash 子进程继承它）。测试里都换成固定值。
+/// `rename_guarded` 由调用方按本次拒绝的操作查询，其他写操作仍可提议授权。
 pub(crate) fn proposed_write_dir(
     path: &Path,
     home: Option<&Path>,
@@ -150,18 +144,21 @@ pub(crate) fn proposed_write_dir(
     rename_guarded: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     let parent = path.parent()?;
-    if decided(path) || rename_guarded(path) || decided(parent) || !safe_to_grant(parent, home) {
+    if decided(path) || rename_guarded(path) || decided(parent) {
         return None;
     }
+    let target = safe_write_target(parent, home)?;
     let cache_root = home.and_then(|home| {
-        tool_cache_roots(home, &var).into_iter().find(|root| {
-            path.starts_with(root)
-                && path != root
-                && grantable_write_dir(root, Some(home))
-                && !decided(root)
+        tool_cache_roots(home, &var).into_iter().find_map(|root| {
+            if !path.starts_with(&root) || path == root || decided(&root) {
+                return None;
+            }
+            let resolved = safe_write_target(&root, Some(home))?;
+            (target.starts_with(&resolved) && nameable_dir(&resolved) && !decided(&resolved))
+                .then_some(resolved)
         })
     });
-    cache_root.or_else(|| nameable_dir(parent).then(|| parent.to_path_buf()))
+    cache_root.or_else(|| nameable_dir(&target).then_some(target))
 }
 
 /// 包管理器按包分目录的缓存根。每个根给出原拼写和规范化后的两种形式：日志里的被拒路径是真实
