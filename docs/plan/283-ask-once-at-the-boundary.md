@@ -602,7 +602,7 @@ kloop 沙箱内同样 1390 过（真实 seatbelt 用例跳过）。
 1. ✅（见下面“核实与处理”）kloop 项目里的 `sandbox_escalate(cargo test *)`、`sandbox_escalate(cargo fmt *)`：先核实
    `kloop-process-spawn` 现在能不能在 kloop 沙箱内通过，再由用户决定删不删（规则在用户本机的权限文件里）。
    要不要让 kloop 自己发现这类"沙箱内其实能跑"的旧规则，仍待定。
-2. `rm` 的目标都是 `/tmp`、`$TMPDIR` 下的字面路径时，不再当危险命令（沙箱本来就允许写这些地方）；工作区内
+2. ✅（plan 286）`rm` 的目标都是 `/tmp`、`$TMPDIR` 下的字面路径时，不再当危险命令（沙箱本来就允许写这些地方）；工作区内
    被 gitignore 的临时产物要不要也放过，单独问。
 3. `KLOOP_REQUIRE_SEATBELT_TESTS` 把 `0`、`false` 当成未设置，或在 `AGENTS.md` 写明只认 `1`。
 4. 输出里引用的拒绝文本：有日志、日志又没有事件时，系统拒绝文本还要不要单独成为证据。要在"日志丢事件"

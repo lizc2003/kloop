@@ -1484,6 +1484,11 @@ irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
 `shred`, and any of them behind `sudo`. `git clean -fdx` and `git reset --hard`
 are deliberately absent: inside a repository those are the recovery path.
 设备输出（`… > /dev/sda`）由固定输出路径检查强制确认；动态目标仍 opaque。
+同一条标准也划出了一个例外（plan 286）：`rm` 的每个操作数都是不含变量、glob、花括号的字面
+绝对路径，解析到真实落点后严格在 `/tmp` 或 `$TMPDIR` 之内（不是这两个根本身），且不在工作区里、
+不是敏感路径时，删的只是一次性的探针和日志，不算危险命令。`$TMPDIR` 是 `/`、家目录或其祖先时不算
+临时目录；操作数后面再跟选项（BSD 与 GNU 语义不同）、命令里出现 `sudo`/`doas`、xargs 与循环绑定
+这些带未知值的视图，都照旧确认。只在 Unix 上生效。
 
 **Rules** are split by lifetime. Global `~/.kloop/config.toml` provides only
 process-wide constraints:
@@ -4045,7 +4050,7 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   whose parse failed, or that hit the node/wrapper limit, keeps the asking
   layers: bash still executes the lines it did parse, and missing facts must not
   be read as safety. Deny rules, safety checks (a visible
-  `rm -rf` still confirms) and explicit ask rules stay in force above it.
+  `rm -rf` outside the temp directories still confirms) and explicit ask rules stay in force above it.
   The accepted trade-off: a contained command can still modify the workspace
   without a prompt — protected `.git` internals aside, git history is the
   recovery path. `trust_sandboxed = false` reverts to pure containment (approve

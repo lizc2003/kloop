@@ -1532,6 +1532,7 @@ mod tests {
     include!("permissions/plan283_tests.rs");
     include!("permissions/plan284_tests.rs");
     include!("permissions/plan285_tests.rs");
+    include!("permissions/plan286_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;
@@ -4175,10 +4176,11 @@ mod tests {
         );
         assert_eq!(approver.ask_count(), 0, "deny is a verdict, not a question");
 
+        // 删的是工作区里的目录；只删临时目录的 `rm` 不算危险（plan 286）。
         let approver = ScriptedApprover::new(vec![Decision::Deny]);
         let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
         assert!(
-            p.check_call("bash", &bash("rm -rf /tmp/x"), 0, true)
+            p.check_call("bash", &bash("rm -rf build"), 0, true)
                 .await
                 .is_err()
         );

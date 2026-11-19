@@ -61,6 +61,9 @@ pub(crate) struct CallFacts {
     /// Present only when the bash analysis gave up: with no argv to key on, the
     /// script's own text is what rules and session memories are written about.
     pub(super) opaque_script: Option<OpaqueScript>,
+    /// 判断 `rm` 的目标是否只在临时目录里（plan 286）要用到的工作目录。
+    cwd: PathBuf,
+    canonical_cwd: PathBuf,
 }
 
 /// An unparseable bash script kept whole.
@@ -276,7 +279,57 @@ impl CallFacts {
             removing_worktree: name == "exit_worktree"
                 && input["action"].as_str() == Some("remove"),
             opaque_script,
+            cwd: cwd.to_path_buf(),
+            canonical_cwd: canonical,
         }
+    }
+
+    /// 危险命令判定，直接执行的 argv 和剥掉包装器后的各个视图都看。只清理临时目录的
+    /// `rm` 不算（plan 286），但整条命令里出现 `sudo`/`doas` 时不豁免：提权后删的东西
+    /// 不再受“只是自己的临时文件”这个前提约束。
+    fn argv_is_hazardous(&self, argv: &[String]) -> bool {
+        let elevated = argv
+            .iter()
+            .any(|word| matches!(word.rsplit('/').next().unwrap_or(word), "sudo" | "doas"));
+        let hazardous = |view: &[String]| {
+            argv_is_dangerous(view) && (elevated || !self.removes_only_scratch(view))
+        };
+        hazardous(argv) || risk_wrapper_views(argv).iter().any(|view| hazardous(view))
+    }
+
+    /// `rm` 的每个操作数都只落在 `/tmp` 或 `$TMPDIR` 里（plan 286）。选项只认第一个操作数
+    /// 之前的：BSD 的 `rm` 把操作数后面的 `-x` 当文件名，这种写法两边语义不同，不豁免。
+    fn removes_only_scratch(&self, argv: &[String]) -> bool {
+        let Some(command) = argv.first() else {
+            return false;
+        };
+        if command.rsplit('/').next() != Some("rm") {
+            return false;
+        }
+        let roots = scratch_roots();
+        if roots.is_empty() {
+            return false;
+        }
+        let root = PathRoot {
+            cwd: &self.cwd,
+            canonical: &self.canonical_cwd,
+        };
+        let mut operands = 0;
+        let mut options_done = false;
+        for arg in &argv[1..] {
+            if !options_done && arg.starts_with('-') && arg != "-" {
+                if operands > 0 {
+                    return false;
+                }
+                options_done = arg == "--";
+                continue;
+            }
+            if !operand_is_scratch(arg, root, &roots) {
+                return false;
+            }
+            operands += 1;
+        }
+        operands > 0
     }
 
     pub(super) fn hazard(&self, name: &str) -> Option<Hazard> {
@@ -296,12 +349,8 @@ impl CallFacts {
         if let Some(cmds) = self.shell.as_ref().and_then(|shell| match shell {
             ShellFacts::Bash(analysis) => analysis.commands(),
             ShellFacts::PowerShellOpaque => None,
-        }) && cmds.iter().any(|argv| {
-            argv_is_dangerous(argv)
-                || risk_wrapper_views(argv)
-                    .iter()
-                    .any(|view| argv_is_dangerous(view))
-        }) {
+        }) && cmds.iter().any(|argv| self.argv_is_hazardous(argv))
+        {
             return Some(Hazard { tag: "destructive" });
         }
         if self.risk_commands.iter().any(|command| {
@@ -317,12 +366,9 @@ impl CallFacts {
             }
             // 循环绑定只细化 syntax，value 保持 Unknown 以免产生授权；危险判定两个视图都看。
             let resolved = command.bound_risk_argv();
-            [command.risk_argv(), resolved].iter().any(|argv| {
-                argv_is_dangerous(argv)
-                    || risk_wrapper_views(argv)
-                        .iter()
-                        .any(|view| argv_is_dangerous(view))
-            })
+            [command.risk_argv(), resolved]
+                .iter()
+                .any(|argv| self.argv_is_hazardous(argv))
         }) {
             return Some(Hazard { tag: "destructive" });
         }
@@ -1153,6 +1199,51 @@ fn is_stream_device(path: &Path) -> bool {
         path.to_str(),
         Some("/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty")
     )
+}
+
+/// 临时目录的规范路径：`/tmp` 与 `$TMPDIR`，也就是沙箱给的两个临时可写根。`$TMPDIR` 被设成
+/// `/`、家目录或它的祖先时不算临时目录，免得一个错配的环境变量把整个家目录都当成可随手删的地方。
+/// 只在 Unix 上认。
+fn scratch_roots() -> Vec<PathBuf> {
+    if !cfg!(unix) {
+        return Vec::new();
+    }
+    let home = std::env::home_dir().and_then(|home| std::fs::canonicalize(home).ok());
+    scratch_roots_from(
+        &[PathBuf::from("/tmp"), std::env::temp_dir()],
+        home.as_deref(),
+    )
+}
+
+pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        let Ok(root) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        let too_wide = root.parent().is_none() || home.is_some_and(|home| home.starts_with(&root));
+        if !too_wide && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// 一个 `rm` 操作数是否只是临时目录里的东西：字面绝对路径（不含未知片段、glob 与花括号），
+/// 解析后严格落在某个临时根之内，不在工作区里，也不是敏感路径。解析失败（断链、权限错误、
+/// 缺失部分里有 `..`）一律不算。
+fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[PathBuf]) -> bool {
+    if raw.contains(['\0', '*', '?', '[', '{']) || !Path::new(raw).is_absolute() {
+        return false;
+    }
+    let facts = PathFacts::gather_in(Path::new(raw), root, None);
+    facts.resolved
+        && !facts.inside_cwd
+        && !facts.original.starts_with(root.cwd)
+        && facts.sensitivity(Access::Write).is_none()
+        && roots
+            .iter()
+            .any(|scratch| facts.normalized.starts_with(scratch) && facts.normalized != *scratch)
 }
 
 /// Canonical spelling of a working directory, with the lexical fallback every
