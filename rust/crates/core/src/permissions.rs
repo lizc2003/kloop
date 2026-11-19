@@ -68,7 +68,8 @@ mod approval_replay;
 mod argv_roles;
 mod capability;
 pub(crate) use capability::CapabilityRequest;
-pub(crate) use capability::grantable_write_dir;
+#[cfg(test)]
+use capability::grantable_write_dir;
 pub(crate) use capability::proposed_write_dir;
 pub(crate) use describe::network_programs;
 mod describe;

@@ -86,7 +86,9 @@ impl CapabilityRequest {
 }
 
 /// Whether bash may be offered writes to `dir`: an absolute directory below
-/// the filesystem root, not the home directory itself, spelled without glob
+/// the filesystem root, neither the home directory nor one of its ancestors —
+/// compared as spelled and as resolved, since the system log reports real
+/// paths and `$HOME` may lead through a symlink — spelled without glob
 /// characters (a rule could not name it), and naming nothing the permission
 /// layer treats as sensitive — `.git`, `.kloop`, credential directories. The
 /// sandbox's own write denies still apply on top of any grant.
@@ -96,28 +98,43 @@ pub(crate) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
     };
     dir.is_absolute()
         && dir.parent().is_some()
-        && home.is_none_or(|home| dir != home)
+        && home.is_none_or(|home| !holds_home(dir, home))
         && !text.contains(['*', '?', '[', ']', '{', '}', '\n', '\r'])
         && PathFacts::gather_with_resolved(&dir.join("kloop-grant-probe"), Path::new("/"), None)
             .sensitivity(Access::Write)
             .is_none()
 }
 
+/// `dir` 是家目录或它的祖先：原拼写与解析后的家目录都比（复审 P2：`$HOME` 经符号链接时，
+/// 只比原拼写会把真实家目录当成普通目录提议出去）。
+fn holds_home(dir: &Path, home: &Path) -> bool {
+    home.starts_with(dir)
+        || crate::path_resolve::resolve_nearest_existing(home)
+            .is_some_and(|resolved| resolved.starts_with(dir))
+}
+
 /// 被拒写入要提议授权的目录（plan 287）：落在已知的工具缓存里时提议整个缓存根，下一个依赖、
-/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。缓存根同样要能授权，且不是家目录的祖先，
-/// 否则退回父目录，不扩大。`var` 读 kloop 自己的环境（bash 子进程继承它），测试里换成固定值。
+/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。上提之前先看原始落点：父目录本身不能
+/// 授权，或策略已经决定了它的写权限（禁写路径、受保护子路径）时什么都不提议，授权哪一级都解除
+/// 不了这次拒绝（复审 P2）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
+/// `decided` 是策略的 `already_decides_writes`；`var` 读 kloop 自己的环境（bash 子进程继承它），
+/// 测试里换成固定值。
 pub(crate) fn proposed_write_dir(
     path: &Path,
     home: Option<&Path>,
     var: impl Fn(&str) -> Option<OsString>,
+    decided: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     let parent = path.parent()?;
+    if !grantable_write_dir(parent, home) || decided(parent) {
+        return None;
+    }
     let cache_root = home.and_then(|home| {
         tool_cache_roots(home, &var).into_iter().find(|root| {
             path.starts_with(root)
                 && path != root
-                && !home.starts_with(root)
                 && grantable_write_dir(root, Some(home))
+                && !decided(root)
         })
     });
     Some(cache_root.unwrap_or_else(|| parent.to_path_buf()))

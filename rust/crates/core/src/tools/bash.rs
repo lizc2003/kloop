@@ -680,17 +680,15 @@ fn capability_request(
             let home = std::env::home_dir();
             let mut dirs: Vec<std::path::PathBuf> = Vec::new();
             for path in &denial.paths {
-                let Some(dir) =
-                    crate::permissions::proposed_write_dir(path, home.as_deref(), |name| {
-                        std::env::var_os(name)
-                    })
-                else {
+                let Some(dir) = crate::permissions::proposed_write_dir(
+                    path,
+                    home.as_deref(),
+                    |name| std::env::var_os(name),
+                    |dir| policy.already_decides_writes(dir),
+                ) else {
                     continue;
                 };
-                if crate::permissions::grantable_write_dir(&dir, home.as_deref())
-                    && !policy.already_decides_writes(&dir)
-                    && !dirs.contains(&dir)
-                {
+                if !dirs.contains(&dir) {
                     dirs.push(dir);
                 }
             }

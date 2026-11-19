@@ -346,6 +346,8 @@ fn plan283_only_plain_directories_are_offered_for_writes() {
         ("/opt/out", true),
         ("/", false),
         ("/Users/someone", false),
+        // 家目录的祖先同样会把整个家目录变成可写（复审 P2）。
+        ("/Users", false),
         ("/opt/out[1]", false),
         ("/Users/someone/repo/.git", false),
         ("/Users/someone/repo/.kloop", false),

@@ -441,7 +441,12 @@ async fn replay_escalation(
         Some(denial) if denial.kind == DenialKind::Write && !denial.paths.is_empty() => {
             let mut dirs: Vec<PathBuf> = Vec::new();
             for dir in denial.paths.iter().filter_map(|path| {
-                super::proposed_write_dir(path, home.as_deref(), |name| std::env::var_os(name))
+                super::proposed_write_dir(
+                    path,
+                    home.as_deref(),
+                    |name| std::env::var_os(name),
+                    |dir| policy.already_decides_writes(dir),
+                )
             }) {
                 if grants
                     .writable
@@ -450,10 +455,7 @@ async fn replay_escalation(
                 {
                     return None;
                 }
-                if super::grantable_write_dir(&dir, home.as_deref())
-                    && !policy.already_decides_writes(&dir)
-                    && !dirs.contains(&dir)
-                {
+                if !dirs.contains(&dir) {
                     dirs.push(dir);
                 }
             }

@@ -59,7 +59,7 @@ fn plan287_a_tool_cache_proposes_its_root() {
         (home.join("go/bin/tool"), home.join("go/bin")),
     ] {
         assert_eq!(
-            proposed_write_dir(&refused, Some(&home), plan287_vars(&[])),
+            proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |_| false),
             Some(offered),
             "{}",
             refused.display()
@@ -99,7 +99,7 @@ fn plan287_environment_moves_the_cache_roots() {
     }
     for (refused, offered) in cases {
         assert_eq!(
-            proposed_write_dir(&refused, Some(&home), plan287_vars(&vars)),
+            proposed_write_dir(&refused, Some(&home), plan287_vars(&vars), |_| false),
             Some(offered),
             "{}",
             refused.display()
@@ -110,7 +110,8 @@ fn plan287_environment_moves_the_cache_roots() {
         proposed_write_dir(
             &path("gopath/pkg/mod/x@v1/go.mod"),
             Some(&home),
-            plan287_vars(&[("GOPATH", gopath.as_str())])
+            plan287_vars(&[("GOPATH", gopath.as_str())]),
+            |_| false
         ),
         Some(path("gopath/pkg/mod"))
     );
@@ -118,13 +119,15 @@ fn plan287_environment_moves_the_cache_roots() {
         proposed_write_dir(
             &home.join("go/pkg/mod/x@v1/go.mod"),
             Some(&home),
-            plan287_vars(&[("GOMODCACHE", "relative/mod")])
+            plan287_vars(&[("GOMODCACHE", "relative/mod")]),
+            |_| false
         ),
         Some(home.join("go/pkg/mod"))
     );
 }
 
-/// 缓存根是家目录的祖先、`/`，或通不过授权检查时，退回父目录，不扩大。
+/// 缓存根是家目录的祖先、`/`，或通不过授权检查时，退回父目录，不扩大；父目录本身都不能授权时
+/// 什么都不提议。
 #[test]
 fn plan287_a_cache_root_that_is_too_wide_falls_back_to_the_parent() {
     let home = plan287_home("plan287-wide-");
@@ -132,14 +135,84 @@ fn plan287_a_cache_root_that_is_too_wide_falls_back_to_the_parent() {
     let refused = home.join("project/out/x.o");
     for value in [ancestor.as_str(), "/"] {
         assert_eq!(
-            proposed_write_dir(&refused, Some(&home), plan287_vars(&[("GOMODCACHE", value)])),
+            proposed_write_dir(
+                &refused,
+                Some(&home),
+                plan287_vars(&[("GOMODCACHE", value)]),
+                |_| false
+            ),
             Some(home.join("project/out")),
             "{value}"
         );
     }
     let refused = PathBuf::from("/tmp/m*d/x@v1/go.mod");
     assert_eq!(
-        proposed_write_dir(&refused, Some(&home), plan287_vars(&[("GOMODCACHE", "/tmp/m*d")])),
-        Some(PathBuf::from("/tmp/m*d/x@v1"))
+        proposed_write_dir(
+            &refused,
+            Some(&home),
+            plan287_vars(&[("GOMODCACHE", "/tmp/m*d")]),
+            |_| false
+        ),
+        None
+    );
+}
+
+/// `$HOME` 经符号链接指向真实家目录时，日志报的是真实路径：真实家目录和它的祖先同样不能被
+/// 提议，无论是作为缓存根还是作为父目录（复审 P2）。
+#[cfg(unix)]
+#[test]
+fn plan287_a_symlinked_home_is_still_home() {
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(crate::resource_id::fresh("plan287-link-").unwrap());
+    let real = base.join("real-home");
+    std::fs::create_dir_all(real.join("project")).unwrap();
+    let link = base.join("home-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let link_text = link.to_str().unwrap().to_string();
+
+    // 缓存根就是家目录（经链接拼写）：解析后的根是真实家目录，退回父目录。
+    assert_eq!(
+        proposed_write_dir(
+            &real.join("project/out.o"),
+            Some(&link),
+            plan287_vars(&[("GOMODCACHE", link_text.as_str())]),
+            |_| false
+        ),
+        Some(real.join("project"))
+    );
+    // 被拒文件直接在真实家目录下：父目录就是家目录，什么都不提议。
+    assert_eq!(
+        proposed_write_dir(&real.join("out.o"), Some(&link), plan287_vars(&[]), |_| false),
+        None
+    );
+    assert!(!grantable_write_dir(&real, Some(&link)));
+    assert!(!grantable_write_dir(&base, Some(&link)));
+    assert!(grantable_write_dir(&real.join("project"), Some(&link)));
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// 上提之前先看原始落点（复审 P2）：策略已经决定了被拒路径所在目录的写权限（例如缓存里某个
+/// 子目录被显式禁写）时，授权缓存根也解除不了这次拒绝，什么都不提议；只有缓存根本身被策略
+/// 决定时，退回父目录。
+#[test]
+fn plan287_the_refused_location_is_checked_before_lifting() {
+    let home = plan287_home("plan287-decided-");
+    let cache = home.join(".npm");
+    let denied = cache.join("_cacache/locked");
+    let refused = denied.join("entry");
+    assert_eq!(
+        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |dir| {
+            dir.starts_with(&denied)
+        }),
+        None
+    );
+    assert_eq!(
+        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |dir| dir == cache),
+        Some(denied.clone())
+    );
+    assert_eq!(
+        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |_| false),
+        Some(cache)
     );
 }

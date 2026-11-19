@@ -4185,11 +4185,17 @@ next command that needs it is covered whatever its text.
   (`$npm_config_cache` or `~/.npm`), cargo's `registry` and `git` under
   `$CARGO_HOME` or `~/.cargo`, `~/.m2/repository`, and `caches` under
   `$GRADLE_USER_HOME` or `~/.gradle`. The variables are kloop's own (bash
-  inherits them), only absolute values count, and a root that is an ancestor of
-  home or fails the checks below falls back to the parent. Caches are not made
+  inherits them), only absolute values count, and a root that fails the checks
+  below falls back to the parent. The refused location is checked before
+  lifting: when its parent cannot be offered or the policy already decides it
+  (a write deny inside the cache), nothing is offered — a grant on the cache root
+  would not lift that refusal, and the rerun would only end at the full
+  escalation. Caches are not made
   writable by default: a sandboxed run could then plant code in an unpacked
   module that a later uncontained build executes. Only a plain directory is
-  offered: absolute, not `/` or the home directory itself, no glob characters,
+  offered: absolute, not `/`, neither home nor an ancestor of it — compared as
+  spelled and as resolved, since the log reports real paths and `$HOME` may
+  lead through a symlink — no glob characters,
   nothing the permission layer treats as sensitive (`.git`, `.kloop`,
   credential directories), and not one the policy already decides (inside a
   writable root, where the refusal came from a protected subpath, or inside a
