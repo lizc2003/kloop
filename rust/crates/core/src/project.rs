@@ -383,13 +383,12 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    fn init_repository(tag: &str) -> tempfile::TempDir {
-        let root = temp_dir(tag);
-        git(root.path(), &["init", "-q"]);
-        std::fs::write(root.path().join("seed"), "seed\n").unwrap();
-        git(root.path(), &["add", "seed"]);
+    fn seed_repository(root: &Path) {
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("seed"), "seed\n").unwrap();
+        git(root, &["add", "seed"]);
         git(
-            root.path(),
+            root,
             &[
                 "-c",
                 "user.name=kloop",
@@ -400,22 +399,26 @@ mod tests {
                 "seed",
             ],
         );
+    }
+
+    fn init_repository(tag: &str) -> tempfile::TempDir {
+        let root = temp_dir(tag);
+        seed_repository(root.path());
         root
     }
 
     #[test]
     fn linked_worktrees_share_project_but_not_workspace() {
-        let root = init_repository("linked");
-        let tree_a = root.path().with_file_name(format!(
-            "{}-tree-a",
-            root.path().file_name().unwrap().to_string_lossy()
-        ));
-        let tree_b = root.path().with_file_name(format!(
-            "{}-tree-b",
-            root.path().file_name().unwrap().to_string_lossy()
-        ));
+        // Everything lives under one TempDir, worktrees included: a failed
+        // assertion must not leave them behind.
+        let root = temp_dir("linked");
+        let main = root.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        seed_repository(&main);
+        let tree_a = root.path().join("tree-a");
+        let tree_b = root.path().join("tree-b");
         git(
-            root.path(),
+            &main,
             &[
                 "worktree",
                 "add",
@@ -426,7 +429,7 @@ mod tests {
             ],
         );
         git(
-            root.path(),
+            &main,
             &[
                 "worktree",
                 "add",
@@ -437,7 +440,7 @@ mod tests {
             ],
         );
 
-        let main = WorkspaceIdentity::resolve(root.path());
+        let main = WorkspaceIdentity::resolve(&main);
         let first = WorkspaceIdentity::resolve(&tree_a);
         let second = WorkspaceIdentity::resolve(&tree_b);
         assert_eq!(main.project_id(), first.project_id());
@@ -453,9 +456,6 @@ mod tests {
         assert_eq!(main.scheduler_key().len(), 28);
         assert!(main.project_id().unwrap().as_str().starts_with("p1_"));
         assert_eq!(main.project_id().unwrap().as_str().len(), 28);
-
-        let _ = std::fs::remove_dir_all(tree_a);
-        let _ = std::fs::remove_dir_all(tree_b);
     }
 
     #[test]

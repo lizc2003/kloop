@@ -16,7 +16,9 @@
 `tempfile::TempDir`，core 新增 `#[cfg(test)] mod test_support`。验证：core lib 1462 通过、1 ignored
 （外层执行沙箱之外，真实 seatbelt 用例实际执行）、CLI bin 170 通过、两个 crate 的
 `clippy --all-targets -D warnings`、`cargo fmt --all --check`、`cargo check --all-targets`；
-未跑全量 `make check`、parity、真实 API。教训 416、417。
+未跑全量 `make check`、parity、真实 API。提交后复审修两条：公开门面的三个模块链接改成普通
+代码标记（私有模块不进公开文档）；`history`/`project` 两处测试夹具移进各自 `TempDir`，断言
+失败也随目录清理。教训 416、417。
 
 **Plan 268 ✅：后台执行 registry 统一（2026-11-17）**：用户定 (a)——只抽共享流程，不动三条生命周期。
 五条复核都成立，但第 1 条已经只剩两份：子 agent 的 supervisor 收尾在 plan 267 已抽成

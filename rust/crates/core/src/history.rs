@@ -1919,13 +1919,13 @@ mod tests {
     /// per-result spill has no such option and still truncates.
     #[test]
     fn a_spill_that_cannot_reach_disk_stays_inline_for_the_round_budget_only() {
-        let dir = temp_dir("round-budget-no-disk");
-        let _ = std::fs::remove_dir_all(dir.path());
-        std::fs::create_dir_all(dir.path().parent().expect("temp dir has a parent")).unwrap();
+        let root = temp_dir("round-budget-no-disk");
+        let dir = root.path().join("offload");
         // A file where the offload directory should be: create_dir_all fails.
-        std::fs::write(dir.path(), "not a directory").unwrap();
+        // It lives inside the TempDir so even a failed assertion cleans it up.
+        std::fs::write(&dir, "not a directory").unwrap();
 
-        let mut h = History::new(dir.path().to_path_buf());
+        let mut h = History::new(dir.clone());
         let round = vec![
             ("t1", "a".repeat(31_000)),
             ("t2", "b".repeat(31_000)),
@@ -1945,7 +1945,6 @@ mod tests {
         assert!(truncated.contains("offload to disk failed"), "{truncated}");
         assert!(truncated.contains("output truncated"), "{truncated}");
         assert!(truncated.chars().count() < OFFLOAD_CAP_CHARS, "{truncated}");
-        let _ = std::fs::remove_file(dir.path());
     }
 
     #[test]

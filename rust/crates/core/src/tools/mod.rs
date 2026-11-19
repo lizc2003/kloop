@@ -2,9 +2,9 @@
 //! the entry points the agent loop and the frontends depend on.
 //!
 //! Three sibling modules carry the machinery:
-//! - [`catalog`] — what a request offers and what it withholds;
-//! - [`dispatch`] — one round of calls: batching, gating, hooks, deadlines;
-//! - [`paths`] — the path anchor the tools and the permission gate share.
+//! - `catalog` — what a request offers and what it withholds;
+//! - `dispatch` — one round of calls: batching, gating, hooks, deadlines;
+//! - `paths` — the path anchor the tools and the permission gate share.
 //!
 //! Individual tool implementations live in the other sibling modules.
 

@@ -65,3 +65,7 @@
 --all-targets -- -D warnings`；`cargo fmt --all -- --check`。未跑全量 `make check`、parity 与真实 API。
 计划外的临时目录（`cli/src/{args,startup,user_config,project_store,private_store,mcp_auth}.rs`、
 `server/tests`、`process-spawn` 等）不在本次审查清单内，未动。
+
+提交后复审修两条：`tools/mod.rs` 公开文档里指向 `catalog`/`dispatch`/`paths` 的三个链接会让
+rustdoc 报 `private_intra_doc_links`（模块是私有的），改成普通代码标记；`history` 的阻塞文件与
+`project` 的两个 worktree 原来落在 `TempDir` 之外，断言失败会留下夹具，改成放在各自临时目录内。
