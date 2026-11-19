@@ -685,6 +685,7 @@ fn capability_request(
                     home.as_deref(),
                     |name| std::env::var_os(name),
                     |dir| policy.already_decides_writes(dir),
+                    |path| policy.guards_rename(path),
                 ) else {
                     continue;
                 };

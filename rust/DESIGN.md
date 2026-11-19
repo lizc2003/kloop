@@ -4192,11 +4192,18 @@ next command that needs it is covered whatever its text.
   below falls back to the parent. The refused location is checked before
   lifting: when the refused path itself or its parent is already decided by
   the policy (a write deny inside the cache, or the denied directory itself
-  being renamed), or the parent would be unsafe to grant, nothing is offered —
+  being renamed), when the refused path's entry is one the profile pins
+  against rename and unlink (an ancestor of a denied path or of a protected
+  subpath — `SandboxPolicy::guards_rename`, the same list the profile is built
+  from), or when the parent would be unsafe to grant, nothing is offered —
   a grant on the cache root would not lift that refusal, and the rerun would
   only end at the full escalation. A parent that is merely unnameable (glob
   characters in its name, so no rule can spell it) still lifts to a covering
-  cache root. Caches are not made
+  cache root. A remembered `sandbox_write(<dir>)` stores only the path, and
+  `with_grants` resolves it again on every use, so the safety checks below run
+  again on every use too: a directory that has since become a link to home,
+  `/` or a sensitive directory neither widens the sandbox nor counts as
+  remembered. Caches are not made
   writable by default: a sandboxed run could then plant code in an unpacked
   module that a later uncontained build executes. Only a plain directory is
   offered, judged both as spelled and as resolved — `with_grants` adds both to

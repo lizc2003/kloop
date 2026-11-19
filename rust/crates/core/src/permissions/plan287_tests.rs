@@ -59,7 +59,7 @@ fn plan287_a_tool_cache_proposes_its_root() {
         (home.join("go/bin/tool"), home.join("go/bin")),
     ] {
         assert_eq!(
-            proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |_| false),
+            proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |_| false, |_| false),
             Some(offered),
             "{}",
             refused.display()
@@ -99,7 +99,7 @@ fn plan287_environment_moves_the_cache_roots() {
     }
     for (refused, offered) in cases {
         assert_eq!(
-            proposed_write_dir(&refused, Some(&home), plan287_vars(&vars), |_| false),
+            proposed_write_dir(&refused, Some(&home), plan287_vars(&vars), |_| false, |_| false),
             Some(offered),
             "{}",
             refused.display()
@@ -111,6 +111,7 @@ fn plan287_environment_moves_the_cache_roots() {
             &path("gopath/pkg/mod/x@v1/go.mod"),
             Some(&home),
             plan287_vars(&[("GOPATH", gopath.as_str())]),
+            |_| false,
             |_| false
         ),
         Some(path("gopath/pkg/mod"))
@@ -120,6 +121,7 @@ fn plan287_environment_moves_the_cache_roots() {
             &home.join("go/pkg/mod/x@v1/go.mod"),
             Some(&home),
             plan287_vars(&[("GOMODCACHE", "relative/mod")]),
+            |_| false,
             |_| false
         ),
         Some(home.join("go/pkg/mod"))
@@ -139,6 +141,7 @@ fn plan287_a_cache_root_that_is_too_wide_falls_back_to_the_parent() {
                 &refused,
                 Some(&home),
                 plan287_vars(&[("GOMODCACHE", value)]),
+                |_| false,
                 |_| false
             ),
             Some(home.join("project/out")),
@@ -151,6 +154,7 @@ fn plan287_a_cache_root_that_is_too_wide_falls_back_to_the_parent() {
             &refused,
             Some(&home),
             plan287_vars(&[("GOMODCACHE", "/tmp/m*d")]),
+            |_| false,
             |_| false
         ),
         None
@@ -177,13 +181,14 @@ fn plan287_a_symlinked_home_is_still_home() {
             &real.join("project/out.o"),
             Some(&link),
             plan287_vars(&[("GOMODCACHE", link_text.as_str())]),
+            |_| false,
             |_| false
         ),
         Some(real.join("project"))
     );
     // 被拒文件直接在真实家目录下：父目录就是家目录，什么都不提议。
     assert_eq!(
-        proposed_write_dir(&real.join("out.o"), Some(&link), plan287_vars(&[]), |_| false),
+        proposed_write_dir(&real.join("out.o"), Some(&link), plan287_vars(&[]), |_| false, |_| false),
         None
     );
     assert!(!grantable_write_dir(&real, Some(&link)));
@@ -204,15 +209,16 @@ fn plan287_the_refused_location_is_checked_before_lifting() {
     assert_eq!(
         proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |dir| {
             dir.starts_with(&denied)
-        }),
+        },
+        |_| false),
         None
     );
     assert_eq!(
-        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |dir| dir == cache),
+        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |dir| dir == cache, |_| false),
         Some(denied.clone())
     );
     assert_eq!(
-        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |_| false),
+        proposed_write_dir(&refused, Some(&home), plan287_vars(&[]), |_| false, |_| false),
         Some(cache)
     );
 }
@@ -226,7 +232,8 @@ fn plan287_a_refusal_of_the_denied_directory_itself_offers_nothing() {
     assert_eq!(
         proposed_write_dir(&denied, Some(&home), plan287_vars(&[]), |dir| {
             dir.starts_with(&denied)
-        }),
+        },
+        |_| false),
         None
     );
 }
@@ -253,6 +260,7 @@ fn plan287_an_aliased_candidate_is_judged_where_it_lands() {
             &to_home.join("_cacache/tmp/x"),
             Some(&home),
             plan287_vars(&[("npm_config_cache", cache.as_str())]),
+            |_| false,
             |_| false
         ),
         Some(to_home.join("_cacache/tmp"))
@@ -266,6 +274,7 @@ fn plan287_an_aliased_candidate_is_judged_where_it_lands() {
             &to_root.join("x"),
             Some(&home),
             plan287_vars(&[("npm_config_cache", cache.as_str())]),
+            |_| false,
             |_| false
         ),
         None
@@ -283,12 +292,91 @@ fn plan287_an_unnameable_parent_still_lifts_to_the_cache_root() {
             &home.join(".npm/_cacache/chunk[1]/x"),
             Some(&home),
             plan287_vars(&[]),
+            |_| false,
             |_| false
         ),
         Some(home.join(".npm"))
     );
     assert_eq!(
-        proposed_write_dir(&home.join("out[1]/x.o"), Some(&home), plan287_vars(&[]), |_| false),
+        proposed_write_dir(&home.join("out[1]/x.o"), Some(&home), plan287_vars(&[]), |_| false, |_| false),
         None
     );
+}
+
+/// 记住的 `sandbox_write(<dir>)` 每次生效时都会被重新解析：目录后来变成指向家目录的链接时，这条授权
+/// 不再进 `Verdict`，也不算“已记住”（第三轮复审 P2）。正常目录照旧生效。
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn plan287_a_remembered_grant_that_now_leads_home_is_dropped() {
+    let home = std::env::home_dir().expect("home");
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(crate::resource_id::fresh("plan287-moved-").unwrap());
+    let kept = base.join("cache");
+    std::fs::create_dir_all(&kept).unwrap();
+    let moved = base.join("moved-cache");
+    std::os::unix::fs::symlink(&home, &moved).unwrap();
+    let rule = |dir: &Path| format!("sandbox_write({})", dir.display());
+    let approver = ScriptedApprover::new(vec![]);
+    let p = gate(
+        Mode::Manual,
+        rules(&[&rule(&kept), &rule(&moved)], &[], &[]),
+        approver.clone(),
+    );
+    let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false);
+    let verdict = p
+        .check_call_with_execution(
+            "bash",
+            &bash("printf x > out.txt"),
+            0,
+            crate::sandbox::ExecutionContext::sandboxed(Some(&policy)),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(verdict.grants.writable, vec![kept.clone()]);
+
+    let denial = crate::sandbox::SandboxDenial {
+        kind: crate::sandbox::DenialKind::Write,
+        evidence: "file-write-create".into(),
+        paths: Vec::new(),
+    };
+    let covered_by_moved = CapabilityRequest::Write {
+        dirs: vec![moved.join("sub")],
+    };
+    let escalation = p
+        .escalate_capability("touch x", &denial, &covered_by_moved, 0)
+        .await;
+    assert_ne!(
+        escalation.outcome,
+        EscalationOutcome::Approved(EscalationApproval::Remembered),
+        "a grant that now leads home does not answer for its subdirectories"
+    );
+    assert_eq!(approver.ask_count(), 1);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// 被拒的是禁写路径或受保护子路径的祖先（拒绝的正是改名）时，授权哪一级都解除不了，什么都不提议；
+/// 在它里面新建文件照旧可以提议（第三轮复审 P2）。
+#[test]
+fn plan287_a_refused_rename_of_a_guarded_ancestor_offers_nothing() {
+    // 不能放在临时目录下：那里本来就是工作区策略的可写根，策略已经“决定”了它的写权限。
+    let home = PathBuf::from("/Users/kloop-plan287-nobody");
+    let locked = home.join(".npm/_cacache/locked");
+    let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false)
+        .with_denied_write_path(&locked);
+    let offer = |refused: &Path| {
+        proposed_write_dir(
+            refused,
+            Some(&home),
+            plan287_vars(&[]),
+            |dir| policy.already_decides_writes(dir),
+            |path| policy.guards_rename(path),
+        )
+    };
+    assert!(policy.guards_rename(&home.join(".npm/_cacache")));
+    assert!(!policy.guards_rename(&home.join(".npm/_cacache/other")));
+    assert_eq!(offer(&home.join(".npm/_cacache")), None);
+    assert_eq!(offer(&locked), None);
+    assert_eq!(offer(&home.join(".npm/_cacache/new-entry")), Some(home.join(".npm")));
 }

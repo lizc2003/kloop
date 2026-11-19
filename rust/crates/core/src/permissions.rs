@@ -1082,7 +1082,12 @@ impl Permissions {
                 .is_some_and(|programs| self.project.network_programs_covered(&programs));
         SandboxGrants {
             network,
-            writable: self.project.sandbox_write_dirs(),
+            writable: self
+                .project
+                .sandbox_write_dirs()
+                .into_iter()
+                .filter(|dir| capability::usable_write_grant(dir))
+                .collect(),
         }
     }
 

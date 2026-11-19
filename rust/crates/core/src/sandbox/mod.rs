@@ -286,6 +286,16 @@ impl SandboxPolicy {
         policy
     }
 
+    /// Whether the profile pins `path`'s directory entry against rename and
+    /// unlink — an ancestor of a denied write path, or of a protected subpath
+    /// inside a writable root. A write refused there is that guard, and no
+    /// writable-root grant lifts it (plan 287, third review).
+    pub(crate) fn guards_rename(&self, path: &Path) -> bool {
+        rename_guards(self, &protected_subpaths_by_root(self))
+            .iter()
+            .any(|guard| guard == path)
+    }
+
     /// Whether this policy already settles writes under `dir`: it lies inside
     /// a writable root (so a refusal there came from a protected subpath or a
     /// deny, which a grant would not change) or inside a denied write path.
@@ -607,38 +617,14 @@ fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) 
         rule
     };
     let mut write_denies = Vec::new();
-    let mut rename_denies = Vec::new();
     for (i, path) in policy.denied_write_paths.iter().enumerate() {
         let key = format!("DENIED_WRITE_{i}");
         params.push((key.clone(), path.clone()));
         write_denies.push(format!(
             "(literal (param \"{key}\")) (subpath (param \"{key}\"))"
         ));
-        // rename 父目录不会逐个检查后代；只固定祖先目录条目，普通兄弟文件仍可写。
-        for ancestor in path.ancestors().skip(1) {
-            if !ancestor.as_os_str().is_empty()
-                && !rename_denies.iter().any(|path| path == ancestor)
-            {
-                rename_denies.push(ancestor.to_path_buf());
-            }
-        }
     }
-    // 可写根内的只读子路径同样怕父目录被改名：`(require-not subpath .git/hooks)`
-    // 在 `.git` 被改成别的名字后就不再有意义，新名字下写入也不受它约束。
-    // 只固定严格位于可写根内的祖先（关键是 `<root>/.git`），不动根本身。
-    for (root, read_only) in policy.writable_roots.iter().zip(&protected) {
-        for subpath in read_only {
-            for ancestor in subpath.ancestors().skip(1) {
-                if ancestor.starts_with(&root.root)
-                    && ancestor != root.root
-                    && !ancestor.as_os_str().is_empty()
-                    && !rename_denies.iter().any(|path| path == ancestor)
-                {
-                    rename_denies.push(ancestor.to_path_buf());
-                }
-            }
-        }
-    }
+    let rename_denies = rename_guards(policy, &protected);
     let mut file_write = if write_denies.is_empty() {
         format!("(allow file-write*\n{}\n)", write_parts.join("\n"))
     } else {
@@ -677,6 +663,35 @@ fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) 
         sections.push(SEATBELT_LOOPBACK_POLICY.to_string());
     }
     (sections.join("\n"), params)
+}
+
+/// 目录条目被固定、不能 rename/unlink 的路径。rename 父目录不会逐个检查后代，所以禁写路径的每一级
+/// 祖先都要固定（普通兄弟文件仍可写）；可写根内的只读子路径同样怕父目录被改名：
+/// `(require-not subpath .git/hooks)` 在 `.git` 被改成别的名字后就不再有意义，所以也固定它们严格
+/// 位于可写根内的祖先（关键是 `<root>/.git`），不动根本身。profile 与权限层（判断一次写拒绝能不能
+/// 靠授权解除）共用这一份。
+fn rename_guards(policy: &SandboxPolicy, protected: &[Vec<PathBuf>]) -> Vec<PathBuf> {
+    let mut guards: Vec<PathBuf> = Vec::new();
+    let mut push = |ancestor: &Path| {
+        if !ancestor.as_os_str().is_empty() && !guards.iter().any(|path| path == ancestor) {
+            guards.push(ancestor.to_path_buf());
+        }
+    };
+    for path in &policy.denied_write_paths {
+        for ancestor in path.ancestors().skip(1) {
+            push(ancestor);
+        }
+    }
+    for (root, read_only) in policy.writable_roots.iter().zip(protected) {
+        for subpath in read_only {
+            for ancestor in subpath.ancestors().skip(1) {
+                if ancestor.starts_with(&root.root) && ancestor != root.root {
+                    push(ancestor);
+                }
+            }
+        }
+    }
+    guards
 }
 
 /// Each writable root's protected subpaths as the profile must state them: its

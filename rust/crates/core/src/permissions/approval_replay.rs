@@ -446,6 +446,7 @@ async fn replay_escalation(
                     home.as_deref(),
                     |name| std::env::var_os(name),
                     |dir| policy.already_decides_writes(dir),
+                    |path| policy.guards_rename(path),
                 )
             }) {
                 if grants

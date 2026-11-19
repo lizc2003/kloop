@@ -127,21 +127,30 @@ fn safe_to_grant(dir: &Path, home: Option<&Path>) -> bool {
     })
 }
 
+/// 记在项目里的 `sandbox_write(<dir>)` 现在还能不能用：规则只存了路径，每次生效时 `with_grants`
+/// 都重新解析它，所以提议时做过的检查在使用时再做一遍。目录后来变成指向家目录、`/` 或敏感目录的
+/// 链接时，这条授权不再生效，也不算“已记住”（第三轮复审 P2）。
+pub(super) fn usable_write_grant(dir: &Path) -> bool {
+    safe_to_grant(dir, std::env::home_dir().as_deref())
+}
+
 /// 被拒写入要提议授权的目录（plan 287）：落在已知的工具缓存里时提议整个缓存根，下一个依赖、
-/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。上提之前先看原始落点：被拒路径本身或它的
-/// 父目录已被策略决定（禁写路径、受保护子路径、已在可写根里），或父目录授权出去不安全时，什么都
-/// 不提议，授权哪一级都解除不了这次拒绝（两轮复审 P2）。父目录只是写不成规则（名字里有 glob 字符）
-/// 时仍可由缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
-/// `decided` 是策略的 `already_decides_writes`；`var` 读 kloop 自己的环境（bash 子进程继承它），
-/// 测试里换成固定值。
+/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。上提之前先看原始落点，下列情况什么都不提议，
+/// 授权哪一级都解除不了这次拒绝：被拒路径本身或它的父目录已被策略决定（禁写路径、受保护子路径、
+/// 已在可写根里）；被拒路径的目录条目被改名保护固定住（它是禁写路径或受保护子路径的祖先，拒绝的正是
+/// 改名）；父目录授权出去不安全（三轮复审 P2）。父目录只是写不成规则（名字里有 glob 字符）时仍可由
+/// 缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
+/// `decided` 是策略的 `already_decides_writes`，`rename_guarded` 是它的 `guards_rename`；`var` 读
+/// kloop 自己的环境（bash 子进程继承它）。测试里都换成固定值。
 pub(crate) fn proposed_write_dir(
     path: &Path,
     home: Option<&Path>,
     var: impl Fn(&str) -> Option<OsString>,
     decided: impl Fn(&Path) -> bool,
+    rename_guarded: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     let parent = path.parent()?;
-    if decided(path) || decided(parent) || !safe_to_grant(parent, home) {
+    if decided(path) || rename_guarded(path) || decided(parent) || !safe_to_grant(parent, home) {
         return None;
     }
     let cache_root = home.and_then(|home| {
@@ -212,7 +221,12 @@ impl Permissions {
                     .map(|_| MemorySource::Rule)
             }
             CapabilityRequest::Write { dirs } => {
-                let granted = self.project.sandbox_write_dirs();
+                let granted: Vec<PathBuf> = self
+                    .project
+                    .sandbox_write_dirs()
+                    .into_iter()
+                    .filter(|dir| usable_write_grant(dir))
+                    .collect();
                 dirs.iter()
                     .all(|dir| granted.iter().any(|root| dir.starts_with(root)))
                     .then_some(MemorySource::Rule)
