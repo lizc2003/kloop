@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::path_resolve::resolve_nearest_existing;
+use crate::sandbox::{SandboxPolicy, WriteDenial};
 
 use super::ApprovalAnswer;
 use super::ApprovalDoor;
@@ -136,7 +137,7 @@ pub(crate) fn usable_write_grant(dir: &Path) -> bool {
 /// 改名）；父目录授权出去不安全（三轮复审 P2）。父目录只是写不成规则（名字里有 glob 字符）时仍可由
 /// 缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
 /// `rename_guarded` 由调用方按本次拒绝的操作查询，其他写操作仍可提议授权。
-pub(crate) fn proposed_write_dir(
+pub(super) fn proposed_write_dir(
     path: &Path,
     home: Option<&Path>,
     var: impl Fn(&str) -> Option<OsString>,
@@ -159,6 +160,28 @@ pub(crate) fn proposed_write_dir(
         })
     });
     cache_root.or_else(|| nameable_dir(&target).then_some(target))
+}
+
+/// 整批写拒绝都能靠目录授权解除时才提议，否则重跑仍会遇到同一条拒绝。
+pub(crate) fn proposed_write_dirs(
+    writes: &[WriteDenial],
+    policy: &SandboxPolicy,
+) -> Option<Vec<PathBuf>> {
+    let home = std::env::home_dir();
+    let mut dirs = Vec::new();
+    for write in writes {
+        let dir = proposed_write_dir(
+            &write.path,
+            home.as_deref(),
+            |name| std::env::var_os(name),
+            |dir| policy.already_decides_writes(dir),
+            |path| write.is_unlink() && policy.guards_rename(path),
+        )?;
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    (!dirs.is_empty()).then_some(dirs)
 }
 
 /// 包管理器按包分目录的缓存根。每个根给出原拼写和规范化后的两种形式：日志里的被拒路径是真实

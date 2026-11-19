@@ -649,8 +649,8 @@ async fn ask_escalation(
 }
 
 /// The sandbox widening that would answer this refusal, if one can: the
-/// network, or the directories of the refused writes that may be granted at
-/// all — a known tool cache's root, else the parent (plan 287). `None` sends
+/// network, or directories that cover every refused write — a known tool
+/// cache's root, else the parent (plan 287). `None` sends
 /// the refusal to the full escalation.
 fn capability_request(
     denial: &sandbox::SandboxDenial,
@@ -677,23 +677,8 @@ fn capability_request(
             })
         }
         sandbox::DenialKind::Write => {
-            let home = std::env::home_dir();
-            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-            for write in &denial.writes {
-                let Some(dir) = crate::permissions::proposed_write_dir(
-                    &write.path,
-                    home.as_deref(),
-                    |name| std::env::var_os(name),
-                    |dir| policy.already_decides_writes(dir),
-                    |path| write.is_unlink() && policy.guards_rename(path),
-                ) else {
-                    continue;
-                };
-                if !dirs.contains(&dir) {
-                    dirs.push(dir);
-                }
-            }
-            (!dirs.is_empty()).then_some(crate::permissions::CapabilityRequest::Write { dirs })
+            crate::permissions::proposed_write_dirs(&denial.writes, policy)
+                .map(|dirs| crate::permissions::CapabilityRequest::Write { dirs })
         }
         sandbox::DenialKind::Network
         | sandbox::DenialKind::Read
@@ -2790,6 +2775,73 @@ mod tests {
             assert!(out.contains("denied (nested sandbox)"), "{out}");
             assert_eq!(asked.load(Ordering::SeqCst), 2, "{out}");
             let _ = std::fs::remove_file(target);
+        }
+
+        #[tokio::test]
+        async fn plan287_a_guarded_rename_blocks_widening_the_write_batch() {
+            if crate::sandbox::skip_nested_seatbelt_test() {
+                return;
+            }
+            let (ctx, _) = sandbox_ctx("cap-rename");
+            let fixture = tempfile::tempdir().unwrap();
+            let cwd = fixture.path().canonicalize().unwrap();
+            let source = cwd.join(".npm/_cacache");
+            let target = cwd.join(".npm/_old");
+            let protected = source.join("locked");
+            std::fs::create_dir_all(&protected).unwrap();
+            let policy = ctx
+                .cfg
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .with_denied_write_path(&protected);
+            let bash = ctx.cfg.shell_programs.bash.as_ref().unwrap();
+            let rename = "/bin/mv .npm/_cacache .npm/_old";
+            let mixed = "/bin/mv .npm/_cacache .npm/_old; /usr/bin/touch .npm/_old";
+            for command in [rename, mixed] {
+                let attempt = super::super::contained_attempt(
+                    command,
+                    &cwd,
+                    Some(&policy),
+                    bash,
+                    super::super::DEFAULT_FOREGROUND_TIMEOUT_MS,
+                    &ctx,
+                    crate::permissions::Protection::Clear,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(!attempt.output.status.success());
+                let denial = attempt.denial.unwrap();
+                if command == mixed {
+                    let write = denial
+                        .writes
+                        .iter()
+                        .find(|write| {
+                            write.path == target && write.operation == "file-write-create"
+                        })
+                        .unwrap_or_else(|| panic!("{denial:?}"));
+                    assert_eq!(
+                        crate::permissions::proposed_write_dirs(
+                            std::slice::from_ref(write),
+                            &policy
+                        ),
+                        Some(vec![cwd.join(".npm")])
+                    );
+                }
+                assert!(
+                    denial
+                        .writes
+                        .iter()
+                        .any(|write| write.path == source && write.is_unlink()),
+                    "{denial:?}"
+                );
+                assert!(
+                    super::super::capability_request(&denial, &policy, command, None).is_none()
+                );
+            }
+            assert!(protected.is_dir());
+            assert!(!target.exists());
         }
 
         /// Plan 283 stage 2b: a refused write outside the root is answered by

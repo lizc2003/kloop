@@ -4188,14 +4188,13 @@ next command that needs it is covered whatever its text.
   `$CARGO_HOME` or `~/.cargo`, `~/.m2/repository`, and `caches` under
   `$GRADLE_USER_HOME` or `~/.gradle`. The variables are kloop's own (bash
   inherits them), only absolute values count, and a root that fails the checks
-  below falls back to the parent. The refused location is checked before
-  lifting: when the refused path itself or its parent is already decided by
-  the policy (a write deny inside the cache, or the denied directory itself
-  being renamed), when a logged `file-write-unlink` targets an entry the
-  profile guards against rename and unlink, or when the parent would be
-  unsafe to grant, the command goes to the full escalation. The log keeps
-  the operation for each refused write, so other operations on a guarded
-  entry can still get a directory offer. A parent that is merely unnameable (glob
+  below falls back to the parent. A directory offer must cover every write
+  refusal from the same run. The command goes to full escalation if any
+  refused path or its parent is already decided by the policy, a refusal
+  lacks a path, a logged `file-write-unlink` targets a guarded entry, or
+  the parent would be unsafe to grant. The log keeps the operation for
+  each write, so other operations on a guarded entry can still get a
+  directory offer. A parent that is merely unnameable (glob
   characters in its name, so no rule can spell it) still lifts to a covering
   cache root. The offer shows the resolved directory and stores that same
   path in `sandbox_write(<dir>)`. Each use checks that the path still resolves

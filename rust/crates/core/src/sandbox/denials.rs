@@ -86,7 +86,7 @@ pub(crate) fn classify_logged(denials: &[LoggedDenial]) -> Option<SandboxDenial>
         .collect();
     if let Some(first) = writes.first() {
         let mut targets = Vec::new();
-        for denial in writes.iter().filter(|denial| !denial.target.is_empty()) {
+        for denial in &writes {
             let write = WriteDenial {
                 operation: denial.operation.clone(),
                 path: PathBuf::from(&denial.target),
@@ -244,6 +244,7 @@ mod tests {
         events.push(logged(
             "Sandbox: cp(3) deny(1) file-write-create /opt/out/a",
         ));
+        events.push(logged("Sandbox: cp(3) deny(1) file-write-data"));
         assert_eq!(
             classify_logged(&events),
             Some(SandboxDenial {
@@ -261,6 +262,10 @@ mod tests {
                     WriteDenial {
                         operation: "file-write-unlink".into(),
                         path: "/opt/out/b".into()
+                    },
+                    WriteDenial {
+                        operation: "file-write-data".into(),
+                        path: PathBuf::new()
                     },
                 ],
             })

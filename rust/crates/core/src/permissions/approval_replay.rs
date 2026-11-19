@@ -415,11 +415,9 @@ fn tally_one(tally: &mut Tally, detail: &mut Detail, record: ApprovalRecord) {
 }
 
 /// The question a recorded denial leads to now (plan 283 stage 2b): a refused
-/// network, or a refused write whose logged path names a directory that may be
-/// granted, is asked as a capability — and not at all when the call already
-/// carried that grant from a remembered consent; anything else is the full
-/// escalation. A write recorded before the log gave paths has none, so it goes
-/// to the full escalation as it did then.
+/// network or a batch of refused writes is offered as a capability when it
+/// can cover the whole refusal. Remembered capabilities answer the offer.
+/// Requests that cannot be covered go to the full escalation.
 async fn replay_escalation(
     gate: &Permissions,
     command: &str,
@@ -428,7 +426,6 @@ async fn replay_escalation(
     grants: &super::SandboxGrants,
     depth: u8,
 ) -> Option<ApprovalRecord> {
-    let home = std::env::home_dir();
     let request = match &denial {
         Some(denial) if denial.kind == DenialKind::Network => {
             if grants.network {
@@ -441,29 +438,21 @@ async fn replay_escalation(
                     .filter(|programs| !programs.is_empty()),
             })
         }
-        Some(denial) if denial.kind == DenialKind::Write && !denial.writes.is_empty() => {
-            let mut dirs: Vec<PathBuf> = Vec::new();
-            for dir in denial.writes.iter().filter_map(|write| {
-                super::proposed_write_dir(
-                    &write.path,
-                    home.as_deref(),
-                    |name| std::env::var_os(name),
-                    |dir| policy.already_decides_writes(dir),
-                    |path| write.is_unlink() && policy.guards_rename(path),
-                )
-            }) {
-                if grants
-                    .writable
-                    .iter()
-                    .any(|granted| dir.starts_with(granted))
-                {
+        Some(denial) if denial.kind == DenialKind::Write => {
+            if let Some(mut dirs) = super::proposed_write_dirs(&denial.writes, policy) {
+                dirs.retain(|dir| {
+                    !grants
+                        .writable
+                        .iter()
+                        .any(|granted| dir.starts_with(granted))
+                });
+                if dirs.is_empty() {
                     return None;
                 }
-                if !dirs.contains(&dir) {
-                    dirs.push(dir);
-                }
+                Some(super::CapabilityRequest::Write { dirs })
+            } else {
+                None
             }
-            (!dirs.is_empty()).then_some(super::CapabilityRequest::Write { dirs })
         }
         Some(denial) if denial.kind == DenialKind::Read => return None,
         _ => None,
