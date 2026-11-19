@@ -6,6 +6,8 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::path_resolve::resolve_nearest_existing;
+
 use super::ApprovalAnswer;
 use super::ApprovalDoor;
 use super::ApprovalRecord;
@@ -85,38 +87,51 @@ impl CapabilityRequest {
     }
 }
 
-/// Whether bash may be offered writes to `dir`: an absolute directory below
-/// the filesystem root, neither the home directory nor one of its ancestors —
-/// compared as spelled and as resolved, since the system log reports real
-/// paths and `$HOME` may lead through a symlink — spelled without glob
-/// characters (a rule could not name it), and naming nothing the permission
-/// layer treats as sensitive — `.git`, `.kloop`, credential directories. The
+/// Whether bash may be offered writes to `dir`: a rule can name it (see
+/// [`nameable_dir`]) and granting it is safe (see [`safe_to_grant`]). The
 /// sandbox's own write denies still apply on top of any grant.
 pub(crate) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
-    let Some(text) = dir.to_str() else {
-        return false;
-    };
-    dir.is_absolute()
-        && dir.parent().is_some()
-        && home.is_none_or(|home| !holds_home(dir, home))
-        && !text.contains(['*', '?', '[', ']', '{', '}', '\n', '\r'])
-        && PathFacts::gather_with_resolved(&dir.join("kloop-grant-probe"), Path::new("/"), None)
-            .sensitivity(Access::Write)
-            .is_none()
+    nameable_dir(dir) && safe_to_grant(dir, home)
 }
 
-/// `dir` 是家目录或它的祖先：原拼写与解析后的家目录都比（复审 P2：`$HOME` 经符号链接时，
-/// 只比原拼写会把真实家目录当成普通目录提议出去）。
-fn holds_home(dir: &Path, home: &Path) -> bool {
-    home.starts_with(dir)
-        || crate::path_resolve::resolve_nearest_existing(home)
-            .is_some_and(|resolved| resolved.starts_with(dir))
+/// 能写成 `sandbox_write(<dir>)` 规则：UTF-8 的绝对路径，不含 glob 字符和换行。
+fn nameable_dir(dir: &Path) -> bool {
+    dir.is_absolute()
+        && dir
+            .to_str()
+            .is_some_and(|text| !text.contains(['*', '?', '[', ']', '{', '}', '\n', '\r']))
+}
+
+/// 授权它不会把不该放的放出去：原拼写和解析后的落点都要过，因为授权时 `with_grants` 两种都会加进
+/// 可写根（复审 P2：只解析家目录、不解析候选目录时，指向家目录或 `/` 的链接能混过去）。每种形式都
+/// 不是 `/`，不是家目录或其祖先（家目录同样按原拼写和解析后两种比，`$HOME` 可能经过符号链接），也
+/// 不碰权限层视为敏感的目录（`.git`、`.kloop`、凭据目录）。解析失败（断链、权限错误）不授权。
+fn safe_to_grant(dir: &Path, home: Option<&Path>) -> bool {
+    let Some(resolved) = resolve_nearest_existing(dir) else {
+        return false;
+    };
+    let homes: Vec<PathBuf> = home
+        .into_iter()
+        .flat_map(|home| std::iter::once(home.to_path_buf()).chain(resolve_nearest_existing(home)))
+        .collect();
+    [dir, resolved.as_path()].into_iter().all(|form| {
+        form.parent().is_some()
+            && !homes.iter().any(|home| home.starts_with(form))
+            && PathFacts::gather_with_resolved(
+                &form.join("kloop-grant-probe"),
+                Path::new("/"),
+                None,
+            )
+            .sensitivity(Access::Write)
+            .is_none()
+    })
 }
 
 /// 被拒写入要提议授权的目录（plan 287）：落在已知的工具缓存里时提议整个缓存根，下一个依赖、
-/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。上提之前先看原始落点：父目录本身不能
-/// 授权，或策略已经决定了它的写权限（禁写路径、受保护子路径）时什么都不提议，授权哪一级都解除
-/// 不了这次拒绝（复审 P2）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
+/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。上提之前先看原始落点：被拒路径本身或它的
+/// 父目录已被策略决定（禁写路径、受保护子路径、已在可写根里），或父目录授权出去不安全时，什么都
+/// 不提议，授权哪一级都解除不了这次拒绝（两轮复审 P2）。父目录只是写不成规则（名字里有 glob 字符）
+/// 时仍可由缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
 /// `decided` 是策略的 `already_decides_writes`；`var` 读 kloop 自己的环境（bash 子进程继承它），
 /// 测试里换成固定值。
 pub(crate) fn proposed_write_dir(
@@ -126,7 +141,7 @@ pub(crate) fn proposed_write_dir(
     decided: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     let parent = path.parent()?;
-    if !grantable_write_dir(parent, home) || decided(parent) {
+    if decided(path) || decided(parent) || !safe_to_grant(parent, home) {
         return None;
     }
     let cache_root = home.and_then(|home| {
@@ -137,7 +152,7 @@ pub(crate) fn proposed_write_dir(
                 && !decided(root)
         })
     });
-    Some(cache_root.unwrap_or_else(|| parent.to_path_buf()))
+    cache_root.or_else(|| nameable_dir(parent).then(|| parent.to_path_buf()))
 }
 
 /// 包管理器按包分目录的缓存根。每个根给出原拼写和规范化后的两种形式：日志里的被拒路径是真实
@@ -175,8 +190,7 @@ fn tool_cache_roots(home: &Path, var: &impl Fn(&str) -> Option<OsString>) -> Vec
     ]
     .into_iter()
     .flat_map(|root| {
-        let resolved = crate::path_resolve::resolve_nearest_existing(&root)
-            .filter(|resolved| *resolved != root);
+        let resolved = resolve_nearest_existing(&root).filter(|resolved| *resolved != root);
         std::iter::once(root).chain(resolved)
     })
     .collect()

@@ -4189,15 +4189,20 @@ next command that needs it is covered whatever its text.
   `$GRADLE_USER_HOME` or `~/.gradle`. The variables are kloop's own (bash
   inherits them), only absolute values count, and a root that fails the checks
   below falls back to the parent. The refused location is checked before
-  lifting: when its parent cannot be offered or the policy already decides it
-  (a write deny inside the cache), nothing is offered — a grant on the cache root
-  would not lift that refusal, and the rerun would only end at the full
-  escalation. Caches are not made
+  lifting: when the refused path itself or its parent is already decided by
+  the policy (a write deny inside the cache, or the denied directory itself
+  being renamed), or the parent would be unsafe to grant, nothing is offered —
+  a grant on the cache root would not lift that refusal, and the rerun would
+  only end at the full escalation. A parent that is merely unnameable (glob
+  characters in its name, so no rule can spell it) still lifts to a covering
+  cache root. Caches are not made
   writable by default: a sandboxed run could then plant code in an unpacked
   module that a later uncontained build executes. Only a plain directory is
-  offered: absolute, not `/`, neither home nor an ancestor of it — compared as
-  spelled and as resolved, since the log reports real paths and `$HOME` may
-  lead through a symlink — no glob characters,
+  offered, judged both as spelled and as resolved — `with_grants` adds both to
+  the writable roots, so a link to home or `/` must not pass on its spelling:
+  absolute, not `/`, neither home nor an ancestor of it (home also compared
+  both ways, since the log reports real paths and `$HOME` may lead through a
+  symlink), no glob characters,
   nothing the permission layer treats as sensitive (`.git`, `.kloop`,
   credential directories), and not one the policy already decides (inside a
   writable root, where the refusal came from a protected subpath, or inside a

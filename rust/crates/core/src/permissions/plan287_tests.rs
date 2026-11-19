@@ -216,3 +216,79 @@ fn plan287_the_refused_location_is_checked_before_lifting() {
         Some(cache)
     );
 }
+
+/// 被拒的就是禁写目录本身（例如重命名它）时，父目录和缓存根都解除不了这次拒绝，什么都不提议
+/// （第二轮复审 P2）。
+#[test]
+fn plan287_a_refusal_of_the_denied_directory_itself_offers_nothing() {
+    let home = plan287_home("plan287-denied-self-");
+    let denied = home.join(".npm/_cacache/locked");
+    assert_eq!(
+        proposed_write_dir(&denied, Some(&home), plan287_vars(&[]), |dir| {
+            dir.starts_with(&denied)
+        }),
+        None
+    );
+}
+
+/// 候选目录经符号链接指向家目录或 `/` 时，按解析后的落点判断：授权时 `with_grants` 会把真实路径
+/// 加进可写根（第二轮复审 P2）。
+#[cfg(unix)]
+#[test]
+fn plan287_an_aliased_candidate_is_judged_where_it_lands() {
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(crate::resource_id::fresh("plan287-alias-").unwrap());
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let to_home = base.join("cache-to-home");
+    std::os::unix::fs::symlink(&home, &to_home).unwrap();
+    let to_root = base.join("cache-to-root");
+    std::os::unix::fs::symlink("/", &to_root).unwrap();
+
+    // 缓存根按链接拼写命中，但它落在家目录上：退回父目录（链接下一级，落在家目录里面）。
+    let cache = to_home.to_str().unwrap().to_string();
+    assert_eq!(
+        proposed_write_dir(
+            &to_home.join("_cacache/tmp/x"),
+            Some(&home),
+            plan287_vars(&[("npm_config_cache", cache.as_str())]),
+            |_| false
+        ),
+        Some(to_home.join("_cacache/tmp"))
+    );
+    assert!(!grantable_write_dir(&to_home, Some(&home)));
+    // 落在 `/` 上的链接本身不能授权；被拒文件直接在它下面时什么都不提议。
+    assert!(!grantable_write_dir(&to_root, Some(&home)));
+    let cache = to_root.to_str().unwrap().to_string();
+    assert_eq!(
+        proposed_write_dir(
+            &to_root.join("x"),
+            Some(&home),
+            plan287_vars(&[("npm_config_cache", cache.as_str())]),
+            |_| false
+        ),
+        None
+    );
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// 父目录名里有 glob 字符、写不成规则时，缓存根仍能覆盖这次写入；不在缓存里时什么都不提议
+/// （第二轮复审 P3）。
+#[test]
+fn plan287_an_unnameable_parent_still_lifts_to_the_cache_root() {
+    let home = plan287_home("plan287-bracket-");
+    assert_eq!(
+        proposed_write_dir(
+            &home.join(".npm/_cacache/chunk[1]/x"),
+            Some(&home),
+            plan287_vars(&[]),
+            |_| false
+        ),
+        Some(home.join(".npm"))
+    );
+    assert_eq!(
+        proposed_write_dir(&home.join("out[1]/x.o"), Some(&home), plan287_vars(&[]), |_| false),
+        None
+    );
+}
