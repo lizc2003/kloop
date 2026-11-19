@@ -228,3 +228,44 @@ fn plan286_a_symlinked_tmpdir_entry_is_guarded() {
     std::fs::remove_dir_all(&job).unwrap();
     std::fs::remove_dir_all(&elsewhere).unwrap();
 }
+
+/// `$TMPDIR` 的拼写里，`..` 跟在符号链接后面：目录项的真实上级要先经过链接再回退，词法折叠会算错
+/// （第三轮复审 P3）。删除真实上级不豁免。
+#[cfg(unix)]
+#[test]
+fn plan286_a_tmpdir_spelled_through_a_link_and_dotdot_is_guarded() {
+    let tmp = std::fs::canonicalize("/tmp").unwrap();
+    let id = crate::resource_id::fresh("plan286-dotdot-").unwrap();
+    let base = tmp.join(&id);
+    let elsewhere = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("{id}-real"));
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    std::fs::create_dir_all(base.join("other/y")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(base.join("other/y"), base.join("a/link")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, base.join("other/T")).unwrap();
+    // 物理上：`/tmp/<id>/a/link/..` 是 `/tmp/<id>/other`，它下面的 `T` 才是 `$TMPDIR` 的入口。
+    let spelled = Path::new("/tmp").join(&id).join("a/link/../T");
+    let roots = facts::scratch_roots_from(&[PathBuf::from("/tmp"), spelled], None);
+    let cwd = test_cwd();
+    let canonical = facts::canonical_cwd(&cwd);
+    let root = facts::PathRoot {
+        cwd: &cwd,
+        canonical: &canonical,
+    };
+    let text = |path: &Path| path.to_str().unwrap().to_string();
+    for (operand, scratch) in [
+        (text(&base.join("other")), false),
+        (text(&base.join("a")), true),
+        (text(&elsewhere.join("probe.log")), true),
+    ] {
+        assert_eq!(
+            facts::operand_is_scratch(&operand, root, &roots),
+            scratch,
+            "{operand}"
+        );
+    }
+    std::fs::remove_dir_all(&base).unwrap();
+    std::fs::remove_dir_all(&elsewhere).unwrap();
+}

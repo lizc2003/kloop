@@ -1212,8 +1212,9 @@ fn is_stream_device(path: &Path) -> bool {
 }
 
 /// 一个临时根：`canonical` 是删除落点要严格落在其内的规范路径；`entries` 是通向它的目录项的
-/// 各种拼写（原拼写、父目录规范化后接上自己的名字、规范路径）。`$TMPDIR` 本身可能是符号链接，
-/// 只留规范路径时，删掉链接所在的上级目录就认不出是在删会话正用着的临时目录入口（第二轮复审 P3）。
+/// 各种拼写（词法归一的原拼写、原拼写的父目录物理解析后接上自己的名字、规范路径）。`$TMPDIR` 本身
+/// 可能是符号链接，只留规范路径时，删掉链接所在的上级目录就认不出是在删会话正用着的临时目录入口
+/// （第二、三轮复审 P3）。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ScratchRoot {
     pub(super) canonical: PathBuf,
@@ -1245,9 +1246,11 @@ pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) ->
             continue;
         }
         let spelled = crate::paths::lexically_normalize(Path::new("/"), candidate);
-        let through_parent = spelled
+        // 目录项的真实位置按原拼写的父目录物理解析：先经过符号链接再走 `..`。先词法折叠 `..` 会把
+        // `/tmp/a/link/../T` 算成 `/tmp/a/T`，漏掉链接后面真正的上级目录（第三轮复审 P3）。
+        let through_parent = candidate
             .parent()
-            .zip(spelled.file_name())
+            .zip(candidate.file_name())
             .and_then(|(parent, name)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
         let index = match roots.iter().position(|root| root.canonical == canonical) {
             Some(index) => index,
