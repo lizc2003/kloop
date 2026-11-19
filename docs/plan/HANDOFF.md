@@ -1846,28 +1846,28 @@ server），core 从不写进 `History`；plan 219 曾把它记成「模型面�
 
 | plan | 一句话 | 规模 | 依赖 |
 |---|---|---|---|
-| **243** 敏感路径判定补漏 | `grep -rn`/`rg -.` 递归漏判、名单漏 `.env*`、glob 拼写、`~` 写目标;名单五份收成一份 | 中 | — |
+| **243** ✅ 敏感路径判定补漏 | `grep -rn`/`rg -.` 递归漏判、名单漏 `.env*`、glob 拼写、`~` 写目标;名单五份收成一份 | 中 | — |
 | **244** ✅ "总是允许"的作用域收窄 | 两词前缀不识别 wrapper/`-c`、`disable_sandbox` 不分键、文件工具 allow 跟随符号链接与 glob 元字符、`strip_wrappers` 留操作数 | 中 | — |
-| **245** 沙箱升级与实际执行对齐 | 通配升级 + 自动放行 = 不审批也不进沙箱;只读子路径祖先防改名;解析不可信不自动放行;两份祖先规范化 | 中 | — |
-| **246** 指令文件与注入的信任边界 | `AGENTS.md`/rules/`@import` 符号链接出界;skill 参数驱动注入;注入 No 不结束 turn;`@file` 有界读 | 中 | — |
-| **247** git 调用收成一个入口 | 环境加固只在一处(`GIT_DIR`/`GIT_INDEX_FILE` 串仓);scheduler 另算项目身份;启动 6–7 个 git 进程;测试 git 夹具隔离 | 中 | — |
-| **248** 共享的文本、路径与文件 helper | 截断十多份、原子写五六份、`~` 展开三份、hex 六份;exclude 文件变 0600 | 中 | — |
-| **249** 资源守卫与取消契约 | 前台 worktree 子 agent 中断泄漏、rewind/fork 孤儿文件、`bg-*.out` 残留;"工具 future 可被丢弃"写成契约 | 中 | — |
-| **250** agent 主循环与上下文估算 | hook 上下文残留吞掉用户输入;图片按 base64/4 估 token;主请求超长不记实测上限;`final_text` 拼接 | 中 | — |
-| **251** 会话持久化与恢复 | server 新会话文件不清理且读不出;rewind 回退错 route;digest 遇坏 UTF-8;resume 读两遍 | 中 | — |
-| **252** worktree 健壮性 | 一个失效的已登记 worktree 让所有操作失败;相对 path 按进程 cwd;阻塞 IO | 小 | 247 之后更顺 |
+| **245** ✅ 沙箱升级与实际执行对齐 | 通配升级 + 自动放行 = 不审批也不进沙箱;只读子路径祖先防改名;解析不可信不自动放行;两份祖先规范化 | 中 | — |
+| **246** ✅ 指令文件与注入的信任边界 | `AGENTS.md`/rules/`@import` 符号链接出界;skill 参数驱动注入;注入 No 不结束 turn;`@file` 有界读 | 中 | — |
+| **247** ✅ git 调用收成一个入口 | 环境加固只在一处(`GIT_DIR`/`GIT_INDEX_FILE` 串仓);scheduler 另算项目身份;启动 6–7 个 git 进程;测试 git 夹具隔离 | 中 | — |
+| **248** ✅ 共享的文本、路径与文件 helper | 截断十多份、原子写五六份、`~` 展开三份、hex 六份;exclude 文件变 0600 | 中 | — |
+| **249** ✅ 资源守卫与取消契约 | 前台 worktree 子 agent 中断泄漏、rewind/fork 孤儿文件、`bg-*.out` 残留;"工具 future 可被丢弃"写成契约 | 中 | — |
+| **250** ✅ agent 主循环与上下文估算 | hook 上下文残留吞掉用户输入;图片按 base64/4 估 token;主请求超长不记实测上限;`final_text` 拼接 | 中 | — |
+| **251** ✅ 会话持久化与恢复 | server 新会话文件不清理且读不出;rewind 回退错 route;digest 遇坏 UTF-8;resume 读两遍 | 中 | — |
+| **252** ✅ worktree 健壮性 | 一个失效的已登记 worktree 让所有操作失败;相对 path 按进程 cwd;阻塞 IO | 小 | 247 之后更顺 |
 | **253** ✅ provider 流式与请求构造 | Chat 轨 finish_reason 后停读丢 usage;空 `tools`;null 缓存字段判协议错;`billing` 太宽;无 data 帧 | 中 | — |
-| **254** provider 去重与解析性能 | SSE O(n²)、逐事件深拷贝;三条轨校验函数与 usage 解析成对复制 | 中 | 253 |
+| **254** ✅ provider 去重与解析性能 | SSE O(n²)、逐事件深拷贝;三条轨校验函数与 usage 解析成对复制 | 中 | 253 |
 | **255** ✅ bash 输出、超时与 hook IO | setsid 后代持管道让成功变错误;超时丢输出;`timeout_ms: 0`;stderr 被挤掉;hook 输出无上限 | 中 | — |
-| **256** 文件工具边界 | notebook 改类型、Unix 非覆盖 rename、长行永远不可写、二进制预览写成新文件、text_edit 内存放大 | 中 | — |
-| **257** 子 agent、Program、Workflow、调度 | `agent()` 的 `max_rounds` 必失败;Promise 不 settle 时 stop 无效;journal O(n²);休眠后定时延迟 | 中 | — |
+| **256** ✅ 文件工具边界 | notebook 改类型、Unix 非覆盖 rename、长行永远不可写、二进制预览写成新文件、text_edit 内存放大 | 中 | — |
+| **257** ✅ 子 agent、Program、Workflow、调度 | `agent()` 的 `max_rounds` 必失败;Promise 不 settle 时 stop 无效;journal O(n²);休眠后定时延迟 | 中 | — |
 | **258** ✅ CLI 前端 | headless stdout 污染(含 plan 241 那条);plain 两个 stdin 读者;`--plain` 信任前连 MCP;启动期 panic | 中 | — |
-| **259** server 输入与 worker | 唤醒信号被吞 steer 卡住;一行非 UTF-8 让 server 退出;`/provider` 残留 in_progress turn;delta O(n²) | 中 | — |
+| **259** ✅ server 输入与 worker | 唤醒信号被吞 steer 卡住;一行非 UTF-8 让 server 退出;`/provider` 残留 in_progress turn;delta O(n²) | 中 | — |
 | **260** ✅ MCP 传输与 OAuth | Windows `cmd /C start` 的 `&`;stdio 写不受超时;刷新无超时;relogin 粘死;`tools/call` 重放 | 中 | — |
 | **261** ✅ web_fetch | DNS rebinding 窗口;忽略 charset;先下满 20MiB 再看类型 | 小 | — |
 | **262** ✅ TUI 正确性 | 选择器出错不恢复 raw mode;`@` 补全只跳过 `.jj`;两套宽度算法;Tab 粘贴错位;`as u16` 丢行 | 中 | — |
 | **263** ✅ TUI 渲染缓存与事件循环 | 每帧重复解析 markdown 4–6 次;`@` 搜索/剪贴板/git 阻塞事件循环;面板键位等四类重复 | 中 | 262 |
-| **264** 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
+| **264** ✅ 每轮与每次调用的重复计算 | 历史每轮深拷两遍;每次工具调用重建全部 schema 两遍;`+term` 必选判断偏窄 | 小 | — |
 | **265** ✅ 同步/异步边界的约定 | 定约定;已读文件检查(含 FIFO 卡死)、后台 spawn 持锁、serve 工厂阻塞 | 小 | — |
 | **266** ✅ 权限判定一次产出 | `Verdict` 贯穿到执行;同一命令解析 5–7 次;两套 glob 语义;tree 选项两份 | 大 | 243、244、245 |
 | **267** ✅ 工具契约单一来源 | schema/解析/TS 声明三处分头演化;参数 helper 四份分叉;两个 `call_agent` bridge | 大 | 257 |

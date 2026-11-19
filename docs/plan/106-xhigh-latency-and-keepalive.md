@@ -1,6 +1,6 @@
 # Plan 106 — 网关 xhigh 实测:放行 `keepalive` 带外事件、补 `prompt_cache_key`
 
-> 状态：进行中（2026-08-31）
+> 状态：✅ 已完成（片 1–4、6–9；片 5 定为不做，理由见该节）
 >
 > 起因：用户反馈「kloop 用 gpt-5.6-sol xhigh 审查代码非常慢,codex 同样 gpt-5.6-sol xhigh 快一倍」。
 > 依赖：Plan 95(Responses 带外事件窄口放行,本计划沿用其纪律与形状)。
