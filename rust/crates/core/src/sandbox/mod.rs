@@ -910,7 +910,12 @@ pub fn classify_sandbox_denial(
     if exit_code == Some(0) {
         return None;
     }
-    classify_lines(output, network_disabled, &DENIED_KEYWORDS, &DNS_KEYWORDS)
+    classify_lines(
+        output,
+        network_disabled,
+        |line| DENIED_KEYWORDS.iter().any(|keyword| line.contains(keyword)),
+        &DNS_KEYWORDS,
+    )
 }
 
 /// The OS's own refusal texts — EPERM, EACCES, EROFS — without the mechanism
@@ -946,15 +951,35 @@ pub fn classify_masked_denial(output: &str, network_disabled: bool) -> Option<Sa
     classify_lines(
         output,
         network_disabled,
-        &STRONG_DENIED_KEYWORDS,
+        |line| {
+            STRONG_DENIED_KEYWORDS
+                .iter()
+                .any(|keyword| reads_as_a_refusal(line, keyword))
+        },
         &STRONG_DNS_KEYWORDS,
     )
+}
+
+/// 系统拒绝文本出现在报错的位置上：整行就是它，或前面紧挨 `:`、引号、`]`、`(`，后面是行尾或
+/// `:`、引号、`,`、`;`、`)`、` (`。日志认不出的拒绝（setuid 程序、未标记的内建拒绝）只能靠这行
+/// 文本，所以不能因为日志里没有事件就不认它；但读文件、grep 带出来的引用（“…就报 Operation not
+/// permitted。…”、反引号包着的文档）不是本次运行的失败（plan 283 第十三节候选 4）。`line` 已转小写。
+fn reads_as_a_refusal(line: &str, keyword: &str) -> bool {
+    line.match_indices(keyword).any(|(start, _)| {
+        let before = line[..start].trim_end();
+        let after = &line[start + keyword.len()..];
+        let opens = before.is_empty() || before.ends_with([':', '"', '\'', ']', '(']);
+        let closes = after.trim().is_empty()
+            || after.starts_with([':', '"', '\'', ',', ';', ')'])
+            || after.starts_with(" (");
+        opens && closes
+    })
 }
 
 fn classify_lines(
     output: &str,
     network_disabled: bool,
-    denied_keywords: &[&str],
+    denied: impl Fn(&str) -> bool,
     dns_keywords: &[&str],
 ) -> Option<SandboxDenial> {
     // Per line, so the evidence handed back is the sentence that matched rather
@@ -964,7 +989,7 @@ fn classify_lines(
     // verdict.
     for line in output.lines() {
         let lower = line.to_lowercase();
-        let denied = denied_keywords.iter().any(|k| lower.contains(k));
+        let denied = denied(&lower);
         let dns = network_disabled && dns_keywords.iter().any(|k| lower.contains(k));
         if !denied && !dns {
             continue;
@@ -1102,6 +1127,37 @@ mod tests {
             tagged.replace(" (with message \"kloop-deny-T3st\")", ""),
             plain
         );
+    }
+
+    /// 系统拒绝文本要出现在报错的位置上才算证据：这周日志认不出、只能靠输出认出的真实拒绝都是
+    /// 这些形状；读文件、grep 带出来的引用不算（plan 283 第十三节候选 4）。
+    #[test]
+    fn refusal_text_counts_only_where_an_error_puts_it() {
+        for failure in [
+            "Operation not permitted (os error 1)",
+            "called `Result::unwrap()` on an `Err` value: Os { code: 1, kind: PermissionDenied, message: \"Operation not permitted\" }",
+            "(eval):1: operation not permitted: ps",
+            "touch: /x/y: Operation not permitted",
+            "PermissionError: [Errno 13] Permission denied: '/x/y'",
+            "Error: EPERM: operation not permitted, open '/x/y'",
+            "java.io.FileNotFoundException: /x/y (Operation not permitted)",
+            "  Permission denied (os error 13)",
+            "rm: /x/y: Read-only file system",
+        ] {
+            assert!(
+                classify_masked_denial(failure, false).is_some(),
+                "{failure}"
+            );
+        }
+        for quoted in [
+            "37-# 内层 sandbox_apply 就报 Operation not permitted。全量测试不跳过它们（plan 283）：先试一次",
+            "the sandbox fails with `Operation not permitted` when nested",
+            "macOS answers Operation not permitted and the tool retries",
+            "permission denied errors are retried once",
+            "DESIGN.md:12: a read-only file system is never the workspace",
+        ] {
+            assert_eq!(classify_masked_denial(quoted, false), None, "{quoted}");
+        }
     }
 
     /// A zero exit that a pipe may have masked stands on the OS's own refusal

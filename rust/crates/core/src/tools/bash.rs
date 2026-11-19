@@ -2908,6 +2908,8 @@ mod tests {
                 crate::permissions::Decision::Allow(crate::permissions::ApprovalScope::Once),
             );
             let target = outside_dir("cap-expected").join("expected.txt");
+            // 固定路径的夹具：之前放到沙箱外重跑的那次会把它写出来，留着它最后的断言就失效了。
+            let _ = std::fs::remove_file(&target);
             let (out, is_error) = run_tool(
                 "bash",
                 bash_input(&format!(

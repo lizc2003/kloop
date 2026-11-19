@@ -4095,8 +4095,16 @@ purpose and still succeed (a test that expects `PermissionError` and catches
 it), so the log alone never says the work failed — only output showing the
 OS's own refusal text does, and the log then says precisely what was refused. Two things the log does not show are read off the output: a nested
 `sandbox-exec` (`sandbox_apply: Operation not permitted`, a built-in refusal the
-marker does not reach — `nested sandbox`) and, should an event have been
-dropped, the OS's own refusal text. Without a watch — another platform, a `log`
+marker does not reach — `nested sandbox`) and the OS's own refusal text. The
+latter is not a fallback for dropped events but the only evidence for
+refusals the log never tags: in plan 283's week of records every
+`unclassified` denial came from it — a setuid `ps`, a Rust
+`Operation not permitted (os error 1)`, an `Os { … message: "Operation not
+permitted" }`. That text counts only where an error puts it (plan 283 section
+13, candidate 4): the whole line, or right after `:`, a quote, `]` or `(`, and
+followed by the line end, `:`, a quote, `,`, `;`, `)` or ` (`. A file's content
+quoting the phrase — a `grep` hit on a comment, a backticked doc — is not this
+run's failure. Without a watch — another platform, a `log`
 that does not answer within 500 ms, a background command — the output is all
 there is: the keyword classifier ported from codex (plus DNS-failure shapes when
 the network is denied) for a failure, and for a masked zero only strong
