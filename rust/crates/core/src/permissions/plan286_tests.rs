@@ -69,6 +69,10 @@ fn plan286_other_removals_stay_destructive() {
         "rm -rf \"$TMPDIR/kloop-plan286-a\"".to_string(),
         "printf '/tmp/kloop-plan286-a\\n' | xargs rm -rf".to_string(),
         "for d in /tmp/kloop-plan286-a; do rm -rf \"$d\"; done".to_string(),
+        // xargs 从 stdin 往后追加操作数：固定参数里的临时路径不能替追加的那些作保。
+        "printf 'src\\n' | xargs rm -rf /tmp/kloop-plan286-a".to_string(),
+        "find . -name '*.o' -print0 | xargs -0 rm -f /tmp/kloop-plan286-a".to_string(),
+        "printf 'src\\n' | timeout 5 xargs rm -rf /tmp/kloop-plan286-a".to_string(),
     ] {
         assert_eq!(
             plan286_hazard(&command, &test_cwd()),
@@ -96,6 +100,9 @@ fn plan286_resolution_decides_where_the_removal_lands() {
     assert_eq!(plan286_hazard(&inside_workspace, &workspace), Some("destructive"));
     let whole_workspace = format!("rm -rf {workspace_text}");
     assert_eq!(plan286_hazard(&whole_workspace, &workspace), Some("destructive"));
+    // 工作区的上级目录：递归删除会把工作区一起删掉（复审 P2）。
+    let workspace_parent = format!("rm -rf {base_text}");
+    assert_eq!(plan286_hazard(&workspace_parent, &workspace), Some("destructive"));
     let beside_workspace = format!("rm -rf {base_text}/scratch");
     assert_eq!(plan286_hazard(&beside_workspace, &workspace), None);
 
@@ -141,4 +148,36 @@ async fn plan286_the_gate_no_longer_asks_for_scratch_cleanup() {
     let p = gate(Mode::Manual, rules(&[], &[], &[]), approver.clone());
     p.check_call("bash", &bash(command), 0, true).await.expect_err(command);
     assert_eq!(approver.ask_count(), 1);
+}
+
+/// `$TMPDIR` 嵌在 `/tmp` 下时，`/tmp` 里通向它的目录和它本身都不是可随手删的临时文件（复审 P2）；
+/// 它里面的东西照旧豁免。
+#[cfg(unix)]
+#[test]
+fn plan286_a_tmpdir_nested_in_tmp_is_not_scratch_itself() {
+    let tmp = std::fs::canonicalize("/tmp").unwrap();
+    let user = tmp.join(crate::resource_id::fresh("plan286-nested-").unwrap());
+    let nested = user.join("T");
+    std::fs::create_dir_all(&nested).unwrap();
+    let roots = vec![tmp.clone(), nested.clone()];
+    let cwd = test_cwd();
+    let canonical = facts::canonical_cwd(&cwd);
+    let root = facts::PathRoot {
+        cwd: &cwd,
+        canonical: &canonical,
+    };
+    let text = |path: &Path| path.to_str().unwrap().to_string();
+    for (operand, scratch) in [
+        (text(&user), false),
+        (text(&nested), false),
+        (text(&nested.join("probe.log")), true),
+        (text(&user.join("sibling")), true),
+    ] {
+        assert_eq!(
+            facts::operand_is_scratch(&operand, root, &roots),
+            scratch,
+            "{operand}"
+        );
+    }
+    std::fs::remove_dir_all(&user).unwrap();
 }

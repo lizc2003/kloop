@@ -285,14 +285,18 @@ impl CallFacts {
     }
 
     /// 危险命令判定，直接执行的 argv 和剥掉包装器后的各个视图都看。只清理临时目录的
-    /// `rm` 不算（plan 286），但整条命令里出现 `sudo`/`doas` 时不豁免：提权后删的东西
-    /// 不再受“只是自己的临时文件”这个前提约束。
+    /// `rm` 不算（plan 286），但整条命令里出现下面两类词时不豁免：`sudo`/`doas` 提权后删的
+    /// 东西不再受“只是自己的临时文件”这个前提约束；`xargs` 会从 stdin 往视图后面追加操作数，
+    /// 剥掉它看到的 `rm` 只是固定参数那一半。
     fn argv_is_hazardous(&self, argv: &[String]) -> bool {
-        let elevated = argv
-            .iter()
-            .any(|word| matches!(word.rsplit('/').next().unwrap_or(word), "sudo" | "doas"));
+        let no_exemption = argv.iter().any(|word| {
+            matches!(
+                word.rsplit('/').next().unwrap_or(word),
+                "sudo" | "doas" | "xargs"
+            )
+        });
         let hazardous = |view: &[String]| {
-            argv_is_dangerous(view) && (elevated || !self.removes_only_scratch(view))
+            argv_is_dangerous(view) && (no_exemption || !self.removes_only_scratch(view))
         };
         hazardous(argv) || risk_wrapper_views(argv).iter().any(|view| hazardous(view))
     }
@@ -1230,16 +1234,24 @@ pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) ->
 }
 
 /// 一个 `rm` 操作数是否只是临时目录里的东西：字面绝对路径（不含未知片段、glob 与花括号），
-/// 解析后严格落在某个临时根之内，不在工作区里，也不是敏感路径。解析失败（断链、权限错误、
-/// 缺失部分里有 `..`）一律不算。
-fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[PathBuf]) -> bool {
+/// 解析后严格落在某个临时根之内，既不在工作区里，也不是工作区或某个临时根的祖先（工作区在
+/// 临时目录里、`$TMPDIR` 嵌在 `/tmp` 下时，递归删上级目录会把它们一起删掉），也不是敏感路径。
+/// 解析失败（断链、权限错误、缺失部分里有 `..`）一律不算。
+pub(super) fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[PathBuf]) -> bool {
     if raw.contains(['\0', '*', '?', '[', '{']) || !Path::new(raw).is_absolute() {
         return false;
     }
     let facts = PathFacts::gather_in(Path::new(raw), root, None);
+    let holds_workspace =
+        root.canonical.starts_with(&facts.normalized) || root.cwd.starts_with(&facts.original);
+    let holds_scratch_root = roots
+        .iter()
+        .any(|scratch| scratch.starts_with(&facts.normalized));
     facts.resolved
         && !facts.inside_cwd
         && !facts.original.starts_with(root.cwd)
+        && !holds_workspace
+        && !holds_scratch_root
         && facts.sensitivity(Access::Write).is_none()
         && roots
             .iter()

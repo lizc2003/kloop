@@ -1485,10 +1485,12 @@ irreversible and git is not the way back** — `rm -rf`, `dd of=…`, `mkfs*`,
 are deliberately absent: inside a repository those are the recovery path.
 设备输出（`… > /dev/sda`）由固定输出路径检查强制确认；动态目标仍 opaque。
 同一条标准也划出了一个例外（plan 286）：`rm` 的每个操作数都是不含变量、glob、花括号的字面
-绝对路径，解析到真实落点后严格在 `/tmp` 或 `$TMPDIR` 之内（不是这两个根本身），且不在工作区里、
-不是敏感路径时，删的只是一次性的探针和日志，不算危险命令。`$TMPDIR` 是 `/`、家目录或其祖先时不算
-临时目录；操作数后面再跟选项（BSD 与 GNU 语义不同）、命令里出现 `sudo`/`doas`、xargs 与循环绑定
-这些带未知值的视图，都照旧确认。只在 Unix 上生效。
+绝对路径，解析到真实落点后严格在 `/tmp` 或 `$TMPDIR` 之内，既不在工作区里，也不是工作区或某个临时根
+的本身或祖先（工作区在临时目录里、`$TMPDIR` 嵌在 `/tmp` 下时，递归删上级目录会把它们一起删掉），也不是
+敏感路径时，删的只是一次性的探针和日志，不算危险命令。`$TMPDIR` 是 `/`、家目录或其祖先时不算临时目录；
+操作数后面再跟选项（BSD 与 GNU 语义不同）、命令里出现 `sudo`/`doas`（提权）或 `xargs`（从 stdin 往后
+追加操作数，固定参数里的临时路径替追加的那些作不了保）、循环绑定这些带未知值的视图，都照旧确认。只在
+Unix 上生效。
 
 **Rules** are split by lifetime. Global `~/.kloop/config.toml` provides only
 process-wide constraints:

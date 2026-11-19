@@ -5,6 +5,10 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 286 复审修正（2026-11-19）**：两条 P2 都成立。整条 argv 里有 `xargs` 时不豁免（它往后追加的操作数没参与
+判断，`… | xargs rm -rf /tmp/x` 曾被放行）；操作数是工作区或任一临时根的本身或祖先时不豁免（工作区在临时目录里时
+删它的上级、`$TMPDIR` 嵌在 `/tmp` 下时删 `$TMPDIR` 本身）。kloop-core 库测试沙箱外 1475 过；fmt、clippy 干净。
+
 **Plan 288（已回退，2026-11-19）：`ps` 在沙箱里能跑的 profile 例外**：plan 283 第十三节候选 6。曾在 profile
 里加 `(allow process-exec (literal "/bin/ps") (with no-sandbox))`，并对打印环境变量的 `ps` 加
 `[process environment]` 检查。复审（P1）指出 exec 规则只认文件不认调用者，沙箱里所有后代进程都能借它出沙箱：
