@@ -14,6 +14,13 @@
 这周全在沙箱外跑，"kloop 日常开发零询问"因此按原意不算达成。六条后续候选列在 plan 283 第十三节末，
 本阶段不改行为，各自另立计划前问用户。只读会话文件统计，没跑回放、没编译。教训 418。
 
+**Plan 283 第十三节候选 1 处理（2026-11-19）**：在手工拼出的 kloop 沙箱 profile 里核实：
+`kloop-process-spawn` 17 过（11-13 的 EPERM 不再出现），`cargo fmt --check` 过，workspace 全量 2505 过、
+1 败。失败的是 `tui_pty` 里一条起真 kloop 跑 bash 的用例：嵌套沙箱后停在升级询问上，阶段 1 的跳过只覆盖了
+kloop-core。用户删掉了 kloop 项目的 `cargo test *`/`cargo fmt *` 脱沙箱规则；PTY 支持模块补了同一判据的
+跳过 helper。验证：这条用例沙箱内跳过、沙箱内设 `KLOOP_REQUIRE_SEATBELT_TESTS=1` 真跑并失败、沙箱外真跑并
+通过；fmt 和这三个 PTY 测试目标的 clippy `-D warnings` 干净。教训 419。
+
 **Plan 270 ✅：模块切分与测试整理（2026-11-18）**：开工问答定为测试文件不改名、只加“测什么”的头注释；
 扫描后 `tui/src/app.rs`、`core/src/permissions.rs`、`core/src/tools/fs.rs` 不切——三份的 60–75% 是测试，
 非测试部分分别是单个 `App` 状态机（46 字段、66 个方法互相调用）、已有 10 个子模块的权限门、读写共用
@@ -5484,3 +5491,9 @@ plan 270 把测试的 `temp_dir(tag) -> PathBuf` 换成 `TempDir` 后，`History
 被项目规则直接放到沙箱外，起因只是一个未提交 crate 里的一个测试在沙箱内失败时，用户选了“本项目”。
 判据：只要一条授权能长期免问，就同时统计它免掉了什么、在什么证据下记下的；报告里把“没问但没被
 约束”的次数和询问次数写在一起，不只报询问数。
+
+419. **按“需要真实 seatbelt”划跳过范围时，要搜全部 crate，包括起子进程的场景测试。** plan 283 阶段 1 只量了
+kloop-core 库测试在沙箱内的失败清单，跳过 helper 也是 kloop-core 里 `cfg(test)` 的函数；cli 的 PTY 用例起的
+是真 kloop，那个 kloop 再把 bash 放进 seatbelt，在 kloop 沙箱内就嵌套失败，用户为此记下的
+`sandbox_escalate(cargo test *)` 让整个测试命令长期脱沙箱。判据：沙箱相关的跳过，用整个 workspace 在真实
+profile 里跑一遍来定范围，不按某个 crate 的清单推。

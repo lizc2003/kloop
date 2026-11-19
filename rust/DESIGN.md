@@ -4253,8 +4253,11 @@ process is still assigned to a mandatory Job Object before user code runs;
 process group. Sandboxed processes see `KLOOP_SANDBOX=seatbelt` (and
 `KLOOP_SANDBOX_NETWORK_DISABLED=1`) as detection hints. kloop's own tests use it:
 seatbelt cannot nest (an outer profile with any restriction makes the inner
-`sandbox_apply` fail), so the 26 real-seatbelt tests skip themselves inside
-kloop's sandbox and everything else runs there as usual. A full run must not
+`sandbox_apply` fail), so every test that really runs `sandbox-exec` skips itself
+inside kloop's sandbox and everything else runs there as usual. That is
+kloop-core's real-seatbelt tests and the PTY scenario whose child kloop runs a
+real Bash call; the integration tests carry their own copy of the check, since
+kloop-core's helper is test-only and out of their reach. A full run must not
 skip them: `make test`/`make check` first try to nest `sandbox-exec` and fail at
 once with the real denial line if they cannot — which is what the escalation
 classifier needs to see — and set `KLOOP_REQUIRE_SEATBELT_TESTS=1`, which turns

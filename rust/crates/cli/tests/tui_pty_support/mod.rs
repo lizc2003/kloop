@@ -1064,6 +1064,24 @@ pub fn scaled_timeout(timeout: Duration) -> Duration {
     }
 }
 
+/// 子进程真会跑 `sandbox-exec` 的场景是否该跳过：已经在 kloop 的沙箱里，seatbelt
+/// 不能嵌套（plan 283）。判据与 kloop-core 的同名测试 helper 一致，集成测试够不到
+/// 那个 `cfg(test)` 函数，所以在这里再写一份；`make test` 设了
+/// `KLOOP_REQUIRE_SEATBELT_TESTS`，完整检查照样真跑、真失败。
+pub fn skip_nested_seatbelt_test() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    if std::env::var_os("KLOOP_SANDBOX").is_none_or(|value| value != "seatbelt") {
+        return false;
+    }
+    if std::env::var_os("KLOOP_REQUIRE_SEATBELT_TESTS").is_some_and(|value| !value.is_empty()) {
+        return false;
+    }
+    eprintln!("skipped: needs the real OS sandbox, which cannot nest inside kloop's sandbox");
+    true
+}
+
 fn bounded_raw_summary(raw: &[u8]) -> String {
     let start = raw.len().saturating_sub(2048);
     raw[start..]

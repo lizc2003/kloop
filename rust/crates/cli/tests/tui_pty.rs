@@ -17,6 +17,7 @@ use tui_pty_support::PtyHarness;
 use tui_pty_support::PtyOptions;
 use tui_pty_support::contains_bytes;
 use tui_pty_support::find_bytes;
+use tui_pty_support::skip_nested_seatbelt_test;
 use tui_pty_support::sse_text;
 use tui_pty_support::sse_tool_call;
 
@@ -1103,8 +1104,12 @@ async fn one_tool_call_and_its_result_fill_the_screen() -> Result<()> {
 /// 160). The summary and the command are each long enough that the old
 /// one-row header would have truncated the command away entirely; `seq` is on
 /// the read-only argv list, so the gate lets the turn run without a prompt.
+/// 这条命令在真实的 seatbelt 里跑；嵌套在 kloop 沙箱内时会被拒、停在升级询问上，所以跳过。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shell_command_gets_a_row_of_its_own() -> Result<()> {
+    if skip_nested_seatbelt_test() {
+        return Ok(());
+    }
     let _guard = PTY_TEST_LOCK.lock().await;
     let fixture = ChatFixture::start(vec![
         sse_tool_call(

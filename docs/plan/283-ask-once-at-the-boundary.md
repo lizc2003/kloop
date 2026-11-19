@@ -532,7 +532,7 @@ kloop 沙箱内同样 1390 过（真实 seatbelt 用例跳过）。
 3. **测试在沙箱里真失败 1 次**（kloop）。`cargo test -p kloop-process-spawn` 先因写 `~/.cargo/.package-cache`
    被拒，按项目给了 `sandbox_write(~/.cargo)`（有界）。重跑后 `piped_stdin_round_trips` 在 spawn 时报 EPERM，
    日志里没有能归类的事件，认不出 → 整个脱沙箱，用户选了"本项目"，记下 `sandbox_escalate(cargo test *)`。
-   当时这个 crate 还是 plan 260 未提交的代码；现在的版本在沙箱里还失不失败，**没有核实**。阶段 0 只量了
+   当时这个 crate 还是 plan 260 未提交的代码；现在的版本在沙箱里已经能通过（见本节末“核实与处理”）。阶段 0 只量了
    kloop-core 库测试，没量这个 crate。
 4. **改 `.git/config` 1 次**（业务仓库）。`git branch -D` 会删掉 `.git/config` 里的分支配置，受保护子路径不
    提议目录，走整个脱沙箱，用户记成 `sandbox_escalate(git branch *)`。符合设计。
@@ -599,9 +599,9 @@ kloop 沙箱内同样 1390 过（真实 seatbelt 用例跳过）。
 
 后续候选（本阶段不改行为；各自另立计划，开工前问用户），按轻重排：
 
-1. kloop 项目里的 `sandbox_escalate(cargo test *)`、`sandbox_escalate(cargo fmt *)`：先核实
+1. ✅（见下面“核实与处理”）kloop 项目里的 `sandbox_escalate(cargo test *)`、`sandbox_escalate(cargo fmt *)`：先核实
    `kloop-process-spawn` 现在能不能在 kloop 沙箱内通过，再由用户决定删不删（规则在用户本机的权限文件里）。
-   再看要不要让 kloop 自己发现这类"沙箱内其实能跑"的旧规则。
+   要不要让 kloop 自己发现这类"沙箱内其实能跑"的旧规则，仍待定。
 2. `rm` 的目标都是 `/tmp`、`$TMPDIR` 下的字面路径时，不再当危险命令（沙箱本来就允许写这些地方）；工作区内
    被 gitignore 的临时产物要不要也放过，单独问。
 3. `KLOOP_REQUIRE_SEATBELT_TESTS` 把 `0`、`false` 当成未设置，或在 `AGENTS.md` 写明只认 `1`。
@@ -609,3 +609,19 @@ kloop 沙箱内同样 1390 过（真实 seatbelt 用例跳过）。
    和"引用文本被误判"之间取舍。
 5. 包管理器缓存的写目录提议上移到缓存根（Go 模块缓存、Go telemetry 等），或者把常见工具缓存默认设为可写。
 6. `ps` 这类 setuid 只读程序：沙箱内不能执行，现在每次都要整个脱沙箱，而且记不住。
+
+### 核实与处理（2026-11-19）
+
+- **核实方法**：用 kloop-core 的 `SandboxPolicy::workspace` + `seatbelt_profile`，按 CLI 启动时的同一份策略
+  拼出 profile（工作区是仓库根；`/tmp`、`$TMPDIR`、用户缓存目录可写；私有状态根读写都拒绝；凭据根拒绝；
+  再加上项目已有的 `sandbox_write(~/.cargo)`），设好 `KLOOP_SANDBOX=seatbelt`，在 `sandbox-exec` 里手工跑。
+  拼 profile 的临时程序没有提交。
+- **结果**：`cargo test -p kloop-process-spawn` 17 过，包括 11-13 报 EPERM 的 `piped_stdin_round_trips`；
+  `cargo fmt --all -- --check` 通过；`cargo test --workspace --no-fail-fast` 2505 过、1 败、7 ignored。
+  失败的是 `tui_pty` 的 `a_shell_command_gets_a_row_of_its_own`：它起一个真的 kloop，那个 kloop 再把 bash
+  放进 seatbelt，在沙箱内就撞上嵌套，停在升级询问上超时。阶段 1 只按 kloop-core 划了跳过范围，漏了这条：
+  kloop-core 的跳过 helper 是 `cfg(test)` 的 crate 内函数，集成测试够不到。
+- **处理**：用户删掉了 kloop 项目的 `sandbox_escalate(cargo test *)` 和 `sandbox_escalate(cargo fmt *)`
+  （`revision` 21 → 22）。PTY 测试支持模块加了同一判据的 `skip_nested_seatbelt_test`，这条用例开头调用它。
+  验证结果：kloop 沙箱内会跳过并通过；沙箱内设 `KLOOP_REQUIRE_SEATBELT_TESTS=1` 时真跑，照旧停在嵌套询问上
+  失败；沙箱外真跑并通过。
