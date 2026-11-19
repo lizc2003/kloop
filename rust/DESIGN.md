@@ -4043,6 +4043,21 @@ deny-by-default SBPL profile — the shape cc and codex converged on):
   own configuration reads as a guarantee it cannot keep. Credentials are the
   one exception — see below — because those belong to this process, not to the
   command.
+- **`/bin/ps` leaves the sandbox on its own** (plan 288). It is setuid root,
+  and a sandboxed process may not exec a setuid binary, so every `ps` failed
+  with `operation not permitted` and could only run after the whole command
+  left the sandbox — once each time, since `ps -axo …` has no stable prefix to
+  remember. The profile carries one exception,
+  `(allow process-exec (literal "/bin/ps") (with no-sandbox))`: `ps` itself
+  runs uncontained (it reads the process table and writes nothing), the `grep`
+  or `head` it pipes into stays contained. Command lines of every process are
+  what any local user sees anyway; other processes' **environment** is not,
+  and often holds secrets, so a `ps` that prints it — `E` in an option cluster,
+  `e`/`E` in a BSD-style first argument, or an argument the parser cannot see —
+  is a `[process environment]` safety check at the gate, asked every time.
+  Option values (`-o etime`) do not count. Legacy mode's `-e` is not
+  recognized. macOS only; `pgrep` stays unusable inside the sandbox (it asks a
+  system service the profile does not reach).
 - **Sandboxed = fewer questions** (`trust_sandboxed`, default on): a bash call
   the sandbox will contain skips the asking layers of the permission gate when
   its parse tree and local facts are complete — including opaque control flow

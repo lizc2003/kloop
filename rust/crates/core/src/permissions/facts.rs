@@ -332,6 +332,34 @@ impl CallFacts {
         operands > 0
     }
 
+    /// macOS 的沙箱让 `/bin/ps` 自己出沙箱运行（plan 288），它能看到所有进程；打印别的进程
+    /// 环境变量（常带密钥）的写法要先问。直接执行的 argv、剥掉包装器后的视图、循环绑定都看。
+    fn lists_process_environment(&self) -> bool {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        let shows = |argv: &[String]| {
+            ps_shows_environment(argv)
+                || risk_wrapper_views(argv)
+                    .iter()
+                    .any(|view| ps_shows_environment(view))
+        };
+        let analysed = self
+            .shell
+            .as_ref()
+            .and_then(|shell| match shell {
+                ShellFacts::Bash(analysis) => analysis.commands(),
+                ShellFacts::PowerShellOpaque => None,
+            })
+            .is_some_and(|cmds| cmds.iter().any(|argv| shows(argv)));
+        analysed
+            || self.risk_commands.iter().any(|command| {
+                [command.risk_argv(), command.bound_risk_argv()]
+                    .iter()
+                    .any(|argv| shows(argv))
+            })
+    }
+
     pub(super) fn hazard(&self, name: &str) -> Option<Hazard> {
         if self.entering_existing_worktree {
             return Some(Hazard {
@@ -371,6 +399,11 @@ impl CallFacts {
                 .any(|argv| self.argv_is_hazardous(argv))
         }) {
             return Some(Hazard { tag: "destructive" });
+        }
+        if self.lists_process_environment() {
+            return Some(Hazard {
+                tag: "process environment",
+            });
         }
         if self.risk_writes.iter().any(WriteTarget::sensitive) {
             return Some(Hazard {
@@ -1199,6 +1232,45 @@ fn is_stream_device(path: &Path) -> bool {
         path.to_str(),
         Some("/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty")
     )
+}
+
+/// `ps` 的参数里有没有打印环境变量的写法（plan 288）：选项簇里的 `E`，或 BSD 写法（第一个参数不带
+/// `-`）里的 `e`/`E`。`-o`、`-O`、`-G`、`-g`、`-u`、`-p`、`-t`、`-U` 带值，值里的字母不算（`-o etime`）。
+/// 认不出的参数（变量、命令替换）按会打印处理，选项的值除外。legacy 模式（`COMMAND_MODE=legacy`）
+/// 下 `-e` 也打印环境，这里不认。
+fn ps_shows_environment(argv: &[String]) -> bool {
+    let Some(command) = argv.first() else {
+        return false;
+    };
+    if command.rsplit('/').next() != Some("ps") {
+        return false;
+    }
+    let mut value_next = false;
+    for (index, arg) in argv.iter().enumerate().skip(1) {
+        if value_next {
+            value_next = false;
+            continue;
+        }
+        if arg.contains('\0') {
+            return true;
+        }
+        match arg.strip_prefix('-') {
+            Some(cluster) => {
+                for (position, flag) in cluster.char_indices() {
+                    if flag == 'E' {
+                        return true;
+                    }
+                    if matches!(flag, 'o' | 'O' | 'G' | 'g' | 'u' | 'p' | 't' | 'U') {
+                        value_next = position + flag.len_utf8() == cluster.len();
+                        break;
+                    }
+                }
+            }
+            None if index == 1 && arg.contains(['e', 'E']) => return true,
+            None => {}
+        }
+    }
+    false
 }
 
 /// 临时目录的规范路径：`/tmp` 与 `$TMPDIR`，也就是沙箱给的两个临时可写根。`$TMPDIR` 被设成

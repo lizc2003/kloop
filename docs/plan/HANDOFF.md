@@ -5,6 +5,13 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**Plan 288 ✅：`ps` 在沙箱里能跑；打印进程环境变量的 `ps` 先问（2026-11-19）**：plan 283 第十三节候选 6。
+`/bin/ps` 是 setuid，沙箱进程执行不了；profile 新增 `seatbelt_ps.sbpl` 一条
+`(allow process-exec (literal "/bin/ps") (with no-sandbox))`，只有 `ps` 自己出沙箱，管道后面照旧受限。能打印
+别的进程环境变量的写法（选项簇里的 `E`、BSD 写法第一个参数里的 `e`/`E`、认不出的参数）是新的安全检查
+`[process environment]`，每次都问；带值选项的值不算；只在 macOS。`pgrep` 在沙箱里仍不可用。至此第十三节
+六条候选只剩候选 1 的“kloop 自己发现过时规则”待定。kloop-core 库测试沙箱外 1475 过；fmt、clippy 干净。
+
 **Plan 287 ✅：写入被拒落在工具缓存里时提议整个缓存根（2026-11-19）**：plan 283 第十三节候选 5，用户选“上移到
 缓存根”而不是默认可写。Go 模块缓存、Go telemetry、npm、cargo 的 `registry`/`git`、Maven、Gradle 的缓存里
 被拒的写入，提议的是缓存根而不是只覆盖一个包的父目录；位置按 kloop 自己的环境变量（只认绝对值），根是家目录
