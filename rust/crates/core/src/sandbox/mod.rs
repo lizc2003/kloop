@@ -34,7 +34,6 @@ pub const SEATBELT_EXE: &str = "/usr/bin/sandbox-exec";
 const SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base.sbpl");
 const SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network.sbpl");
 const SEATBELT_LOOPBACK_POLICY: &str = include_str!("seatbelt_loopback.sbpl");
-const SEATBELT_PS_POLICY: &str = include_str!("seatbelt_ps.sbpl");
 
 /// 正文例外依赖凭据隔离；失败和启动前拒绝都不能建议移除该保护。
 pub const PROTECTION_REQUIRED: &str = "\n[This literal-input command requires credential read/write protection. Running it without that protection is blocked; sandbox escalation is unavailable.]";
@@ -662,7 +661,6 @@ fn untagged_profile(policy: &SandboxPolicy) -> (String, Vec<(String, PathBuf)>) 
     // by the base policy's (deny default) unless allow rules are appended.
     let mut sections = vec![
         SEATBELT_BASE_POLICY.to_string(),
-        SEATBELT_PS_POLICY.to_string(),
         "; kloop dynamic policy: full-disk read minus credentials, allow-listed writes".to_string(),
         file_read,
         file_write,
@@ -1248,9 +1246,7 @@ mod tests {
         // locked by `network_denied_still_allows_loopback_but_nothing_off_machine`.
         assert_eq!(
             profile,
-            format!(
-                "{SEATBELT_BASE_POLICY}\n{SEATBELT_PS_POLICY}\n{expected_dynamic}\n{SEATBELT_LOOPBACK_POLICY}"
-            )
+            format!("{SEATBELT_BASE_POLICY}\n{expected_dynamic}\n{SEATBELT_LOOPBACK_POLICY}")
         );
         assert_eq!(
             params,

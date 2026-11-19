@@ -1,7 +1,0 @@
-; kloop (plan 288): /bin/ps is setuid root, and a sandboxed process may not exec
-; a setuid binary, so every `ps` failed with "operation not permitted" and could
-; only run after leaving the sandbox entirely. Only /bin/ps itself leaves it: it
-; reads the process table and writes nothing, and the rest of the command (the
-; `grep` or `head` it pipes into) stays contained. Showing other processes'
-; environment (`-E`, BSD-style `e`) is asked about at the permission gate.
-(allow process-exec (literal "/bin/ps") (with no-sandbox))

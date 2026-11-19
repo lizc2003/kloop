@@ -1535,7 +1535,6 @@ mod tests {
     include!("permissions/plan285_tests.rs");
     include!("permissions/plan286_tests.rs");
     include!("permissions/plan287_tests.rs");
-    include!("permissions/plan288_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;

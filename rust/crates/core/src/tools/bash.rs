@@ -2930,21 +2930,6 @@ mod tests {
             assert!(!target.exists());
         }
 
-        /// `/bin/ps` 是 setuid 程序，沙箱里的进程本来执行不了它；profile 只给它开了例外
-        /// （plan 288），所以在沙箱里能跑、不触发升级，管道后面的命令照旧在沙箱里。
-        #[tokio::test]
-        async fn ps_runs_inside_the_sandbox() {
-            if crate::sandbox::skip_nested_seatbelt_test() {
-                return;
-            }
-            let (ctx, asked) = escalating_ctx("ps", crate::permissions::Decision::Deny);
-            let (out, is_error) =
-                run_tool("bash", bash_input("ps -p $$ -o pid= | head -1"), &ctx).await;
-            assert!(!is_error, "{out}");
-            assert!(out.trim().parse::<u32>().is_ok(), "{out}");
-            assert_eq!(asked.load(Ordering::SeqCst), 0, "{out}");
-        }
-
         /// A refused read is a protected path by construction — the profile
         /// reads the whole disk otherwise — so it is never offered for an
         /// escalation, whatever the approver would say.
