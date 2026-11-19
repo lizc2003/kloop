@@ -1075,11 +1075,20 @@ pub fn skip_nested_seatbelt_test() -> bool {
     if std::env::var_os("KLOOP_SANDBOX").is_none_or(|value| value != "seatbelt") {
         return false;
     }
-    if std::env::var_os("KLOOP_REQUIRE_SEATBELT_TESTS").is_some_and(|value| !value.is_empty()) {
+    if seatbelt_tests_required(std::env::var_os("KLOOP_REQUIRE_SEATBELT_TESTS").as_deref()) {
         return false;
     }
     eprintln!("skipped: needs the real OS sandbox, which cannot nest inside kloop's sandbox");
     true
+}
+
+/// 与 kloop-core 同名函数同一判据：空值、`0`、`false`（不分大小写）算没设置，不是 UTF-8 的
+/// 值按要求处理。
+fn seatbelt_tests_required(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| match value.to_str() {
+        Some(text) => !(text.is_empty() || text == "0" || text.eq_ignore_ascii_case("false")),
+        None => true,
+    })
 }
 
 fn bounded_raw_summary(raw: &[u8]) -> String {
@@ -1176,6 +1185,24 @@ mod tests {
             text = text.replace(from, to);
         }
         assert_eq!(text, "cwd /sandbox/workspace via http://mock-provider");
+    }
+
+    #[test]
+    fn zero_and_false_do_not_require_seatbelt_tests() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let cases: [(Option<&std::ffi::OsStr>, bool); 8] = [
+            (None, false),
+            (Some("".as_ref()), false),
+            (Some("0".as_ref()), false),
+            (Some("false".as_ref()), false),
+            (Some("FALSE".as_ref()), false),
+            (Some("1".as_ref()), true),
+            (Some("yes".as_ref()), true),
+            (Some(std::ffi::OsStr::from_bytes(b"\xff")), true),
+        ];
+        for (value, required) in cases {
+            assert_eq!(seatbelt_tests_required(value), required, "{value:?}");
+        }
     }
 
     #[test]

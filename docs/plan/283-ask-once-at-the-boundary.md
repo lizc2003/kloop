@@ -604,7 +604,10 @@ kloop 沙箱内同样 1390 过（真实 seatbelt 用例跳过）。
    要不要让 kloop 自己发现这类"沙箱内其实能跑"的旧规则，仍待定。
 2. ✅（plan 286）`rm` 的目标都是 `/tmp`、`$TMPDIR` 下的字面路径时，不再当危险命令（沙箱本来就允许写这些地方）；工作区内
    被 gitignore 的临时产物要不要也放过，单独问。
-3. `KLOOP_REQUIRE_SEATBELT_TESTS` 把 `0`、`false` 当成未设置，或在 `AGENTS.md` 写明只认 `1`。
+3. ✅（2026-11-19，用户选前者）`KLOOP_REQUIRE_SEATBELT_TESTS` 把 `0`、`false` 当成未设置，或在 `AGENTS.md` 写明只认 `1`。
+   kloop-core 与 PTY 测试支持模块的两份跳过 helper 都改为：空值、`0`、`false`（不分大小写）算没设置，
+   不是 UTF-8 的值按要求处理。在 kloop 沙箱 profile 内实测：`=0`、`=false` 时 `tools::bash::tests::seatbelt`
+   30 个和那条 PTY 用例都跳过并通过；`=1` 时照旧真跑失败（16 个与 1 个）。
 4. 输出里引用的拒绝文本：有日志、日志又没有事件时，系统拒绝文本还要不要单独成为证据。要在"日志丢事件"
    和"引用文本被误判"之间取舍。
 5. 包管理器缓存的写目录提议上移到缓存根（Go 模块缓存、Go telemetry 等），或者把常见工具缓存默认设为可写。

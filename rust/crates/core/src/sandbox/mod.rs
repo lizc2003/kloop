@@ -736,11 +736,22 @@ pub(crate) fn skip_nested_seatbelt_test() -> bool {
     if std::env::var_os("KLOOP_SANDBOX").is_none_or(|value| value != "seatbelt") {
         return false;
     }
-    if std::env::var_os("KLOOP_REQUIRE_SEATBELT_TESTS").is_some_and(|value| !value.is_empty()) {
+    if seatbelt_tests_required(std::env::var_os("KLOOP_REQUIRE_SEATBELT_TESTS").as_deref()) {
         return false;
     }
     eprintln!("skipped: needs the real OS sandbox, which cannot nest inside kloop's sandbox");
     true
+}
+
+/// `KLOOP_REQUIRE_SEATBELT_TESTS` 是否要求真跑。空值、`0`、`false`（不分大小写）都算没设置：
+/// 人和模型都会把 `=0` 读成“关”（plan 283 第十三节）。不是 UTF-8 的值按要求处理，完整检查
+/// 宁可真跑失败，也不悄悄跳过。
+#[cfg(all(test, target_os = "macos"))]
+fn seatbelt_tests_required(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| match value.to_str() {
+        Some(text) => !(text.is_empty() || text == "0" || text.eq_ignore_ascii_case("false")),
+        None => true,
+    })
 }
 
 /// Err(reason) when bash cannot be sandboxed on this machine; the CLI turns
@@ -981,6 +992,25 @@ fn clip_evidence(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zero_and_false_do_not_require_seatbelt_tests() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let cases: [(Option<&std::ffi::OsStr>, bool); 8] = [
+            (None, false),
+            (Some("".as_ref()), false),
+            (Some("0".as_ref()), false),
+            (Some("false".as_ref()), false),
+            (Some("FALSE".as_ref()), false),
+            (Some("1".as_ref()), true),
+            (Some("yes".as_ref()), true),
+            (Some(std::ffi::OsStr::from_bytes(b"\xff")), true),
+        ];
+        for (value, required) in cases {
+            assert_eq!(super::seatbelt_tests_required(value), required, "{value:?}");
+        }
+    }
 
     /// Write allows are a union, so a root that contains the workspace — a
     /// granted parent directory (plan 283) — must keep the workspace's

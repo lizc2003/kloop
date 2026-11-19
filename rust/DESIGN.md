@@ -4266,7 +4266,8 @@ kloop-core's helper is test-only and out of their reach. A full run must not
 skip them: `make test`/`make check` first try to nest `sandbox-exec` and fail at
 once with the real denial line if they cannot — which is what the escalation
 classifier needs to see — and set `KLOOP_REQUIRE_SEATBELT_TESTS=1`, which turns
-the skip off (plan 283). `--mock` never
+the skip off (plan 283). An empty value, `0` or `false` counts as unset, since
+that is how people and models read `=0`. `--mock` never
 sandboxes.
 
 ## Root-owned session todo list (Plans 71–74, 187, 188, 190)
