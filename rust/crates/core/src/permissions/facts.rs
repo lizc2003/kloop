@@ -289,16 +289,22 @@ impl CallFacts {
     /// 东西不再受“只是自己的临时文件”这个前提约束；`xargs` 会从 stdin 往视图后面追加操作数，
     /// 剥掉它看到的 `rm` 只是固定参数那一半。
     fn argv_is_hazardous(&self, argv: &[String]) -> bool {
-        let no_exemption = argv.iter().any(|word| {
-            matches!(
-                word.rsplit('/').next().unwrap_or(word),
-                "sudo" | "doas" | "xargs"
-            )
-        });
+        let views = risk_wrapper_views(argv);
+        // 只看命令位置：原 argv 和每个包装器视图的第一个词。扫每个参数会把名叫 `xargs` 的临时文件
+        // （`rm -f /tmp/xargs`）也当成包装器（第二轮复审 P3）。
+        let no_exemption = std::iter::once(argv)
+            .chain(views.iter().map(Vec::as_slice))
+            .filter_map(|view| view.first())
+            .any(|word| {
+                matches!(
+                    word.rsplit('/').next().unwrap_or(word),
+                    "sudo" | "doas" | "xargs"
+                )
+            });
         let hazardous = |view: &[String]| {
             argv_is_dangerous(view) && (no_exemption || !self.removes_only_scratch(view))
         };
-        hazardous(argv) || risk_wrapper_views(argv).iter().any(|view| hazardous(view))
+        hazardous(argv) || views.iter().any(|view| hazardous(view))
     }
 
     /// `rm` 的每个操作数都只落在 `/tmp` 或 `$TMPDIR` 里（plan 286）。选项只认第一个操作数
@@ -1205,10 +1211,18 @@ fn is_stream_device(path: &Path) -> bool {
     )
 }
 
-/// 临时目录的规范路径：`/tmp` 与 `$TMPDIR`，也就是沙箱给的两个临时可写根。`$TMPDIR` 被设成
-/// `/`、家目录或它的祖先时不算临时目录，免得一个错配的环境变量把整个家目录都当成可随手删的地方。
-/// 只在 Unix 上认。
-fn scratch_roots() -> Vec<PathBuf> {
+/// 一个临时根：`canonical` 是删除落点要严格落在其内的规范路径；`entries` 是通向它的目录项的
+/// 各种拼写（原拼写、父目录规范化后接上自己的名字、规范路径）。`$TMPDIR` 本身可能是符号链接，
+/// 只留规范路径时，删掉链接所在的上级目录就认不出是在删会话正用着的临时目录入口（第二轮复审 P3）。
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ScratchRoot {
+    pub(super) canonical: PathBuf,
+    pub(super) entries: Vec<PathBuf>,
+}
+
+/// 临时目录：`/tmp` 与 `$TMPDIR`，也就是沙箱给的两个临时可写根。`$TMPDIR` 被设成 `/`、家目录或
+/// 它的祖先时不算临时目录，免得一个错配的环境变量把整个家目录都当成可随手删的地方。只在 Unix 上认。
+fn scratch_roots() -> Vec<ScratchRoot> {
     if !cfg!(unix) {
         return Vec::new();
     }
@@ -1219,15 +1233,36 @@ fn scratch_roots() -> Vec<PathBuf> {
     )
 }
 
-pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
+pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) -> Vec<ScratchRoot> {
+    let mut roots: Vec<ScratchRoot> = Vec::new();
     for candidate in candidates {
-        let Ok(root) = std::fs::canonicalize(candidate) else {
+        let Ok(canonical) = std::fs::canonicalize(candidate) else {
             continue;
         };
-        let too_wide = root.parent().is_none() || home.is_some_and(|home| home.starts_with(&root));
-        if !too_wide && !roots.contains(&root) {
-            roots.push(root);
+        let too_wide =
+            canonical.parent().is_none() || home.is_some_and(|home| home.starts_with(&canonical));
+        if too_wide {
+            continue;
+        }
+        let spelled = crate::paths::lexically_normalize(Path::new("/"), candidate);
+        let through_parent = spelled
+            .parent()
+            .zip(spelled.file_name())
+            .and_then(|(parent, name)| Some(std::fs::canonicalize(parent).ok()?.join(name)));
+        let index = match roots.iter().position(|root| root.canonical == canonical) {
+            Some(index) => index,
+            None => {
+                roots.push(ScratchRoot {
+                    entries: vec![canonical.clone()],
+                    canonical,
+                });
+                roots.len() - 1
+            }
+        };
+        for entry in std::iter::once(spelled).chain(through_parent) {
+            if !roots[index].entries.contains(&entry) {
+                roots[index].entries.push(entry);
+            }
         }
     }
     roots
@@ -1237,7 +1272,7 @@ pub(super) fn scratch_roots_from(candidates: &[PathBuf], home: Option<&Path>) ->
 /// 解析后严格落在某个临时根之内，既不在工作区里，也不是工作区或某个临时根的祖先（工作区在
 /// 临时目录里、`$TMPDIR` 嵌在 `/tmp` 下时，递归删上级目录会把它们一起删掉），也不是敏感路径。
 /// 解析失败（断链、权限错误、缺失部分里有 `..`）一律不算。
-pub(super) fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[PathBuf]) -> bool {
+pub(super) fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[ScratchRoot]) -> bool {
     if raw.contains(['\0', '*', '?', '[', '{']) || !Path::new(raw).is_absolute() {
         return false;
     }
@@ -1246,7 +1281,8 @@ pub(super) fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[PathBuf
         root.canonical.starts_with(&facts.normalized) || root.cwd.starts_with(&facts.original);
     let holds_scratch_root = roots
         .iter()
-        .any(|scratch| scratch.starts_with(&facts.normalized));
+        .flat_map(|scratch| &scratch.entries)
+        .any(|entry| entry.starts_with(&facts.normalized) || entry.starts_with(&facts.original));
     facts.resolved
         && !facts.inside_cwd
         && !facts.original.starts_with(root.cwd)
@@ -1255,7 +1291,7 @@ pub(super) fn operand_is_scratch(raw: &str, root: PathRoot<'_>, roots: &[PathBuf
         && facts.sensitivity(Access::Write).is_none()
         && roots
             .iter()
-            .any(|scratch| facts.normalized.starts_with(scratch) && facts.normalized != *scratch)
+            .any(|scratch| facts.normalized.starts_with(&scratch.canonical))
 }
 
 /// Canonical spelling of a working directory, with the lexical fallback every

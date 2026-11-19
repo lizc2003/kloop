@@ -30,6 +30,8 @@ fn plan286_literal_scratch_removals_are_not_hazards() {
         "timeout 5 rm -rf /tmp/kloop-plan286-a".to_string(),
         "cd /tmp && rm -rf /tmp/kloop-plan286-probe".to_string(),
         "rm -f /tmp/kloop-plan286-loop.log; cargo test -p kloop-core 2>&1 | tail -5".to_string(),
+        // 只有命令位置上的 `xargs`/`sudo` 才取消豁免；同名的临时文件不算（第二轮复审 P3）。
+        "rm -f /tmp/xargs /tmp/sudo".to_string(),
     ] {
         assert_eq!(plan286_hazard(&command, &test_cwd()), None, "{command}");
     }
@@ -73,6 +75,7 @@ fn plan286_other_removals_stay_destructive() {
         "printf 'src\\n' | xargs rm -rf /tmp/kloop-plan286-a".to_string(),
         "find . -name '*.o' -print0 | xargs -0 rm -f /tmp/kloop-plan286-a".to_string(),
         "printf 'src\\n' | timeout 5 xargs rm -rf /tmp/kloop-plan286-a".to_string(),
+        "timeout 5 sudo rm -rf /tmp/kloop-plan286-a".to_string(),
     ] {
         assert_eq!(
             plan286_hazard(&command, &test_cwd()),
@@ -129,7 +132,10 @@ fn plan286_a_misconfigured_tmpdir_is_not_scratch() {
         ],
         Some(&home),
     );
-    assert_eq!(roots, vec![tmp]);
+    assert_eq!(
+        roots.iter().map(|root| root.canonical.clone()).collect::<Vec<_>>(),
+        vec![tmp]
+    );
     std::fs::remove_dir_all(&home).unwrap();
 }
 
@@ -159,7 +165,7 @@ fn plan286_a_tmpdir_nested_in_tmp_is_not_scratch_itself() {
     let user = tmp.join(crate::resource_id::fresh("plan286-nested-").unwrap());
     let nested = user.join("T");
     std::fs::create_dir_all(&nested).unwrap();
-    let roots = vec![tmp.clone(), nested.clone()];
+    let roots = facts::scratch_roots_from(&[tmp.clone(), nested.clone()], None);
     let cwd = test_cwd();
     let canonical = facts::canonical_cwd(&cwd);
     let root = facts::PathRoot {
@@ -180,4 +186,45 @@ fn plan286_a_tmpdir_nested_in_tmp_is_not_scratch_itself() {
         );
     }
     std::fs::remove_dir_all(&user).unwrap();
+}
+
+/// `$TMPDIR` 本身是符号链接时，递归删除链接所在的上级目录会移除会话正用着的临时目录入口，
+/// 不豁免；链接旁边的东西照旧豁免（第二轮复审 P3）。
+#[cfg(unix)]
+#[test]
+fn plan286_a_symlinked_tmpdir_entry_is_guarded() {
+    let tmp = std::fs::canonicalize("/tmp").unwrap();
+    let job = tmp.join(crate::resource_id::fresh("plan286-job-").unwrap());
+    let elsewhere = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(crate::resource_id::fresh("plan286-real-").unwrap());
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let link = job.join("T");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    // 用 `/tmp/...` 的原拼写给出 `$TMPDIR`，和环境变量里常见的写法一样。
+    let spelled_job = Path::new("/tmp").join(job.file_name().unwrap());
+    let roots = facts::scratch_roots_from(&[PathBuf::from("/tmp"), spelled_job.join("T")], None);
+    let cwd = test_cwd();
+    let canonical = facts::canonical_cwd(&cwd);
+    let root = facts::PathRoot {
+        cwd: &cwd,
+        canonical: &canonical,
+    };
+    let text = |path: &Path| path.to_str().unwrap().to_string();
+    for (operand, scratch) in [
+        (text(&spelled_job), false),
+        (text(&job), false),
+        (text(&link), false),
+        (text(&job.join("sibling")), true),
+        (text(&elsewhere.join("probe.log")), true),
+    ] {
+        assert_eq!(
+            facts::operand_is_scratch(&operand, root, &roots),
+            scratch,
+            "{operand}"
+        );
+    }
+    std::fs::remove_dir_all(&job).unwrap();
+    std::fs::remove_dir_all(&elsewhere).unwrap();
 }
