@@ -69,6 +69,7 @@ mod argv_roles;
 mod capability;
 pub(crate) use capability::CapabilityRequest;
 pub(crate) use capability::grantable_write_dir;
+pub(crate) use capability::proposed_write_dir;
 pub(crate) use describe::network_programs;
 mod describe;
 mod facts;
@@ -1533,6 +1534,7 @@ mod tests {
     include!("permissions/plan284_tests.rs");
     include!("permissions/plan285_tests.rs");
     include!("permissions/plan286_tests.rs");
+    include!("permissions/plan287_tests.rs");
     use super::rule::parse_rule;
     use super::testutil::ScriptedWriter;
     use super::testutil::test_cwd;

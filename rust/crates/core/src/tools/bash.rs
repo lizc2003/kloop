@@ -649,8 +649,9 @@ async fn ask_escalation(
 }
 
 /// The sandbox widening that would answer this refusal, if one can: the
-/// network, or the parent directories of the refused writes that may be
-/// granted at all. `None` sends the refusal to the full escalation.
+/// network, or the directories of the refused writes that may be granted at
+/// all — a known tool cache's root, else the parent (plan 287). `None` sends
+/// the refusal to the full escalation.
 fn capability_request(
     denial: &sandbox::SandboxDenial,
     policy: &SandboxPolicy,
@@ -679,14 +680,18 @@ fn capability_request(
             let home = std::env::home_dir();
             let mut dirs: Vec<std::path::PathBuf> = Vec::new();
             for path in &denial.paths {
-                let Some(dir) = path.parent() else {
+                let Some(dir) =
+                    crate::permissions::proposed_write_dir(path, home.as_deref(), |name| {
+                        std::env::var_os(name)
+                    })
+                else {
                     continue;
                 };
-                if crate::permissions::grantable_write_dir(dir, home.as_deref())
-                    && !policy.already_decides_writes(dir)
-                    && !dirs.iter().any(|known| known == dir)
+                if crate::permissions::grantable_write_dir(&dir, home.as_deref())
+                    && !policy.already_decides_writes(&dir)
+                    && !dirs.contains(&dir)
                 {
-                    dirs.push(dir.to_path_buf());
+                    dirs.push(dir);
                 }
             }
             (!dirs.is_empty()).then_some(crate::permissions::CapabilityRequest::Write { dirs })

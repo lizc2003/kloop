@@ -2,6 +2,7 @@
 //! 不是“把沙箱拿掉”。联网可以只给这一次、给本会话所有命令、或按程序记到项目；写只按具体
 //! 目录，只给这一次或记到项目。重跑仍在沙箱里，其余限制（别处的写、凭据、受保护子路径）不变。
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -100,6 +101,68 @@ pub(crate) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
         && PathFacts::gather_with_resolved(&dir.join("kloop-grant-probe"), Path::new("/"), None)
             .sensitivity(Access::Write)
             .is_none()
+}
+
+/// 被拒写入要提议授权的目录（plan 287）：落在已知的工具缓存里时提议整个缓存根，下一个依赖、
+/// 下一份遥测不必再问；其它情况提议被拒路径的父目录。缓存根同样要能授权，且不是家目录的祖先，
+/// 否则退回父目录，不扩大。`var` 读 kloop 自己的环境（bash 子进程继承它），测试里换成固定值。
+pub(crate) fn proposed_write_dir(
+    path: &Path,
+    home: Option<&Path>,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let cache_root = home.and_then(|home| {
+        tool_cache_roots(home, &var).into_iter().find(|root| {
+            path.starts_with(root)
+                && path != root
+                && !home.starts_with(root)
+                && grantable_write_dir(root, Some(home))
+        })
+    });
+    Some(cache_root.unwrap_or_else(|| parent.to_path_buf()))
+}
+
+/// 包管理器按包分目录的缓存根。每个根给出原拼写和规范化后的两种形式：日志里的被拒路径是真实
+/// 路径，家目录或缓存目录可能经过符号链接。
+fn tool_cache_roots(home: &Path, var: &impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
+    let absolute = |name: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let gopath = var("GOPATH")
+        .and_then(|value| std::env::split_paths(&value).next())
+        .filter(|path| path.is_absolute());
+    let go_modules = absolute("GOMODCACHE").unwrap_or_else(|| {
+        gopath
+            .unwrap_or_else(|| home.join("go"))
+            .join("pkg")
+            .join("mod")
+    });
+    let user_config = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else {
+        absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"))
+    };
+    let cargo = absolute("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    let gradle = absolute("GRADLE_USER_HOME").unwrap_or_else(|| home.join(".gradle"));
+    [
+        go_modules,
+        user_config.join("go").join("telemetry"),
+        absolute("npm_config_cache").unwrap_or_else(|| home.join(".npm")),
+        cargo.join("registry"),
+        cargo.join("git"),
+        home.join(".m2").join("repository"),
+        gradle.join("caches"),
+    ]
+    .into_iter()
+    .flat_map(|root| {
+        let resolved = crate::path_resolve::resolve_nearest_existing(&root)
+            .filter(|resolved| *resolved != root);
+        std::iter::once(root).chain(resolved)
+    })
+    .collect()
 }
 
 impl Permissions {

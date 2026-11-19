@@ -4164,7 +4164,18 @@ next command that needs it is covered whatever its text.
   and gets the session scope only. Writes stay limited — the sandbox stays on.
 - **Write**: the parent directories of the refused paths the system log
   reported, once or for this project — `sandbox_write(<dir>)`, a writable root
-  added to every contained bash call in the project. Only a plain directory is
+  added to every contained bash call in the project. A refused path inside a
+  known package cache offers the cache's root instead (plan 287), because those
+  caches split by package and a parent covers one package only: the Go module
+  cache (`$GOMODCACHE`, else `$GOPATH`'s first entry or `~/go`, plus
+  `pkg/mod`), Go telemetry under the user config directory, npm
+  (`$npm_config_cache` or `~/.npm`), cargo's `registry` and `git` under
+  `$CARGO_HOME` or `~/.cargo`, `~/.m2/repository`, and `caches` under
+  `$GRADLE_USER_HOME` or `~/.gradle`. The variables are kloop's own (bash
+  inherits them), only absolute values count, and a root that is an ancestor of
+  home or fails the checks below falls back to the parent. Caches are not made
+  writable by default: a sandboxed run could then plant code in an unpacked
+  module that a later uncontained build executes. Only a plain directory is
   offered: absolute, not `/` or the home directory itself, no glob characters,
   nothing the permission layer treats as sensitive (`.git`, `.kloop`,
   credential directories), and not one the policy already decides (inside a
