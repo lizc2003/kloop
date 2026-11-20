@@ -309,6 +309,51 @@ pub(super) fn parse_rule(entry: &str) -> Result<Rule> {
     }
 }
 
+/// 一条授权规则为什么非法，说明里不复述规则内容：`bash(...)` 一类规则可能带着命令参数里的密钥，
+/// 而这段说明会显示给用户（项目权限文件加载失败的提示）。只点出已知的工具名，以及
+/// `sandbox_escalate` 开头那个只读命令的名字（固定的命令名，不是参数）。合法或空白时返回 `None`。
+pub fn invalid_rule_reason(entry: &str) -> Option<String> {
+    let entry = entry.trim();
+    if entry.is_empty() || parse_rule(entry).is_ok() {
+        return None;
+    }
+    const PATTERN_TOOLS: &[&str] = &[
+        "bash",
+        "sandbox_escalate",
+        "sandbox_network",
+        "sandbox_write",
+        "powershell",
+        "write_file",
+        "edit_file",
+        "read_file",
+        "notebook_edit",
+        "bash_write",
+        "sandbox_escalate_write",
+    ];
+    let (tool, inner) = match entry.split_once('(') {
+        Some((tool, rest)) if PATTERN_TOOLS.contains(&tool) => (Some(tool), rest),
+        _ => (None, ""),
+    };
+    Some(match tool {
+        Some("sandbox_escalate") => {
+            let head = inner
+                .split_whitespace()
+                .next()
+                .map(|head| head.rsplit('/').next().unwrap_or(head))
+                .filter(|head| crate::shell::readonly_whatever_the_arguments(head));
+            match head {
+                Some(head) => format!(
+                    "`sandbox_escalate({head} …)` never matches: an escalation rule cannot start with a read-only command such as `{head}`"
+                ),
+                None => "`sandbox_escalate(…)` is not a valid command prefix".to_string(),
+            }
+        }
+        Some("sandbox_write") => "`sandbox_write(…)` must name one absolute directory other than `/`, spelled without glob characters, `.`, `..`, `//` or a trailing `/`".to_string(),
+        Some(tool) => format!("`{tool}(…)` is not a valid rule"),
+        None => "not a valid rule".to_string(),
+    })
+}
+
 pub(super) fn parse_rules(entries: &[String]) -> Result<Vec<Rule>> {
     entries
         .iter()
@@ -479,6 +524,42 @@ mod tests {
             .to_string();
         assert!(error.contains("PowerShell v1"), "{error}");
         assert!(parse_rule("powershell").is_ok());
+    }
+
+    /// 非法规则的说明不复述规则原文，只点出已知工具名和 `sandbox_escalate` 开头的只读命令名；
+    /// 合法规则和空白没有说明。
+    #[test]
+    fn invalid_rule_reasons_name_the_problem_without_the_rule() {
+        for valid in [
+            "bash(cargo test *)",
+            "sandbox_write(/opt/out)",
+            "web_search",
+            "  ",
+        ] {
+            assert_eq!(invalid_rule_reason(valid), None, "{valid}");
+        }
+        assert_eq!(
+            invalid_rule_reason("sandbox_escalate(/bin/echo token-123 *)").as_deref(),
+            Some(
+                "`sandbox_escalate(echo …)` never matches: an escalation rule cannot start with a read-only command such as `echo`"
+            )
+        );
+        for (entry, reason) in [
+            (
+                "sandbox_escalate()",
+                "`sandbox_escalate(…)` is not a valid command prefix",
+            ),
+            (
+                "write_file([secret-glob)",
+                "`write_file(…)` is not a valid rule",
+            ),
+            ("sk_live_secret(x)", "not a valid rule"),
+            ("sentinel-secret(", "not a valid rule"),
+        ] {
+            let got = invalid_rule_reason(entry).unwrap();
+            assert_eq!(got, reason, "{entry}");
+            assert!(!got.contains("secret") && !got.contains("token"), "{got}");
+        }
     }
 
     #[test]

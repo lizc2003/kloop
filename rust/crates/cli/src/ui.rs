@@ -361,7 +361,7 @@ impl Ui for StdoutUi {
             // reduce to the one-line dim note they showed before plan 39.
             other => {
                 if let Some(note) = other.as_note() {
-                    eprintln!("\x1b[2m[{note}]\x1b[0m");
+                    crate::eprint_note(&note);
                 }
             }
         }

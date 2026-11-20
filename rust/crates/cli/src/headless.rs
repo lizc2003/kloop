@@ -132,7 +132,7 @@ impl Ui for HeadlessTextUi {
         // Streamed assistant text is suppressed (the final answer prints once to
         // stdout); every event with a note form goes to stderr as dim context.
         if let Some(note) = ev.as_note() {
-            eprintln!("\x1b[2m[{note}]\x1b[0m");
+            crate::eprint_note(&note);
         }
     }
 }

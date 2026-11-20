@@ -416,9 +416,15 @@ fn load_project_permission_policy(
     };
     let unavailable = |err: anyhow::Error| {
         registry.invalidate(&project_id);
-        notify(&format!(
-            "project permission policy is unavailable or invalid ({err:#}); durable project approvals are disabled for this session"
-        ));
+        // 看了就知道怎么改：原因、文件位置、每条能照做的修法；用警告记号让前端醒目显示。
+        let mut text = format!(
+            "durable project approvals are off for this session: the project permission policy could not be loaded ({err:#})"
+        );
+        for fix in store.load_failure_fixes(&project_id) {
+            text.push_str("\n  ");
+            text.push_str(&fix);
+        }
+        notify(&kloop_core::event::warning_note(&text));
         Arc::new(ProjectPermissionPolicy::unavailable())
     };
     match store.load_blocking(&project_id) {
@@ -461,9 +467,9 @@ fn build_permissions(
             if let kloop_core::project::ProjectIdentityStatus::Unavailable(reason) =
                 identity.status()
             {
-                notify(&format!(
+                notify(&kloop_core::event::warning_note(&format!(
                     "project identity unavailable ({reason}); durable project approvals are disabled for this session"
-                ));
+                )));
             }
             Arc::new(ProjectPermissionPolicy::unavailable())
         }
@@ -905,9 +911,9 @@ fn build_sandbox_for_home(
             Ok(Some(Arc::new(policy)))
         }
         Err(reason) => {
-            warn(&format!(
+            warn(&kloop_core::event::warning_note(&format!(
                 "sandbox unavailable ({reason}); bash commands run unsandboxed"
-            ));
+            )));
             Ok(None)
         }
     }
@@ -1393,6 +1399,17 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
             notes[0].contains("invalid project permission policy: unknown field `projectId`"),
+            "{}",
+            notes[0]
+        );
+        // 警告记号让前端醒目显示；修法写明是哪个文件、怎么办。
+        assert!(
+            kloop_core::event::is_warning_note(&notes[0]),
+            "{}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains(&format!("fix {} by hand, or delete it", path.display())),
             "{}",
             notes[0]
         );

@@ -43,8 +43,11 @@ pub(super) fn validate_private_permissions(
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    if metadata.permissions().mode() & 0o077 != 0 {
-        bail!("{label} contains credentials; restrict it to mode 0600");
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "{label} is readable or writable by other users (mode {mode:04o}); it must be mode 0600"
+        );
     }
     Ok(())
 }
@@ -82,8 +85,11 @@ fn validate_private_dir(dir: std::fs::File, label: &str) -> Result<std::fs::File
     if !metadata.is_dir() {
         bail!("directory for {label} must be a regular directory, not a symlink");
     }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        bail!("directory for {label} must not be accessible by group or other");
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "directory for {label} is accessible by other users (mode {mode:04o}); it must be mode 0700"
+        );
     }
     Ok(dir)
 }

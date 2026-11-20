@@ -110,7 +110,7 @@ impl ProcessState {
         let provider = Arc::new(provider_config::load(args.mock, user_config.table())?);
         let runtime = Arc::new(RuntimeSettings::load(&user_config, args.mock)?);
         for warning in runtime.shell_warnings() {
-            eprintln!("\x1b[2m[{warning}]\x1b[0m");
+            eprint_note(warning);
         }
         // MCP servers connect once per process and are shared into every
         // Config — including all server-mode threads. --mock stays hermetic: no
@@ -125,7 +125,7 @@ impl ProcessState {
                 None,
             )
         } else {
-            let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+            let warn = |s: &str| eprint_note(s);
             // Web tools ride the same ToolSource seam, registered before MCP so
             // a colliding MCP tool name loses (and is warned about).
             let web_cfg = web::load_web_config(user_config.table())?;
@@ -182,10 +182,10 @@ impl ProcessState {
     /// place, so no `Config` rebuild is needed.
     async fn connect_deferred_mcp(&mut self) -> Result<()> {
         if let Some(startup) = self.mcp_startup.take() {
-            let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+            let warn = |s: &str| eprint_note(s);
             startup.connect(&warn, None).await?;
         }
-        let warn = |s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m");
+        let warn = |s: &str| eprint_note(s);
         for warning in tool_merge_warnings(
             &self.tool_sources,
             self.runtime.defer_threshold(),
@@ -230,7 +230,7 @@ impl SessionState {
             &process.runtime,
             session_store,
             &identity,
-            &|warning| eprintln!("\x1b[2m[{warning}]\x1b[0m"),
+            &|warning| eprint_note(warning),
         )?;
         let Some((mut history, session_id)) = open_history(
             session_store,
@@ -252,7 +252,7 @@ impl SessionState {
             .adopt_or_initialize_provider_route(&process.provider.initial_route())
             .map_err(anyhow::Error::new)?;
         if let Some(reopened) = &reopened {
-            eprintln!("\x1b[2m[{reopened}]\x1b[0m");
+            eprint_note(&reopened.to_string());
         }
         // `--image` files are read + validated once, up front, so a bad path fails
         // fast before any UI owns the terminal. They attach to the first user turn.
@@ -282,6 +282,16 @@ impl SessionState {
 /// it can be: `set_var` is sound while the process is single-threaded, and the
 /// runtime built on the next line is what ends that. The file wins over what
 /// the shell exported — see `load_env_overrides`.
+/// 把一条提示写到 stderr：警告（[`kloop_core::event::is_warning_note`]）用黄色粗体醒目显示，
+/// 其余提示照旧是括起来的暗色文字。
+pub(crate) fn eprint_note(note: &str) {
+    if kloop_core::event::is_warning_note(note) {
+        eprintln!("\x1b[1;33m{note}\x1b[0m");
+    } else {
+        eprintln!("\x1b[2m[{note}]\x1b[0m");
+    }
+}
+
 fn main() -> Result<ExitCode> {
     // Read argv as `OsString` here: a non-UTF-8 argument is reported by `run`
     // like any other bad input, instead of panicking on `std::env::args`.
@@ -546,7 +556,7 @@ async fn run_headless_turn(
         let piped = read_stdin_if_piped().await?;
         headless::assemble_prompt(args.prompt.as_deref(), piped.as_deref())?
     };
-    let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+    let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprint_note(s));
     let mut cfg = config_from_settings(
         &args,
         &process.provider,

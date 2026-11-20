@@ -278,6 +278,20 @@ fn background_task_note(task: &BackgroundTask) -> String {
     note
 }
 
+/// 需要用户动手处理的提示（某份设置读不了、某层保护没生效）以这个记号开头。前端据此醒目显示，
+/// 普通 note 仍是暗色；只显示文字的前端里，记号本身就是提醒。
+pub const WARNING_MARK: &str = "⚠ ";
+
+/// 把一段需要用户处理的提示标成警告。
+pub fn warning_note(text: &str) -> String {
+    format!("{WARNING_MARK}{text}")
+}
+
+/// 这条 note 是不是警告。
+pub fn is_warning_note(note: &str) -> bool {
+    note.starts_with(WARNING_MARK)
+}
+
 impl Event {
     /// The note a front-end that renders only text and notes shows for this
     /// event, or `None` if the event has no note form (deltas, tool completions,

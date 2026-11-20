@@ -511,16 +511,26 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             // terminal width, so wrap instead of cutting the tail off. The body
             // of an HTTP error is only bounded at 64 KiB upstream, so cap the
             // rows a single note may claim and say how many were dropped.
-            let wrapped = wrap(&format!("[{text}]"), width.saturating_sub(1).max(1));
+            // 警告（需要用户动手处理的提示）用黄色粗体、不加括号，免得混在暗色的普通提示里看不见。
+            let warning = kloop_core::event::is_warning_note(text);
+            let (body, style) = if warning {
+                (
+                    text.clone(),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (format!("[{text}]"), DIM)
+            };
+            let wrapped = wrap(&body, width.saturating_sub(1).max(1));
             let dropped = wrapped.len().saturating_sub(NOTE_MAX_LINES);
             for (i, l) in wrapped.into_iter().take(NOTE_MAX_LINES).enumerate() {
                 let indent = if i == 0 { "" } else { " " };
-                lines.push(Line::from(Span::styled(format!("{indent}{l}"), DIM)));
+                lines.push(Line::from(Span::styled(format!("{indent}{l}"), style)));
             }
             if dropped > 0 {
                 lines.push(Line::from(Span::styled(
                     format!(" …(+{dropped} more line(s))"),
-                    DIM,
+                    style,
                 )));
             }
         }
@@ -2154,6 +2164,33 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(texts.len(), NOTE_MAX_LINES + 1);
         assert_eq!(texts.last().unwrap(), " …(+11 more line(s))");
+    }
+
+    /// 警告提示（带警告记号的 note）黄色粗体、不加括号，每一行都是，免得混在暗色提示里；
+    /// 普通提示照旧暗色带括号。
+    #[test]
+    fn a_warning_note_stands_out_from_ordinary_notes() {
+        let warning = Cell::Note(kloop_core::event::warning_note(
+            "durable project approvals are off for this session\n  run: chmod 600 ~/.kloop/x",
+        ));
+        let lines = cell_lines(&warning, 80);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "⚠ durable project approvals are off for this session".to_string(),
+                "   run: chmod 600 ~/.kloop/x".to_string(),
+            ]
+        );
+        let loud = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        for line in &lines {
+            for span in &line.spans {
+                assert_eq!(span.style, loud, "{texts:?}");
+            }
+        }
+        let ordinary = cell_lines(&Cell::Note("compacted".into()), 80);
+        assert_eq!(line_text(&ordinary[0]), "[compacted]");
+        assert_eq!(ordinary[0].spans[0].style, DIM);
     }
 
     #[test]

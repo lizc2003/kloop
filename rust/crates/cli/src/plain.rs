@@ -228,7 +228,7 @@ async fn plain_main(
     pending_images: Vec<ContentBlock>,
     session_dirs: SessionDirs,
 ) -> Result<()> {
-    let notify: kloop_tui::NoteFn = Arc::new(|s: &str| eprintln!("\x1b[2m[{s}]\x1b[0m"));
+    let notify: kloop_tui::NoteFn = Arc::new(|s: &str| crate::eprint_note(s));
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
     // Spawned before the config because the same handle answers approvals and
     // questions during a turn; a second reader would race the REPL for stdin.

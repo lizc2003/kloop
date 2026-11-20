@@ -89,6 +89,7 @@ pub use record::ApprovalDoor;
 pub use record::ApprovalRecord;
 pub use record::AskReason;
 pub use record::MemorySource;
+pub use rule::invalid_rule_reason;
 mod rule;
 pub(crate) mod sensitive;
 #[cfg(test)]

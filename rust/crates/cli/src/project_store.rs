@@ -176,9 +176,80 @@ impl ProjectStore {
         PrivateDir::ensure(&self.root, &self.components(project_id), POLICY_LABEL)
     }
 
-    #[cfg(test)]
     pub(crate) fn policy_path(&self, project_id: &ProjectId) -> PathBuf {
         self.project_dir(project_id).join(POLICY_FILE)
+    }
+
+    /// 权限文件读不了时给用户的修法，每条都能照做：权限位过宽给出 `chmod` 命令，符号链接要换成
+    /// 普通文件，非法规则指出是 `allow` 里的第几条、为什么（不复述规则原文，见
+    /// [`kloop_core::permissions::invalid_rule_reason`]）。都不是时给通用的办法。只在加载失败后
+    /// 调用，自己再看一遍文件系统，不从错误文本里反推。
+    pub(crate) fn load_failure_fixes(&self, project_id: &ProjectId) -> Vec<String> {
+        let path = self.policy_path(project_id);
+        let shown = shell_path(&path);
+        let mut fixes = Vec::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut dir = self.root.to_path_buf();
+            let mut dirs = vec![dir.clone()];
+            for component in self.components(project_id) {
+                dir.push(component);
+                dirs.push(dir.clone());
+            }
+            for dir in dirs {
+                if let Ok(metadata) = std::fs::symlink_metadata(&dir)
+                    && metadata.is_dir()
+                    && metadata.permissions().mode() & 0o077 != 0
+                {
+                    fixes.push(format!("run: chmod 700 {}", shell_path(&dir)));
+                }
+            }
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fixes.push(format!("replace the symlink {shown} with a regular file"));
+                return fixes;
+            }
+            Ok(_metadata) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    if _metadata.permissions().mode() & 0o077 != 0 {
+                        fixes.push(format!("run: chmod 600 {shown}"));
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        let entries = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("allow")
+                    .and_then(|allow| allow.as_array())
+                    .cloned()
+            })
+            .unwrap_or_default();
+        for (index, entry) in entries.iter().enumerate() {
+            let reason = match entry.as_str() {
+                Some(text) => kloop_core::permissions::invalid_rule_reason(text),
+                None => Some("not a string".to_string()),
+            };
+            if let Some(reason) = reason {
+                fixes.push(format!(
+                    "edit {shown}: remove entry {} of \"allow\" — {reason}",
+                    index + 1
+                ));
+            }
+        }
+        if fixes.is_empty() {
+            fixes.push(format!(
+                "fix {shown} by hand, or delete it (that forgets this project's remembered approvals)"
+            ));
+        }
+        fixes
     }
 
     #[cfg(test)]
@@ -218,6 +289,25 @@ struct StoreFile {
     project_id: String,
     revision: u64,
     allow: Vec<String>,
+}
+
+/// 给用户照抄进终端的路径：家目录缩成 `~`，带空白或引号时整体加单引号（`~` 留在引号外才会展开）。
+fn shell_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    let (prefix, rest) = match std::env::home_dir()
+        .and_then(|home| path.strip_prefix(&home).ok().map(Path::to_path_buf))
+    {
+        Some(relative) => ("~/", relative.display().to_string()),
+        None => ("", text),
+    };
+    if rest
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '$' | '`' | '\\'))
+    {
+        format!("{prefix}'{}'", rest.replace('\'', "'\\''"))
+    } else {
+        format!("{prefix}{rest}")
+    }
 }
 
 fn read_policy(dir: &PrivateDir, project_id: &ProjectId) -> Result<ProjectPolicySnapshot> {
@@ -522,6 +612,53 @@ mod tests {
         assert!(error.contains("invalid project permission policy rules"));
         assert!(!error.contains("sentinel-secret"));
         assert_eq!(store.load(&id).await, Err(ProjectPolicyStoreError::Invalid));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 读不了权限文件时的修法要能照做：权限位过宽给出 `chmod`，非法规则指出是第几条、为什么，
+    /// 但不复述规则原文（规则可能带着命令参数里的密钥）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_failures_explain_how_to_fix_the_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (base, store, id) = fixture("fixes");
+        store
+            .append(
+                id.clone(),
+                ProjectAllowRules::parse(&["bash(cargo test *)".into()]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let path = store.policy_path(&id);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["allow"] = serde_json::json!([
+            "bash(cargo test *)",
+            "sandbox_escalate(cd /work/repo *)",
+            "sandbox_write(/opt/out/)",
+            "sentinel-secret(",
+        ]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = format!("{:#}", store.load_blocking(&id).unwrap_err());
+        assert!(error.contains("mode 0644"), "{error}");
+        assert!(error.contains("must be mode 0600"), "{error}");
+        let shown = path.display();
+        assert_eq!(
+            store.load_failure_fixes(&id),
+            vec![
+                format!("run: chmod 600 {shown}"),
+                format!(
+                    "edit {shown}: remove entry 2 of \"allow\" — `sandbox_escalate(cd …)` never matches: an escalation rule cannot start with a read-only command such as `cd`"
+                ),
+                format!(
+                    "edit {shown}: remove entry 3 of \"allow\" — `sandbox_write(…)` must name one absolute directory other than `/`, spelled without glob characters, `.`, `..`, `//` or a trailing `/`"
+                ),
+                format!("edit {shown}: remove entry 4 of \"allow\" — not a valid rule"),
+            ]
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
