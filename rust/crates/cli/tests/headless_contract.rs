@@ -176,8 +176,26 @@ fn permission_report_can_select_a_project_from_another_directory() {
         .write_all(br#"{"private_marker": true}"#)
         .unwrap();
 
+    // 当前目录的项目还没记过授权：说明没有记录，正常退出，而不是报“有效”。
     let local = root.command(&["--check-permissions"]).output().unwrap();
     assert!(local.status.success(), "{local:?}");
+    let local = String::from_utf8(local.stdout).unwrap();
+    assert!(
+        local.starts_with("No permission policy is recorded for project p1_"),
+        "{local}"
+    );
+
+    // 显式给出、却没有权限文件的 ID（例如抄错了）：同样说明没有记录，但不能算通过。
+    let missing = format!("p1_{}", "0".repeat(25));
+    let absent = root
+        .command(&["--check-permissions", &missing])
+        .output()
+        .unwrap();
+    assert_eq!(absent.status.code(), Some(1), "{absent:?}");
+    assert_eq!(
+        String::from_utf8(absent.stdout).unwrap(),
+        format!("No permission policy is recorded for project {missing}.\n")
+    );
 
     let selected = root
         .command(&["--check-permissions", project_id])
@@ -188,6 +206,22 @@ fn permission_report_can_select_a_project_from_another_directory() {
     assert!(report.contains("unknown field (line "), "{report}");
     assert!(report.contains(project_id), "{report}");
     assert!(!report.contains("private_marker"), "{report}");
+
+    // 修好之后同一条命令报有效。
+    std::fs::write(
+        policy_dir.join("permissions.json"),
+        format!(r#"{{"version": 1, "project_id": "{project_id}", "revision": 1, "allow": []}}"#),
+    )
+    .unwrap();
+    let fixed = root
+        .command(&["--check-permissions", project_id])
+        .output()
+        .unwrap();
+    assert!(fixed.status.success(), "{fixed:?}");
+    assert_eq!(
+        String::from_utf8(fixed.stdout).unwrap(),
+        format!("Permission policy for project {project_id} is valid.\n")
+    );
 }
 
 /// A writer killed between its runtime line and its first turn leaves a

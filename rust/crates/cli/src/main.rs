@@ -356,20 +356,31 @@ async fn run(arguments: Vec<std::ffi::OsString>) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(check) = args.check_permissions {
-        let project_id = match check {
+        let (project_id, named) = match check {
             PermissionCheck::CurrentProject => {
                 let cwd = std::env::current_dir().context("cannot determine cwd")?;
-                WorkspaceIdentity::resolve(&cwd)
+                let project_id = WorkspaceIdentity::resolve(&cwd)
                     .project_id()
                     .cloned()
-                    .context("cannot determine the current project's identity")?
+                    .context("cannot determine the current project's identity")?;
+                (project_id, false)
             }
-            PermissionCheck::Project(project_id) => project_id,
+            PermissionCheck::Project(project_id) => (project_id, true),
         };
         let store = project_store::ProjectStore::new(user_config::private_state_root()?);
         return match store.load_blocking(&project_id) {
+            // 没有记录过权限文件（目录或文件不存在）不等于“有效”：显式给出的 ID 多半是抄错了，
+            // 不能报成通过；当前目录的项目只是还没记过授权。
+            Ok(snapshot) if snapshot.revision == 0 => {
+                println!("No permission policy is recorded for project {project_id}.");
+                Ok(if named {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                })
+            }
             Ok(_) => {
-                println!("Project permission policy is valid.");
+                println!("Permission policy for project {project_id} is valid.");
                 Ok(ExitCode::SUCCESS)
             }
             Err(error) => {
