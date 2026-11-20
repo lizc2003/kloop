@@ -47,7 +47,7 @@ fmt、clippy 干净。
 里加 `(allow process-exec (literal "/bin/ps") (with no-sandbox))`，并对打印环境变量的 `ps` 加
 `[process environment]` 检查。复审（P1）指出 exec 规则只认文件不认调用者，沙箱里所有后代进程都能借它出沙箱：
 仓库脚本里的 `ps -E` 不经权限门就能读别的进程的环境变量。代码全部回退，`ps` 回到走整个脱沙箱。复审给的方向是
-kloop 自己核对参数后在沙箱外启动 `/bin/ps`，待设计、开工前问用户。教训 421。
+kloop 自己核对参数后用绝对路径在沙箱外启动 `/bin/ps`；2026-11-20 用户定不做（改动大、一周只问 1 次）。教训 421。
 
 **Plan 287 ✅：写入被拒落在工具缓存里时提议整个缓存根（2026-11-19）**：plan 283 第十三节候选 5，用户选“上移到
 缓存根”而不是默认可写。Go 模块缓存、Go telemetry、npm、cargo 的 `registry`/`git`、Maven、Gradle 的缓存里
