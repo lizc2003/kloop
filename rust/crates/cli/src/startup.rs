@@ -404,13 +404,10 @@ fn parse_permission_rules(root: &toml::Table) -> Result<PermissionRules> {
     Ok(rules)
 }
 
-/// `workspace` 是会话的工作目录：`--check-permissions` 按当前目录推断项目，提示里要带上它，
-/// 在别处运行查到的是另一个项目。
 fn load_project_permission_policy(
     store: &Arc<ProjectStore>,
     registry: &Arc<ProjectPolicyRegistry>,
     project_id: kloop_core::project::ProjectId,
-    workspace: &Path,
     notify: &kloop_tui::NoteFn,
 ) -> Arc<ProjectPermissionPolicy> {
     let register = |snapshot| {
@@ -421,8 +418,7 @@ fn load_project_permission_policy(
         registry.invalidate(&project_id);
         // 看了就知道怎么改：原因、文件位置、每条能照做的修法；用警告记号让前端醒目显示。
         let text = format!(
-            "durable project approvals are off for this session (full report: cd {} && kloop --check-permissions)\n{}",
-            crate::project_store::shell_path(workspace),
+            "durable project approvals are off for this session\n  full report: kloop --check-permissions {project_id}\n{}",
             store.load_failure_report(&project_id, &err)
         );
         notify(&kloop_core::event::warning_note(&text));
@@ -461,13 +457,9 @@ fn build_permissions(
         identity.project_id().cloned(),
         settings.project_store.as_ref(),
     ) {
-        (Some(project_id), Some(store)) => load_project_permission_policy(
-            store,
-            &settings.project_registry,
-            project_id,
-            identity.cwd(),
-            &notify,
-        ),
+        (Some(project_id), Some(store)) => {
+            load_project_permission_policy(store, &settings.project_registry, project_id, &notify)
+        }
         _ => {
             if let kloop_core::project::ProjectIdentityStatus::Unavailable(reason) =
                 identity.status()
@@ -1344,12 +1336,11 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         .unwrap();
         let registry = Arc::new(ProjectPolicyRegistry::default());
         let notify: kloop_tui::NoteFn = Arc::new(|_| {});
-        let first =
-            load_project_permission_policy(&store, &registry, project_id.clone(), &cwd, &notify);
+        let first = load_project_permission_policy(&store, &registry, project_id.clone(), &notify);
         assert_eq!(first.snapshot().revision, 1);
 
         std::fs::remove_file(store.policy_path(&project_id)).unwrap();
-        let reloaded = load_project_permission_policy(&store, &registry, project_id, &cwd, &notify);
+        let reloaded = load_project_permission_policy(&store, &registry, project_id, &notify);
         assert!(Arc::ptr_eq(&first, &reloaded));
         assert_eq!(
             reloaded.snapshot(),
@@ -1384,6 +1375,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         .unwrap();
         // 键名改版前写下的文件:`projectId` 而不是 `project_id`。
         let path = store.policy_path(&project_id);
+        let hint = format!("  full report: kloop --check-permissions {project_id}");
         let stale = std::fs::read_to_string(&path)
             .unwrap()
             .replace("\"project_id\"", "\"projectId\"");
@@ -1395,7 +1387,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             sink.lock().unwrap().push(note.to_string());
         });
         let registry = Arc::new(ProjectPolicyRegistry::default());
-        let policy = load_project_permission_policy(&store, &registry, project_id, &cwd, &notify);
+        let policy = load_project_permission_policy(&store, &registry, project_id, &notify);
 
         assert_eq!(
             policy.snapshot(),
@@ -1404,7 +1396,7 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
         let notes = notes.lock().unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
-            notes[0].contains("invalid project permission policy: unknown field `projectId`"),
+            notes[0].contains("invalid project permission policy: unknown field (line "),
             "{}",
             notes[0]
         );
@@ -1414,14 +1406,8 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             "{}",
             notes[0]
         );
-        assert!(
-            notes[0].contains(&format!(
-                "full report: cd {} && kloop --check-permissions",
-                crate::project_store::shell_path(&cwd)
-            )),
-            "{}",
-            notes[0]
-        );
+        assert!(!notes[0].contains("projectId"), "{}", notes[0]);
+        assert!(notes[0].lines().any(|line| line == hint), "{}", notes[0]);
         assert!(
             notes[0].contains(&format!(
                 "\n  file: {}",

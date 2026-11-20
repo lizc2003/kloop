@@ -428,34 +428,30 @@ impl std::fmt::Display for InvalidPolicyFile {
 
 impl std::error::Error for InvalidPolicyFile {}
 
-/// JSON 读不进来时的说明：只留出错的位置，以及形如标识符的字段名（`unknown field `projectId``）。
-/// serde 的原文会引用出错的值，而值可能就是一条规则（例如 `allow` 被改成了一个字符串），会把规则
-/// 里命令参数中的密钥带进警告和 `--check-permissions` 的输出。
+/// serde 的错误会引用任意未知键和值，权限文件的这些内容可能包含命令参数中的密钥。
+/// 诊断只使用错误类别、位置和模式定义的字段名。
 fn describe_json_error(error: &serde_json::Error) -> String {
     let at = format!("line {}, column {}", error.line(), error.column());
     let what = match error.classify() {
         serde_json::error::Category::Data => {
             let message = error.to_string();
-            ["unknown field", "missing field", "duplicate field"]
-                .into_iter()
-                .find(|kind| message.starts_with(kind))
-                .map(|kind| {
-                    let name = message[kind.len()..]
-                        .trim_start()
-                        .strip_prefix('`')
-                        .and_then(|rest| rest.split_once('`'))
-                        .map(|(name, _)| name)
-                        .filter(|name| {
-                            !name.is_empty()
-                                && name.len() <= 40
-                                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        });
-                    match name {
-                        Some(name) => format!("{kind} `{name}`"),
-                        None => kind.to_string(),
-                    }
-                })
-                .unwrap_or_else(|| "a value has the wrong type or form".to_string())
+            if message.starts_with("unknown field ") {
+                "unknown field".to_string()
+            } else {
+                ["missing field", "duplicate field"]
+                    .into_iter()
+                    .find_map(|kind| {
+                        let field = message.strip_prefix(kind)?.strip_prefix(" `")?;
+                        let (name, _) = field.split_once('`')?;
+                        Some(match name {
+                            "version" | "project_id" | "revision" | "allow" => {
+                                format!("{kind} `{name}`")
+                            }
+                            _ => kind.to_string(),
+                        })
+                    })
+                    .unwrap_or_else(|| "a value has the wrong type or form".to_string())
+            }
         }
         serde_json::error::Category::Syntax => "not valid JSON".to_string(),
         serde_json::error::Category::Eof => "not valid JSON (it ends early)".to_string(),
@@ -918,10 +914,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    /// JSON 读不进来时只说位置和标识符样的字段名，不引用出错的值：`allow` 被改成字符串、或规则被
-    /// 写成了键时，serde 原文会把规则（连同命令参数里的密钥）带出来。
     #[test]
-    fn json_errors_name_the_place_but_never_the_value() {
+    fn json_errors_only_name_schema_fields() {
         let parse = |raw: &str| {
             let error = serde_json::from_str::<StoreFile>(raw).unwrap_err();
             describe_json_error(&error)
@@ -932,21 +926,23 @@ mod tests {
         assert!(message.starts_with("invalid project permission policy: a value has the wrong type or form (line 1, column "), "{message}");
         assert!(!message.contains("sentinel-secret"), "{message}");
 
-        let message = parse(r#"{"projectId": "p"}"#);
-        assert!(
-            message.starts_with(
-                "invalid project permission policy: unknown field `projectId` (line 1, column "
-            ),
-            "{message}"
-        );
+        for key in [
+            "projectId",
+            "private_marker",
+            "bash(curl -H sentinel-secret *)",
+        ] {
+            let message = parse(&format!(r#"{{"{key}": 1}}"#));
+            assert!(
+                message.starts_with(
+                    "invalid project permission policy: unknown field (line 1, column "
+                ),
+                "{message}"
+            );
+            assert!(!message.contains(key), "{message}");
+        }
 
-        let message = parse(r#"{"bash(curl -H sentinel-secret *)": 1}"#);
-        assert!(
-            message
-                .starts_with("invalid project permission policy: unknown field (line 1, column "),
-            "{message}"
-        );
-        assert!(!message.contains("sentinel-secret"), "{message}");
+        assert!(parse(r#"{"version": 1}"#).contains("missing field `project_id`"));
+        assert!(parse(r#"{"version": 1, "version": 2}"#).contains("duplicate field `version`"));
 
         assert!(parse("{").contains("not valid JSON (it ends early)"));
         assert!(parse("{,}").contains("not valid JSON (line 1, column"));

@@ -1508,24 +1508,15 @@ Durable allow rules live instead in the user-private, per-project
 neither applies, silently ignores, rewrites, nor automatically migrates it.
 Remove the legacy entry and approve again in each project.
 
-A store that cannot be loaded — a mode looser than 0600 (directories 0700), a
-symlink or other non-regular entry, malformed JSON, or any invalid rule — turns
-the project's durable approvals off for the session, and says so as a
-**warning**: a note that starts with `⚠ ` (`kloop_core::event::warning_note`),
-which the TUI draws in bold yellow with a 40-row preview. Plain and headless
-front-ends print the full warning on stderr. In the affected checkout,
-`kloop --check-permissions` prints the full current report without starting
-a session or connecting to a provider; it finds the project from the current
-directory, so the warning names it as a command to copy
-(`cd <workspace> && kloop --check-permissions`). The report includes the load
-error, the file path, and one line per fix. On Unix, the path uses `~/` for the
-home directory and single-quotes the rest if it contains characters outside a
-safe set. Other platforms display the native path. A file that is not valid
-policy JSON is described by position only — `not valid JSON`, `a value has the
-wrong type or form`, or a missing/unknown/duplicate field named only when the
-name is a plain identifier — never by serde's own text, which quotes the
-offending value and so could print a rule (an `allow` turned into a string, a
-rule written as a key).
+项目权限文件加载失败时，本会话停用项目持久授权。加载失败包括权限位超过文件 0600 或
+目录 0700、符号链接或其他非普通条目、JSON 无效和规则无效。警告以 `⚠ ` 开头
+（`kloop_core::event::warning_note`），TUI 用黄色粗体预览 40 行，plain 和 headless
+在 stderr 打印完整警告。直接复制警告中的 `kloop --check-permissions <project-id>`，
+从任意工作目录读取该项目的完整报告。省略 ID 时按当前目录确定项目。两种调用都以只读方式
+检查权限文件，无需启动会话或连接提供商。报告包含加载错误、文件路径和逐条修法。Unix 路径将家
+目录缩成 `~/`，余下部分有白名单外的字符时用单引号包起来。其他平台显示原生路径。
+JSON 诊断给出类别和行列。缺失或重复字段可显示模式定义的字段名，未知字段一律只显示
+错误类别和行列。文件中的键和值可能包含密钥。
 
 An invalid rule is reported by the loader itself, which has already read the
 file safely: `InvalidRules` carries one fix per distinct reason, the entries

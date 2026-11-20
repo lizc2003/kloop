@@ -147,6 +147,49 @@ fn help_and_list_sessions_ignore_invalid_provider_environment() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn permission_report_can_select_a_project_from_another_directory() {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+    use kloop_core::project::WorkspaceIdentity;
+
+    let root = TestRoot::new("permission-report");
+    write_config(&root, "invalid = [\n");
+    let workspace = root.root.join("work tree");
+    std::fs::create_dir(&workspace).unwrap();
+    let identity = WorkspaceIdentity::resolve(&workspace);
+    let project_id = identity.project_id().unwrap().as_str();
+    let policy_dir = root.root.join("home/.kloop/projects/v1").join(project_id);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&policy_dir)
+        .unwrap();
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(policy_dir.join("permissions.json"))
+        .unwrap()
+        .write_all(br#"{"private_marker": true}"#)
+        .unwrap();
+
+    let local = root.command(&["--check-permissions"]).output().unwrap();
+    assert!(local.status.success(), "{local:?}");
+
+    let selected = root
+        .command(&["--check-permissions", project_id])
+        .output()
+        .unwrap();
+    assert_eq!(selected.status.code(), Some(1));
+    let report = String::from_utf8(selected.stdout).unwrap();
+    assert!(report.contains("unknown field (line "), "{report}");
+    assert!(report.contains(project_id), "{report}");
+    assert!(!report.contains("private_marker"), "{report}");
+}
+
 /// A writer killed between its runtime line and its first turn leaves a
 /// preamble-only session. Resuming it must open the initial route like a fresh
 /// session instead of failing to adopt a timeline that does not exist.

@@ -38,6 +38,7 @@ use kloop_server::SkillsReader;
 use kloop_server::SkillsSnapshot;
 
 use crate::args::CliArgs;
+use crate::args::PermissionCheck;
 use crate::args::list_sessions;
 use crate::args::open_history;
 use crate::args::parse_args;
@@ -354,24 +355,30 @@ async fn run(arguments: Vec<std::ffi::OsString>) -> Result<ExitCode> {
         println!("kloop {}", version_string());
         return Ok(ExitCode::SUCCESS);
     }
-    let cwd = std::env::current_dir().context("cannot determine cwd")?;
-    if args.check_permissions {
-        let identity = WorkspaceIdentity::resolve(&cwd);
-        let project_id = identity
-            .project_id()
-            .context("cannot determine the current project's identity")?;
+    if let Some(check) = args.check_permissions {
+        let project_id = match check {
+            PermissionCheck::CurrentProject => {
+                let cwd = std::env::current_dir().context("cannot determine cwd")?;
+                WorkspaceIdentity::resolve(&cwd)
+                    .project_id()
+                    .cloned()
+                    .context("cannot determine the current project's identity")?
+            }
+            PermissionCheck::Project(project_id) => project_id,
+        };
         let store = project_store::ProjectStore::new(user_config::private_state_root()?);
-        return match store.load_blocking(project_id) {
+        return match store.load_blocking(&project_id) {
             Ok(_) => {
                 println!("Project permission policy is valid.");
                 Ok(ExitCode::SUCCESS)
             }
             Err(error) => {
-                println!("{}", store.load_failure_report(project_id, &error));
+                println!("{}", store.load_failure_report(&project_id, &error));
                 Ok(ExitCode::FAILURE)
             }
         };
     }
+    let cwd = std::env::current_dir().context("cannot determine cwd")?;
     // Session storage resolves before the user config is parsed: `--list-sessions`
     // must keep working when `~/.kloop/config.toml` is broken, so the store needs
     // the private-state root but never its contents.
