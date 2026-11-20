@@ -225,6 +225,14 @@ pub(super) fn parse_rule(entry: &str) -> Result<Rule> {
             }
             "sandbox_escalate" => {
                 let (tokens, wildcard) = parse_prefix_pattern(tool, inner)?;
+                // 升级的键跳过只读段，以只读命令开头的规则永远命不中；旧文件里的这类规则直接判非法，
+                // 不再保留可读（2026-11-20 用户定：不考虑兼容）。
+                if crate::shell::readonly_whatever_the_arguments(&tokens[0]) {
+                    bail!(
+                        "rule '{entry}': sandbox_escalate never matches a read-only command such as '{}'",
+                        tokens[0]
+                    );
+                }
                 Ok(Rule::SandboxEscalatePrefix { tokens, wildcard })
             }
             "sandbox_network" => {
@@ -242,12 +250,21 @@ pub(super) fn parse_rule(entry: &str) -> Result<Rule> {
             }
             "sandbox_write" => {
                 let dir = std::path::Path::new(inner);
+                // 授权生效时逐字比对解析后的物理路径（plan 287），尾斜杠、`.`、`..`、`//` 这类写法
+                // 永远对不上；直接判非法，而不是读进来再在使用时丢掉。
+                let spelled_canonically = !inner.ends_with('/')
+                    && !inner.contains("//")
+                    && inner
+                        .split('/')
+                        .skip(1)
+                        .all(|component| !matches!(component, "." | ".."));
                 if !dir.is_absolute()
                     || dir.parent().is_none()
+                    || !spelled_canonically
                     || inner.contains(['*', '?', '[', ']', '{', '}', '\n', '\r'])
                 {
                     bail!(
-                        "rule '{entry}': sandbox_write takes one absolute directory other than /, without glob characters"
+                        "rule '{entry}': sandbox_write takes one absolute directory other than /, spelled without glob characters, '.', '..', '//' or a trailing '/'"
                     );
                 }
                 Ok(Rule::SandboxWrite {

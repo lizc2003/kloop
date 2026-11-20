@@ -331,8 +331,41 @@ fn plan283_capability_rules_parse_programs_and_absolute_dirs() {
         "sandbox_write(out)",
         "sandbox_write(/)",
         "sandbox_write(/opt/*)",
+        // 非规范写法：授权生效时逐字比对物理路径，永远对不上（2026-11-20：不考虑兼容，直接判非法）。
+        "sandbox_write(/opt/out/)",
+        "sandbox_write(/opt//out)",
+        "sandbox_write(/opt/./out)",
+        "sandbox_write(/opt/../out)",
+        "sandbox_write(/opt/out/.)",
     ] {
         assert!(parse_rule(bad).is_err(), "{bad}");
+    }
+}
+
+/// 升级的键跳过只读段：以“不论参数都只读”的命令开头的 `sandbox_escalate` 永远命不中，解析时就拒绝；
+/// 只读与否取决于参数的命令（`sed`、`find`、`git`）照常接受（2026-11-20：不考虑兼容）。
+#[test]
+fn plan283_escalation_rules_headed_by_a_read_only_command_are_invalid() {
+    for bad in [
+        "sandbox_escalate(cd /Users/someone/repo *)",
+        "sandbox_escalate(cd .. *)",
+        "sandbox_escalate(echo EXIT:0 *)",
+        "sandbox_escalate(cat *)",
+        "sandbox_escalate(/bin/ls *)",
+    ] {
+        assert!(parse_rule(bad).is_err(), "{bad}");
+    }
+    for good in [
+        "sandbox_escalate(cargo test *)",
+        "sandbox_escalate(make check *)",
+        "sandbox_escalate(sed -n *)",
+        "sandbox_escalate(find *)",
+        "sandbox_escalate(git push *)",
+    ] {
+        assert!(
+            matches!(parse_rule(good), Ok(rule::Rule::SandboxEscalatePrefix { .. })),
+            "{good}"
+        );
     }
 }
 

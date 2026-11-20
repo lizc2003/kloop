@@ -427,6 +427,40 @@ fn executable_name(raw: &str) -> &str {
     raw.rsplit('/').next().unwrap_or(raw)
 }
 
+/// Commands that are read-only whatever arguments follow them. A
+/// `sandbox_escalate(<prefix> *)` rule headed by one can never match: escalation
+/// keys skip read-only segments (plan 283 stage 1).
+pub(crate) fn readonly_whatever_the_arguments(name: &str) -> bool {
+    matches!(
+        executable_name(name),
+        "cat"
+            | "cd"
+            | "cut"
+            | "du"
+            | "echo"
+            | "expr"
+            | "false"
+            | "file"
+            | "head"
+            | "id"
+            | "ls"
+            | "nl"
+            | "paste"
+            | "pwd"
+            | "rev"
+            | "seq"
+            | "stat"
+            | "tail"
+            | "tr"
+            | "true"
+            | "uname"
+            | "uniq"
+            | "wc"
+            | "which"
+            | "whoami"
+    )
+}
+
 /// Read-only classifier over one parsed argv (codex
 /// `is_safe_to_call_with_exec`): a safelisted NAME is necessary but not
 /// sufficient — tools whose options can execute or write are vetted
@@ -437,9 +471,7 @@ pub fn argv_is_readonly(argv: &[String]) -> bool {
     };
     let rest = &argv[1..];
     match executable_name(cmd0) {
-        "cat" | "cd" | "cut" | "du" | "echo" | "expr" | "false" | "file" | "head" | "id" | "ls"
-        | "nl" | "paste" | "pwd" | "rev" | "seq" | "stat" | "tail" | "tr" | "true" | "uname"
-        | "uniq" | "wc" | "which" | "whoami" => true,
+        name if readonly_whatever_the_arguments(name) => true,
 
         "base64" => !rest
             .iter()

@@ -762,8 +762,7 @@ a memory that answered one: which door asked (`gate`, or `escalation` after a
 sandbox denial), why (`hazard`, `ask_rule`, `incomplete_parse`, `uncontained`,
 `outside_workspace`, `tool`, `sandbox_denied`, `escalated_before_run` — a
 remembered escalation that took the call out of the sandbox before it ran, so
-neither door asked; `no_sandbox` only in files written before `disable_sandbox`
-was removed), the clipped
+neither door asked), the clipped
 detail, the session keys and durable rules a remembering answer would write,
 the scopes offered, and the answer (`allowed` with its scope, `denied`,
 `stopped`, `no_approver`, or `remembered` by a project rule or the session
@@ -4199,10 +4198,12 @@ next command that needs it is covered whatever its text.
   characters in its name, so no rule can spell it) still lifts to a covering
   cache root. The offer shows the resolved directory and stores that same
   path in `sandbox_write(<dir>)`. Each use checks that the path still resolves
-  verbatim to itself (not a symlink or non-canonical spelling such as a
-  trailing slash, `.`, or `//`), and the profile gets that exact path. A
-  legacy rule that names an alias needs fresh approval for the resolved
-  directory. Caches are not made
+  verbatim to itself, and the profile gets that exact path; a directory that
+  has since become a symlink stops granting anything until a fresh approval.
+  A rule spelled non-canonically (a trailing slash, `.`, `..` or `//`) can
+  never resolve to itself, so it is a parse error, not a rule kept and
+  ignored — like any invalid rule it disables the project's durable approvals
+  for the session until it is removed (no compatibility, 2026-11-20). Caches are not made
   writable by default: a sandboxed run could then plant code in an unpacked
   module that a later uncontained build executes. Only a plain directory is
   offered, judged both as spelled and as resolved. It must be absolute and
@@ -4249,7 +4250,9 @@ filter and `| tail -20`, so it never matched again. 可解析但两词前缀不�
 相对写入目标另行解析。于是 `cd <dir> && make check 2>&1 | tail -80` 由
 `sandbox_escalate(make check *)` 覆盖，询问提议的也是这条，不再退成逐字记忆或写下
 `sandbox_escalate(cd <dir> *)`；只剩写入的命令（`echo x > /elsewhere/f`）由写入规则单独
-覆盖。普通 `bash_write` 与升级写入规则不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
+覆盖。以“不论参数都只读”的命令（`cd`、`echo`、`cat`……）开头的 `sandbox_escalate` 规则因此永远命不中，
+解析时直接判非法；早先写下的这类规则会让整份项目权限文件判为无效，本会话的项目授权停用并提示，删掉即可
+（2026-11-20 用户定：不考虑兼容，不保留读取旧规则的代码）。只读与否看参数的命令（`sed -n`、`find`）不在此列。普通 `bash_write` 与升级写入规则不能互相替代。`p` 的持久化失败仍放行这一次，并和普通权限门一样报告规则没有保存。
 A remembered **per-command** rule is consulted **before** the sandboxed attempt,
 not after it fails: the command runs uncontained from the start and the result
 says so (`[Ran without the sandbox: a remembered sandbox_escalate rule …]`).

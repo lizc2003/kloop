@@ -411,10 +411,11 @@ fn plan287_a_refused_rename_of_a_guarded_ancestor_offers_nothing() {
     assert_eq!(offer(&home.join(".npm/_cacache/new-entry")), Some(home.join(".npm")));
 }
 
-/// 带尾斜杠、`.` 或 `//` 的旧写授权不是规范字面量：按别名过滤，不进入可写根，也不把对应目录算作已记住。
+/// 带尾斜杠、`.` 或 `//` 的写法不是规范字面量：规则解析时就拒绝（见 plan283 的解析用例），
+/// 别处直接交给 `with_grants` 的也按别名过滤，不进入可写根。
 #[cfg(unix)]
-#[tokio::test]
-async fn plan287_non_canonical_write_grant_spellings_are_dropped() {
+#[test]
+fn plan287_non_canonical_write_grant_spellings_are_dropped() {
     let base = std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(crate::resource_id::fresh("plan287-spelling-").unwrap());
@@ -429,70 +430,23 @@ async fn plan287_non_canonical_write_grant_spellings_are_dropped() {
     assert!(usable_write_grant(&kept));
     for bad in [&trailing_slash, &dot_segment, &double_slash] {
         assert!(!usable_write_grant(bad), "{}", bad.display());
+        assert!(
+            parse_rule(&format!("sandbox_write({})", bad.display())).is_err(),
+            "{}",
+            bad.display()
+        );
     }
 
-    let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false);
-    #[cfg(target_os = "macos")]
-    let sandbox_policy = policy.clone();
     let ungranted = crate::sandbox::SandboxPolicy {
         writable_roots: Vec::new(),
-        ..policy
+        ..crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false)
     };
     let applied = ungranted.with_grants(&SandboxGrants {
         network: false,
-        writable: vec![
-            trailing_slash.clone(),
-            dot_segment.clone(),
-            double_slash.clone(),
-        ],
+        writable: vec![trailing_slash, dot_segment, double_slash],
     });
     assert!(applied.writable_roots.is_empty());
     assert!(!applied.already_decides_writes(&kept));
-
-    let rule = |dir: &Path| format!("sandbox_write({})", dir.display());
-    let approver = ScriptedApprover::new(vec![]);
-    let p = gate(
-        Mode::Manual,
-        rules(
-            &[
-                &rule(&trailing_slash),
-                &rule(&dot_segment),
-                &rule(&double_slash),
-            ],
-            &[],
-            &[],
-        ),
-        approver.clone(),
-    );
-    #[cfg(target_os = "macos")]
-    {
-        let verdict = p
-            .check_call_with_execution(
-                "bash",
-                &bash("printf x > out.txt"),
-                0,
-                crate::sandbox::ExecutionContext::sandboxed(Some(&sandbox_policy)),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(verdict.grants.writable.is_empty());
-    }
-    let denial = crate::sandbox::SandboxDenial {
-        kind: crate::sandbox::DenialKind::Write,
-        evidence: format!("file-write-create {kept_text}/x"),
-        writes: Vec::new(),
-    };
-    let request = CapabilityRequest::Write {
-        dirs: vec![kept.clone()],
-    };
-    let escalation = p.escalate_capability("touch x", &denial, &request, 0).await;
-    assert_ne!(
-        escalation.outcome,
-        EscalationOutcome::Approved(EscalationApproval::Remembered),
-        "non-canonical spellings must trigger fresh approval for the physical path"
-    );
-    assert_eq!(approver.ask_count(), 1);
     std::fs::remove_dir_all(&base).unwrap();
 }
 
