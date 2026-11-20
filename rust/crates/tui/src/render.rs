@@ -53,8 +53,6 @@ pub(crate) const BRAND: Color = Color::Rgb(79, 179, 200);
 /// the response body (bounded at 64 KiB upstream), which would otherwise push
 /// the whole turn out of the viewport.
 const NOTE_MAX_LINES: usize = 10;
-/// 警告是 kloop 自己写的、要用户照着改的提示，行数有界，不能被普通提示的上限截掉后半段修法。
-const WARNING_MAX_LINES: usize = 40;
 
 /// Wall-clock timing the event loop feeds each frame (the pure `App` has no
 /// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
@@ -523,11 +521,9 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             } else {
                 (format!("[{text}]"), DIM)
             };
-            let cap = if warning {
-                WARNING_MAX_LINES
-            } else {
-                NOTE_MAX_LINES
-            };
+            // 警告是 kloop 自己写的、要用户照着改的提示，修法已经按原因合并过，不设行数上限：截掉的修法
+            // 在原生滚动历史里也看不到（同一个渲染入口）。
+            let cap = if warning { usize::MAX } else { NOTE_MAX_LINES };
             let wrapped = wrap(&body, width.saturating_sub(1).max(1));
             let dropped = wrapped.len().saturating_sub(cap);
             for (i, l) in wrapped.into_iter().take(cap).enumerate() {
@@ -2195,16 +2191,22 @@ mod tests {
                 assert_eq!(span.style, loud, "{texts:?}");
             }
         }
-        // 修法多的警告不按普通提示的 10 行上限截断。
+        // 修法多、终端又窄时，警告也一行不截。
         let many = (1..=15)
             .map(|n| format!("  remove entry {n} of \"allow\": not a valid rule"))
             .collect::<Vec<_>>()
             .join("\n");
         let long = cell_lines(
             &Cell::Note(kloop_core::event::warning_note(&format!("header\n{many}"))),
-            80,
+            24,
         );
-        assert_eq!(long.len(), 16);
+        let long_texts: Vec<String> = long.iter().map(line_text).collect();
+        assert!(long_texts.len() > NOTE_MAX_LINES * 3, "{long_texts:?}");
+        assert!(!long_texts.iter().any(|text| text.contains("more line(s)")));
+        assert!(
+            long_texts.concat().contains("entry 15 of"),
+            "{long_texts:?}"
+        );
         let ordinary = cell_lines(&Cell::Note("compacted".into()), 80);
         assert_eq!(line_text(&ordinary[0]), "[compacted]");
         assert_eq!(ordinary[0].spans[0].style, DIM);

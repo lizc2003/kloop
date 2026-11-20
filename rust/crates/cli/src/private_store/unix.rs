@@ -52,6 +52,169 @@ pub(super) fn validate_private_permissions(
     Ok(())
 }
 
+pub(super) fn inspect_private_file(
+    root: &Path,
+    components: &[&OsStr],
+    name: &OsStr,
+) -> super::Inspection {
+    use super::Finding;
+    use rustix::fs::AtFlags;
+    use rustix::fs::FileType;
+    use rustix::fs::Mode;
+    use rustix::fs::OFlags;
+
+    let mut inspection = super::Inspection::default();
+    let lookup =
+        private_dir_lookup_flags() | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let mut path = root.to_path_buf();
+    // 一级目录的结论：`Err` 是要停下的问题（或 `None`：不存在，没什么可看），`Ok(true)` 是权限位过宽。
+    let directory_state =
+        |stat: &rustix::fs::Stat, path: &Path| -> std::result::Result<bool, Finding> {
+            let mode = stat.st_mode as u32;
+            match FileType::from_raw_mode(stat.st_mode as _) {
+                FileType::Symlink => Err(Finding::Link {
+                    path: path.to_path_buf(),
+                    directory: true,
+                }),
+                FileType::Directory => Ok(mode & 0o077 != 0),
+                _ => Err(Finding::NotDirectory(path.to_path_buf())),
+            }
+        };
+    let opened = |result: rustix::io::Result<rustix::fd::OwnedFd>, path: &Path, directory: bool| {
+        match result {
+            Ok(fd) => Ok(Some(fd)),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(rustix::io::Errno::LOOP) => Err(Finding::Link {
+                path: path.to_path_buf(),
+                directory,
+            }),
+            Err(rustix::io::Errno::NOTDIR) if directory => {
+                Err(Finding::NotDirectory(path.to_path_buf()))
+            }
+            Err(_) => Err(Finding::Inaccessible(path.to_path_buf())),
+        }
+    };
+
+    let stat = match rustix::fs::lstat(root) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return inspection,
+        Err(_) => {
+            inspection.findings.push(Finding::Inaccessible(path));
+            return inspection;
+        }
+    };
+    match directory_state(&stat, &path) {
+        Err(finding) => {
+            inspection.findings.push(finding);
+            return inspection;
+        }
+        Ok(true) => inspection.findings.push(Finding::LooseMode {
+            path: path.clone(),
+            directory: true,
+        }),
+        Ok(false) => {}
+    }
+    let mut current = match opened(rustix::fs::open(root, lookup, Mode::empty()), &path, true) {
+        Ok(Some(fd)) => fd,
+        Ok(None) => return inspection,
+        Err(finding) => {
+            inspection.findings.push(finding);
+            return inspection;
+        }
+    };
+    for component in components {
+        path.push(component);
+        let stat = match rustix::fs::statat(&current, *component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => return inspection,
+            Err(_) => {
+                inspection.findings.push(Finding::Inaccessible(path));
+                return inspection;
+            }
+        };
+        match directory_state(&stat, &path) {
+            Err(finding) => {
+                inspection.findings.push(finding);
+                return inspection;
+            }
+            Ok(true) => inspection.findings.push(Finding::LooseMode {
+                path: path.clone(),
+                directory: true,
+            }),
+            Ok(false) => {}
+        }
+        current = match opened(
+            rustix::fs::openat(&current, *component, lookup, Mode::empty()),
+            &path,
+            true,
+        ) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => return inspection,
+            Err(finding) => {
+                inspection.findings.push(finding);
+                return inspection;
+            }
+        };
+    }
+    path.push(name);
+    let stat = match rustix::fs::statat(&current, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return inspection,
+        Err(_) => {
+            inspection.findings.push(Finding::Inaccessible(path));
+            return inspection;
+        }
+    };
+    match FileType::from_raw_mode(stat.st_mode as _) {
+        FileType::Symlink => {
+            inspection.findings.push(Finding::Link {
+                path,
+                directory: false,
+            });
+            return inspection;
+        }
+        FileType::RegularFile => {
+            if (stat.st_mode as u32) & 0o077 != 0 {
+                inspection.findings.push(Finding::LooseMode {
+                    path: path.clone(),
+                    directory: false,
+                });
+            }
+        }
+        _ => {
+            inspection.findings.push(Finding::NotRegularFile(path));
+            return inspection;
+        }
+    }
+    let fd = match opened(
+        rustix::fs::openat(
+            &current,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ),
+        &path,
+        false,
+    ) {
+        Ok(Some(fd)) => fd,
+        Ok(None) => return inspection,
+        Err(finding) => {
+            inspection.findings.push(finding);
+            return inspection;
+        }
+    };
+    let mut file = std::fs::File::from(fd);
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        inspection.findings.push(Finding::NotRegularFile(path));
+        return inspection;
+    }
+    let mut raw = String::new();
+    if std::io::Read::read_to_string(&mut file, &mut raw).is_ok() {
+        inspection.contents = Some(raw);
+    }
+    inspection
+}
+
 fn private_file_name<'a>(path: &'a Path, label: &str) -> Result<&'a OsStr> {
     path.file_name()
         .with_context(|| format!("{label} has no file name"))

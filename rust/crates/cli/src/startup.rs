@@ -421,7 +421,7 @@ fn load_project_permission_policy(
             "durable project approvals are off for this session: the project permission policy could not be loaded ({err:#})\n  file: {}",
             crate::project_store::shell_path(&store.policy_path(&project_id))
         );
-        for fix in store.load_failure_fixes(&project_id) {
+        for fix in store.load_failure_fixes(&project_id, &err) {
             text.push_str("\n  ");
             text.push_str(&fix);
         }

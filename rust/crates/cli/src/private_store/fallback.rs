@@ -207,3 +207,11 @@ pub(super) fn lock_file(_file: &std::fs::File) -> Result<()> {
 pub(super) fn unlock_file(_file: &std::fs::File) -> Result<()> {
     Ok(())
 }
+
+pub(super) fn inspect_private_file(
+    _root: &Path,
+    _components: &[&OsStr],
+    _name: &OsStr,
+) -> super::Inspection {
+    super::Inspection::default()
+}

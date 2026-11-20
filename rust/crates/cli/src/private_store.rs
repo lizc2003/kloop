@@ -36,6 +36,42 @@ pub(crate) fn write_private_atomic(path: &Path, label: &str, bytes: &[u8]) -> Re
     platform::write_private_atomic(path, label, bytes)
 }
 
+/// 加载失败后看现场的一条结论，对应一个能动手改的地方。只有 unix 实现会产出。
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum Finding {
+    /// 这一级是符号链接；检查停在这里，不越过它。
+    Link {
+        path: std::path::PathBuf,
+        directory: bool,
+    },
+    /// 这一级应是目录却不是；检查停在这里。
+    NotDirectory(std::path::PathBuf),
+    /// 文件不是普通文件（FIFO、目录、设备……）；检查停在这里。
+    NotRegularFile(std::path::PathBuf),
+    /// 同组或其他用户可访问。
+    LooseMode {
+        path: std::path::PathBuf,
+        directory: bool,
+    },
+    /// 打不开或看不了；检查停在这里。
+    Inaccessible(std::path::PathBuf),
+}
+
+/// 看现场的结果：发现的问题，以及走到文件、确认是普通文件时读到的内容（不管权限位）。
+#[derive(Debug, Default)]
+pub(crate) struct Inspection {
+    pub(crate) findings: Vec<Finding>,
+    pub(crate) contents: Option<String>,
+}
+
+/// 和正式加载走同一条路径看现场：逐级持有目录句柄、每一级都不跟随链接、打开文件不阻塞，只是遇到
+/// 权限位过宽不停下，而是记下来，好让调用方一次给出全部修法。只有 unix 实现；其它平台的加载器
+/// 自己的错误已经说清楚（例如 Windows 拒绝一切重解析点），这里不另走一遍。
+pub(crate) fn inspect_private_file(root: &Path, components: &[&OsStr], name: &OsStr) -> Inspection {
+    platform::inspect_private_file(root, components, name)
+}
+
 fn read_opened_private_file(mut file: std::fs::File, label: &str) -> Result<String> {
     validate_private_file(&file, label)?;
     let mut raw = String::new();
