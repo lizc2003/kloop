@@ -418,27 +418,67 @@ fn number_ranges(numbers: &[usize]) -> String {
 
 /// 只有加载器已打开普通文件并读到内容时才产生，和路径遍历错误区分开。
 #[derive(Debug)]
-struct InvalidPolicyFile(&'static str);
+struct InvalidPolicyFile(String);
 
 impl std::fmt::Display for InvalidPolicyFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for InvalidPolicyFile {}
+
+/// JSON 读不进来时的说明：只留出错的位置，以及形如标识符的字段名（`unknown field `projectId``）。
+/// serde 的原文会引用出错的值，而值可能就是一条规则（例如 `allow` 被改成了一个字符串），会把规则
+/// 里命令参数中的密钥带进警告和 `--check-permissions` 的输出。
+fn describe_json_error(error: &serde_json::Error) -> String {
+    let at = format!("line {}, column {}", error.line(), error.column());
+    let what = match error.classify() {
+        serde_json::error::Category::Data => {
+            let message = error.to_string();
+            ["unknown field", "missing field", "duplicate field"]
+                .into_iter()
+                .find(|kind| message.starts_with(kind))
+                .map(|kind| {
+                    let name = message[kind.len()..]
+                        .trim_start()
+                        .strip_prefix('`')
+                        .and_then(|rest| rest.split_once('`'))
+                        .map(|(name, _)| name)
+                        .filter(|name| {
+                            !name.is_empty()
+                                && name.len() <= 40
+                                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        });
+                    match name {
+                        Some(name) => format!("{kind} `{name}`"),
+                        None => kind.to_string(),
+                    }
+                })
+                .unwrap_or_else(|| "a value has the wrong type or form".to_string())
+        }
+        serde_json::error::Category::Syntax => "not valid JSON".to_string(),
+        serde_json::error::Category::Eof => "not valid JSON (it ends early)".to_string(),
+        serde_json::error::Category::Io => "cannot be read".to_string(),
+    };
+    format!("invalid project permission policy: {what} ({at})")
+}
 
 fn read_policy(dir: &PrivateDir, project_id: &ProjectId) -> Result<ProjectPolicySnapshot> {
     let Some(raw) = dir.read_string(OsStr::new(POLICY_FILE), POLICY_LABEL)? else {
         return Ok(ProjectPolicySnapshot::empty());
     };
     let file: StoreFile = serde_json::from_str(&raw)
-        .context(InvalidPolicyFile("invalid project permission policy"))?;
+        .map_err(|error| anyhow::Error::new(InvalidPolicyFile(describe_json_error(&error))))?;
     if file.version != 1 {
-        return Err(InvalidPolicyFile("unsupported project permission policy version").into());
+        return Err(
+            InvalidPolicyFile("unsupported project permission policy version".to_string()).into(),
+        );
     }
     if file.project_id != project_id.as_str() {
-        return Err(InvalidPolicyFile("project permission policy identity mismatch").into());
+        return Err(
+            InvalidPolicyFile("project permission policy identity mismatch".to_string()).into(),
+        );
     }
     let allow = ProjectAllowRules::parse(&file.allow).map_err(|_| {
         anyhow::Error::new(InvalidRules(rule_fixes(
@@ -876,6 +916,40 @@ mod tests {
         assert!(format!("{error:#}").contains(&entry.display().to_string()));
         assert!(store.load_failure_fixes(&id, &error).is_empty());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// JSON 读不进来时只说位置和标识符样的字段名，不引用出错的值：`allow` 被改成字符串、或规则被
+    /// 写成了键时，serde 原文会把规则（连同命令参数里的密钥）带出来。
+    #[test]
+    fn json_errors_name_the_place_but_never_the_value() {
+        let parse = |raw: &str| {
+            let error = serde_json::from_str::<StoreFile>(raw).unwrap_err();
+            describe_json_error(&error)
+        };
+        let message = parse(
+            r#"{"version": 1, "project_id": "p", "revision": 1, "allow": "bash(curl -H sentinel-secret *)"}"#,
+        );
+        assert!(message.starts_with("invalid project permission policy: a value has the wrong type or form (line 1, column "), "{message}");
+        assert!(!message.contains("sentinel-secret"), "{message}");
+
+        let message = parse(r#"{"projectId": "p"}"#);
+        assert!(
+            message.starts_with(
+                "invalid project permission policy: unknown field `projectId` (line 1, column "
+            ),
+            "{message}"
+        );
+
+        let message = parse(r#"{"bash(curl -H sentinel-secret *)": 1}"#);
+        assert!(
+            message
+                .starts_with("invalid project permission policy: unknown field (line 1, column "),
+            "{message}"
+        );
+        assert!(!message.contains("sentinel-secret"), "{message}");
+
+        assert!(parse("{").contains("not valid JSON (it ends early)"));
+        assert!(parse("{,}").contains("not valid JSON (line 1, column"));
     }
 
     /// `1, 2, 3, 5` 合成 `1–3, 5`；两个相邻的不写成区间。

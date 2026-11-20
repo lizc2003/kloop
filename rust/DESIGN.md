@@ -1515,10 +1515,17 @@ the project's durable approvals off for the session, and says so as a
 which the TUI draws in bold yellow with a 40-row preview. Plain and headless
 front-ends print the full warning on stderr. In the affected checkout,
 `kloop --check-permissions` prints the full current report without starting
-a session or connecting to a provider. The report includes the load error,
-the file path, and one line per fix. On Unix, the path uses `~/` for the home
-directory and single-quotes the rest if it contains characters outside a safe
-set. Other platforms display the native path.
+a session or connecting to a provider; it finds the project from the current
+directory, so the warning names it as a command to copy
+(`cd <workspace> && kloop --check-permissions`). The report includes the load
+error, the file path, and one line per fix. On Unix, the path uses `~/` for the
+home directory and single-quotes the rest if it contains characters outside a
+safe set. Other platforms display the native path. A file that is not valid
+policy JSON is described by position only — `not valid JSON`, `a value has the
+wrong type or form`, or a missing/unknown/duplicate field named only when the
+name is a plain identifier — never by serde's own text, which quotes the
+offending value and so could print a rule (an `allow` turned into a string, a
+rule written as a key).
 
 An invalid rule is reported by the loader itself, which has already read the
 file safely: `InvalidRules` carries one fix per distinct reason, the entries
