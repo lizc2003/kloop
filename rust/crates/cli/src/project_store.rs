@@ -14,7 +14,6 @@ use std::sync::Mutex;
 
 use anyhow::Context as _;
 use anyhow::Result;
-use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -183,7 +182,8 @@ impl ProjectStore {
     /// 权限文件读不了时给用户的修法，每条都能照做。规则非法时加载器已经安全地读过文件，修法就是
     /// 它带回来的逐条说明；其余情况和正式加载走同一条按句柄逐级、不跟随链接、不阻塞的路径再看一遍
     /// 现场（[`crate::private_store::inspect_private_file`]），权限位过宽给 `chmod`，链接或类型不对
-    /// 的条目给针对它的修法，走得到文件时连同里面的非法规则一起列出。都不是时给通用办法。规则原文
+    /// 的条目给针对它的修法，走得到文件时连同里面的非法规则一起列出。其他平台只在加载器读到了
+    /// 内容无效的文件时给通用修法。规则原文
     /// 不出现在修法里（见 [`kloop_core::permissions::invalid_rule_reason`]）。
     pub(crate) fn load_failure_fixes(
         &self,
@@ -199,8 +199,13 @@ impl ProjectStore {
             OsStr::new(POLICY_FILE),
         );
         use crate::private_store::Finding;
-        let mut fixes: Vec<String> = inspection
-            .findings
+        let findings = match inspection.findings.last() {
+            Some(blocker) if !matches!(blocker, Finding::LooseMode { .. }) => {
+                std::slice::from_ref(blocker)
+            }
+            _ => &inspection.findings,
+        };
+        let mut fixes: Vec<String> = findings
             .iter()
             .map(|finding| match finding {
                 Finding::Link {
@@ -237,6 +242,10 @@ impl ProjectStore {
                     "cannot inspect {}; check its owner and permissions",
                     shell_path(path)
                 ),
+                Finding::Changed(path) => format!(
+                    "{} changed during inspection; check the entry and retry",
+                    shell_path(path)
+                ),
             })
             .collect();
         if let Some(allow) = inspection
@@ -251,13 +260,29 @@ impl ProjectStore {
         {
             fixes.extend(rule_fixes(allow.iter().map(serde_json::Value::as_str)));
         }
-        if fixes.is_empty() {
+        if fixes.is_empty() && (cfg!(unix) || error.is::<InvalidPolicyFile>()) {
             fixes.push(
                 "fix the file by hand, or delete it (that forgets this project's remembered approvals)"
                     .to_string(),
             );
         }
         fixes
+    }
+
+    pub(crate) fn load_failure_report(
+        &self,
+        project_id: &ProjectId,
+        error: &anyhow::Error,
+    ) -> String {
+        let mut report = format!(
+            "the project permission policy could not be loaded ({error:#})\n  file: {}",
+            shell_path(&self.policy_path(project_id))
+        );
+        for fix in self.load_failure_fixes(project_id, error) {
+            report.push_str("\n  ");
+            report.push_str(&fix);
+        }
+        report
     }
 
     #[cfg(test)]
@@ -391,17 +416,29 @@ fn number_ranges(numbers: &[usize]) -> String {
     parts.join(", ")
 }
 
+/// 只有加载器已打开普通文件并读到内容时才产生，和路径遍历错误区分开。
+#[derive(Debug)]
+struct InvalidPolicyFile(&'static str);
+
+impl std::fmt::Display for InvalidPolicyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidPolicyFile {}
+
 fn read_policy(dir: &PrivateDir, project_id: &ProjectId) -> Result<ProjectPolicySnapshot> {
     let Some(raw) = dir.read_string(OsStr::new(POLICY_FILE), POLICY_LABEL)? else {
         return Ok(ProjectPolicySnapshot::empty());
     };
-    let file: StoreFile =
-        serde_json::from_str(&raw).context("invalid project permission policy")?;
+    let file: StoreFile = serde_json::from_str(&raw)
+        .context(InvalidPolicyFile("invalid project permission policy"))?;
     if file.version != 1 {
-        bail!("unsupported project permission policy version");
+        return Err(InvalidPolicyFile("unsupported project permission policy version").into());
     }
     if file.project_id != project_id.as_str() {
-        bail!("project permission policy identity mismatch");
+        return Err(InvalidPolicyFile("project permission policy identity mismatch").into());
     }
     let allow = ProjectAllowRules::parse(&file.allow).map_err(|_| {
         anyhow::Error::new(InvalidRules(rule_fixes(
@@ -814,6 +851,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, &project).unwrap();
         {
             use std::os::unix::fs::PermissionsExt as _;
+            let projects = project.parent().unwrap().parent().unwrap();
+            std::fs::set_permissions(projects, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         assert_eq!(
@@ -823,6 +862,19 @@ mod tests {
                 shell_path(&project)
             )]
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_policy_directory_names_the_entry_without_a_delete_suggestion() {
+        let (base, store, id) = fixture("wrong-directory");
+        std::fs::create_dir_all(&*store.root).unwrap();
+        let entry = store.root.join(PROJECTS);
+        std::fs::write(&entry, "").unwrap();
+        let error = store.load_blocking(&id).unwrap_err();
+        assert!(format!("{error:#}").contains(&entry.display().to_string()));
+        assert!(store.load_failure_fixes(&id, &error).is_empty());
         let _ = std::fs::remove_dir_all(base);
     }
 

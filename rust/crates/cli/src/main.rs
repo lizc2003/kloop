@@ -355,6 +355,23 @@ async fn run(arguments: Vec<std::ffi::OsString>) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let cwd = std::env::current_dir().context("cannot determine cwd")?;
+    if args.check_permissions {
+        let identity = WorkspaceIdentity::resolve(&cwd);
+        let project_id = identity
+            .project_id()
+            .context("cannot determine the current project's identity")?;
+        let store = project_store::ProjectStore::new(user_config::private_state_root()?);
+        return match store.load_blocking(project_id) {
+            Ok(_) => {
+                println!("Project permission policy is valid.");
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                println!("{}", store.load_failure_report(project_id, &error));
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
     // Session storage resolves before the user config is parsed: `--list-sessions`
     // must keep working when `~/.kloop/config.toml` is broken, so the store needs
     // the private-state root but never its contents.

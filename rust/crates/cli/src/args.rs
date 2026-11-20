@@ -64,6 +64,7 @@ pub(crate) struct CliArgs {
     /// the model's plan is approved via exit_plan_mode). `--mock` ignores it
     /// (no gate at all).
     pub(crate) permission_mode: Mode,
+    pub(crate) check_permissions: bool,
     pub(crate) list_sessions: bool,
     /// `--all` (`--list-sessions` only): list every project's sessions, not
     /// just this working directory's. Sessions are stored per project, so this
@@ -103,6 +104,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
         help: false,
         version: false,
         permission_mode: Mode::Manual,
+        check_permissions: false,
         list_sessions: false,
         all: false,
         plain: false,
@@ -136,6 +138,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
                     }
                 };
             }
+            "--check-permissions" => parsed.check_permissions = true,
             "--list-sessions" => parsed.list_sessions = true,
             "--all" => parsed.all = true,
             "--plain" => parsed.plain = true,
@@ -201,7 +204,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             // A leading dash is an unknown flag; anything else is the headless
             // positional prompt (only one is allowed).
             other if other.starts_with('-') => bail!(
-                "unknown argument '{other}' (-h/--help | -V/--version | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions [--all])"
+                "unknown argument '{other}' (-h/--help | -V/--version | --headless | --json | --max-rounds <n> | --mock | --permission-mode <mode> | --plain | --serve | --image <path> | -c/--continue | -r/--resume [id] | --fork <id>[#<seq>] | --list-sessions [--all] | --check-permissions)"
             ),
             prompt => {
                 if parsed.prompt.is_some() {
@@ -211,6 +214,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<CliArgs> {
             }
         }
         i += 1;
+    }
+    if parsed.check_permissions && args.len() != 1 {
+        bail!("--check-permissions is a standalone command");
     }
     // `--json` / `--max-rounds` / a positional prompt only mean something in
     // headless mode; requiring `--headless` keeps the mode's flags cohesive.
@@ -271,6 +277,7 @@ pub(crate) fn help_text() -> &'static str {
      \n\
      PERMISSIONS:\n\
      \x20       --permission-mode <mode>   manual (default) | bypass | plan\n\
+     \x20       --check-permissions        print this project's permission policy report and exit\n\
      \n\
      INPUT:\n\
      \x20       --image <path>    attach a local image (repeatable)\n\
@@ -650,6 +657,7 @@ mod tests {
             help: false,
             version: false,
             permission_mode: Mode::Manual,
+            check_permissions: false,
             list_sessions: false,
             all: false,
             plain: false,
@@ -667,6 +675,14 @@ mod tests {
     #[test]
     fn parse_args_covers_all_flags() {
         assert_eq!(parse_args(&[]).unwrap(), base());
+        assert_eq!(
+            parse_args(&strings(&["--check-permissions"])).unwrap(),
+            CliArgs {
+                check_permissions: true,
+                ..base()
+            }
+        );
+        assert!(parse_args(&strings(&["--check-permissions", "--mock"])).is_err());
         assert_eq!(
             parse_args(&strings(&["--mock", "--resume"])).unwrap(),
             CliArgs {

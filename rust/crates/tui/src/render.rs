@@ -41,6 +41,7 @@ use crate::menu::Popup;
 use crate::text_layout::display_width;
 use crate::text_layout::truncate;
 use crate::text_layout::wrap;
+use crate::text_layout::wrap_prefix;
 
 pub(crate) const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 /// kloop's brand accent: a vivid cyan-blue marks the agent's own presence —
@@ -53,6 +54,7 @@ pub(crate) const BRAND: Color = Color::Rgb(79, 179, 200);
 /// the response body (bounded at 64 KiB upstream), which would otherwise push
 /// the whole turn out of the viewport.
 const NOTE_MAX_LINES: usize = 10;
+const WARNING_MAX_LINES: usize = 40;
 
 /// Wall-clock timing the event loop feeds each frame (the pure `App` has no
 /// clock, plan 38 slice 5). `elapsed`/`thinking` are the running turn's and the
@@ -521,20 +523,27 @@ pub fn cell_lines(cell: &Cell, width: usize) -> Vec<Line<'static>> {
             } else {
                 (format!("[{text}]"), DIM)
             };
-            // 警告是 kloop 自己写的、要用户照着改的提示，修法已经按原因合并过，不设行数上限：截掉的修法
-            // 在原生滚动历史里也看不到（同一个渲染入口）。
-            let cap = if warning { usize::MAX } else { NOTE_MAX_LINES };
-            let wrapped = wrap(&body, width.saturating_sub(1).max(1));
+            let width = width.saturating_sub(1).max(1);
+            let (cap, wrapped) = if warning {
+                (
+                    WARNING_MAX_LINES,
+                    wrap_prefix(&body, width, WARNING_MAX_LINES + 1),
+                )
+            } else {
+                (NOTE_MAX_LINES, wrap(&body, width))
+            };
             let dropped = wrapped.len().saturating_sub(cap);
             for (i, l) in wrapped.into_iter().take(cap).enumerate() {
                 let indent = if i == 0 { "" } else { " " };
                 lines.push(Line::from(Span::styled(format!("{indent}{l}"), style)));
             }
             if dropped > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!(" …(+{dropped} more line(s))"),
-                    style,
-                )));
+                let more = if warning {
+                    " … (warning continues)".into()
+                } else {
+                    format!(" …(+{dropped} more line(s))")
+                };
+                lines.push(Line::from(Span::styled(more, style)));
             }
         }
         Cell::System(text) => {
@@ -2191,21 +2200,25 @@ mod tests {
                 assert_eq!(span.style, loud, "{texts:?}");
             }
         }
-        // 修法多、终端又窄时，警告也一行不截。
-        let many = (1..=15)
+        // 终端窄时按折行后的行数限制预览，完整报告的入口保留在开头。
+        let many = (1..=100)
             .map(|n| format!("  remove entry {n} of \"allow\": not a valid rule"))
             .collect::<Vec<_>>()
             .join("\n");
         let long = cell_lines(
-            &Cell::Note(kloop_core::event::warning_note(&format!("header\n{many}"))),
+            &Cell::Note(kloop_core::event::warning_note(&format!(
+                "kloop --check-permissions\n{many}"
+            ))),
             24,
         );
         let long_texts: Vec<String> = long.iter().map(line_text).collect();
-        assert!(long_texts.len() > NOTE_MAX_LINES * 3, "{long_texts:?}");
-        assert!(!long_texts.iter().any(|text| text.contains("more line(s)")));
+        assert_eq!(long_texts.len(), WARNING_MAX_LINES + 1);
+        assert_eq!(long_texts.last().unwrap(), " … (warning continues)");
         assert!(
-            long_texts.concat().contains("entry 15 of"),
-            "{long_texts:?}"
+            long_texts[..2]
+                .concat()
+                .replace(' ', "")
+                .contains("--check-permissions")
         );
         let ordinary = cell_lines(&Cell::Note("compacted".into()), 80);
         assert_eq!(line_text(&ordinary[0]), "[compacted]");

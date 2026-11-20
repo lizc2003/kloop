@@ -417,14 +417,10 @@ fn load_project_permission_policy(
     let unavailable = |err: anyhow::Error| {
         registry.invalidate(&project_id);
         // 看了就知道怎么改：原因、文件位置、每条能照做的修法；用警告记号让前端醒目显示。
-        let mut text = format!(
-            "durable project approvals are off for this session: the project permission policy could not be loaded ({err:#})\n  file: {}",
-            crate::project_store::shell_path(&store.policy_path(&project_id))
+        let text = format!(
+            "durable project approvals are off for this session (full report: kloop --check-permissions)\n{}",
+            store.load_failure_report(&project_id, &err)
         );
-        for fix in store.load_failure_fixes(&project_id, &err) {
-            text.push_str("\n  ");
-            text.push_str(&fix);
-        }
         notify(&kloop_core::event::warning_note(&text));
         Arc::new(ProjectPermissionPolicy::unavailable())
     };
@@ -1409,14 +1405,16 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             "{}",
             notes[0]
         );
+        assert!(notes[0].contains("full report: kloop --check-permissions"));
         assert!(
             notes[0].contains(&format!(
-                "\n  file: {}\n  fix the file by hand, or delete it",
+                "\n  file: {}",
                 crate::project_store::shell_path(&path)
             )),
             "{}",
             notes[0]
         );
+        assert!(notes[0].contains("fix the file by hand, or delete it"));
         let _ = std::fs::remove_dir_all(base);
     }
 

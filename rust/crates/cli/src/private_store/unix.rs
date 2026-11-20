@@ -67,18 +67,14 @@ pub(super) fn inspect_private_file(
     let lookup =
         private_dir_lookup_flags() | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
     let mut path = root.to_path_buf();
-    // 一级目录的结论：`Err` 是要停下的问题（或 `None`：不存在，没什么可看），`Ok(true)` 是权限位过宽。
-    let directory_state =
-        |stat: &rustix::fs::Stat, path: &Path| -> std::result::Result<bool, Finding> {
-            let mode = stat.st_mode as u32;
-            match FileType::from_raw_mode(stat.st_mode as _) {
-                FileType::Symlink => Err(Finding::Link {
-                    path: path.to_path_buf(),
-                    directory: true,
-                }),
-                FileType::Directory => Ok(mode & 0o077 != 0),
-                _ => Err(Finding::NotDirectory(path.to_path_buf())),
-            }
+    let directory_problem =
+        |stat: &rustix::fs::Stat, path: &Path| match FileType::from_raw_mode(stat.st_mode as _) {
+            FileType::Symlink => Some(Finding::Link {
+                path: path.to_path_buf(),
+                directory: true,
+            }),
+            FileType::Directory => None,
+            _ => Some(Finding::NotDirectory(path.to_path_buf())),
         };
     let opened = |result: rustix::io::Result<rustix::fd::OwnedFd>, path: &Path, directory: bool| {
         match result {
@@ -103,16 +99,9 @@ pub(super) fn inspect_private_file(
             return inspection;
         }
     };
-    match directory_state(&stat, &path) {
-        Err(finding) => {
-            inspection.findings.push(finding);
-            return inspection;
-        }
-        Ok(true) => inspection.findings.push(Finding::LooseMode {
-            path: path.clone(),
-            directory: true,
-        }),
-        Ok(false) => {}
+    if let Some(finding) = directory_problem(&stat, &path) {
+        inspection.findings.push(finding);
+        return inspection;
     }
     let mut current = match opened(rustix::fs::open(root, lookup, Mode::empty()), &path, true) {
         Ok(Some(fd)) => fd,
@@ -122,6 +111,15 @@ pub(super) fn inspect_private_file(
             return inspection;
         }
     };
+    if !inspect_opened_mode(
+        &current,
+        &stat,
+        &path,
+        /*directory*/ true,
+        &mut inspection,
+    ) {
+        return inspection;
+    }
     for component in components {
         path.push(component);
         let stat = match rustix::fs::statat(&current, *component, AtFlags::SYMLINK_NOFOLLOW) {
@@ -132,16 +130,9 @@ pub(super) fn inspect_private_file(
                 return inspection;
             }
         };
-        match directory_state(&stat, &path) {
-            Err(finding) => {
-                inspection.findings.push(finding);
-                return inspection;
-            }
-            Ok(true) => inspection.findings.push(Finding::LooseMode {
-                path: path.clone(),
-                directory: true,
-            }),
-            Ok(false) => {}
+        if let Some(finding) = directory_problem(&stat, &path) {
+            inspection.findings.push(finding);
+            return inspection;
         }
         current = match opened(
             rustix::fs::openat(&current, *component, lookup, Mode::empty()),
@@ -155,6 +146,15 @@ pub(super) fn inspect_private_file(
                 return inspection;
             }
         };
+        if !inspect_opened_mode(
+            &current,
+            &stat,
+            &path,
+            /*directory*/ true,
+            &mut inspection,
+        ) {
+            return inspection;
+        }
     }
     path.push(name);
     let stat = match rustix::fs::statat(&current, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -173,14 +173,7 @@ pub(super) fn inspect_private_file(
             });
             return inspection;
         }
-        FileType::RegularFile => {
-            if (stat.st_mode as u32) & 0o077 != 0 {
-                inspection.findings.push(Finding::LooseMode {
-                    path: path.clone(),
-                    directory: false,
-                });
-            }
-        }
+        FileType::RegularFile => {}
         _ => {
             inspection.findings.push(Finding::NotRegularFile(path));
             return inspection;
@@ -203,16 +196,80 @@ pub(super) fn inspect_private_file(
             return inspection;
         }
     };
-    let mut file = std::fs::File::from(fd);
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        inspection.findings.push(Finding::NotRegularFile(path));
+    if !inspect_opened_mode(&fd, &stat, &path, /*directory*/ false, &mut inspection) {
         return inspection;
     }
+    let mut file = std::fs::File::from(fd);
     let mut raw = String::new();
     if std::io::Read::read_to_string(&mut file, &mut raw).is_ok() {
         inspection.contents = Some(raw);
     }
     inspection
+}
+
+/// 只有已经打开、且与目录项检查读到的是同一个对象时，才记录权限位。
+fn inspect_opened_mode(
+    fd: &rustix::fd::OwnedFd,
+    before: &rustix::fs::Stat,
+    path: &Path,
+    directory: bool,
+    inspection: &mut super::Inspection,
+) -> bool {
+    use super::Finding;
+    use rustix::fs::FileType;
+
+    let Ok(stat) = rustix::fs::fstat(fd) else {
+        inspection
+            .findings
+            .push(Finding::Inaccessible(path.to_path_buf()));
+        return false;
+    };
+    let expected = if directory {
+        FileType::Directory
+    } else {
+        FileType::RegularFile
+    };
+    if stat.st_dev != before.st_dev
+        || stat.st_ino != before.st_ino
+        || FileType::from_raw_mode(stat.st_mode as _) != expected
+    {
+        inspection
+            .findings
+            .push(Finding::Changed(path.to_path_buf()));
+        return false;
+    }
+    if (stat.st_mode as u32) & 0o077 != 0 {
+        inspection.findings.push(Finding::LooseMode {
+            path: path.to_path_buf(),
+            directory,
+        });
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn inspecting_a_replaced_entry_withholds_the_mode_fix() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("permissions.json");
+    let replacement = root.path().join("replacement");
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let before = rustix::fs::lstat(&path).unwrap();
+    std::fs::write(&replacement, "").unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    let fd = std::fs::File::open(&path).unwrap().into();
+    let mut inspection = super::Inspection::default();
+    assert!(!inspect_opened_mode(
+        &fd,
+        &before,
+        &path,
+        /*directory*/ false,
+        &mut inspection
+    ));
+    assert_eq!(inspection.findings, vec![super::Finding::Changed(path)]);
 }
 
 fn private_file_name<'a>(path: &'a Path, label: &str) -> Result<&'a OsStr> {

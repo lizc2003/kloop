@@ -56,6 +56,8 @@ pub(crate) enum Finding {
     },
     /// 打不开或看不了；检查停在这里。
     Inaccessible(std::path::PathBuf),
+    /// 打开时的目录项与前一次检查不同。
+    Changed(std::path::PathBuf),
 }
 
 /// 看现场的结果：发现的问题，以及走到文件、确认是普通文件时读到的内容（不管权限位）。
@@ -286,7 +288,7 @@ mod tests {
             root.file_name().unwrap().to_string_lossy()
         ));
         std::fs::create_dir_all(&outside).unwrap();
-        let junction = root.join("projects/v1");
+        let junction = root.join("projects").join("v1");
         let status = Command::new("cmd")
             .args([
                 "/C",
@@ -305,7 +307,9 @@ mod tests {
         )
         .err()
         .expect("junction component must be rejected");
-        assert!(error.to_string().contains("reparse"), "{error:#}");
+        let detail = format!("{error:#}");
+        assert!(detail.contains(&junction.display().to_string()), "{detail}");
+        assert!(detail.contains("reparse"), "{detail}");
 
         let _ = std::fs::remove_dir_all(junction);
         let _ = std::fs::remove_dir_all(root);

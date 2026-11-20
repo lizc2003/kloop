@@ -452,11 +452,17 @@ pub(super) struct Dir {
 
 impl Dir {
     pub(super) fn open(root: &Path, components: &[&OsStr], label: &str) -> Result<Option<Self>> {
-        let Some(mut current) = open_directory_path(root, label)? else {
+        let mut path = root.to_path_buf();
+        let Some(mut current) = open_directory_path(root, label)
+            .with_context(|| format!("cannot use private directory {}", path.display()))?
+        else {
             return Ok(None);
         };
         for component in components {
-            let Some(next) = open_private_dir_at(&current, component, label)? else {
+            path.push(component);
+            let Some(next) = open_private_dir_at(&current, component, label)
+                .with_context(|| format!("cannot use private directory {}", path.display()))?
+            else {
                 return Ok(None);
             };
             current = next;

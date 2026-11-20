@@ -167,8 +167,16 @@ pub(crate) fn byte_offset_at_display_column(text: &str, column: usize) -> ByteOf
 /// Hard-wrap text at grapheme boundaries. A grapheme wider than the requested
 /// width occupies a row by itself rather than being split.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
+    wrap_prefix(text, width, usize::MAX)
+}
+
+/// 只取折行后的前几行，供可能很长的警告预览。
+pub(crate) fn wrap_prefix(text: &str, width: usize, limit: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
+    if limit == 0 {
+        return lines;
+    }
     for raw in text.split('\n') {
         let mut line = String::new();
         let mut columns = 0;
@@ -176,12 +184,18 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
             let grapheme_width = display_width(grapheme);
             if columns + grapheme_width > width && !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
+                if lines.len() == limit {
+                    return lines;
+                }
                 columns = 0;
             }
             line.push_str(grapheme);
             columns += grapheme_width;
         }
         lines.push(line);
+        if lines.len() == limit {
+            break;
+        }
     }
     lines
 }
