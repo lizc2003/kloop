@@ -5,6 +5,11 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**权限文件 `revision` 为 0 一律无效（2026-11-20）**：ff0bdba 审查的 P3。启动和 `--check-permissions` 都用加载结果
+`revision == 0` 判断“没有文件”，加载器却接受手写的 `"revision": 0`，于是一份有规则的文件启动时照常生效、诊断却报
+“没有记录”。按不考虑兼容的约定，加载器直接拒绝 0（`InvalidPolicyFile`，给通用修法），`revision == 0` 从此只表示没有
+文件。补了加载器单元用例和 CLI 集成用例；project_store/启动用例 40 过，clippy、fmt 干净。
+
 **`--check-permissions` 不再把“没有权限文件”报成有效（2026-11-20）**：f73962e 审查的 P3。快照 `revision` 为 0（项目目录
 或文件不存在）时说明 “No permission policy is recorded for project <id>.”；显式给出的 ID 以状态 1 退出（多半抄错），
 当前目录的项目以 0 退出；有效时也带上项目 ID。集成用例补上抄错的 ID 与修好后报有效两步；clippy、fmt 干净。

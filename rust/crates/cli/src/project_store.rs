@@ -476,6 +476,14 @@ fn read_policy(dir: &PrivateDir, project_id: &ProjectId) -> Result<ProjectPolicy
             InvalidPolicyFile("project permission policy identity mismatch".to_string()).into(),
         );
     }
+    // kloop 写下的文件 revision 从 1 起；0 只表示“没有文件”（启动和 `--check-permissions` 都靠它判断），
+    // 手写的 0 要当成无效，不能让一份有规则的文件被读成“没有记录”。
+    if file.revision == 0 {
+        return Err(InvalidPolicyFile(
+            "project permission policy revision must be at least 1".to_string(),
+        )
+        .into());
+    }
     let allow = ProjectAllowRules::parse(&file.allow).map_err(|_| {
         anyhow::Error::new(InvalidRules(rule_fixes(
             file.allow.iter().map(|entry| Some(entry.as_str())),
@@ -911,6 +919,39 @@ mod tests {
         let error = store.load_blocking(&id).unwrap_err();
         assert!(format!("{error:#}").contains(&entry.display().to_string()));
         assert!(store.load_failure_fixes(&id, &error).is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// revision 0 只表示“没有文件”：手写成 0 的文件即便规则都合法，也按无效处理并给出通用修法，
+    /// 不会被启动或 `--check-permissions` 当成“没有记录”。
+    #[tokio::test]
+    async fn a_policy_file_with_revision_zero_is_invalid_not_missing() {
+        let (base, store, id) = fixture("revision-zero");
+        store
+            .append(
+                id.clone(),
+                ProjectAllowRules::parse(&["bash(cargo test *)".into()]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let path = store.policy_path(&id);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["revision"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let error = store.load_blocking(&id).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "project permission policy revision must be at least 1"
+        );
+        assert_eq!(
+            store.load_failure_fixes(&id, &error),
+            vec![
+                "fix the file by hand, or delete it (that forgets this project's remembered approvals)"
+                    .to_string()
+            ]
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

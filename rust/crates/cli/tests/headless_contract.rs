@@ -207,6 +207,27 @@ fn permission_report_can_select_a_project_from_another_directory() {
     assert!(report.contains(project_id), "{report}");
     assert!(!report.contains("private_marker"), "{report}");
 
+    // 手写的 revision 0：规则都合法也不能报成“没有记录”，按无效处理。
+    std::fs::write(
+        policy_dir.join("permissions.json"),
+        format!(r#"{{"version": 1, "project_id": "{project_id}", "revision": 0, "allow": []}}"#),
+    )
+    .unwrap();
+    let zero = root
+        .command(&["--check-permissions", project_id])
+        .output()
+        .unwrap();
+    assert_eq!(zero.status.code(), Some(1), "{zero:?}");
+    let report = String::from_utf8(zero.stdout).unwrap();
+    assert!(
+        report.contains("project permission policy revision must be at least 1"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("No permission policy is recorded"),
+        "{report}"
+    );
+
     // 修好之后同一条命令报有效。
     std::fs::write(
         policy_dir.join("permissions.json"),
