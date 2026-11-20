@@ -180,35 +180,63 @@ impl ProjectStore {
         self.project_dir(project_id).join(POLICY_FILE)
     }
 
-    /// 权限文件读不了时给用户的修法，每条都能照做：权限位过宽给出 `chmod` 命令，符号链接要换成
-    /// 普通文件，非法规则指出是 `allow` 里的第几条、为什么（不复述规则原文，见
-    /// [`kloop_core::permissions::invalid_rule_reason`]）。都不是时给通用的办法。只在加载失败后
-    /// 调用，自己再看一遍文件系统，不从错误文本里反推。
+    /// 权限文件读不了时给用户的修法，每条都能照做。加载失败后自己再看一遍现场，规则和加载时一样：
+    /// 从存储根逐级看到权限文件，每一级都不跟随符号链接；遇到符号链接或类型不对的条目，只给针对它的
+    /// 修法就停，不越过链接去看、去读、去改另一头的东西。权限位过宽给出 `chmod`。确认是普通文件后才
+    /// 不跟随、不阻塞地读内容（FIFO 不会挂住启动），指出非法规则是 `allow` 里的第几条、为什么，
+    /// 不复述规则原文（见 [`kloop_core::permissions::invalid_rule_reason`]）。都不是时给通用办法。
     pub(crate) fn load_failure_fixes(&self, project_id: &ProjectId) -> Vec<String> {
-        let path = self.policy_path(project_id);
-        let shown = shell_path(&path);
         let mut fixes = Vec::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut dir = self.root.to_path_buf();
-            let mut dirs = vec![dir.clone()];
-            for component in self.components(project_id) {
-                dir.push(component);
-                dirs.push(dir.clone());
-            }
-            for dir in dirs {
-                if let Ok(metadata) = std::fs::symlink_metadata(&dir)
-                    && metadata.is_dir()
-                    && metadata.permissions().mode() & 0o077 != 0
-                {
-                    fixes.push(format!("run: chmod 700 {}", shell_path(&dir)));
+        let mut dir = self.root.to_path_buf();
+        let mut dirs = vec![dir.clone()];
+        for component in self.components(project_id) {
+            dir.push(component);
+            dirs.push(dir.clone());
+        }
+        for dir in &dirs {
+            let shown = shell_path(dir);
+            match std::fs::symlink_metadata(dir) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    fixes.push(format!(
+                        "replace the symlink {shown} with a real directory (kloop does not follow links in its private state)"
+                    ));
+                    return fixes;
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    fixes.push(format!(
+                        "{shown} must be a directory; move it out of the way"
+                    ));
+                    return fixes;
+                }
+                Ok(_metadata) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        if _metadata.permissions().mode() & 0o077 != 0 {
+                            fixes.push(format!("run: chmod 700 {shown}"));
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return fixes,
+                Err(error) => {
+                    fixes.push(format!(
+                        "cannot inspect {shown} ({error}); check its permissions"
+                    ));
+                    return fixes;
                 }
             }
         }
+        let path = self.policy_path(project_id);
+        let shown = shell_path(&path);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 fixes.push(format!("replace the symlink {shown} with a regular file"));
+                return fixes;
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                fixes.push(format!(
+                    "{shown} is not a regular file; move it out of the way"
+                ));
                 return fixes;
             }
             Ok(_metadata) => {
@@ -220,10 +248,15 @@ impl ProjectStore {
                     }
                 }
             }
-            Err(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return fixes,
+            Err(error) => {
+                fixes.push(format!(
+                    "cannot inspect {shown} ({error}); check its permissions"
+                ));
+                return fixes;
+            }
         }
-        let entries = std::fs::read_to_string(&path)
-            .ok()
+        let entries = read_regular_file(&path)
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|value| {
                 value
@@ -238,16 +271,14 @@ impl ProjectStore {
                 None => Some("not a string".to_string()),
             };
             if let Some(reason) = reason {
-                fixes.push(format!(
-                    "edit {shown}: remove entry {} of \"allow\" — {reason}",
-                    index + 1
-                ));
+                fixes.push(format!("remove entry {} of \"allow\": {reason}", index + 1));
             }
         }
         if fixes.is_empty() {
-            fixes.push(format!(
-                "fix {shown} by hand, or delete it (that forgets this project's remembered approvals)"
-            ));
+            fixes.push(
+                "fix the file by hand, or delete it (that forgets this project's remembered approvals)"
+                    .to_string(),
+            );
         }
         fixes
     }
@@ -291,22 +322,54 @@ struct StoreFile {
     allow: Vec<String>,
 }
 
-/// 给用户照抄进终端的路径：家目录缩成 `~`，带空白或引号时整体加单引号（`~` 留在引号外才会展开）。
-fn shell_path(path: &Path) -> String {
-    let text = path.display().to_string();
+/// 给用户照抄进终端的路径：家目录缩成 `~/`；剩下的部分只要有白名单之外的字符就整体加单引号
+/// （`~/` 留在引号外才会展开）。白名单之外包括空白、引号和全部 shell 元字符，也包括非 ASCII 字符。
+pub(crate) fn shell_path(path: &Path) -> String {
     let (prefix, rest) = match std::env::home_dir()
         .and_then(|home| path.strip_prefix(&home).ok().map(Path::to_path_buf))
+        .filter(|relative| !relative.as_os_str().is_empty())
     {
         Some(relative) => ("~/", relative.display().to_string()),
-        None => ("", text),
+        None => ("", path.display().to_string()),
     };
-    if rest
-        .chars()
-        .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '$' | '`' | '\\'))
-    {
-        format!("{prefix}'{}'", rest.replace('\'', "'\\''"))
-    } else {
+    let plain = rest.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ':' | ',')
+    });
+    if plain {
         format!("{prefix}{rest}")
+    } else {
+        format!("{prefix}'{}'", rest.replace('\'', "'\\''"))
+    }
+}
+
+/// 只读普通文件：不跟随叶子上的符号链接，也不在 FIFO 上阻塞（打开后再确认类型）。读不了或不是
+/// 普通文件时给 `None`。
+fn read_regular_file(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::Mode;
+        use rustix::fs::OFlags;
+        use std::io::Read as _;
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .ok()?;
+        let mut file = std::fs::File::from(fd);
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
+        Some(raw)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        std::fs::read_to_string(path).ok()
     }
 }
 
@@ -645,21 +708,102 @@ mod tests {
         let error = format!("{:#}", store.load_blocking(&id).unwrap_err());
         assert!(error.contains("mode 0644"), "{error}");
         assert!(error.contains("must be mode 0600"), "{error}");
-        let shown = path.display();
         assert_eq!(
             store.load_failure_fixes(&id),
             vec![
-                format!("run: chmod 600 {shown}"),
-                format!(
-                    "edit {shown}: remove entry 2 of \"allow\" — `sandbox_escalate(cd …)` never matches: an escalation rule cannot start with a read-only command such as `cd`"
-                ),
-                format!(
-                    "edit {shown}: remove entry 3 of \"allow\" — `sandbox_write(…)` must name one absolute directory other than `/`, spelled without glob characters, `.`, `..`, `//` or a trailing `/`"
-                ),
-                format!("edit {shown}: remove entry 4 of \"allow\" — not a valid rule"),
+                format!("run: chmod 600 {}", shell_path(&path)),
+                "remove entry 2 of \"allow\": `sandbox_escalate(cd …)` never matches (it starts with the read-only command `cd`)".to_string(),
+                "remove entry 3 of \"allow\": `sandbox_write(…)` needs a plain absolute directory (no glob, `.`, `..`, `//` or trailing `/`)".to_string(),
+                "remove entry 4 of \"allow\": not a valid rule".to_string(),
             ]
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 看现场时和加载一样不跟随、不阻塞：权限文件是 FIFO 时不能挂住启动，是目录时不能建议
+    /// `chmod 600` 去掉它的搜索位；上级目录是符号链接时只指出那一级，不越过链接去看、去读。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_failure_fixes_stop_at_odd_entries_without_following_them() {
+        let (base, store, id) = fixture("odd");
+        store
+            .append(
+                id.clone(),
+                ProjectAllowRules::parse(&["bash(cargo test *)".into()]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let path = store.policy_path(&id);
+
+        std::fs::remove_file(&path).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = store.clone();
+        let probe_id = id.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(probe.load_failure_fixes(&probe_id));
+        });
+        let fixes = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO must not block the diagnosis");
+        assert_eq!(
+            fixes,
+            vec![format!(
+                "{} is not a regular file; move it out of the way",
+                shell_path(&path)
+            )]
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            store.load_failure_fixes(&id),
+            vec![format!(
+                "{} is not a regular file; move it out of the way",
+                shell_path(&path)
+            )]
+        );
+
+        let project = path.parent().unwrap().to_path_buf();
+        let real = base.join("elsewhere");
+        std::fs::rename(&project, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &project).unwrap();
+        assert_eq!(
+            store.load_failure_fixes(&id),
+            vec![format!(
+                "replace the symlink {} with a real directory (kloop does not follow links in its private state)",
+                shell_path(&project)
+            )]
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 修法里的路径要能原样贴进 shell：白名单之外的字符一律整体加单引号，家目录缩成 `~/`。
+    #[test]
+    fn shell_paths_quote_anything_outside_a_safe_set() {
+        assert_eq!(
+            shell_path(Path::new("/tmp/a-b_c.d/x+y@z:1,2")),
+            "/tmp/a-b_c.d/x+y@z:1,2"
+        );
+        for (raw, quoted) in [
+            ("/tmp/work(1)/p", "'/tmp/work(1)/p'"),
+            ("/tmp/a&b", "'/tmp/a&b'"),
+            ("/tmp/dir[1]", "'/tmp/dir[1]'"),
+            ("/tmp/a*b?c", "'/tmp/a*b?c'"),
+            ("/tmp/#x ~y !z", "'/tmp/#x ~y !z'"),
+            ("/tmp/项目", "'/tmp/项目'"),
+            ("/tmp/it's", "'/tmp/it'\\''s'"),
+        ] {
+            assert_eq!(shell_path(Path::new(raw)), quoted, "{raw}");
+        }
+        if let Some(home) = std::env::home_dir() {
+            assert_eq!(shell_path(&home.join(".kloop/x")), "~/.kloop/x");
+            assert_eq!(shell_path(&home.join("a b")), "~/'a b'");
+        }
     }
 
     #[tokio::test]

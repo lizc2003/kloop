@@ -278,10 +278,6 @@ impl SessionState {
     }
 }
 
-/// `[env]` is applied here and nowhere else, because here is the only place
-/// it can be: `set_var` is sound while the process is single-threaded, and the
-/// runtime built on the next line is what ends that. The file wins over what
-/// the shell exported — see `load_env_overrides`.
 /// 把一条提示写到 stderr：警告（[`kloop_core::event::is_warning_note`]）用黄色粗体醒目显示，
 /// 其余提示照旧是括起来的暗色文字。
 pub(crate) fn eprint_note(note: &str) {
@@ -292,6 +288,10 @@ pub(crate) fn eprint_note(note: &str) {
     }
 }
 
+/// `[env]` is applied here and nowhere else, because here is the only place
+/// it can be: `set_var` is sound while the process is single-threaded, and the
+/// runtime built on the next line is what ends that. The file wins over what
+/// the shell exported — see `load_env_overrides`.
 fn main() -> Result<ExitCode> {
     // Read argv as `OsString` here: a non-UTF-8 argument is reported by `run`
     // like any other bad input, instead of panicking on `std::env::args`.

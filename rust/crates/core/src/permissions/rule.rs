@@ -330,9 +330,17 @@ pub fn invalid_rule_reason(entry: &str) -> Option<String> {
         "bash_write",
         "sandbox_escalate_write",
     ];
+    // 和 `parse_rule` 一样先剥掉末尾的 `)`：精确写法 `sandbox_escalate(cd)` 的开头命令要认得出；
+    // 缺右括号的是语法错误，不按里面的内容归因。
     let (tool, inner) = match entry.split_once('(') {
-        Some((tool, rest)) if PATTERN_TOOLS.contains(&tool) => (Some(tool), rest),
-        _ => (None, ""),
+        Some((tool, rest)) if PATTERN_TOOLS.contains(&tool) => (Some(tool), rest.strip_suffix(')')),
+        _ => (None, None),
+    };
+    let Some(inner) = inner else {
+        return Some(match tool {
+            Some(tool) => format!("`{tool}(…` is missing its closing parenthesis"),
+            None => "not a valid rule".to_string(),
+        });
     };
     Some(match tool {
         Some("sandbox_escalate") => {
@@ -343,12 +351,12 @@ pub fn invalid_rule_reason(entry: &str) -> Option<String> {
                 .filter(|head| crate::shell::readonly_whatever_the_arguments(head));
             match head {
                 Some(head) => format!(
-                    "`sandbox_escalate({head} …)` never matches: an escalation rule cannot start with a read-only command such as `{head}`"
+                    "`sandbox_escalate({head} …)` never matches (it starts with the read-only command `{head}`)"
                 ),
                 None => "`sandbox_escalate(…)` is not a valid command prefix".to_string(),
             }
         }
-        Some("sandbox_write") => "`sandbox_write(…)` must name one absolute directory other than `/`, spelled without glob characters, `.`, `..`, `//` or a trailing `/`".to_string(),
+        Some("sandbox_write") => "`sandbox_write(…)` needs a plain absolute directory (no glob, `.`, `..`, `//` or trailing `/`)".to_string(),
         Some(tool) => format!("`{tool}(…)` is not a valid rule"),
         None => "not a valid rule".to_string(),
     })
@@ -538,16 +546,30 @@ mod tests {
         ] {
             assert_eq!(invalid_rule_reason(valid), None, "{valid}");
         }
-        assert_eq!(
-            invalid_rule_reason("sandbox_escalate(/bin/echo token-123 *)").as_deref(),
-            Some(
-                "`sandbox_escalate(echo …)` never matches: an escalation rule cannot start with a read-only command such as `echo`"
-            )
-        );
+        for entry in [
+            "sandbox_escalate(/bin/echo token-123 *)",
+            "sandbox_escalate(echo)",
+        ] {
+            assert_eq!(
+                invalid_rule_reason(entry).as_deref(),
+                Some(
+                    "`sandbox_escalate(echo …)` never matches (it starts with the read-only command `echo`)"
+                ),
+                "{entry}"
+            );
+        }
         for (entry, reason) in [
             (
                 "sandbox_escalate()",
                 "`sandbox_escalate(…)` is not a valid command prefix",
+            ),
+            (
+                "sandbox_escalate(echo secret-token",
+                "`sandbox_escalate(…` is missing its closing parenthesis",
+            ),
+            (
+                "sandbox_write(/opt/out",
+                "`sandbox_write(…` is missing its closing parenthesis",
             ),
             (
                 "write_file([secret-glob)",

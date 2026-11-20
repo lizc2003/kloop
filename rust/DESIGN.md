@@ -1509,20 +1509,28 @@ neither applies, silently ignores, rewrites, nor automatically migrates it.
 Remove the legacy entry and approve again in each project.
 
 A store that cannot be loaded — a mode looser than 0600 (directories 0700), a
-symlink, malformed JSON, or any invalid rule — turns the project's durable
-approvals off for the session, and says so as a **warning**: a note that
-starts with `⚠ ` (`kloop_core::event::warning_note`), which the TUI draws in
-bold yellow without brackets and the plain/headless front-ends print in bold
-yellow on stderr, while ordinary notes stay dim. The warning is meant to be
-acted on as read: the load error, then one line per fix, found by looking at
-the files again rather than parsing the error text — `run: chmod 600 <file>` /
-`chmod 700 <dir>` for each loose mode, a symlink to replace, and
-`edit <file>: remove entry N of "allow" — <why>` for each invalid rule. The
-reasons never quote the rule (a `bash(...)` rule can carry a secret from a
-command line); they name only a known tool and, for an escalation rule headed
-by a read-only command, that command's name. When nothing specific is found,
-the fix is to repair the file by hand or delete it, which forgets the
-project's remembered approvals.
+symlink or other non-regular entry, malformed JSON, or any invalid rule — turns
+the project's durable approvals off for the session, and says so as a
+**warning**: a note that starts with `⚠ ` (`kloop_core::event::warning_note`),
+which the TUI draws in bold yellow without brackets (and with a 40-row cap
+instead of an ordinary note's 10, so the fixes are not cut off) and the
+plain/headless front-ends print in bold yellow on stderr, while ordinary notes
+stay dim. The warning is meant to be acted on as read: the load error, the
+file (`file: <path>`, home shown as `~/`, quoted for the shell whenever it
+holds anything outside a safe character set), then one line per fix. The fixes
+come from looking at the files again under the loader's own rules rather than
+from parsing the error text: from the store root down, no level is followed
+through a symlink — a symlink or a non-directory stops the walk with a fix for
+that entry alone, so nothing past a link is read, chmod-ed or deleted — and the
+policy file is read only after it is confirmed to be a regular file, opened
+`O_NOFOLLOW | O_NONBLOCK` so a FIFO cannot hang startup. The fixes are
+`run: chmod 700 <dir>` / `run: chmod 600 <file>` for each loose mode, a symlink
+or a non-regular entry to replace, and `remove entry N of "allow": <why>` for
+each invalid rule. The reasons never quote the rule (a `bash(...)` rule can
+carry a secret from a command line); they name only a known tool and, for an
+escalation rule headed by a read-only command, that command's name. When
+nothing specific is found, the fix is to repair the file by hand or delete it,
+which forgets the project's remembered approvals.
 
 `tool_name` covers the whole tool; `bash(<tokens>)` matches one command's
 leading argv tokens (trailing `*` = any remainder, no `*` = exact), applied

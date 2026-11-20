@@ -418,7 +418,8 @@ fn load_project_permission_policy(
         registry.invalidate(&project_id);
         // 看了就知道怎么改：原因、文件位置、每条能照做的修法；用警告记号让前端醒目显示。
         let mut text = format!(
-            "durable project approvals are off for this session: the project permission policy could not be loaded ({err:#})"
+            "durable project approvals are off for this session: the project permission policy could not be loaded ({err:#})\n  file: {}",
+            crate::project_store::shell_path(&store.policy_path(&project_id))
         );
         for fix in store.load_failure_fixes(&project_id) {
             text.push_str("\n  ");
@@ -1409,7 +1410,10 @@ powershell = 'C:\Program Files\PowerShell\7\pwsh.exe'
             notes[0]
         );
         assert!(
-            notes[0].contains(&format!("fix {} by hand, or delete it", path.display())),
+            notes[0].contains(&format!(
+                "\n  file: {}\n  fix the file by hand, or delete it",
+                crate::project_store::shell_path(&path)
+            )),
             "{}",
             notes[0]
         );

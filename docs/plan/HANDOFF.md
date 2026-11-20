@@ -5,6 +5,15 @@
 完整检查只在明确要求或有具体覆盖缺口时执行，详见根 `AGENTS.md`。历史条目中的全量
 验证记录保留为当时事实，不代表当前提交要求。配置文件注释使用英文。教训 351。
 
+**权限文件警告的复审修正（2026-11-20）**：六条都成立。（P1）`load_failure_fixes` 看现场时没守住加载时的不跟随、
+不阻塞规则：权限文件是 FIFO 会挂住启动，是目录会被建议 `chmod 600`，上级目录是符号链接时会越过链接去读、去建议改
+另一头。现在从存储根逐级 `symlink_metadata`，遇到符号链接或类型不对就只给针对那一级的修法并停；权限文件确认是普通
+文件后才用 `O_NOFOLLOW | O_NONBLOCK` 打开读。（P2）`invalid_rule_reason` 先剥掉末尾 `)` 再认开头命令
+（`sandbox_escalate(cd)` 认得出，缺右括号的单说语法问题）；`shell_path` 改白名单，白名单外整体加单引号。（P3）警告在
+TUI 里的行数上限从 10 放到 40，提示改成单独一行 `file:`，每条修法不再重复路径、说明缩短；两处测试改用 `shell_path`
+断言；`eprint_note` 插错位置导致 `main` 的文档注释挂到了它上面，已移回。新增 FIFO/目录/符号链接上级、路径加引号、
+精确写法与缺括号、警告不截断的用例；cli 单元（project_store、启动警告）、core 规则、TUI note 用例过；fmt、clippy 干净。
+
 **项目权限文件读不了时的警告看了就能改，而且醒目（2026-11-20）**：用户反映提示
 "project permission policy contains credentials; restrict it to mode 0600" 看了不知道改哪、怎么改，颜色也和普通提示
 一样暗。现在：提示以 `⚠ ` 开头（`kloop_core::event::warning_note`），TUI 黄色粗体不加括号，plain/headless 的
