@@ -91,7 +91,7 @@ impl CapabilityRequest {
 /// Whether bash may be offered writes to `dir`: a rule can name it (see
 /// [`nameable_dir`]) and granting it is safe (see [`safe_write_target`]). The
 /// sandbox's own write denies still apply on top of any grant.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn grantable_write_dir(dir: &Path, home: Option<&Path>) -> bool {
     nameable_dir(dir) && safe_write_target(dir, home).is_some_and(|target| nameable_dir(&target))
 }
@@ -125,17 +125,19 @@ fn safe_write_target(dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
     safe.then_some(resolved)
 }
 
-/// 已同意的路径需仍指向同一个落点。旧规则若记的是别名，重新触发审批时会提议真实落点。
+/// 已同意的路径需仍按原字面指向同一个物理落点。带符号链接、尾部斜杠、`.` 或 `//` 的旧规则
+/// 视作别名，重新触发审批时会提议干净的物理落点。
 pub(crate) fn usable_write_grant(dir: &Path) -> bool {
-    safe_write_target(dir, std::env::home_dir().as_deref()).is_some_and(|target| target == dir)
+    safe_write_target(dir, std::env::home_dir().as_deref())
+        .is_some_and(|target| target.as_os_str() == dir.as_os_str())
 }
 
 /// 被拒写入要提议授权的目录（plan 287）：落在已知的工具缓存里时提议整个缓存根，下一个依赖、
 /// 下一份遥测不必再问；其它情况提议被拒路径的父目录。上提之前先看原始落点，下列情况什么都不提议，
-/// 授权哪一级都解除不了这次拒绝：被拒路径本身或它的父目录已被策略决定（禁写路径、受保护子路径、
-/// 已在可写根里）；被拒路径的目录条目被改名保护固定住（它是禁写路径或受保护子路径的祖先，拒绝的正是
-/// 改名）；父目录授权出去不安全（三轮复审 P2）。父目录只是写不成规则（名字里有 glob 字符）时仍可由
-/// 缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
+/// 授权哪一级都解除不了这次拒绝：被拒路径本身或它的父目录（原拼写与解析后）已被策略决定（禁写路径、
+/// 受保护子路径、已在可写根里）；被拒路径的目录条目被改名保护固定住（它是禁写路径或受保护子路径的
+/// 祖先，拒绝的正是改名）；父目录授权出去不安全（三轮复审 P2）。父目录只是写不成规则（名字里有 glob
+/// 字符）时仍可由缓存根覆盖（复审 P3）。缓存根同样要能授权、策略没有决定它，否则退回父目录，不扩大。
 /// `rename_guarded` 由调用方按本次拒绝的操作查询，其他写操作仍可提议授权。
 pub(super) fn proposed_write_dir(
     path: &Path,
@@ -149,6 +151,15 @@ pub(super) fn proposed_write_dir(
         return None;
     }
     let target = safe_write_target(parent, home)?;
+    if decided(&target) {
+        return None;
+    }
+    if let Some(name) = path.file_name() {
+        let entry = target.join(name);
+        if decided(&entry) || rename_guarded(&entry) {
+            return None;
+        }
+    }
     let cache_root = home.and_then(|home| {
         tool_cache_roots(home, &var).into_iter().find_map(|root| {
             if !path.starts_with(&root) || path == root || decided(&root) {

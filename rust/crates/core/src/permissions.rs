@@ -68,9 +68,9 @@ mod approval_replay;
 mod argv_roles;
 mod capability;
 pub(crate) use capability::CapabilityRequest;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use capability::grantable_write_dir;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use capability::proposed_write_dir;
 pub(crate) use capability::proposed_write_dirs;
 pub(crate) use capability::usable_write_grant;

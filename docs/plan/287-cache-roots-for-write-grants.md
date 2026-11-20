@@ -119,3 +119,15 @@ Go 的模块缓存和 telemetry 目录各问了一次，都是这个形状。
 
 写目录提议要求覆盖同一次运行收到的全部写拒绝。只要有一条无法靠目录授权解除，就走完整升级。
 Bash 与回放共用这道判断。历史输出前缀每次保留一条代表事件，回放能检查的范围以实际记录为准。
+
+## 十、第五轮复审修正（2026-11-20）
+
+- `usable_write_grant` 改为按 `OsStr` 精确比对解析结果与原路径。带尾部 `/`、`.` 或 `//` 的旧规则
+  不再经由 `Path::eq` 混进 `with_grants`（那样会把非规范字面量写进 Seatbelt profile，同时
+  `already_decides_writes` 与 `capability_remembered` 又按分量判定为已覆盖），而是按别名过滤、
+  触发一次对规范物理路径的重新审批。
+- `proposed_write_dir` 解析出父目录的物理落点 `target` 后，补查 `decided(&target)` 以及被拒条目
+  物理位置 `target.join(name)` 的 `decided` 与 `rename_guarded`，防止别名路径越过策略已决定的目录
+  或改名保护条目。
+- 写目录提议相关的 Unix 路径单测补齐 `#[cfg(unix)]`，避免 Windows 下 `canonicalize` 的 `\\?\`
+  verbatim 前缀命中 `nameable_dir` 的 `?` 字符检查导致测试失败。

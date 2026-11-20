@@ -1,5 +1,6 @@
 // plan 287：写入被拒落在已知的工具缓存里时提议整个缓存根，其它情况照旧提议父目录。
 
+#[cfg(unix)]
 fn plan287_home(label: &str) -> PathBuf {
     std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
@@ -7,6 +8,7 @@ fn plan287_home(label: &str) -> PathBuf {
         .join("home")
 }
 
+#[cfg(unix)]
 fn plan287_vars(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
     let vars: Vec<(String, String)> = vars
         .iter()
@@ -19,6 +21,7 @@ fn plan287_vars(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsSt
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plan287_a_tool_cache_proposes_its_root() {
     let home = plan287_home("plan287-defaults-");
@@ -68,6 +71,7 @@ fn plan287_a_tool_cache_proposes_its_root() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn plan287_environment_moves_the_cache_roots() {
     let home = plan287_home("plan287-env-");
@@ -131,6 +135,7 @@ fn plan287_environment_moves_the_cache_roots() {
 
 /// 缓存根是家目录的祖先、`/`，或通不过授权检查时，退回父目录，不扩大；父目录本身都不能授权时
 /// 什么都不提议。
+#[cfg(unix)]
 #[test]
 fn plan287_a_cache_root_that_is_too_wide_falls_back_to_the_parent() {
     let home = plan287_home("plan287-wide-");
@@ -201,6 +206,7 @@ fn plan287_a_symlinked_home_is_still_home() {
 /// 上提之前先看原始落点（复审 P2）：策略已经决定了被拒路径所在目录的写权限（例如缓存里某个
 /// 子目录被显式禁写）时，授权缓存根也解除不了这次拒绝，什么都不提议；只有缓存根本身被策略
 /// 决定时，退回父目录。
+#[cfg(unix)]
 #[test]
 fn plan287_the_refused_location_is_checked_before_lifting() {
     let home = plan287_home("plan287-decided-");
@@ -226,6 +232,7 @@ fn plan287_the_refused_location_is_checked_before_lifting() {
 
 /// 被拒的就是禁写目录本身（例如重命名它）时，父目录和缓存根都解除不了这次拒绝，什么都不提议
 /// （第二轮复审 P2）。
+#[cfg(unix)]
 #[test]
 fn plan287_a_refusal_of_the_denied_directory_itself_offers_nothing() {
     let home = plan287_home("plan287-denied-self-");
@@ -239,8 +246,7 @@ fn plan287_a_refusal_of_the_denied_directory_itself_offers_nothing() {
     );
 }
 
-/// 候选目录经符号链接指向家目录或 `/` 时，按解析后的落点判断：授权时 `with_grants` 会把真实路径
-/// 加进可写根（第二轮复审 P2）。
+/// 候选目录经符号链接指向家目录或 `/` 时，按解析后的落点判断，且提议返回的也是物理路径。
 #[cfg(unix)]
 #[test]
 fn plan287_an_aliased_candidate_is_judged_where_it_lands() {
@@ -285,6 +291,7 @@ fn plan287_an_aliased_candidate_is_judged_where_it_lands() {
 
 /// 父目录名里有 glob 字符、写不成规则时，缓存根仍能覆盖这次写入；不在缓存里时什么都不提议
 /// （第二轮复审 P3）。
+#[cfg(unix)]
 #[test]
 fn plan287_an_unnameable_parent_still_lifts_to_the_cache_root() {
     let home = plan287_home("plan287-bracket-");
@@ -380,6 +387,7 @@ async fn plan287_a_remembered_grant_that_now_leads_home_is_dropped() {
 
 /// 被拒的是禁写路径或受保护子路径的祖先（拒绝的正是改名）时，授权哪一级都解除不了，什么都不提议；
 /// 在它里面新建文件照旧可以提议（第三轮复审 P2）。
+#[cfg(unix)]
 #[test]
 fn plan287_a_refused_rename_of_a_guarded_ancestor_offers_nothing() {
     // 不能放在临时目录下：那里本来就是工作区策略的可写根，策略已经“决定”了它的写权限。
@@ -401,4 +409,175 @@ fn plan287_a_refused_rename_of_a_guarded_ancestor_offers_nothing() {
     assert_eq!(offer(&home.join(".npm/_cacache")), None);
     assert_eq!(offer(&locked), None);
     assert_eq!(offer(&home.join(".npm/_cacache/new-entry")), Some(home.join(".npm")));
+}
+
+/// 带尾斜杠、`.` 或 `//` 的旧写授权不是规范字面量：按别名过滤，不进入可写根，也不把对应目录算作已记住。
+#[cfg(unix)]
+#[tokio::test]
+async fn plan287_non_canonical_write_grant_spellings_are_dropped() {
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(crate::resource_id::fresh("plan287-spelling-").unwrap());
+    let kept = base.join("cache");
+    std::fs::create_dir_all(&kept).unwrap();
+    let kept_text = kept.display();
+    let base_text = base.display();
+    let trailing_slash = PathBuf::from(format!("{kept_text}/"));
+    let dot_segment = PathBuf::from(format!("{base_text}/./cache"));
+    let double_slash = PathBuf::from(format!("{base_text}//cache"));
+
+    assert!(usable_write_grant(&kept));
+    for bad in [&trailing_slash, &dot_segment, &double_slash] {
+        assert!(!usable_write_grant(bad), "{}", bad.display());
+    }
+
+    let policy = crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false);
+    #[cfg(target_os = "macos")]
+    let sandbox_policy = policy.clone();
+    let ungranted = crate::sandbox::SandboxPolicy {
+        writable_roots: Vec::new(),
+        ..policy
+    };
+    let applied = ungranted.with_grants(&SandboxGrants {
+        network: false,
+        writable: vec![
+            trailing_slash.clone(),
+            dot_segment.clone(),
+            double_slash.clone(),
+        ],
+    });
+    assert!(applied.writable_roots.is_empty());
+    assert!(!applied.already_decides_writes(&kept));
+
+    let rule = |dir: &Path| format!("sandbox_write({})", dir.display());
+    let approver = ScriptedApprover::new(vec![]);
+    let p = gate(
+        Mode::Manual,
+        rules(
+            &[
+                &rule(&trailing_slash),
+                &rule(&dot_segment),
+                &rule(&double_slash),
+            ],
+            &[],
+            &[],
+        ),
+        approver.clone(),
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let verdict = p
+            .check_call_with_execution(
+                "bash",
+                &bash("printf x > out.txt"),
+                0,
+                crate::sandbox::ExecutionContext::sandboxed(Some(&sandbox_policy)),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(verdict.grants.writable.is_empty());
+    }
+    let denial = crate::sandbox::SandboxDenial {
+        kind: crate::sandbox::DenialKind::Write,
+        evidence: format!("file-write-create {kept_text}/x"),
+        writes: Vec::new(),
+    };
+    let request = CapabilityRequest::Write {
+        dirs: vec![kept.clone()],
+    };
+    let escalation = p.escalate_capability("touch x", &denial, &request, 0).await;
+    assert_ne!(
+        escalation.outcome,
+        EscalationOutcome::Approved(EscalationApproval::Remembered),
+        "non-canonical spellings must trigger fresh approval for the physical path"
+    );
+    assert_eq!(approver.ask_count(), 1);
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// 经符号链接别名传入的写拒绝，解析到真实落点后仍需过策略决定与改名保护检查，
+/// 既不直接提议策略已决定的目录，也不越过它上提到缓存根。
+#[cfg(unix)]
+#[test]
+fn plan287_aliased_refusals_still_check_policy_where_they_land() {
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(crate::resource_id::fresh("plan287-aliased-policy-").unwrap());
+    let home = base.join("home");
+    let real = base.join("real-cache");
+    let locked = real.join("locked");
+    let granted = real.join("granted");
+    let guarded = real.join("guarded");
+    let guarded_locked = guarded.join("locked");
+    let normal = real.join("normal");
+    for dir in [&home, &locked, &granted, &guarded_locked, &normal] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let alias = base.join("alias-cache");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+    let policy = crate::sandbox::SandboxPolicy {
+        writable_roots: Vec::new(),
+        ..crate::sandbox::SandboxPolicy::workspace(&test_cwd(), &[], false)
+    }
+    .with_denied_write_path(&locked)
+    .with_denied_write_path(&guarded_locked)
+    .with_grants(&SandboxGrants {
+        network: false,
+        writable: vec![granted.clone()],
+    });
+    let cache_text = alias.to_str().unwrap().to_string();
+    let offer = |refused: &Path, cache: Option<&str>, is_unlink: bool| {
+        let vars = match cache {
+            Some(cache) => plan287_vars(&[("npm_config_cache", cache)]),
+            None => plan287_vars(&[]),
+        };
+        proposed_write_dir(
+            refused,
+            Some(&home),
+            vars,
+            |dir| policy.already_decides_writes(dir),
+            |path| is_unlink && policy.guards_rename(path),
+        )
+    };
+
+    for cache in [Some(cache_text.as_str()), None] {
+        // 父目录经别名落在禁写目录或已授权可写根上：不能提议，也不能越过它上提缓存根。
+        assert_eq!(
+            offer(&alias.join("locked/entry"), cache, /*is_unlink*/ false),
+            None
+        );
+        assert_eq!(
+            offer(&alias.join("granted/entry"), cache, /*is_unlink*/ false),
+            None
+        );
+        // 被拒条目自身的物理落点就是禁写目录。
+        assert_eq!(
+            offer(&alias.join("locked"), cache, /*is_unlink*/ false),
+            None
+        );
+        // 被拒条目自身的物理落点命中改名保护：unlink 拒绝不提议，其他写操作照常提议。
+        assert_eq!(
+            offer(&alias.join("guarded"), cache, /*is_unlink*/ true),
+            None
+        );
+        assert_eq!(
+            offer(&alias.join("guarded"), cache, /*is_unlink*/ false),
+            Some(real.clone())
+        );
+    }
+    assert_eq!(
+        offer(
+            &alias.join("normal/entry"),
+            Some(cache_text.as_str()),
+            /*is_unlink*/ false
+        ),
+        Some(real.clone())
+    );
+    assert_eq!(
+        offer(&alias.join("normal/entry"), None, /*is_unlink*/ false),
+        Some(normal)
+    );
+    std::fs::remove_dir_all(&base).unwrap();
 }

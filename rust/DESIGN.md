@@ -4190,16 +4190,19 @@ next command that needs it is covered whatever its text.
   inherits them), only absolute values count, and a root that fails the checks
   below falls back to the parent. A directory offer must cover every write
   refusal from the same run. The command goes to full escalation if any
-  refused path or its parent is already decided by the policy, a refusal
-  lacks a path, a logged `file-write-unlink` targets a guarded entry, or
+  refused path or its parent — as spelled or at its resolved entry — is
+  already decided by the policy, a refusal lacks a path, a logged
+  `file-write-unlink` targets a guarded entry (spelled or resolved), or
   the parent would be unsafe to grant. The log keeps the operation for
   each write, so other operations on a guarded entry can still get a
   directory offer. A parent that is merely unnameable (glob
   characters in its name, so no rule can spell it) still lifts to a covering
   cache root. The offer shows the resolved directory and stores that same
   path in `sandbox_write(<dir>)`. Each use checks that the path still resolves
-  to itself, and the profile gets that exact path. A legacy rule that names
-  an alias needs fresh approval for the resolved directory. Caches are not made
+  verbatim to itself (not a symlink or non-canonical spelling such as a
+  trailing slash, `.`, or `//`), and the profile gets that exact path. A
+  legacy rule that names an alias needs fresh approval for the resolved
+  directory. Caches are not made
   writable by default: a sandboxed run could then plant code in an unpacked
   module that a later uncontained build executes. Only a plain directory is
   offered, judged both as spelled and as resolved. It must be absolute and

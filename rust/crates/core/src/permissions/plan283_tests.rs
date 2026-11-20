@@ -338,6 +338,7 @@ fn plan283_capability_rules_parse_programs_and_absolute_dirs() {
 
 /// 只提议能写成规则、又不碰敏感目录的目录：不是根、不是家目录本身、没有 glob 字符、
 /// 不含 `.git`/`.kloop`/凭据目录。
+#[cfg(unix)]
 #[test]
 fn plan283_only_plain_directories_are_offered_for_writes() {
     let home = Path::new("/Users/someone");
